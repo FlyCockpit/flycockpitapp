@@ -2420,7 +2420,13 @@ async fn run_container_shell(
         Ok(cmd) => cmd,
         Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
     };
-    run_prepared_command(cmd, ctx, timeout_ms).await
+    run_prepared_command(
+        cmd,
+        ctx,
+        timeout_ms,
+        vec![serde_json::json!({"execute": {"command": command}})],
+    )
+    .await
 }
 
 fn render_bash_outcome(
@@ -2588,13 +2594,30 @@ async fn run_shell(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    run_prepared_command(cmd, ctx, timeout_ms).await
+    let concrete_effects = vec![
+        // Ordinary command approval binds the exact shell text.
+        serde_json::json!({"execute": {"command": command}}),
+        // A run-fail-escalate approval additionally binds the actual retry
+        // confinement selected by the user.
+        serde_json::json!({"execute": {
+            "command": command,
+            "sandbox": if confine { "confined" } else { "unconfined" },
+        }}),
+    ];
+    run_prepared_command(
+        cmd,
+        ctx,
+        timeout_ms,
+        concrete_effects,
+    )
+    .await
 }
 
 async fn run_prepared_command(
     mut cmd: tokio::process::Command,
     ctx: &ToolCtx,
     timeout_ms: u64,
+    concrete_effects: Vec<serde_json::Value>,
 ) -> RunOutcome {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2603,6 +2626,16 @@ async fn run_prepared_command(
     #[cfg(unix)]
     cmd.process_group(0);
 
+    // This is the immediate process-creation boundary, after all sandbox
+    // preparation but before `spawn` can hand control to the host OS.
+    if let Err(error) = crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+        "bash_shell_spawn",
+        &concrete_effects,
+    )
+    .await
+    {
+        return RunOutcome::SpawnError(std::io::Error::other(error.to_string()));
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return RunOutcome::SpawnError(e),

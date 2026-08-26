@@ -1,6 +1,651 @@
 use super::*;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::sync::Arc;
+
+/// Daemon-private proof that one exact provider/model entry participated in a
+/// captured workspace snapshot.  This is intentionally neither serde nor
+/// displayable: the daemon uses it only to bind a retained write capability
+/// to the exact bytes and model object it previously projected.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RetainedProviderModelSource {
+    layer_index: usize,
+    provider_id: String,
+    model_id: String,
+    provider_digest: [u8; 32],
+    model_digest: [u8; 32],
+}
+
+/// Daemon-private receipt for one capability-relative model-favorite write.
+///
+/// The receipt deliberately carries only content identities and the retained
+/// source token.  It is not serializable or displayable: callers use it to
+/// distinguish the exact pre-write snapshot from the bytes this operation
+/// wrote before asking the worker to publish a new configuration generation.
+#[derive(Clone)]
+pub struct RetainedProviderModelFavoriteWriteReceipt {
+    source: RetainedProviderModelSource,
+    old_provider_digest: [u8; 32],
+    new_provider_digest: [u8; 32],
+    old_model_digest: [u8; 32],
+    new_model_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for RetainedProviderModelFavoriteWriteReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedProviderModelFavoriteWriteReceipt")
+            .field("source_layer_index", &self.source.layer_index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedProviderModelFavoriteWriteReceipt {
+    pub fn source(&self) -> &RetainedProviderModelSource {
+        &self.source
+    }
+
+    pub fn old_provider_digest(&self) -> &[u8; 32] {
+        &self.old_provider_digest
+    }
+
+    pub fn new_provider_digest(&self) -> &[u8; 32] {
+        &self.new_provider_digest
+    }
+
+    pub fn old_model_digest(&self) -> &[u8; 32] {
+        &self.old_model_digest
+    }
+
+    pub fn new_model_digest(&self) -> &[u8; 32] {
+        &self.new_model_digest
+    }
+
+    /// True only when a freshly captured source is the exact bytes this
+    /// receipt committed.  A same-slot check alone is not sufficient: another
+    /// writer could replace the provider/model between the durable boundary
+    /// and worker publication.
+    pub fn matches_committed_source(&self, observed: &RetainedProviderModelSource) -> bool {
+        self.source.has_same_source_slot(observed)
+            && observed.provider_digest == self.new_provider_digest
+            && observed.model_digest == self.new_model_digest
+    }
+}
+
+/// A favorite update has a durable filesystem boundary.  Callers must not
+/// collapse a post-write authority failure into the same result as a rejected
+/// preflight. Once atomic replacement is attempted, this code must never
+/// compensate by overwriting a possible later external write; callers need a
+/// reattach to discover and publish the final durable state.
+#[derive(Debug)]
+pub enum RetainedProviderModelFavoriteWriteError {
+    /// No provider bytes were changed by this operation.
+    Rejected(anyhow::Error),
+    /// Atomic replacement was attempted, so the operation may have crossed
+    /// its durable boundary. The source was not published into the worker;
+    /// its bytes are intentionally left untouched. The receipt identifies
+    /// the precise attached authority/bytes for a later reattach.
+    DurableButUnpublished {
+        receipt: RetainedProviderModelFavoriteWriteReceipt,
+        cause: anyhow::Error,
+    },
+}
+
+impl std::fmt::Display for RetainedProviderModelFavoriteWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(_) => {
+                formatter.write_str("model-favorite update was rejected before commit")
+            }
+            Self::DurableButUnpublished { .. } => formatter.write_str(
+                "model-favorite update reached a durable boundary but could not be safely republished",
+            ),
+        }
+    }
+}
+
+impl RetainedProviderModelFavoriteWriteError {
+    /// The receipt is available only for the explicit durable-but-unpublished
+    /// state; rejected operations never attempted the durable replacement.
+    pub fn receipt(&self) -> Option<&RetainedProviderModelFavoriteWriteReceipt> {
+        match self {
+            Self::DurableButUnpublished { receipt, .. } => Some(receipt),
+            Self::Rejected(_) => None,
+        }
+    }
+}
+
+impl std::error::Error for RetainedProviderModelFavoriteWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rejected(cause) | Self::DurableButUnpublished { cause, .. } => {
+                Some(cause.root_cause())
+            }
+        }
+    }
+}
+
+pub type RetainedProviderModelFavoritePreWriteVerifier =
+    Arc<dyn Fn() -> Result<()> + Send + Sync + 'static>;
+pub type RetainedProviderModelFavoritePostWriteVerifier =
+    Arc<
+        dyn Fn(&RetainedProviderModelFavoriteWriteReceipt) -> Result<()> + Send + Sync + 'static,
+    >;
+
+impl std::fmt::Debug for RetainedProviderModelSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedProviderModelSource")
+            .field("layer_index", &self.layer_index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedProviderModelSource {
+    pub fn layer_index(&self) -> usize {
+        self.layer_index
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    /// Source identity intentionally excludes mutable content digests. It is
+    /// used after a successful write to prove the refreshed favorite still
+    /// comes from the same retained layer/file/model slot, while the digest
+    /// itself is expected to change because the favorite bit changed.
+    pub fn has_same_source_slot(&self, other: &Self) -> bool {
+        self.layer_index == other.layer_index
+            && self.provider_id == other.provider_id
+            && self.model_id == other.model_id
+    }
+}
+
+/// One retained config-directory lock that participates in a favorite source
+/// selection.  A lower-precedence favorite cannot be written while a higher
+/// captured layer is concurrently becoming the effective source.
+pub struct RetainedProviderModelFavoriteLock {
+    config_directory: std::fs::File,
+    canonical_config_path: PathBuf,
+    display_config_parent: PathBuf,
+}
+
+impl RetainedProviderModelFavoriteLock {
+    pub fn new(config_directory: std::fs::File, canonical_config_path: PathBuf) -> Result<Self> {
+        let display_config_parent = canonical_config_path
+            .parent()
+            .context("captured config path has no parent")?
+            .to_path_buf();
+        Ok(Self {
+            config_directory,
+            canonical_config_path,
+            display_config_parent,
+        })
+    }
+
+    fn acquire(&self) -> Result<ConfigMutationLock> {
+        ConfigMutationLock::acquire_retained(
+            &self.config_directory,
+            &self.canonical_config_path,
+            &self.display_config_parent,
+        )
+    }
+}
+
+impl std::fmt::Debug for RetainedProviderModelFavoriteLock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedProviderModelFavoriteLock")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Return the highest-precedence retained layer that supplied this exact
+/// provider/model object.  The returned proof contains no paths, provider
+/// secrets, or wire-facing values; it is valid only for the snapshot bytes
+/// supplied to this function.
+pub fn retained_provider_model_source_from_workspace_layer_snapshots(
+    snapshots: &[crate::config::WorkspaceConfigLayerSnapshot],
+    provider_id: &str,
+    model_id: &str,
+) -> Result<Option<RetainedProviderModelSource>> {
+    validate_provider_id_for_filename(provider_id)?;
+    anyhow::ensure!(!model_id.is_empty(), "model id must not be empty");
+    for (layer_index, snapshot) in snapshots.iter().enumerate().rev() {
+        let Some((_, provider_bytes)) = snapshot
+            .provider_files
+            .iter()
+            .find(|(id, _)| id == provider_id)
+        else {
+            continue;
+        };
+        let provider: Value = serde_json::from_slice(provider_bytes)
+            .with_context(|| format!("parsing retained provider `{provider_id}`"))?;
+        let provider = provider
+            .as_object()
+            .context("retained provider config root must be an object")?;
+        let Some(models) = provider.get("models").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut matching = models.iter().filter(|model| {
+            model
+                .as_object()
+                .and_then(|model| model.get("id"))
+                .and_then(Value::as_str)
+                == Some(model_id)
+        });
+        let Some(model) = matching.next() else {
+            continue;
+        };
+        anyhow::ensure!(
+            matching.next().is_none(),
+            "retained provider `{provider_id}` contains duplicate model `{model_id}`"
+        );
+        return Ok(Some(RetainedProviderModelSource {
+            layer_index,
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            provider_digest: sha256_bytes(provider_bytes),
+            model_digest: sha256_model_value(model)?,
+        }));
+    }
+    Ok(None)
+}
+
+/// Non-serializable authority for changing a model favorite in one exact
+/// provider file captured by an attached daemon worker. The open provider
+/// directory is the filesystem authority; the paths retained alongside it are
+/// diagnostic and lock-identity data only.
+pub struct RetainedProviderModelFavoriteTarget {
+    provider_directory: std::fs::File,
+    provider_leaf: OsString,
+    canonical_provider_path: PathBuf,
+    source: RetainedProviderModelSource,
+    precedence_locks: Vec<RetainedProviderModelFavoriteLock>,
+    pre_write_verifier: Option<RetainedProviderModelFavoritePreWriteVerifier>,
+    post_write_verifier: Option<RetainedProviderModelFavoritePostWriteVerifier>,
+}
+
+impl std::fmt::Debug for RetainedProviderModelFavoriteTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedProviderModelFavoriteTarget")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedProviderModelFavoriteTarget {
+    /// Capture the already-existing provider leaf below `config_directory`.
+    /// This intentionally refuses to manufacture a new provider file: the
+    /// dispatcher must first prove that the selected source participated in
+    /// the immutable attach-time snapshot.
+    pub fn new(
+        config_directory: std::fs::File,
+        canonical_config_path: PathBuf,
+        source: RetainedProviderModelSource,
+    ) -> Result<Self> {
+        validate_provider_id_for_filename(source.provider_id())?;
+        let Some(provider_directory) =
+            crate::config::files::open_retained_child_directory_optional(
+                &config_directory,
+                std::ffi::OsStr::new(PROVIDERS_DIR),
+            )?
+        else {
+            anyhow::bail!("captured provider directory is missing");
+        };
+        let provider_leaf = OsString::from(format!("{}.json", source.provider_id()));
+        let display_config_parent = canonical_config_path
+            .parent()
+            .context("captured config path has no parent")?
+            .to_path_buf();
+        let canonical_provider_path = display_config_parent
+            .join(PROVIDERS_DIR)
+            .join(&provider_leaf);
+        let source_lock = RetainedProviderModelFavoriteLock::new(
+            config_directory.try_clone().context("cloning retained config directory")?,
+            canonical_config_path.clone(),
+        )?;
+        Ok(Self {
+            provider_directory,
+            provider_leaf,
+            canonical_provider_path,
+            source,
+            precedence_locks: vec![source_lock],
+            pre_write_verifier: None,
+            post_write_verifier: None,
+        })
+    }
+
+    /// Install a fence that must hold before the provider/model bytes may be
+    /// replaced. This phase intentionally requires the exact attach-time
+    /// source digests.
+    pub fn with_pre_write_verifier(
+        mut self,
+        verifier: RetainedProviderModelFavoritePreWriteVerifier,
+    ) -> Self {
+        self.pre_write_verifier = Some(match self.pre_write_verifier.take() {
+            Some(previous) => Arc::new(move || {
+                previous()?;
+                verifier()
+            }),
+            None => verifier,
+        });
+        self
+    }
+
+    /// Install a fence for the committed bytes.  Unlike the pre-write fence,
+    /// this receives the receipt and must validate the new digest/source
+    /// token, not the now-obsolete attach-time digest.
+    pub fn with_post_write_verifier(
+        mut self,
+        verifier: RetainedProviderModelFavoritePostWriteVerifier,
+    ) -> Self {
+        self.post_write_verifier = Some(match self.post_write_verifier.take() {
+            Some(previous) => Arc::new(move |receipt| {
+                previous(receipt)?;
+                verifier(receipt)
+            }),
+            None => verifier,
+        });
+        self
+    }
+
+    /// Add retained layers above the source that can supersede it. The target
+    /// keeps its source lock first and acquires this ordered suffix before its
+    /// final source verification and write.
+    pub fn with_higher_precedence_locks(
+        mut self,
+        higher_precedence_locks: Vec<RetainedProviderModelFavoriteLock>,
+    ) -> Self {
+        self.precedence_locks.extend(higher_precedence_locks);
+        self
+    }
+
+    fn verify_pre_write(&self) -> Result<()> {
+        if let Some(verifier) = &self.pre_write_verifier {
+            verifier()?;
+        }
+        Ok(())
+    }
+
+    fn verify_post_write(
+        &self,
+        receipt: &RetainedProviderModelFavoriteWriteReceipt,
+    ) -> Result<()> {
+        if let Some(verifier) = &self.post_write_verifier {
+            verifier(receipt)?;
+        }
+        Ok(())
+    }
+
+    /// Validate a no-op favorite request against the same retained authority
+    /// and exact source bytes required for a write, without serializing or
+    /// replacing the provider file.  An `Ack` for an already-selected value
+    /// is therefore a durable observation at this validation point, rather
+    /// than merely an assertion about an old worker snapshot.
+    pub fn validate_model_favorite_noop(&self, favorite: bool) -> Result<()> {
+        self.verify_pre_write()?;
+        let _locks = self
+            .precedence_locks
+            .iter()
+            .map(RetainedProviderModelFavoriteLock::acquire)
+            .collect::<Result<Vec<_>>>()?;
+        self.verify_pre_write()?;
+        let bytes = crate::config::files::read_optional_leaf_from_directory_handle(
+            &self.provider_directory,
+            &self.provider_leaf,
+            crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES,
+        )?
+        .context("captured provider file is missing")?;
+        anyhow::ensure!(
+            sha256_bytes(&bytes) == self.source.provider_digest,
+            "captured provider file changed after attached snapshot"
+        );
+        let raw: Value = if bytes.iter().all(u8::is_ascii_whitespace) {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_slice(&bytes).context("parsing captured provider config")?
+        };
+        let provider = raw
+            .as_object()
+            .context("captured provider config root must be an object")?;
+        validate_captured_model_favorite(
+            provider,
+            self.source.model_id(),
+            self.source.model_digest,
+            favorite,
+        )
+    }
+
+    /// Atomically update the captured provider file with the same config-layer
+    /// lock identity used by ambient `ConfigDoc` mutations. All reads, lock-file
+    /// operations and the replacement are relative to the retained directory
+    /// handle, so a changed `COCKPIT_CONFIG` or pathname replacement cannot
+    /// redirect an attached session to another source.
+    pub fn write_model_favorite(
+        &self,
+        favorite: bool,
+    ) -> std::result::Result<RetainedProviderModelFavoriteWriteReceipt, RetainedProviderModelFavoriteWriteError> {
+        self.verify_pre_write()
+            .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
+        let _locks = self
+            .precedence_locks
+            .iter()
+            .map(RetainedProviderModelFavoriteLock::acquire)
+            .collect::<Result<Vec<_>>>()
+            .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
+        // The lock serializes writers but does not prove the attached
+        // directory chain still names the captured authority. Recheck on both
+        // sides of the durable boundary; a changed chain fails closed.
+        self.verify_pre_write()
+            .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
+        let bytes = crate::config::files::read_optional_leaf_from_directory_handle(
+            &self.provider_directory,
+            &self.provider_leaf,
+            crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES,
+        )
+        .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?
+        .context("captured provider file is missing")
+        .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
+        if sha256_bytes(&bytes) != self.source.provider_digest {
+            return Err(RetainedProviderModelFavoriteWriteError::Rejected(
+                anyhow::anyhow!("captured provider file changed after attached snapshot"),
+            ));
+        }
+        let mut raw: Value = if bytes.iter().all(u8::is_ascii_whitespace) {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_slice(&bytes)
+                .context("parsing captured provider config")
+                .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?
+        };
+        let provider = raw
+            .as_object_mut()
+            .context("captured provider config root must be an object")
+            .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
+        let new_model_digest = apply_captured_model_favorite(
+            provider,
+            self.source.model_id(),
+            self.source.model_digest,
+            favorite,
+        )
+        .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
+        let pretty = serde_json::to_string_pretty(&Value::Object(provider.clone()))
+            .context("serializing captured provider config")
+            .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
+        let new_bytes = format!("{pretty}\n").into_bytes();
+        let receipt = RetainedProviderModelFavoriteWriteReceipt {
+            source: self.source.clone(),
+            old_provider_digest: self.source.provider_digest,
+            new_provider_digest: sha256_bytes(&new_bytes),
+            old_model_digest: self.source.model_digest,
+            new_model_digest,
+        };
+        if let Err(cause) = crate::config::files::atomic_write_leaf_from_retained_directory(
+            &self.provider_directory,
+            &self.provider_leaf,
+            &self.canonical_provider_path,
+            &new_bytes,
+        ) {
+            // `atomic_write` can fail after rename (for example while syncing
+            // its parent). There is no portable atomic conditional restore,
+            // so never classify this as pre-write rejection or overwrite a
+            // concurrent external update. The receipt lets a new attachment
+            // inspect the retained authority's actual final bytes.
+            return Err(RetainedProviderModelFavoriteWriteError::DurableButUnpublished {
+                receipt,
+                cause,
+            });
+        }
+        if let Err(cause) = self.verify_post_write(&receipt) {
+            // The post-write fence can race an external writer. Deliberately
+            // retain whatever bytes now exist: a compensation write could
+            // clobber that external state after the durable boundary.
+            return Err(RetainedProviderModelFavoriteWriteError::DurableButUnpublished {
+                receipt,
+                cause,
+            });
+        }
+        Ok(receipt)
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"cockpit-retained-provider-favorite-v1\0");
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn sha256_model_value(value: &Value) -> Result<[u8; 32]> {
+    let canonical = serde_json::to_vec(value).context("serializing retained provider model")?;
+    Ok(sha256_bytes(&canonical))
+}
+
+/// Retained favorite writes differ deliberately from the ambient edit helper:
+/// an attached session may update only the model object it actually observed.
+/// It must never manufacture a model after a source has changed.
+fn apply_captured_model_favorite(
+    provider: &mut Map<String, Value>,
+    model_id: &str,
+    expected_model_digest: [u8; 32],
+    favorite: bool,
+) -> Result<[u8; 32]> {
+    let models = provider
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .context("captured provider models are missing or malformed")?;
+    let matches = models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, model)| {
+            (model
+                .as_object()
+                .and_then(|model| model.get("id"))
+                .and_then(Value::as_str)
+                == Some(model_id))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let index = *matches
+        .first()
+        .context("captured provider model is no longer present")?;
+    anyhow::ensure!(
+        matches.len() == 1,
+        "captured provider now contains duplicate model `{model_id}`"
+    );
+    let model = &mut models[index];
+    anyhow::ensure!(
+        sha256_model_value(model)? == expected_model_digest,
+        "captured provider model changed after attached snapshot"
+    );
+    let model = model
+        .as_object_mut()
+        .context("captured provider model must be an object")?;
+    model.insert("favorite".to_string(), Value::Bool(favorite));
+    sha256_model_value(&Value::Object(model.clone()))
+}
+
+/// Prove that the exact captured model object is still present and already
+/// carries the requested favorite. This is deliberately separate from the
+/// mutating helper so a no-op RPC never reformats a provider file.
+fn validate_captured_model_favorite(
+    provider: &Map<String, Value>,
+    model_id: &str,
+    expected_model_digest: [u8; 32],
+    favorite: bool,
+) -> Result<()> {
+    let models = provider
+        .get("models")
+        .and_then(Value::as_array)
+        .context("captured provider models are missing or malformed")?;
+    let mut matching = models.iter().filter(|model| {
+        model
+            .as_object()
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str)
+            == Some(model_id)
+    });
+    let model = matching
+        .next()
+        .context("captured provider model is no longer present")?;
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "captured provider has duplicate model `{model_id}`"
+    );
+    anyhow::ensure!(
+        sha256_model_value(model)? == expected_model_digest,
+        "captured provider model changed after attached snapshot"
+    );
+    let model = model
+        .as_object()
+        .context("captured provider model must be an object")?;
+    let observed_favorite = match model.get("favorite") {
+        Some(value) => value
+            .as_bool()
+            .context("captured provider model favorite must be a boolean")?,
+        None => false,
+    };
+    anyhow::ensure!(
+        observed_favorite == favorite,
+        "captured provider model favorite no longer matches requested value"
+    );
+    Ok(())
+}
+
+fn apply_model_favorite(provider: &mut Map<String, Value>, model_id: &str, favorite: bool) {
+    let models = provider
+        .entry("models".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !models.is_array() {
+        *models = Value::Array(Vec::new());
+    }
+    let models = models.as_array_mut().expect("models reset to array");
+    let mut found = false;
+    for model in models.iter_mut() {
+        let Some(model_obj) = model.as_object_mut() else {
+            continue;
+        };
+        if model_obj.get("id").and_then(Value::as_str) == Some(model_id) {
+            model_obj.insert("favorite".to_string(), Value::Bool(favorite));
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        let mut model = Map::new();
+        model.insert("id".to_string(), Value::String(model_id.to_string()));
+        model.insert("favorite".to_string(), Value::Bool(favorite));
+        models.push(Value::Object(model));
+    }
+}
 
 /// How an atomic active-model mutation should treat an existing effective
 /// default.
@@ -54,6 +699,63 @@ pub(crate) fn next_load_effective_generation() -> u64 {
 }
 
 impl ConfigDoc {
+    /// Project one already-captured project-local layer.  Acquisition happens
+    /// through a retained directory handle in the daemon; this routine is
+    /// intentionally pure with respect to the filesystem so parsing can never
+    /// reopen a replaced workspace path.
+    pub fn providers_from_workspace_layer_snapshot(
+        snapshot: &crate::config::WorkspaceConfigLayerSnapshot,
+    ) -> Result<ProvidersConfig> {
+        let bytes = snapshot.config_json.as_deref().unwrap_or(b"{}");
+        let text = std::str::from_utf8(bytes).context("workspace config.json is not valid UTF-8")?;
+        let mut raw: Value = if text.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_str(text).context("workspace config.json is not valid JSON")?
+        };
+        let Some(root) = raw.as_object_mut() else {
+            anyhow::bail!("workspace config.json root must be an object");
+        };
+        let mut providers = Map::new();
+        for (id, bytes) in &snapshot.provider_files {
+            validate_provider_id_for_filename(id)?;
+            let value: Value = serde_json::from_slice(bytes)
+                .with_context(|| format!("parsing workspace provider `{id}`"))?;
+            let Some(provider) = value.as_object() else {
+                anyhow::bail!("workspace provider `{id}` must be a JSON object");
+            };
+            reject_legacy_redact_fields(id, provider)?;
+            providers.insert(id.clone(), value);
+        }
+        root.insert("providers".to_string(), Value::Object(providers));
+        Ok(Self {
+            path: PathBuf::new(),
+            raw,
+            originally_loaded_providers: BTreeMap::new(),
+        }
+        .providers())
+    }
+
+    /// Merge a sequence of already-captured layers without consulting the
+    /// filesystem.  This is deliberately the same typed projection used for
+    /// one retained layer above, but preserves layer precedence for callers
+    /// that must predict a mutation's effective value from frozen directory
+    /// capabilities (rather than from a subsequently changed environment).
+    pub fn providers_from_workspace_layer_snapshots(
+        snapshots: &[crate::config::WorkspaceConfigLayerSnapshot],
+    ) -> Result<ProvidersConfig> {
+        let mut merged = Value::Object(Map::new());
+        for snapshot in snapshots {
+            let layer = serde_json::to_value(Self::providers_from_workspace_layer_snapshot(
+                snapshot,
+            )?)
+            .context("serializing retained workspace provider layer")?;
+            deep_merge_value(&mut merged, &layer);
+        }
+        serde_json::from_value(merged)
+            .context("projecting merged retained workspace provider layers")
+    }
+
     /// Load the effective provider config for `cwd` by merging every
     /// applicable config layer from least-specific to most-specific.
     /// `COCKPIT_CONFIG` supplies the only config.json path when set; provider
@@ -523,30 +1225,7 @@ impl ConfigDoc {
     ) -> Result<()> {
         let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
-        let models = provider
-            .entry("models".to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if !models.is_array() {
-            *models = Value::Array(Vec::new());
-        }
-        let models = models.as_array_mut().expect("models reset to array");
-        let mut found = false;
-        for model in models.iter_mut() {
-            let Some(model_obj) = model.as_object_mut() else {
-                continue;
-            };
-            if model_obj.get("id").and_then(Value::as_str) == Some(model_id) {
-                model_obj.insert("favorite".to_string(), Value::Bool(favorite));
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            let mut model = Map::new();
-            model.insert("id".to_string(), Value::String(model_id.to_string()));
-            model.insert("favorite".to_string(), Value::Bool(favorite));
-            models.push(Value::Object(model));
-        }
+        apply_model_favorite(&mut provider, model_id, favorite);
         self.persist_provider_raw_unlocked(provider_id, provider)?;
         self.refresh_from_disk_unlocked()
     }

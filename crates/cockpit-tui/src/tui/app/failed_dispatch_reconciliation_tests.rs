@@ -57,6 +57,7 @@ fn switch_outcome_with_epoch(session_id: uuid::Uuid, attachment_epoch: u64) -> A
     AsyncActionPayload::SessionSwitched(Box::new(SessionSwitchOutcome {
         target: SessionTarget::New,
         session_id,
+        session_entry_mode: cockpit_core::daemon::proto::SessionEntryMode::Code,
         short_id: "fresh1".to_string(),
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],
@@ -1036,6 +1037,7 @@ async fn successful_side_return_commits_snapshot_restore_and_discard_after_resul
             since_seq: None,
         },
         session_id: main_session_id,
+        session_entry_mode: cockpit_core::daemon::proto::SessionEntryMode::Code,
         short_id: "main123".to_string(),
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],

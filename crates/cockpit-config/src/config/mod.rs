@@ -41,6 +41,128 @@ pub mod resolve;
 pub mod sandbox_mode;
 pub mod trust;
 
+/// Maximum bytes accepted from one capability-bound workspace configuration
+/// leaf.  Every daemon-owned workspace reader, including hook configuration,
+/// uses this one policy limit so an attacker cannot turn a configuration
+/// refresh into an unbounded allocation.
+pub const MAX_WORKSPACE_CONFIG_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Immutable bytes captured from one attach-time configuration layer through
+/// a retained directory handle. A layer can be trusted global, project, or an
+/// explicit override. This is deliberately a data object, rather than a
+/// filesystem capability: parsing/projection can therefore stay in this lower
+/// crate while the daemon retains ownership of the directory handle that
+/// authorized acquisition. In particular, a global layer never grants
+/// workspace filesystem authority.
+///
+/// `provider_files` is ordered by its validated provider id.  The bytes are
+/// bounded regular files read without following a path component; callers must
+/// discard the entire capture on an acquisition error instead of combining a
+/// partial layer with a later retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceConfigLayerSnapshot {
+    pub config_json: Option<Vec<u8>>,
+    pub provider_files: Vec<(String, Vec<u8>)>,
+    /// Opaque digest of the exact effective-default journal/backup pair read
+    /// for this selected leaf. The raw backup can contain configuration
+    /// secrets, so it never leaves acquisition; its digest still participates
+    /// in the authoritative configuration revision.
+    pub effective_default_artifact_digest: Option<String>,
+    pub digest: String,
+}
+
+/// Ordered attach-time configuration layers, from least to most specific.
+/// The aggregate digest is framed over the per-layer digests and is the only
+/// revision token a daemon worker publishes for the capability-backed config
+/// contribution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceConfigLayerSnapshotChain {
+    pub layers: Vec<WorkspaceConfigLayerSnapshot>,
+    /// This snapshot is a complete retained effective chain, so the ambient
+    /// loader must not rediscover normal layers beside it. An explicit
+    /// `COCKPIT_CONFIG` is the one-layer case; normal worker snapshots retain
+    /// every attach-time source to keep global/project provenance and reload
+    /// on the same authority chain.
+    pub exclusive: bool,
+    pub digest: String,
+}
+
+pub fn workspace_config_layer_snapshot_chain(
+    layers: Vec<WorkspaceConfigLayerSnapshot>,
+) -> WorkspaceConfigLayerSnapshotChain {
+    workspace_config_layer_snapshot_chain_with_exclusive(layers, false)
+}
+
+pub fn workspace_config_layer_snapshot_chain_with_exclusive(
+    layers: Vec<WorkspaceConfigLayerSnapshot>,
+    exclusive: bool,
+) -> WorkspaceConfigLayerSnapshotChain {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"cockpit-workspace-config-layer-chain-v1");
+    hasher.update([u8::from(exclusive)]);
+    hasher.update((layers.len() as u64).to_be_bytes());
+    for layer in &layers {
+        hasher.update((layer.digest.len() as u64).to_be_bytes());
+        hasher.update(layer.digest.as_bytes());
+    }
+    WorkspaceConfigLayerSnapshotChain {
+        layers,
+        exclusive,
+        digest: hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+    }
+}
+
+/// An intentionally empty retained layer used when a daemon has kept an
+/// attach-time capability for a source that current workspace policy no
+/// longer permits projecting.  Keeping the slot (rather than compacting the
+/// chain) makes retained provider-source indices stable while ensuring no
+/// config, provider, or transaction-artifact bytes from the denied source
+/// enter the resolved view.
+pub fn empty_workspace_config_layer_snapshot() -> WorkspaceConfigLayerSnapshot {
+    files::empty_workspace_config_layer_snapshot()
+}
+
+/// Capture the project-local `.cockpit` configuration layer relative to an
+/// already-open workspace directory.  No pathname below that directory is
+/// reopened, so replacing the workspace pathname after attachment cannot
+/// redirect the returned bytes.
+pub fn snapshot_workspace_config_layer_from_retained_directory(
+    directory: &std::fs::File,
+) -> anyhow::Result<WorkspaceConfigLayerSnapshot> {
+    files::snapshot_workspace_config_layer_from_retained_directory(directory)
+}
+
+/// Capture one config file and its sibling provider directory relative to an
+/// already-held *config-directory* handle. The leaf must be a single normal
+/// path component; this supports a trusted explicit `COCKPIT_CONFIG` without
+/// reopening its mutable absolute path.
+pub fn snapshot_workspace_config_layer_from_retained_config_directory(
+    directory: &std::fs::File,
+    config_leaf: &std::ffi::OsStr,
+    canonical_config_path: &std::path::Path,
+    journal_leaf: Option<&std::ffi::OsStr>,
+    backup_leaf: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<WorkspaceConfigLayerSnapshot> {
+    files::snapshot_workspace_config_layer_from_retained_config_directory(
+        directory,
+        config_leaf,
+        canonical_config_path,
+        journal_leaf,
+        backup_leaf,
+    )
+}
+
+/// Derive a new retained-layer snapshot with replacement `config.json` bytes
+/// while preserving its acquired provider inventory and artifact digest. This
+/// is a pure operation; it never reopens the source directory.
+pub fn workspace_config_layer_snapshot_with_config_json(
+    snapshot: &WorkspaceConfigLayerSnapshot,
+    config_json: Option<Vec<u8>>,
+) -> WorkspaceConfigLayerSnapshot {
+    files::workspace_config_layer_snapshot_with_config_json(snapshot, config_json)
+}
+
 /// A held cross-process config mutation lock.
 ///
 /// The lock itself is crate-internal; this handle exists so higher layers can

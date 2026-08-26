@@ -1,5 +1,63 @@
 use super::*;
 
+#[tokio::test]
+async fn intermediate_noninteractive_continue_checkpoint_survives_cancel_or_failure_for_restart() {
+    // `history` and `next_prompt` model the state immediately after a turn
+    // returned `Continue`: the tool result is ready for the next provider
+    // round, but the late-steer continuation is not terminal yet. A crash or
+    // nonterminal exit must retain that exact continuation identity so
+    // recovery reattaches its permit instead of appending the user steer
+    // payload to this saved prompt again.
+    let continuation_id = uuid::Uuid::now_v7();
+    let snapshot_json = ready_noninteractive_recovery_snapshot_with_late_steer(
+        vec![Message::user("accepted steer's first provider handoff")],
+        Message::user("tool result from the intermediate Continue round"),
+        Some(continuation_id),
+    )
+    .unwrap();
+    let recovered = parse_noninteractive_recovery_snapshot(&snapshot_json).unwrap();
+    assert_eq!(
+        recovered.late_user_steer_continuation_id,
+        Some(continuation_id),
+        "restart must wait for the exact accepted continuation rather than replaying its payload"
+    );
+
+    for outcome in [
+        crate::engine::driver::LateUserSteerContinuationOutcome::Cancelled,
+        crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+            "provider failed after an intermediate Continue",
+        ),
+    ] {
+        let (respond_to, receipt) = tokio::sync::oneshot::channel();
+        retain_noninteractive_late_steer_checkpoint(
+            &[],
+            vec![
+                (
+                    uuid::Uuid::now_v7(),
+                    continuation_id,
+                    uuid::Uuid::now_v7(),
+                    7,
+                    "accepted late steer body".to_string(),
+                    respond_to,
+                ),
+            ],
+            outcome.clone(),
+        );
+        assert_eq!(
+            receipt.await.unwrap(),
+            outcome,
+            "a nonterminal Continue follow-up must retain—not complete—the accepted checkpoint"
+        );
+        assert_eq!(
+            parse_noninteractive_recovery_snapshot(&snapshot_json)
+                .unwrap()
+                .late_user_steer_continuation_id,
+            Some(continuation_id),
+            "restart must continue to use the saved post-Continue checkpoint"
+        );
+    }
+}
+
 /// Workspace-authored v2 coding definition used by positive on-disk fixtures.
 /// Tool authority deliberately stays out of these documents; tests that need a
 /// constrained host surface write a `.tools.json` sidecar (see
@@ -328,6 +386,7 @@ fn batch_entry(
 ) -> crate::engine::agent::BatchTaskEntry {
     crate::engine::agent::BatchTaskEntry {
         label: label.to_string(),
+        depends_on: Vec::new(),
         child_agent: child_agent.to_string(),
         prompt: format!("{label} prompt"),
         model,
@@ -1393,6 +1452,7 @@ async fn backgrounded_batch_completion_delivers_one_mixed_status_payload() {
                         },
                     ],
                     repair_notes: Vec::new(),
+                    already_terminal_labels: std::collections::BTreeSet::new(),
                 })),
             }),
             &tx,
@@ -2472,6 +2532,7 @@ async fn noninteractive_batch_inline_result_shape_is_unchanged() {
                     },
                 ],
                 repair_notes: Vec::new(),
+                already_terminal_labels: std::collections::BTreeSet::new(),
             },
             &tx,
         )
@@ -2517,6 +2578,7 @@ async fn noninteractive_batch_result_includes_task_repair_notes() {
                     "dropped `action` (incompatible with fresh delegation) — treating as fresh spawn of `agent=explore`"
                         .to_string(),
                 ],
+                already_terminal_labels: std::collections::BTreeSet::new(),
             },
             &tx,
         )
@@ -5677,6 +5739,7 @@ async fn noninteractive_batch_delivery_fires_one_subagent_stop_per_child() {
                         },
                     ],
                     repair_notes: Vec::new(),
+                    already_terminal_labels: std::collections::BTreeSet::new(),
                 })),
             }),
             &tx,

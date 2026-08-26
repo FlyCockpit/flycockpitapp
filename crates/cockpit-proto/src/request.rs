@@ -155,6 +155,24 @@ where
     deserialize_bounded_optional_string::<MAX_OWNER_INVENTORY_CURSOR_BYTES, D>(deserializer)
 }
 
+fn validate_agent_tree_page_request(
+    session_id: Uuid,
+    root_agent_instance_id: Option<Uuid>,
+    after: Option<&AgentTreeCursor>,
+    limit: u16,
+) -> std::result::Result<(), String> {
+    if session_id.is_nil()
+        || root_agent_instance_id.is_some_and(|id| id.is_nil())
+        || after.is_some_and(|cursor| cursor.id.is_nil())
+    {
+        return Err("agent tree identifiers must not be nil".to_string());
+    }
+    if !(1..=100).contains(&limit) {
+        return Err("agent tree page limit must be between 1 and 100".to_string());
+    }
+    Ok(())
+}
+
 fn deserialize_owner_secret_name<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -390,6 +408,13 @@ pub enum Request {
         /// treated as headless — the safe, non-blocking default.
         #[serde(default)]
         interactive: bool,
+        /// Immutable daemon-owned entry setup for a newly-created session.
+        /// It is required for new sessions. Existing-session attaches omit it
+        /// in all first-party clients; if another client supplies it, the
+        /// daemon requires exact equality with the durable value and never
+        /// permits it to overwrite that value.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_entry_mode: Option<crate::SessionEntryMode>,
         /// Plan-level model pin (prompt
         /// `plan-duplication-and-model-override.md`). The complete selection
         /// is also the new session's authoritative active model, while this
@@ -1157,6 +1182,38 @@ pub enum Request {
         limit: u32,
     },
 
+    /// Read a stable, paginated daemon-owned projection of one recursive
+    /// agent tree. `root_agent_instance_id = None` returns the session forest.
+    /// The response deliberately contains no provider context or process
+    /// handles; frontends render only durable lifecycle state.
+    ReadAgentTree {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_agent_instance_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<AgentTreeCursor>,
+        limit: u16,
+    },
+
+    /// Read typed, decision-owned Attention entries. This is intentionally
+    /// separate from the legacy interrupt history so decision lifecycle state
+    /// has one ordered durable projection.
+    ReadAgentAttention {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<AgentTreeCursor>,
+        limit: u16,
+    },
+
+    /// Deliver a user-authored steer to the agent that requested a decision.
+    /// The daemon validates this answer against the persisted redacted
+    /// contract. Host approvals have no client resolution path.
+    ResolveAgentDecision {
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        answer: AgentDecisionAnswer,
+    },
+
     /// Per-session live status for the `/sessions` browser's top two
     /// tiers (GOALS §17f): which of `session_ids` currently have active
     /// async jobs (loop/timer/background) and which are mid-turn
@@ -1254,6 +1311,13 @@ pub enum Request {
         project_root: String,
         session_id: Uuid,
         selected_agent: String,
+    },
+
+    /// Return daemon-owned installed-agent/model setup choices for the
+    /// attached session. The daemon derives both workspace and selected
+    /// installation; callers cannot select another session's inventory.
+    GetSessionSetupSnapshot {
+        session_id: Uuid,
     },
 
     /// Snapshot the daemon-wide resource scheduler for `/resources`.
@@ -2736,6 +2800,45 @@ impl Request {
                     ));
                 }
             }
+            Self::ReadAgentTree {
+                session_id,
+                root_agent_instance_id,
+                after,
+                limit,
+            } => {
+                validate_agent_tree_page_request(
+                    *session_id,
+                    *root_agent_instance_id,
+                    after.as_ref(),
+                    *limit,
+                )?;
+            }
+            Self::ReadAgentAttention {
+                session_id,
+                after,
+                limit,
+            } => validate_agent_tree_page_request(*session_id, None, after.as_ref(), *limit)?,
+            Self::ResolveAgentDecision {
+                session_id,
+                decision_request_id,
+                answer,
+            } => {
+                if session_id.is_nil() || decision_request_id.is_nil() {
+                    return Err("agent decision identifiers must not be nil".to_string());
+                }
+                match answer {
+                    AgentDecisionAnswer::Option { option_id } if option_id.is_empty() => {
+                        return Err("agent decision option id must not be empty".to_string());
+                    }
+                    AgentDecisionAnswer::FreeText { text } if text.is_empty() => {
+                        return Err("agent decision free text must not be empty".to_string());
+                    }
+                    AgentDecisionAnswer::InterruptResponse { response } => {
+                        validate_agent_interrupt_response(response)?;
+                    }
+                    _ => {}
+                }
+            }
             Self::PutNamedSecret { name, value } => {
                 if name.len() > MAX_OWNER_SECRET_NAME_BYTES {
                     return Err("named secret name exceeds maximum length".to_string());
@@ -3589,6 +3692,36 @@ impl Request {
         Ok(())
     }
 }
+
+fn validate_agent_interrupt_response(response: &AgentInterruptResponse) -> Result<(), String> {
+    match response {
+        AgentInterruptResponse::Single { selected_id } => {
+            if selected_id.is_empty() {
+                return Err("agent interrupt selected id must not be empty".to_string());
+            }
+        }
+        AgentInterruptResponse::Multi { selected_ids } => {
+            if selected_ids.is_empty() || selected_ids.iter().any(String::is_empty) {
+                return Err("agent interrupt selected ids must not be empty".to_string());
+            }
+        }
+        AgentInterruptResponse::Freetext { text } => {
+            if text.is_empty() {
+                return Err("agent interrupt free text must not be empty".to_string());
+            }
+        }
+        AgentInterruptResponse::Batch { responses } => {
+            if responses.is_empty() {
+                return Err("agent interrupt batch must not be empty".to_string());
+            }
+            for response in responses {
+                validate_agent_interrupt_response(response)?;
+            }
+        }
+        AgentInterruptResponse::Cancel => {}
+    }
+    Ok(())
+}
 #[macro_export]
 macro_rules! request_variants {
     ($with_variants:ident $(, $context:ident)*) => {
@@ -3690,6 +3823,9 @@ macro_rules! request_variants {
             (Request::ReadClientSubmissionReceipt { .. }, "read_client_submission_receipt");
             (Request::ReadHistoryPage { .. }, "read_history_page");
             (Request::ReadSubagentHistoryPage { .. }, "read_subagent_history_page");
+            (Request::ReadAgentTree { .. }, "read_agent_tree");
+            (Request::ReadAgentAttention { .. }, "read_agent_attention");
+            (Request::ResolveAgentDecision { .. }, "resolve_agent_decision");
             (Request::SessionLiveStatus { .. }, "session_live_status");
             (Request::ArchiveSession { .. }, "archive_session");
             (Request::UnarchiveSession { .. }, "unarchive_session");
@@ -3702,6 +3838,7 @@ macro_rules! request_variants {
             (Request::RecordSessionNote { .. }, "record_session_note");
             (Request::DeleteSession { .. }, "delete_session");
             (Request::GetInventoryBundle { .. }, "get_inventory_bundle");
+            (Request::GetSessionSetupSnapshot { .. }, "get_session_setup_snapshot");
             (Request::ResourceSnapshot, "resource_snapshot");
             (Request::PromoteResource { .. }, "promote_resource");
             (Request::CreateScheduledJob { .. }, "create_scheduled_job");
@@ -3889,7 +4026,7 @@ impl Request {
 macro_rules! command {
     ($with_commands:ident $(, $context:ident)*) => {
         $with_commands! { ($($context),*) [
-            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
+            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:Option<SessionEntryMode>|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: Option<SessionEntryMode> => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
             (Request::SendUserMessage { client_submission_id, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, text: String => param, display_text: Option<String> => param, tag_expansions: Vec<TagExpansionMeta> => param, image_refs: Vec<ImageAttachmentRef> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::SendUserMessageBulk { client_submission_id, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
@@ -3990,6 +4127,9 @@ macro_rules! command {
             (Request::ReadClientSubmissionReceipt { session_id, client_submission_id }, "read_client_submission_receipt", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|client_submission_id:Uuid", [session_id: Uuid => session, client_submission_id: Uuid => param]);
             (Request::ReadHistoryPage { session_id, before_seq, limit }, "read_history_page", custom(authorize_read_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, before_seq: Option<i64> => param, limit: u32 => param]);
             (Request::ReadSubagentHistoryPage { session_id, task_call_id, label, before_seq, limit }, "read_subagent_history_page", custom(authorize_read_subagent_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, task_call_id: String => param, label: String => param, before_seq: Option<i64> => param, limit: u32 => param]);
+            (Request::ReadAgentTree { session_id, root_agent_instance_id, after, limit }, "read_agent_tree", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|root_agent_instance_id:Option<Uuid>|after:Option<AgentTreeCursor>|limit:u16", [session_id: Uuid => session, root_agent_instance_id: Option<Uuid> => param, after: Option<AgentTreeCursor> => param, limit: u16 => param]);
+            (Request::ReadAgentAttention { session_id, after, limit }, "read_agent_attention", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|after:Option<AgentTreeCursor>|limit:u16", [session_id: Uuid => session, after: Option<AgentTreeCursor> => param, limit: u16 => param]);
+            (Request::ResolveAgentDecision { session_id, decision_request_id, answer }, "resolve_agent_decision", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|decision_request_id:Uuid|answer:AgentDecisionAnswer", [session_id: Uuid => session, decision_request_id: Uuid => param, answer: AgentDecisionAnswer => param]);
             (Request::SessionLiveStatus { session_ids }, "session_live_status", public_read, none, false, read_only, none, concurrent, none, "session_ids:Vec<Uuid>", [session_ids: Vec<Uuid> => param]);
             (Request::ArchiveSession { session_id, cascade }, "archive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|cascade:bool", [session_id: Uuid => session, cascade: bool => param]);
             (Request::UnarchiveSession { session_id }, "unarchive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
@@ -4002,6 +4142,7 @@ macro_rules! command {
             (Request::RecordSessionNote { session_id, text }, "record_session_note", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|text:String", [session_id: Uuid => session, text: String => param]);
             (Request::DeleteSession { session_id }, "delete_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::GetInventoryBundle { project_root, session_id, selected_agent }, "get_inventory_bundle", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, path(project_root), "project_root:String|session_id:Uuid|selected_agent:String", [project_root: String => project_root, session_id: Uuid => session, selected_agent: String => param]);
+            (Request::GetSessionSetupSnapshot { session_id }, "get_session_setup_snapshot", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, false, local_only, none, concurrent, none, "-", []);
             (Request::PromoteResource { request_id, session_id }, "promote_resource", owner_only, option_field(session_id), true, local_only, none, serialized, none, "request_id:String|session_id:Option<Uuid>", [request_id: String => param, session_id: Option<Uuid> => session]);
             (Request::CreateScheduledJob { job }, "create_scheduled_job", owner_only, none, true, local_only, none, serialized, none, "job:ScheduledJobCreate", [job: ScheduledJobCreate => scheduled]);
@@ -4134,7 +4275,11 @@ macro_rules! command {
             (Request::StopDaemon { grace_secs }, "stop_daemon", owner_only, none, true, local_only, none, serialized, none, "grace_secs:Option<u64>", [grace_secs: Option<u64> => param]);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetHostCapabilities, "get_host_capabilities", public_read, none, false, read_only, none, concurrent, none, "-", []);
-            (Request::RefreshHostCapabilities, "refresh_host_capabilities", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            // The durable HostEffect itself is serialized by the attached
+            // session worker. Its client request must remain concurrent so a
+            // single attached client can submit the matching ResolveInterrupt
+            // while this original request is awaiting that decision.
+            (Request::RefreshHostCapabilities, "refresh_host_capabilities", owner_only, none, true, local_only, none, concurrent, none, "-", []);
             (Request::MigrateKekPlacement { dest }, "migrate_kek_placement", owner_only, none, true, local_only, none, serialized, none, "dest:SecretStorePlacement", [dest: SecretStorePlacement => param]);
             (Request::ListPackages, "list_packages", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::AddPackage { project_root, identifier, git, branch, local_path, deep }, "add_package", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_root:String|identifier:String|git:Option<String>|branch:Option<String>|local_path:Option<String>|deep:bool", [project_root: String => param, identifier: String => param, git: Option<String> => param, branch: Option<String> => param, local_path: Option<String> => param, deep: bool => param]);
@@ -4643,6 +4788,26 @@ pub fn remote_operation_uuid_v7_from_parts(
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_interrupt_response_rejects_the_same_empty_shapes_as_typescript() {
+        for response in [
+            AgentInterruptResponse::Multi {
+                selected_ids: Vec::new(),
+            },
+            AgentInterruptResponse::Freetext {
+                text: String::new(),
+            },
+            AgentInterruptResponse::Batch {
+                responses: Vec::new(),
+            },
+        ] {
+            assert!(
+                validate_agent_interrupt_response(&response).is_err(),
+                "empty response shape must be rejected: {response:?}"
+            );
+        }
+    }
+
     #[cfg(feature = "remote")]
     #[test]
     fn optional_sensitive_wire_payload_fcor_is_exactly_digest_redacted() {
@@ -4752,6 +4917,7 @@ mod tests {
                 initial_model: Some(invalid.clone()),
                 no_sandbox: false,
                 interactive: false,
+                session_entry_mode: Some(SessionEntryMode::Code),
                 model_override: None,
                 client_protocol_version: PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -4764,6 +4930,7 @@ mod tests {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: false,
+                session_entry_mode: Some(SessionEntryMode::Code),
                 model_override: Some(invalid.clone()),
                 client_protocol_version: PROTOCOL_VERSION,
                 env_snapshot: None,

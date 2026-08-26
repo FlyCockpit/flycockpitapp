@@ -58,6 +58,37 @@ describe("cockpit-proto daemon wire schemas", () => {
     }
   });
 
+  it("modes_session_setup_requires an explicit mode only when attach creates a session", () => {
+    const fresh = {
+      v: PROTOCOL_VERSION,
+      kind: "req" as const,
+      id: "11111111-1111-4111-8111-111111111111",
+      request: "attach" as const,
+      params: { project_root: "/work/project", session_entry_mode: "computer" as const },
+    };
+    expect(clientEnvelopeSchema.safeParse(fresh).success).toBe(true);
+    expect(
+      clientEnvelopeSchema.safeParse({ ...fresh, params: { project_root: "/work/project" } })
+        .success,
+    ).toBe(false);
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...fresh,
+        params: { session_id: "11111111-1111-4111-8111-111111111111" },
+      }).success,
+    ).toBe(true);
+  });
+
+  it("modes_session_setup_nonempty snapshot sentinel stays schema-valid and redacted", () => {
+    const frame = responsesFixture.session_setup_snapshot;
+    expect(responseEnvelopeSchema.safeParse(frame).success).toBe(true);
+    expect(frame.data.snapshot.candidates.length).toBeGreaterThan(0);
+    expect(frame.data.snapshot.selected_installation_id).toBe(
+      frame.data.snapshot.candidates[0]?.installation.installation_id,
+    );
+    expect(JSON.stringify(frame)).not.toContain("credential-profile");
+  });
+
   it("accepts only opaque 64KiB-through-8MiB bulk user-message references", () => {
     const envelope = (total_length: string, mime_class = "opaque") => ({
       v: PROTOCOL_VERSION,
@@ -490,6 +521,16 @@ describe("cockpit-proto daemon wire schemas", () => {
     expect(responseKinds).toEqual(new Set(["single", "multi", "freetext", "batch", "cancel"]));
   });
 
+  it("rejects empty interrupt responses accepted by neither wire implementation", () => {
+    for (const response of [
+      { kind: "multi", data: { selected_ids: [] } },
+      { kind: "freetext", data: { text: "" } },
+      { kind: "batch", data: { responses: [] } },
+    ]) {
+      expect(resolveResponseSchema.safeParse(response).success).toBe(false);
+    }
+  });
+
   it("parses command_detail present and absent, sandbox_escalation, and all grant kinds", () => {
     const present = interruptsFixture.event_single_command_detail_present.data.question.data;
     expect(commandDetailSchema.safeParse(present.command_detail).success).toBe(true);
@@ -528,8 +569,8 @@ describe("cockpit-proto daemon wire schemas", () => {
     );
   });
 
-  it("config_refreshed_typescript_mirror_is_v10", () => {
-    expect(PROTOCOL_VERSION).toBe(18);
+  it("config_refreshed_typescript_mirror_is_v20", () => {
+    expect(PROTOCOL_VERSION).toBe(20);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );

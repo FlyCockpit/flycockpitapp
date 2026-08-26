@@ -333,6 +333,8 @@ pub struct AgentRunner {
     /// Authoritative active-model snapshot from `Attach`, used to seed chrome
     /// before any later live active-model event arrives.
     pub active_model_state: Option<proto::ActiveModelState>,
+    /// Exact daemon-returned setup metadata for this attached session.
+    pub session_entry_mode: proto::SessionEntryMode,
     /// This session's full id. Shown in the startup graphic and printed on
     /// exit (session-id-display-and-lazy-persist). Assigned by the daemon at
     /// attach, before the `sessions` row is persisted.
@@ -546,6 +548,7 @@ impl AgentRunner {
             skill_inventory_names: Arc::new(Mutex::new(None)),
             foreground_target: Some(proto::QueueTarget::root("Build")),
             active_model_state: None,
+            session_entry_mode: proto::SessionEntryMode::Code,
             session_id_state: Arc::new(Mutex::new(session_id)),
             attachment_epoch: Arc::new(AtomicU64::new(0)),
             submission_session_tx,
@@ -722,8 +725,10 @@ impl AgentRunner {
         self.last_applied_seq = Some(Arc::new(Mutex::new(Some(0))));
         let (client_epoch_tx, _client_epoch_rx) = watch::channel(self.attachment_epoch());
         self.attach_context = Some(Arc::new(RwLock::new(AttachRequestContext {
+            session_id: None,
             project_root: "/tmp/cockpit-test".to_string(),
             no_sandbox: false,
+            session_entry_mode: proto::SessionEntryMode::Code,
             env_snapshot: cockpit_core::env_snapshot::capture_tui_shell_env()
                 .0
                 .to_wire(),
@@ -787,6 +792,7 @@ impl AgentRunner {
         }
         let current_client = self.current_client.clone();
         let attach_context = self.attach_context.clone();
+        let session_id_state = self.session_id_state.clone();
         let last_applied_seq = self.last_applied_seq.clone();
         let endpoint = self.endpoint.clone();
         let input_tx = self.input_tx.clone();
@@ -844,6 +850,7 @@ impl AgentRunner {
     }
 
     pub(crate) fn apply_session_switch_outcome(&mut self, outcome: &SessionSwitchOutcome) {
+        self.session_entry_mode = outcome.session_entry_mode;
         apply_session_switch_state(
             outcome,
             &self.session_id_state,
@@ -1446,8 +1453,10 @@ fn advance_attachment_epoch(context: &AttachRequestContext) -> u64 {
 
 #[derive(Clone)]
 pub(crate) struct AttachRequestContext {
+    session_id: Option<Uuid>,
     project_root: String,
     no_sandbox: bool,
+    session_entry_mode: proto::SessionEntryMode,
     env_snapshot: cockpit_proto::EnvSnapshotWire,
     transition_gate: Arc<AsyncMutex<()>>,
     client_epoch_tx: watch::Sender<u64>,
@@ -1467,6 +1476,7 @@ pub enum SessionTarget {
 pub struct SessionSwitchOutcome {
     pub target: SessionTarget,
     pub session_id: Uuid,
+    pub session_entry_mode: proto::SessionEntryMode,
     pub short_id: String,
     pub active_agent: String,
     pub active_agent_path: Vec<String>,
@@ -1553,6 +1563,7 @@ struct ReconnectBackoff<J = SystemJitter> {
 
 struct ReconnectAttach {
     client: DaemonClient,
+    session_entry_mode: proto::SessionEntryMode,
     history: Vec<proto::HistoryEntry>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
@@ -1560,6 +1571,7 @@ struct ReconnectAttach {
 }
 
 struct AttachedPayload {
+    session_entry_mode: proto::SessionEntryMode,
     history: Vec<proto::HistoryEntry>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
@@ -1619,6 +1631,12 @@ fn event_persisted_seq(event: &proto::Event) -> Option<i64> {
         | proto::Event::ToolError { seq, .. } => *seq,
         proto::Event::UserMessageRecorded { seq, .. } => Some(*seq),
         proto::Event::HistoryReplay { max_seq, .. } => Some(*max_seq),
+        // `AgentTreeChanged` is a durable tree invalidation, but this
+        // terminal renderer has no tree projection yet.  It therefore has no
+        // transcript effect and must not advance the transcript replay cursor:
+        // a higher tree event arriving before a lower transcript event would
+        // otherwise make reconnect/live forwarding drop that transcript row.
+        proto::Event::AgentTreeChanged { .. } => None,
         _ => None,
     }
 }
@@ -1796,11 +1814,13 @@ impl ClientEventState {
         F: FnOnce(Uuid, AttachRequestContext, Arc<Mutex<Option<i64>>>) -> Fut,
         Fut: std::future::Future<Output = Result<AttachedPayload, ReconnectAttachError>>,
     {
-        let session_id = self.session_id();
+        let attach_snapshot = self.attach_context.read().await.clone();
+        let Some(session_id) = attach_snapshot.session_id else {
+            return false;
+        };
         if lag_session_id.is_some_and(|lag_session_id| lag_session_id != session_id) {
             return true;
         }
-        let attach_snapshot = self.attach_context.read().await.clone();
         match resync(
             session_id,
             attach_snapshot.clone(),
@@ -1883,9 +1903,17 @@ async fn switch_session_inner(
         move || async move { outgoing_client.request(Request::CancelTurn).await },
     )
     .await;
+    // The Attach helper has already installed the daemon-returned id+mode
+    // under one context write lock. Publish the synchronous submission id
+    // before replacing the client/epoch, so reconnect cannot pair the new
+    // mode with the old id while the App awaits its switch outcome.
+    *session_id_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = outcome.session_id;
     *current_client.write().await = replacement_client;
     let context = attach_context.read().await;
     let attachment_epoch = advance_attachment_epoch(&context);
+    drop(context);
     let mut outcome = outcome;
     outcome.attachment_epoch = attachment_epoch;
     Ok(outcome)
@@ -1945,6 +1973,7 @@ where
         initial_model: None,
         no_sandbox: ctx.no_sandbox,
         interactive: true,
+        session_entry_mode: target_session_id.is_none().then_some(ctx.session_entry_mode),
         model_override: None,
         client_protocol_version,
         env_snapshot: Some(ctx.env_snapshot.clone()),
@@ -1952,7 +1981,7 @@ where
     })
     .await
     .map_err(|e| format!("attach: {e}"))?;
-    match response {
+    let outcome = match response {
         Ok(Response::Attached {
             session_id,
             short_id,
@@ -1960,6 +1989,7 @@ where
             active_agent_path: new_active_agent_path,
             foreground_target,
             active_model_state,
+            session_entry_mode,
             project_id,
             history,
             paused_work,
@@ -1968,30 +1998,47 @@ where
             daemon_version,
             compatible,
             ..
-        }) => Ok(session_switch_outcome_from_attached(
-            SessionSwitchAttached {
-                session_id,
-                short_id,
-                active_agent: new_active_agent,
-                active_agent_path: new_active_agent_path,
-                foreground_target,
-                active_model_state,
-                project_id,
-                history,
-                paused_work,
-                repair_required: repair_required.map(|repair| *repair),
-                btw_fork,
-                daemon_version,
-                daemon_compatible: compatible,
-            },
-            requested_target,
-        )),
+        }) => {
+            if target_session_id.is_none() && session_entry_mode != ctx.session_entry_mode {
+                return Err(format!(
+                    "daemon returned mismatched new-session entry mode: requested {}, received {}",
+                    ctx.session_entry_mode.as_str(),
+                    session_entry_mode.as_str(),
+                ));
+            }
+            Ok(session_switch_outcome_from_attached(
+                SessionSwitchAttached {
+                    session_id,
+                    short_id,
+                    active_agent: new_active_agent,
+                    active_agent_path: new_active_agent_path,
+                    foreground_target,
+                    active_model_state,
+                    session_entry_mode,
+                    project_id,
+                    history,
+                    paused_work,
+                    repair_required: repair_required.map(|repair| *repair),
+                    btw_fork,
+                    daemon_version,
+                    daemon_compatible: compatible,
+                },
+                requested_target,
+            ))
+        }
         Ok(other) => Err(format!("unexpected attach response: {other:?}")),
         Err(error) if error.code == ErrorCode::ProtocolVersion => {
             Err(incompatible_protocol_chip().to_string())
         }
         Err(error) => Err(format!("attach: daemon error: {error}")),
-    }
+    }?;
+    // The daemon owns both values. One write keeps reconnect from observing
+    // a new session id paired with the previous session's mode.
+    let mut context = attach_context.write().await;
+    context.session_id = Some(outcome.session_id);
+    context.session_entry_mode = outcome.session_entry_mode;
+    drop(context);
+    Ok(outcome)
 }
 
 struct SessionSwitchAttached {
@@ -2001,6 +2048,7 @@ struct SessionSwitchAttached {
     active_agent_path: Vec<String>,
     foreground_target: Option<proto::QueueTarget>,
     active_model_state: Option<proto::ActiveModelState>,
+    session_entry_mode: proto::SessionEntryMode,
     project_id: String,
     history: Vec<proto::HistoryEntry>,
     paused_work: Vec<proto::PausedWorkSummary>,
@@ -2023,6 +2071,7 @@ fn session_switch_outcome_from_attached(
     SessionSwitchOutcome {
         target,
         session_id: attached.session_id,
+        session_entry_mode: attached.session_entry_mode,
         short_id: attached.short_id,
         active_agent: attached.active_agent,
         active_agent_path,
@@ -2177,6 +2226,7 @@ async fn try_spawn_inner(
                 // `question` prompts) — mark this attach interactive so
                 // the loop guard prompts here instead of auto-rejecting.
                 interactive: true,
+                session_entry_mode: requested_session_entry_mode,
                 // The interactive TUI uses the session's active model; the
                 // plan-level override is only for the headless plan-run
                 // path (`cockpit run --model`).
@@ -2201,6 +2251,7 @@ async fn try_spawn_inner(
             active_agent_path,
             foreground_target,
             active_model_state,
+            session_entry_mode,
             project_id,
             history,
             paused_work,
@@ -2216,6 +2267,7 @@ async fn try_spawn_inner(
                 active_agent_path,
                 foreground_target,
                 active_model_state,
+                session_entry_mode,
                 project_id,
                 history,
                 paused_work,
@@ -2231,6 +2283,7 @@ async fn try_spawn_inner(
                 active_agent_path,
                 foreground_target,
                 active_model_state,
+                session_entry_mode,
                 project_id,
                 history,
                 paused_work,
@@ -2241,6 +2294,15 @@ async fn try_spawn_inner(
             ),
             other => return Err(format!("unexpected attach response: {other:?}")),
         };
+        if let Some(requested_mode) = requested_session_entry_mode
+            && session_entry_mode != requested_mode
+        {
+            return Err(format!(
+                "daemon returned mismatched new-session entry mode: requested {}, received {}",
+                requested_mode.as_str(),
+                session_entry_mode.as_str(),
+            ));
+        }
         // Fetch the autocomplete frequency maps for this session's
         // project. Best-effort: a daemon that doesn't speak
         // `GetUsageCounts` just leaves the maps empty (no ranking).
@@ -2288,6 +2350,7 @@ async fn try_spawn_inner(
             active_agent_path,
             foreground_target,
             active_model_state,
+            session_entry_mode,
             project_id,
             usage,
             skill_inventory_names,
@@ -2311,6 +2374,7 @@ async fn try_spawn_inner(
         active_agent_path,
         foreground_target,
         active_model_state,
+        session_entry_mode,
         project_id,
         usage,
         initial_skill_names,
@@ -2358,8 +2422,10 @@ async fn try_spawn_inner(
     let (attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
     let (client_epoch_tx, mut client_epoch_rx) = watch::channel(0_u64);
     let attach_context = Arc::new(RwLock::new(AttachRequestContext {
+        session_id: Some(session_id),
         project_root: cwd.to_string_lossy().into_owned(),
         no_sandbox,
+        session_entry_mode,
         env_snapshot: cockpit_core::env_snapshot::capture_tui_shell_env()
             .0
             .to_wire(),
@@ -2663,10 +2729,9 @@ async fn try_spawn_inner(
                     if !event_state
                         .handle_event_with_resync(
                             event,
-                            move |session_id, attach_snapshot, last| async move {
+                            move |_session_id, attach_snapshot, last| async move {
                                 let attached = reconnect_and_attach(
                                     &resync_driver,
-                                    session_id,
                                     &attach_snapshot,
                                     &last,
                                 )
@@ -2704,12 +2769,11 @@ async fn try_spawn_inner(
                     let transition_gate = event_state.transition_gate.clone();
                     let _transition_guard = transition_gate.lock_owned().await;
                     let attach_snapshot = attach_context.read().await.clone();
-                    let session_id = *session_id_state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let Some(session_id) = attach_snapshot.session_id else {
+                        return;
+                    };
                     match reconnect_and_attach(
                         &driver,
-                        session_id,
                         &attach_snapshot,
                         &last_applied_seq,
                     )
@@ -2784,6 +2848,7 @@ async fn try_spawn_inner(
         skill_inventory_names,
         foreground_target: foreground_target.map(queue_target_from_proto),
         active_model_state,
+        session_entry_mode,
         session_id_state,
         attachment_epoch,
         submission_session_tx,
@@ -3484,7 +3549,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TandemState { session_id, .. }
         | GitignoreAllow { session_id, .. }
         | PausedWorkAvailable { session_id, .. }
-        | WaitingForLock { session_id, .. } => *session_id,
+        | WaitingForLock { session_id, .. }
+        | AgentTreeChanged { session_id, .. } => *session_id,
         EventStreamLagged {
             session_id: Some(session_id),
             ..
@@ -3514,10 +3580,14 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
 
 async fn reconnect_and_attach(
     driver: &LocalReconnectDriver,
-    session_id: uuid::Uuid,
     attach_context: &AttachRequestContext,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
 ) -> Result<ReconnectAttach, ReconnectAttachError> {
+    let Some(session_id) = attach_context.session_id else {
+        return Err(ReconnectAttachError::Terminal(
+            "reconnect has no authoritative attached session".to_string(),
+        ));
+    };
     let client = driver
         .connect()
         .await
@@ -3526,6 +3596,7 @@ async fn reconnect_and_attach(
         resync_attach_payload(&client, session_id, attach_context, last_applied_seq).await?;
     Ok(ReconnectAttach {
         client,
+        session_entry_mode: payload.session_entry_mode,
         history: payload.history,
         paused_work: payload.paused_work,
         repair_required: payload.repair_required,
@@ -3539,7 +3610,7 @@ async fn resync_attach_payload(
     attach_context: &AttachRequestContext,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
 ) -> Result<AttachedPayload, ReconnectAttachError> {
-    request_attach_payload(
+    let payload = request_attach_payload(
         session_id,
         attach_context,
         last_applied_seq,
@@ -3549,7 +3620,15 @@ async fn resync_attach_payload(
             async move { client.request(request).await }
         },
     )
-    .await
+    .await?;
+    if payload.session_entry_mode != attach_context.session_entry_mode {
+        return Err(ReconnectAttachError::Terminal(format!(
+            "daemon returned mismatched session entry mode: requested {}, received {}",
+            attach_context.session_entry_mode.as_str(),
+            payload.session_entry_mode.as_str(),
+        )));
+    }
+    Ok(payload)
 }
 
 async fn request_attach_payload<F, Fut>(
@@ -3570,6 +3649,7 @@ where
         initial_model: None,
         no_sandbox: attach_context.no_sandbox,
         interactive: true,
+        session_entry_mode: None,
         model_override: None,
         client_protocol_version,
         env_snapshot: Some(attach_context.env_snapshot.clone()),
@@ -3585,12 +3665,14 @@ fn attach_payload_from_response(
 ) -> Result<AttachedPayload, ReconnectAttachError> {
     match response {
         Ok(Response::Attached {
+            session_entry_mode,
             history,
             paused_work,
             repair_required,
             active_model_state,
             ..
         }) => Ok(AttachedPayload {
+            session_entry_mode,
             history,
             paused_work,
             repair_required: repair_required.map(|repair| *repair),
@@ -3613,6 +3695,7 @@ fn attach_payload_from_response(
 fn split_reconnect_attached(attached: ReconnectAttach) -> (DaemonClient, AttachedPayload) {
     let client = attached.client;
     let payload = AttachedPayload {
+        session_entry_mode: attached.session_entry_mode,
         history: attached.history,
         paused_work: attached.paused_work,
         repair_required: attached.repair_required,
@@ -3626,6 +3709,7 @@ fn apply_attached_payload(
     ctx: &IncomingEventContext<'_>,
 ) -> Option<proto::ActiveModelState> {
     let AttachedPayload {
+        session_entry_mode: _,
         history,
         paused_work,
         repair_required,
@@ -4464,6 +4548,11 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
         },
+        // Agent-tree changes invalidate daemon-owned Attention/tree queries;
+        // the current terminal UI has no tree surface or local cache to
+        // refresh. Consume the event explicitly so a new protocol event never
+        // falls through as a rendered history turn.
+        AgentTreeChanged { .. } => return None,
         // This daemon-global, project-scoped invalidation has no image-control
         // TUI state to refresh yet. Consume its safe projection explicitly so
         // it is neither treated as a session event nor rendered as history.
@@ -4674,8 +4763,10 @@ mod tests {
 
     fn test_attach_context(project_root: &str) -> Arc<RwLock<AttachRequestContext>> {
         Arc::new(RwLock::new(AttachRequestContext {
+            session_id: None,
             project_root: project_root.to_string(),
             no_sandbox: true,
+            session_entry_mode: proto::SessionEntryMode::Code,
             env_snapshot: cockpit_proto::EnvSnapshotWire {
                 source: cockpit_proto::EnvSnapshotSource::TuiShell,
                 digest: String::new(),
@@ -4707,6 +4798,7 @@ mod tests {
             foreground_target: None,
             active_subagent: None,
             active_model_state: None,
+            session_entry_mode: proto::SessionEntryMode::Code,
             history,
             paused_work: Vec::new(),
             repair_required: None,
@@ -5147,6 +5239,7 @@ mod tests {
                 since_seq: None,
             },
             session_id: destination,
+            session_entry_mode: proto::SessionEntryMode::Code,
             short_id: "dest01".to_string(),
             active_agent: "Build".to_string(),
             active_agent_path: vec!["Build".to_string()],
@@ -6054,8 +6147,10 @@ mod tests {
         };
         *active_model_state = Some(expected.clone());
         let attach_context = AttachRequestContext {
+            session_id: Some(session_id),
             project_root: "/tmp/project".to_string(),
             no_sandbox: false,
+            session_entry_mode: proto::SessionEntryMode::Code,
             env_snapshot: cockpit_proto::EnvSnapshotWire {
                 source: cockpit_proto::EnvSnapshotSource::TuiShell,
                 digest: String::new(),
@@ -6249,6 +6344,7 @@ mod tests {
                 active_agent_path: Vec::new(),
                 foreground_target: None,
                 active_model_state: None,
+                session_entry_mode: proto::SessionEntryMode::Code,
                 project_id: "new-project".to_string(),
                 history,
                 paused_work: Vec::new(),
@@ -6291,8 +6387,10 @@ mod tests {
         let initial_session_id = uuid::Uuid::new_v4();
         let new_session_id = uuid::Uuid::new_v4();
         let attach_context = Arc::new(RwLock::new(AttachRequestContext {
+            session_id: Some(initial_session_id),
             project_root: "/tmp/project".to_string(),
             no_sandbox: true,
+            session_entry_mode: proto::SessionEntryMode::Code,
             env_snapshot: cockpit_proto::EnvSnapshotWire {
                 source: cockpit_proto::EnvSnapshotSource::TuiShell,
                 digest: String::new(),
@@ -6326,6 +6424,7 @@ mod tests {
                         foreground_target: None,
                         active_subagent: None,
                         active_model_state: None,
+                        session_entry_mode: proto::SessionEntryMode::Code,
                         history: Vec::new(),
                         paused_work: Vec::new(),
                         repair_required: None,
@@ -6440,6 +6539,45 @@ mod tests {
                 reason: cockpit_proto::IdleReason::Completed,
             } if turn_id == "turn-1"
         ));
+    }
+
+    #[test]
+    fn agent_tree_invalidation_does_not_advance_transcript_cursor_or_drop_late_transcript() {
+        let session_id = uuid::Uuid::new_v4();
+        let event = proto::Event::AgentTreeChanged {
+            session_id,
+            session_event_seq: 47,
+            transition: proto::AgentTreeTransition::AttentionStateChanged,
+            subject_kind: proto::AgentTreeEventSubject::Decision,
+            subject_id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(event_session(&event), Some(session_id));
+        assert_eq!(event_persisted_seq(&event), None);
+        assert!(
+            proto_event_to_turn_event(event.clone()).is_none(),
+            "the current TUI has no agent-tree surface but must consume its durable invalidation"
+        );
+        // Event streams can reconnect with a tree invalidation before an
+        // earlier transcript event. Tree state has no local renderer/cursor,
+        // so it must not make that valid transcript event look stale.
+        let cursor = Arc::new(Mutex::new(Some(45)));
+        if let Some(seq) = event_persisted_seq(&event) {
+            update_last_applied_seq(&cursor, seq);
+        }
+        assert_eq!(current_last_applied_seq(&cursor), Some(45));
+        let transcript = proto::Event::AssistantText {
+            session_id,
+            agent: "Build".to_string(),
+            text: "arrived after tree invalidation".to_string(),
+            presentation_text: None,
+            reasoning: String::new(),
+            seq: Some(46),
+            response_performance: None,
+        };
+        let seq = event_persisted_seq(&transcript).expect("transcript events own cursor order");
+        assert!(current_last_applied_seq(&cursor).is_none_or(|last| seq > last));
+        update_last_applied_seq(&cursor, seq);
+        assert_eq!(current_last_applied_seq(&cursor), Some(46));
     }
 
     #[test]

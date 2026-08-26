@@ -54,6 +54,10 @@ pub enum DefaultModelStandaloneOutcome {
     Applied {
         selection: Option<cockpit_config::config::providers::ActiveModelRef>,
         generation: u64,
+        /// Opaque digest of the retained attach authority and the exact worker
+        /// config generation at the durable receipt fence.  It is safe to
+        /// expose: it contains no path, credential, or configuration value.
+        authority_revision: String,
         scope_label: String,
         #[serde(default)]
         unchanged: bool,
@@ -681,6 +685,27 @@ impl<'de> Deserialize<'de> for AuthFailureKind {
 /// fire-and-forget — clients do not ack individual events. A client
 /// that misses events (e.g. dropped connection) re-`Attach`es and
 /// receives a fresh history snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTreeTransition {
+    AgentCreated,
+    AgentStateChanged,
+    AttentionRaised,
+    AttentionStateChanged,
+    DecisionStateChanged,
+    RecoveryAttached,
+}
+
+/// Identity category for a state-free ordered AgentTree invalidation.  The
+/// event is intentionally not a snapshot: consumers fetch the current typed
+/// tree/Attention page after observing its sequence edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTreeEventSubject {
+    Agent,
+    Decision,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", content = "data")]
 pub enum Event {
@@ -1632,6 +1657,20 @@ pub enum Event {
         snapshot: crate::HostCapabilitySnapshot,
     },
 
+    /// A durable tree or decision transition committed. This is deliberately
+    /// state-free: clients use its ordered sequence edge and re-read the
+    /// typed tree/Attention pages, so an event can never claim a later mutable
+    /// revision was the state at its commit.
+    AgentTreeChanged {
+        session_id: Uuid,
+        /// Durable `session_events.seq`; clients order only events from this
+        /// session and never treat the daemon-global bus as tree authority.
+        session_event_seq: i64,
+        transition: AgentTreeTransition,
+        subject_kind: AgentTreeEventSubject,
+        subject_id: Uuid,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -1723,6 +1762,7 @@ macro_rules! event_variants {
             (Event::PausedWorkAvailable { .. }, "paused_work_available");
             (Event::WaitingForLock { .. }, "waiting_for_lock");
             (Event::HostCapabilitiesChanged { .. }, "host_capabilities_changed");
+            (Event::AgentTreeChanged { .. }, "agent_tree_changed");
             (Event::Unknown, "__unknown");
         ] }
     };

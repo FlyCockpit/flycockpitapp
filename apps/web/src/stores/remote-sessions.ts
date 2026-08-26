@@ -2096,6 +2096,7 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
       const result = await client.attach({
         project_root: input.projectRoot,
         interactive: true,
+        session_entry_mode: "code",
         initial_model: input.initialModel,
       });
       if (!isCurrent() || !coordinator.bindSession(attempt, result.session_id)) {

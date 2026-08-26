@@ -3,6 +3,7 @@
 //! Shared probes run once at boot and again on `RefreshHostCapabilities`.
 //! The TUI in-process doctor compose is not this authority.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -144,10 +145,53 @@ impl HostCapabilityProbeInputs {
     }
 }
 
-/// Generation-tagged snapshot store. Late refreshes are discarded.
+/// Generation-tagged snapshot store. An older *committed* refresh never
+/// overwrites a newer committed snapshot; an uncommitted probe reservation has
+/// no authority to suppress a durable receipt.
 #[derive(Clone, Debug, Default)]
 pub struct HostCapabilitySnapshotStore {
     inner: Arc<Mutex<StoreInner>>,
+    // The daemon-global outbox dispatcher and refresh execution hold this
+    // across ordered receipt replay, probe, and acknowledgement. It lives
+    // beside the shared snapshot state (rather than a session-worker config
+    // clone) so every session using this store observes one serialization
+    // boundary. The matching DB claim is global too: this lock is not merely
+    // an in-process optimization over per-session durability.
+    refresh_serialization: Arc<tokio::sync::Mutex<()>>,
+    // Refresh operations are global to this store as well. Keeping this
+    // registry beside the serialization lock makes duplicate dispatch
+    // suppression survive the per-session configuration snapshots which
+    // merely clone the store. The durable DB lease remains the cross-process
+    // authority; this set prevents an unbounded pile of same-process retry
+    // tasks while a lease owner is still making progress.
+    refresh_in_flight_operations: Arc<Mutex<HashSet<uuid::Uuid>>>,
+    // Stable per-session keyset cursors for bounded allowed-refresh
+    // maintenance. This is scheduling state only; durable ordering and
+    // eligibility remain in SQLite.
+    refresh_allowed_operation_cursors:
+        Arc<Mutex<std::collections::HashMap<uuid::Uuid, Option<(i64, uuid::Uuid)>>>>,
+}
+
+/// Probe output reserved for a later, explicitly authorized publication.
+///
+/// A durable host operation must not make a probe observable merely because
+/// collecting it succeeded: cancellation or a failed completion CAS may win
+/// between the read-only probe and the durable terminal receipt.  Keeping the
+/// snapshot staged makes the caller choose that receipt boundary before it
+/// mutates the live store.
+#[derive(Clone)]
+pub struct StagedHostCapabilityRefresh {
+    snapshot: HostCapabilitySnapshot,
+}
+
+impl StagedHostCapabilityRefresh {
+    pub fn snapshot(&self) -> &HostCapabilitySnapshot {
+        &self.snapshot
+    }
+
+    pub fn into_snapshot(self) -> HostCapabilitySnapshot {
+        self.snapshot
+    }
 }
 
 #[derive(Debug, Default)]
@@ -161,10 +205,74 @@ impl HostCapabilitySnapshotStore {
         Self::default()
     }
 
+    pub(crate) fn refresh_serialization(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.refresh_serialization)
+    }
+
+    pub(crate) fn refresh_in_flight_operations(&self) -> Arc<Mutex<HashSet<uuid::Uuid>>> {
+        Arc::clone(&self.refresh_in_flight_operations)
+    }
+
+    pub(crate) fn refresh_allowed_operation_cursor(
+        &self,
+        session_id: uuid::Uuid,
+    ) -> Option<(i64, uuid::Uuid)> {
+        self.refresh_allowed_operation_cursors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&session_id)
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn set_refresh_allowed_operation_cursor(
+        &self,
+        session_id: uuid::Uuid,
+        cursor: Option<(i64, uuid::Uuid)>,
+    ) {
+        self.refresh_allowed_operation_cursors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id, cursor);
+    }
+
     pub fn begin_refresh(&self) -> u64 {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.next_generation = inner.next_generation.saturating_add(1);
         inner.next_generation
+    }
+
+    /// Seed a newly constructed daemon store from durable refresh state before
+    /// it creates any local snapshot. This advances only the reservation
+    /// high-water; callers which have a completed receipt should additionally
+    /// install it with [`Self::publish_committed`].
+    pub fn observe_durable_generation(&self, generation: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.next_generation = inner.next_generation.max(generation);
+    }
+
+    /// Accept the exact generation already reserved by the database at the
+    /// host-effect execution boundary. This is not a new reservation: the DB
+    /// has already made it globally durable. A stale process cannot stage an
+    /// older number beneath a live or recovered receipt.
+    pub fn accept_durable_refresh_reservation(&self, generation: u64) -> Result<(), String> {
+        if generation == 0 {
+            return Err("host capability durable refresh generation must be positive".to_string());
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(current) = &inner.current
+            && generation <= current.generation
+        {
+            return Err(format!(
+                "host capability durable refresh generation {generation} is not newer than live generation {}",
+                current.generation
+            ));
+        }
+        // A restart may load a global allocator value ahead of this process;
+        // the exact claimed generation may equal that high-water. Do not call
+        // `begin_refresh` here, which would invent a second number.
+        inner.next_generation = inner.next_generation.max(generation);
+        Ok(())
     }
 
     pub fn publish(&self, snapshot: HostCapabilitySnapshot) -> bool {
@@ -179,6 +287,57 @@ impl HostCapabilitySnapshotStore {
         }
         inner.current = Some(Arc::new(snapshot));
         true
+    }
+
+    /// Atomically make a durably committed refresh visible.  Unlike
+    /// [`Self::publish`], a reservation from a later probe cannot strand an
+    /// earlier receipt: an uncommitted later probe must never suppress a
+    /// committed result.  A snapshot that has already been superseded by a
+    /// newer *committed* generation leaves that newer current value intact.
+    ///
+    /// This is deliberately an in-memory mutex-protected swap with no fallible
+    /// I/O after the durable completion transaction.  The returned flag says
+    /// whether this receipt changed the live view. A receipt may also be
+    /// replayed after a crash, in which case the store accepts it only when it
+    /// already contains the *exact* same snapshot. A different snapshot at the
+    /// same or a newer generation is a durable/in-memory split-brain signal;
+    /// callers must retain the outbox entry and fail closed rather than
+    /// acknowledging an unpublished result.
+    pub fn publish_committed(
+        &self,
+        snapshot: HostCapabilitySnapshot,
+    ) -> Result<bool, String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match &inner.current {
+            Some(current) if current.generation > snapshot.generation => {
+                return Err(format!(
+                    "host capability receipt generation {} is older than live generation {}",
+                    snapshot.generation, current.generation
+                ));
+            }
+            Some(current) if current.generation == snapshot.generation => {
+                if current.as_ref() != &snapshot {
+                    return Err(format!(
+                        "host capability receipt generation {} disagrees with the live snapshot",
+                        snapshot.generation
+                    ));
+                }
+                // Recovery may install a committed receipt before any local
+                // refresh reservation has happened. Keep the high-water mark
+                // coupled to that receipt so the next `begin_refresh` cannot
+                // reuse this generation and be silently rejected later.
+                inner.next_generation = inner.next_generation.max(snapshot.generation);
+                return Ok(false);
+            }
+            _ => {}
+        }
+        // The generation high-water and visible committed snapshot advance
+        // under the same mutex. This includes outbox recovery: after replaying
+        // durable generation N, the next reservation is strictly greater than
+        // N even on a freshly constructed store.
+        inner.next_generation = inner.next_generation.max(snapshot.generation);
+        inner.current = Some(Arc::new(snapshot));
+        Ok(true)
     }
 
     pub fn current(&self) -> Option<Arc<HostCapabilitySnapshot>> {
@@ -221,7 +380,8 @@ pub async fn refresh_host_capabilities(
     store: &HostCapabilitySnapshotStore,
     inputs: &HostCapabilityProbeInputs,
 ) -> Result<(HostCapabilitySnapshot, bool), String> {
-    refresh_host_capabilities_inner(store, inputs, None).await
+    let staged = stage_host_capabilities_refresh(store, inputs).await?;
+    publish_staged_host_capabilities_refresh(store, staged)
 }
 
 /// Same as [`refresh_host_capabilities`], but publish `secret_store` (already
@@ -232,15 +392,49 @@ pub async fn refresh_host_capabilities_with_secret_store(
     inputs: &HostCapabilityProbeInputs,
     secret_store: SecretStoreSnapshot,
 ) -> Result<(HostCapabilitySnapshot, bool), String> {
-    refresh_host_capabilities_inner(store, inputs, Some(secret_store)).await
+    let staged =
+        stage_host_capabilities_refresh_with_secret_store(store, inputs, secret_store).await?;
+    publish_staged_host_capabilities_refresh(store, staged)
 }
 
-async fn refresh_host_capabilities_inner(
+/// Collect a new host-capability snapshot without publishing it.  The caller
+/// must first commit any durable operation receipt that authorizes this exact
+/// probe, then call [`publish_staged_host_capabilities_refresh`].
+pub async fn stage_host_capabilities_refresh(
+    store: &HostCapabilitySnapshotStore,
+    inputs: &HostCapabilityProbeInputs,
+) -> Result<StagedHostCapabilityRefresh, String> {
+    stage_host_capabilities_refresh_inner(store, inputs, None, store.begin_refresh()).await
+}
+
+/// Stage a refresh using the supplied post-migration secret-store projection
+/// without exposing it until the caller has committed its own durable receipt.
+pub async fn stage_host_capabilities_refresh_with_secret_store(
+    store: &HostCapabilitySnapshotStore,
+    inputs: &HostCapabilityProbeInputs,
+    secret_store: SecretStoreSnapshot,
+) -> Result<StagedHostCapabilityRefresh, String> {
+    stage_host_capabilities_refresh_inner(store, inputs, Some(secret_store), store.begin_refresh()).await
+}
+
+/// Stage a host refresh at the generation reserved by the durable operation
+/// claim. AgentTree is the only production caller: it must never derive this
+/// value from process-local state after a restart.
+pub async fn stage_host_capabilities_refresh_at_generation(
+    store: &HostCapabilitySnapshotStore,
+    inputs: &HostCapabilityProbeInputs,
+    generation: u64,
+) -> Result<StagedHostCapabilityRefresh, String> {
+    store.accept_durable_refresh_reservation(generation)?;
+    stage_host_capabilities_refresh_inner(store, inputs, None, generation).await
+}
+
+async fn stage_host_capabilities_refresh_inner(
     store: &HostCapabilitySnapshotStore,
     inputs: &HostCapabilityProbeInputs,
     secret_store: Option<SecretStoreSnapshot>,
-) -> Result<(HostCapabilitySnapshot, bool), String> {
-    let generation = store.begin_refresh();
+    generation: u64,
+) -> Result<StagedHostCapabilityRefresh, String> {
     let inputs = inputs.for_refresh();
     let probes = collect_shared_host_probes(&inputs, true).await;
     let previous = secret_store.unwrap_or_else(|| {
@@ -251,14 +445,23 @@ async fn refresh_host_capabilities_inner(
     });
     let secret_store = reconcile_secret_store_with_probe(previous, &probes.keyring);
     let snapshot = build_host_capability_snapshot(generation, &probes, secret_store);
-    if store.publish(snapshot.clone()) {
-        Ok((snapshot, true))
-    } else {
-        store
-            .current()
-            .map(|current| ((*current).clone(), false))
-            .ok_or_else(|| "host capability snapshot was superseded".to_string())
-    }
+    Ok(StagedHostCapabilityRefresh { snapshot })
+}
+
+/// Publish a snapshot that was staged by one prior probe *after* its durable
+/// receipt succeeds. Publication atomically installs the result unless the
+/// store already contains that exact receipt. A different same/newer live
+/// snapshot is an error: callers must retain the durable outbox item rather
+/// than acknowledge a snapshot that was not made visible. The returned
+/// snapshot is always this staged operation's durable receipt, never a lossy
+/// projection of a concurrent refresh.
+pub fn publish_staged_host_capabilities_refresh(
+    store: &HostCapabilitySnapshotStore,
+    staged: StagedHostCapabilityRefresh,
+) -> Result<(HostCapabilitySnapshot, bool), String> {
+    let snapshot = staged.into_snapshot();
+    let published = store.publish_committed(snapshot.clone())?;
+    Ok((snapshot, published))
 }
 
 pub struct SharedHostProbes {

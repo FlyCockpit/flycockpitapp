@@ -115,6 +115,16 @@ pub async fn connect_with_context(
     context: McpConnectContext,
 ) -> Result<Box<dyn McpClient>> {
     context.authorize_connect(name, cfg).await?;
+    // Re-derive the same non-secret identity that the authorization prompt
+    // bound. Every concrete transport boundary below compares this exact
+    // value with its opaque selected capability; headers and credential
+    // material are intentionally not part of this identity.
+    let connection_effect = serde_json::json!({
+        "connect": {
+            "server": name,
+            "identity": cfg.connect_identity(name)?,
+        }
+    });
     // Owner-scoped resolution: when the daemon supplies the owning workspace
     // root, this MCP server may only resolve `mcp:` secrets owned by (mcp, that
     // root) — a foreign/cross-kind name fails closed. Callers without a root
@@ -181,6 +191,14 @@ pub async fn connect_with_context(
             let timeouts =
                 McpTimeouts::from_secs(cfg.connect_timeout_secs(), cfg.request_timeout_secs());
             let connect_deadline = Instant::now() + timeouts.connect;
+            // The subprocess is the concrete connect effect. Credential
+            // resolution above may await, so recheck only here, immediately
+            // before ownership transfers to the host process table.
+            crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                "mcp_stdio_connect_spawn",
+                &[connection_effect.clone()],
+            )
+            .await?;
             let mut client = match tokio::time::timeout(timeouts.connect, async {
                 StdioClient::spawn(
                     name,
@@ -205,6 +223,11 @@ pub async fn connect_with_context(
             let remaining = connect_deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or_default();
+            crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                "mcp_initialize_request",
+                &[connection_effect.clone()],
+            )
+            .await?;
             match tokio::time::timeout(remaining, client.initialize_with_deadline(remaining)).await
             {
                 Ok(Ok(())) => return Ok(Box::new(client)),
@@ -220,6 +243,13 @@ pub async fn connect_with_context(
             }
         }
     };
+    // HTTP/SSE construction is local; initialization sends the first remote
+    // request and is therefore their concrete network boundary.
+    crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+        "mcp_initialize_request",
+        &[connection_effect],
+    )
+    .await?;
     client.initialize().await?;
     Ok(client)
 }

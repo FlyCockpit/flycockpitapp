@@ -883,8 +883,9 @@ pub(super) async fn begin_attachment_upload_admitted(
         MediaDimension, MediaEvaluationRequest, PASTE_IMAGE_PROFILE,
     };
     let (_, extended) = if let Some(attached) = state.attached.as_ref() {
+        let trust_policy = attached.handle.current_trust_policy();
         ctx.config_source
-            .load_effective_for_daemon(&attached.handle.project_root, &attached.handle.trust_policy)
+            .load_effective_for_daemon(&attached.handle.project_root, &trust_policy)
             .map_err(internal)?
     } else {
         // Terminal uploads can exist before session attachment. They have no
@@ -1514,7 +1515,7 @@ mod decode_cleanup_tests {
             .and_then(|tail| tail.split("pub(super) fn upload_attachment_chunk").next())
             .expect("attachment admission function");
         assert!(begin.contains("load_effective_for_daemon"));
-        assert!(begin.contains("handle.trust_policy"));
+        assert!(begin.contains("current_trust_policy"));
         assert!(begin.contains("WorkspaceTrustMode::IgnoreConfig"));
 
         let finish = source

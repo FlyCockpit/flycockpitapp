@@ -46,6 +46,8 @@ mod paths;
 mod policy;
 mod prompt;
 
+pub(crate) use paths::write_content_commitment;
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -86,6 +88,95 @@ pub const ID_LOOP_REJECT_PROJECT: &str = ApprovalOptionId::RepeatRejectProject.a
 pub const ID_GITIGNORE_FILE: &str = ApprovalOptionId::GitignoreFile.as_str();
 pub const ID_GITIGNORE_PARENT: &str = ApprovalOptionId::GitignoreParent.as_str();
 pub const ID_GITIGNORE_REJECT: &str = ApprovalOptionId::GitignoreReject.as_str();
+
+/// The daemon settles the durable host-operation record before it wakes the
+/// parked approver continuation. Keep the selected-candidate interpretation
+/// beside the canonical approval-option vocabulary so a raw interrupt response
+/// can never turn a dismissal or unknown id into a final operation. A scoped
+/// reject is a durable host mutation, so it is selected and fenced too.
+pub(crate) fn host_approval_response_allows(
+    response: &ResolveResponse,
+    offered: &InterruptQuestionSet,
+) -> bool {
+    // Validate the exact prompt contract first. A globally known allow ID is
+    // not authority for a different approval prompt.
+    let ResolveResponse::Single { selected_id: id } = response else {
+        return false;
+    };
+    // Host approval has one concrete effect boundary and therefore one
+    // concrete offered question. A response cannot borrow an allow-like id
+    // from a different question in a batch.
+    let [InterruptQuestion::Single { options, .. }] = offered.questions.as_slice() else {
+        return false;
+    };
+    let offered_here = options.iter().any(|option| option.id == *id);
+    if !offered_here {
+        return false;
+    }
+    matches!(
+        ApprovalOptionId::from_str(id),
+        Some(
+            ApprovalOptionId::Approve
+                | ApprovalOptionId::ApproveOnce
+                | ApprovalOptionId::ApproveSession
+                | ApprovalOptionId::ApproveProject
+                | ApprovalOptionId::ApproveGlobal
+                | ApprovalOptionId::ApproveAllOnce
+                | ApprovalOptionId::EscalateGrantSession
+                | ApprovalOptionId::EscalateGrantProject
+                | ApprovalOptionId::EscalateGrantGlobal
+                | ApprovalOptionId::EscalateRunUnconfinedOnce
+                | ApprovalOptionId::GitignoreFile
+                | ApprovalOptionId::GitignoreParent
+                | ApprovalOptionId::RepeatAcceptOnce
+                | ApprovalOptionId::RepeatAcceptSession
+                | ApprovalOptionId::RepeatAcceptProject
+                | ApprovalOptionId::RepeatRejectSession
+                | ApprovalOptionId::RepeatRejectProject
+                | ApprovalOptionId::RejectSession
+                | ApprovalOptionId::RejectProject
+                | ApprovalOptionId::RejectGlobal
+        )
+    )
+}
+
+/// Validate the only response shapes that may terminally decline a real host
+/// approval.  Cancellation is explicit; a deny must be the exact `Single`
+/// option offered by that same persisted approval question.  In particular,
+/// a batch, multi-select, free-text value, foreign option ID, or an allow-like
+/// option cannot be laundered into the cancellation path.
+pub(crate) fn host_approval_response_declines(
+    response: &ResolveResponse,
+    offered: &InterruptQuestionSet,
+) -> bool {
+    match response {
+        ResolveResponse::Cancel => true,
+        ResolveResponse::Single { selected_id } => {
+            let [InterruptQuestion::Single { options, .. }] = offered.questions.as_slice() else {
+                return false;
+            };
+            if !options.iter().any(|option| option.id == *selected_id) {
+                return false;
+            }
+            matches!(
+                ApprovalOptionId::from_str(selected_id),
+                Some(
+                    ApprovalOptionId::Reject
+                        | ApprovalOptionId::RejectSession
+                        | ApprovalOptionId::RejectProject
+                        | ApprovalOptionId::RejectGlobal
+                        | ApprovalOptionId::GitignoreReject
+                        | ApprovalOptionId::RepeatRejectOnce
+                        | ApprovalOptionId::RepeatRejectSession
+                        | ApprovalOptionId::RepeatRejectProject
+                )
+            )
+        }
+        ResolveResponse::Multi { .. }
+        | ResolveResponse::Freetext { .. }
+        | ResolveResponse::Batch { .. } => false,
+    }
+}
 
 /// The decision a prompt (or an already-granted query) produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,14 +301,28 @@ pub enum AuthorizationRequest<'a> {
     },
     NativeTool {
         label: &'a str,
+        /// Canonical wire input at the actual native-tool effect boundary.
+        /// The label is presentation only and must never be used as the
+        /// approval operation's final-input binding.
+        input: &'a serde_json::Value,
     },
     ExternalMcpTool {
         server: &'a str,
         tool: &'a str,
+        /// Canonical JSON arguments passed to the third-party tool.
+        input: &'a serde_json::Value,
+        /// Secret-free transport target/scope resolved from the live server
+        /// configuration immediately before connection.
+        target: &'a serde_json::Value,
     },
     /// A configured shell tool, keyed by the calling agent and tool name.
     CustomTool {
         tool: &'a str,
+        /// Fully rendered command that will execute outside the sandbox.
+        command: &'a str,
+        /// Canonical template arguments used to derive `command`.
+        input: &'a serde_json::Value,
+        cwd: &'a std::path::Path,
     },
     /// Connect to a configured external MCP server before it spawns or egresses.
     McpServerConnect {
@@ -252,6 +357,23 @@ pub enum AuthorizationRequest<'a> {
         observation_generation: u64,
         /// True if a host lease token is held (physical target).
         has_host_lease: bool,
+        /// Provider call identity, separately bound from the action batch ID.
+        provider_call_id: &'a str,
+        /// Position in the canonical provider action batch.
+        batch_index: u32,
+        /// Geometry generation used to validate the action coordinates.
+        geometry_generation: u64,
+        /// Safe advisory class of the canonical action.
+        action_class: &'a str,
+        /// Secret-free SHA-256 digest of the exact canonical action batch.
+        action_payload_digest: &'a str,
+        /// Secret-free SHA-256 digest of the physical lease target and
+        /// generation, present only for real-desktop dispatch.
+        lease_binding_digest: Option<&'a str>,
+        /// Secret-free SHA-256 digest of the concrete physical or virtual
+        /// target evidence. Virtual displays have no host lease and therefore
+        /// need their own exact authority witness.
+        target_evidence_binding_digest: &'a str,
     },
     /// The single central composite authorization for an image-generation
     /// dispatch. It is the one decision issuer for image generation; the pure
@@ -442,11 +564,23 @@ impl Approver {
                 command,
                 escalation,
             } => self.approve_command_inner(command, Some(escalation)).await,
-            AuthorizationRequest::NativeTool { label } => self.approve_tool_call_inner(label).await,
-            AuthorizationRequest::ExternalMcpTool { server, tool } => {
-                self.approve_mcp_tool_inner(server, tool).await
+            AuthorizationRequest::NativeTool { label, input } => {
+                self.approve_tool_call_inner(label, input).await
             }
-            AuthorizationRequest::CustomTool { tool } => self.approve_custom_tool_inner(tool).await,
+            AuthorizationRequest::ExternalMcpTool {
+                server,
+                tool,
+                input,
+                target,
+            } => {
+                self.approve_mcp_tool_inner(server, tool, input, target).await
+            }
+            AuthorizationRequest::CustomTool {
+                tool,
+                command,
+                input,
+                cwd,
+            } => self.approve_custom_tool_inner(tool, command, input, cwd).await,
             AuthorizationRequest::McpServerConnect { server, identity } => {
                 self.approve_mcp_server_connect_inner(server, identity)
                     .await
@@ -457,10 +591,22 @@ impl Approver {
                 next,
             } => self.approve_file_write(path, previous, next).await,
             AuthorizationRequest::ComputerAction {
+                session_id,
+                delegation_id,
                 action_id,
                 tier,
                 action_label,
-                ..
+                backend_kind,
+                focus_generation,
+                observation_generation,
+                has_host_lease,
+                provider_call_id,
+                batch_index,
+                geometry_generation,
+                action_class,
+                action_payload_digest,
+                lease_binding_digest,
+                target_evidence_binding_digest,
             } => {
                 // The computer-use action coordinator resolves tier before
                 // reaching this seam. "ask" pauses for a human response;
@@ -468,8 +614,25 @@ impl Approver {
                 // action/target denial. The central authorizer returns a
                 // Decision that the coordinator translates into its own
                 // CoordinatedOutcome.
-                self.approve_computer_action_inner(action_id, tier, action_label)
-                    .await
+                self.approve_computer_action_inner(
+                    session_id,
+                    delegation_id,
+                    action_id,
+                    tier,
+                    action_label,
+                    backend_kind,
+                    focus_generation,
+                    observation_generation,
+                    has_host_lease,
+                    provider_call_id,
+                    batch_index,
+                    geometry_generation,
+                    action_class,
+                    action_payload_digest,
+                    lease_binding_digest,
+                    target_evidence_binding_digest,
+                )
+                .await
             }
             AuthorizationRequest::ImageGeneration {
                 plan_digest,
@@ -1088,6 +1251,33 @@ fn scope_label(scope: Scope) -> &'static str {
         Scope::Session => "this session",
         Scope::Project => "this project",
         Scope::Global => "everywhere",
+    }
+}
+
+/// Return the stable interrupt option id for a positive approval at `scope`.
+///
+/// Human-facing scope labels intentionally include prose (for example, "this
+/// session"). They must never be used to construct a protocol option id or a
+/// durable host-operation candidate selection: those ids are the exact values
+/// the interrupt resolver returns and the operation receipt later verifies.
+pub(crate) const fn approve_option_id_for_scope(scope: Scope) -> ApprovalOptionId {
+    match scope {
+        Scope::Once => ApprovalOptionId::ApproveOnce,
+        Scope::Session => ApprovalOptionId::ApproveSession,
+        Scope::Project => ApprovalOptionId::ApproveProject,
+        Scope::Global => ApprovalOptionId::ApproveGlobal,
+    }
+}
+
+/// Stable option ID for a persisted negative decision. `Once` is a plain
+/// deny/cancel and never performs a durable mutation, so it must not be used
+/// to manufacture a persistent-reject candidate.
+pub(crate) const fn reject_option_id_for_scope(scope: Scope) -> ApprovalOptionId {
+    match scope {
+        Scope::Once => ApprovalOptionId::Reject,
+        Scope::Session => ApprovalOptionId::RejectSession,
+        Scope::Project => ApprovalOptionId::RejectProject,
+        Scope::Global => ApprovalOptionId::RejectGlobal,
     }
 }
 
@@ -2103,6 +2293,14 @@ mod tests {
             focus_generation: 1,
             observation_generation: 1,
             has_host_lease: false,
+            provider_call_id: action_id,
+            batch_index: 0,
+            geometry_generation: 1,
+            action_class: "unknown",
+            action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            lease_binding_digest: None,
+            target_evidence_binding_digest:
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         }
     }
 
@@ -2192,6 +2390,14 @@ mod tests {
             focus_generation: 1,
             observation_generation: 1,
             has_host_lease: false,
+            provider_call_id: action_id,
+            batch_index: 0,
+            geometry_generation: 1,
+            action_class: "unknown",
+            action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            lease_binding_digest: None,
+            target_evidence_binding_digest:
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         }
     }
 
@@ -4286,5 +4492,109 @@ mod tests {
             .unwrap();
         let info = shape_info("git log");
         assert!(!command_grant_allowed_by_policy(approver.store(), &info).await);
+    }
+
+    #[test]
+    fn host_approval_requires_an_allow_option_from_this_exact_prompt() {
+        let offered = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Approve this operation?".into(),
+                options: vec![InterruptOption {
+                    id: ApprovalOptionId::Reject.as_str().into(),
+                    label: "Deny".into(),
+                    description: None,
+                    secondary: false,
+                }],
+                allow_freetext: false,
+                command_detail: None,
+                permission: true,
+                approval_class: None,
+                sandbox_escalation: None,
+            }],
+        };
+        assert!(
+            !host_approval_response_allows(
+                &ResolveResponse::Single {
+                    selected_id: ApprovalOptionId::Approve.as_str().into(),
+                },
+                &offered,
+            ),
+            "a globally recognized allow id from a different prompt must not approve"
+        );
+    }
+
+    #[test]
+    fn host_approval_cancellation_accepts_only_cancel_or_exact_offered_deny() {
+        let offered = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Approve this operation?".into(),
+                options: vec![
+                    InterruptOption {
+                        id: ApprovalOptionId::ApproveOnce.as_str().into(),
+                        label: "Approve".into(),
+                        description: None,
+                        secondary: false,
+                    },
+                    InterruptOption {
+                        id: ApprovalOptionId::Reject.as_str().into(),
+                        label: "Deny".into(),
+                        description: None,
+                        secondary: true,
+                    },
+                ],
+                allow_freetext: false,
+                command_detail: None,
+                permission: true,
+                approval_class: None,
+                sandbox_escalation: None,
+            }],
+        };
+        assert!(host_approval_response_declines(&ResolveResponse::Cancel, &offered));
+        assert!(host_approval_response_declines(
+            &ResolveResponse::Single {
+                selected_id: ApprovalOptionId::Reject.as_str().into(),
+            },
+            &offered,
+        ));
+        for invalid in [
+            ResolveResponse::Single {
+                selected_id: ApprovalOptionId::ApproveOnce.as_str().into(),
+            },
+            ResolveResponse::Single {
+                selected_id: "foreign".into(),
+            },
+            ResolveResponse::Multi {
+                selected_ids: vec![ApprovalOptionId::Reject.as_str().into()],
+            },
+            ResolveResponse::Freetext { text: "deny".into() },
+            ResolveResponse::Batch {
+                responses: vec![ResolveResponse::Cancel],
+            },
+        ] {
+            assert!(
+                !host_approval_response_declines(&invalid, &offered),
+                "only the exact Cancel or exact offered deny response may terminalize host approval"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_candidate_scope_selections_are_wire_option_ids_not_display_labels() {
+        assert_eq!(
+            approve_option_id_for_scope(Scope::Session).as_str(),
+            ID_APPROVE_SESSION
+        );
+        assert_eq!(
+            approve_option_id_for_scope(Scope::Project).as_str(),
+            ID_APPROVE_PROJECT
+        );
+        assert_eq!(
+            approve_option_id_for_scope(Scope::Global).as_str(),
+            ID_APPROVE_GLOBAL
+        );
+        assert!(
+            !scope_label(Scope::Session).contains('_'),
+            "display prose must not be used as a persisted option id"
+        );
     }
 }

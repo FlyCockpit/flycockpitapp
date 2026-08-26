@@ -866,6 +866,15 @@ async fn in_process_text_hits(
         .session
         .secret_path_matcher(&ctx.config.extended().redact)
         .clone();
+    // The early root approval can wait.  Only now, after all pure search
+    // setup is complete and immediately before the blocking walker begins
+    // reading metadata/content, may its exact Read candidate cross the host
+    // boundary.
+    crate::tools::sandbox::recheck_native_access_effect_boundary(
+        &guard_root,
+        crate::tools::shell_sandbox::SandboxPathAccess::Read,
+    )
+    .await?;
     let outcome = tokio::task::spawn_blocking(move || {
         search_records_blocking(&search_root, &display_root, &options, |path| {
             (path == guard_root || path.starts_with(&guard_root))

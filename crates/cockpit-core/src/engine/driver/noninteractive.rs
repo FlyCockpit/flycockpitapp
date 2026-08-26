@@ -634,6 +634,200 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) task_call_id: String,
     pub(in crate::engine::driver) task_provider_item_id: Option<String>,
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
+    /// Present only when this exact durable executor is reconstructed after a
+    /// worker crash.  The snapshot owns the real next `Message`; no recovery
+    /// path projects it through text or replays the original task payload.
+    pub(in crate::engine::driver) recovery: Option<RecoveredNoninteractiveTaskState>,
+}
+
+pub(in crate::engine::driver) struct RecoveredNoninteractiveTaskState {
+    pub(in crate::engine::driver) agent_instance_id: uuid::Uuid,
+    pub(in crate::engine::driver) label: String,
+    pub(in crate::engine::driver) was_backgrounded: bool,
+    pub(in crate::engine::driver) history: Vec<Message>,
+    pub(in crate::engine::driver) next_prompt: Message,
+    /// The persisted `(history, next_prompt)` is already after this steer’s
+    /// first provider handoff. Recovery must reattach its permit/receipt, not
+    /// append the user payload to history a second time.
+    pub(in crate::engine::driver) late_user_steer_continuation_id: Option<uuid::Uuid>,
+    pub(in crate::engine::driver) pending_recursive: Option<PendingRecursiveContinuation>,
+    /// The session worker consumes the durable recovery claim only after the
+    /// exact child has installed its live warm-resolver endpoint.
+    pub(in crate::engine::driver) endpoint_ready:
+        Option<
+            tokio::sync::oneshot::Sender<
+                std::result::Result<
+                    (
+                        crate::engine::agent::AgentTreeEndpointGeneration,
+                        tokio::sync::mpsc::Sender<crate::engine::agent::AgentTreeExecutorRequest>,
+                    ),
+                    String,
+                >,
+            >,
+        >,
+    /// Shared boot-recovery barrier.  This executor and every recursive
+    /// descendant publish their exact resolver mailbox before the session
+    /// worker consumes the complete durable claim set; none may enter a model
+    /// turn until that acknowledgement releases this gate.
+    pub(in crate::engine::driver) activation_gate:
+        crate::engine::driver::RecoveryActivationGate,
+    /// A recovered batch installs every concrete resolver mailbox before it
+    /// waits for declared predecessors. The gate then preserves the original
+    /// dependency DAG without a global restart barrier.
+    pub(in crate::engine::driver) start_gate: Option<NoninteractiveStartGate>,
+    /// Shared by a recovered root and every recursive descendant.  The worker
+    /// consumes claims only after this collector has observed every exact
+    /// mailbox named by the persisted waiting checkpoint.
+    pub(in crate::engine::driver) endpoint_collector:
+        Option<std::sync::Arc<RecoveredNoninteractiveEndpointCollector>>,
+}
+
+pub(in crate::engine::driver) struct RecoveredNoninteractiveEndpointCollector {
+    endpoints: std::sync::Mutex<
+        std::collections::HashMap<
+            uuid::Uuid,
+            (
+                crate::engine::agent::AgentTreeEndpointGeneration,
+                tokio::sync::mpsc::Sender<crate::engine::agent::AgentTreeExecutorRequest>,
+            ),
+        >,
+    >,
+    /// A recursive descendant can legitimately become terminal while its
+    /// parent is being reconstructed (for example a revoked immutable grant
+    /// is converted into the parent's durable failure result).  Terminal
+    /// descendants are resolved recovery outcomes, not missing mailboxes.
+    terminal: std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>,
+    /// Descriptor/reconstruction failures that cannot be terminalized (most
+    /// importantly because an owned decision is still live) must wake the
+    /// reattacher with an actionable error. Waiting for a mailbox that can
+    /// never be registered would otherwise deadlock worker recovery forever.
+    unrecoverable: std::sync::Mutex<std::collections::HashMap<uuid::Uuid, String>>,
+    changed: tokio::sync::Notify,
+}
+
+impl RecoveredNoninteractiveEndpointCollector {
+    pub(in crate::engine::driver) fn new() -> Self {
+        Self {
+            endpoints: std::sync::Mutex::new(std::collections::HashMap::new()),
+            terminal: std::sync::Mutex::new(std::collections::HashSet::new()),
+            unrecoverable: std::sync::Mutex::new(std::collections::HashMap::new()),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn register(
+        &self,
+        agent_instance_id: uuid::Uuid,
+        endpoint_generation: crate::engine::agent::AgentTreeEndpointGeneration,
+        endpoint: tokio::sync::mpsc::Sender<crate::engine::agent::AgentTreeExecutorRequest>,
+    ) {
+        self.endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(agent_instance_id, (endpoint_generation, endpoint));
+        self.changed.notify_waiters();
+    }
+
+    fn report_terminal(&self, agent_instance_id: uuid::Uuid) {
+        self.terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(agent_instance_id);
+        self.changed.notify_waiters();
+    }
+
+    fn report_unrecoverable(&self, agent_instance_id: uuid::Uuid, error: impl Into<String>) {
+        self.unrecoverable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(agent_instance_id, error.into());
+        self.changed.notify_waiters();
+    }
+
+    pub(in crate::engine::driver) async fn wait_for(
+        &self,
+        expected: &std::collections::BTreeSet<uuid::Uuid>,
+    ) -> Result<Vec<crate::engine::driver::RecoveredNoninteractiveResolverEndpoint>> {
+        loop {
+            let notified = self.changed.notified();
+            let endpoints = self
+                .endpoints
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let terminal = self
+                .terminal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let unrecoverable = self
+                .unrecoverable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((agent_instance_id, error)) = expected
+                .iter()
+                .find_map(|agent_instance_id| {
+                    unrecoverable
+                        .get(agent_instance_id)
+                        .map(|error| (agent_instance_id, error))
+                })
+            {
+                anyhow::bail!(
+                    "recovered recursive executor {agent_instance_id} cannot install a resolver mailbox: {error}"
+                );
+            }
+            if expected.iter().all(|agent_instance_id| {
+                endpoints.contains_key(agent_instance_id) || terminal.contains(agent_instance_id)
+            }) {
+                return Ok(expected
+                    .iter()
+                    .filter_map(|agent_instance_id| {
+                        endpoints.get(agent_instance_id).cloned().map(|(endpoint_generation, endpoint)| {
+                            crate::engine::driver::RecoveredNoninteractiveResolverEndpoint {
+                                agent_instance_id: *agent_instance_id,
+                                endpoint_generation,
+                                endpoint,
+                            }
+                        })
+                    })
+                    .collect());
+            }
+            drop(unrecoverable);
+            drop(terminal);
+            drop(endpoints);
+            notified.await;
+        }
+    }
+}
+
+pub(in crate::engine::driver) struct NoninteractiveStartGate {
+    dependencies: Vec<tokio::sync::watch::Receiver<bool>>,
+    execution_slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl NoninteractiveStartGate {
+    async fn acquire(
+        mut self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, String> {
+        for dependency in &mut self.dependencies {
+            while !*dependency.borrow() {
+                tokio::select! {
+                    changed = dependency.changed() => {
+                        if changed.is_err() {
+                            return Err("declared batch dependency executor disappeared during recovery".to_string());
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        return Err("recovered batch child cancelled before declared dependency completed".to_string());
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            permit = self.execution_slots.clone().acquire_owned() => permit
+                .map_err(|_| "recovered batch execution coordinator stopped".to_string()),
+            _ = cancel.cancelled() => Err("recovered batch child cancelled before execution".to_string()),
+        }
+    }
 }
 
 pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
@@ -678,6 +872,107 @@ pub(in crate::engine::driver) struct BatchNoninteractiveCompletion {
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
     pub(in crate::engine::driver) children: Vec<BatchChildCompletion>,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
+    /// These members had already reached a durable terminal state before the
+    /// worker crashed. Include them in the aggregate result, but never replay
+    /// their terminal DB transition, hook, or report.
+    pub(in crate::engine::driver) already_terminal_labels:
+        std::collections::BTreeSet<String>,
+}
+
+struct RecoveredBatchChild {
+    idx: usize,
+    depends_on: Vec<String>,
+    task: SingleNoninteractiveTask,
+}
+
+struct RecoveredBatchNoninteractiveTask {
+    task_call_id: String,
+    task_provider_item_id: Option<String>,
+    task_function_call_id: Option<String>,
+    repair_notes: Vec<String>,
+    children: Vec<RecoveredBatchChild>,
+    already_terminal: Vec<BatchChildCompletion>,
+}
+
+/// Revalidate the dependency graph copied into an immutable batch descriptor
+/// before recovery rebuilds its in-memory gates. Live launch validates the
+/// parsed `BatchTaskEntry` graph too, but recovery must never turn a corrupt
+/// descriptor's unknown edge into an accidental non-edge (or deadlock on a
+/// cycle).
+fn validate_recovered_batch_dependency_descriptor(
+    entries: &[serde_json::Value],
+) -> Result<()> {
+    let mut dependencies = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for entry in entries {
+        let label = entry
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .context("recovered batch entry has no string label")?
+            .to_owned();
+        let deps = entry
+            .get("depends_on")
+            .and_then(serde_json::Value::as_array)
+            .context("recovered batch entry has no dependency snapshot")?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("recovered batch dependency is not a string")
+                    .map(str::to_owned)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            dependencies.insert(label.clone(), deps).is_none(),
+            "recovered batch descriptor has duplicate label `{label}`"
+        );
+    }
+    anyhow::ensure!(
+        !dependencies.is_empty(),
+        "recovered batch descriptor has no entries"
+    );
+    for (label, deps) in &dependencies {
+        let mut seen = std::collections::BTreeSet::new();
+        for dependency in deps {
+            anyhow::ensure!(dependency != label, "recovered batch entry `{label}` depends on itself");
+            anyhow::ensure!(
+                dependencies.contains_key(dependency),
+                "recovered batch entry `{label}` depends on unknown label `{dependency}`"
+            );
+            anyhow::ensure!(
+                seen.insert(dependency),
+                "recovered batch entry `{label}` lists dependency `{dependency}` more than once"
+            );
+        }
+    }
+    fn visit(
+        label: &str,
+        dependencies: &std::collections::BTreeMap<String, Vec<String>>,
+        visiting: &mut std::collections::BTreeSet<String>,
+        visited: &mut std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        if visited.contains(label) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            visiting.insert(label.to_owned()),
+            "recovered batch dependency cycle includes `{label}`"
+        );
+        for dependency in dependencies
+            .get(label)
+            .expect("recovered dependency graph was validated")
+        {
+            visit(dependency, dependencies, visiting, visited)?;
+        }
+        visiting.remove(label);
+        visited.insert(label.to_owned());
+        Ok(())
+    }
+    let mut visiting = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    for label in dependencies.keys() {
+        visit(label, &dependencies, &mut visiting, &mut visited)?;
+    }
+    Ok(())
 }
 
 pub(in crate::engine::driver) enum BackgroundNoninteractiveCompletion {
@@ -1071,6 +1366,587 @@ impl Driver {
         )
     }
 
+    /// Persist the compatibility task result and its AgentTree terminal
+    /// receipt in one database transaction.  A dependency gate is never
+    /// allowed to observe an in-memory completion before this returns.
+    async fn settle_task_tree_child(
+        &self,
+        task_call_id: &str,
+        label: &str,
+        outcome: crate::db::agent_tree_decisions::TaskDelegationTerminalState,
+        report: Option<&str>,
+    ) -> Result<bool> {
+        self
+            .session
+            .db
+            .settle_task_delegation_child_and_agent(
+                self.session.id,
+                task_call_id.to_string(),
+                label.to_string(),
+                outcome,
+                report.map(str::to_owned),
+                None,
+                serde_json::json!({
+                    "source": "task_delegation",
+                    "task_call_id": task_call_id,
+                    "label": label,
+                    "state": match outcome {
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed => "completed",
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed => "failed",
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Cancelled => "cancelled",
+                    },
+                })
+                .to_string(),
+                crate::agent_tree::system_now_unix_ms(),
+                None,
+            )
+            .await
+    }
+
+    /// Reattach a detached child from the immutable launch descriptor and its
+    /// latest persisted continuation.  This deliberately bypasses task
+    /// creation, payload upsert, and `ensure_*_agent`: all three would either
+    /// mint a second child or overwrite the very checkpoint being recovered.
+    ///
+    /// Batch jobs deliberately do not pass through this one-child launcher:
+    /// their dependency coordinator owns one atomic result delivery. Treating
+    /// a batch label as a stand-alone single task would let it bypass declared
+    /// prerequisites and could emit a partial job result.
+    pub(in crate::engine::driver) async fn reattach_noninteractive_task_child(
+        &mut self,
+        recovery: RecoveredNoninteractiveTaskChild,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> anyhow::Result<Vec<crate::engine::driver::RecoveredNoninteractiveResolverEndpoint>> {
+        anyhow::ensure!(
+            recovery.label == "default",
+            "batch child recovery requires the batch executor reattacher"
+        );
+        let args: serde_json::Value = serde_json::from_str(&recovery.original_args_json)
+            .context("parsing recovered noninteractive task launch descriptor")?;
+        anyhow::ensure!(
+            args.get("interactive").and_then(serde_json::Value::as_bool) == Some(false),
+            "recovered task descriptor is not noninteractive"
+        );
+        anyhow::ensure!(
+            args.get("entries").is_none(),
+            "batch child recovery requires the batch executor reattacher"
+        );
+        let entry = &args;
+        anyhow::ensure!(
+            entry.get("child_agent").and_then(serde_json::Value::as_str)
+                == Some(recovery.child_agent.as_str()),
+            "recovered task child agent does not match its durable descriptor"
+        );
+        let model = crate::engine::model_roles::DelegationModelSelector::from_value(
+            entry.get("model"),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let remaining_depth = entry
+            .get("remaining_depth")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| u32::try_from(value).context("recovered noninteractive task remaining depth overflows u32"))
+            .transpose()?;
+        let granted_tools = entry
+            .get("granted_tools")
+            .and_then(serde_json::Value::as_array)
+            .context("recovered noninteractive task has no granted-tools snapshot")?
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned).context("recovered noninteractive granted tool is not a string"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let repair_notes = args
+            .get("repair_notes")
+            .and_then(serde_json::Value::as_array)
+            .context("recovered noninteractive task has no repair-note snapshot")?
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned).context("recovered noninteractive repair note is not a string"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let requested_cwd = entry.get("requested_cwd").and_then(serde_json::Value::as_str);
+        let child_cwd = self
+            .resolve_child_cwd(requested_cwd)
+            .map_err(anyhow::Error::msg)?;
+        let child_recursion = self
+            .resolve_task_recursion(&recovery.child_agent, remaining_depth, &model)
+            .map_err(anyhow::Error::msg)?;
+        let snapshot = parse_noninteractive_recovery_snapshot(&recovery.snapshot_json)?;
+        let next_prompt = snapshot.next_prompt.clone().unwrap_or_else(|| {
+            Message::user("[recovery: waiting for durable recursive child result]")
+        });
+        let mut expected_endpoints = std::collections::BTreeSet::new();
+        expected_endpoints.insert(recovery.agent_instance_id);
+        if let Some(pending) = snapshot.pending_recursive.as_ref() {
+            let _ = recursive_recovery_execution_order(pending)?;
+            collect_recursive_recovery_endpoint_ids(
+                &self.session,
+                recovery.agent_instance_id,
+                &pending.children,
+                &mut expected_endpoints,
+            )
+            .await?;
+        }
+        let endpoint_collector = std::sync::Arc::new(RecoveredNoninteractiveEndpointCollector::new());
+        let (endpoint_ready, endpoint_attached) = tokio::sync::oneshot::channel();
+        let task = SingleNoninteractiveTask {
+            child_agent: recovery.child_agent,
+            // The checkpoint owns the actual next message. `brief` exists only
+            // for legacy result rendering and is never used by the recovered
+            // execution path below.
+            brief: recovery.payload,
+            model,
+            remaining_depth,
+            why: args.get("why").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+            resume_handle: entry.get("resume_handle").and_then(serde_json::Value::as_str).map(str::to_owned),
+            child_cwd,
+            context: crate::engine::agent::TaskContext::from_value(entry.get("context")),
+            write_scope: entry.get("write_scope").and_then(serde_json::Value::as_str).map(str::to_owned),
+            granted_tools,
+            todo_ids: entry.get("todo_ids").and_then(serde_json::Value::as_array).map(|ids| {
+                ids.iter().map(|id| id.as_str().context("recovered noninteractive todo id is not a string").and_then(|id| uuid::Uuid::parse_str(id).context("recovered noninteractive todo id is not a UUID"))).collect::<anyhow::Result<Vec<_>>>()
+            }).transpose()?.unwrap_or_default(),
+            child_recursion,
+            repair_notes,
+            task_call_id: recovery.task_call_id,
+            task_provider_item_id: args.get("provider_item_id").and_then(serde_json::Value::as_str).map(str::to_owned),
+            task_function_call_id: args.get("function_call_id").and_then(serde_json::Value::as_str).map(str::to_owned),
+            recovery: Some(RecoveredNoninteractiveTaskState {
+                agent_instance_id: recovery.agent_instance_id,
+                label: recovery.label,
+                was_backgrounded: recovery.was_backgrounded,
+                history: snapshot.history,
+                next_prompt,
+                late_user_steer_continuation_id: snapshot.late_user_steer_continuation_id,
+                pending_recursive: snapshot.pending_recursive,
+                endpoint_ready: Some(endpoint_ready),
+                activation_gate: recovery.activation_gate,
+                start_gate: None,
+                endpoint_collector: Some(endpoint_collector.clone()),
+            }),
+        };
+        self.launch_recovered_noninteractive_task(task, tx).await?;
+        endpoint_attached
+            .await
+            .context("recovered noninteractive task exited before installing its resolver mailbox")?
+            .map_err(anyhow::Error::msg)?;
+        endpoint_collector.wait_for(&expected_endpoints).await
+    }
+
+    fn recovered_noninteractive_task_from_entry(
+        &self,
+        recovery: crate::engine::driver::RecoveredNoninteractiveTaskChild,
+        args: &serde_json::Value,
+        entry: &serde_json::Value,
+        endpoint_ready: tokio::sync::oneshot::Sender<
+            std::result::Result<
+                (
+                    crate::engine::agent::AgentTreeEndpointGeneration,
+                    tokio::sync::mpsc::Sender<crate::engine::agent::AgentTreeExecutorRequest>,
+                ),
+                String,
+            >,
+        >,
+        endpoint_collector: std::sync::Arc<RecoveredNoninteractiveEndpointCollector>,
+    ) -> anyhow::Result<SingleNoninteractiveTask> {
+        anyhow::ensure!(
+            entry.get("child_agent").and_then(serde_json::Value::as_str)
+                == Some(recovery.child_agent.as_str()),
+            "recovered batch child agent does not match its durable descriptor"
+        );
+        let model = crate::engine::model_roles::DelegationModelSelector::from_value(entry.get("model"))
+            .map_err(anyhow::Error::msg)?;
+        let remaining_depth = entry
+            .get("remaining_depth")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| u32::try_from(value).context("recovered task remaining depth overflows u32"))
+            .transpose()?;
+        let granted_tools = entry
+            .get("granted_tools")
+            .and_then(serde_json::Value::as_array)
+            .context("recovered task has no granted-tools snapshot")?
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned).context("recovered task granted tool is not a string"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let repair_notes = args
+            .get("repair_notes")
+            .and_then(serde_json::Value::as_array)
+            .context("recovered task has no repair-note snapshot")?
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned).context("recovered task repair note is not a string"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let child_cwd = self
+            .resolve_child_cwd(entry.get("requested_cwd").and_then(serde_json::Value::as_str))
+            .map_err(anyhow::Error::msg)?;
+        let child_recursion = self
+            .resolve_task_recursion(&recovery.child_agent, remaining_depth, &model)
+            .map_err(anyhow::Error::msg)?;
+        let snapshot = parse_noninteractive_recovery_snapshot(&recovery.snapshot_json)?;
+        let next_prompt = snapshot.next_prompt.clone().unwrap_or_else(|| {
+            Message::user("[recovery: waiting for durable recursive child result]")
+        });
+        Ok(SingleNoninteractiveTask {
+            child_agent: recovery.child_agent,
+            brief: recovery.payload,
+            model,
+            remaining_depth,
+            why: args.get("why").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+            resume_handle: entry.get("resume_handle").and_then(serde_json::Value::as_str).map(str::to_owned),
+            child_cwd,
+            context: crate::engine::agent::TaskContext::from_value(entry.get("context")),
+            write_scope: entry.get("write_scope").and_then(serde_json::Value::as_str).map(str::to_owned),
+            granted_tools,
+            todo_ids: entry.get("todo_ids").and_then(serde_json::Value::as_array).map(|ids| {
+                ids.iter().map(|id| id.as_str().context("recovered task todo id is not a string").and_then(|id| uuid::Uuid::parse_str(id).context("recovered task todo id is not a UUID"))).collect::<anyhow::Result<Vec<_>>>()
+            }).transpose()?.unwrap_or_default(),
+            child_recursion,
+            repair_notes,
+            task_call_id: recovery.task_call_id,
+            task_provider_item_id: args.get("provider_item_id").and_then(serde_json::Value::as_str).map(str::to_owned),
+            task_function_call_id: args.get("function_call_id").and_then(serde_json::Value::as_str).map(str::to_owned),
+            recovery: Some(RecoveredNoninteractiveTaskState {
+                agent_instance_id: recovery.agent_instance_id,
+                label: recovery.label,
+                was_backgrounded: recovery.was_backgrounded,
+                history: snapshot.history,
+                next_prompt,
+                late_user_steer_continuation_id: snapshot.late_user_steer_continuation_id,
+                pending_recursive: snapshot.pending_recursive,
+                endpoint_ready: Some(endpoint_ready),
+                activation_gate: recovery.activation_gate,
+                start_gate: None,
+                endpoint_collector: Some(endpoint_collector),
+            }),
+        })
+    }
+
+    pub(in crate::engine::driver) async fn reattach_noninteractive_task_batch(
+        &mut self,
+        recoveries: Vec<crate::engine::driver::RecoveredNoninteractiveTaskChild>,
+        terminal_children: Vec<crate::engine::driver::RecoveredNoninteractiveTaskTerminal>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> anyhow::Result<Vec<crate::engine::driver::RecoveredNoninteractiveResolverEndpoint>> {
+        anyhow::ensure!(!recoveries.is_empty(), "recovered batch has no live children");
+        let task_call_id = recoveries[0].task_call_id.clone();
+        let original_args_json = recoveries[0].original_args_json.clone();
+        let args: serde_json::Value = serde_json::from_str(&original_args_json)
+            .context("parsing recovered batch task launch descriptor")?;
+        anyhow::ensure!(args.get("interactive").and_then(serde_json::Value::as_bool) == Some(false));
+        let entries = args.get("entries").and_then(serde_json::Value::as_array)
+            .context("recovered batch task has no entries")?;
+        validate_recovered_batch_dependency_descriptor(entries)?;
+        let mut endpoints = Vec::with_capacity(recoveries.len());
+        let mut children = Vec::with_capacity(recoveries.len());
+        for recovery in recoveries {
+            anyhow::ensure!(recovery.task_call_id == task_call_id, "recovered batch mixed task ids");
+            anyhow::ensure!(recovery.original_args_json == original_args_json, "recovered batch has divergent immutable descriptors");
+            let entry = entries.iter().enumerate().find(|(_, entry)| {
+                entry.get("label").and_then(serde_json::Value::as_str) == Some(recovery.label.as_str())
+            }).context("recovered batch child label is absent from immutable descriptor")?;
+            let mut expected_endpoints = std::collections::BTreeSet::new();
+            expected_endpoints.insert(recovery.agent_instance_id);
+            let recovery_snapshot = parse_noninteractive_recovery_snapshot(&recovery.snapshot_json)?;
+            if let Some(pending) = recovery_snapshot.pending_recursive.as_ref() {
+                let _ = recursive_recovery_execution_order(pending)?;
+                collect_recursive_recovery_endpoint_ids(
+                    &self.session,
+                    recovery.agent_instance_id,
+                    &pending.children,
+                    &mut expected_endpoints,
+                )
+                .await?;
+            }
+            let endpoint_collector = std::sync::Arc::new(RecoveredNoninteractiveEndpointCollector::new());
+            let (endpoint_ready, endpoint_attached) = tokio::sync::oneshot::channel();
+            let task = self.recovered_noninteractive_task_from_entry(
+                recovery,
+                &args,
+                entry.1,
+                endpoint_ready,
+                endpoint_collector.clone(),
+            )?;
+            let agent_instance_id = task
+                .recovery
+                .as_ref()
+                .expect("recovered task has recovery state")
+                .agent_instance_id;
+            children.push(RecoveredBatchChild { idx: entry.0, depends_on: entry.1.get("depends_on").and_then(serde_json::Value::as_array).context("recovered batch entry has no dependency snapshot")?.iter().map(|value| value.as_str().map(str::to_owned).context("recovered batch dependency is not a string")).collect::<anyhow::Result<Vec<_>>>()?, task });
+            endpoints.push((agent_instance_id, endpoint_attached, endpoint_collector, expected_endpoints));
+        }
+        let terminal = terminal_children.into_iter().filter_map(|terminal| {
+            entries.iter().enumerate().find(|(_, entry)| entry.get("label").and_then(serde_json::Value::as_str) == Some(terminal.label.as_str())).map(|(idx, _)| BatchChildCompletion { idx, label: terminal.label, child_agent: terminal.child_agent, report: terminal.report, failed: terminal.failed, partial_progress: DelegationPartialProgress::default(), snapshot: NoninteractiveDelegationSnapshot::empty() })
+        }).collect::<Vec<_>>();
+        self.launch_recovered_batch_noninteractive_task(RecoveredBatchNoninteractiveTask {
+            task_call_id,
+            task_provider_item_id: args.get("provider_item_id").and_then(serde_json::Value::as_str).map(str::to_owned),
+            task_function_call_id: args.get("function_call_id").and_then(serde_json::Value::as_str).map(str::to_owned),
+            repair_notes: args.get("repair_notes").and_then(serde_json::Value::as_array).map(|notes| notes.iter().filter_map(|note| note.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
+            children,
+            already_terminal: terminal,
+        }, tx).await?;
+        let mut attached = Vec::new();
+        for (agent_instance_id, endpoint, collector, expected_endpoints) in endpoints {
+            let (endpoint_generation, endpoint) = endpoint
+                .await
+                .context("recovered batch child exited before installing resolver mailbox")?
+                .map_err(anyhow::Error::msg)?;
+            collector.register(agent_instance_id, endpoint_generation, endpoint);
+            attached.extend(collector.wait_for(&expected_endpoints).await?);
+        }
+        Ok(attached)
+    }
+
+    async fn launch_recovered_batch_noninteractive_task(
+        &mut self,
+        task: RecoveredBatchNoninteractiveTask,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> anyhow::Result<()> {
+        let activation_gate = task
+            .children
+            .first()
+            .and_then(|child| child.task.recovery.as_ref())
+            .map(|recovery| recovery.activation_gate.clone())
+            .context("recovered batch has no activation gate")?;
+        let permits = self
+            .admit_current_vnext_children(task.children.len())
+            .map_err(anyhow::Error::msg)?;
+        let task_call_id = task.task_call_id.clone();
+        let task_provider_item_id = task.task_provider_item_id.clone();
+        let task_function_call_id = task.task_function_call_id.clone();
+        let completion_task_call_id = task_call_id.clone();
+        let completion_task_provider_item_id = task_provider_item_id.clone();
+        let completion_task_function_call_id = task_function_call_id.clone();
+        for child in &task.children {
+            let recovery = child.task.recovery.as_ref().expect("recovered batch child state");
+            self.noninteractive_delegations.register_running(
+                &task_call_id,
+                &recovery.label,
+                child.task.child_agent.clone(),
+                NoninteractiveDelegationSnapshot::empty(),
+            );
+            if recovery.was_backgrounded {
+                let _ = self
+                    .noninteractive_delegations
+                    .background_on_user_input(&task_call_id, &recovery.label);
+            }
+        }
+        let mut runner = self.clone_for_background_noninteractive(tx);
+        let complete_tx = self.noninteractive_complete_tx.clone();
+        let tx_for_task = tx.clone();
+        let handle = tokio::spawn(async move {
+            let _permits = permits;
+            let result = runner
+                .execute_recovered_batch_noninteractive_task(task, &tx_for_task)
+                .await;
+            if activation_gate.is_aborted() {
+                return;
+            }
+            let _ = complete_tx
+                .send(BackgroundNoninteractiveCompletion::Batch {
+                    task_call_id: completion_task_call_id,
+                    task_provider_item_id: completion_task_provider_item_id,
+                    task_function_call_id: completion_task_function_call_id,
+                    result: Box::new(result),
+                })
+                .await;
+        });
+        self.noninteractive_jobs.insert(
+            task_call_id.clone(),
+            BackgroundNoninteractiveJob {
+                delivered: false,
+                handle,
+            },
+        );
+        Ok(())
+    }
+
+    async fn execute_recovered_batch_noninteractive_task(
+        &mut self,
+        task: RecoveredBatchNoninteractiveTask,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<BatchNoninteractiveCompletion> {
+        use futures::StreamExt as _;
+
+        let RecoveredBatchNoninteractiveTask {
+            task_call_id,
+            task_provider_item_id,
+            task_function_call_id,
+            repair_notes,
+            mut children,
+            already_terminal,
+        } = task;
+        let active_labels = children
+            .iter()
+            .map(|child| child.task.recovery.as_ref().expect("recovery state").label.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let completion_senders = children
+            .iter()
+            .map(|child| {
+                let label = child.task.recovery.as_ref().expect("recovery state").label.clone();
+                let (sender, _receiver) = tokio::sync::watch::channel(false);
+                (label, sender)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        // Each child already holds one atomically admitted direct-child slot
+        // for this recovered batch. Keep an execution permit per child here
+        // so these gates encode only declared dependency edges: a recovery
+        // must not manufacture a global barrier between independent siblings.
+        let execution_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(children.len()));
+        let mut runs = futures::stream::FuturesUnordered::new();
+        for mut child in children.drain(..) {
+            let label = child.task.recovery.as_ref().expect("recovery state").label.clone();
+            let dependencies = child
+                .depends_on
+                .iter()
+                .filter(|dependency| active_labels.contains(*dependency))
+                .map(|dependency| completion_senders
+                    .get(dependency)
+                    .expect("active recovered dependency has completion signal")
+                    .subscribe())
+                .collect::<Vec<_>>();
+            child.task.recovery.as_mut().expect("recovery state").start_gate = Some(
+                NoninteractiveStartGate {
+                    dependencies,
+                    execution_slots: execution_slots.clone(),
+                },
+            );
+            let completion_sender = completion_senders
+                .get(&label)
+                .expect("recovered child has completion signal")
+                .clone();
+            let activation_gate = child
+                .task
+                .recovery
+                .as_ref()
+                .expect("recovered batch child state")
+                .activation_gate
+                .clone();
+            let mut child_runner = self.clone_for_background_noninteractive(tx);
+            let child_tx = tx.clone();
+            let child_task_call_id = task_call_id.clone();
+            runs.push(async move {
+                let outcome = child_runner
+                    .execute_single_noninteractive_task(
+                        child.task,
+                        &child_tx,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await?;
+                anyhow::ensure!(
+                    !activation_gate.is_aborted(),
+                    "recovered batch activation was aborted before its resume claim was consumed"
+                );
+                child_runner
+                    .settle_task_tree_child(
+                        &child_task_call_id,
+                        &label,
+                        if outcome.failed {
+                            crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
+                        } else {
+                            crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed
+                        },
+                        Some(&outcome.report),
+                    )
+                    .await
+                    .context("durably terminalizing recovered batch predecessor before releasing dependents")?;
+                completion_sender.send_replace(true);
+                Ok::<_, anyhow::Error>((child.idx, label, outcome))
+            });
+        }
+        let mut completions = already_terminal;
+        let already_terminal_labels = completions
+            .iter()
+            .map(|child| child.label.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        while let Some(outcome) = runs.next().await {
+            let (idx, label, outcome) = outcome?;
+            completions.push(BatchChildCompletion {
+                idx,
+                label,
+                child_agent: outcome.child_agent,
+                report: outcome.report,
+                failed: outcome.failed,
+                partial_progress: outcome.partial_progress,
+                snapshot: outcome.snapshot,
+            });
+        }
+        Ok(BatchNoninteractiveCompletion {
+            task_call_id,
+            task_provider_item_id,
+            task_function_call_id,
+            children: completions,
+            repair_notes,
+            already_terminal_labels,
+        })
+    }
+
+    async fn launch_recovered_noninteractive_task(
+        &mut self,
+        task: SingleNoninteractiveTask,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> anyhow::Result<()> {
+        let activation_gate = task
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.activation_gate.clone());
+        let task_call_id = task.task_call_id.clone();
+        let task_provider_item_id = task.task_provider_item_id.clone();
+        let task_function_call_id = task.task_function_call_id.clone();
+        let was_backgrounded = task
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.was_backgrounded);
+        let completion_task_call_id = task_call_id.clone();
+        let completion_task_provider_item_id = task_provider_item_id.clone();
+        let completion_task_function_call_id = task_function_call_id.clone();
+        let permits = self
+            .admit_current_vnext_children(1)
+            .map_err(anyhow::Error::msg)?;
+        self.noninteractive_delegations.register_running(
+            &task_call_id,
+            "default",
+            task.child_agent.clone(),
+            NoninteractiveDelegationSnapshot::empty(),
+        );
+        if was_backgrounded {
+            let _ = self
+                .noninteractive_delegations
+                .background_on_user_input(&task_call_id, "default");
+        }
+        let mut runner = self.clone_for_background_noninteractive(tx);
+        let complete_tx = self.noninteractive_complete_tx.clone();
+        let tx_for_task = tx.clone();
+        let handle = tokio::spawn(async move {
+            let _permits = permits;
+            let result = runner
+                .execute_single_noninteractive_task(
+                    task,
+                    &tx_for_task,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            // A failed claim acknowledges no recovered work.  Suppress the
+            // ordinary completion/failure finalizer so an activation abort
+            // cannot turn the still-retryable durable executor into a false
+            // terminal delegation outcome.
+            if activation_gate.is_some_and(|gate| gate.is_aborted()) {
+                return;
+            }
+            let _ = complete_tx
+                .send(BackgroundNoninteractiveCompletion::Single {
+                    task_call_id: completion_task_call_id,
+                    task_provider_item_id: completion_task_provider_item_id,
+                    task_function_call_id: completion_task_function_call_id,
+                    result: Box::new(result),
+                })
+                .await;
+        });
+        self.noninteractive_jobs.insert(
+            task_call_id.clone(),
+            BackgroundNoninteractiveJob {
+                delivered: false,
+                handle,
+            },
+        );
+        Ok(())
+    }
+
     pub(in crate::engine::driver) async fn run_single_noninteractive_task_backgroundable(
         &mut self,
         mut task: SingleNoninteractiveTask,
@@ -1115,13 +1991,19 @@ impl Driver {
         let task_args_json = serde_json::to_string(&serde_json::json!({
             "child_agent": &task.child_agent,
             "model": model_selector_json(&task.model),
+            "remaining_depth": task.remaining_depth,
             "why": &task.why,
             "resume_handle": &task.resume_handle,
             "context": task.context.as_str(),
             "requested_cwd": task.child_cwd.requested_json(),
             "resolved_cwd": &resolved_cwd_display,
             "write_scope": &task.write_scope,
+            "granted_tools": &task.granted_tools,
             "todo_ids": &task.todo_ids,
+            "repair_notes": &task.repair_notes,
+            "provider_item_id": &task.task_provider_item_id,
+            "function_call_id": &task.task_function_call_id,
+            "interactive": false,
         }))
         .ok();
         let parent_agent = self.stack.last().unwrap().agent.name.clone();
@@ -1179,6 +2061,112 @@ impl Driver {
                     ),
                 );
             }
+        }
+        // Publishing a task child is a two-phase durability boundary: create
+        // the immutable task/payload record first, then atomically attach the
+        // exact first model input, change the child to `running`, and create
+        // its AgentTree lineage node in one transaction. No crash can leave a
+        // running child with no reconstructable continuation or tree UUID.
+        let (initial_history, initial_prompt) = if task.context
+            == crate::engine::agent::TaskContext::Fork
+        {
+            (Vec::new(), task.brief.clone())
+        } else {
+            match self
+                .delegation_payload_delivery(
+                    &task_call_id,
+                    "default",
+                    &task.brief,
+                    task.child_agent != "docs",
+                )
+                .await
+            {
+                Ok(delivery) => delivery,
+                Err(error) => {
+                    tracing::warn!(%error, %task_call_id, "preparing initial task continuation failed");
+                    return Ok(
+                        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(
+                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                                &task.repair_notes,
+                            ),
+                        ),
+                    );
+                }
+            }
+        };
+        let initial_snapshot = match ready_noninteractive_recovery_snapshot(
+            initial_history,
+            Message::user(initial_prompt),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, %task_call_id, "serializing initial task continuation failed");
+                return Ok(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                            &task.repair_notes,
+                        ),
+                    ),
+                );
+            }
+        };
+        let Some(parent_agent_instance_id) = self
+            .stack
+            .last()
+            .and_then(|frame| frame.agent_instance_id)
+        else {
+            tracing::warn!(%task_call_id, "single task has no durable parent agent");
+            return Ok(
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    "task",
+                    prepend_task_repair_notes(
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        &task.repair_notes,
+                    ),
+                ),
+            );
+        };
+        if let Err(error) = self
+            .session
+            .db
+            .publish_task_delegation_children_and_agents(
+                self.session.id,
+                parent_agent_instance_id,
+                task_call_id.clone(),
+                vec![crate::db::agent_tree_decisions::NewTaskDelegationAgent {
+                    label: "default".to_string(),
+                    snapshot_json: initial_snapshot,
+                }],
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+        {
+            tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
+            return Ok(
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    "task",
+                    prepend_task_repair_notes(
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        &task.repair_notes,
+                    ),
+                ),
+            );
         }
         self.noninteractive_delegations.register_running(
             &task_call_id,
@@ -1339,7 +2327,106 @@ impl Driver {
             task_call_id,
             task_provider_item_id,
             task_function_call_id,
+            recovery,
         } = task;
+
+        if let Some(recovery) = recovery {
+            // The durable snapshot is the authority for a restarted child.
+            // Do not run the normal payload-delivery/handle-rehydration path:
+            // it would reconstruct a user-text prompt and lose media/tool
+            // result content stored in `next_prompt`.
+            self.config = self.config.repin();
+            let resolved_write_scope = resolve_write_scope(
+                write_scope.as_deref(),
+                &child_cwd.resolved,
+                &self.cwd,
+            )?;
+            let child = crate::engine::builtin::load(
+                &child_agent,
+                &self.spawn_args_delegated_in_cwd_scoped(
+                    &child_cwd.resolved,
+                    false,
+                    granted_tools,
+                    model,
+                    child_recursion,
+                    DelegationConfinement {
+                        lock_identity: Some(format!("{child_agent}#{}", task_call_id)),
+                        write_scope: resolved_write_scope,
+                    },
+                ),
+            )
+            .context("loading recovered noninteractive task child")?;
+            let child_routing = ChildRoutingMetadata::from_model(&child.model);
+            let recovered_next_prompt = recovery.next_prompt;
+            let target = NoninteractiveSteerTarget::new(task_call_id.clone(), recovery.label)
+                .with_agent_instance_id(recovery.agent_instance_id)
+                .with_recovered_late_user_steer_continuation(
+                    recovery.late_user_steer_continuation_id,
+                );
+            let outcome = run_noninteractive_resumable(
+                child,
+                recovered_next_prompt,
+                recovery.history,
+                self.session.clone(),
+                self.locks.clone(),
+                self.redact.clone(),
+                child_cwd.resolved,
+                self.config.clone(),
+                self.interrupts.clone(),
+                cancel,
+                self.approver.clone(),
+                self.resource_scheduler.clone(),
+                self.loop_guard_threshold,
+                EXPLORE_MAX_TURNS,
+                self.vnext_local_installation_resolver.clone(),
+                Some(self.tandem_set.clone()),
+                Some(tx.clone()),
+                Some(target),
+                recovery.endpoint_ready,
+                Some(recovery.activation_gate),
+                recovery.start_gate,
+                recovery.endpoint_collector,
+                recovery.pending_recursive,
+            )
+            .await;
+            return match outcome {
+                Ok(outcome) => Ok(SingleNoninteractiveCompletion {
+                    child_agent,
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    report: outcome.report,
+                    failed: false,
+                    failure: None,
+                    partial_progress: DelegationPartialProgress::default(),
+                    new_handle: None,
+                    snapshot: NoninteractiveDelegationSnapshot::from_history(outcome.history),
+                    shrink: None,
+                    repair_notes,
+                    child_routing: Some(child_routing),
+                }),
+                Err(error) => {
+                    let (message, history, fallback_decision, failure) = error.into_parts();
+                    Ok(SingleNoninteractiveCompletion {
+                        child_agent,
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        report: format!("Error: {message}"),
+                        failed: true,
+                        failure,
+                        partial_progress: DelegationPartialProgress::default(),
+                        new_handle: None,
+                        snapshot: NoninteractiveDelegationSnapshot::from_history(history),
+                        shrink: None,
+                        repair_notes,
+                        child_routing: Some(
+                            child_routing.with_fallback_decision(fallback_decision.as_ref()),
+                        ),
+                    })
+                }
+            };
+        }
 
         // Repin the config to a held snapshot for THIS delegation attempt. A
         // pinned handle's reads return the fixed snapshot and do NOT observe later
@@ -1862,7 +2949,7 @@ impl Driver {
                     };
                     match run_noninteractive_resumable(
                         child,
-                        dispatch_brief,
+                        Message::user(dispatch_brief),
                         prior_history,
                         child_session.clone(),
                         self.locks.clone(),
@@ -1882,6 +2969,11 @@ impl Driver {
                             task_call_id.clone(),
                             "default",
                         )),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                     .await
                     {
@@ -2028,14 +3120,18 @@ impl Driver {
                 failed,
                 Some(result.clone()),
             );
-            if let Err(e) = self
-                .session
-                .db
-                .complete_task_delegation_child(&task_call_id, "default", &report, failed, None)
-                .await
-            {
-                tracing::warn!(error = %e, task_call_id, "complete single delegation child failed");
-            }
+            let _ = self
+                .settle_task_tree_child(
+                    &task_call_id,
+                    "default",
+                    if failed {
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
+                    } else {
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed
+                    },
+                    Some(&report),
+                )
+                .await;
             let _ = self
                 .noninteractive_delegations
                 .mark_delivered(&task_call_id, "default");
@@ -2161,14 +3257,18 @@ impl Driver {
             failed,
             Some(result.clone()),
         );
-        if let Err(e) = self
-            .session
-            .db
-            .complete_task_delegation_child(&task_call_id, "default", &report, failed, None)
-            .await
-        {
-            tracing::warn!(error = %e, task_call_id, "complete single delegation child failed");
-        }
+        let _ = self
+            .settle_task_tree_child(
+                &task_call_id,
+                "default",
+                if failed {
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
+                } else {
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed
+                },
+                Some(&report),
+            )
+            .await;
         let _ = self
             .noninteractive_delegations
             .mark_delivered(&task_call_id, "default");
@@ -2206,6 +3306,7 @@ impl Driver {
         }
         let ctx = crate::engine::agent::ResultRecheckCtx {
             agent_id: child_agent.to_string(),
+            agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
             session: self.session.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
@@ -2598,14 +3699,14 @@ impl Driver {
             .into_iter()
             .filter(|row| row.task_call_id == task_call_id && delegation_status_live(row.status))
         {
-            if let Err(e) = self
-                .session
-                .db
-                .complete_task_delegation_child(task_call_id, &row.label, body, true, None)
-                .await
-            {
-                tracing::warn!(error = %e, task_call_id, label = %row.label, "complete errored background delegation child failed");
-            }
+            let _ = self
+                .settle_task_tree_child(
+                    task_call_id,
+                    &row.label,
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed,
+                    Some(body),
+                )
+                .await;
             self.noninteractive_delegations.complete(
                 task_call_id,
                 &row.label,
@@ -2741,7 +3842,7 @@ impl Driver {
         let row = &selected[0];
         if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
             let reason = if orphaned.contains(&task_control_key(row)) {
-                "lost (daemon restarted; no live worker)".to_string()
+                "recovering durable executor; retry when its worker attaches".to_string()
             } else {
                 delegation_status_name(row.status).to_string()
             };
@@ -2861,58 +3962,33 @@ impl Driver {
                 }
                 let mut changed = Vec::new();
                 let mut unchanged = Vec::new();
-                let mut orphaned_lost = Vec::new();
+                let mut recovering = Vec::new();
                 for row in selected {
                     let key = task_control_key(&row);
                     if orphaned.contains(&key) {
-                        match self
-                            .session
-                            .db
-                            .mark_task_delegation_child_lost(&row.task_call_id, &row.label)
-                            .await
-                        {
-                            Ok(true) => {
-                                let _ = self
-                                    .session
-                                    .db
-                                    .finish_task_assignment(
-                                        self.session.id,
-                                        &row.task_call_id,
-                                        &row.label,
-                                        "lost",
-                                        None,
-                                    )
-                                    .await;
-                                orphaned_lost.push(format!("{}:{}", row.task_call_id, row.label))
-                            }
-                            Ok(false) => unchanged.push(format!(
-                                "{}:{} ({})",
-                                row.task_call_id,
-                                row.label,
-                                task_control_row_status_name(&row, &orphaned)
-                            )),
-                            Err(e) => {
-                                return format!(
-                                    "Error: could not mark orphaned `{}`/`{}` lost: {e:#}",
-                                    row.task_call_id, row.label
-                                );
-                            }
-                        }
+                        // A restart leaves this durable child recoverable. Do
+                        // not reinterpret a human cancel as evidence that it
+                        // was lost: recovery owns reattachment and preserves
+                        // any pending decision/approved-effect receipt.
+                        recovering.push(format!("{}:{}", row.task_call_id, row.label));
                         continue;
                     }
                     let live_changed = self
                         .noninteractive_delegations
                         .cancel(&row.task_call_id, &row.label);
                     let db_changed = match self
-                        .session
-                        .db
-                        .cancel_task_delegation_child(&row.task_call_id, &row.label)
+                        .settle_task_tree_child(
+                            &row.task_call_id,
+                            &row.label,
+                            crate::db::agent_tree_decisions::TaskDelegationTerminalState::Cancelled,
+                            None,
+                        )
                         .await
                     {
                         Ok(changed) => changed,
                         Err(e) => {
                             return format!(
-                                "Error: could not cancel `{}`/`{}`: {e:#}",
+                                "Error: could not atomically cancel `{}`/`{}`: {e:#}",
                                 row.task_call_id, row.label
                             );
                         }
@@ -2939,10 +4015,10 @@ impl Driver {
                         ));
                     }
                 }
-                let state = if changed.is_empty() && orphaned_lost.is_empty() {
+                let state = if changed.is_empty() && recovering.is_empty() {
                     "no_change"
-                } else if !orphaned_lost.is_empty() && changed.is_empty() {
-                    "lost"
+                } else if !recovering.is_empty() && changed.is_empty() {
+                    "recovering"
                 } else {
                     "cancelled"
                 };
@@ -2955,7 +4031,7 @@ impl Driver {
                     "report_available": false,
                     "report_delivered": false,
                     "cancelled": changed,
-                    "orphaned_lost": orphaned_lost,
+                    "recovering": recovering,
                     "unchanged": unchanged,
                     "children": [],
                 }))
@@ -2987,7 +4063,7 @@ impl Driver {
                 let row = &selected[0];
                 if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
                     let reason = if orphaned.contains(&task_control_key(row)) {
-                        "lost (daemon restarted; no live worker)".to_string()
+                        "recovering durable executor; retry when its worker attaches".to_string()
                     } else {
                         delegation_status_name(row.status).to_string()
                     };
@@ -3067,7 +4143,7 @@ impl Driver {
                 let row = &selected[0];
                 if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
                     let reason = if orphaned.contains(&task_control_key(row)) {
-                        "lost (daemon restarted; no live worker)".to_string()
+                        "recovering durable executor; retry when its worker attaches".to_string()
                     } else {
                         delegation_status_name(row.status).to_string()
                     };
@@ -3202,16 +4278,23 @@ impl Driver {
         let task_args_json = serde_json::to_string(&serde_json::json!({
             "entries": task.entries.iter().zip(task.child_cwds.iter()).map(|(entry, child_cwd)| serde_json::json!({
                 "label": &entry.label,
+                "depends_on": &entry.depends_on,
                 "child_agent": &entry.child_agent,
                 "model": model_selector_json(&entry.model),
+                "remaining_depth": entry.remaining_depth,
                 "context": entry.context.as_str(),
                 "resume_handle": &entry.resume_handle,
                 "requested_cwd": child_cwd.requested_json(),
                 "resolved_cwd": child_cwd.resolved_display(),
                 "write_scope": &entry.write_scope,
+                "granted_tools": &entry.granted_tools,
                 "todo_ids": &entry.todo_ids,
             })).collect::<Vec<_>>(),
             "why": &task.why,
+            "repair_notes": &task.repair_notes,
+            "provider_item_id": &task.task_provider_item_id,
+            "function_call_id": &task.task_function_call_id,
+            "interactive": false,
         }))
         .ok();
         let parent_agent = self.stack.last().unwrap().agent.name.clone();
@@ -3268,6 +4351,120 @@ impl Driver {
                     ),
                 );
             }
+        }
+        // Keep a recovered batch all-or-nothing before any AgentTree child is
+        // made running. Each snapshot records the exact first turn for that
+        // label; the database publishes every label and every lineage mapping
+        // in one transaction so a crash cannot produce a partially
+        // addressable dependency graph.
+        let mut initial_snapshots = Vec::with_capacity(task.entries.len());
+        for entry in &task.entries {
+            let (initial_history, initial_prompt) = if entry.context
+                == crate::engine::agent::TaskContext::Fork
+            {
+                (Vec::new(), entry.prompt.clone())
+            } else {
+                match self
+                    .delegation_payload_delivery(
+                        &task_call_id,
+                        &entry.label,
+                        &entry.prompt,
+                        entry.child_agent != "docs",
+                    )
+                    .await
+                {
+                    Ok(delivery) => delivery,
+                    Err(error) => {
+                        tracing::warn!(%error, %task_call_id, label = %entry.label, "preparing initial batch continuation failed");
+                        return Ok(
+                            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                task_call_id,
+                                task_provider_item_id,
+                                task_function_call_id,
+                                "task",
+                                prepend_task_repair_notes(
+                                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                                    &task.repair_notes,
+                                ),
+                            ),
+                        );
+                    }
+                }
+            };
+            let snapshot = match ready_noninteractive_recovery_snapshot(
+                initial_history,
+                Message::user(initial_prompt),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(%error, %task_call_id, label = %entry.label, "serializing initial batch continuation failed");
+                    return Ok(
+                        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(
+                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                                &task.repair_notes,
+                            ),
+                        ),
+                    );
+                }
+            };
+            initial_snapshots.push((entry.label.clone(), snapshot));
+        }
+        let Some(parent_agent_instance_id) = self
+            .stack
+            .last()
+            .and_then(|frame| frame.agent_instance_id)
+        else {
+            tracing::warn!(%task_call_id, "batch task has no durable parent agent");
+            return Ok(
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    "task",
+                    prepend_task_repair_notes(
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        &task.repair_notes,
+                    ),
+                ),
+            );
+        };
+        let tree_children = initial_snapshots
+            .into_iter()
+            .map(|(label, snapshot_json)| crate::db::agent_tree_decisions::NewTaskDelegationAgent {
+                label,
+                snapshot_json,
+            })
+            .collect();
+        if let Err(error) = self
+            .session
+            .db
+            .publish_task_delegation_children_and_agents(
+                self.session.id,
+                parent_agent_instance_id,
+                task_call_id.clone(),
+                tree_children,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+        {
+            tracing::warn!(%error, %task_call_id, "atomically publishing batch task children and agent tree identities failed");
+            return Ok(
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    "task",
+                    prepend_task_repair_notes(
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        &task.repair_notes,
+                    ),
+                ),
+            );
         }
         for entry in &task.entries {
             self.noninteractive_delegations.register_running(
@@ -3629,6 +4826,7 @@ impl Driver {
                     snapshot: NoninteractiveDelegationSnapshot::empty(),
                 }],
                 repair_notes,
+                already_terminal_labels: std::collections::BTreeSet::new(),
             });
         }
         // NOTE: `pregrant_write_scope` is DEFERRED into each child's future, AFTER
@@ -3662,6 +4860,19 @@ impl Driver {
         // an admissible child, which took no permit, still overlap it — the write
         // lock is what excludes the admissible readers.)
         let admission_lock = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        // Every child is admitted to the executor immediately. A child with
+        // declared predecessors awaits *only* those completion signals inside
+        // its own future, so independent siblings retain normal concurrency.
+        // The edge set was validated before persistence and is persisted in the
+        // job transaction; these in-memory watches merely enforce the current
+        // attempt's order.
+        let dependency_completion_senders = entries
+            .iter()
+            .map(|entry| {
+                let (sender, _receiver) = tokio::sync::watch::channel(false);
+                (entry.label.clone(), sender)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         let mut children = Vec::new();
         for (
             idx,
@@ -3682,6 +4893,20 @@ impl Driver {
             .zip(admission_generations)
             .enumerate()
         {
+            let completion_sender = dependency_completion_senders
+                .get(&entry.label)
+                .expect("every batch entry has a completion signal")
+                .clone();
+            let dependency_receivers = entry
+                .depends_on
+                .iter()
+                .map(|label| {
+                    dependency_completion_senders
+                        .get(label)
+                        .expect("batch dependency labels were validated")
+                        .subscribe()
+                })
+                .collect::<Vec<_>>();
             let driver = &*self;
             let entry_why = why.clone();
             let entry_task_call_id = task_call_id.clone();
@@ -3707,11 +4932,21 @@ impl Driver {
                                 label = %entry.label,
                                 "batch task delegation payload delivery failed"
                             );
+                            let refusal = DELEGATION_PAYLOAD_REFUSAL.to_string();
+                            self.settle_task_tree_child(
+                                &task_call_id,
+                                &entry.label,
+                                crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed,
+                                Some(&refusal),
+                            )
+                            .await
+                            .context("durably terminalizing failed batch payload before releasing dependents")?;
+                            completion_sender.send_replace(true);
                             children.push(BatchChildCompletion {
                                 idx,
                                 label: entry.label,
                                 child_agent: entry.child_agent,
-                                report: DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                                report: refusal,
                                 failed: true,
                                 partial_progress: DelegationPartialProgress::default(),
                                 snapshot: NoninteractiveDelegationSnapshot::empty(),
@@ -3805,6 +5040,37 @@ impl Driver {
             let vnext_admission = vnext_admissions.pop();
             let child_fut = async move {
                 let _vnext_admission = vnext_admission;
+                let mut snapshot = NoninteractiveDelegationSnapshot::empty();
+                for mut dependency_complete in dependency_receivers {
+                    while !*dependency_complete.borrow() {
+                        tokio::select! {
+                            changed = dependency_complete.changed() => {
+                                if changed.is_err() {
+                                    return (
+                                        idx,
+                                        entry,
+                                        DelegationChildOutcome::failed(
+                                            "Error: declared batch dependency executor disappeared",
+                                        ),
+                                        snapshot,
+                                        completion_sender,
+                                    );
+                                }
+                            }
+                            _ = child_cancel.cancelled() => {
+                                    return (
+                                        idx,
+                                        entry,
+                                        DelegationChildOutcome::failed(
+                                            "Error: batch child cancelled before declared dependency completed",
+                                        ),
+                                        snapshot,
+                                        completion_sender,
+                                    );
+                            }
+                        }
+                    }
+                }
                 // Surface-gated concurrency (RAII, released on completion / error
                 // / panic): an admissible child holds a SHARED read guard (runs
                 // with other admissible children); a NON-admissible child holds the
@@ -3874,7 +5140,6 @@ impl Driver {
                 // safe only for a child whose real surface is still concurrently
                 // admissible.
                 let held_read = _read_guard.is_some();
-                let mut snapshot = NoninteractiveDelegationSnapshot::empty();
                 let outcome = if let Some(err) = grant_rejection(GrantRejectionInput {
                     parent_cwd: &driver.cwd,
                     cwd: &child_cwd.resolved,
@@ -4013,6 +5278,7 @@ impl Driver {
                                     entry,
                                     DelegationChildOutcome::failed(format!("Error: {e:#}")),
                                     snapshot,
+                                    completion_sender,
                                 );
                             }
                         };
@@ -4045,7 +5311,13 @@ impl Driver {
                             "Error: batch entry `{}`: the child's built surface is more privileged than its admitted read-guard class (its agent definition changed between admission and build); re-delegate",
                             entry.label
                         );
-                        return (idx, entry, DelegationChildOutcome::failed(report), snapshot);
+                        return (
+                            idx,
+                            entry,
+                            DelegationChildOutcome::failed(report),
+                            snapshot,
+                            completion_sender,
+                        );
                     }
                     // Record any write-scope grant under the pinned attempt config,
                     // only AFTER the built child's surface is confirmed to match its
@@ -4080,6 +5352,7 @@ impl Driver {
                                         "Error: failed to create forked task session: {e:#}"
                                     )),
                                     snapshot,
+                                    completion_sender,
                                 );
                             }
                         }
@@ -4117,7 +5390,7 @@ impl Driver {
                     };
                     match run_noninteractive_resumable(
                         child,
-                        brief,
+                        Message::user(brief),
                         prior_history,
                         child_session,
                         driver.locks.clone(),
@@ -4137,6 +5410,11 @@ impl Driver {
                             entry_task_call_id.clone(),
                             entry.label.clone(),
                         )),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                     .await
                     {
@@ -4194,12 +5472,12 @@ impl Driver {
                         }
                     }
                 };
-                (idx, entry, outcome, snapshot)
+                (idx, entry, outcome, snapshot, completion_sender)
             };
             runs.push(child_fut);
         }
 
-        while let Some((idx, entry, outcome, snapshot)) = runs.next().await {
+        while let Some((idx, entry, outcome, snapshot, completion_sender)) = runs.next().await {
             let report = self
                 .reconcile_todo_delta(
                     &task_call_id,
@@ -4212,6 +5490,24 @@ impl Driver {
             let caller = self.stack.last().expect("stack never empty").agent.clone();
             let report =
                 self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name);
+            // This durable transition is the dependency linearization point.
+            // A successor may start only after both the compatibility result
+            // and this exact AgentTree executor's terminal receipt commit.
+            // Returning an error leaves its watch closed, so no dependent can
+            // mistake an unpersisted in-memory result for a predecessor.
+            self.settle_task_tree_child(
+                &task_call_id,
+                &entry.label,
+                if outcome.failed {
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
+                } else {
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed
+                },
+                Some(&report),
+            )
+            .await
+            .context("durably terminalizing batch predecessor before releasing dependents")?;
+            completion_sender.send_replace(true);
             let mut report_data = subagent_report_event_data(
                 &entry.child_agent,
                 Some(&task_call_id),
@@ -4303,6 +5599,7 @@ impl Driver {
             task_function_call_id,
             children,
             repair_notes,
+            already_terminal_labels: std::collections::BTreeSet::new(),
         })
     }
 
@@ -4317,6 +5614,7 @@ impl Driver {
             task_function_call_id,
             mut children,
             repair_notes,
+            already_terminal_labels,
         } = completion;
 
         if children.len() == 1
@@ -4382,6 +5680,9 @@ impl Driver {
             body,
         );
         for (label, report, failed, snapshot) in registry_updates {
+            if already_terminal_labels.contains(&label) {
+                continue;
+            }
             self.noninteractive_delegations
                 .set_snapshot(&task_call_id, &label, snapshot);
             self.noninteractive_delegations.complete(
@@ -4391,14 +5692,18 @@ impl Driver {
                 failed,
                 Some(result.clone()),
             );
-            if let Err(e) = self
-                .session
-                .db
-                .complete_task_delegation_child(&task_call_id, &label, &report, failed, None)
-                .await
-            {
-                tracing::warn!(error = %e, task_call_id, label, "complete batch delegation child failed");
-            }
+            let _ = self
+                .settle_task_tree_child(
+                    &task_call_id,
+                    &label,
+                    if failed {
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
+                    } else {
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed
+                    },
+                    Some(&report),
+                )
+                .await;
             let _ = self
                 .noninteractive_delegations
                 .mark_delivered(&task_call_id, &label);
@@ -4847,7 +6152,7 @@ pub(crate) async fn run_noninteractive(
     // transcript context: it only needs the report text.
     let out = run_noninteractive_resumable(
         child,
-        brief,
+        Message::user(brief),
         Vec::new(),
         session,
         locks,
@@ -4864,6 +6169,11 @@ pub(crate) async fn run_noninteractive(
         tandem,
         event_tx,
         steer_target,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .await?;
     Ok(out.report)
@@ -4873,6 +6183,13 @@ pub(crate) async fn run_noninteractive(
 pub struct NoninteractiveSteerTarget {
     task_call_id: String,
     label: String,
+    /// Recursive vNext children do not share their compatibility task row.
+    /// Their exact durable AgentTree UUID is threaded explicitly so late
+    /// steers, resolver routing, and recovery cannot collapse onto the parent.
+    agent_instance_id: Option<uuid::Uuid>,
+    /// Only set by a recovered snapshot which already captured the first
+    /// provider handoff of this exact accepted continuation.
+    late_user_steer_continuation_id: Option<uuid::Uuid>,
 }
 
 impl NoninteractiveSteerTarget {
@@ -4880,6 +6197,66 @@ impl NoninteractiveSteerTarget {
         Self {
             task_call_id: task_call_id.into(),
             label: label.into(),
+            agent_instance_id: None,
+            late_user_steer_continuation_id: None,
+        }
+    }
+
+    fn with_agent_instance_id(mut self, agent_instance_id: uuid::Uuid) -> Self {
+        self.agent_instance_id = Some(agent_instance_id);
+        self
+    }
+
+    fn with_recovered_late_user_steer_continuation(
+        mut self,
+        continuation_id: Option<uuid::Uuid>,
+    ) -> Self {
+        self.late_user_steer_continuation_id = continuation_id;
+        self
+    }
+}
+
+async fn terminalize_recursive_noninteractive_agent(
+    session: &Session,
+    agent_instance_id: uuid::Uuid,
+    failed: bool,
+) {
+    let next_state = if failed {
+        crate::db::agent_tree_decisions::AgentInstanceState::Failed
+    } else {
+        crate::db::agent_tree_decisions::AgentInstanceState::Completed
+    };
+    for _ in 0..4 {
+        let agent = match session.db.agent_instance(session.id, agent_instance_id).await {
+            Ok(Some(agent)) => agent,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, %agent_instance_id, "loading recursive child lifecycle row failed");
+                return;
+            }
+        };
+        if agent.state.is_terminal() {
+            return;
+        }
+        match session
+            .db
+            .transition_agent_instance(
+                session.id,
+                agent_instance_id,
+                agent.revision,
+                next_state,
+                r#"{"source":"recursive_noninteractive"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+        {
+            Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_))
+            | Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_)) => return,
+            Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict) => continue,
+            Err(error) => {
+                tracing::warn!(%error, %agent_instance_id, "terminalizing recursive child lifecycle row failed");
+                return;
+            }
         }
     }
 }
@@ -5026,6 +6403,34 @@ async fn send_wrapped_noninteractive_event(
         .is_ok()
 }
 
+/// Guarantees that a noninteractive warm endpoint is withdrawn when any of
+/// this function's many terminal paths returns. Its private unbounded ingress
+/// decouples `Drop` from the bounded display/event channel, so backpressure
+/// cannot leave a dead mailbox in the worker's exact-owner registry. If the
+/// worker has already gone away the pump observes its closed receiver, at
+/// which point no registry remains to route through.
+struct NoninteractiveAgentTreeEndpointRegistration {
+    /// An unbounded, endpoint-private teardown lane. `Drop` can always append
+    /// to it even while the bounded worker event queue is full; its dedicated
+    /// pump owns the awaited delivery and preserves the exact detach until the
+    /// worker goes away.
+    cleanup_tx: mpsc::UnboundedSender<TurnEvent>,
+    agent_instance_id: uuid::Uuid,
+    endpoint_generation: crate::engine::agent::AgentTreeEndpointGeneration,
+}
+
+impl Drop for NoninteractiveAgentTreeEndpointRegistration {
+    fn drop(&mut self) {
+        // `UnboundedSender::send` fails only after the receiver/pump has
+        // already gone away. Unlike `try_send` on the bounded worker channel,
+        // a full event queue can never strand this exact-owner registry entry.
+        let _ = self.cleanup_tx.send(TurnEvent::AgentTreeExecutorEndpointDetached {
+            agent_instance_id: self.agent_instance_id,
+            endpoint_generation: self.endpoint_generation,
+        });
+    }
+}
+
 async fn flush_nested_deltas(
     tx: &mpsc::Sender<TurnEvent>,
     target: &NoninteractiveSteerTarget,
@@ -5118,6 +6523,212 @@ fn render_noninteractive_steers(
     out
 }
 
+/// Render AgentTree late steers only after this exact child has claimed their
+/// durable delivery receipt.  These are intentionally not fed through the
+/// legacy task-steer queue: that queue records `delivered` at drain time,
+/// before the child model has accepted a continuation.
+fn render_noninteractive_agent_tree_late_steers(
+    steers: &[crate::db::agent_tree_decisions::LateUserDecisionSteer],
+) -> String {
+    let mut out = String::from("[durable late user decision steer]\n");
+    for (idx, steer) in steers.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", idx + 1, steer.payload_json));
+    }
+    out.push_str("\nContinue this delegated task using the durable user decision above.");
+    out
+}
+
+/// The session worker keeps the receiver for this acknowledgement outside its
+/// main loop.  The noninteractive executor must therefore retain it until the
+/// *whole* accepted continuation reaches a terminal model outcome; a single
+/// provider round that returns `Continue` has only produced an intermediate
+/// tool/result checkpoint.
+type NoninteractiveLateSteerAck = (
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+    String,
+    tokio::sync::oneshot::Sender<
+        crate::engine::driver::LateUserSteerContinuationOutcome,
+    >,
+);
+
+/// Finish accepted noninteractive steers only at the executor's actual
+/// terminal `Done`/`Return` boundary.  Direct DB claims own both the durable
+/// completion and delivery acknowledgement.  Mailbox-delivered claims notify
+/// the session-worker receipt task after they complete; that task owns the
+/// final delivery acknowledgement and schedules the next steer.
+async fn complete_noninteractive_late_steer_continuation(
+    session: &Session,
+    claimed: &[crate::db::agent_tree_decisions::LateUserDecisionSteer],
+    recovery_epoch: Option<uuid::Uuid>,
+    externally_claimed: Vec<NoninteractiveLateSteerAck>,
+) -> Result<()> {
+    let now = crate::agent_tree::system_now_unix_ms();
+    if !claimed.is_empty() {
+        let epoch = recovery_epoch.context(
+            "accepted noninteractive late steer has no recovery epoch at terminal completion",
+        )?;
+        for steer in claimed {
+            anyhow::ensure!(
+                session
+                    .db
+                    .complete_late_user_decision_steer_execution(
+                        session.id,
+                        steer.steer_id,
+                        epoch,
+                        now,
+                    )
+                    .await?,
+                "noninteractive late steer completion lost its exact durable claim"
+            );
+            anyhow::ensure!(
+                session
+                    .db
+                    .ack_late_user_decision_steer_delivery(session.id, steer.steer_id, epoch, now)
+                    .await?,
+                "completed noninteractive late steer acknowledgement lost its exact claim"
+            );
+        }
+    }
+
+    for (steer_id, _, recovery_epoch, _, respond_to) in externally_claimed {
+        let outcome = match session
+            .db
+            .complete_late_user_decision_steer_execution(session.id, steer_id, recovery_epoch, now)
+            .await
+        {
+            Ok(true) => crate::engine::driver::LateUserSteerContinuationOutcome::Completed,
+            Ok(false) => crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                "noninteractive late steer completion lost its exact durable claim",
+            ),
+            Err(error) => crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                format!("persisting noninteractive late steer completion failed: {error:#}"),
+            ),
+        };
+        let _ = respond_to.send(outcome);
+    }
+    Ok(())
+}
+
+/// A cancellation, provider failure, or parked tool is not a completion of an
+/// accepted steer.  Accepted rows are intentionally no-redelivery durable
+/// checkpoints, so this helper only reports the runtime outcome to the
+/// session worker; it never releases or terminalizes those rows.
+fn retain_noninteractive_late_steer_checkpoint(
+    claimed: &[crate::db::agent_tree_decisions::LateUserDecisionSteer],
+    externally_claimed: Vec<NoninteractiveLateSteerAck>,
+    outcome: crate::engine::driver::LateUserSteerContinuationOutcome,
+) {
+    for steer in claimed {
+        tracing::warn!(
+            steer_id = %steer.steer_id,
+            agent_instance_id = %steer.agent_instance_id,
+            ?outcome,
+            "nonterminal noninteractive late steer outcome retained its accepted recovery checkpoint"
+        );
+    }
+    for (_, _, _, _, respond_to) in externally_claimed {
+        let _ = respond_to.send(outcome.clone());
+    }
+}
+
+/// The final provider fence can lose to a new question or approval after an
+/// executor has claimed a pending steer but before it has accepted it.  That
+/// is deliberately not a terminal child failure: release only still-pending
+/// direct claims, notify the session worker for mailbox claims, and let the
+/// owner wait behind its newer continuation.  An already-accepted row is
+/// intentionally untouched by the release CAS and remains its immutable
+/// recovery unit.
+async fn defer_noninteractive_late_steers_until_owner_is_runnable(
+    session: &Session,
+    claimed: &[crate::db::agent_tree_decisions::LateUserDecisionSteer],
+    recovery_epoch: Option<uuid::Uuid>,
+    externally_claimed: Vec<NoninteractiveLateSteerAck>,
+) {
+    if let Some(epoch) = recovery_epoch {
+        let now = crate::agent_tree::system_now_unix_ms();
+        for steer in claimed {
+            match session
+                .db
+                .release_late_user_decision_steer_claim(session.id, steer.steer_id, epoch, now)
+                .await
+            {
+                Ok(true) => tracing::debug!(
+                    steer_id = %steer.steer_id,
+                    agent_instance_id = %steer.agent_instance_id,
+                    "released pending noninteractive late steer after owner parked before provider handoff"
+                ),
+                Ok(false) => tracing::debug!(
+                    steer_id = %steer.steer_id,
+                    agent_instance_id = %steer.agent_instance_id,
+                    "noninteractive late steer was already accepted, terminalized, or claimed by newer recovery"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    steer_id = %steer.steer_id,
+                    agent_instance_id = %steer.agent_instance_id,
+                    "failed to release deferred pending noninteractive late steer"
+                ),
+            }
+        }
+    }
+
+    for (_, _, _, _, respond_to) in externally_claimed {
+        let _ = respond_to.send(
+            crate::engine::driver::LateUserSteerContinuationOutcome::interrupted(
+                "noninteractive late steer is pending behind the owner's current continuation",
+            ),
+        );
+    }
+}
+
+/// Rebuild the same provider-dispatch fence for an accepted steer whose
+/// persisted `(history, next_prompt)` is already past the first provider
+/// handoff.  The worker has independently validated the checkpoint before it
+/// sends this request; this executor additionally requires that it belongs to
+/// the exact snapshot it was reconstructed from.  In particular, the payload
+/// is deliberately *not* rendered into a second prompt here.
+fn recovered_noninteractive_late_steer_permit(
+    expected_continuation_id: uuid::Uuid,
+    agent_instance_id: Option<uuid::Uuid>,
+    session: Arc<Session>,
+    cancel: tokio_util::sync::CancellationToken,
+    ack: &NoninteractiveLateSteerAck,
+) -> std::result::Result<
+    (
+        uuid::Uuid,
+        crate::engine::agent::AgentTreeSteerDispatchPermit,
+    ),
+    String,
+> {
+    let (
+        steer_id,
+        continuation_id,
+        recovery_epoch,
+        _,
+        _,
+    ) = ack;
+    if *continuation_id != expected_continuation_id {
+        return Err("recovered noninteractive late steer continuation does not match its durable snapshot".to_string());
+    }
+    let owner = agent_instance_id.ok_or_else(|| {
+        "recovered noninteractive late steer reached an executor without a durable owner identity"
+            .to_string()
+    })?;
+    Ok((
+        *continuation_id,
+        crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+            session,
+            *steer_id,
+            *continuation_id,
+            owner,
+            *recovery_epoch,
+            cancel,
+        ),
+    ))
+}
+
 /// A finished noninteractive run: the report text plus the full transcript
 /// (so the driver can persist a re-query handle, GOALS §3c).
 pub(crate) struct NoninteractiveOutcome {
@@ -5128,6 +6739,881 @@ pub(crate) struct NoninteractiveOutcome {
     /// normal mode.
     pub history: Vec<Message>,
     pub fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
+}
+
+/// The durable continuation of a noninteractive executor.  Version one was a
+/// ready-to-run `(history, next_prompt)` pair.  Version two additionally
+/// records the one tool result that has not yet been injected because the
+/// parent is waiting on its exact recursive executor set.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct NoninteractiveRecoverySnapshot {
+    version: u8,
+    history: Vec<Message>,
+    #[serde(default)]
+    next_prompt: Option<Message>,
+    /// This marker proves that `history`/`next_prompt` already carry the
+    /// first model handoff for an accepted late steer. It is private recovery
+    /// state, never wire/UI content; a recovered executor uses it to restore
+    /// the same permit without injecting the user payload again.
+    #[serde(default)]
+    late_user_steer_continuation_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    pending_recursive: Option<PendingRecursiveContinuation>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(in crate::engine::driver) struct PendingRecursiveContinuation {
+    task_call_id: String,
+    task_provider_item_id: Option<String>,
+    task_function_call_id: Option<String>,
+    repair_notes: Vec<String>,
+    children: Vec<uuid::Uuid>,
+    #[serde(default)]
+    batch: bool,
+    /// For a recursive batch, the exact topological launch order chosen while
+    /// the parent checkpoint and all child descriptors were committed.  The
+    /// authored `children` order remains the result-rendering order; this
+    /// order is solely the durable dependency schedule used by recovery.
+    batch_execution_order: Vec<uuid::Uuid>,
+    /// Exact predecessor edges for a recursive batch.  A topological order is
+    /// not an execution policy: retaining the edges lets recovery start every
+    /// independent sibling immediately while each dependent waits only for
+    /// its declared predecessors.  UUIDs, not display labels, make this
+    /// resilient to identical child-agent names and preserve the authority
+    /// boundary of the checkpoint that created the executors.
+    batch_dependencies: std::collections::BTreeMap<uuid::Uuid, Vec<uuid::Uuid>>,
+}
+
+/// Produce a stable topological order without turning independent batch
+/// entries into a barrier.  The parser normally validates this graph before a
+/// `TurnOutcome` reaches the driver, but the recursive persistence boundary
+/// validates it again because it is the authority that writes the restart
+/// schedule.
+fn recursive_batch_execution_order_labels(
+    entries: &[crate::engine::agent::BatchTaskEntry],
+) -> std::result::Result<Vec<String>, String> {
+    crate::engine::agent::validate_batch_dependencies(entries)?;
+
+    let mut completed = std::collections::BTreeSet::new();
+    let mut pending = entries.iter().collect::<Vec<_>>();
+    let mut order = Vec::with_capacity(entries.len());
+    while !pending.is_empty() {
+        let Some(index) = pending
+            .iter()
+            .position(|entry| entry.depends_on.iter().all(|dependency| completed.contains(dependency)))
+        else {
+            // `validate_batch_dependencies` has already ruled out cycles;
+            // retaining a defensive error here keeps malformed in-memory
+            // input from becoming a checkpoint that no recovery can obey.
+            return Err("recursive batch has no dependency-ready child".to_string());
+        };
+        let entry = pending.remove(index);
+        completed.insert(entry.label.clone());
+        order.push(entry.label.clone());
+    }
+    Ok(order)
+}
+
+/// Validate and return the exact durable launch order for a recursive
+/// checkpoint.  Both the pre-launch subtree collector and the runner call
+/// this, so a malformed descriptor fails its reattach request rather than
+/// publishing only the parent endpoint and then waiting forever for children
+/// that can never be reconstructed.
+fn recursive_recovery_execution_order(
+    pending: &PendingRecursiveContinuation,
+) -> Result<Vec<uuid::Uuid>> {
+    anyhow::ensure!(
+        !pending.children.is_empty(),
+        "recursive parent checkpoint has no children"
+    );
+    let child_set = pending
+        .children
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    anyhow::ensure!(
+        child_set.len() == pending.children.len(),
+        "recursive checkpoint contains duplicate child identities"
+    );
+    if pending.batch {
+        anyhow::ensure!(
+            pending.batch_execution_order.len() == pending.children.len(),
+            "recursive batch checkpoint has no complete durable dependency schedule"
+        );
+        let scheduled = pending
+            .batch_execution_order
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        anyhow::ensure!(
+            scheduled == child_set,
+            "recursive batch checkpoint dependency schedule does not name its exact child set"
+        );
+        anyhow::ensure!(
+            pending.batch_dependencies.len() == pending.children.len()
+                && pending
+                    .children
+                    .iter()
+                    .all(|child| pending.batch_dependencies.contains_key(child)),
+            "recursive batch checkpoint has no complete durable dependency edges"
+        );
+        let mut completed = std::collections::BTreeSet::new();
+        for child in &pending.batch_execution_order {
+            let dependencies = pending
+                .batch_dependencies
+                .get(child)
+                .expect("validated recursive batch dependency entry");
+            anyhow::ensure!(
+                dependencies.iter().all(|dependency| child_set.contains(dependency)),
+                "recursive batch checkpoint dependency names a child outside its exact set"
+            );
+            anyhow::ensure!(
+                dependencies.iter().all(|dependency| completed.contains(dependency)),
+                "recursive batch checkpoint schedule violates a declared predecessor edge"
+            );
+            completed.insert(*child);
+        }
+        Ok(pending.batch_execution_order.clone())
+    } else {
+        anyhow::ensure!(
+            pending.children.len() == 1,
+            "single recursive checkpoint must name exactly one child"
+        );
+        anyhow::ensure!(
+            pending.batch_execution_order.is_empty(),
+            "single recursive checkpoint unexpectedly carries a batch schedule"
+        );
+        anyhow::ensure!(
+            pending.batch_dependencies.is_empty(),
+            "single recursive checkpoint unexpectedly carries batch dependency edges"
+        );
+        Ok(pending.children.clone())
+    }
+}
+
+fn ready_noninteractive_recovery_snapshot(
+    history: Vec<Message>,
+    next_prompt: Message,
+) -> Result<String> {
+    ready_noninteractive_recovery_snapshot_with_late_steer(history, next_prompt, None)
+}
+
+fn ready_noninteractive_recovery_snapshot_with_late_steer(
+    history: Vec<Message>,
+    next_prompt: Message,
+    late_user_steer_continuation_id: Option<uuid::Uuid>,
+) -> Result<String> {
+    serde_json::to_string(&NoninteractiveRecoverySnapshot {
+        version: 2,
+        history,
+        next_prompt: Some(next_prompt),
+        late_user_steer_continuation_id,
+        pending_recursive: None,
+    })
+    .context("serializing ready noninteractive recovery snapshot")
+}
+
+fn validated_recursive_noninteractive_snapshot(
+    raw: impl AsRef<str>,
+) -> Result<crate::db::agent_tree_decisions::ValidatedRecursiveNoninteractiveSnapshot> {
+    crate::db::agent_tree_decisions::ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(raw)
+        .context("validating recursive noninteractive continuation snapshot")
+}
+
+fn validated_recursive_noninteractive_launch(
+    raw: impl AsRef<str>,
+) -> Result<crate::db::agent_tree_decisions::ValidatedRecursiveNoninteractiveLaunch> {
+    crate::db::agent_tree_decisions::ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(raw)
+        .context("validating recursive noninteractive launch descriptor")
+}
+
+fn waiting_recursive_recovery_snapshot(
+    history: Vec<Message>,
+    pending_recursive: PendingRecursiveContinuation,
+    late_user_steer_continuation_id: Option<uuid::Uuid>,
+) -> Result<String> {
+    serde_json::to_string(&NoninteractiveRecoverySnapshot {
+        version: 2,
+        history,
+        next_prompt: None,
+        late_user_steer_continuation_id,
+        pending_recursive: Some(pending_recursive),
+    })
+    .context("serializing waiting recursive recovery snapshot")
+}
+
+fn parse_noninteractive_recovery_snapshot(
+    raw: &str,
+) -> Result<NoninteractiveRecoverySnapshot> {
+    let snapshot: serde_json::Value =
+        serde_json::from_str(raw).context("parsing noninteractive recovery snapshot")?;
+    let version = snapshot
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .context("recovered noninteractive snapshot has no version")?;
+    match version {
+        1 => Ok(NoninteractiveRecoverySnapshot {
+            version: 1,
+            history: serde_json::from_value(
+                snapshot
+                    .get("history")
+                    .cloned()
+                    .context("recovered noninteractive snapshot has no history")?,
+            )
+            .context("decoding recovered noninteractive history")?,
+            next_prompt: Some(
+                serde_json::from_value(
+                    snapshot
+                        .get("next_prompt")
+                        .cloned()
+                        .context("recovered noninteractive snapshot has no next prompt")?,
+                )
+                .context("decoding recovered noninteractive next prompt")?,
+            ),
+            late_user_steer_continuation_id: None,
+            pending_recursive: None,
+        }),
+        2 => serde_json::from_value(snapshot)
+            .context("decoding version-two noninteractive recovery snapshot"),
+        _ => anyhow::bail!("recovered noninteractive snapshot version is unsupported"),
+    }
+}
+
+async fn collect_recursive_recovery_endpoint_ids(
+    session: &Session,
+    parent_agent_instance_id: uuid::Uuid,
+    children: &[uuid::Uuid],
+    collected: &mut std::collections::BTreeSet<uuid::Uuid>,
+) -> Result<()> {
+    for child_agent_instance_id in children {
+        // A terminal recursive child has an immutable parent-visible outcome
+        // rather than a runnable descriptor. It must not be included in the
+        // exact mailbox set that reattach waits for, but it is still an
+        // authority-bearing edge in the persisted checkpoint, so prove its
+        // exact owner before treating its dependency gate as complete.
+        if let Some(outcome) = session
+            .db
+            .recursive_noninteractive_outcome(session.id, *child_agent_instance_id)
+            .await?
+        {
+            anyhow::ensure!(
+                outcome.parent_agent_instance_id == parent_agent_instance_id,
+                "recursive recovery checkpoint terminal child belongs to a different parent"
+            );
+            continue;
+        }
+        if !collected.insert(*child_agent_instance_id) {
+            anyhow::bail!("recursive recovery checkpoint contains a child cycle");
+        }
+        let descriptor = session
+            .db
+            .recursive_noninteractive_recovery_descriptor(session.id, *child_agent_instance_id)
+            .await?
+            .with_context(|| format!("recursive recovery checkpoint references missing live child {child_agent_instance_id}"))?;
+        let snapshot = parse_noninteractive_recovery_snapshot(descriptor.snapshot.as_json())?;
+        if let Some(pending) = snapshot.pending_recursive {
+            // Validate the whole checkpoint before advertising any endpoint
+            // from this subtree. Otherwise a malformed batch schedule could
+            // leave the worker waiting indefinitely for descendants that the
+            // runner will correctly refuse to start.
+            let _ = recursive_recovery_execution_order(&pending)?;
+            Box::pin(collect_recursive_recovery_endpoint_ids(
+                session,
+                descriptor.agent_instance_id,
+                &pending.children,
+                collected,
+            ))
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+struct RecoveredRecursiveChildReport {
+    agent_instance_id: uuid::Uuid,
+    label: String,
+    child_agent: String,
+    report: String,
+}
+
+/// The immutable portion of a recursive executor.  Building this before an
+/// endpoint is published is deliberately stronger than merely parsing its
+/// JSON descriptor: grant, workspace, builtin, and continuation validation
+/// all have to agree before recovery advertises a mailbox that a decision can
+/// target.
+struct PreparedRecoveredRecursiveExecutor {
+    task_call_id: String,
+    label: String,
+    child_agent: String,
+    child: Agent,
+    child_cwd: std::path::PathBuf,
+    snapshot: NoninteractiveRecoverySnapshot,
+}
+
+async fn prepare_recovered_recursive_noninteractive_executor(
+    descriptor: &crate::db::agent_tree_decisions::RecursiveNoninteractiveRecoveryDescriptor,
+    parent_agent: &Agent,
+    parent_cwd: &std::path::Path,
+    session: &Session,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    local_installations: &crate::agents::LocalInstallationResolver,
+) -> Result<PreparedRecoveredRecursiveExecutor> {
+    let launch: serde_json::Value = serde_json::from_str(descriptor.launch.as_json())
+        .context("parsing recursive executor launch descriptor")?;
+    anyhow::ensure!(
+        launch.get("version").and_then(serde_json::Value::as_u64) == Some(2),
+        "recursive executor launch descriptor version is unsupported"
+    );
+    let task_call_id = launch
+        .get("task_call_id")
+        .and_then(serde_json::Value::as_str)
+        .context("recursive executor launch descriptor has no task call id")?
+        .to_owned();
+    let label = launch
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .context("recursive executor launch descriptor has no parent label")?
+        .to_owned();
+    let child_agent = launch
+        .get("child_agent")
+        .and_then(serde_json::Value::as_str)
+        .context("recursive executor launch descriptor has no child agent")?
+        .to_owned();
+    let model = crate::engine::model_roles::DelegationModelSelector::from_value(launch.get("model"))
+        .map_err(anyhow::Error::msg)?;
+    let granted_tools = launch
+        .get("granted_tools")
+        .and_then(serde_json::Value::as_array)
+        .context("recursive executor launch descriptor has no granted-tools snapshot")?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned).context("recursive executor granted tool is not a string"))
+        .collect::<Result<Vec<_>>>()?;
+    let raw_cwd = launch
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .context("recursive executor launch descriptor has no cwd")?;
+    let child_cwd = resolve_recursive_vnext_child_cwd(
+        Some(raw_cwd),
+        parent_cwd,
+        &session.project_root,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let parent_grant = parent_agent
+        .vnext_grant
+        .as_ref()
+        .context("recovered recursive executor parent has no vNext grant")?
+        .clone();
+    if let Some(error) = super::delegation_helpers::grant_rejection(
+        super::delegation_helpers::GrantRejectionInput {
+            parent_cwd,
+            cwd: &child_cwd,
+            config,
+            parent_agent: &parent_agent.name,
+            parent_vnext_grant: Some(&parent_grant),
+            child_agent: &child_agent,
+            grant: &granted_tools,
+            assistant_db: &session.db,
+            local_installations,
+        },
+    )
+    .await
+    {
+        anyhow::bail!("recovered recursive executor no longer passes its immutable grant: {error}");
+    }
+    let write_scope = resolve_write_scope(
+        launch.get("write_scope").and_then(serde_json::Value::as_str),
+        &child_cwd,
+        &session.project_root,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let child = crate::engine::builtin::load(
+        &child_agent,
+        &crate::engine::builtin::SpawnArgs {
+            model: parent_agent.model.clone(),
+            params: crate::engine::model::ModelParams {
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+                ..parent_agent.params.clone()
+            },
+            env_overlay: parent_agent.env_overlay.clone(),
+            cwd: child_cwd.clone(),
+            config: config.clone(),
+            session_short_id: session.short_id.clone(),
+            assistant_identity_prefix: parent_agent.assistant_identity_prefix.clone(),
+            model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+            interactive: false,
+            llm_mode: parent_agent.llm_mode,
+            model_override: None,
+            delegation_model: model,
+            delegated: true,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
+            vnext_local_installation_resolver: local_installations.clone(),
+            parent_vnext_grant: Some(parent_grant),
+            swarm_depth: 0,
+            swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
+            granted_tools,
+            lock_identity: None,
+            write_scope,
+            credential_store: session.provider_credential_store(&config.providers()).ok(),
+        },
+    )
+    .context("loading recovered recursive noninteractive child")?;
+    let snapshot = parse_noninteractive_recovery_snapshot(descriptor.snapshot.as_json())?;
+    Ok(PreparedRecoveredRecursiveExecutor {
+        task_call_id,
+        label,
+        child_agent,
+        child,
+        child_cwd,
+        snapshot,
+    })
+}
+
+/// Fully reconcile a recursive checkpoint before the parent is permitted to
+/// expose any endpoint.  In particular, do not make a waiting sibling depend
+/// on a mailbox that a malformed descriptor, revoked grant, invalid cwd, or
+/// unavailable builtin can never create.
+async fn preflight_pending_recursive_recovery(
+    parent_agent_instance_id: uuid::Uuid,
+    parent_agent: &Agent,
+    parent_cwd: &std::path::Path,
+    pending: &PendingRecursiveContinuation,
+    session: &Session,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    local_installations: &crate::agents::LocalInstallationResolver,
+) -> Result<()> {
+    for child_agent_instance_id in recursive_recovery_execution_order(pending)? {
+        // Completed recursive children deliberately have no live recovery
+        // descriptor/mailbox. Their durable outcome is the restart-safe
+        // dependency receipt; authorize it by the exact parent edge and let
+        // live siblings/dependents continue through their normal preflight.
+        if let Some(outcome) = session
+            .db
+            .recursive_noninteractive_outcome(session.id, child_agent_instance_id)
+            .await?
+        {
+            anyhow::ensure!(
+                outcome.parent_agent_instance_id == parent_agent_instance_id,
+                "recursive parent checkpoint terminal child belongs to a different parent"
+            );
+            continue;
+        }
+        let descriptor = session
+            .db
+            .recursive_noninteractive_recovery_descriptor(session.id, child_agent_instance_id)
+            .await?
+            .with_context(|| format!("recursive parent checkpoint references missing live child {child_agent_instance_id}"))?;
+        anyhow::ensure!(
+            descriptor.parent_agent_instance_id == parent_agent_instance_id,
+            "recursive parent checkpoint references a child owned by a different parent"
+        );
+        let prepared = prepare_recovered_recursive_noninteractive_executor(
+            &descriptor,
+            parent_agent,
+            parent_cwd,
+            session,
+            config,
+            local_installations,
+        )
+        .await?;
+        if let Some(nested) = prepared.snapshot.pending_recursive.as_ref() {
+            Box::pin(preflight_pending_recursive_recovery(
+                descriptor.agent_instance_id,
+                &prepared.child,
+                &prepared.child_cwd,
+                nested,
+                session,
+                config,
+                local_installations,
+            ))
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Reconstruct one recursive executor under the exact already-reconstructed
+/// parent agent.  It deliberately does not consult the foreground driver's
+/// stack: that stack represents a different executor after a restart and
+/// would be an authority escalation for a nested vNext child.
+async fn run_recovered_recursive_noninteractive_executor(
+    descriptor: crate::db::agent_tree_decisions::RecursiveNoninteractiveRecoveryDescriptor,
+    parent_agent: &Agent,
+    parent_cwd: &std::path::Path,
+    session: Arc<Session>,
+    locks: Arc<crate::locks::LockManager>,
+    redact: Arc<RedactionTable>,
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    cancel: tokio_util::sync::CancellationToken,
+    approver: Option<Arc<crate::approval::Approver>>,
+    resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    loop_guard_threshold: u32,
+    max_turns: usize,
+    local_installations: crate::agents::LocalInstallationResolver,
+    tandem: Option<crate::engine::schedule::TandemSet>,
+    event_tx: Option<mpsc::Sender<TurnEvent>>,
+    endpoint_collector: Option<std::sync::Arc<RecoveredNoninteractiveEndpointCollector>>,
+    activation_gate: Option<crate::engine::driver::RecoveryActivationGate>,
+    start_gate: Option<NoninteractiveStartGate>,
+) -> Result<RecoveredRecursiveChildReport> {
+    let PreparedRecoveredRecursiveExecutor {
+        task_call_id,
+        label,
+        child_agent,
+        child,
+        child_cwd,
+        snapshot,
+    } = prepare_recovered_recursive_noninteractive_executor(
+        &descriptor,
+        parent_agent,
+        parent_cwd,
+        &session,
+        &config,
+        &local_installations,
+    )
+    .await?;
+    let next_prompt = snapshot.next_prompt.unwrap_or_else(|| {
+        Message::user("[recovery: waiting for durable recursive child result]")
+    });
+    let outcome = run_noninteractive_resumable(
+        child,
+        next_prompt,
+        snapshot.history,
+        session,
+        locks,
+        redact,
+        child_cwd,
+        config,
+        interrupts,
+        cancel,
+        approver,
+        resource_scheduler,
+        loop_guard_threshold,
+        max_turns,
+        local_installations,
+        tandem,
+        event_tx,
+        Some(
+            NoninteractiveSteerTarget::new(task_call_id, label.clone())
+                .with_agent_instance_id(descriptor.agent_instance_id)
+                .with_recovered_late_user_steer_continuation(
+                    snapshot.late_user_steer_continuation_id,
+                ),
+        ),
+        None,
+        activation_gate,
+        start_gate,
+        endpoint_collector,
+        snapshot.pending_recursive,
+    )
+    .await
+    .map(|outcome| outcome.report)
+    .unwrap_or_else(|error| format!("Error: {error}"));
+    Ok(RecoveredRecursiveChildReport {
+        agent_instance_id: descriptor.agent_instance_id,
+        label,
+        child_agent,
+        report: outcome,
+    })
+}
+
+/// Resolve the persisted children before the parent makes another model call.
+/// The child UUID order is the authored result order, while the persisted
+/// predecessor edges are the execution policy.  Recovery starts every child
+/// immediately so each can publish its exact resolver endpoint; a child waits
+/// only for the predecessors it explicitly declared.  This is important for
+/// both correctness (independent children must remain independent after a
+/// restart) and availability (decision replay must not wait for an unrelated
+/// sibling to finish before its owner becomes addressable).
+async fn recover_pending_recursive_continuation(
+    parent_agent_instance_id: uuid::Uuid,
+    parent_agent: &Agent,
+    parent_cwd: &std::path::Path,
+    history: Vec<Message>,
+    pending: PendingRecursiveContinuation,
+    session: Arc<Session>,
+    locks: Arc<crate::locks::LockManager>,
+    redact: Arc<RedactionTable>,
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    cancel: tokio_util::sync::CancellationToken,
+    approver: Option<Arc<crate::approval::Approver>>,
+    resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    loop_guard_threshold: u32,
+    max_turns: usize,
+    local_installations: crate::agents::LocalInstallationResolver,
+    tandem: Option<crate::engine::schedule::TandemSet>,
+    event_tx: Option<mpsc::Sender<TurnEvent>>,
+    endpoint_collector: Option<std::sync::Arc<RecoveredNoninteractiveEndpointCollector>>,
+    activation_gate: Option<crate::engine::driver::RecoveryActivationGate>,
+) -> Result<Message> {
+    use futures::StreamExt as _;
+
+    let child_positions = pending
+        .children
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(position, child_agent_instance_id)| (child_agent_instance_id, position))
+        .collect::<std::collections::HashMap<_, _>>();
+    let execution_order = recursive_recovery_execution_order(&pending)?;
+    let mut launches = Vec::with_capacity(pending.children.len());
+    let mut recovered_terminal_reports = Vec::new();
+    let mut recovered_terminal_ids = std::collections::BTreeSet::new();
+    for child_agent_instance_id in execution_order {
+        let idx = *child_positions
+            .get(&child_agent_instance_id)
+            .expect("validated recursive execution schedule names a child");
+        if let Some(outcome) = session
+            .db
+            .recursive_noninteractive_outcome(session.id, child_agent_instance_id)
+            .await?
+        {
+            anyhow::ensure!(
+                outcome.parent_agent_instance_id == parent_agent_instance_id,
+                "recursive outcome belongs to a different parent"
+            );
+            recovered_terminal_ids.insert(child_agent_instance_id);
+            recovered_terminal_reports.push((
+                idx,
+                RecoveredRecursiveChildReport {
+                    agent_instance_id: child_agent_instance_id,
+                    label: outcome.label,
+                    child_agent: outcome.child_agent,
+                    report: outcome.report,
+                },
+            ));
+            continue;
+        }
+        let descriptor = session
+            .db
+            .recursive_noninteractive_recovery_descriptor(session.id, child_agent_instance_id)
+            .await?
+            .with_context(|| format!("recursive parent checkpoint references missing live child {child_agent_instance_id}"))?;
+        anyhow::ensure!(
+            descriptor.parent_agent_instance_id == parent_agent_instance_id,
+            "recursive parent checkpoint references a child owned by a different parent"
+        );
+        // Keep a presentation-only fallback before moving the immutable
+        // descriptor into the reconstruction routine. It is used only when a
+        // malformed launch cannot be rebuilt; it never influences authority
+        // or recovery routing.
+        let failure_launch = serde_json::from_str::<serde_json::Value>(descriptor.launch.as_json()).ok();
+        let failure_label = failure_launch
+            .as_ref()
+            .and_then(|launch| launch.get("label"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("recovered-child-{}", idx + 1));
+        let failure_child_agent = failure_launch
+            .as_ref()
+            .and_then(|launch| launch.get("child_agent"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        launches.push((
+            idx,
+            child_agent_instance_id,
+            descriptor,
+            failure_label,
+            failure_child_agent,
+        ));
+    }
+    let completion_senders = pending
+        .children
+        .iter()
+        .copied()
+        .map(|agent_instance_id| {
+            let (sender, _receiver) = tokio::sync::watch::channel(false);
+            (agent_instance_id, sender)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    // Previously committed children are already durable predecessors.  Their
+    // dependents may begin immediately after recovery, while live siblings
+    // retain their exact declared gates.
+    for child_agent_instance_id in &recovered_terminal_ids {
+        completion_senders
+            .get(child_agent_instance_id)
+            .expect("terminal recursive child has completion signal")
+            .send_replace(true);
+    }
+    let parent_agent = parent_agent.clone();
+    let parent_cwd = parent_cwd.to_path_buf();
+    let execution_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(pending.children.len()));
+    let mut runs = futures::stream::FuturesUnordered::new();
+    for (idx, child_agent_instance_id, descriptor, failure_label, failure_child_agent) in launches {
+        let dependencies = pending
+            .batch_dependencies
+            .get(&child_agent_instance_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dependency| {
+                completion_senders
+                    .get(&dependency)
+                    .expect("validated recursive batch dependency has a completion signal")
+                    .subscribe()
+            })
+            .collect::<Vec<_>>();
+        let completion_sender = completion_senders
+            .get(&child_agent_instance_id)
+            .expect("validated recursive child has a completion signal")
+            .clone();
+        let parent_agent = parent_agent.clone();
+        let parent_cwd = parent_cwd.clone();
+        let session = session.clone();
+        let locks = locks.clone();
+        let redact = redact.clone();
+        let config = config.clone();
+        let interrupts = interrupts.clone();
+        let cancel = cancel.clone();
+        let approver = approver.clone();
+        let resource_scheduler = resource_scheduler.clone();
+        let local_installations = local_installations.clone();
+        let tandem = tandem.clone();
+        let event_tx = event_tx.clone();
+        let endpoint_collector = endpoint_collector.clone();
+        let activation_gate = activation_gate.clone();
+        let start_gate = NoninteractiveStartGate {
+            dependencies,
+            execution_slots: execution_slots.clone(),
+        };
+        runs.push(async move {
+            let settlement_session = session.clone();
+            let recovered = match Box::pin(run_recovered_recursive_noninteractive_executor(
+                descriptor,
+                &parent_agent,
+                &parent_cwd,
+                session,
+                locks,
+                redact,
+                config,
+                interrupts,
+                cancel,
+                approver,
+                resource_scheduler,
+                loop_guard_threshold,
+                max_turns,
+                local_installations,
+                tandem,
+                event_tx,
+                endpoint_collector,
+                activation_gate,
+                Some(start_gate),
+            ))
+            .await
+            {
+                Ok(recovered) => recovered,
+                Err(error)
+                    if activation_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.is_aborted()) =>
+                {
+                    // The worker failed the all-or-nothing recovery claim.
+                    // This is not a child execution failure: retain every
+                    // exact durable checkpoint for the next epoch rather
+                    // than settling a fabricated terminal report.
+                    return Err(error);
+                }
+                Err(error) => RecoveredRecursiveChildReport {
+                    // The descriptor was found and its durable parent ownership
+                    // were verified before this executor was admitted. A
+                    // malformed launch, revoked grant, or unavailable builtin
+                    // is terminal for this child, never a retry loop.
+                    agent_instance_id: child_agent_instance_id,
+                    label: failure_label,
+                    child_agent: failure_child_agent,
+                    report: format!("Error: could not reconstruct recursive executor: {error:#}"),
+                },
+            };
+            settlement_session
+                .db
+                .settle_recursive_noninteractive_child_outcome(
+                    settlement_session.id,
+                    parent_agent_instance_id,
+                    child_agent_instance_id,
+                    recovered.label.clone(),
+                    recovered.child_agent.clone(),
+                    recovered.report.clone(),
+                    recovered.report.starts_with("Error:"),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await?;
+            completion_sender.send_replace(true);
+            Ok::<_, anyhow::Error>((idx, recovered))
+        });
+    }
+    let mut reports = recovered_terminal_reports;
+    while let Some(report) = runs.next().await {
+        reports.push(report?);
+    }
+    let terminal_children = reports
+        .iter()
+        .map(|(_, report)| (report.agent_instance_id, report.report.starts_with("Error:")))
+        .collect::<Vec<_>>();
+    let result = if pending.batch {
+        render_recursive_vnext_batch_result(
+            reports
+                .iter()
+                .map(|(idx, report)| {
+                    (
+                        *idx,
+                        report.label.clone(),
+                        report.child_agent.clone(),
+                        report.report.clone(),
+                    )
+                })
+                .collect(),
+        )
+    } else {
+        anyhow::ensure!(reports.len() == 1, "single recursive checkpoint has multiple children");
+        reports.remove(0).1.report
+    };
+    let completed_next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+        pending.task_call_id,
+        pending.task_provider_item_id,
+        pending.task_function_call_id,
+        "task",
+        prepend_task_repair_notes(result, &pending.repair_notes),
+    );
+    let parent_snapshot = ready_noninteractive_recovery_snapshot(
+        history,
+        completed_next_prompt.clone(),
+    )?;
+    let parent_snapshot = validated_recursive_noninteractive_snapshot(&parent_snapshot)?;
+    if let Err(error) = session
+        .db
+        .complete_recursive_noninteractive_children_and_checkpoint_parent(
+            session.id,
+            parent_agent_instance_id,
+            parent_snapshot,
+            terminal_children.clone(),
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+    {
+        // In particular, a child with a live Attention decision is forbidden
+        // from terminalization. Wake the endpoint collector rather than
+        // leaving recovery blocked forever on a descriptor that intentionally
+        // did not create a runnable mailbox. The durable claim remains for a
+        // later epoch, when the decision/grant can be reconciled safely.
+        if let Some(collector) = endpoint_collector.as_ref() {
+            let detail = format!("recursive terminal recovery failed: {error:#}");
+            for (agent_instance_id, _) in &terminal_children {
+                collector.report_unrecoverable(*agent_instance_id, detail.clone());
+            }
+        }
+        return Err(error);
+    }
+    if let Some(collector) = endpoint_collector.as_ref() {
+        for (agent_instance_id, _) in &terminal_children {
+            collector.report_terminal(*agent_instance_id);
+        }
+    }
+    Ok(completed_next_prompt)
 }
 
 #[derive(Debug)]
@@ -5187,6 +7673,138 @@ impl std::fmt::Display for NoninteractiveRunError {
 
 impl std::error::Error for NoninteractiveRunError {}
 
+/// Replay one already-terminal QuestionTool call inside the exact detached or
+/// recursive executor that originally parked it.  This deliberately mirrors
+/// the foreground driver's ordinary-call path rather than asking the model to
+/// regenerate the pre-interrupt prompt: the persisted call id, arguments,
+/// gate memo, response, and question occurrence remain the authority.
+#[allow(clippy::too_many_arguments)]
+async fn replay_parked_interrupt_in_noninteractive_executor(
+    agent: &Agent,
+    agent_instance_id: uuid::Uuid,
+    history: &mut Vec<Message>,
+    session: &Arc<Session>,
+    locks: &Arc<crate::locks::LockManager>,
+    redact: &Arc<RedactionTable>,
+    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    interrupts: &Arc<crate::engine::interrupt::InterruptHub>,
+    approver: &Option<Arc<crate::approval::Approver>>,
+    resource_scheduler: &Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    loop_guard_threshold: u32,
+    deferred_log: crate::engine::deferred::DeferredLog,
+    tx: &mpsc::Sender<TurnEvent>,
+    interrupt_id: uuid::Uuid,
+    payload: crate::db::needs_attention::InterruptParkPayload,
+    response: crate::daemon::proto::ResolveResponse,
+    question: crate::engine::interrupt::PreResolvedInterruptQuestion,
+) -> Result<()> {
+    use rig::message::ToolFunction;
+
+    // The exact AgentTree UUID is the continuation identity. The resume
+    // anchor's agent name remains transcript/display provenance only, so a
+    // renamed or same-named recursive executor cannot reject or steal this
+    // replay on a string comparison.
+    anyhow::ensure!(
+        question.agent_instance_id == Some(agent_instance_id),
+        "recovered QuestionTool identity does not match this noninteractive executor"
+    );
+    let active_tools = crate::engine::agent::turn_toolbox(agent, session, cwd, config).await;
+    anyhow::ensure!(
+        active_tools.get(&payload.tool).is_some(),
+        "parked interrupt tool `{}` is not registered",
+        payload.tool
+    );
+    super::delegation_helpers::ensure_or_restore_parked_tool_call(history, &payload)?;
+    let ctx = crate::engine::tool::ToolCtx {
+        agent_id: agent.name.clone(),
+        agent_instance_id: Some(agent_instance_id),
+        lock_identity: agent.name.clone(),
+        write_scope: None,
+        current_tool_call_id: None,
+        llm_mode: agent.llm_mode,
+        locks: locks.clone(),
+        session: session.clone(),
+        cwd: cwd.to_path_buf(),
+        redact: redact.clone(),
+        interrupts: interrupts.clone(),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        shutdown_gate: agent.model.shutdown_gate(),
+        approver: approver.clone(),
+        deferred_log,
+        root_agent_frame: false,
+        skill_write_origin: payload.resume.call_origin,
+        review_cage: None,
+        context_usage: Some(crate::engine::tool::ContextUsageSnapshot::unavailable()),
+        available_tools: Arc::new(
+            active_tools
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+        mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+        has_tree: agent.tools.get("code").is_some(),
+        has_bash: agent.tools.get("bash").is_some(),
+        events: Some(tx.clone()),
+        lsp: None,
+        resource_scheduler: resource_scheduler.clone(),
+        env_overlay: agent.env_overlay.clone(),
+        config: config.clone(),
+    };
+    let call = crate::engine::message::ToolCall {
+        id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
+        provider: payload
+            .resume
+            .provider_call_id
+            .clone()
+            .and_then(rig::message::ProviderCallId::new)
+            .map(|provider| match payload.resume.provider_item_id.clone() {
+                Some(item_id) => provider.with_item_id(item_id),
+                None => provider,
+            }),
+        function: ToolFunction {
+            name: payload.tool.clone(),
+            arguments: payload.args.clone(),
+        },
+        signature: None,
+        additional_params: None,
+    };
+    let config_snapshot = ctx.config.snapshot();
+    let env = crate::engine::agent::tool_dispatch::DispatchEnv {
+        agent,
+        session,
+        model: &agent.model,
+        active_tools: &active_tools,
+        ctx: &ctx,
+        tx,
+        hint_corrections: crate::engine::agent::hint_tool_call_corrections_enabled(session, config),
+        loop_guard_threshold,
+        cwd,
+        hooks: config_snapshot.hooks(),
+    };
+    crate::engine::interrupt::with_pre_resolved_interrupt_question(
+        interrupt_id,
+        response,
+        question,
+        async {
+            crate::engine::interrupt::with_interrupt_park_payload(payload.clone(), async {
+                crate::engine::agent::tool_dispatch::execute_ordinary_call(
+                    &env,
+                    history,
+                    &call,
+                    &payload.tool,
+                    crate::db::tool_calls::Recovery::Clean,
+                    None,
+                )
+                .await
+            })
+            .await
+        },
+    )
+    .await
+}
+
 /// Run a child agent's loop to completion, optionally **rehydrated** from a
 /// prior transcript (`prior_history`). Returns the report + the full
 /// transcript. [`run_noninteractive`] is the no-rehydrate wrapper used by the
@@ -5194,7 +7812,7 @@ impl std::error::Error for NoninteractiveRunError {}
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_noninteractive_resumable(
     child: Agent,
-    brief: String,
+    initial_prompt: Message,
     prior_history: Vec<Message>,
     session: Arc<Session>,
     locks: Arc<crate::locks::LockManager>,
@@ -5215,6 +7833,24 @@ pub(crate) async fn run_noninteractive_resumable(
     tandem: Option<crate::engine::schedule::TandemSet>,
     event_tx: Option<mpsc::Sender<TurnEvent>>,
     steer_target: Option<NoninteractiveSteerTarget>,
+    /// Used only while reattaching a durable executor. The mailbox is handed
+    /// directly to the owning worker after its normal lifecycle registration
+    /// has been accepted, avoiding a polling race with the event forwarder.
+    endpoint_ready: Option<
+        tokio::sync::oneshot::Sender<
+            std::result::Result<
+                (
+                    crate::engine::agent::AgentTreeEndpointGeneration,
+                    tokio::sync::mpsc::Sender<crate::engine::agent::AgentTreeExecutorRequest>,
+                ),
+                String,
+            >,
+        >,
+    >,
+    activation_gate: Option<crate::engine::driver::RecoveryActivationGate>,
+    start_gate: Option<NoninteractiveStartGate>,
+    endpoint_collector: Option<std::sync::Arc<RecoveredNoninteractiveEndpointCollector>>,
+    pending_recursive: Option<PendingRecursiveContinuation>,
 ) -> std::result::Result<NoninteractiveOutcome, NoninteractiveRunError> {
     use crate::engine::agent::turn_with_backup;
 
@@ -5243,16 +7879,767 @@ pub(crate) async fn run_noninteractive_resumable(
     // Rehydration: a follow-up starts from the subagent's prior transcript,
     // so it answers with full knowledge of what it already did (GOALS §3c).
     let mut history: Vec<Message> = prior_history;
-    let mut next_prompt = Message::user(brief);
+    let mut next_prompt = initial_prompt;
     let mut fallback_decision: Option<crate::engine::agent::BackupFallbackDecision> = None;
     let mut fallback_tried: Vec<crate::engine::agent::FailoverAttempt> = Vec::new();
+    // The task row is the durable executor anchor on a restart.  A missing
+    // mapping is intentionally left as `None` for non-delegation utility
+    // callers; normal task creation binds it before an executor is spawned.
+    let agent_instance_id = match &steer_target {
+        Some(target) if target.agent_instance_id.is_some() => target.agent_instance_id,
+        Some(target) => match session
+            .db
+            .task_delegation_child_agent(
+                session.id,
+                target.task_call_id.clone(),
+                target.label.clone(),
+            )
+            .await
+        {
+            Ok(Some(agent)) => Some(agent.agent_instance_id),
+            Ok(None) => {
+                tracing::warn!(task_call_id = %target.task_call_id, label = %target.label, "noninteractive executor has no durable agent-tree child");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, task_call_id = %target.task_call_id, label = %target.label, "loading noninteractive task lifecycle child failed");
+                None
+            }
+        },
+        None => None,
+    };
+    let mut endpoint_ready = endpoint_ready;
+    if let (Some(pending), Some(parent_agent_instance_id)) =
+        (pending_recursive.as_ref(), agent_instance_id)
+        && let Err(error) = Box::pin(preflight_pending_recursive_recovery(
+            parent_agent_instance_id,
+            agent.as_ref(),
+            &cwd,
+            pending,
+            &session,
+            &config,
+            &local_installations,
+        ))
+        .await
+    {
+        // A recursive waiting checkpoint must be all-or-nothing from the
+        // recovery worker's point of view.  If any descendant cannot be
+        // reconstructed, fail this attempt before the parent or a sibling
+        // exposes a resolver endpoint; otherwise a pending decision could be
+        // routed into a partial tree that has no way to install the declared
+        // endpoint set.
+        let detail = format!("recursive recovery preflight failed: {error:#}");
+        if let Some(endpoint_ready) = endpoint_ready.take() {
+            let _ = endpoint_ready.send(Err(detail.clone()));
+        }
+        if let Some(collector) = endpoint_collector.as_ref() {
+            collector.report_unrecoverable(parent_agent_instance_id, detail.clone());
+        }
+        drop(child_tx);
+        let _ = forwarder.await;
+        return Err(NoninteractiveRunError::new(
+            anyhow::anyhow!(detail),
+            history,
+            fallback_decision,
+            fallback_tried,
+        ));
+    }
+    // Noninteractive children do not occupy the foreground driver stack, so
+    // they publish their own exact mailbox. It is polled at the child's real
+    // model-turn boundary below and completion is acknowledged through the
+    // request's oneshot; merely enqueueing never counts as a warm receipt.
+    let (agent_tree_resolver_tx, mut agent_tree_resolver_rx) = mpsc::channel(1);
+    let agent_tree_endpoint_registration = match (
+        agent_instance_id,
+        event_tx.as_ref(),
+        steer_target.as_ref(),
+    ) {
+        (Some(agent_instance_id), Some(event_tx), Some(target)) => {
+            let endpoint_generation = crate::engine::agent::next_agent_tree_endpoint_generation();
+            if send_wrapped_noninteractive_event(
+                event_tx,
+                target,
+                TurnEvent::AgentTreeNoninteractiveEndpointAttached {
+                    agent_instance_id,
+                    endpoint_generation,
+                    endpoint: agent_tree_resolver_tx.clone(),
+                },
+            )
+            .await
+            {
+                // `Drop` cannot await a full bounded worker event channel.
+                // A private unbounded ingress plus this pump preserves the
+                // exact detach until worker backpressure clears.
+                let (cleanup_tx, mut cleanup_rx) = mpsc::unbounded_channel();
+                let cleanup_event_tx = event_tx.clone();
+                let cleanup_target = target.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = cleanup_rx.recv().await {
+                        if !send_wrapped_noninteractive_event(
+                            &cleanup_event_tx,
+                            &cleanup_target,
+                            event,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                });
+                Some(NoninteractiveAgentTreeEndpointRegistration {
+                    cleanup_tx,
+                    agent_instance_id,
+                    endpoint_generation,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(endpoint_ready) = endpoint_ready {
+        if agent_tree_endpoint_registration.is_none() {
+            let _ = endpoint_ready.send(Err(
+                "recovered noninteractive task could not register its lifecycle resolver endpoint"
+                    .to_string(),
+            ));
+            drop(child_tx);
+            let _ = forwarder.await;
+            return Err(NoninteractiveRunError::new(
+                anyhow::anyhow!(
+                    "recovered noninteractive task could not register its lifecycle resolver endpoint"
+                ),
+                Vec::new(),
+                None,
+                Vec::new(),
+            ));
+        }
+        let endpoint_generation = agent_tree_endpoint_registration
+            .as_ref()
+            .expect("checked live endpoint registration")
+            .endpoint_generation;
+        let _ = endpoint_ready.send(Ok((endpoint_generation, agent_tree_resolver_tx.clone())));
+    }
+    if let (Some(collector), Some(agent_instance_id), Some(registration)) =
+        (endpoint_collector.as_ref(), agent_instance_id, agent_tree_endpoint_registration.as_ref())
+    {
+        collector.register(
+            agent_instance_id,
+            registration.endpoint_generation,
+            agent_tree_resolver_tx.clone(),
+        );
+    }
+    // Reattachment snapshots intentionally preserve the input that was about
+    // to enter `turn_with_backup`.  If that turn parked in QuestionTool, that
+    // input is now a pre-interrupt prompt and must never be sent to the model
+    // again.  The durable interrupt row is the source of truth across a
+    // worker crash: publish the exact mailbox above, honor the declared start
+    // gate, then wait there until a terminal decision redelivers the parked
+    // call.  `Executing` is included because it is the persisted exactly-once
+    // replay claim after a terminal decision has already won but before this
+    // new executor consumed it.
+    let mut parked_replay = match agent_instance_id {
+        Some(agent_instance_id) => session
+            .db
+            .list_reconcilable_interrupts(session.id)
+            .await
+            .map_err(|error| {
+                NoninteractiveRunError::new(
+                    error.context("loading durable parked continuation for noninteractive recovery"),
+                    history.clone(),
+                    fallback_decision.clone(),
+                    fallback_tried.clone(),
+                )
+            })?
+            .into_iter()
+            .any(|row| {
+                row.agent_instance_id == Some(agent_instance_id)
+                    && row.parked.is_some()
+                    && matches!(
+                        row.state,
+                        crate::db::needs_attention::InterruptState::Open
+                            | crate::db::needs_attention::InterruptState::Parked
+                            | crate::db::needs_attention::InterruptState::Executing
+                    )
+            }),
+        None => false,
+    };
+    // Pre-activation recursive recovery is deliberately structural only: it
+    // validates every immutable descriptor and starts every descendant far
+    // enough to publish its UUID-owned mailbox, but every executor is still
+    // stopped at `activation_gate` below.  Waiting for that gate before
+    // constructing descendants deadlocks recovery: the worker needs their
+    // endpoints to consume the complete claim set, while the descendants need
+    // that consumption before they can start.  This applies even when this
+    // parent has a parked QuestionTool continuation; no child can perform a
+    // model/tool/effect action before the all-or-nothing acknowledgement.
+    if let Some(pending) = pending_recursive {
+        let Some(parent_agent_instance_id) = agent_instance_id else {
+            drop(child_tx);
+            let _ = forwarder.await;
+            return Err(NoninteractiveRunError::new(
+                anyhow::anyhow!("recovered recursive continuation has no durable parent identity"),
+                history,
+                fallback_decision,
+                fallback_tried,
+            ));
+        };
+        next_prompt = Box::pin(recover_pending_recursive_continuation(
+            parent_agent_instance_id,
+            agent.as_ref(),
+            &cwd,
+            history.clone(),
+            pending,
+            session.clone(),
+            locks.clone(),
+            redact.clone(),
+            config.clone(),
+            interrupts.clone(),
+            cancel.clone(),
+            approver.clone(),
+            resource_scheduler.clone(),
+            loop_guard_threshold,
+            max_turns,
+            local_installations.clone(),
+            tandem.clone(),
+            event_tx.clone(),
+            endpoint_collector.clone(),
+            activation_gate.clone(),
+        ))
+        .await
+        .map_err(|error| {
+            // A failure before every recursive descendant has registered is
+            // not a missing-notification condition. The recovery caller must
+            // retain its exact durable claim and retry/reconcile instead of
+            // awaiting a mailbox that this parent can no longer create.
+            if let Some(collector) = endpoint_collector.as_ref() {
+                collector.report_unrecoverable(
+                    parent_agent_instance_id,
+                    format!("recursive continuation recovery failed: {error:#}"),
+                );
+            }
+            NoninteractiveRunError::new(error, history.clone(), fallback_decision.clone(), fallback_tried.clone())
+        })?;
+    }
+    // Endpoint publication is intentionally before activation: the recursive
+    // preactivation phase above proves every exact executor is addressable,
+    // then the session worker atomically consumes that entire claim set, and
+    // only afterwards may any executor do model, tool, or host-effect work.
+    // This closes both the partial-subtree and unclaimed-pre-crash-prompt
+    // windows.
+    if let Some(gate) = activation_gate.as_ref() {
+        gate.wait().await.map_err(|error| {
+            NoninteractiveRunError::new(error, history.clone(), None, Vec::new())
+        })?;
+    }
+    // Publish the exact mailbox before waiting on declared predecessors. This
+    // keeps recovery addressable without allowing a dependent to begin model
+    // work ahead of its own dependency gate.
+    let _recovery_execution_permit = match start_gate {
+        Some(gate) => Some(gate.acquire(&cancel).await.map_err(|error| {
+            NoninteractiveRunError::new(anyhow::anyhow!(error), history.clone(), None, Vec::new())
+        })?),
+        None => None,
+    };
     // A noninteractive subagent's own deferred-log (`plan.md §3d`). Agents
     // that hold `defer_to_orchestrator` get their deferred items folded into
     // the leaf report they return up; agents without it keep this buffer empty.
     let deferred_log = crate::engine::deferred::DeferredLog::new();
-
-    for _ in 0..max_turns {
-        if let Some(target) = &steer_target {
+    // Unlike an ordinary child turn, an accepted AgentTree steer spans every
+    // model/tool continuation round until this executor reaches `Done` or
+    // `Return`. Keep its immutable provider permit, first-handoff identity,
+    // direct-claim receipt, and worker acknowledgement together across those
+    // rounds. Dropping any of these after `Continue` used to falsely complete
+    // a user steer as soon as its first tool call returned.
+    let mut active_agent_tree_steer_permit = None;
+    let mut active_agent_tree_steer_continuation_id = None;
+    let mut active_agent_tree_steer_first_provider_handoff = false;
+    // Only a fresh, still-pending steer replaces `next_prompt` with its
+    // durable user body. If the final provider fence defers that first
+    // handoff, restore the original continuation before waiting for the new
+    // decision/replay. Recovered accepted checkpoints are already past this
+    // substitution and must never pop their saved prompt.
+    let mut active_agent_tree_steer_injected_prompt = false;
+    let mut active_claimed_agent_tree_steers = Vec::new();
+    let mut active_agent_tree_steer_epoch = None;
+    let mut active_externally_claimed_agent_tree_steers: Vec<NoninteractiveLateSteerAck> =
+        Vec::new();
+    // A recovered snapshot carrying this marker is already past the first
+    // provider handoff.  Do not let the ordinary loop send its saved prompt
+    // until the worker has restored this exact continuation's permit.
+    let recovered_agent_tree_steer_continuation_id = steer_target
+        .as_ref()
+        .and_then(|target| target.late_user_steer_continuation_id);
+    'turns: for _ in 0..max_turns {
+        if !parked_replay
+            && active_agent_tree_steer_permit.is_none()
+            && let Some(expected_continuation_id) = recovered_agent_tree_steer_continuation_id
+        {
+            // Endpoint publication and recovery activation have both happened
+            // above.  The only valid next transition for this saved model/tool
+            // checkpoint is the worker's exact resume request; running the
+            // saved prompt first would execute the accepted user steer twice.
+            let Some(request) = agent_tree_resolver_rx.recv().await else {
+                return Err(NoninteractiveRunError::new(
+                    anyhow::anyhow!(
+                        "recovered noninteractive late steer executor mailbox closed before its exact continuation resumed"
+                    ),
+                    history,
+                    fallback_decision,
+                    fallback_tried,
+                ));
+            };
+            match request {
+                crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    let response = agent
+                        .model
+                        .text_completion_with_live_context(
+                            crate::engine::model::UtilityCallSite::AgentTreeDecision,
+                            agent.params.clone(),
+                            &agent.system,
+                            &history,
+                            &request.prompt,
+                            &agent.name,
+                            &cancel,
+                        )
+                        .await
+                        .map_err(|error| {
+                            format!("warm noninteractive resolver failed: {error:#}")
+                        });
+                    let _ = request.respond_to.send(response);
+                    continue 'turns;
+                }
+                crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
+                    respond_to,
+                    ..
+                } => {
+                    // The durable interrupt scan above found no parked
+                    // continuation, so this endpoint has no exact replay to
+                    // consume. Preserve the late-steer checkpoint instead of
+                    // letting an unrelated replay open its saved prompt.
+                    let _ = respond_to.send(Err(
+                        "noninteractive executor has no parked interrupt for this replay"
+                            .to_string(),
+                    ));
+                    continue 'turns;
+                }
+                crate::engine::agent::AgentTreeExecutorRequest::DeliverLateUserDecisionSteer {
+                    respond_to,
+                    ..
+                } => {
+                    let _ = respond_to.send(
+                        crate::engine::driver::LateUserSteerContinuationOutcome::interrupted(
+                            "noninteractive executor is waiting for its recovered late steer continuation",
+                        ),
+                    );
+                    continue 'turns;
+                }
+                crate::engine::agent::AgentTreeExecutorRequest::ResumeAcceptedLateUserDecisionSteer {
+                    steer_id,
+                    continuation_id,
+                    recovery_epoch,
+                    payload_json,
+                    respond_to,
+                    ..
+                } => {
+                    let ack = (
+                        steer_id,
+                        continuation_id,
+                        recovery_epoch,
+                        payload_json,
+                        respond_to,
+                    );
+                    match recovered_noninteractive_late_steer_permit(
+                        expected_continuation_id,
+                        agent_instance_id,
+                        session.clone(),
+                        cancel.clone(),
+                        &ack,
+                    ) {
+                        Ok((continuation_id, permit)) => {
+                            active_agent_tree_steer_continuation_id = Some(continuation_id);
+                            active_agent_tree_steer_first_provider_handoff = false;
+                            active_agent_tree_steer_permit = Some(permit);
+                            active_externally_claimed_agent_tree_steers = vec![ack];
+                        }
+                        Err(reason) => {
+                            let _ = ack.4.send(
+                                crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                                    reason.clone(),
+                                ),
+                            );
+                            return Err(NoninteractiveRunError::new(
+                                anyhow::anyhow!(reason),
+                                history,
+                                fallback_decision,
+                                fallback_tried,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if parked_replay {
+            // A replayed tool can itself park behind a second durable
+            // QuestionTool seam. Keep this exact executor alive and consume
+            // only its mailbox until that later terminal response arrives;
+            // falling through to `turn_with_backup` here would regenerate the
+            // pre-interrupt model prompt instead of resuming the parked call.
+            let Some(request) = agent_tree_resolver_rx.recv().await else {
+                retain_noninteractive_late_steer_checkpoint(
+                    &active_claimed_agent_tree_steers,
+                    std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                    crate::engine::driver::LateUserSteerContinuationOutcome::interrupted(
+                        "parked noninteractive executor mailbox closed before its continuation replay",
+                    ),
+                );
+                return Err(NoninteractiveRunError::new(
+                    anyhow::anyhow!("parked noninteractive executor mailbox closed"),
+                    history,
+                    fallback_decision,
+                    fallback_tried,
+                ));
+            };
+            match request {
+                crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    let response = agent
+                        .model
+                        .text_completion_with_live_context(
+                            crate::engine::model::UtilityCallSite::AgentTreeDecision,
+                            agent.params.clone(),
+                            &agent.system,
+                            &history,
+                            &request.prompt,
+                            &agent.name,
+                            &cancel,
+                        )
+                        .await
+                        .map_err(|error| format!("warm noninteractive resolver failed: {error:#}"));
+                    let _ = request.respond_to.send(response);
+                }
+                crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
+                    interrupt_id,
+                    payload,
+                    response,
+                    question,
+                    respond_to,
+                } => {
+                    let replay = replay_parked_interrupt_in_noninteractive_executor(
+                        &agent,
+                        agent_instance_id.expect("attached noninteractive executor has an agent UUID"),
+                        &mut history,
+                        &session,
+                        &locks,
+                        &redact,
+                        &cwd,
+                        &config,
+                        &interrupts,
+                        &approver,
+                        &resource_scheduler,
+                        loop_guard_threshold,
+                        deferred_log.clone(),
+                        &child_tx,
+                        interrupt_id,
+                        *payload,
+                        response,
+                        *question,
+                    )
+                    .await;
+                    let replay = match replay {
+                        Ok(()) => history
+                            .pop()
+                            .context("parked noninteractive replay produced no tool result")
+                            .map(|tool_result| {
+                                next_prompt = tool_result;
+                                parked_replay = false;
+                                crate::engine::driver::ParkedReplayOutcome::Completed
+                            })
+                            .map_err(|error| format!("{error:#}")),
+                        Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                            Ok(crate::engine::driver::ParkedReplayOutcome::ParkedAgain)
+                        }
+                        Err(error) => Err(format!("{error:#}")),
+                    };
+                    let _ = respond_to.send(replay);
+                }
+                crate::engine::agent::AgentTreeExecutorRequest::DeliverLateUserDecisionSteer {
+                    respond_to,
+                    ..
+                } => {
+                    // A parked tool has no model-turn continuation in which a
+                    // steer can be consumed. Leave its claim retryable rather
+                    // than pretending queue receipt is execution.
+                    let _ = respond_to.send(
+                        crate::engine::driver::LateUserSteerContinuationOutcome::interrupted(
+                            "noninteractive executor is parked behind an exact QuestionTool continuation",
+                        ),
+                    );
+                }
+                crate::engine::agent::AgentTreeExecutorRequest::ResumeAcceptedLateUserDecisionSteer {
+                    steer_id,
+                    continuation_id,
+                    recovery_epoch,
+                    payload_json,
+                    respond_to,
+                    ..
+                } => {
+                    let mut ack = Some((
+                        steer_id,
+                        continuation_id,
+                        recovery_epoch,
+                        payload_json,
+                        respond_to,
+                    ));
+                    let outcome = match (
+                        recovered_agent_tree_steer_continuation_id,
+                        active_agent_tree_steer_permit.is_none(),
+                    ) {
+                        (Some(expected_continuation_id), true) => {
+                            match recovered_noninteractive_late_steer_permit(
+                                expected_continuation_id,
+                                agent_instance_id,
+                                session.clone(),
+                                cancel.clone(),
+                                ack.as_ref().expect("late-steer acknowledgement is still owned"),
+                            ) {
+                                Ok((continuation_id, permit)) => {
+                                    active_agent_tree_steer_continuation_id = Some(continuation_id);
+                                    active_agent_tree_steer_first_provider_handoff = false;
+                                    active_agent_tree_steer_permit = Some(permit);
+                                    active_externally_claimed_agent_tree_steers = vec![
+                                        ack.take().expect(
+                                            "successful late-steer recovery retains its acknowledgement",
+                                        ),
+                                    ];
+                                    None
+                                }
+                                Err(reason) => Some(
+                                    crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                                        reason,
+                                    ),
+                                ),
+                            }
+                        }
+                        _ => Some(
+                            crate::engine::driver::LateUserSteerContinuationOutcome::interrupted(
+                                "noninteractive executor is parked behind an exact QuestionTool continuation",
+                            ),
+                        ),
+                    };
+                    if let Some(outcome) = outcome {
+                        let _ = ack
+                            .take()
+                            .expect("failed late-steer recovery retains its acknowledgement")
+                            .4
+                            .send(outcome);
+                    }
+                }
+            }
+            continue 'turns;
+        }
+        if let Some(target) = steer_target.as_ref() {
+            match ready_noninteractive_recovery_snapshot_with_late_steer(
+                history.clone(),
+                next_prompt.clone(),
+                active_agent_tree_steer_continuation_id
+                    .or(recovered_agent_tree_steer_continuation_id),
+            ) {
+                Ok(snapshot_json) => {
+                    let persisted = if target.agent_instance_id.is_some() {
+                        session
+                            .db
+                            .persist_recursive_noninteractive_snapshot(
+                                session.id,
+                                agent_instance_id.expect("recursive target has an agent UUID"),
+                                validated_recursive_noninteractive_snapshot(&snapshot_json).map_err(|error| {
+                                    NoninteractiveRunError::new(
+                                        error,
+                                        history.clone(),
+                                        fallback_decision.clone(),
+                                        fallback_tried.clone(),
+                                    )
+                                })?,
+                                crate::agent_tree::system_now_unix_ms(),
+                            )
+                            .await
+                    } else {
+                        session
+                            .db
+                            .persist_task_delegation_snapshot(
+                                &target.task_call_id,
+                                &target.label,
+                                &snapshot_json,
+                            )
+                            .await
+                    };
+                    match persisted {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            retain_noninteractive_late_steer_checkpoint(
+                                &active_claimed_agent_tree_steers,
+                                std::mem::take(
+                                    &mut active_externally_claimed_agent_tree_steers,
+                                ),
+                                crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                                    "noninteractive executor lost its durable recovery descriptor",
+                                ),
+                            );
+                            return Err(NoninteractiveRunError::new(
+                                anyhow::anyhow!("noninteractive executor lost its durable recovery descriptor"),
+                                history,
+                                fallback_decision,
+                                fallback_tried,
+                            ));
+                        }
+                        Err(error) => {
+                        retain_noninteractive_late_steer_checkpoint(
+                            &active_claimed_agent_tree_steers,
+                            std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                            crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                                "persisting noninteractive task recovery snapshot failed",
+                            ),
+                        );
+                        return Err(NoninteractiveRunError::new(
+                            error.context("persisting noninteractive task recovery snapshot"),
+                            history,
+                            fallback_decision,
+                            fallback_tried,
+                        ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    retain_noninteractive_late_steer_checkpoint(
+                        &active_claimed_agent_tree_steers,
+                        std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                        crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                            "serializing noninteractive task recovery snapshot failed",
+                        ),
+                    );
+                    return Err(NoninteractiveRunError::new(
+                        error.into(),
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                }
+            }
+        }
+        // Drain only at an ordinary child turn boundary. A request accepted by
+        // this mailbox is not complete until this exact child continuation has
+        // consumed it, so a crashed/finished executor cannot yield a false
+        // warm-parent, parked-replay, or late-steer receipt.
+        let mut externally_claimed_agent_tree_steers: Vec<NoninteractiveLateSteerAck> =
+            Vec::new();
+        while let Ok(request) = agent_tree_resolver_rx.try_recv() {
+            match request {
+                crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    let response = agent
+                        .model
+                        .text_completion_with_live_context(
+                            crate::engine::model::UtilityCallSite::AgentTreeDecision,
+                            agent.params.clone(),
+                            &agent.system,
+                            &history,
+                            &request.prompt,
+                            &agent.name,
+                            &cancel,
+                        )
+                        .await
+                        .map_err(|error| format!("warm noninteractive resolver failed: {error:#}"));
+                    let _ = request.respond_to.send(response);
+                }
+                crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
+                    interrupt_id,
+                    payload,
+                    response,
+                    question,
+                    respond_to,
+                } => {
+                    let replay = replay_parked_interrupt_in_noninteractive_executor(
+                        &agent,
+                        agent_instance_id.expect("attached noninteractive executor has an agent UUID"),
+                        &mut history,
+                        &session,
+                        &locks,
+                        &redact,
+                        &cwd,
+                        &config,
+                        &interrupts,
+                        &approver,
+                        &resource_scheduler,
+                        loop_guard_threshold,
+                        deferred_log.clone(),
+                        &child_tx,
+                        interrupt_id,
+                        *payload,
+                        response,
+                        *question,
+                    )
+                    .await;
+                    let replay = match replay {
+                        Ok(()) => history
+                            .pop()
+                            .context("parked noninteractive replay produced no tool result")
+                            .map(|tool_result| {
+                                next_prompt = tool_result;
+                                crate::engine::driver::ParkedReplayOutcome::Completed
+                            })
+                            .map_err(|error| format!("{error:#}")),
+                        Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                            Ok(crate::engine::driver::ParkedReplayOutcome::ParkedAgain)
+                        }
+                        Err(error) => Err(format!("{error:#}")),
+                    };
+                    let parked_again = matches!(
+                        replay,
+                        Ok(crate::engine::driver::ParkedReplayOutcome::ParkedAgain)
+                    );
+                    let _ = respond_to.send(replay);
+                    if parked_again {
+                        // The newly parked QuestionTool continuation is now
+                        // durable. Do not re-run the old prompt; the next
+                        // terminal delivery returns to this exact mailbox.
+                        parked_replay = true;
+                        break;
+                    }
+                }
+                crate::engine::agent::AgentTreeExecutorRequest::DeliverLateUserDecisionSteer {
+                    steer_id,
+                    continuation_id,
+                    recovery_epoch,
+                    payload_json,
+                    respond_to,
+                } => externally_claimed_agent_tree_steers.push((
+                    steer_id,
+                    continuation_id,
+                    recovery_epoch,
+                    payload_json,
+                    respond_to,
+                )),
+                crate::engine::agent::AgentTreeExecutorRequest::ResumeAcceptedLateUserDecisionSteer {
+                    respond_to,
+                    ..
+                } => {
+                    // A snapshot-backed resume is consumed by the recovery
+                    // gate before this ordinary drain.  Never downgrade a
+                    // late arrival into a fresh delivery, which would append
+                    // the same durable user payload a second time.
+                    let _ = respond_to.send(
+                        crate::engine::driver::LateUserSteerContinuationOutcome::interrupted(
+                            "noninteractive recovered late steer was not waiting on this executor checkpoint",
+                        ),
+                    );
+                }
+            }
+        }
+        if parked_replay {
+            continue 'turns;
+        }
+        if let Some(target) = steer_target
+            .as_ref()
+            .filter(|target| target.agent_instance_id.is_none())
+        {
             match session
                 .db
                 .drain_task_delegation_steers(&target.task_call_id, &target.label)
@@ -5273,15 +8660,190 @@ pub(crate) async fn run_noninteractive_resumable(
                 }
             }
         }
-        // Per-round id, shared with this turn's tandem shadows.
-        let call_id = uuid::Uuid::new_v4();
+        // AgentTree late steers are a separate, UUID-owned continuation
+        // channel. Claim them only when this executor does not already own a
+        // late-steer continuation. A `Continue` result leaves that
+        // continuation live through further model/tool rounds, so folding a
+        // second steer into it would lose both exact identities and
+        // acknowledgements. The claim is intentionally still `pending` here:
+        // the model-dispatch choke point commits acceptance only once this
+        // exact owner is runnable and about to hand off to its provider.
+        let mut claimed_agent_tree_steers = Vec::new();
+        let mut agent_tree_steer_epoch = None;
+        if active_agent_tree_steer_permit.is_none()
+            && let Some(agent_instance_id) = agent_instance_id
+        {
+            let epoch = uuid::Uuid::now_v7();
+            match session
+                .db
+                .claim_late_user_decision_steers(session.id, agent_instance_id, epoch)
+                .await
+            {
+                Ok(steers) if !steers.is_empty() => {
+                    let mut executable_steers = Vec::new();
+                    for steer in steers {
+                        // Completion commits before the outer delivery receipt.
+                        // This child may therefore recover an acknowledgement
+                        // without re-running the model turn that already
+                        // consumed the durable user instruction.
+                        if steer.completed_at_unix_ms.is_some() {
+                            match session
+                                .db
+                                .ack_late_user_decision_steer_delivery(
+                                    session.id,
+                                    steer.steer_id,
+                                    epoch,
+                                    crate::agent_tree::system_now_unix_ms(),
+                                )
+                                .await
+                            {
+                                Ok(true) => continue,
+                                Ok(false) => {
+                                    return Err(NoninteractiveRunError::new(
+                                        anyhow::anyhow!(
+                                            "completed noninteractive late steer acknowledgement lost its exact claim"
+                                        ),
+                                        history,
+                                        fallback_decision,
+                                        fallback_tried,
+                                    ));
+                                }
+                                Err(error) => {
+                                    return Err(NoninteractiveRunError::new(
+                                        error.context(
+                                            "acknowledging completed noninteractive late steer",
+                                        ),
+                                        history,
+                                        fallback_decision,
+                                        fallback_tried,
+                                    ));
+                                }
+                            }
+                        }
+                        executable_steers.push(steer);
+                    }
+                    if !executable_steers.is_empty() {
+                        claimed_agent_tree_steers = executable_steers;
+                        agent_tree_steer_epoch = Some(epoch);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    %agent_instance_id,
+                    "claiming noninteractive AgentTree late steers failed"
+                ),
+            }
+        }
+        if active_agent_tree_steer_permit.is_some()
+            && !externally_claimed_agent_tree_steers.is_empty()
+        {
+            // The existing continuation remains its own recoverable unit.
+            // Tell another live delivery attempt to retain/retry rather than
+            // silently coalescing its external receipt into the first one.
+            for (_, _, _, _, respond_to) in externally_claimed_agent_tree_steers {
+                let _ = respond_to.send(
+                    crate::engine::driver::LateUserSteerContinuationOutcome::interrupted(
+                        "noninteractive executor is still completing an earlier accepted late steer",
+                    ),
+                );
+            }
+        } else if !claimed_agent_tree_steers.is_empty()
+            || !externally_claimed_agent_tree_steers.is_empty()
+        {
+            // A steer continuation's id is stable across the mailbox/recovery
+            // boundary.  It is the external journal identity for the *first*
+            // provider handoff; the same permit stays installed for every
+            // later tool/Continue round until the terminal receipt below.
+            let (continuation_id, permit) = if let Some(steer) = claimed_agent_tree_steers.first()
+            {
+                let Some(recovery_epoch) = agent_tree_steer_epoch else {
+                    return Err(NoninteractiveRunError::new(
+                        anyhow::anyhow!("accepted noninteractive late steer has no recovery epoch"),
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                };
+                (
+                    steer.continuation_id,
+                    crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                        session.clone(),
+                        steer.steer_id,
+                        steer.continuation_id,
+                        steer.agent_instance_id,
+                        recovery_epoch,
+                        cancel.clone(),
+                    ),
+                )
+            } else if let Some((
+                steer_id,
+                continuation_id,
+                recovery_epoch,
+                _,
+                _,
+            )) = externally_claimed_agent_tree_steers.first()
+            {
+                let Some(owner) = agent_instance_id else {
+                    return Err(NoninteractiveRunError::new(
+                        anyhow::anyhow!(
+                            "external AgentTree steer reached an executor without a durable owner identity"
+                        ),
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                };
+                (
+                    *continuation_id,
+                    crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                        session.clone(),
+                        *steer_id,
+                        *continuation_id,
+                        owner,
+                        *recovery_epoch,
+                        cancel.clone(),
+                    ),
+                )
+            } else {
+                unreachable!("nonempty accepted steer set has no first identity")
+            };
+            let mut steer_sections = Vec::new();
+            if !claimed_agent_tree_steers.is_empty() {
+                steer_sections.push(render_noninteractive_agent_tree_late_steers(
+                    &claimed_agent_tree_steers,
+                ));
+            }
+            steer_sections.extend(externally_claimed_agent_tree_steers.iter().map(
+                |(_, _, _, payload_json, _)| {
+                    format!("[Durable late user decision steer for this continuation]\n{payload_json}")
+                },
+            ));
+            history.push(next_prompt);
+            next_prompt = Message::user(steer_sections.join("\n\n"));
+            active_agent_tree_steer_continuation_id = Some(continuation_id);
+            active_agent_tree_steer_first_provider_handoff = true;
+            active_agent_tree_steer_injected_prompt = true;
+            active_agent_tree_steer_permit = Some(permit);
+            active_claimed_agent_tree_steers = claimed_agent_tree_steers;
+            active_agent_tree_steer_epoch = agent_tree_steer_epoch;
+            active_externally_claimed_agent_tree_steers = externally_claimed_agent_tree_steers;
+        }
+        let call_id = if active_agent_tree_steer_first_provider_handoff {
+            active_agent_tree_steer_first_provider_handoff = false;
+            active_agent_tree_steer_continuation_id
+                .expect("active late steer always has its immutable continuation id")
+        } else {
+            uuid::Uuid::new_v4()
+        };
+        let agent_tree_steer_dispatch_permit = active_agent_tree_steer_permit.clone();
         let mut turn_metadata = BackupTurnMetadata::default();
         // Model-comparison tandem (shadow) set for this leaf subagent turn
         // (`builder`/`explore`/`docs`, `model-comparison-tandem-
         // inference.md`). Passed into `turn`, which dispatches the shadows from
         // the exact post-redaction body; a pure DB-only observer that never
         // enters the child's history or affects its loop. `None`/empty = off.
-        let turn_future = turn_with_backup(
+        let turn_future = crate::engine::agent::with_agent_instance_id(agent_instance_id, crate::engine::agent::with_agent_tree_steer_dispatch_permit(agent_tree_steer_dispatch_permit, turn_with_backup(
             &agent,
             backup_model.as_ref(),
             &fallback_models,
@@ -5312,7 +8874,7 @@ pub(crate) async fn run_noninteractive_resumable(
             None,
             &child_tx,
             Some(&mut turn_metadata),
-        );
+        )));
         let outcome_future = async {
             if let Some(target) = &steer_target {
                 crate::session::with_session_event_lineage(Some(target.lineage()), turn_future)
@@ -5323,6 +8885,10 @@ pub(crate) async fn run_noninteractive_resumable(
         };
         let outcome = match outcome_future.await {
             Ok(outcome) => {
+                // The first provider handoff succeeded, so the saved prompt
+                // is now ordinary transcript history rather than a deferred
+                // substitution we could roll back.
+                active_agent_tree_steer_injected_prompt = false;
                 if !turn_metadata.fallback_tried.is_empty() {
                     fallback_tried = turn_metadata.fallback_tried.clone();
                 }
@@ -5338,6 +8904,74 @@ pub(crate) async fn run_noninteractive_resumable(
                 if let Some(fallback) = turn_metadata.fallback_decision.take() {
                     fallback_decision = Some(fallback);
                 }
+                if crate::engine::model::is_late_user_steer_deferred(&error) {
+                    // No provider bytes were sent and the permit transaction
+                    // left a pending row unaccepted. Restore the pre-steer
+                    // prompt only for a new pending delivery, release that
+                    // claim, and remain attached to the exact executor while
+                    // the owner waits for its question/approval replay.
+                    if active_agent_tree_steer_injected_prompt {
+                        let Some(original_prompt) = history.pop() else {
+                            return Err(NoninteractiveRunError::new(
+                                anyhow::anyhow!(
+                                    "deferred noninteractive late steer lost its original continuation prompt"
+                                ),
+                                history,
+                                fallback_decision,
+                                fallback_tried,
+                            ));
+                        };
+                        next_prompt = original_prompt;
+                        active_agent_tree_steer_injected_prompt = false;
+                    }
+                    defer_noninteractive_late_steers_until_owner_is_runnable(
+                        &session,
+                        &active_claimed_agent_tree_steers,
+                        active_agent_tree_steer_epoch,
+                        std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                    )
+                    .await;
+                    active_claimed_agent_tree_steers.clear();
+                    active_agent_tree_steer_epoch = None;
+                    active_agent_tree_steer_permit = None;
+                    active_agent_tree_steer_continuation_id = None;
+                    // A nonterminal owner will eventually send this exact
+                    // executor a replay after its current decision resolves.
+                    // Terminal transitions reject pending rows atomically;
+                    // their cancellation path owns executor shutdown.
+                    parked_replay = true;
+                    continue 'turns;
+                }
+                // Any other outcome reached (or got past) the provider
+                // boundary. A later parked replay must not roll the original
+                // prompt back if its accepted permit is subsequently revoked.
+                active_agent_tree_steer_injected_prompt = false;
+                if crate::engine::interrupt::is_parked(&error) {
+                    // A parked QuestionTool is an intermediate continuation
+                    // checkpoint, not a terminal steer outcome. Keep the
+                    // accepted identity, provider permit, and worker receipt
+                    // alive while this exact executor waits for the replay
+                    // mailbox; the replay then feeds its tool result into the
+                    // next turn under the same permit.
+                    parked_replay = true;
+                    continue 'turns;
+                }
+                let continuation_outcome = if crate::engine::model::is_cancelled(&error) {
+                    crate::engine::driver::LateUserSteerContinuationOutcome::Cancelled
+                } else {
+                    crate::engine::driver::LateUserSteerContinuationOutcome::failed(format!(
+                        "noninteractive late steer continuation failed: {error:#}"
+                    ))
+                };
+                // Do not call `release_late_user_decision_steer_claim` here:
+                // these rows are already in the irreversible `accepted`
+                // state, and releasing is both ineffective and conceptually
+                // wrong. Their immutable checkpoint is the recovery unit.
+                retain_noninteractive_late_steer_checkpoint(
+                    &active_claimed_agent_tree_steers,
+                    std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                    continuation_outcome,
+                );
                 drop(child_tx);
                 let _ = forwarder.await;
                 return Err(NoninteractiveRunError::new(
@@ -5355,6 +8989,23 @@ pub(crate) async fn run_noninteractive_resumable(
                     .expect("Continue with empty history is unreachable");
             }
             TurnOutcome::Done => {
+                if let Err(error) = complete_noninteractive_late_steer_continuation(
+                    &session,
+                    &active_claimed_agent_tree_steers,
+                    active_agent_tree_steer_epoch,
+                    std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                )
+                .await
+                {
+                    drop(child_tx);
+                    let _ = forwarder.await;
+                    return Err(NoninteractiveRunError::new(
+                        error.context("persisting terminal noninteractive late steer completion"),
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                }
                 drop(child_tx);
                 let _ = forwarder.await;
                 // No `return` tool call: fall back to wrapping the final text
@@ -5368,6 +9019,23 @@ pub(crate) async fn run_noninteractive_resumable(
                 });
             }
             TurnOutcome::Return { fields } => {
+                if let Err(error) = complete_noninteractive_late_steer_continuation(
+                    &session,
+                    &active_claimed_agent_tree_steers,
+                    active_agent_tree_steer_epoch,
+                    std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                )
+                .await
+                {
+                    drop(child_tx);
+                    let _ = forwarder.await;
+                    return Err(NoninteractiveRunError::new(
+                        error.context("persisting terminal noninteractive late steer completion"),
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                }
                 drop(child_tx);
                 let _ = forwarder.await;
                 let report =
@@ -5471,6 +9139,8 @@ pub(crate) async fn run_noninteractive_resumable(
                         continue;
                     }
                 };
+                let recovery_model = model.clone();
+                let recovery_granted_tools = granted_tools.clone();
                 let child_args = crate::engine::builtin::SpawnArgs {
                     model: agent.model.clone(),
                     params: crate::engine::model::ModelParams {
@@ -5502,10 +9172,151 @@ pub(crate) async fn run_noninteractive_resumable(
                     write_scope: resolved_write_scope,
                     credential_store: session.provider_credential_store(&config.providers()).ok(),
                 };
+                let nested_steer_target = match (agent_instance_id, steer_target.as_ref()) {
+                    (Some(parent_agent_instance_id), Some(parent_target)) => {
+                        let child_agent_instance_id = uuid::Uuid::now_v7();
+                        let recovery_anchor = uuid::Uuid::now_v7();
+                        let waiting_snapshot = waiting_recursive_recovery_snapshot(
+                            history.clone(),
+                            PendingRecursiveContinuation {
+                                task_call_id: task_call_id.clone(),
+                                task_provider_item_id: task_provider_item_id.clone(),
+                                task_function_call_id: task_function_call_id.clone(),
+                            repair_notes: repair_notes.clone(),
+                            children: vec![child_agent_instance_id],
+                            batch: false,
+                            batch_execution_order: Vec::new(),
+                                batch_dependencies: std::collections::BTreeMap::new(),
+                            },
+                            active_agent_tree_steer_continuation_id
+                                .or(recovered_agent_tree_steer_continuation_id),
+                        );
+                        match waiting_snapshot {
+                            Ok(waiting_snapshot) => {
+                            let launch_json = serde_json::to_string(&serde_json::json!({
+                                "version": 2,
+                                "task_call_id": &task_call_id,
+                                "label": &parent_target.label,
+                                "child_agent": &child_agent,
+                                "model": model_selector_json(&recovery_model),
+                                "granted_tools": &recovery_granted_tools,
+                                "cwd": child_cwd.to_string_lossy(),
+                                "write_scope": &write_scope,
+                            }));
+                            let snapshot_json = ready_noninteractive_recovery_snapshot(
+                                Vec::new(),
+                                Message::user(&prompt),
+                            );
+                            let descriptors = launch_json
+                                .zip(snapshot_json)
+                                .map(|(launch_json, snapshot_json)| {
+                                    Ok::<_, anyhow::Error>((
+                                        validated_recursive_noninteractive_snapshot(&waiting_snapshot)?,
+                                        validated_recursive_noninteractive_launch(&launch_json)?,
+                                        validated_recursive_noninteractive_snapshot(&snapshot_json)?,
+                                    ))
+                                })
+                                .transpose();
+                            match descriptors {
+                                Some(Ok((parent_snapshot, launch, snapshot))) => match session
+                                    .db
+                                    .create_recursive_noninteractive_executors_and_checkpoint_parent(
+                                        session.id,
+                                        parent_agent_instance_id,
+                                        parent_snapshot,
+                                        vec![crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
+                                            agent_instance_id: child_agent_instance_id,
+                                            recovery_anchor,
+                                            launch,
+                                            snapshot,
+                                        }],
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await
+                                {
+                                    Ok(children) if children.len() == 1
+                                        && children[0].agent_instance_id == child_agent_instance_id => {
+                                        Some(parent_target.clone().with_agent_instance_id(child_agent_instance_id))
+                                    }
+                                    Ok(_) => {
+                                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                            task_call_id,
+                                            task_provider_item_id,
+                                            task_function_call_id,
+                                            "task",
+                                            prepend_task_repair_notes(
+                                                "Error: recursive executor checkpoint returned an unexpected child identity".to_string(),
+                                                &repair_notes,
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                            task_call_id,
+                                            task_provider_item_id,
+                                            task_function_call_id,
+                                            "task",
+                                            prepend_task_repair_notes(
+                                                format!("Error: could not persist recursive executor: {error:#}"),
+                                                &repair_notes,
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                },
+                                Some(Err(error)) => {
+                                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                        task_call_id,
+                                        task_provider_item_id,
+                                        task_function_call_id,
+                                        "task",
+                                        prepend_task_repair_notes(
+                                            format!("Error: could not validate recursive executor descriptor: {error:#}"),
+                                            &repair_notes,
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                None => {
+                                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                        task_call_id,
+                                        task_provider_item_id,
+                                        task_function_call_id,
+                                        "task",
+                                        prepend_task_repair_notes(
+                                            "Error: could not serialize recursive executor descriptor".to_string(),
+                                            &repair_notes,
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            }
+                            }
+                            Err(error) => {
+                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                    task_call_id,
+                                    task_provider_item_id,
+                                    task_function_call_id,
+                                    "task",
+                                    prepend_task_repair_notes(
+                                        format!("Error: could not checkpoint recursive parent: {error:#}"),
+                                        &repair_notes,
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let nested_agent_instance_id = nested_steer_target
+                    .as_ref()
+                    .and_then(|target| target.agent_instance_id);
                 let result = match crate::engine::builtin::load(&child_agent, &child_args) {
                     Ok(nested_child) => Box::pin(run_noninteractive_resumable(
                         nested_child,
-                        prompt,
+                        Message::user(prompt),
                         Vec::new(),
                         session.clone(),
                         locks.clone(),
@@ -5521,21 +9332,77 @@ pub(crate) async fn run_noninteractive_resumable(
                         local_installations.clone(),
                         tandem.clone(),
                         event_tx.clone(),
-                        steer_target.clone(),
+                        nested_steer_target,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     ))
                     .await
                     .map(|outcome| outcome.report)
                     .unwrap_or_else(|error| format!("Error: {error}")),
                     Err(error) => format!("Error: {error:#}"),
                 };
-                next_prompt =
+                let completed_next_prompt =
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                        task_call_id,
-                        task_provider_item_id,
-                        task_function_call_id,
+                        task_call_id.clone(),
+                        task_provider_item_id.clone(),
+                        task_function_call_id.clone(),
                         "task",
-                        prepend_task_repair_notes(result, &repair_notes),
+                        prepend_task_repair_notes(result.clone(), &repair_notes),
                     );
+                if let (Some(nested_agent_instance_id), Some(parent_agent_instance_id)) =
+                    (nested_agent_instance_id, agent_instance_id)
+                {
+                    let parent_snapshot = ready_noninteractive_recovery_snapshot_with_late_steer(
+                        history.clone(),
+                        completed_next_prompt.clone(),
+                        active_agent_tree_steer_continuation_id
+                            .or(recovered_agent_tree_steer_continuation_id),
+                    )
+                    .map_err(|error| {
+                        NoninteractiveRunError::new(
+                            error,
+                            history.clone(),
+                            fallback_decision.clone(),
+                            fallback_tried.clone(),
+                        )
+                    })?;
+                    let parent_snapshot = validated_recursive_noninteractive_snapshot(&parent_snapshot)
+                        .map_err(|error| NoninteractiveRunError::new(
+                            error,
+                            history.clone(),
+                            fallback_decision.clone(),
+                            fallback_tried.clone(),
+                        ))?;
+                    session
+                        .db
+                        .complete_recursive_noninteractive_children_and_checkpoint_parent(
+                            session.id,
+                            parent_agent_instance_id,
+                            parent_snapshot,
+                            vec![(nested_agent_instance_id, result.starts_with("Error:"))],
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            NoninteractiveRunError::new(
+                                error.context("checkpointing recursive child completion"),
+                                history.clone(),
+                                fallback_decision.clone(),
+                                fallback_tried.clone(),
+                            )
+                        })?;
+                } else if let Some(nested_agent_instance_id) = nested_agent_instance_id {
+                    terminalize_recursive_noninteractive_agent(
+                        &session,
+                        nested_agent_instance_id,
+                        result.starts_with("Error:"),
+                    )
+                    .await;
+                }
+                next_prompt = completed_next_prompt;
             }
             TurnOutcome::SpawnNoninteractiveBatch {
                 entries,
@@ -5551,6 +9418,19 @@ pub(crate) async fn run_noninteractive_resumable(
                 // whole reservation alive until each direct child completes.
                 // This mirrors the driver-owned batch's all-or-nothing admission
                 // while preserving the nested parent's live effective grant.
+                let batch_execution_order = match recursive_batch_execution_order_labels(&entries) {
+                    Ok(order) => order,
+                    Err(error) => {
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(format!("Error: {error}"), &repair_notes),
+                        );
+                        continue;
+                    }
+                };
                 let parent_grant = agent.vnext_grant.as_ref().expect("guarded above").clone();
                 let mut prepared = Vec::with_capacity(entries.len());
                 let mut rejection = None;
@@ -5669,7 +9549,191 @@ pub(crate) async fn run_noninteractive_resumable(
                     }
                 };
 
+                // The parent first becomes durably waiting for the complete
+                // batch, then every child node/descriptor is created in the
+                // same transaction.  A restart can therefore recover the
+                // batch result injection without treating siblings as orphaned
+                // stand-alone work.
+                let recursive_targets = match (agent_instance_id, steer_target.as_ref()) {
+                    (Some(parent_agent_instance_id), Some(parent_target)) => {
+                        let child_ids = prepared
+                            .iter()
+                            .map(|_| uuid::Uuid::now_v7())
+                            .collect::<Vec<_>>();
+                        let child_ids_by_label = prepared
+                            .iter()
+                            .zip(child_ids.iter().copied())
+                            .map(|((_, entry, _, _), agent_instance_id)| {
+                                (entry.label.as_str(), agent_instance_id)
+                            })
+                            .collect::<std::collections::HashMap<_, _>>();
+                        let durable_batch_execution_order = batch_execution_order
+                            .iter()
+                            .map(|label| {
+                                *child_ids_by_label
+                                    .get(label.as_str())
+                                    .expect("validated recursive batch schedule names a prepared child")
+                            })
+                            .collect::<Vec<_>>();
+                        let durable_batch_dependencies = prepared
+                            .iter()
+                            .zip(child_ids.iter().copied())
+                            .map(|((_, entry, _, _), agent_instance_id)| {
+                                let dependencies = entry
+                                    .depends_on
+                                    .iter()
+                                    .map(|label| {
+                                        child_ids_by_label
+                                            .get(label.as_str())
+                                            .copied()
+                                            .expect("validated recursive batch dependency names a prepared child")
+                                    })
+                                    .collect::<Vec<_>>();
+                                (agent_instance_id, dependencies)
+                            })
+                            .collect::<std::collections::BTreeMap<_, _>>();
+                        let waiting_snapshot = waiting_recursive_recovery_snapshot(
+                            history.clone(),
+                            PendingRecursiveContinuation {
+                                task_call_id: task_call_id.clone(),
+                                task_provider_item_id: task_provider_item_id.clone(),
+                                task_function_call_id: task_function_call_id.clone(),
+                                repair_notes: repair_notes.clone(),
+                                children: child_ids.clone(),
+                                batch: true,
+                                batch_execution_order: durable_batch_execution_order,
+                                batch_dependencies: durable_batch_dependencies,
+                            },
+                            active_agent_tree_steer_continuation_id
+                                .or(recovered_agent_tree_steer_continuation_id),
+                        );
+                        let children = prepared
+                            .iter()
+                            .zip(child_ids.iter().copied())
+                            .map(|((_, entry, _, child_cwd), agent_instance_id)| {
+                                Ok::<_, anyhow::Error>(
+                                    crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
+                                        agent_instance_id,
+                                        recovery_anchor: uuid::Uuid::now_v7(),
+                                        launch: validated_recursive_noninteractive_launch(serde_json::to_string(&serde_json::json!({
+                                            "version": 2,
+                                            "task_call_id": &task_call_id,
+                                            "label": &parent_target.label,
+                                            "depends_on": &entry.depends_on,
+                                            "child_agent": &entry.child_agent,
+                                            "model": model_selector_json(&entry.model),
+                                            "granted_tools": &entry.granted_tools,
+                                            "cwd": child_cwd.to_string_lossy(),
+                                            "write_scope": &entry.write_scope,
+                                        }))
+                                        .context("serializing recursive batch child launch descriptor")?)?,
+                                        snapshot: validated_recursive_noninteractive_snapshot(ready_noninteractive_recovery_snapshot(
+                                            Vec::new(),
+                                            Message::user(&entry.prompt),
+                                        )?)?,
+                                    },
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>();
+                        let (waiting_snapshot, children) = match (waiting_snapshot, children) {
+                            (Ok(waiting_snapshot), Ok(children)) => match validated_recursive_noninteractive_snapshot(&waiting_snapshot) {
+                                Ok(waiting_snapshot) => (waiting_snapshot, children),
+                                Err(error) => {
+                                    tracing::warn!(%error, "validating recursive batch parent checkpoint failed");
+                                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                        task_call_id,
+                                        task_provider_item_id,
+                                        task_function_call_id,
+                                        "task",
+                                        prepend_task_repair_notes(
+                                            "Error: could not validate recursive batch recovery checkpoint".to_string(),
+                                            &repair_notes,
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            },
+                            (Err(error), _) | (_, Err(error)) => {
+                                tracing::warn!(%error, "serializing recursive batch recovery checkpoint failed");
+                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                    task_call_id,
+                                    task_provider_item_id,
+                                    task_function_call_id,
+                                    "task",
+                                    prepend_task_repair_notes(
+                                        "Error: could not serialize recursive batch recovery checkpoint".to_string(),
+                                        &repair_notes,
+                                    ),
+                                );
+                                continue;
+                            }
+                        };
+                        match session
+                            .db
+                            .create_recursive_noninteractive_executors_and_checkpoint_parent(
+                                session.id,
+                                parent_agent_instance_id,
+                                waiting_snapshot,
+                                children,
+                                crate::agent_tree::system_now_unix_ms(),
+                            )
+                            .await
+                        {
+                            Ok(created) if created.len() == child_ids.len()
+                                && created.iter().zip(&child_ids).all(|(child, id)| child.agent_instance_id == *id) => {
+                                prepared
+                                    .iter()
+                                    .zip(child_ids)
+                                    .map(|((idx, _, _, _), agent_instance_id)| {
+                                        (*idx, parent_target.clone().with_agent_instance_id(agent_instance_id))
+                                    })
+                                    .collect::<std::collections::HashMap<_, _>>()
+                            }
+                            Ok(_) => {
+                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                    task_call_id,
+                                    task_provider_item_id,
+                                    task_function_call_id,
+                                    "task",
+                                    prepend_task_repair_notes(
+                                        "Error: recursive batch checkpoint returned unexpected child identities".to_string(),
+                                        &repair_notes,
+                                    ),
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                    task_call_id,
+                                    task_provider_item_id,
+                                    task_function_call_id,
+                                    "task",
+                                    prepend_task_repair_notes(
+                                        format!("Error: could not checkpoint recursive batch: {error:#}"),
+                                        &repair_notes,
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    _ => std::collections::HashMap::new(),
+                };
+
                 use futures::StreamExt as _;
+                // Preserve the normal batch contract in the recursive path:
+                // unrelated siblings begin immediately, while a dependent
+                // starts only after each declared predecessor has reached a
+                // terminal outcome.  These watches are an execution aid for
+                // this live attempt; `batch_execution_order` above is the
+                // durable equivalent used after a restart.
+                let dependency_completion_senders = prepared
+                    .iter()
+                    .map(|(_, entry, _, _)| {
+                        let (sender, _receiver) = tokio::sync::watch::channel(false);
+                        (entry.label.clone(), sender)
+                    })
+                    .collect::<std::collections::HashMap<_, _>>();
                 let mut runs = futures::stream::FuturesUnordered::new();
                 for (idx, entry, child, child_cwd) in prepared {
                     let admission = vnext_admissions
@@ -5686,16 +9750,104 @@ pub(crate) async fn run_noninteractive_resumable(
                     let local_installations = local_installations.clone();
                     let tandem = tandem.clone();
                     let event_tx = event_tx.clone();
-                    let steer_target = steer_target.clone();
+                    let nested_steer_target = recursive_targets.get(&idx).cloned();
+                    let recursive_child_agent_instance_id = nested_steer_target
+                        .as_ref()
+                        .and_then(|target| target.agent_instance_id);
+                    let recursive_parent_agent_instance_id = agent_instance_id;
+                    let completion_sender = dependency_completion_senders
+                        .get(&entry.label)
+                        .expect("validated recursive batch child has completion signal")
+                        .clone();
+                    let dependency_receivers = entry
+                        .depends_on
+                        .iter()
+                        .map(|label| {
+                            dependency_completion_senders
+                                .get(label)
+                                .expect("validated recursive batch dependency has completion signal")
+                                .subscribe()
+                        })
+                        .collect::<Vec<_>>();
                     runs.push(async move {
                         // RAII releases each slot as soon as its child ends,
                         // including cancellation, errors, and panics.
                         let _admission = admission;
+                        for mut dependency in dependency_receivers {
+                            while !*dependency.borrow() {
+                                tokio::select! {
+                                    changed = dependency.changed() => {
+                                        if changed.is_err() {
+                                            let report = "Error: recursive batch dependency executor disappeared".to_string();
+                                            if let (Some(child_agent_instance_id), Some(parent_agent_instance_id)) = (
+                                                recursive_child_agent_instance_id,
+                                                recursive_parent_agent_instance_id,
+                                            ) {
+                                                session
+                                                    .db
+                                                    .settle_recursive_noninteractive_child_outcome(
+                                                        session.id,
+                                                        parent_agent_instance_id,
+                                                        child_agent_instance_id,
+                                                        entry.label.clone(),
+                                                        entry.child_agent.clone(),
+                                                        report.clone(),
+                                                        true,
+                                                        crate::agent_tree::system_now_unix_ms(),
+                                                    )
+                                                    .await
+                                                    .map_err(|error| format!(
+                                                        "durably terminalizing recursive batch dependency failure failed: {error:#}"
+                                                    ))?;
+                                            }
+                                            completion_sender.send_replace(true);
+                                            return Ok::<_, String>((
+                                                idx,
+                                                entry.label,
+                                                entry.child_agent,
+                                                report,
+                                            ));
+                                        }
+                                    }
+                                    _ = cancel.cancelled() => {
+                                        let report = "Error: recursive batch child cancelled before declared dependency completed".to_string();
+                                        if let (Some(child_agent_instance_id), Some(parent_agent_instance_id)) = (
+                                            recursive_child_agent_instance_id,
+                                            recursive_parent_agent_instance_id,
+                                        ) {
+                                            session
+                                                .db
+                                                .settle_recursive_noninteractive_child_outcome(
+                                                    session.id,
+                                                    parent_agent_instance_id,
+                                                    child_agent_instance_id,
+                                                    entry.label.clone(),
+                                                    entry.child_agent.clone(),
+                                                    report.clone(),
+                                                    true,
+                                                    crate::agent_tree::system_now_unix_ms(),
+                                                )
+                                                .await
+                                                .map_err(|error| format!(
+                                                    "durably terminalizing cancelled recursive batch child failed: {error:#}"
+                                                ))?;
+                                        }
+                                        completion_sender.send_replace(true);
+                                        return Ok::<_, String>((
+                                            idx,
+                                            entry.label,
+                                            entry.child_agent,
+                                            report,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                         let report = Box::pin(run_noninteractive_resumable(
                             child,
-                            entry.prompt,
+                            Message::user(entry.prompt),
                             Vec::new(),
-                            session,
+                            session.clone(),
                             locks,
                             redact,
                             child_cwd,
@@ -5709,27 +9861,114 @@ pub(crate) async fn run_noninteractive_resumable(
                             local_installations,
                             tandem,
                             event_tx,
-                            steer_target,
+                            nested_steer_target,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
                         ))
                         .await
                         .map(|outcome| outcome.report)
                         .unwrap_or_else(|error| format!("Error: {error}"));
-                        (idx, entry.label, entry.child_agent, report)
+                        if let (Some(child_agent_instance_id), Some(parent_agent_instance_id)) = (
+                            recursive_child_agent_instance_id,
+                            recursive_parent_agent_instance_id,
+                        ) {
+                            session
+                                .db
+                                .settle_recursive_noninteractive_child_outcome(
+                                    session.id,
+                                    parent_agent_instance_id,
+                                    child_agent_instance_id,
+                                    entry.label.clone(),
+                                    entry.child_agent.clone(),
+                                    report.clone(),
+                                    report.starts_with("Error:"),
+                                    crate::agent_tree::system_now_unix_ms(),
+                                )
+                                .await
+                                .map_err(|error| format!(
+                                    "durably terminalizing recursive batch predecessor failed: {error:#}"
+                                ))?;
+                        }
+                        completion_sender.send_replace(true);
+                        Ok((idx, entry.label, entry.child_agent, report))
                     });
                 }
                 let mut reports = Vec::new();
                 while let Some(report) = runs.next().await {
-                    reports.push(report);
+                    reports.push(report.map_err(|error| {
+                        NoninteractiveRunError::new(
+                            anyhow::anyhow!(error),
+                            history.clone(),
+                            fallback_decision.clone(),
+                            fallback_tried.clone(),
+                        )
+                    })?);
                 }
+                let terminal_children = reports
+                    .iter()
+                    .filter_map(|(idx, _, _, report)| {
+                        recursive_targets
+                            .get(idx)
+                            .and_then(|target| target.agent_instance_id)
+                            .map(|agent_instance_id| (agent_instance_id, report.starts_with("Error:")))
+                    })
+                    .collect::<Vec<_>>();
                 let result = render_recursive_vnext_batch_result(reports);
-                next_prompt =
+                let completed_next_prompt =
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                        task_call_id,
-                        task_provider_item_id,
-                        task_function_call_id,
+                        task_call_id.clone(),
+                        task_provider_item_id.clone(),
+                        task_function_call_id.clone(),
                         "task",
                         prepend_task_repair_notes(result, &repair_notes),
                     );
+                if let Some(parent_agent_instance_id) = agent_instance_id
+                    && !terminal_children.is_empty()
+                {
+                    let parent_snapshot = ready_noninteractive_recovery_snapshot_with_late_steer(
+                        history.clone(),
+                        completed_next_prompt.clone(),
+                        active_agent_tree_steer_continuation_id
+                            .or(recovered_agent_tree_steer_continuation_id),
+                    )
+                    .map_err(|error| {
+                        NoninteractiveRunError::new(
+                            error,
+                            history.clone(),
+                            fallback_decision.clone(),
+                            fallback_tried.clone(),
+                        )
+                    })?;
+                    let parent_snapshot = validated_recursive_noninteractive_snapshot(&parent_snapshot)
+                        .map_err(|error| NoninteractiveRunError::new(
+                            error,
+                            history.clone(),
+                            fallback_decision.clone(),
+                            fallback_tried.clone(),
+                        ))?;
+                    session
+                        .db
+                        .complete_recursive_noninteractive_children_and_checkpoint_parent(
+                            session.id,
+                            parent_agent_instance_id,
+                            parent_snapshot,
+                            terminal_children,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            NoninteractiveRunError::new(
+                                error.context("checkpointing recursive batch completion"),
+                                history.clone(),
+                                fallback_decision.clone(),
+                                fallback_tried.clone(),
+                            )
+                        })?;
+                }
+                next_prompt = completed_next_prompt;
             }
             TurnOutcome::SpawnSubagent { .. }
             | TurnOutcome::SpawnNoninteractive { .. }
@@ -5742,6 +9981,13 @@ pub(crate) async fn run_noninteractive_resumable(
                 // happen, but if it does we bail rather than spin (the single
                 // async-job authority is the main driver, never a noninteractive
                 // subagent — §22 anti-runaway).
+                retain_noninteractive_late_steer_checkpoint(
+                    &active_claimed_agent_tree_steers,
+                    std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                    crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                        "noninteractive agent produced an unsupported terminal continuation outcome",
+                    ),
+                );
                 drop(child_tx);
                 let _ = forwarder.await;
                 return Err(NoninteractiveRunError::new(
@@ -5756,6 +10002,14 @@ pub(crate) async fn run_noninteractive_resumable(
             }
         }
     }
+    retain_noninteractive_late_steer_checkpoint(
+        &active_claimed_agent_tree_steers,
+        std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+        crate::engine::driver::LateUserSteerContinuationOutcome::failed(format!(
+            "noninteractive agent `{}` exceeded {max_turns} turns",
+            agent.name
+        )),
+    );
     drop(child_tx);
     let _ = forwarder.await;
     Err(NoninteractiveRunError::new(
@@ -5772,6 +10026,160 @@ pub(crate) async fn run_noninteractive_resumable(
 #[cfg(test)]
 mod vnext_child_admission_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn endpoint_drop_is_not_lost_when_the_worker_event_channel_is_full() {
+        let owner = uuid::Uuid::new_v4();
+        let (worker_tx, mut worker_rx) = mpsc::channel(1);
+        let endpoint_generation = crate::engine::agent::next_agent_tree_endpoint_generation();
+        // Fill the bounded worker lane before dropping the endpoint. A
+        // try_send teardown would fail here and leave the registry stale.
+        worker_tx
+            .send(TurnEvent::AgentTreeExecutorEndpointAttached {
+                agent_instance_id: owner,
+                endpoint_generation,
+            })
+            .await
+            .unwrap();
+        let target = NoninteractiveSteerTarget::new("task-full", "child");
+        let (cleanup_tx, mut cleanup_rx) = mpsc::unbounded_channel();
+        let pump_tx = worker_tx.clone();
+        let pump_target = target.clone();
+        let pump = tokio::spawn(async move {
+            while let Some(event) = cleanup_rx.recv().await {
+                if !send_wrapped_noninteractive_event(&pump_tx, &pump_target, event).await {
+                    break;
+                }
+            }
+        });
+        let registration = NoninteractiveAgentTreeEndpointRegistration {
+            cleanup_tx,
+            agent_instance_id: owner,
+            endpoint_generation,
+        };
+        drop(registration);
+
+        assert!(matches!(
+            worker_rx.recv().await,
+            Some(TurnEvent::AgentTreeExecutorEndpointAttached { agent_instance_id, .. }) if agent_instance_id == owner
+        ));
+        let detached = tokio::time::timeout(std::time::Duration::from_millis(100), worker_rx.recv())
+            .await
+            .expect("private teardown pump must wait through worker backpressure");
+        assert!(matches!(
+            detached,
+            Some(TurnEvent::NestedTurn { inner, .. })
+                if matches!(inner.as_ref(), TurnEvent::AgentTreeExecutorEndpointDetached { agent_instance_id, .. } if *agent_instance_id == owner)
+        ));
+        drop(worker_tx);
+        pump.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recursive_recovery_collector_reports_unreconstructable_child_instead_of_waiting() {
+        let collector = RecoveredNoninteractiveEndpointCollector::new();
+        let child = uuid::Uuid::new_v4();
+        collector.report_unrecoverable(child, "immutable grant was revoked");
+        let error = collector
+            .wait_for(&std::collections::BTreeSet::from([child]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("grant was revoked"));
+    }
+
+    #[tokio::test]
+    async fn recursive_recovery_collector_accepts_durable_terminal_outcome() {
+        let collector = RecoveredNoninteractiveEndpointCollector::new();
+        let live = uuid::Uuid::new_v4();
+        let terminal = uuid::Uuid::new_v4();
+        let (endpoint, _receiver) = tokio::sync::mpsc::channel(1);
+        collector.register(
+            live,
+            crate::engine::agent::next_agent_tree_endpoint_generation(),
+            endpoint,
+        );
+        collector.report_terminal(terminal);
+
+        let endpoints = collector
+            .wait_for(&std::collections::BTreeSet::from([live, terminal]))
+            .await
+            .unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].agent_instance_id, live);
+    }
+
+    #[tokio::test]
+    async fn pending_recursive_restart_publishes_full_subtree_before_claim_activation() {
+        let gate = crate::engine::driver::RecoveryActivationGate::new();
+        let root = uuid::Uuid::new_v4();
+        let nested = uuid::Uuid::new_v4();
+        let collector = RecoveredNoninteractiveEndpointCollector::new();
+        let (root_endpoint, _root_rx) = tokio::sync::mpsc::channel(1);
+        let (nested_endpoint, _nested_rx) = tokio::sync::mpsc::channel(1);
+        let nested_gate = gate.clone();
+        let nested_wait = tokio::spawn(async move { nested_gate.wait().await });
+
+        // A restart of a pending recursive continuation must let the worker
+        // observe every live UUID-owned mailbox while the common activation
+        // barrier is still closed.  If this publication waited for release,
+        // the worker could never consume the full claim set that releases it.
+        collector.register(
+            root,
+            crate::engine::agent::next_agent_tree_endpoint_generation(),
+            root_endpoint,
+        );
+        collector.register(
+            nested,
+            crate::engine::agent::next_agent_tree_endpoint_generation(),
+            nested_endpoint,
+        );
+        let endpoints = collector
+            .wait_for(&std::collections::BTreeSet::from([root, nested]))
+            .await
+            .unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert!(
+            !nested_wait.is_finished(),
+            "no recursive model work may start before claim consumption"
+        );
+
+        gate.release();
+        assert!(nested_wait.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn recovered_batch_waits_only_for_declared_dependencies() {
+        let (base_done, dependent_watch) = tokio::sync::watch::channel(false);
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let independent = NoninteractiveStartGate {
+            dependencies: Vec::new(),
+            execution_slots: slots.clone(),
+        };
+        let dependent = NoninteractiveStartGate {
+            dependencies: vec![dependent_watch],
+            execution_slots: slots,
+        };
+
+        // No edge points at `independent`, so it may start even while the
+        // declared predecessor for the other child is unfinished.
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            independent.acquire(&cancel),
+        )
+        .await
+        .expect("independent child must not inherit an unrelated barrier")
+        .is_ok());
+        let mut blocked = Box::pin(dependent.acquire(&cancel));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut blocked)
+            .await
+            .is_err());
+        base_done.send(true).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), blocked)
+            .await
+            .expect("declared dependent should release after its predecessor")
+            .is_ok());
+    }
 
     #[test]
     fn agent_vnext_batch_child_admission_is_atomic_and_reusable() {
@@ -5844,6 +10252,32 @@ mod vnext_child_admission_tests {
         assert_eq!(body["children"][1]["label"], "second");
         assert_eq!(body["children"][2]["label"], "third");
         assert_eq!(body["children"][1]["failed"], true);
+    }
+
+    #[test]
+    fn recursive_recovery_keeps_dependency_edges_without_serializing_siblings() {
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let dependent = uuid::Uuid::new_v4();
+        let pending = PendingRecursiveContinuation {
+            task_call_id: "task".to_string(),
+            task_provider_item_id: None,
+            task_function_call_id: None,
+            repair_notes: Vec::new(),
+            children: vec![first, second, dependent],
+            batch: true,
+            batch_execution_order: vec![first, second, dependent],
+            batch_dependencies: std::collections::BTreeMap::from([
+                (first, Vec::new()),
+                (second, Vec::new()),
+                (dependent, vec![first]),
+            ]),
+        };
+        assert_eq!(
+            recursive_recovery_execution_order(&pending).unwrap(),
+            vec![first, second, dependent],
+            "the schedule remains a stable result order while runtime gates use the exact edge map"
+        );
     }
 
     #[test]

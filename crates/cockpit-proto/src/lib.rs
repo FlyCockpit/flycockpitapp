@@ -71,6 +71,11 @@ pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
     ProviderMutationUpsert, ProviderSecretValue,
 };
+pub mod session_setup;
+pub use session_setup::{
+    SESSION_SETUP_DTO_VERSION, SessionSetupAgentCandidateV1, SessionSetupLockedReasonV1,
+    SessionSetupModelSlotV1, SessionSetupSnapshotV1, SessionSetupUnavailableReasonV1,
+};
 #[cfg(feature = "remote")]
 pub mod remote_connection_metadata;
 #[cfg(feature = "remote")]
@@ -246,6 +251,87 @@ pub struct EnvSnapshotMeta {
     pub digest: String,
     pub key_count: usize,
     pub path_entry_count: usize,
+}
+
+/// Opaque, stable pagination position for daemon-owned agent-tree reads.
+/// Timestamp plus UUID avoids drops when several lifecycle transitions share a
+/// clock tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTreeCursor {
+    pub created_at_unix_ms: i64,
+    pub id: Uuid,
+}
+
+/// Public, resolver-context-free projection of one durable agent node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTreeNode {
+    pub agent_instance_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_instance_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_ref: Option<String>,
+    pub state: String,
+    pub revision: i64,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+/// Typed attention projection. All contracts were allowlisted and redacted by
+/// the daemon before persistence; no resolver prompt, credential, live tool
+/// handle, or approval operation appears on this wire type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDecisionAttention {
+    pub attention_id: Uuid,
+    pub decision_request_id: Uuid,
+    pub agent_instance_id: Uuid,
+    pub state: String,
+    pub decision_state: String,
+    pub decision_class: String,
+    /// Bounded opaque task lineage derived by the daemon from the owning
+    /// agent, never from caller presentation metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_call_id: Option<String>,
+    /// Bounded opaque daemon-owned workspace reference for the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_ref: Option<String>,
+    pub options_contract_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_text_contract_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<i64>,
+    pub revision: i64,
+    pub raised_at_unix_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_unix_ms: Option<i64>,
+}
+
+/// A client answer is validated against the durable bounded/free-text
+/// contract by the daemon and reduced to a redacted receipt before storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentDecisionAnswer {
+    Option { option_id: String },
+    FreeText { text: String },
+    /// Exact wire continuation for a linked QuestionTool interrupt.  It has
+    /// the same serde envelope as `ResolveResponse`, but lives in the
+    /// protocol crate so clients never depend on the daemon storage crate.
+    InterruptResponse { response: AgentInterruptResponse },
+}
+
+/// A QuestionTool continuation supplied through `ResolveAgentDecision`.
+/// Keeping this typed rather than accepting JSON means the session worker can
+/// validate the durable redacted question contract before it releases the
+/// parked continuation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", content = "data")]
+pub enum AgentInterruptResponse {
+    Single { selected_id: String },
+    Multi { selected_ids: Vec<String> },
+    Freetext { text: String },
+    Batch { responses: Vec<AgentInterruptResponse> },
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +525,37 @@ pub enum EnvDriftPolicy {
     Client,
     UpdateDaemon,
     ErrorOnDrift,
+}
+
+/// Daemon-owned setup presentation selected when a session is created.
+///
+/// This is deliberately not an execution, model, sandbox, or agent-authority
+/// setting. It is immutable session setup metadata: later attaches reload it
+/// from the daemon rather than changing the session's entry contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEntryMode {
+    Code,
+    Assistant,
+    Computer,
+}
+
+impl SessionEntryMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Assistant => "assistant",
+            Self::Computer => "computer",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Code => "Code",
+            Self::Assistant => "Assistant",
+            Self::Computer => "Computer",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1100,26 +1217,14 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v18 adds exact, idempotent disposal of
-/// daemon-admitted image drafts that never crossed the first-reference
-/// boundary. v17 added explicit, owner-scoped provider OAuth
-/// cancellation so local frontends can terminally settle timed-out or dismissed
-/// daemon-owned PKCE/device flows. It also adds correlated durable configuration
-/// receipts, including atomic image-spend policy receipts, and operation-bound
-/// external-editor settlement/status receipts. Agent and assistant inventory
-/// reads also carry one shared configuration generation, while agent inventory
-/// binds its canonical and requested workspace roots. Browser-provided local
-/// image paths are admitted by a daemon-only, trust-scoped normalization RPC.
-/// External-editor completion documents use the redacting
-/// `SensitiveWirePayload` wrapper, and durable publication journals distinguish
-/// reserved, intended, and published settlement without putting document bytes
-/// in SQLite. Terminal editor receipts bind the exact durable consumed/result
-/// configuration generation pair.
-pub const PROTOCOL_VERSION: u32 = 18;
+/// Current wire schema version. v20 adds the attached-session, daemon-owned
+/// setup inventory. v19's entry-mode attach contract and every older fixture
+/// remain frozen migration evidence, not a compatibility window.
+pub const PROTOCOL_VERSION: u32 = 20;
 
-/// Oldest wire schema version this binary accepts. v18 is current-only: the
-/// authority lifecycle changes have no safe compatibility fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 18;
+/// Oldest wire schema version this binary accepts. v20 is current-only: setup
+/// inventory is an explicit contract with no compatibility shim.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 20;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1866,7 +1971,7 @@ fn default_client_protocol_version() -> u32 {
 
 mod event;
 pub use event::{
-    AuthFailureKind, DefaultModelStandaloneOutcome, DefaultModelUpdateOutcome, Event,
+    AgentTreeEventSubject, AgentTreeTransition, AuthFailureKind, DefaultModelStandaloneOutcome, DefaultModelUpdateOutcome, Event,
     InferenceErrorClass, ModelSelectionActiveState, ModelSelectionOutcome, ResponsePerformance,
     UserMessageTerminalDisposition,
 };
@@ -3871,8 +3976,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[18];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[20];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -3951,7 +4056,7 @@ mod proto_fixture_tests {
     }
 
     #[test]
-    fn frozen_fixture_supported_version_list_matches_directories() {
+    fn frozen_fixture_directories_are_well_formed_without_expanding_compatibility() {
         let listed = SUPPORTED_PROTOCOL_VERSIONS
             .iter()
             .chain(ARCHIVED_PROTOCOL_VERSIONS)
@@ -3966,11 +4071,14 @@ mod proto_fixture_tests {
             !directories.is_empty(),
             "daemon_proto has no v*/ fixture directories"
         );
-        assert_eq!(
-            directories, listed,
-            "supported protocol version list must match daemon_proto/v*/ directories"
+        assert!(
+            directories.is_superset(&listed),
+            "every live protocol version needs a daemon_proto/vN fixture directory"
         );
-        for version in listed {
+        // Older vN directories are migration archaeology. They deliberately
+        // remain in-tree as frozen wire evidence, but their presence must not
+        // widen the live protocol-compatibility window.
+        for version in directories {
             assert_fixture_directory_files(version);
         }
     }
@@ -4258,12 +4366,16 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "get_inventory_bundle",
         "get_app_flag",
         "get_startup_disclosures",
+        "get_session_setup_snapshot",
         "list_sessions",
         "read_history_page",
         "read_session_messages",
         "read_subagent_history_page",
+        "read_agent_attention",
+        "read_agent_tree",
         "rename_session",
         "resolve_interrupt",
+        "resolve_agent_decision",
         "resolve_assistant_session",
         "restart_if_idle",
         "resume_paused_work",
@@ -4306,9 +4418,13 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "run_invocation_status",
         "session_messages",
         "sessions",
+        "session_setup_snapshot",
         "stats_rollup",
         "startup_disclosures",
         "subagent_history_page",
+        "agent_attention_page",
+        "agent_decision_steered",
+        "agent_tree_page",
         "user_message_queued",
         "workspace_trust_set",
     ];
@@ -5308,6 +5424,12 @@ mod errorcode_forward_tests {
 }
 
 // ---- Tests -----------------------------------------------------------------
+
+/// Retained daemon-wire fixtures from versions this binary deliberately does
+/// not support. Keep this separate from the remote-gated supported-version
+/// table: fixture retention must never widen the live compatibility window.
+#[cfg(test)]
+const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19];
 
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
@@ -7688,7 +7810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v17_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v20_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -7706,6 +7828,20 @@ mod tests {
             receiver.recv().await.unwrap(),
             Some(RecvFrame::VersionMismatch { v: 10, .. })
         ));
+    }
+
+    #[test]
+    fn modes_session_setup_entry_mode_has_exact_three_value_wire_contract() {
+        assert_eq!(serde_json::to_value(SessionEntryMode::Code).unwrap(), "code");
+        assert_eq!(
+            serde_json::to_value(SessionEntryMode::Assistant).unwrap(),
+            "assistant"
+        );
+        assert_eq!(
+            serde_json::to_value(SessionEntryMode::Computer).unwrap(),
+            "computer"
+        );
+        assert!(serde_json::from_value::<SessionEntryMode>(json!("unknown")).is_err());
     }
 
     #[tokio::test]
@@ -7739,13 +7875,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 18);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 18);
+        assert_eq!(PROTOCOL_VERSION, 20);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 20);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v17 config_refreshed fixture")
+                .expect("current v20 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7760,20 +7896,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 18);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 18);
+        assert_eq!(PROTOCOL_VERSION, 20);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 20);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v17 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v20 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v17 {response_name} must freeze the inclusive verification cap"
+                "current v20 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v17 {response_name} must deserialize: {error}")
+                panic!("current v20 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7786,13 +7922,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v17 {response_name} assistant identity is invalid: {error}")
+                panic!("current v20 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v17 assistant inventory must carry bounded opaque revisions");
+            .expect("current v20 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -7884,7 +8020,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v17 MCP CAS fixture must carry {field}"
+                "current v20 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -7934,7 +8070,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v17 fixture must carry an operation id for {tag}"
+                "current v20 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");
@@ -7978,7 +8114,11 @@ mod tests {
 
     #[test]
     fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
-        for version in [12, 13] {
+        for version in ARCHIVED_PROTOCOL_VERSIONS.iter().copied() {
+            assert!(
+                version < MIN_SUPPORTED_PROTOCOL_VERSION,
+                "archived fixture v{version} must remain older than the live support window"
+            );
             assert!(!is_protocol_compatible(version));
             let archived = proto_fixture_files::read_fixture_for(version, "response.json");
             assert!(archived.contains_key("config_refreshed"));

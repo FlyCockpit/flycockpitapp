@@ -172,7 +172,7 @@ impl App {
                 async move {
                     let runner = match initial_model {
                         Some(model) => {
-                            agent_runner::try_spawn_with_model(
+                            agent_runner::try_spawn_with_model_and_entry_mode(
                                 &worker_cwd,
                                 requested_session_id,
                                 model,
@@ -321,6 +321,8 @@ impl App {
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         let mut runner = runner;
         if let Ok(r) = &mut runner {
+            // The daemon, not the CLI parser, is authoritative after Attach.
+            self.session_mode = Some(r.session_entry_mode);
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
             let live_btw_fork = r.btw_fork.clone();
             self.reset_display_attach_backoff();

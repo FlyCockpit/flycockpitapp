@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use super::frame::{
@@ -109,6 +110,236 @@ impl HostLeaseToken {
     ) -> bool {
         self.generation == current_generation && self.owner_instance == current_owner
     }
+}
+
+/// Bind an approval to the exact canonical action list without storing a
+/// potentially sensitive typed-text payload.  `ComputerAction` is the
+/// post-parser, post-normalization representation that reaches dispatch, so
+/// this digest changes for action kind, coordinates, key chords, text, and
+/// batch order alike.
+fn canonical_computer_action_payload_digest(actions: &[ComputerAction]) -> String {
+    fn bytes(digest: &mut Sha256, value: &[u8]) {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+
+    fn coordinate_space_tag(space: super::CoordinateSpace) -> u8 {
+        match space {
+            super::CoordinateSpace::Physical => 0,
+            super::CoordinateSpace::Logical => 1,
+        }
+    }
+
+    fn point(digest: &mut Sha256, point: super::Point) {
+        digest.update([coordinate_space_tag(point.space)]);
+        digest.update(point.x.to_bits().to_be_bytes());
+        digest.update(point.y.to_bits().to_be_bytes());
+    }
+
+    fn rect(digest: &mut Sha256, rect: super::Rect) {
+        digest.update([coordinate_space_tag(rect.space)]);
+        digest.update(rect.x.to_bits().to_be_bytes());
+        digest.update(rect.y.to_bits().to_be_bytes());
+        digest.update(rect.width.to_bits().to_be_bytes());
+        digest.update(rect.height.to_bits().to_be_bytes());
+    }
+
+    fn duration(digest: &mut Sha256, duration: std::time::Duration) {
+        digest.update(duration.as_secs().to_be_bytes());
+        digest.update(duration.subsec_nanos().to_be_bytes());
+    }
+
+    fn mouse_button_tag(button: super::MouseButton) -> u8 {
+        match button {
+            super::MouseButton::Left => 0,
+            super::MouseButton::Right => 1,
+            super::MouseButton::Middle => 2,
+        }
+    }
+
+    fn click_count_tag(count: super::ClickCount) -> u8 {
+        match count {
+            super::ClickCount::Single => 0,
+            super::ClickCount::Double => 1,
+            super::ClickCount::Triple => 2,
+        }
+    }
+
+    fn easing_tag(easing: super::Easing) -> u8 {
+        match easing {
+            super::Easing::Linear => 0,
+            super::Easing::EaseInOut => 1,
+        }
+    }
+
+    fn modifiers(digest: &mut Sha256, modifiers: super::Modifiers) {
+        digest.update([
+            u8::from(modifiers.shift),
+            u8::from(modifiers.control),
+            u8::from(modifiers.alt),
+            u8::from(modifiers.meta),
+        ]);
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"flycockpit.computer-action.v1\0");
+    digest.update((actions.len() as u64).to_be_bytes());
+    for action in actions {
+        // This is a deliberate stable wire-like encoding, not `Debug`/`Hash`:
+        // both are implementation details and can change between compiler or
+        // library versions. Sensitive text and key names enter only this
+        // one-way hash stream, never an approval record or packet.
+        match action {
+            ComputerAction::CaptureFull => digest.update([0]),
+            ComputerAction::CaptureRegion { rect: action_rect } => {
+                digest.update([1]);
+                rect(&mut digest, *action_rect);
+            }
+            ComputerAction::CaptureNativeZoom {
+                rect: action_rect,
+                scale,
+            } => {
+                digest.update([2]);
+                rect(&mut digest, *action_rect);
+                digest.update(scale.0.to_bits().to_be_bytes());
+            }
+            ComputerAction::MoveCursor {
+                to,
+                duration: action_duration,
+                easing,
+            } => {
+                digest.update([3]);
+                point(&mut digest, *to);
+                duration(&mut digest, *action_duration);
+                digest.update([easing_tag(*easing)]);
+            }
+            ComputerAction::Click {
+                button,
+                count,
+                modifiers: action_modifiers,
+            } => {
+                digest.update([4, mouse_button_tag(*button), click_count_tag(*count)]);
+                modifiers(&mut digest, *action_modifiers);
+            }
+            ComputerAction::MouseDown { button } => {
+                digest.update([5, mouse_button_tag(*button)]);
+            }
+            ComputerAction::MouseUp { button } => {
+                digest.update([6, mouse_button_tag(*button)]);
+            }
+            ComputerAction::Drag {
+                button,
+                path,
+                modifiers: action_modifiers,
+            } => {
+                digest.update([7, mouse_button_tag(*button)]);
+                modifiers(&mut digest, *action_modifiers);
+                digest.update((path.len() as u64).to_be_bytes());
+                for timed_point in path {
+                    point(&mut digest, timed_point.point);
+                    duration(&mut digest, timed_point.duration);
+                    digest.update([easing_tag(timed_point.easing)]);
+                }
+            }
+            ComputerAction::TypeText { text } => {
+                digest.update([8]);
+                bytes(&mut digest, text.as_bytes());
+            }
+            ComputerAction::KeyChord { chord } => {
+                digest.update([9]);
+                digest.update((chord.keys.len() as u64).to_be_bytes());
+                for key in &chord.keys {
+                    bytes(&mut digest, key.as_bytes());
+                }
+            }
+            ComputerAction::HoldKey {
+                key,
+                duration: action_duration,
+            } => {
+                digest.update([10]);
+                bytes(&mut digest, key.as_bytes());
+                duration(&mut digest, *action_duration);
+            }
+            ComputerAction::Scroll {
+                delta_x,
+                delta_y,
+                modifiers: action_modifiers,
+            } => {
+                digest.update([11]);
+                digest.update(delta_x.to_be_bytes());
+                digest.update(delta_y.to_be_bytes());
+                modifiers(&mut digest, *action_modifiers);
+            }
+            ComputerAction::Wait {
+                duration: action_duration,
+            } => {
+                digest.update([12]);
+                duration(&mut digest, *action_duration);
+            }
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// The target identifiers themselves are host secrets.  The approval only
+/// needs a stable equality witness, so bind their hash with the lease
+/// generation, owner, and delegation rather than persisting any raw target
+/// identity or evidence bytes.
+fn host_lease_binding_digest(lease: &HostLeaseToken) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"flycockpit.computer-lease.v1\0");
+    digest.update(lease.target_key.host_installation_id.as_bytes());
+    digest.update(lease.target_key.platform_session_or_seat_id);
+    digest.update(lease.target_key.physical_display_id);
+    digest.update(lease.generation.as_u64().to_le_bytes());
+    digest.update(lease.owner_instance.0.to_le_bytes());
+    digest.update(lease.delegation.0.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// A secret-free witness for the target evidence that the backend will act
+/// upon. Physical targets are identified by the same immutable target key as
+/// their host lease; virtual targets carry their independent display UUID.
+/// The lease binding above additionally captures the owner/delegation and
+/// lease generation, while focus/observation/geometry generations travel as
+/// separate canonical operation facts.
+fn target_evidence_binding_digest(
+    backend_kind: BackendKind,
+    host_lease: Option<&HostLeaseToken>,
+    virtual_display_uuid: Option<[u8; 16]>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"flycockpit.computer-target-evidence.v1\0");
+    digest.update(backend_kind.diagnostic_label().as_bytes());
+    match (host_lease, virtual_display_uuid) {
+        (Some(lease), None) => {
+            digest.update([0]);
+            digest.update(lease.target_key.host_installation_id.as_bytes());
+            digest.update(lease.target_key.platform_session_or_seat_id);
+            digest.update(lease.target_key.physical_display_id);
+        }
+        (None, Some(virtual_display_uuid)) => {
+            digest.update([1]);
+            digest.update(virtual_display_uuid);
+        }
+        // This cannot reach the Ask approval seam: `ask_lease_key` rejects an
+        // action without either a physical lease or a virtual display UUID.
+        // Keep an explicit domain tag instead of conflating malformed state
+        // with a valid physical or virtual target.
+        (None, None) => digest.update([2]),
+        // A virtual display never carries a physical host lease. Treat an
+        // inconsistent dual identity as distinct and fail closed at the
+        // coordinator's normal target/lease gates rather than silently
+        // normalizing it to either authority surface.
+        (Some(lease), Some(virtual_display_uuid)) => {
+            digest.update([3]);
+            digest.update(lease.target_key.host_installation_id.as_bytes());
+            digest.update(lease.target_key.platform_session_or_seat_id);
+            digest.update(lease.target_key.physical_display_id);
+            digest.update(virtual_display_uuid);
+        }
+    }
+    format!("{:x}", digest.finalize())
 }
 
 /// Trait for OS-level advisory lock operations. Tests inject an in-memory
@@ -961,6 +1192,17 @@ pub struct ComputerActionAuthorization {
     /// Advisory action risk class (audit/guidance only — never affects
     /// dispatch).
     pub action_class: ActionRiskClass,
+    /// Secret-free digest of the canonical action list handed to the backend.
+    /// Type-text content is included only as hash input; it is never retained
+    /// in the approval packet or durable operation binding.
+    pub action_payload_digest: String,
+    /// Secret-free identity digest for the concrete physical host lease and
+    /// its generation.  A virtual backend has no host lease.
+    pub lease_binding_digest: Option<String>,
+    /// Secret-free digest of the concrete physical or virtual target evidence.
+    /// This is intentionally present even for virtual displays, which do not
+    /// carry a host lease but still need an exact approval binding.
+    pub target_evidence_binding_digest: String,
 }
 
 /// The central authorizer trait for computer actions. The real implementation
@@ -1716,6 +1958,28 @@ pub enum CoordinatedOutcome {
     UnsupportedProviderVariant { detail: String },
 }
 
+/// Translate the coordinator's concrete backend result into the durable
+/// terminal receipt for an approval capability.  In particular, an in-flight
+/// cancellation remains `None` (submission unknown), while a pre-dispatch
+/// denial/invalidated result is a known rejection and a backend report is a
+/// definitive completion/failure.
+fn computer_host_effect_terminality(outcome: &CoordinatedOutcome) -> Option<bool> {
+    match outcome {
+        CoordinatedOutcome::Completed { .. } | CoordinatedOutcome::BackendCompleted { .. } => {
+            Some(true)
+        }
+        CoordinatedOutcome::Failed { .. }
+        | CoordinatedOutcome::Denied { .. }
+        | CoordinatedOutcome::CancelledBeforeDispatch
+        | CoordinatedOutcome::Invalidated { .. }
+        | CoordinatedOutcome::IdentityConflict { .. }
+        | CoordinatedOutcome::UnsupportedProviderVariant { .. } => Some(false),
+        CoordinatedOutcome::DispatchUnknown { .. } | CoordinatedOutcome::DuplicateReplay { .. } => {
+            None
+        }
+    }
+}
+
 /// The journal of completed action outcomes, keyed by provider call ID.
 /// Used for dedup/reconnect: duplicate/replayed calls return the prior
 /// sanitized outcome and never touch input again.
@@ -1863,6 +2127,12 @@ pub struct ComputerActionCoordinator {
     /// Holds the bounded denial reason. Every subsequent computer action on
     /// this coordinator returns `Denied` without prompting again.
     denied: Option<String>,
+    /// Coordinator-owned cancellation generation for a concrete native
+    /// computer backend handoff.  It is intentionally separate from Ask
+    /// leases: a lease is reusable delegation authority, while this token
+    /// fences the one currently approved host operation at its final backend
+    /// boundary.
+    host_effect_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl std::fmt::Debug for ComputerActionCoordinator {
@@ -2008,6 +2278,7 @@ impl ComputerActionCoordinator {
             model_id: params.model_id,
             virtual_display_uuid,
             denied: None,
+            host_effect_cancel: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -2036,6 +2307,7 @@ impl ComputerActionCoordinator {
     /// host-lock loss). After invalidation, no further actions may dispatch.
     pub fn invalidate(&mut self, reason: TargetUnavailableReason) {
         self.invalidated = true;
+        self.host_effect_cancel.cancel();
         // Revoke Ask delegation leases for this delegation (display/target/host
         // generation change, host-lock loss, etc.).
         self.revoke_ask_lease_for_delegation();
@@ -2115,6 +2387,37 @@ impl ComputerActionCoordinator {
             return CoordinatedOutcome::Invalidated { reason };
         }
 
+        // The human approval is for the exact post-parser action batch and
+        // the target/lease/evidence state that existed while answering. Rebuild
+        // every one of those facts immediately before the concrete backend
+        // call. A stale/cancelled/different capability is terminalized by the
+        // coordinator-owned scope and must never reach `backend.execute`.
+        let concrete_effect = self.concrete_host_approval_effect(call_id, _action_label, actions);
+        if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+            "computer_coordinator_backend_execute",
+            std::slice::from_ref(&concrete_effect),
+        )
+        .await
+        .is_err()
+            // The ordinary tool-dispatch scope may be the enclosing task-local
+            // owner. It fences its turn cancellation above; this second,
+            // final check additionally binds the coordinator's own target /
+            // lease invalidation generation immediately before the backend.
+            || crate::engine::interrupt::recheck_host_approval_effect_boundary(
+                "computer_coordinator_backend_execute",
+                &self.host_effect_cancel,
+                std::slice::from_ref(&concrete_effect),
+            )
+            .await
+            .is_err()
+        {
+            self.dispatch_states
+                .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+            return CoordinatedOutcome::Denied {
+                reason: "computer action approval is no longer live for this backend handoff".to_string(),
+            };
+        }
+
         // Execute through the backend.
         let report: ComputerBatchReport = self.backend.execute(actions).await;
 
@@ -2186,6 +2489,16 @@ impl ComputerActionCoordinator {
             .first()
             .map(ActionRiskClass::classify)
             .unwrap_or(ActionRiskClass::Unknown);
+        let action_payload_digest = canonical_computer_action_payload_digest(actions);
+        let lease_binding_digest = self
+            .host_lease
+            .as_ref()
+            .map(host_lease_binding_digest);
+        let target_binding_digest = target_evidence_binding_digest(
+            self.backend_kind,
+            self.host_lease.as_ref(),
+            self.virtual_display_uuid(),
+        );
         let request = ComputerActionAuthorization {
             session_id: self.session_id.clone(),
             delegation_id: self.delegation_id.clone(),
@@ -2200,8 +2513,60 @@ impl ComputerActionCoordinator {
             batch_index: 0,
             geometry_generation: self.observation_generation,
             action_class,
+            action_payload_digest,
+            lease_binding_digest,
+            target_evidence_binding_digest: target_binding_digest,
         };
         self.authorizer.authorize(&request).await
+    }
+
+    /// Reconstruct the exact selected-candidate payload at the only concrete
+    /// input boundary.  This deliberately duplicates no mutable prompt text:
+    /// action identity, tier, current host lease, target evidence, generation,
+    /// and the digest of the full canonical action list are all read from the
+    /// coordinator immediately before `backend.execute`.
+    fn concrete_host_approval_effect(
+        &self,
+        call_id: &str,
+        action_label: &str,
+        actions: &[ComputerAction],
+    ) -> serde_json::Value {
+        let action_class = actions
+            .first()
+            .map(ActionRiskClass::classify)
+            .unwrap_or(ActionRiskClass::Unknown);
+        let lease_binding_digest = self
+            .host_lease
+            .as_ref()
+            .map(host_lease_binding_digest);
+        let target_evidence_binding_digest = target_evidence_binding_digest(
+            self.backend_kind,
+            self.host_lease.as_ref(),
+            self.virtual_display_uuid(),
+        );
+        serde_json::json!({
+            "execute": {
+                "session_id": &self.session_id,
+                "delegation_id": &self.delegation_id.0,
+                "action_id": call_id,
+                "tier": match self.tier {
+                    ComputerApprovalTier::Ask => "ask",
+                    ComputerApprovalTier::Yolo => "yolo",
+                },
+                "action_label": action_label,
+                "backend_kind": self.backend_kind.diagnostic_label(),
+                "focus_generation": self.focus_generation,
+                "observation_generation": self.observation_generation,
+                "geometry_generation": self.observation_generation,
+                "provider_call_id": call_id,
+                "batch_index": 0_u32,
+                "action_class": action_class.label(),
+                "has_host_lease": self.host_lease.is_some(),
+                "payload_digest": canonical_computer_action_payload_digest(actions),
+                "lease_binding_digest": lease_binding_digest,
+                "target_evidence_binding_digest": target_evidence_binding_digest,
+            }
+        })
     }
 
     /// Build the Ask lease key for the current coordinator state. The key is
@@ -2213,7 +2578,12 @@ impl ComputerActionCoordinator {
     /// display UUID is used as the target key.
     fn ask_lease_key(&self, virtual_display_uuid: Option<[u8; 16]>) -> Option<AskLeaseKey> {
         let target_key = match (&self.host_lease, virtual_display_uuid) {
-            (Some(token), _) => LeaseTargetKey::Physical(token.target_key),
+            // A target cannot simultaneously be the host-global physical
+            // surface and an independent virtual display. Do not silently
+            // prefer one identity: the approval binding and dispatch gate must
+            // fail closed until fresh evidence establishes one concrete target.
+            (Some(_), Some(_)) => return None,
+            (Some(token), None) => LeaseTargetKey::Physical(token.target_key),
             (None, Some(uuid)) => LeaseTargetKey::Virtual(uuid),
             (None, None) => {
                 // No host lease and no known virtual display UUID — the lease
@@ -2601,6 +2971,29 @@ impl ComputerActionCoordinator {
         call_id: &str,
         actions: &[OpenAiComputerAction],
     ) -> CoordinatedOutcome {
+        let cancel = self.host_effect_cancel.clone();
+        let fallback_action_label = format!("openai_call:{}", actions.len());
+        crate::engine::interrupt::with_host_approval_effect_scope(
+            "computer_coordinator_backend_execute",
+            cancel,
+            async {
+                Ok::<CoordinatedOutcome, anyhow::Error>(
+                    self.execute_openai_call_unscoped(call_id, actions).await,
+                )
+            },
+            computer_host_effect_terminality,
+        )
+        .await
+        .unwrap_or(CoordinatedOutcome::DispatchUnknown {
+            action_label: fallback_action_label,
+        })
+    }
+
+    async fn execute_openai_call_unscoped(
+        &mut self,
+        call_id: &str,
+        actions: &[OpenAiComputerAction],
+    ) -> CoordinatedOutcome {
         // Build the backend action list + action identity BEFORE any dedup, so
         // the identity check is the PRIMARY dedup key. A reused (session,
         // delegation, provider_call_id, batch_index) with a DIFFERENT payload is
@@ -2733,6 +3126,29 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20251124ComputerAction,
     ) -> CoordinatedOutcome {
+        let cancel = self.host_effect_cancel.clone();
+        crate::engine::interrupt::with_host_approval_effect_scope(
+            "computer_coordinator_backend_execute",
+            cancel,
+            async {
+                Ok::<CoordinatedOutcome, anyhow::Error>(
+                    self.execute_anthropic_20251124_call_unscoped(call_id, action)
+                        .await,
+                )
+            },
+            computer_host_effect_terminality,
+        )
+        .await
+        .unwrap_or(CoordinatedOutcome::DispatchUnknown {
+            action_label: "anthropic_20251124_call".to_string(),
+        })
+    }
+
+    async fn execute_anthropic_20251124_call_unscoped(
+        &mut self,
+        call_id: &str,
+        action: &Anthropic20251124ComputerAction,
+    ) -> CoordinatedOutcome {
         // Identity is the PRIMARY dedup key (built before any dedup), so a reused
         // call id with a DIFFERENT payload is an identity_conflict with zero
         // dispatch rather than a stale DuplicateReplay (AC14).
@@ -2843,6 +3259,29 @@ impl ComputerActionCoordinator {
 
     /// Execute an Anthropic 2025-01-24 computer call through the coordinator.
     pub async fn execute_anthropic_20250124_call(
+        &mut self,
+        call_id: &str,
+        action: &Anthropic20250124ComputerAction,
+    ) -> CoordinatedOutcome {
+        let cancel = self.host_effect_cancel.clone();
+        crate::engine::interrupt::with_host_approval_effect_scope(
+            "computer_coordinator_backend_execute",
+            cancel,
+            async {
+                Ok::<CoordinatedOutcome, anyhow::Error>(
+                    self.execute_anthropic_20250124_call_unscoped(call_id, action)
+                        .await,
+                )
+            },
+            computer_host_effect_terminality,
+        )
+        .await
+        .unwrap_or(CoordinatedOutcome::DispatchUnknown {
+            action_label: "anthropic_20250124_call".to_string(),
+        })
+    }
+
+    async fn execute_anthropic_20250124_call_unscoped(
         &mut self,
         call_id: &str,
         action: &Anthropic20250124ComputerAction,
@@ -3000,6 +3439,7 @@ impl ComputerActionCoordinator {
     /// Mark the backend as dead. Failure wakes all waiters with zero input.
     pub fn mark_backend_dead(&mut self) {
         self.backend_dead = true;
+        self.host_effect_cancel.cancel();
         // Revoke Ask delegation leases for this delegation.
         self.revoke_ask_lease_for_delegation();
         // Release the host lease if held.
@@ -3605,6 +4045,81 @@ mod tests {
             [4u8; 16],
             1234,
         )
+    }
+
+    #[test]
+    fn canonical_computer_action_binding_hashes_exact_secret_bearing_actions() {
+        // Approval records retain this digest rather than raw typed text. It
+        // must still distinguish the exact backend payload, including batch
+        // order, so an approval cannot be replayed for a changed action.
+        let secret = "not-a-hex-secret-value";
+        let original = vec![
+            ComputerAction::TypeText {
+                text: secret.to_string(),
+            },
+            ComputerAction::Scroll {
+                delta_x: 0,
+                delta_y: 120,
+                modifiers: Modifiers::default(),
+            },
+        ];
+        let identical = original.clone();
+        let reordered = vec![original[1].clone(), original[0].clone()];
+        let changed_text = vec![
+            ComputerAction::TypeText {
+                text: "not-a-hex-secret-value-changed".to_string(),
+            },
+            original[1].clone(),
+        ];
+
+        let digest = canonical_computer_action_payload_digest(&original);
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(
+            !digest.contains(secret),
+            "the durable approval binding must never retain typed text"
+        );
+        assert_eq!(
+            digest,
+            canonical_computer_action_payload_digest(&identical),
+            "canonical input must give a stable approval binding"
+        );
+        assert_ne!(
+            digest,
+            canonical_computer_action_payload_digest(&changed_text),
+            "changing typed text must invalidate the approval binding"
+        );
+        assert_ne!(
+            digest,
+            canonical_computer_action_payload_digest(&reordered),
+            "batch order is authority-bearing at dispatch"
+        );
+    }
+
+    #[test]
+    fn virtual_target_evidence_has_its_own_exact_approval_binding() {
+        let first = target_evidence_binding_digest(
+            BackendKind::VirtualDisplay,
+            None,
+            Some([0xA1; 16]),
+        );
+        let identical = target_evidence_binding_digest(
+            BackendKind::VirtualDisplay,
+            None,
+            Some([0xA1; 16]),
+        );
+        let different_display = target_evidence_binding_digest(
+            BackendKind::VirtualDisplay,
+            None,
+            Some([0xB2; 16]),
+        );
+
+        assert_eq!(first, identical);
+        assert_ne!(
+            first, different_display,
+            "a virtual-display approval must not be replayable on another target"
+        );
+        assert_eq!(first.len(), 64);
     }
 
     fn make_coordinator_params(authorizer: Arc<dyn ComputerAuthorizer>) -> CoordinatorParams {

@@ -226,7 +226,7 @@ export class RemoteSessionClient {
     ws.close();
   }
 
-  async attach(params: ParamsOf<"attach"> = {}) {
+  async attach(params: ParamsOf<"attach">) {
     return parseAttachResult(await this.send({ request: "attach", params }));
   }
 

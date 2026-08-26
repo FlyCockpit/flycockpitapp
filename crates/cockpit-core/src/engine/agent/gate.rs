@@ -465,7 +465,10 @@ async fn escalate_gated_call(
     } else {
         let label = format!("{tool} {}", gate_payload(tool, args));
         approver
-            .authorize(crate::approval::AuthorizationRequest::NativeTool { label: &label })
+            .authorize(crate::approval::AuthorizationRequest::NativeTool {
+                label: &label,
+                input: args,
+            })
             .await
     };
     match decision {
@@ -558,6 +561,7 @@ mod safety_gate_tests {
         };
         ToolCtx {
             agent_id: "builder".to_string(),
+            agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
             current_tool_call_id: None,
@@ -663,6 +667,7 @@ mod safety_gate_tests {
             .unwrap()
             .expect("parked gate row");
         crate::engine::interrupt::PreResolvedInterruptQuestion {
+            agent_instance_id: row.agent_instance_id,
             agent: row.agent_id,
             description: row.description,
             questions: row.questions.expect("gate question set"),

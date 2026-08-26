@@ -239,11 +239,80 @@ pub(super) async fn add_git_with_prepare_scope(
     shallow: bool,
     prepare_scope: &str,
 ) -> Result<PackageRow> {
+    add_git_with_prepare_scope_inner(
+        db,
+        cwd,
+        identifier,
+        url,
+        branch,
+        shallow,
+        prepare_scope,
+        None,
+    )
+    .await
+}
+
+/// The concrete package-clone effect used by the Docs resolver.  This is
+/// intentionally not folded into the general registry API: direct daemon/CLI
+/// callers have their own authorization boundary, while this path carries the
+/// exact facts selected by the one-use `package_clone` approval.
+pub(super) async fn add_git_with_prepare_scope_and_host_effect(
+    db: &Db,
+    cwd: &Path,
+    identifier: &str,
+    url: &str,
+    branch: Option<&str>,
+    shallow: bool,
+    prepare_scope: &str,
+    concrete_effect: serde_json::Value,
+) -> Result<PackageRow> {
+    add_git_with_prepare_scope_inner(
+        db,
+        cwd,
+        identifier,
+        url,
+        branch,
+        shallow,
+        prepare_scope,
+        Some(&concrete_effect),
+    )
+    .await
+}
+
+async fn recheck_host_approved_package_mutation(
+    concrete_effect: Option<&serde_json::Value>,
+) -> Result<()> {
+    let Some(concrete_effect) = concrete_effect else {
+        return Ok(());
+    };
+    // This is deliberately at the lowest shared package-mutation layer,
+    // rather than only in the UI-facing tool: package dedupe, directory
+    // creation, clone, and registry writes are all side effects. The scope
+    // owns the live cancellation generation and rejects a selected candidate
+    // whose exact identifier/URL/rationale no longer matches this effect.
+    crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+        "package_registry_mutation",
+        std::slice::from_ref(concrete_effect),
+    )
+    .await
+}
+
+async fn add_git_with_prepare_scope_inner(
+    db: &Db,
+    cwd: &Path,
+    identifier: &str,
+    url: &str,
+    branch: Option<&str>,
+    shallow: bool,
+    prepare_scope: &str,
+    concrete_effect: Option<&serde_json::Value>,
+) -> Result<PackageRow> {
     validate_prepare_scope(prepare_scope)?;
     let (dir, dest) = clone_destination(cwd, identifier)?;
 
     // Repo dedupe: reuse an existing clone for the same URL.
     if let Some(existing) = db.package_by_source_url(url).await? {
+        recheck_host_approved_package_mutation(concrete_effect).await?;
         return db
             .upsert_package(&NewPackage {
                 identifier: identifier.to_string(),
@@ -260,12 +329,14 @@ pub(super) async fn add_git_with_prepare_scope(
             .await;
     }
 
+    recheck_host_approved_package_mutation(concrete_effect).await?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating clone dir `{}`", dir.display()))?;
 
     // Concurrency: if the destination already holds a clone (a racing
     // caller got there first), reuse it rather than re-cloning.
     if dest.join(".git").is_dir() {
+        recheck_host_approved_package_mutation(concrete_effect).await?;
         return db
             .upsert_package(&NewPackage {
                 identifier: identifier.to_string(),
@@ -280,9 +351,11 @@ pub(super) async fn add_git_with_prepare_scope(
             .await;
     }
 
+    recheck_host_approved_package_mutation(concrete_effect).await?;
     git_clone(url, &dest, branch, shallow)
         .with_context(|| format!("cloning `{url}` into `{}`", dest.display()))?;
 
+    recheck_host_approved_package_mutation(concrete_effect).await?;
     db.upsert_package(&NewPackage {
         identifier: identifier.to_string(),
         display_name: identifier.to_string(),

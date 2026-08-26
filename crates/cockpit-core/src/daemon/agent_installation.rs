@@ -5,8 +5,19 @@
 //! durable idempotency/journal state. The prerequisite DB installation module
 //! remains the sole binding/snapshot/revision mutation authority.
 
+use std::collections::HashMap;
+#[cfg(any(unix, windows))]
+use std::collections::BTreeMap;
+#[cfg(any(unix, windows))]
+use std::collections::HashSet;
+use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(unix, windows))]
+use std::sync::Mutex;
+#[cfg(any(unix, windows))]
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
@@ -17,7 +28,8 @@ use cockpit_config::config::providers::{ModelCapabilities, ModelEntry, ProviderE
 use cockpit_db::db::Db;
 use cockpit_db::db::agent_installations::{
     AgentInstallationInput, AgentInstallationRow, AgentInstallationScope,
-    AgentReplacementCompensationReceipt, InstallAgentOutcome,
+    AgentReplacementCompensationReceipt, InstallAgentOutcome, SessionSetupDbSnapshot,
+    SessionSetupInstallationSnapshotRow,
 };
 use cockpit_db::db::installation_operations::{
     BeginInstallationOperation, InstallationJournalCheckpoint, InstallationJournalRow,
@@ -30,6 +42,8 @@ use cockpit_proto::{
     AgentInstallationReceiptStatusV1, AgentInstallationRecordV1, AgentInstallationResultV1,
     AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
+    SESSION_SETUP_DTO_VERSION, SessionSetupAgentCandidateV1, SessionSetupLockedReasonV1,
+    SessionSetupModelSlotV1, SessionSetupSnapshotV1, SessionSetupUnavailableReasonV1,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -37,6 +51,22 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const MAX_AGENT_MARKDOWN_BYTES: usize = 1024 * 1024;
+/// Hook files share the bounded retained-workspace config policy.  Keep this
+/// explicit at the acquisition boundary: parser errors may be warnings, but
+/// an oversized capability-backed source is not safe to read or publish.
+const MAX_HOOK_CONFIG_BYTES: usize = cockpit_config::config::MAX_WORKSPACE_CONFIG_FILE_BYTES;
+/// Workspace hook executables are copied once into a daemon-private bundle so
+/// a source pathname can never be reopened after attach. This is intentionally
+/// larger than the config cap while still bounding memory and disk use.
+const MAX_RETAINED_HOOK_EXECUTABLE_BYTES: usize = 64 * 1024 * 1024;
+/// A one-megabyte config could otherwise name arbitrarily many distinct
+/// executables. Bound the whole live source bundle as well as each file.
+const MAX_RETAINED_HOOK_BUNDLE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_RETAINED_HOOK_BUNDLES_PER_SOURCE: usize = 128;
+#[cfg(any(unix, windows))]
+const MAX_RETAINED_HOOK_BUNDLE_BYTES_PER_WORKER: usize = 256 * 1024 * 1024;
+#[cfg(any(unix, windows))]
+const MAX_RETAINED_HOOK_BUNDLES_PER_WORKER: usize = 256;
 const GITHUB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -177,12 +207,1901 @@ pub trait AgentWorkspaceAuthorizer: Send + Sync {
     async fn authorize_workspace(&self, client_path: &str) -> Result<(String, PathBuf)>;
 }
 
+/// Attach-time proof for a local workspace root. It couples canonical path
+/// spelling with the underlying directory identity so a later path reuse
+/// cannot silently inherit an attached session's private/shared scope.
+pub struct AuthorizedWorkspaceRoot {
+    canonical_path: PathBuf,
+    identity_digest: [u8; 32],
+    /// An owned directory capability captured at attach.  All workspace-shared
+    /// definition reads must stay beneath this handle; `canonical_path` is
+    /// only a canonical identity spelling and is never read as authority.
+    held_directory: Arc<cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority>,
+}
+
+impl Clone for AuthorizedWorkspaceRoot {
+    fn clone(&self) -> Self {
+        Self {
+            canonical_path: self.canonical_path.clone(),
+            identity_digest: self.identity_digest,
+            held_directory: Arc::clone(&self.held_directory),
+        }
+    }
+}
+
+impl PartialEq for AuthorizedWorkspaceRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_path == other.canonical_path
+            && self.identity_digest == other.identity_digest
+    }
+}
+
+impl Eq for AuthorizedWorkspaceRoot {}
+
+impl std::fmt::Debug for AuthorizedWorkspaceRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedWorkspaceRoot")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthorizedWorkspaceRoot {
+    pub fn capture(path: &Path) -> Result<Self> {
+        let canonical_path =
+            std::fs::canonicalize(path).context("canonicalizing authorized workspace")?;
+        let held_directory = Arc::new(
+            cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+                &canonical_path,
+            )?,
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(b"cockpit-workspace-root-identity-v1");
+        hasher.update(held_directory.identity().as_bytes());
+        Ok(Self {
+            canonical_path,
+            identity_digest: hasher.finalize().into(),
+            held_directory,
+        })
+    }
+
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    pub fn verify(&self, path: &Path) -> Result<PathBuf> {
+        let observed = Self::capture(path)?;
+        ensure!(
+            observed.canonical_path == self.canonical_path
+                && observed.identity_digest == self.identity_digest,
+            "attached workspace identity changed"
+        );
+        Ok(observed.canonical_path)
+    }
+
+    fn read_workspace_shared_definition(&self, name: &str) -> Result<Vec<u8>> {
+        ensure!(
+            !name.is_empty()
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                }),
+            "invalid workspace agent filename"
+        );
+        let filename = format!("{name}.md");
+        let bytes = self
+            .held_directory
+            .read_regular_file_relative_bounded(
+                &[".cockpit", "agents", &filename],
+                MAX_AGENT_MARKDOWN_BYTES,
+            )?;
+        Ok(bytes)
+    }
+
+    /// Clone the held directory descriptor for a lower-level capability
+    /// operation. The returned handle remains rooted at the captured object;
+    /// callers must never substitute `canonical_path` as filesystem authority.
+    fn retained_directory_handle(&self) -> Result<std::fs::File> {
+        self.held_directory.retained_directory_handle()
+    }
+
+    #[cfg(windows)]
+    fn acquire_windows_execution_lease(
+        &self,
+    ) -> Result<cockpit_host::private_fs::held_directory::WindowsWorkspaceExecutionLease> {
+        self.held_directory
+            .acquire_windows_execution_lease(&self.canonical_path)
+    }
+}
+
+/// Worker-owned authority for the exact configuration sources that
+/// participated in attach-time discovery. It retains each source directory
+/// separately so a later rename/replacement fails closed instead of allowing
+/// a refresh to read a successor through pathname discovery. Global source
+/// handles are config-only capabilities, never workspace authority.
+#[derive(Clone)]
+pub(crate) struct WorkerWorkspaceConfigAuthority {
+    pub(crate) attached_root: AuthorizedWorkspaceRoot,
+    config_layers: Vec<WorkspaceConfigLayerAuthority>,
+    /// Every global, project, or explicit layer selected at attachment,
+    /// retained in precedence order. This is separate from `config_layers`,
+    /// which is the project/explicit-only hook authority. The complete chain
+    /// drives provider provenance, worker reloads, and default clear
+    /// projection without consulting a new `COCKPIT_CONFIG`.
+    default_effective_layers: Vec<RetainedDefaultWriteTargetAuthority>,
+    /// Exact spellings selected before their parent capabilities were
+    /// captured. These are comparison data only: all later reads use the
+    /// matching retained directory, never this path.
+    retained_source_paths: Vec<PathBuf>,
+    default_write_target: Option<RetainedDefaultWriteTargetAuthority>,
+    exclusive_config_override: bool,
+    hook_sources: Vec<cockpit_config::config::extended::hooks::HookConfigSource>,
+    hook_source_layer_indexes: Vec<Option<usize>>,
+    #[cfg(any(unix, windows))]
+    hook_execution_budget: Arc<Mutex<RetainedHookExecutionBudget>>,
+    config_watch_paths: crate::daemon::config_source::ConfigWatchPaths,
+}
+
+#[derive(Clone)]
+struct WorkspaceConfigLayerAuthority {
+    config_directory: AuthorizedWorkspaceRoot,
+    config_leaf: OsString,
+    effective_default_journal_leaf: OsString,
+    effective_default_backup_leaf: OsString,
+}
+
+/// Non-serializable authority for one captured project/explicit hook source.
+/// It keeps the config-parent capability used to find the executable separate
+/// from the attached workspace capability used as the child cwd. Relative
+/// executables are resolved beside their config file, but hooks historically
+/// run in the project root; conflating the two changes hook behavior and lets
+/// an explicit config choose an unintended cwd.
+///
+/// Nothing in this type is included in protocol, config, audit, or debug
+/// data; the config crate only sees it through its narrow launch trait.
+struct RetainedHookExecutionAuthority {
+    #[cfg(any(unix, windows))]
+    executable_source_directory: AuthorizedWorkspaceRoot,
+    #[cfg(any(unix, windows))]
+    working_directory: AuthorizedWorkspaceRoot,
+    #[cfg(any(unix, windows))]
+    bundles: Mutex<RetainedHookExecutionBundles>,
+    #[cfg(any(unix, windows))]
+    bundle_root: Arc<RetainedHookExecutionBundleRoot>,
+    #[cfg(any(unix, windows))]
+    bundle_budget: Arc<Mutex<RetainedHookExecutionBudget>>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct RetainedHookExecutionBundles {
+    bundles: BTreeMap<Vec<String>, Arc<RetainedHookExecutionBundle>>,
+    total_bytes: usize,
+}
+
+/// Shared by all retained sources in this worker, including old and new
+/// turn-pinned snapshots during refresh. This prevents many project layers
+/// from multiplying the per-source snapshot cap.
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct RetainedHookExecutionBudget {
+    total_bytes: usize,
+    total_bundles: usize,
+}
+
+/// One collision-free, owner-private executable snapshot. Its `TempDir`
+/// deletes the bundle when the registry/config snapshot retires. The root
+/// lease keeps its parent alive while an in-flight hook has only this bundle.
+#[cfg(any(unix, windows))]
+struct RetainedHookExecutionBundle {
+    _directory: tempfile::TempDir,
+    executable: PathBuf,
+    /// Exact bytes copied from the no-follow source descriptor. Kept only as
+    /// private provenance for the bundle's lifetime; it is never surfaced in
+    /// hook metadata or wire data.
+    _source_sha256: [u8; 32],
+    #[cfg(unix)]
+    workspace_cwd: Arc<std::fs::File>,
+    #[cfg(windows)]
+    // The workspace lease is acquired per launch. Keeping only the immutable
+    // authority here means attach/refresh remain available if another process
+    // transiently prevents a no-delete cwd lease.
+    _windows_bundle_marker: (),
+    #[cfg(any(unix, windows))]
+    _root: Arc<RetainedHookExecutionBundleRoot>,
+    #[cfg(any(unix, windows))]
+    budget: Arc<Mutex<RetainedHookExecutionBudget>>,
+    #[cfg(any(unix, windows))]
+    byte_len: usize,
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for RetainedHookExecutionBundle {
+    fn drop(&mut self) {
+        let mut budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        budget.total_bytes = budget.total_bytes.saturating_sub(self.byte_len);
+        budget.total_bundles = budget.total_bundles.saturating_sub(1);
+    }
+}
+
+/// Process-private parent for hook snapshots. It lives under Cockpit's
+/// private daemon state, not an ambient shared temporary directory. The open
+/// flock identifies a live owner so later daemon starts can reclaim only
+/// abandoned roots after a crash without touching a concurrently-running
+/// daemon's hooks.
+#[cfg(unix)]
+struct RetainedHookExecutionBundleRoot {
+    _directory: tempfile::TempDir,
+    _lease: std::fs::File,
+    path: PathBuf,
+}
+
+#[cfg(any(unix, windows))]
+static ACTIVE_HOOK_EXECUTION_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[cfg(any(unix, windows))]
+fn active_hook_execution_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    ACTIVE_HOOK_EXECUTION_ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(unix)]
+impl RetainedHookExecutionBundleRoot {
+    const PREFIX: &'static str = "hook-execution-";
+    const STALE_SCAN_LIMIT: usize = 128;
+    const UNLEASED_REAP_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn create() -> std::result::Result<Self, String> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let state_root = cockpit_config::config::resolve::cockpit_state_dir()
+            .map_err(|error| format!("locating daemon hook state directory failed: {error:#}"))?
+            .join("hook-execution");
+        cockpit_host::private_fs::ensure_private_dir(&state_root).map_err(|error| {
+            format!("securing daemon hook state directory failed: {error}")
+        })?;
+        // `pre_exec` changes the child cwd before the absolute bundle program
+        // is executed. Canonicalize after the private no-follow setup so an
+        // otherwise relative XDG value can never turn that program into a
+        // source-cwd-relative lookup.
+        let state_root = std::fs::canonicalize(&state_root)
+            .map_err(|error| format!("canonicalizing daemon hook state directory failed: {error}"))?;
+        Self::reap_abandoned_roots(&state_root);
+        let directory = tempfile::Builder::new()
+            .prefix(Self::PREFIX)
+            .tempdir_in(&state_root)
+            .map_err(|error| format!("creating hook execution root failed: {error}"))?;
+        let path = directory.path().to_path_buf();
+        active_hook_execution_roots()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.clone());
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| {
+                active_hook_execution_roots()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&path);
+                format!("securing hook execution root failed: {error}")
+            })?;
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.path().join(".lease"))
+            .map_err(|error| {
+                active_hook_execution_roots()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&path);
+                format!("creating hook execution root lease failed: {error}")
+            })?;
+        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            active_hook_execution_roots()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&path);
+            return Err(format!(
+                "locking hook execution root lease failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            _directory: directory,
+            _lease: lease,
+            path,
+        })
+    }
+
+    fn reap_abandoned_roots(state_root: &Path) {
+        use std::os::fd::AsRawFd as _;
+
+        let Ok(entries) = std::fs::read_dir(state_root) else {
+            return;
+        };
+        for entry in entries.flatten().take(Self::STALE_SCAN_LIMIT) {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with(Self::PREFIX)
+                || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                continue;
+            }
+            let root = entry.path();
+            if active_hook_execution_roots()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&root)
+            {
+                continue;
+            }
+            let Ok(lease) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join(".lease"))
+            else {
+                // A crash can occur in the tiny interval after `tempdir_in`
+                // creates the root but before its lease file is durable. Do
+                // not race a peer that is actively initializing; reclaim only
+                // a clearly old unleased prefix root on a later startup.
+                let old_unleased_root = std::fs::metadata(&root)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age >= Self::UNLEASED_REAP_AGE);
+                if old_unleased_root {
+                    let _ = std::fs::remove_dir_all(root);
+                }
+                continue;
+            };
+            // A live daemon holds this lock. Reclaim only an abandoned root;
+            // errors are intentionally best-effort housekeeping and never
+            // widen execution to the source pathname.
+            if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self._directory.path()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RetainedHookExecutionBundleRoot {
+    fn drop(&mut self) {
+        active_hook_execution_roots()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.path);
+    }
+}
+
+/// Windows counterpart to the Unix flock-backed bundle root. The private
+/// state directory gives the root its ACL boundary. Its `.lease` is opened
+/// without `FILE_SHARE_DELETE`, which makes `remove_dir_all` fail while a
+/// daemon still owns the root and succeed after a crash closed every handle.
+/// The field order intentionally drops the lease before `TempDir` attempts
+/// cleanup.
+#[cfg(windows)]
+struct RetainedHookExecutionBundleRoot {
+    _lease: Option<std::fs::File>,
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+#[cfg(windows)]
+impl RetainedHookExecutionBundleRoot {
+    const PREFIX: &'static str = "hook-execution-";
+    const STALE_SCAN_LIMIT: usize = 128;
+    const UNLEASED_REAP_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn create() -> std::result::Result<Self, String> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // Win32 FILE_SHARE_READ | FILE_SHARE_WRITE. Keep this local rather
+        // than widening the core's process-containment `windows-sys` feature
+        // surface solely for two documented share-mode bits.
+        const FILE_SHARE_READ_WRITE: u32 = 0x3;
+
+        let state_root = cockpit_config::config::resolve::cockpit_state_dir()
+            .map_err(|error| format!("locating daemon hook state directory failed: {error:#}"))?
+            .join("hook-execution");
+        cockpit_host::private_fs::ensure_private_dir(&state_root).map_err(|error| {
+            format!("securing daemon hook state directory failed: {error}")
+        })?;
+        let state_root = std::fs::canonicalize(&state_root)
+            .map_err(|error| format!("canonicalizing daemon hook state directory failed: {error}"))?;
+        Self::reap_abandoned_roots(&state_root);
+        let directory = tempfile::Builder::new()
+            .prefix(Self::PREFIX)
+            .tempdir_in(&state_root)
+            .map_err(|error| format!("creating hook execution root failed: {error}"))?;
+        // `tempfile` does not itself promise the strict daemon DACL contract
+        // on Windows. Verify/repair the directory before the executable bundle
+        // or its liveness lease is created beneath it.
+        cockpit_host::private_fs::ensure_private_dir(directory.path()).map_err(|error| {
+            format!("securing private Windows hook execution root failed: {error}")
+        })?;
+        let path = directory.path().to_path_buf();
+        active_hook_execution_roots()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.clone());
+        let lease_path = directory.path().join(".lease");
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            // Permit normal reads/writes but deny delete/rename while live.
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(&lease_path)
+            .map_err(|error| {
+                active_hook_execution_roots()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&path);
+                format!("creating Windows hook execution root lease failed: {error}")
+            })?;
+        cockpit_host::private_fs::repair_private_file(&lease_path, "hook execution root lease")
+            .map_err(|error| {
+                active_hook_execution_roots()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&path);
+                format!("securing Windows hook execution root lease failed: {error}")
+            })?;
+        Ok(Self {
+            _lease: Some(lease),
+            _directory: directory,
+            path,
+        })
+    }
+
+    fn reap_abandoned_roots(state_root: &Path) {
+        let Ok(entries) = std::fs::read_dir(state_root) else {
+            return;
+        };
+        for entry in entries.flatten().take(Self::STALE_SCAN_LIMIT) {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with(Self::PREFIX)
+                || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                continue;
+            }
+            let root = entry.path();
+            if active_hook_execution_roots()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&root)
+            {
+                continue;
+            }
+            let lease = root.join(".lease");
+            if !lease.exists() {
+                let old_unleased_root = std::fs::metadata(&root)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age >= Self::UNLEASED_REAP_AGE);
+                if old_unleased_root {
+                    let _ = std::fs::remove_dir_all(root);
+                }
+                continue;
+            }
+            // Mirror the Unix flock pre-check: `remove_dir_all` is not atomic,
+            // so relying on the still-open `.lease` to make it *fail* would
+            // already have deleted a live peer daemon's unprotected `bundle-*`
+            // executables (silently fail-opening its pinned hooks) before the
+            // removal reached the lease. Probe `.lease` for DELETE access
+            // first: the live owner opened it without FILE_SHARE_DELETE, so
+            // this open fails with a sharing violation while the owner runs and
+            // succeeds only once every handle closed on process exit. Reclaim
+            // the root only after that probe proves it abandoned.
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const DELETE: u32 = 0x0001_0000;
+            const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x7;
+            if std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+                .open(&lease)
+                .is_ok()
+            {
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self._directory.path()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RetainedHookExecutionBundleRoot {
+    fn drop(&mut self) {
+        active_hook_execution_roots()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.path);
+        // Close the no-delete handle before `TempDir`'s field drop removes the
+        // root. This also makes an otherwise abandoned crash root reclaimable.
+        let _ = self._lease.take();
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl cockpit_config::config::extended::hooks::HookExecutionLease
+    for RetainedHookExecutionBundle
+{
+}
+
+impl RetainedHookExecutionAuthority {
+    fn new(
+        _executable_source_directory: AuthorizedWorkspaceRoot,
+        _working_directory: AuthorizedWorkspaceRoot,
+        #[cfg(any(unix, windows))] bundle_budget: Arc<Mutex<RetainedHookExecutionBudget>>,
+    ) -> std::result::Result<Self, String> {
+        Ok(Self {
+            #[cfg(any(unix, windows))]
+            executable_source_directory: _executable_source_directory,
+            #[cfg(any(unix, windows))]
+            working_directory: _working_directory,
+            #[cfg(any(unix, windows))]
+            bundles: Mutex::new(RetainedHookExecutionBundles::default()),
+            #[cfg(any(unix, windows))]
+            bundle_root: Arc::new(RetainedHookExecutionBundleRoot::create()?),
+            #[cfg(any(unix, windows))]
+            bundle_budget,
+        })
+    }
+
+    #[cfg(any(unix, windows))]
+    fn bundle_for(
+        &self,
+        relative_components: &[String],
+    ) -> std::result::Result<Arc<RetainedHookExecutionBundle>, String> {
+        let mut bundles = self
+            .bundles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(bundle) = bundles.bundles.get(relative_components) {
+            return Ok(Arc::clone(bundle));
+        }
+        if bundles.bundles.len() >= MAX_RETAINED_HOOK_BUNDLES_PER_SOURCE {
+            return Err("retained hook bundle exceeds the executable count limit".to_owned());
+        }
+        let bundle = self.materialize(relative_components, &mut bundles.total_bytes)?;
+        bundles
+            .bundles
+            .insert(relative_components.to_vec(), Arc::clone(&bundle));
+        Ok(bundle)
+    }
+
+    #[cfg(unix)]
+    fn materialize(
+        &self,
+        relative_components: &[String],
+        total_bytes: &mut usize,
+    ) -> std::result::Result<Arc<RetainedHookExecutionBundle>, String> {
+        let components = relative_components
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let source = self
+            .executable_source_directory
+            .held_directory
+            .read_regular_executable_file_relative_bounded(
+                &components,
+                MAX_RETAINED_HOOK_EXECUTABLE_BYTES,
+            )
+            .map_err(|error| format!("opening retained hook executable failed: {error:#}"))?;
+        if !source.executable {
+            return Err("retained hook executable is not executable".to_owned());
+        }
+        let source_sha256: [u8; 32] = Sha256::digest(&source.bytes).into();
+        let new_total = total_bytes
+            .checked_add(source.bytes.len())
+            .ok_or_else(|| "retained hook bundle size overflow".to_owned())?;
+        if new_total > MAX_RETAINED_HOOK_BUNDLE_BYTES {
+            return Err("retained hook bundle exceeds the total byte limit".to_owned());
+        }
+        let mut worker_budget = self
+            .bundle_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if worker_budget.total_bundles >= MAX_RETAINED_HOOK_BUNDLES_PER_WORKER
+            || worker_budget
+                .total_bytes
+                .checked_add(source.bytes.len())
+                .is_none_or(|total| total > MAX_RETAINED_HOOK_BUNDLE_BYTES_PER_WORKER)
+        {
+            return Err("retained hook bundle exceeds the worker budget".to_owned());
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix("bundle-")
+            .tempdir_in(self.bundle_root.path())
+            .map_err(|error| format!("creating private hook execution bundle failed: {error}"))?;
+        // `tempfile` creates a private directory on supported Unix targets;
+        // set it explicitly as a defense against platform/umask drift before
+        // placing an executable in it.
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("securing private hook execution bundle failed: {error}"))?;
+        let leaf = relative_components
+            .last()
+            .ok_or_else(|| "retained hook executable has no leaf".to_owned())?;
+        // The directory is collision-free; preserve the source basename and
+        // extension inside it so ordinary shebang/interpreter dispatch sees
+        // the expected script suffix without ever reopening the source path.
+        let executable = directory.path().join(leaf);
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&executable)
+            .map_err(|error| format!("creating private hook executable snapshot failed: {error}"))?;
+        output
+            .write_all(&source.bytes)
+            .and_then(|()| output.sync_all())
+            .map_err(|error| format!("writing private hook executable snapshot failed: {error}"))?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("securing private hook executable snapshot failed: {error}"))?;
+        // Config-parent authority only opens the executable. Preserve the
+        // historical attached project root as the child cwd through its own
+        // retained handle: a script must never resolve project-relative files
+        // through a mutable config parent (notably `COCKPIT_CONFIG`).
+        let workspace_cwd = Arc::new(
+            self.working_directory
+                .retained_directory_handle()
+                .map_err(|error| format!("cloning retained hook workspace directory failed: {error:#}"))?,
+        );
+        *total_bytes = new_total;
+        worker_budget.total_bytes += source.bytes.len();
+        worker_budget.total_bundles += 1;
+        Ok(Arc::new(RetainedHookExecutionBundle {
+            _directory: directory,
+            executable,
+            _source_sha256: source_sha256,
+            workspace_cwd,
+            _root: Arc::clone(&self.bundle_root),
+            budget: Arc::clone(&self.bundle_budget),
+            byte_len: source.bytes.len(),
+        }))
+    }
+
+    /// Windows uses the same handle-relative, bounded source read as Unix,
+    /// then writes a private immutable bundle with the original basename and
+    /// extension. Keeping `.cmd` / `.bat` / `.exe` spellings lets the normal
+    /// Windows `Command` semantics select the appropriate interpreter without
+    /// ever reopening the mutable workspace source pathname.
+    #[cfg(windows)]
+    fn materialize(
+        &self,
+        relative_components: &[String],
+        total_bytes: &mut usize,
+    ) -> std::result::Result<Arc<RetainedHookExecutionBundle>, String> {
+        let components = relative_components
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let source = self
+            .executable_source_directory
+            .held_directory
+            .read_regular_executable_file_relative_bounded(
+                &components,
+                MAX_RETAINED_HOOK_EXECUTABLE_BYTES,
+            )
+            .map_err(|error| format!("opening retained hook executable failed: {error:#}"))?;
+        let source_sha256: [u8; 32] = Sha256::digest(&source.bytes).into();
+        let new_total = total_bytes
+            .checked_add(source.bytes.len())
+            .ok_or_else(|| "retained hook bundle size overflow".to_owned())?;
+        if new_total > MAX_RETAINED_HOOK_BUNDLE_BYTES {
+            return Err("retained hook bundle exceeds the total byte limit".to_owned());
+        }
+        let mut worker_budget = self
+            .bundle_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if worker_budget.total_bundles >= MAX_RETAINED_HOOK_BUNDLES_PER_WORKER
+            || worker_budget
+                .total_bytes
+                .checked_add(source.bytes.len())
+                .is_none_or(|total| total > MAX_RETAINED_HOOK_BUNDLE_BYTES_PER_WORKER)
+        {
+            return Err("retained hook bundle exceeds the worker budget".to_owned());
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix("bundle-")
+            .tempdir_in(self.bundle_root.path())
+            .map_err(|error| format!("creating private hook execution bundle failed: {error}"))?;
+        cockpit_host::private_fs::ensure_private_dir(directory.path()).map_err(|error| {
+            format!("securing private Windows hook execution bundle failed: {error}")
+        })?;
+        let leaf = relative_components
+            .last()
+            .ok_or_else(|| "retained hook executable has no leaf".to_owned())?;
+        let executable = directory.path().join(leaf);
+        {
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&executable)
+                .map_err(|error| {
+                    format!("creating private Windows hook executable snapshot failed: {error}")
+                })?;
+            output
+                .write_all(&source.bytes)
+                .and_then(|()| output.sync_all())
+                .map_err(|error| {
+                    format!("writing private Windows hook executable snapshot failed: {error}")
+                })?;
+        }
+        cockpit_host::private_fs::repair_private_file(&executable, "hook execution bundle")
+            .map_err(|error| format!("securing private Windows hook executable snapshot failed: {error}"))?;
+        *total_bytes = new_total;
+        worker_budget.total_bytes += source.bytes.len();
+        worker_budget.total_bundles += 1;
+        Ok(Arc::new(RetainedHookExecutionBundle {
+            _directory: directory,
+            executable,
+            _source_sha256: source_sha256,
+            _windows_bundle_marker: (),
+            _root: Arc::clone(&self.bundle_root),
+            budget: Arc::clone(&self.bundle_budget),
+            byte_len: source.bytes.len(),
+        }))
+    }
+}
+
+impl cockpit_config::config::extended::hooks::RetainedHookExecutionAuthority
+    for RetainedHookExecutionAuthority
+{
+    fn launch(
+        &self,
+        relative_components: &[String],
+    ) -> std::result::Result<
+        cockpit_config::config::extended::hooks::HookExecutionLaunch,
+        String,
+    > {
+        #[cfg(unix)]
+        {
+            let bundle = self.bundle_for(relative_components)?;
+            return Ok(
+                cockpit_config::config::extended::hooks::HookExecutionLaunch::retained(
+                    bundle.executable.clone(),
+                    cockpit_config::config::extended::hooks::HookWorkingDirectory::RetainedUnixDirectory(
+                        Arc::clone(&bundle.workspace_cwd),
+                    ),
+                    bundle,
+                ),
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let bundle = self.bundle_for(relative_components)?;
+            // `CreateProcess` needs a path for the cwd. Acquire a fresh lease
+            // for this child only; it retains the complete no-delete workspace
+            // chain and is revalidated immediately before spawn. The bundle is
+            // already immutable, so a source replacement can never alter the
+            // program this launch executes.
+            let cwd = Arc::new(
+                self.working_directory
+                    .acquire_windows_execution_lease()
+                    .map_err(|error| {
+                        format!("acquiring retained Windows hook cwd lease failed: {error:#}")
+                    })?,
+            );
+            return Ok(
+                cockpit_config::config::extended::hooks::HookExecutionLaunch::retained(
+                    bundle.executable.clone(),
+                    cockpit_config::config::extended::hooks::HookWorkingDirectory::RetainedWindowsDirectory(
+                        cwd,
+                    ),
+                    bundle,
+                ),
+            );
+        }
+
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let _ = relative_components;
+            Err("retained relative workspace hooks are unsupported on this platform".to_owned())
+        }
+    }
+}
+
+/// One config source selected while the worker was attached. This is
+/// intentionally distinct from `config_layers`: the latter is the
+/// project/explicit-only hook authority, while this complete effective chain
+/// retains global, project, and explicit config sources for snapshot
+/// provenance and capability-relative mutations. It never turns a global
+/// source into workspace authority.
+#[derive(Clone)]
+struct RetainedDefaultWriteTargetAuthority {
+    config_directory: AuthorizedWorkspaceRoot,
+    config_leaf: OsString,
+    effective_default_journal_leaf: OsString,
+    effective_default_backup_leaf: OsString,
+    canonical_config_path: PathBuf,
+    scope: cockpit_config::config::effective_default::EffectiveDefaultScope,
+}
+
+fn capture_retained_default_layer(
+    project_root: &Path,
+    config_path: &Path,
+    exclusive_config_override: bool,
+) -> Result<RetainedDefaultWriteTargetAuthority> {
+    let config_directory_path = config_path
+        .parent()
+        .context("effective default target has no parent")?;
+    // Capture once.  Splitting the canonical-path lookup from the retained
+    // handle acquisition would permit a directory replacement between those
+    // two observations and manufacture a mixed identity descriptor.
+    let config_directory = AuthorizedWorkspaceRoot::capture(config_directory_path)?;
+    let config_leaf = config_path
+        .file_name()
+        .context("effective default target has no filename")?
+        .to_os_string();
+    let canonical_config_path = config_directory.canonical_path().join(&config_leaf);
+    let effective_default_journal_leaf =
+        crate::config::effective_default::journal_path_for_layer(&canonical_config_path)
+            .file_name()
+            .context("effective-default journal has no file name")?
+            .to_os_string();
+    let effective_default_backup_leaf =
+        crate::config::effective_default::backup_path_for_layer(&canonical_config_path)
+            .file_name()
+            .context("effective-default backup has no file name")?
+            .to_os_string();
+    let scope = if exclusive_config_override {
+        cockpit_config::config::effective_default::EffectiveDefaultScope::ExplicitOverride
+    } else {
+        crate::config::dirs::discover_config_dirs(project_root)
+            .into_iter()
+            .find(|directory| {
+                directory.path.join(crate::config::dirs::CONFIG_FILE) == config_path
+            })
+            .map(|directory| {
+                cockpit_config::config::effective_default::EffectiveDefaultScope::from_dir_kind(
+                    &directory.kind,
+                )
+            })
+            // A custom nonexclusive source can only arise from a test/config
+            // adapter. Its exact parent capability remains authoritative.
+            .unwrap_or(cockpit_config::config::effective_default::EffectiveDefaultScope::Project)
+    };
+    Ok(RetainedDefaultWriteTargetAuthority {
+        config_directory,
+        config_leaf,
+        effective_default_journal_leaf,
+        effective_default_backup_leaf,
+        canonical_config_path,
+        scope,
+    })
+}
+
+impl WorkerWorkspaceConfigAuthority {
+    pub(crate) fn capture(
+        project_root: &Path,
+        trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<Self> {
+        let attached_root = AuthorizedWorkspaceRoot::capture(project_root)?;
+        // Freeze the exact effective source selection at attach. In
+        // particular, `COCKPIT_CONFIG` collapses normal discovery to one
+        // permitted file; retaining every conventional `.cockpit` ancestor
+        // would silently change its precedence. Every selected config source
+        // (including trusted global layers) is retained below for the worker
+        // snapshot and provider mutations. Hook source selection remains
+        // separate so a global source never becomes workspace authority.
+        let (effective_paths, layer_paths, exclusive_config_override, hook_sources) =
+            crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                let effective_paths = crate::config::dirs::config_file_paths_for_load(project_root);
+                let explicit_override = std::env::var_os(crate::config::dirs::COCKPIT_CONFIG_ENV)
+                    .is_some_and(|value| !value.is_empty());
+                let hook_sources = crate::config::extended::hooks::hook_sources_for_config_paths(
+                    project_root,
+                    effective_paths.clone(),
+                    explicit_override,
+                );
+                if explicit_override && !effective_paths.is_empty() {
+                    // An explicit override is the one effective config file,
+                    // including a non-project file used while IgnoreConfig is
+                    // selected. Its parent + basename are retained below as a
+                    // capability-bound descriptor. A conventional project
+                    // override is absent from `effective_paths` under
+                    // IgnoreConfig and therefore stays excluded.
+                    (effective_paths.clone(), effective_paths, true, hook_sources)
+                } else {
+                    let project_layers = crate::config::dirs::discover_config_dirs(project_root)
+                        .into_iter()
+                        .filter(|dir| {
+                            matches!(
+                                &dir.kind,
+                                crate::config::dirs::ConfigDirKind::Project
+                            )
+                        })
+                        .map(|dir| {
+                            (
+                                dir.path.clone(),
+                                dir.path.join(crate::config::dirs::CONFIG_FILE),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let layer_paths = effective_paths
+                        .iter()
+                        .filter_map(|effective_path| {
+                            project_layers
+                                .iter()
+                                .find(|(_, config_path)| config_path == effective_path)
+                                .map(|(_, config_path)| config_path.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    (effective_paths, layer_paths, false, hook_sources)
+                }
+            });
+        let hook_source_layer_indexes = hook_sources
+            .iter()
+            .map(|source| layer_paths.iter().position(|path| path == &source.path))
+            .collect();
+        let config_watch_paths = crate::daemon::config_source::ConfigWatchPaths::new(
+            effective_paths.clone(),
+            effective_paths
+                .iter()
+                .filter_map(|path| path.parent().map(|parent| parent.join("providers")))
+                .collect(),
+        );
+        let mut config_layers = Vec::with_capacity(layer_paths.len());
+        for config_path in layer_paths {
+            let config_directory = config_path.parent().context("config layer has no parent")?;
+            let config_leaf = config_path
+                .file_name()
+                .context("config layer has no file name")?
+                .to_os_string();
+            let effective_default_journal_leaf =
+                crate::config::effective_default::journal_path_for_layer(&config_path)
+                .file_name()
+                .context("effective-default journal has no file name")?
+                .to_os_string();
+            let effective_default_backup_leaf =
+                crate::config::effective_default::backup_path_for_layer(&config_path)
+                .file_name()
+                .context("effective-default backup has no file name")?
+                .to_os_string();
+            config_layers.push(WorkspaceConfigLayerAuthority {
+                config_directory: AuthorizedWorkspaceRoot::capture(config_directory)?,
+                config_leaf,
+                effective_default_journal_leaf,
+                effective_default_backup_leaf,
+            });
+        }
+        let default_effective_layers = effective_paths
+            .iter()
+            .map(|config_path| {
+                capture_retained_default_layer(
+                    project_root,
+                    config_path,
+                    exclusive_config_override,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // `effective_paths` is low-to-high precedence, so the final retained
+        // descriptor is the exact layer selected by the shared default-write
+        // rule. Cloning it keeps the full chain available for clear preview.
+        let default_write_target = default_effective_layers.last().cloned();
+        Ok(Self {
+            attached_root,
+            config_layers,
+            default_effective_layers,
+            retained_source_paths: effective_paths,
+            default_write_target,
+            exclusive_config_override,
+            hook_sources,
+            hook_source_layer_indexes,
+            #[cfg(any(unix, windows))]
+            hook_execution_budget: Arc::new(Mutex::new(RetainedHookExecutionBudget::default())),
+            config_watch_paths,
+        })
+    }
+
+    pub(crate) fn capture_workspace_config_layers(
+        &self,
+    ) -> Result<cockpit_config::config::WorkspaceConfigLayerSnapshotChain> {
+        self.verify()?;
+        let mut layers = Vec::with_capacity(self.config_layers.len());
+        for layer in &self.config_layers {
+            let directory = layer.config_directory.retained_directory_handle()?;
+            let canonical_config_path = layer
+                .config_directory
+                .canonical_path()
+                .join(&layer.config_leaf);
+            layers.push(
+                cockpit_config::config::snapshot_workspace_config_layer_from_retained_config_directory(
+                    &directory,
+                    &layer.config_leaf,
+                    &canonical_config_path,
+                    Some(&layer.effective_default_journal_leaf),
+                    Some(&layer.effective_default_backup_leaf),
+                )?,
+            );
+        }
+        Ok(
+            cockpit_config::config::workspace_config_layer_snapshot_chain_with_exclusive(
+                layers,
+                self.exclusive_config_override,
+            ),
+        )
+    }
+
+    /// Resolve hooks from the immutable attach-time source selection. The
+    /// files themselves remain live for the ordinary config refresh path, but
+    /// a later `COCKPIT_CONFIG` override cannot redirect this worker to an
+    /// unrelated source tree.
+    pub(crate) fn resolve_hooks(
+        &self,
+    ) -> Result<cockpit_config::config::extended::hooks::HookRegistry> {
+        self.resolve_hooks_with_policy(None)
+    }
+
+    /// Resolve the frozen source set under the *current* database trust
+    /// policy. Project layers stay retained so a later Trust decision can use
+    /// the attach-time capability, but IgnoreConfig removes their hooks from
+    /// the live registry without reopening discovery. An already-authorized
+    /// explicit `COCKPIT_CONFIG` remains its original one-layer contract.
+    pub(crate) fn resolve_hooks_for_policy(
+        &self,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<cockpit_config::config::extended::hooks::HookRegistry> {
+        self.resolve_hooks_with_policy(Some(policy))
+    }
+
+    fn resolve_hooks_with_policy(
+        &self,
+        policy: Option<&crate::config::trust::WorkspaceTrustPolicy>,
+    ) -> Result<cockpit_config::config::extended::hooks::HookRegistry> {
+        match policy {
+            Some(policy) => self.verify_retained_config_source_chain_for_policy(policy)?,
+            None => self.verify_retained_config_source_chain()?,
+        }
+        let mut captured = Vec::with_capacity(self.hook_sources.len());
+        // Project and explicit sources are parsed from bytes opened through a
+        // held directory.  Keep the corresponding execution authority keyed
+        // by the exact source path so that source-relative handlers never
+        // regress to reopening that spelling after a failed refresh.
+        let mut retained_execution_source_directories = HashMap::new();
+        for (source, layer_index) in self
+            .hook_sources
+            .iter()
+            .zip(&self.hook_source_layer_indexes)
+        {
+            let bytes = match layer_index {
+                Some(index) => {
+                    if !self.hook_source_is_projected(source, policy) {
+                        continue;
+                    }
+                    let layer = self
+                        .config_layers
+                        .get(*index)
+                        .context("retained hook source layer is missing")?;
+                    let leaf = layer
+                        .config_leaf
+                        .to_str()
+                        .context("retained hook config leaf is not UTF-8")?;
+                    // Acquisition failures for a workspace/explicit source
+                    // are authority failures, not recoverable parse warnings.
+                    // In particular this bounds the allocation before a
+                    // hostile hook file can reach the parser.
+                    let bytes = layer
+                        .config_directory
+                        .held_directory
+                        .read_regular_file_relative_bounded(&[leaf], MAX_HOOK_CONFIG_BYTES)?;
+                    retained_execution_source_directories.insert(
+                        source.path.clone(),
+                        layer.config_directory.clone(),
+                    );
+                    captured.push((source.clone(), Ok(Some(bytes))));
+                    continue;
+                }
+                // Trusted global sources use their separately retained
+                // config-parent capability too. A project or explicit source
+                // without a captured layer is an authority invariant failure,
+                // never a reason to fall back to reopening its mutable
+                // pathname.
+                None => match &source.kind {
+                        cockpit_config::config::extended::hooks::HookSourceKind::Layer(
+                            crate::config::dirs::ConfigDirKind::HomeXdg
+                            | crate::config::dirs::ConfigDirKind::HomeDot
+                            | crate::config::dirs::ConfigDirKind::MachineLocal,
+                        ) => self.read_retained_global_hook_source(source),
+                        cockpit_config::config::extended::hooks::HookSourceKind::Layer(
+                            crate::config::dirs::ConfigDirKind::Project,
+                        )
+                        | cockpit_config::config::extended::hooks::HookSourceKind::Explicit => {
+                            Err("workspace hook source was not retained at attach".to_owned())
+                        }
+                    },
+                };
+            captured.push((source.clone(), bytes));
+        }
+        let mut registry =
+            cockpit_config::config::extended::hooks::resolve_hooks_from_captured_sources(&captured);
+        // Construct the daemon-private bundle root only if this refresh
+        // actually contains a retained relative handler. Bare/absolute project
+        // hooks retain their existing behavior and do not acquire a new state
+        // directory dependency just because their config source is attached.
+        let mut retained_execution_authorities = HashMap::new();
+        for hook in &mut registry.hooks {
+            if matches!(
+                &hook.execution,
+                cockpit_config::config::extended::hooks::HookExecutionProvenance::RetainedRelative {
+                    ..
+                }
+            ) {
+                let authority = match retained_execution_authorities
+                    .get(&hook.source_config_path)
+                {
+                    Some(authority) => Arc::clone(authority),
+                    None => {
+                        let executable_source_directory = retained_execution_source_directories
+                            .get(&hook.source_config_path)
+                            .context("retained hook execution source is missing")?;
+                        let authority = Arc::new(
+                            RetainedHookExecutionAuthority::new(
+                                executable_source_directory.clone(),
+                                self.attached_root.clone(),
+                                #[cfg(any(unix, windows))]
+                                Arc::clone(&self.hook_execution_budget),
+                            )
+                            .map_err(anyhow::Error::msg)?,
+                        );
+                        retained_execution_authorities
+                            .insert(hook.source_config_path.clone(), Arc::clone(&authority));
+                        authority
+                    }
+                };
+                hook.bind_retained_execution_authority(Arc::clone(&authority))
+                    .map_err(anyhow::Error::msg)?;
+                // Snapshot the source program while its whole retained source
+                // chain is still verified. Windows deliberately stops here:
+                // only the eventual child launch acquires the no-delete cwd
+                // lease, so an unrelated temporary share conflict cannot make
+                // attach or watcher refresh fail.
+                #[cfg(any(unix, windows))]
+                let cockpit_config::config::extended::hooks::HookExecutionProvenance::RetainedRelative {
+                    components,
+                    ..
+                } = &hook.execution
+                else {
+                    unreachable!("retained hook authority was bound to an ambient hook")
+                };
+                #[cfg(any(unix, windows))]
+                authority.bundle_for(components).map_err(anyhow::Error::msg)?;
+                #[cfg(all(not(unix), not(windows)))]
+                hook.retained_execution_launch()
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
+        match policy {
+            Some(policy) => self.verify_retained_config_source_chain_for_policy(policy)?,
+            None => self.verify_retained_config_source_chain()?,
+        }
+        Ok(registry)
+    }
+
+    /// Watch paths are notification hints only, but their selection is still
+    /// frozen with the worker authority so a later `COCKPIT_CONFIG` change
+    /// cannot make a worker configured from A watch B instead.
+    pub(crate) fn config_watch_paths(&self) -> crate::daemon::config_source::ConfigWatchPaths {
+        self.config_watch_paths.clone()
+    }
+
+    /// Return the project/explicit endpoint-repair target selected by the
+    /// same complete attach-time source snapshot. This remains deliberately
+    /// narrower than favorite mutation: a global source gets an exact
+    /// capability for `SetModelFavorite`, but is not workspace-local endpoint
+    /// repair authority. Selection never consults `COCKPIT_CONFIG` or fresh
+    /// discovery.
+    pub(crate) fn provider_write_target(
+        &self,
+        snapshot: &cockpit_config::config::WorkspaceConfigLayerSnapshotChain,
+        provider_id: &str,
+    ) -> Option<PathBuf> {
+        if cockpit_config::config::providers::validate_provider_id_for_filename(provider_id)
+            .is_err()
+            || snapshot.layers.len() != self.default_effective_layers.len()
+            || !snapshot.exclusive
+        {
+            return None;
+        }
+        let mut fallback = None;
+        let mut defining = None;
+        for layer in &self.config_layers {
+            let index = self
+                .default_effective_layers
+                .iter()
+                .position(|retained| {
+                    retained.config_directory.identity_digest == layer.config_directory.identity_digest
+                        && retained.config_leaf == layer.config_leaf
+                })?;
+            let captured = snapshot.layers.get(index)?;
+            let config_path = layer
+                .config_directory
+                .canonical_path()
+                .join(&layer.config_leaf);
+            let provider_path = cockpit_config::config::providers::provider_file_path_for_config(
+                &config_path,
+                provider_id,
+            )
+            .ok()?;
+            fallback = Some(provider_path.clone());
+            if captured.provider_files.iter().any(|(id, _)| id == provider_id) {
+                defining = Some(provider_path);
+            }
+        }
+        defining.or(fallback)
+    }
+
+    /// Materialize the frozen effective-default target as a config-crate
+    /// capability. The returned descriptor owns a clone of the retained
+    /// directory handle, so the mutation never reopens this pathname after
+    /// attachment.
+    pub(crate) fn retained_effective_default_target(
+        self: &Arc<Self>,
+    ) -> Result<cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget> {
+        self.verify()?;
+        let target = self
+            .default_write_target
+            .as_ref()
+            .context("no retained cockpit config layer applies to this attached session")?;
+        target
+            .config_directory
+            .verify(target.config_directory.canonical_path())?;
+        let verifier_authority = Arc::clone(self);
+        cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget::new(
+            target.config_directory.retained_directory_handle()?,
+            target.config_leaf.clone(),
+            target.effective_default_journal_leaf.clone(),
+            target.effective_default_backup_leaf.clone(),
+            target.canonical_config_path.clone(),
+            self.attached_root.canonical_path().to_path_buf(),
+            target.scope.clone(),
+        )
+        .map(|target| {
+            target.with_verifier(Arc::new(move || {
+                verifier_authority.verify_default_effective_layers()
+            }))
+        })
+    }
+
+    /// Return the highest-precedence default target that is enabled by the
+    /// *current* attached workspace policy.  Retaining a project capability at
+    /// attach is deliberately not permission to keep writing it after a
+    /// Trust -> IgnoreConfig change: the retained capability exists only so a
+    /// later Trust refresh can reuse the same identity without rediscovery.
+    pub(crate) fn retained_effective_default_target_for_policy(
+        self: &Arc<Self>,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget> {
+        self.verify_retained_config_source_chain_for_policy(policy)?;
+        let target = self
+            .default_effective_layers
+            .iter()
+            .rev()
+            .find(|layer| self.retained_layer_is_projected(layer, policy))
+            .context("no retained cockpit config layer applies under the current workspace trust policy")?;
+        target
+            .config_directory
+            .verify(target.config_directory.canonical_path())?;
+        let verifier_authority = Arc::clone(self);
+        let policy = policy.clone();
+        cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget::new(
+            target.config_directory.retained_directory_handle()?,
+            target.config_leaf.clone(),
+            target.effective_default_journal_leaf.clone(),
+            target.effective_default_backup_leaf.clone(),
+            target.canonical_config_path.clone(),
+            self.attached_root.canonical_path().to_path_buf(),
+            target.scope.clone(),
+        )
+        .map(|target| {
+            target.with_verifier(Arc::new(move || {
+                verifier_authority.verify_retained_config_source_chain_for_policy(&policy)
+            }))
+        })
+    }
+
+    /// Return whether an attached default-update id is still pending in a
+    /// retained source that the *current* policy no longer projects. This is
+    /// read-only and capability-relative: it never recovers, mutates, or
+    /// rediscover paths below the hidden project source. Without this guard a
+    /// retry of an A-bound project operation after Trust -> IgnoreConfig could
+    /// miss A's journal and reuse the same id for a new global mutation.
+    pub(crate) fn hidden_retained_default_update_is_pending(
+        &self,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+        session_id: uuid::Uuid,
+        default_update_id: uuid::Uuid,
+    ) -> Result<bool> {
+        for layer in self
+            .default_effective_layers
+            .iter()
+            .filter(|layer| !self.retained_layer_is_projected(layer, policy))
+        {
+            // Hold/verify the exact directory identity before taking its
+            // target-local lock. The descriptor reads only the already-open
+            // source A, never a replacement selected by a mutable pathname.
+            layer
+                .config_directory
+                .verify(layer.config_directory.canonical_path())?;
+            let target = cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget::new(
+                layer.config_directory.retained_directory_handle()?,
+                layer.config_leaf.clone(),
+                layer.effective_default_journal_leaf.clone(),
+                layer.effective_default_backup_leaf.clone(),
+                layer.canonical_config_path.clone(),
+                self.attached_root.canonical_path().to_path_buf(),
+                layer.scope.clone(),
+            )?;
+            let Some(correlation) = target.retained_transaction_correlation()? else {
+                continue;
+            };
+            if matches!(
+                correlation,
+                cockpit_config::config::effective_default::TransactionCorrelation::RetainedDefaultUpdate {
+                    session_id: journal_session_id,
+                    default_update_id: journal_default_update_id,
+                    ..
+                } if journal_session_id == session_id && journal_default_update_id == default_update_id
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Materialize a favorite-write capability from a source proof retained in
+    /// the current worker snapshot. This never re-captures layers or follows
+    /// a later `COCKPIT_CONFIG`: the proof chooses one exact captured layer,
+    /// provider file digest, and model object.
+    pub(crate) fn retained_provider_model_favorite_target(
+        self: &Arc<Self>,
+        source: cockpit_config::config::providers::RetainedProviderModelSource,
+    ) -> Result<cockpit_config::config::providers::RetainedProviderModelFavoriteTarget> {
+        self.retained_provider_model_favorite_target_for_selection(source, None)
+    }
+
+    /// Build a favorite-write capability from the current policy projection.
+    /// This is intentionally separate from the worker's attach authority: a
+    /// Trust -> IgnoreConfig transition must still permit an observed global
+    /// source, but must not let a stale project source write after it has been
+    /// removed from the projected configuration.
+    pub(crate) fn retained_provider_model_favorite_target_for_policy(
+        self: &Arc<Self>,
+        source: cockpit_config::config::providers::RetainedProviderModelSource,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<cockpit_config::config::providers::RetainedProviderModelFavoriteTarget> {
+        self.retained_provider_model_favorite_target_for_selection(source, Some(policy.clone()))
+    }
+
+    fn retained_provider_model_favorite_target_for_selection(
+        self: &Arc<Self>,
+        source: cockpit_config::config::providers::RetainedProviderModelSource,
+        policy: Option<crate::config::trust::WorkspaceTrustPolicy>,
+    ) -> Result<cockpit_config::config::providers::RetainedProviderModelFavoriteTarget> {
+        cockpit_config::config::providers::validate_provider_id_for_filename(
+            source.provider_id(),
+        )?;
+        match policy.as_ref() {
+            Some(policy) => self.verify_retained_config_source_chain_for_policy(policy)?,
+            None => self.verify_retained_config_source_chain()?,
+        }
+        let source_layer_index = source.layer_index();
+        let selected = self
+            .default_effective_layers
+            .get(source_layer_index)
+            .context("provider source proof refers to an unknown retained layer")?;
+        if let Some(policy) = policy.as_ref() {
+            anyhow::ensure!(
+                self.retained_layer_is_projected(selected, policy),
+                "provider source is no longer enabled by the current workspace trust policy"
+            );
+        }
+        selected
+            .config_directory
+            .verify(selected.config_directory.canonical_path())?;
+        let higher_precedence_locks = self
+            .default_effective_layers
+            .iter()
+            .skip(source_layer_index.saturating_add(1))
+            .filter(|layer| {
+                policy
+                    .as_ref()
+                    .is_none_or(|policy| self.retained_layer_is_projected(layer, policy))
+            })
+            .map(|layer| {
+                cockpit_config::config::providers::RetainedProviderModelFavoriteLock::new(
+                    layer.config_directory.retained_directory_handle()?,
+                    layer
+                        .config_directory
+                        .canonical_path()
+                        .join(&layer.config_leaf),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let source_for_freshness = source.clone();
+        let verifier_authority = Arc::clone(self);
+        let policy_for_pre_write = policy.clone();
+        let policy_for_post_write = policy.clone();
+        cockpit_config::config::providers::RetainedProviderModelFavoriteTarget::new(
+            selected.config_directory.retained_directory_handle()?,
+            selected
+                .config_directory
+                .canonical_path()
+                .join(&selected.config_leaf),
+            source,
+        )
+        .map(|target| target.with_higher_precedence_locks(higher_precedence_locks))
+        .map(|target| {
+            let pre_write_authority = Arc::clone(&verifier_authority);
+            let pre_write_source = source_for_freshness.clone();
+            target.with_pre_write_verifier(Arc::new(move || {
+                match policy_for_pre_write.as_ref() {
+                    Some(policy) => pre_write_authority
+                        .verify_retained_config_source_chain_for_policy(policy),
+                    None => pre_write_authority.verify_retained_config_source_chain(),
+                }
+                .context("retained provider source authority changed")?;
+                let snapshots = match policy_for_pre_write.as_ref() {
+                    Some(policy) => pre_write_authority.capture_retained_config_source_chain(policy),
+                    None => pre_write_authority.capture_retained_effective_default_layer_chain(),
+                }?;
+                let observed = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+                    &snapshots.layers,
+                    pre_write_source.provider_id(),
+                    pre_write_source.model_id(),
+                )?
+                .context("captured provider/model source is no longer present")?;
+                anyhow::ensure!(
+                    observed == pre_write_source,
+                    "captured provider/model source changed after attached snapshot"
+                );
+                Ok(())
+            }))
+            .with_post_write_verifier(Arc::new(move |receipt| {
+                match policy_for_post_write.as_ref() {
+                    Some(policy) => verifier_authority
+                        .verify_retained_config_source_chain_for_policy(policy),
+                    None => verifier_authority.verify_retained_config_source_chain(),
+                }
+                .context("retained provider source authority changed")?;
+                let snapshots = match policy_for_post_write.as_ref() {
+                    Some(policy) => verifier_authority.capture_retained_config_source_chain(policy),
+                    None => verifier_authority.capture_retained_effective_default_layer_chain(),
+                }?;
+                let observed = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+                    &snapshots.layers,
+                    source_for_freshness.provider_id(),
+                    source_for_freshness.model_id(),
+                )?
+                .context("captured provider/model source is no longer present")?;
+                anyhow::ensure!(
+                    receipt.matches_committed_source(&observed),
+                    "captured provider/model source changed after retained favorite write"
+                );
+                Ok(())
+            }))
+        })
+    }
+
+    /// Resolve the effective provider view after applying an update to the
+    /// retained write target, entirely from the directories selected at
+    /// attachment.  This is used before a clear is journaled: recording
+    /// `None` would make a later crash-recovery receipt lie whenever a lower
+    /// layer provides the inherited default.
+    pub(crate) fn projected_effective_default_after_retained_update(
+        &self,
+        requested: Option<&cockpit_config::config::providers::ActiveModelRef>,
+    ) -> Result<cockpit_config::config::providers::ProvidersConfig> {
+        let mut snapshots = self.capture_retained_effective_default_layer_snapshots()?;
+        let Some(target) = snapshots.last_mut() else {
+            anyhow::bail!("no retained cockpit config layer applies to this attached session");
+        };
+        let bytes = cockpit_config::config::effective_default::projected_config_bytes_for_default_update(
+            target.config_json.as_deref().unwrap_or(b"{}"),
+            requested,
+        )?;
+        *target = cockpit_config::config::workspace_config_layer_snapshot_with_config_json(
+            target,
+            Some(bytes),
+        );
+        cockpit_config::config::providers::ConfigDoc::providers_from_workspace_layer_snapshots(
+            &snapshots,
+        )
+    }
+
+    /// Policy-scoped counterpart used by attached default-model mutations.
+    /// Empty retained slots preserve provider provenance indices, but the
+    /// selected write target is the final *projected* layer rather than the
+    /// final attach-time layer.
+    pub(crate) fn projected_effective_default_after_retained_update_for_policy(
+        &self,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+        requested: Option<&cockpit_config::config::providers::ActiveModelRef>,
+    ) -> Result<cockpit_config::config::providers::ProvidersConfig> {
+        let mut chain = self.capture_retained_config_source_chain_for_policy(policy)?;
+        let index = self
+            .default_effective_layers
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, layer)| self.retained_layer_is_projected(layer, policy).then_some(index))
+            .context("no retained cockpit config layer applies under the current workspace trust policy")?;
+        let target = chain
+            .layers
+            .get_mut(index)
+            .context("retained policy projection lost its default target")?;
+        let bytes = cockpit_config::config::effective_default::projected_config_bytes_for_default_update(
+            target.config_json.as_deref().unwrap_or(b"{}"),
+            requested,
+        )?;
+        *target = cockpit_config::config::workspace_config_layer_snapshot_with_config_json(
+            target,
+            Some(bytes),
+        );
+        cockpit_config::config::providers::ConfigDoc::providers_from_workspace_layer_snapshots(
+            &chain.layers,
+        )
+    }
+
+    /// Snapshot attach-time sources through the current policy projection.
+    /// Global source capabilities are always projected. Conventional project
+    /// slots become empty when `IgnoreConfig` is current; retained slot
+    /// ordering remains stable for provider-source proofs. An attach-time
+    /// explicit override preserves its original one-layer semantics.
+    pub(crate) fn capture_retained_config_source_chain(
+        &self,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<cockpit_config::config::WorkspaceConfigLayerSnapshotChain> {
+        self.capture_retained_config_source_chain_for_policy(policy)
+    }
+
+    fn capture_retained_config_source_chain_for_policy(
+        &self,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<cockpit_config::config::WorkspaceConfigLayerSnapshotChain> {
+        self.verify_retained_config_source_chain_for_policy(policy)?;
+        let mut snapshots = Vec::with_capacity(self.default_effective_layers.len());
+        for layer in &self.default_effective_layers {
+            if self.retained_layer_is_projected(layer, policy) {
+                let directory = layer.config_directory.retained_directory_handle()?;
+                snapshots.push(
+                    cockpit_config::config::snapshot_workspace_config_layer_from_retained_config_directory(
+                        &directory,
+                        &layer.config_leaf,
+                        &layer.canonical_config_path,
+                        Some(&layer.effective_default_journal_leaf),
+                        Some(&layer.effective_default_backup_leaf),
+                    )?,
+                );
+            } else {
+                snapshots.push(cockpit_config::config::empty_workspace_config_layer_snapshot());
+            }
+        }
+        self.verify_retained_config_source_chain_for_policy(policy)?;
+        Ok(
+            cockpit_config::config::workspace_config_layer_snapshot_chain_with_exclusive(
+                snapshots,
+                true,
+            ),
+        )
+    }
+
+    /// Compatibility name for the complete chain consumed by a retained
+    /// default-model transaction. The chain is shared with ordinary worker
+    /// source provenance; its identity does not depend on that mutation.
+    pub(crate) fn capture_retained_effective_default_layer_chain(
+        &self,
+    ) -> Result<cockpit_config::config::WorkspaceConfigLayerSnapshotChain> {
+        Ok(
+            cockpit_config::config::workspace_config_layer_snapshot_chain_with_exclusive(
+                self.capture_retained_effective_default_layer_snapshots()?,
+                true,
+            ),
+        )
+    }
+
+    fn capture_retained_effective_default_layer_snapshots(
+        &self,
+    ) -> Result<Vec<cockpit_config::config::WorkspaceConfigLayerSnapshot>> {
+        self.verify_default_effective_layers()?;
+        let mut snapshots = Vec::with_capacity(self.default_effective_layers.len());
+        for layer in &self.default_effective_layers {
+            let directory = layer.config_directory.retained_directory_handle()?;
+            let snapshot = cockpit_config::config::snapshot_workspace_config_layer_from_retained_config_directory(
+                &directory,
+                &layer.config_leaf,
+                &layer.canonical_config_path,
+                Some(&layer.effective_default_journal_leaf),
+                Some(&layer.effective_default_backup_leaf),
+            )?;
+            snapshots.push(snapshot);
+        }
+        self.verify_default_effective_layers()?;
+        Ok(snapshots)
+    }
+
+    /// Validate every retained directory identity before a worker publishes or
+    /// serves a configuration-derived result.  The attached root alone is not
+    /// sufficient: an ancestor `.cockpit` layer can be replaced while a moved
+    /// descendant preserves the session root's inode.
+    pub(crate) fn verify(&self) -> Result<()> {
+        self.attached_root
+            .verify(self.attached_root.canonical_path())?;
+        for layer in &self.config_layers {
+            layer
+                .config_directory
+                .verify(layer.config_directory.canonical_path())?;
+        }
+        if let Some(target) = &self.default_write_target {
+            target
+                .config_directory
+                .verify(target.config_directory.canonical_path())?;
+        }
+        Ok(())
+    }
+
+    /// Identity fence for every config source captured at attachment. This
+    /// validates global source provenance without treating a global directory
+    /// as workspace authority.
+    pub(crate) fn verify_retained_config_source_chain(&self) -> Result<()> {
+        self.verify()?;
+        for layer in &self.default_effective_layers {
+            layer
+                .config_directory
+                .verify(layer.config_directory.canonical_path())?;
+        }
+        Ok(())
+    }
+
+    fn retained_layer_is_projected(
+        &self,
+        layer: &RetainedDefaultWriteTargetAuthority,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> bool {
+        match &layer.scope {
+            cockpit_config::config::effective_default::EffectiveDefaultScope::User
+            | cockpit_config::config::effective_default::EffectiveDefaultScope::MachineLocal => true,
+            cockpit_config::config::effective_default::EffectiveDefaultScope::Project => {
+                policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust
+            }
+            cockpit_config::config::effective_default::EffectiveDefaultScope::ExplicitOverride => {
+                // This flag is attached only to a one-file explicit override;
+                // it is not a chain-wide authorization override. An external
+                // explicit file historically remains effective in
+                // IgnoreConfig, whereas a conventional project override was
+                // never captured in that mode.
+                self.exclusive_config_override
+            }
+        }
+    }
+
+    fn hook_source_is_projected(
+        &self,
+        source: &cockpit_config::config::extended::hooks::HookConfigSource,
+        policy: Option<&crate::config::trust::WorkspaceTrustPolicy>,
+    ) -> bool {
+        let Some(policy) = policy else {
+            return true;
+        };
+        match &source.kind {
+            cockpit_config::config::extended::hooks::HookSourceKind::Layer(
+                crate::config::dirs::ConfigDirKind::HomeXdg
+                | crate::config::dirs::ConfigDirKind::HomeDot
+                | crate::config::dirs::ConfigDirKind::MachineLocal,
+            ) => true,
+            cockpit_config::config::extended::hooks::HookSourceKind::Layer(
+                crate::config::dirs::ConfigDirKind::Project,
+            ) => policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            cockpit_config::config::extended::hooks::HookSourceKind::Explicit => {
+                self.exclusive_config_override
+            }
+        }
+    }
+
+    /// Verify only source identities that the current policy permits us to
+    /// project. A conventional project directory can be replaced while a
+    /// session is IgnoreConfig without invalidating the still-authorized
+    /// global configuration; a later Trust refresh rechecks it before use.
+    pub(crate) fn verify_retained_config_source_chain_for_policy(
+        &self,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<()> {
+        self.attached_root
+            .verify(self.attached_root.canonical_path())?;
+        for layer in &self.default_effective_layers {
+            if self.retained_layer_is_projected(layer, policy) {
+                layer
+                    .config_directory
+                    .verify(layer.config_directory.canonical_path())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_retained_global_hook_source(
+        &self,
+        source: &cockpit_config::config::extended::hooks::HookConfigSource,
+    ) -> std::result::Result<Option<Vec<u8>>, String> {
+        let index = self
+            .retained_source_paths
+            .iter()
+            .position(|path| path == &source.path)
+            .ok_or_else(|| "trusted global hook source was not retained at attach".to_owned())?;
+        let layer = self
+            .default_effective_layers
+            .get(index)
+            .ok_or_else(|| "trusted global hook source layer is missing".to_owned())?;
+        let leaf = layer
+            .config_leaf
+            .to_str()
+            .ok_or_else(|| "retained global hook config leaf is not UTF-8".to_owned())?;
+        match layer.config_directory.held_directory.read_regular_file_relative_bounded(
+            &[leaf],
+            MAX_HOOK_CONFIG_BYTES,
+        ) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error)
+                if error
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The default-model transaction uses the same complete retained source
+    /// chain as provider provenance and worker refresh.
+    pub(crate) fn verify_retained_effective_default_chain(&self) -> Result<()> {
+        self.verify_retained_config_source_chain()
+    }
+
+    /// Opaque receipt binding for one retained `SetDefaultModel` linearization.
+    ///
+    /// This intentionally hashes immutable attach-time directory identities,
+    /// the exact one-leaf transaction descriptor, and the generation published
+    /// into the worker after the retained reload.  It never serializes a path,
+    /// config body, provider credential, or workspace name.  The caller must
+    /// invoke this only after its final complete-chain verification; this
+    /// method repeats that verification so no caller can accidentally mint a
+    /// receipt for a stale attach capability.
+    pub(crate) fn retained_effective_default_authority_binding(
+        &self,
+        config_generation: u64,
+    ) -> Result<cockpit_config::config::effective_default::DefaultUpdateAuthorityBinding> {
+        self.verify_retained_effective_default_chain()?;
+        let target = self
+            .default_write_target
+            .as_ref()
+            .context("no retained cockpit config layer applies to this attached session")?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"cockpit-retained-default-receipt-authority-v1\0");
+        hasher.update(self.attached_root.identity_digest);
+        hasher.update([u8::from(self.exclusive_config_override)]);
+        hasher.update((self.default_effective_layers.len() as u64).to_le_bytes());
+        for layer in &self.default_effective_layers {
+            // Directory identity and leaf/artifact names together describe
+            // exactly the capability-relative transaction target without
+            // exposing any of them in the public receipt.
+            hasher.update(layer.config_directory.identity_digest);
+            for leaf in [
+                &layer.config_leaf,
+                &layer.effective_default_journal_leaf,
+                &layer.effective_default_backup_leaf,
+            ] {
+                let bytes = leaf.as_encoded_bytes();
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hasher.update(bytes);
+            }
+        }
+        // Bind the selected descriptor again explicitly.  This makes a future
+        // change to effective-layer ordering fail closed even if its final
+        // element happened to have the same directory identity.
+        hasher.update(target.config_directory.identity_digest);
+        for leaf in [
+            &target.config_leaf,
+            &target.effective_default_journal_leaf,
+            &target.effective_default_backup_leaf,
+        ] {
+            let bytes = leaf.as_encoded_bytes();
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        hasher.update(target.scope.as_str().as_bytes());
+        hasher.update(config_generation.to_le_bytes());
+        cockpit_config::config::effective_default::DefaultUpdateAuthorityBinding::new(
+            crate::intel::hex_lower(&hasher.finalize()),
+            config_generation,
+        )
+    }
+
+    /// Create a public-safe receipt binding for the policy projection that
+    /// actually authorized a default-model write. Only the projected source
+    /// scope and selected target are part of the opaque digest: a receipt
+    /// sealed for a trusted project target cannot replay while that target is
+    /// hidden by IgnoreConfig, while a global-only target remains valid across
+    /// a policy transition that does not alter its authority.
+    pub(crate) fn retained_effective_default_authority_binding_for_policy(
+        &self,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+        config_generation: u64,
+    ) -> Result<cockpit_config::config::effective_default::DefaultUpdateAuthorityBinding> {
+        self.verify_retained_config_source_chain_for_policy(policy)?;
+        let target = self
+            .default_effective_layers
+            .iter()
+            .rev()
+            .find(|layer| self.retained_layer_is_projected(layer, policy))
+            .context("no retained cockpit config layer applies under the current workspace trust policy")?;
+        let projected = self
+            .default_effective_layers
+            .iter()
+            .filter(|layer| self.retained_layer_is_projected(layer, policy))
+            .collect::<Vec<_>>();
+        let mut hasher = Sha256::new();
+        hasher.update(b"cockpit-retained-default-receipt-authority-v2\0");
+        hasher.update(self.attached_root.identity_digest);
+        hasher.update([u8::from(self.exclusive_config_override)]);
+        hasher.update((projected.len() as u64).to_le_bytes());
+        for layer in projected {
+            hasher.update(layer.config_directory.identity_digest);
+            for leaf in [
+                &layer.config_leaf,
+                &layer.effective_default_journal_leaf,
+                &layer.effective_default_backup_leaf,
+            ] {
+                let bytes = leaf.as_encoded_bytes();
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hasher.update(bytes);
+            }
+        }
+        hasher.update(target.config_directory.identity_digest);
+        for leaf in [
+            &target.config_leaf,
+            &target.effective_default_journal_leaf,
+            &target.effective_default_backup_leaf,
+        ] {
+            let bytes = leaf.as_encoded_bytes();
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        hasher.update(target.scope.as_str().as_bytes());
+        hasher.update(config_generation.to_le_bytes());
+        cockpit_config::config::effective_default::DefaultUpdateAuthorityBinding::new(
+            crate::intel::hex_lower(&hasher.finalize()),
+            config_generation,
+        )
+    }
+
+    fn verify_default_effective_layers(&self) -> Result<()> {
+        self.verify_retained_effective_default_chain()
+    }
+}
+
 /// Default local-daemon workspace authority. The socket authentication layer
 /// has already established local-owner identity before this runs; canonical
 /// paths are used only internally and are hashed before becoming the opaque
 /// DB/protocol workspace identity.
 pub struct LocalDaemonWorkspaceAuthorizer {
-    authorized_roots: Vec<PathBuf>,
+    authorized_roots: Vec<AuthorizedWorkspaceRoot>,
 }
 
 impl LocalDaemonWorkspaceAuthorizer {
@@ -192,8 +2111,12 @@ impl LocalDaemonWorkspaceAuthorizer {
     pub fn new(authorized_roots: Vec<PathBuf>) -> Result<Self> {
         let authorized_roots = authorized_roots
             .into_iter()
-            .map(|path| std::fs::canonicalize(&path).context("canonicalizing authorized workspace"))
+            .map(|path| AuthorizedWorkspaceRoot::capture(&path))
             .collect::<Result<Vec<_>>>()?;
+        Self::from_captured_roots(authorized_roots)
+    }
+
+    pub fn from_captured_roots(authorized_roots: Vec<AuthorizedWorkspaceRoot>) -> Result<Self> {
         ensure!(
             !authorized_roots.is_empty(),
             "daemon has no authorized workspace roots"
@@ -205,13 +2128,12 @@ impl LocalDaemonWorkspaceAuthorizer {
 #[async_trait]
 impl AgentWorkspaceAuthorizer for LocalDaemonWorkspaceAuthorizer {
     async fn authorize_workspace(&self, client_path: &str) -> Result<(String, PathBuf)> {
-        let path =
-            std::fs::canonicalize(client_path).context("canonicalizing requested workspace")?;
-        ensure!(path.is_dir(), "requested workspace is not a directory");
-        ensure!(
-            self.authorized_roots.iter().any(|root| root == &path),
-            "requested workspace is not authorized for this daemon client"
-        );
+        let requested = Path::new(client_path);
+        let path = self
+            .authorized_roots
+            .iter()
+            .find_map(|root| root.verify(requested).ok())
+            .context("requested workspace is not authorized for this daemon client")?;
         let identity = sha256_hex(path.to_string_lossy().as_bytes());
         Ok((format!("workspace:{identity}"), path))
     }
@@ -1267,6 +3189,316 @@ impl AgentInstallationService {
         }
         .await;
         result.unwrap_or_else(redacted_error)
+    }
+
+    /// Build the read-only session-setup projection from an already-authorized
+    /// workspace and a daemon-owned selected installation.  This intentionally
+    /// shares installed-definition parsing, current-binding reads, and exact
+    /// profile ranking with installation binding; it never accepts a provider
+    /// profile handle, a source path, or a client-selected agent identity.
+    pub async fn session_setup_snapshot(
+        &self,
+        session_id: Uuid,
+        canonical_workspace_id: String,
+        workspace_root: Option<&AuthorizedWorkspaceRoot>,
+        providers: &ProvidersConfig,
+        config_generation: u64,
+        global_config_generation: u64,
+        config_fingerprint: &str,
+        project_sources_projected: bool,
+    ) -> Result<SessionSetupSnapshotV1> {
+        // Filesystem reads cannot join SQLite's snapshot, so retry a bounded
+        // number of times if installation/profile/binding state changes while
+        // they are read. Never publish a torn "revision" for later CAS.
+        for _ in 0..3 {
+            let db_snapshot = self
+                .db
+                .session_setup_snapshot(session_id, canonical_workspace_id.clone())
+                .await?;
+            let selected_installation_id = db_snapshot.selected_installation_id;
+            let mut rows = db_snapshot.installations.clone();
+            rows.sort_by(|left, right| {
+                setup_scope_rank(left.installation.scope)
+                    .cmp(&setup_scope_rank(right.installation.scope))
+                    .then_with(|| {
+                        left.installation
+                            .source_agent_id
+                            .cmp(&right.installation.source_agent_id)
+                    })
+                    .then_with(|| {
+                        left.installation
+                            .installation_id
+                            .cmp(&right.installation.installation_id)
+                    })
+            });
+            let mut projections = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let selected = selected_installation_id == Some(row.installation.installation_id);
+                projections.push(
+                    self.session_setup_candidate(
+                        row,
+                        workspace_root,
+                        providers,
+                        selected,
+                        project_sources_projected,
+                    )?,
+                );
+            }
+            // Definition files sit outside SQLite. Reproject them before the
+            // final DB validation and publish only if their exact vNext
+            // digests and the public projection are unchanged. This is
+            // deliberately a bounded retry rather than a daemon-wide lock
+            // across file IO.
+            let mut confirmed = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let selected = selected_installation_id == Some(row.installation.installation_id);
+                confirmed.push(
+                    self.session_setup_candidate(
+                        row,
+                        workspace_root,
+                        providers,
+                        selected,
+                        project_sources_projected,
+                    )?,
+                );
+            }
+            if projections != confirmed {
+                continue;
+            }
+            // Re-read every durable input after the final external reads, so
+            // the revision never claims a mixture of two DB authority views.
+            let after = self
+                .db
+                .session_setup_snapshot(session_id, canonical_workspace_id.clone())
+                .await?;
+            if session_setup_db_snapshot_fingerprint(&db_snapshot)
+                != session_setup_db_snapshot_fingerprint(&after)
+            {
+                continue;
+            }
+            let candidates = projections
+                .into_iter()
+                .map(|projection| projection.candidate)
+                .collect::<Vec<_>>();
+            let revision = session_setup_revision(
+                selected_installation_id,
+                &candidates,
+                &session_setup_db_snapshot_fingerprint(&after),
+                config_generation,
+                global_config_generation,
+                config_fingerprint,
+            );
+            return Ok(SessionSetupSnapshotV1 {
+                dto_version: SESSION_SETUP_DTO_VERSION,
+                session_id: session_id.to_string(),
+                revision,
+                config_generation,
+                selected_installation_id: selected_installation_id.map(|id| id.to_string()),
+                candidates,
+            });
+        }
+        bail!("session setup authority changed while projecting snapshot; retry request")
+    }
+
+    /// Convenience boundary for daemon dispatch. Its root is taken from an
+    /// already-authorized attached-session handle, never from request data;
+    /// derive the same opaque identity used by the installation boundary
+    /// without narrowing the query to the daemon process's startup cwd.
+    pub async fn session_setup_snapshot_for_attached_workspace(
+        &self,
+        session_id: Uuid,
+        workspace_root: &AuthorizedWorkspaceRoot,
+        providers: &ProvidersConfig,
+        config_generation: u64,
+        global_config_generation: u64,
+        config_fingerprint: &str,
+        project_sources_projected: bool,
+    ) -> Result<SessionSetupSnapshotV1> {
+        let (workspace_id, canonical_workspace_root) = self
+            .workspaces
+            .authorize_workspace(&workspace_root.canonical_path().to_string_lossy())
+            .await
+            .context("authorizing attached session workspace")?;
+        ensure!(
+            canonical_workspace_root == workspace_root.canonical_path(),
+            "attached workspace authorization returned a different canonical root"
+        );
+        self.session_setup_snapshot(
+            session_id,
+            workspace_id,
+            Some(workspace_root),
+            providers,
+            config_generation,
+            global_config_generation,
+            config_fingerprint,
+            project_sources_projected,
+        )
+        .await
+    }
+
+    fn session_setup_candidate(
+        &self,
+        row: &SessionSetupInstallationSnapshotRow,
+        workspace_root: Option<&AuthorizedWorkspaceRoot>,
+        providers: &ProvidersConfig,
+        selected: bool,
+        project_sources_projected: bool,
+    ) -> Result<SessionSetupCandidateProjection> {
+        // `record` remains the one wire projection for source/version/digest
+        // and current binding state.  If the daemon can no longer read the
+        // owned definition, preserve the non-secret durable identity while
+        // making the candidate explicitly unavailable instead of leaking IO
+        // details or silently selecting a fallback.
+        let mut installation = setup_installation_record(&row.installation);
+        let name = match row.installation.source_agent_id.rsplit('/').next() {
+            Some(name) => name,
+            None => return Ok(SessionSetupCandidateProjection::unavailable(row, selected)),
+        };
+        let (bytes, diagnostic_path) = match row.installation.scope {
+            AgentInstallationScope::WorkspaceShared => {
+                // A workspace-shared definition is a PROJECT source. When the
+                // current trust policy does not project project sources (e.g.
+                // Trust -> IgnoreConfig), it must not be read or rendered — the
+                // redaction invariant is one-directional. Project it as
+                // unavailable rather than opening the project agent file, the
+                // same gate `retained_layer_is_projected`/`hook_source_is_projected`
+                // apply to project config and hooks.
+                if !project_sources_projected {
+                    return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
+                }
+                let Some(workspace_root) = workspace_root else {
+                    return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
+                };
+                match workspace_root.read_workspace_shared_definition(name) {
+                    Ok(bytes) => (bytes, PathBuf::from("<attached-workspace-agent>")),
+                    Err(_) => {
+                        return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
+                    }
+                }
+            }
+            // Workspace-private definitions are daemon-owned state beneath
+            // `daemon_agents_dir/private/<opaque-id>`; the attached root only
+            // supplies that opaque key and is never used as filesystem
+            // authority. Workspace-shared definitions above are the only
+            // setup files resolved beneath a user workspace.
+            AgentInstallationScope::Global | AgentInstallationScope::WorkspacePrivate => {
+                let path = match setup_definition_path(
+                    &self.daemon_agents_dir,
+                    &row.installation,
+                    workspace_root.map(AuthorizedWorkspaceRoot::canonical_path),
+                ) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
+                    }
+                };
+                let bytes = match read_owned_file(&path, "reading installed agent setup") {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
+                    }
+                };
+                (bytes, path)
+            }
+        };
+        let definition = match (|| {
+            let name = row
+                .installation
+                .source_agent_id
+                .rsplit('/')
+                .next()
+                .context("installed agent id has no filename")?;
+            let text = std::str::from_utf8(&bytes)
+                .context("installed agent setup is not UTF-8")?;
+            crate::agents::parse_agent(text, name, diagnostic_path)
+        })() {
+            Ok(definition) => definition,
+            Err(_) => return Ok(SessionSetupCandidateProjection::unavailable(row, selected)),
+        };
+        let observed_digest = match definition.vnext_digest_bytes() {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(_) => return Ok(SessionSetupCandidateProjection::unavailable(row, selected)),
+        };
+        let Some(vnext) = definition.vnext else {
+            return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
+        };
+        let rebind_required = row.observation.as_ref().is_none_or(|observation| {
+            !observation.reviewed || observation.observed_digest != observed_digest
+        });
+        let current_bindings = row
+            .bindings
+            .iter()
+            .cloned()
+            .map(|binding| (binding.slot_id, binding.model_id))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        // Shared definition records intentionally omit private binding state
+        // from generic install/list RPCs. This attached, owner-local session
+        // snapshot is the one presentation boundary that can safely render
+        // the redacted state for every scope, still without a profile handle.
+        installation.bindings = vnext
+            .model_slots
+            .iter()
+            .map(|(slot_id, slot)| match current_bindings.get(slot_id) {
+                Some(model_id) => AgentInstallationSlotStatusV1 {
+                    slot_id: slot_id.clone(),
+                    state: if rebind_required {
+                        AgentInstallationSlotBindingStateV1::RebindRequired
+                    } else {
+                        AgentInstallationSlotBindingStateV1::Bound
+                    },
+                    model_id: model_id.clone(),
+                },
+                None => AgentInstallationSlotStatusV1 {
+                    slot_id: slot_id.clone(),
+                    state: if rebind_required {
+                        AgentInstallationSlotBindingStateV1::RebindRequired
+                    } else if slot_id == "primary"
+                        || slot.purpose.eq_ignore_ascii_case("primary")
+                    {
+                        AgentInstallationSlotBindingStateV1::PrimaryUnusable
+                    } else {
+                        AgentInstallationSlotBindingStateV1::OptionalUnbound
+                    },
+                    model_id: String::new(),
+                },
+            })
+            .collect();
+        let offerings = setup_offerings(providers);
+        let slots = vnext
+            .model_slots
+            .iter()
+            .map(|(slot_id, slot)| {
+                if rebind_required {
+                    return SessionSetupModelSlotV1 {
+                        slot_id: slot_id.clone(),
+                        choices: Vec::new(),
+                        unmatched_recommendations: Vec::new(),
+                        unavailable_reason: Some(SessionSetupUnavailableReasonV1::RebindRequired),
+                    };
+                }
+                let ranked =
+                    crate::agents::ranked_compatible_offerings(slot, &offerings, providers);
+                let (choices, unmatched_recommendations) = binding_choices(slot_id, slot, &ranked);
+                SessionSetupModelSlotV1 {
+                    slot_id: slot_id.clone(),
+                    unavailable_reason: choices.is_empty().then_some(
+                        SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel,
+                    ),
+                    choices,
+                    unmatched_recommendations,
+                }
+            })
+            .collect();
+        Ok(SessionSetupCandidateProjection {
+            candidate: SessionSetupAgentCandidateV1 {
+                installation,
+                selected,
+                slots,
+                locked_reason: rebind_required
+                    .then_some(SessionSetupLockedReasonV1::RebindRequired),
+            },
+            definition_digest: Some(observed_digest),
+        })
     }
 
     async fn validate_update_target(
@@ -2345,6 +4577,28 @@ pub fn default_daemon_service(
     providers: ProvidersConfig,
     authorized_workspace_roots: Vec<PathBuf>,
 ) -> Result<AgentInstallationService> {
+    let authorized_workspace_roots = authorized_workspace_roots
+        .into_iter()
+        .map(|path| AuthorizedWorkspaceRoot::capture(&path))
+        .collect::<Result<Vec<_>>>()?;
+    default_daemon_service_with_captured_workspace_roots(
+        db,
+        daemon_paths,
+        secret_vault,
+        providers,
+        authorized_workspace_roots,
+    )
+}
+
+/// Same production coordinator, but retains an attach-time workspace proof
+/// instead of recapturing whatever later occupies the original pathname.
+pub fn default_daemon_service_with_captured_workspace_roots(
+    db: Db,
+    daemon_paths: &crate::daemon::DaemonPaths,
+    secret_vault: Arc<crate::secure_key::SecretVault>,
+    providers: ProvidersConfig,
+    authorized_workspace_roots: Vec<AuthorizedWorkspaceRoot>,
+) -> Result<AgentInstallationService> {
     let state = daemon_paths
         .pid_file
         .parent()
@@ -2353,7 +4607,7 @@ pub fn default_daemon_service(
         db,
         state.join("agents"),
         Arc::new(GithubHttpsAgentFetcher::new(secret_vault)?),
-        Arc::new(LocalDaemonWorkspaceAuthorizer::new(
+        Arc::new(LocalDaemonWorkspaceAuthorizer::from_captured_roots(
             authorized_workspace_roots,
         )?),
         providers,
@@ -3550,6 +5804,390 @@ fn binding_choices(
     (choices, unmatched)
 }
 
+fn setup_scope_rank(scope: AgentInstallationScope) -> u8 {
+    match scope {
+        AgentInstallationScope::Global => 0,
+        AgentInstallationScope::WorkspacePrivate => 1,
+        AgentInstallationScope::WorkspaceShared => 2,
+    }
+}
+
+fn setup_definition_path(
+    daemon_agents_dir: &Path,
+    row: &AgentInstallationRow,
+    workspace_root: Option<&Path>,
+) -> Result<PathBuf> {
+    let name = row
+        .source_agent_id
+        .rsplit('/')
+        .next()
+        .context("installed agent id has no filename")?;
+    let scope = match row.scope {
+        AgentInstallationScope::Global => AgentInstallationScopeWire::Global,
+        AgentInstallationScope::WorkspacePrivate => AgentInstallationScopeWire::WorkspacePrivate,
+        AgentInstallationScope::WorkspaceShared => AgentInstallationScopeWire::WorkspaceShared,
+    };
+    owned_path(daemon_agents_dir, workspace_root, scope, name)
+}
+
+fn unavailable_setup_candidate(
+    row: AgentInstallationRow,
+    selected: bool,
+) -> SessionSetupAgentCandidateV1 {
+    SessionSetupAgentCandidateV1 {
+        installation: AgentInstallationRecordV1 {
+            installation_id: row.installation_id.to_string(),
+            scope: match row.scope {
+                AgentInstallationScope::Global => AgentInstallationScopeWire::Global,
+                AgentInstallationScope::WorkspacePrivate => {
+                    AgentInstallationScopeWire::WorkspacePrivate
+                }
+                AgentInstallationScope::WorkspaceShared => AgentInstallationScopeWire::WorkspaceShared,
+            },
+            source_agent_id: row.source_agent_id,
+            source_identity: row.source_identity,
+            source_revision: row.source_revision,
+            source_digest: row.source_digest,
+            installation_revision: row.installation_revision,
+            bindings: Vec::new(),
+        },
+        selected,
+        slots: Vec::new(),
+        locked_reason: Some(SessionSetupLockedReasonV1::DefinitionUnavailable),
+    }
+}
+
+/// One locally projected candidate plus the exact vNext definition digest
+/// observed while deriving it. The digest never crosses the protocol on its
+/// own; it lets the snapshot builder prove the external definition did not
+/// change between projection and publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionSetupCandidateProjection {
+    candidate: SessionSetupAgentCandidateV1,
+    definition_digest: Option<String>,
+}
+
+impl SessionSetupCandidateProjection {
+    fn unavailable(row: &SessionSetupInstallationSnapshotRow, selected: bool) -> Self {
+        Self {
+            candidate: unavailable_setup_candidate(row.installation.clone(), selected),
+            definition_digest: None,
+        }
+    }
+}
+
+fn setup_installation_record(row: &AgentInstallationRow) -> AgentInstallationRecordV1 {
+    AgentInstallationRecordV1 {
+        installation_id: row.installation_id.to_string(),
+        scope: match row.scope {
+            AgentInstallationScope::Global => AgentInstallationScopeWire::Global,
+            AgentInstallationScope::WorkspacePrivate => AgentInstallationScopeWire::WorkspacePrivate,
+            AgentInstallationScope::WorkspaceShared => AgentInstallationScopeWire::WorkspaceShared,
+        },
+        source_agent_id: row.source_agent_id.clone(),
+        source_identity: row.source_identity.clone(),
+        source_revision: row.source_revision.clone(),
+        source_digest: row.source_digest.clone(),
+        installation_revision: row.installation_revision,
+        bindings: Vec::new(),
+    }
+}
+
+fn session_setup_db_snapshot_fingerprint(snapshot: &SessionSetupDbSnapshot) -> String {
+    let mut hasher = Sha256::new();
+    // This fingerprint is an authority/CAS input, not an ad-hoc cache key.
+    // Every field is framed with its name, type, and length so two distinct
+    // SQLite projections cannot collide merely by concatenating variable-size
+    // strings or optional values.  The digest is never a serialization or a
+    // transport for any of the private fields it covers.
+    hasher.update(b"cockpit-session-setup-db-snapshot-fingerprint-v1");
+    let selected_installation_id = snapshot
+        .selected_installation_id
+        .map(|id| id.to_string());
+    session_setup_fingerprint_optional_text(
+        &mut hasher,
+        "selected_installation_id",
+        selected_installation_id.as_deref(),
+    );
+    session_setup_fingerprint_u64(
+        &mut hasher,
+        "installation_count",
+        snapshot.installations.len() as u64,
+    );
+    for candidate in &snapshot.installations {
+        let installation = &candidate.installation;
+        session_setup_fingerprint_field(&mut hasher, "installation", "begin", &[]);
+        session_setup_fingerprint_text(
+            &mut hasher,
+            "installation_id",
+            &installation.installation_id.to_string(),
+        );
+        session_setup_fingerprint_text(
+            &mut hasher,
+            "scope",
+            match installation.scope {
+                AgentInstallationScope::Global => "global",
+                AgentInstallationScope::WorkspacePrivate => "workspace_private",
+                AgentInstallationScope::WorkspaceShared => "workspace_shared",
+            },
+        );
+        session_setup_fingerprint_optional_text(
+            &mut hasher,
+            "canonical_workspace_id",
+            installation.canonical_workspace_id.as_deref(),
+        );
+        session_setup_fingerprint_text(
+            &mut hasher,
+            "source_agent_id",
+            &installation.source_agent_id,
+        );
+        session_setup_fingerprint_text(
+            &mut hasher,
+            "source_identity",
+            &installation.source_identity,
+        );
+        session_setup_fingerprint_optional_text(
+            &mut hasher,
+            "source_revision",
+            installation.source_revision.as_deref(),
+        );
+        session_setup_fingerprint_text(
+            &mut hasher,
+            "source_digest",
+            &installation.source_digest,
+        );
+        session_setup_fingerprint_i64(
+            &mut hasher,
+            "fetched_at_unix_ms",
+            installation.fetched_at_unix_ms,
+        );
+        session_setup_fingerprint_u64(
+            &mut hasher,
+            "installation_revision",
+            installation.installation_revision,
+        );
+        session_setup_fingerprint_optional_i64(
+            &mut hasher,
+            "deleted_at_unix_ms",
+            installation.deleted_at_unix_ms,
+        );
+        if let Some(observation) = &candidate.observation {
+            session_setup_fingerprint_field(&mut hasher, "observation", "present", &[1]);
+            session_setup_fingerprint_text(
+                &mut hasher,
+                "observation_installation_id",
+                &observation.installation_id.to_string(),
+            );
+            session_setup_fingerprint_text(
+                &mut hasher,
+                "observed_digest",
+                &observation.observed_digest,
+            );
+            session_setup_fingerprint_u64(
+                &mut hasher,
+                "observation_revision",
+                observation.observation_revision,
+            );
+            session_setup_fingerprint_bool(&mut hasher, "reviewed", observation.reviewed);
+            session_setup_fingerprint_i64(
+                &mut hasher,
+                "observed_at_unix_ms",
+                observation.observed_at_unix_ms,
+            );
+        } else {
+            session_setup_fingerprint_field(&mut hasher, "observation", "present", &[0]);
+        }
+        session_setup_fingerprint_u64(
+            &mut hasher,
+            "binding_count",
+            candidate.bindings.len() as u64,
+        );
+        for binding in &candidate.bindings {
+            session_setup_fingerprint_field(&mut hasher, "binding", "begin", &[]);
+            session_setup_fingerprint_text(
+                &mut hasher,
+                "binding_id",
+                &binding.binding_id.to_string(),
+            );
+            session_setup_fingerprint_text(
+                &mut hasher,
+                "binding_installation_id",
+                &binding.installation_id.to_string(),
+            );
+            session_setup_fingerprint_text(
+                &mut hasher,
+                "binding_definition_digest",
+                &binding.definition_digest,
+            );
+            session_setup_fingerprint_text(&mut hasher, "slot_id", &binding.slot_id);
+            session_setup_fingerprint_text(
+                &mut hasher,
+                "provider_profile_handle",
+                &binding.provider_profile_handle,
+            );
+            session_setup_fingerprint_text(&mut hasher, "model_id", &binding.model_id);
+            session_setup_fingerprint_field(
+                &mut hasher,
+                "provenance_payload",
+                "bytes",
+                &binding.provenance_payload,
+            );
+            session_setup_fingerprint_text(
+                &mut hasher,
+                "provenance_digest",
+                &binding.provenance_digest,
+            );
+            session_setup_fingerprint_bool(
+                &mut hasher,
+                "hard_capability_verified",
+                binding.hard_capability_verified,
+            );
+            session_setup_fingerprint_u64(
+                &mut hasher,
+                "binding_revision",
+                binding.binding_revision,
+            );
+            session_setup_fingerprint_optional_i64(
+                &mut hasher,
+                "retired_at_unix_ms",
+                binding.retired_at_unix_ms,
+            );
+            session_setup_fingerprint_i64(
+                &mut hasher,
+                "created_at_unix_ms",
+                binding.created_at_unix_ms,
+            );
+        }
+    }
+    crate::intel::hex_lower(&hasher.finalize())
+}
+
+fn session_setup_fingerprint_field(
+    hasher: &mut Sha256,
+    field_name: &str,
+    type_name: &str,
+    value: &[u8],
+) {
+    for part in [field_name.as_bytes(), type_name.as_bytes(), value] {
+        hasher.update(
+            u64::try_from(part.len())
+                .expect("session setup fingerprint field length fits u64")
+                .to_be_bytes(),
+        );
+        hasher.update(part);
+    }
+}
+
+fn session_setup_fingerprint_text(hasher: &mut Sha256, field_name: &str, value: &str) {
+    session_setup_fingerprint_field(hasher, field_name, "text", value.as_bytes());
+}
+
+fn session_setup_fingerprint_optional_text(
+    hasher: &mut Sha256,
+    field_name: &str,
+    value: Option<&str>,
+) {
+    match value {
+        Some(value) => session_setup_fingerprint_field(
+            hasher,
+            field_name,
+            "optional-text:some",
+            value.as_bytes(),
+        ),
+        None => session_setup_fingerprint_field(hasher, field_name, "optional-text:none", &[]),
+    }
+}
+
+fn session_setup_fingerprint_u64(hasher: &mut Sha256, field_name: &str, value: u64) {
+    session_setup_fingerprint_field(hasher, field_name, "u64", &value.to_be_bytes());
+}
+
+fn session_setup_fingerprint_i64(hasher: &mut Sha256, field_name: &str, value: i64) {
+    session_setup_fingerprint_field(hasher, field_name, "i64", &value.to_be_bytes());
+}
+
+fn session_setup_fingerprint_optional_i64(
+    hasher: &mut Sha256,
+    field_name: &str,
+    value: Option<i64>,
+) {
+    match value {
+        Some(value) => session_setup_fingerprint_field(
+            hasher,
+            field_name,
+            "optional-i64:some",
+            &value.to_be_bytes(),
+        ),
+        None => session_setup_fingerprint_field(hasher, field_name, "optional-i64:none", &[]),
+    }
+}
+
+fn session_setup_fingerprint_bool(hasher: &mut Sha256, field_name: &str, value: bool) {
+    session_setup_fingerprint_field(hasher, field_name, "bool", &[u8::from(value)]);
+}
+
+fn setup_offerings(providers: &ProvidersConfig) -> Vec<crate::agents::AgentProfileModelOffering> {
+    providers
+        .providers
+        .iter()
+        .enumerate()
+        .flat_map(|(provider_index, (provider_profile_handle, entry))| {
+            let provider_id = entry.template.clone().unwrap_or_else(|| {
+                // Custom-provider map keys are daemon-local credential routes;
+                // the wire carries this deterministic display token instead.
+                format!("configured-provider-{provider_index}")
+            });
+            entry.models.iter().enumerate().map(move |(model_index, model)| {
+                crate::agents::AgentProfileModelOffering {
+                    offering_id: format!("offering-{provider_index}-{model_index}"),
+                    provider_profile_handle: provider_profile_handle.clone(),
+                    provider_id: provider_id.clone(),
+                    model_id: model.id.clone(),
+                }
+            })
+        })
+        .collect()
+}
+
+/// A daemon-private exact-content revision for the provider inventory. The
+/// serialized configuration can contain credential references, so this digest
+/// never crosses the protocol boundary; only its inclusion in the final
+/// snapshot revision makes a configuration replacement detectable.
+pub(crate) fn session_setup_config_fingerprint(providers: &ProvidersConfig) -> Result<String> {
+    Ok(sha256_hex(
+        &serde_json::to_vec(providers).context("serializing setup provider snapshot")?,
+    ))
+}
+
+fn session_setup_revision(
+    selected_installation_id: Option<Uuid>,
+    candidates: &[SessionSetupAgentCandidateV1],
+    db_snapshot_fingerprint: &str,
+    config_generation: u64,
+    global_config_generation: u64,
+    config_fingerprint: &str,
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(selected_installation_id.map(|id| id.to_string()).unwrap_or_default());
+    hasher.update(db_snapshot_fingerprint.as_bytes());
+    hasher.update(config_generation.to_be_bytes());
+    hasher.update(global_config_generation.to_be_bytes());
+    hasher.update(config_fingerprint.as_bytes());
+    // The canonical DTO contains only public/redacted data and captures every
+    // visible availability, recommendation, and binding-state change. Hash it
+    // rather than maintaining a second, inevitably incomplete revision view.
+    hasher.update(serde_json::to_vec(candidates).expect("session setup DTO serializes"));
+    let digest = hasher.finalize();
+    // Bound the revision to JS `Number.MAX_SAFE_INTEGER` (2^53 - 1). The
+    // TypeScript wire mirror validates it with `safeU64NumberSchema` and uses
+    // it as an exact CAS token; a full-range u64 exceeds that cap ~99.95% of
+    // the time and, above 2^53, cannot survive a `JSON.parse`/`stringify`
+    // round-trip. Masking a uniform SHA-256 prefix to 53 bits preserves ~2^53
+    // of change-detection space, which is ample for an opaque snapshot label.
+    u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix is eight bytes"))
+        & ((1u64 << 53) - 1)
+}
+
 /// Persist the daemon-local profile route selected while choices are built.
 /// A wire choice only identifies the portable provider alias; a restart must
 /// never infer a credential-owning profile from that alias again.
@@ -3783,6 +6421,421 @@ fn typed_installation_error(code: AgentInstallationErrorCodeV1) -> AgentInstalla
             code,
             message: "agent installation request was refused; inspect daemon logs for redacted diagnostics".into(),
         },
+    }
+}
+
+/// Test-only durable fixture shared by the installation service and the
+/// daemon endpoint.  It deliberately uses the public DB mutation boundaries
+/// instead of inserting profile rows by hand: the selected installation,
+/// observation, binding, preparation receipt, and immutable profile are all
+/// subject to the same CAS and canonical-payload checks as production.
+#[cfg(test)]
+pub(crate) mod session_setup_test_support {
+    use super::*;
+    use cockpit_config::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
+    use cockpit_db::db::agent_installations::{
+        AgentBindingExpectation, AgentBindingInput, AgentBindingRevision,
+        AgentBindingRevisionMap, AgentExecutionKind, AgentSessionCreateInput, BindAgentOutcome,
+        ObserveAgentOutcome, PrepareAgentSessionInput, PrepareAgentSessionOutcome, ProviderAlias,
+        RedactedAgentProfileSnapshot, RedactedBindingEvidence, RedactedQuestionPolicy,
+    };
+
+    pub(crate) const SELECTED_PROFILE_HANDLE: &str = "credential-profile-sentinel";
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct SessionSetupFixture {
+        pub session_id: Uuid,
+        pub selected_installation_id: Uuid,
+        pub workspace_id: String,
+    }
+
+    pub(crate) fn providers() -> ProvidersConfig {
+        let mut providers = ProvidersConfig::default();
+        for (profile, model_id) in [
+            ("profile-a", "exact-a"),
+            ("profile-b", "exact-b"),
+            ("profile-local", "compatible"),
+        ] {
+            providers.providers.insert(
+                profile.into(),
+                ProviderEntry {
+                    template: Some("openai-compatible".into()),
+                    // Worker construction is real, but the fixture never
+                    // dispatches inference. A no-auth loopback endpoint keeps
+                    // the endpoint test hermetic.
+                    url: "http://127.0.0.1:9/v1".into(),
+                    models: vec![ModelEntry {
+                        id: model_id.into(),
+                        context_length: Some(128),
+                        ..ModelEntry::default()
+                    }],
+                    ..ProviderEntry::default()
+                },
+            );
+        }
+        // The endpoint fixture resumes a real ordinary worker.  Its immutable
+        // agent receipt is independent of the ordinary session default, but
+        // resume still requires one to construct a usable worker.
+        providers.active_model = Some(ActiveModelRef {
+            provider: "profile-a".into(),
+            model: "exact-a".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        });
+        providers
+    }
+
+    pub(crate) fn add_refreshed_offering(providers: &mut ProvidersConfig) {
+        providers.providers.insert(
+            "profile-refreshed".into(),
+            ProviderEntry {
+                template: Some("openai-compatible".into()),
+                url: "http://127.0.0.1:9/v1".into(),
+                models: vec![ModelEntry {
+                    id: "compatible-after-refresh".into(),
+                    context_length: Some(128),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+    }
+
+    /// Materialize the normal project-local provider layer consumed by the
+    /// production `ConfigSource`.  Provider entries deliberately live in the
+    /// sibling `providers/` directory: inline entries in `config.json` are
+    /// ignored by the long-term configuration grammar.
+    pub(crate) fn write_workspace_provider_layer(
+        workspace: &Path,
+        providers: &ProvidersConfig,
+    ) -> Result<()> {
+        let config_path = workspace.join(".cockpit/config.json");
+        std::fs::create_dir_all(
+            config_path
+                .parent()
+                .context("workspace config path has no parent")?,
+        )?;
+        let layer_metadata = serde_json::json!({
+            "active_model": &providers.active_model,
+        });
+        std::fs::write(&config_path, serde_json::to_vec(&layer_metadata)?)?;
+        for (profile, entry) in &providers.providers {
+            let provider_path = crate::config::providers::provider_file_path_for_config(
+                &config_path,
+                profile,
+            )?;
+            std::fs::create_dir_all(
+                provider_path
+                    .parent()
+                    .context("workspace provider path has no parent")?,
+            )?;
+            std::fs::write(provider_path, serde_json::to_vec(entry)?)?;
+        }
+        Ok(())
+    }
+
+    fn markdown(agent_id: &str, required_capability: &str) -> String {
+        format!(
+            "---\ndescription: setup fixture\nschemaVersion: 2\nagentId: {agent_id}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [{required_capability}]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: openai-compatible\n            modelId: exact-a\n      - recommendationId: second\n        upstreamIdentity: upstream/second\n        providerAliases:\n          - providerId: openai-compatible\n            modelId: exact-b\n      - recommendationId: missing\n        upstreamIdentity: upstream/missing\n---\nfixture body\n"
+        )
+    }
+
+    fn digest(name: &str, markdown: &str) -> Result<String> {
+        let definition = crate::agents::parse_agent(
+            markdown,
+            name,
+            PathBuf::from(format!("<{name}-session-setup-fixture>")),
+        )?;
+        Ok(sha256_hex(&definition.vnext_digest_bytes()?))
+    }
+
+    fn workspace_id(workspace: &Path) -> String {
+        format!(
+            "workspace:{}",
+            sha256_hex(workspace.to_string_lossy().as_bytes())
+        )
+    }
+
+    fn input(
+        installation_id: Uuid,
+        scope: AgentInstallationScope,
+        canonical_workspace_id: Option<String>,
+        name: &str,
+        source_digest: String,
+    ) -> AgentInstallationInput {
+        AgentInstallationInput {
+            installation_id,
+            scope,
+            canonical_workspace_id,
+            source_agent_id: format!("authored/{name}"),
+            source_identity: format!("fixture/repository:agents/{name}.md"),
+            source_revision: Some("a".repeat(40)),
+            source_digest,
+            fetched_at_unix_ms: 1,
+        }
+    }
+
+    async fn install_observe_and_maybe_bind(
+        db: &Db,
+        input: AgentInstallationInput,
+        binding: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let installation_id = input.installation_id;
+        let definition_digest = input.source_digest.clone();
+        ensure!(matches!(
+            db.install_agent(input).await?,
+            InstallAgentOutcome::Installed(_)
+        ));
+        ensure!(matches!(
+            db.observe_agent_definition(installation_id, definition_digest.clone(), 2)
+                .await?,
+            ObserveAgentOutcome::Current(_)
+        ));
+        if let Some((profile_handle, model_id)) = binding {
+            let provenance_payload = format!("fixture-provenance:{installation_id}").into_bytes();
+            ensure!(matches!(
+                db.bind_agent_model(
+                    installation_id,
+                    definition_digest,
+                    None,
+                    format!("fixture-bind-{installation_id}"),
+                    "fixture-binding-request".into(),
+                    AgentBindingInput {
+                        slot_id: "primary".into(),
+                        provider_profile_handle: profile_handle.into(),
+                        model_id: model_id.into(),
+                        provenance_digest: sha256_hex(&provenance_payload),
+                        provenance_payload,
+                        hard_capability_verified: true,
+                    },
+                    3,
+                )
+                .await?,
+                BindAgentOutcome::Bound(_)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Seed global, workspace-private, and workspace-shared collisions plus
+    /// explicit stale and hard-capability-unavailable candidates.  The private
+    /// candidate is selected through `prepare_agent_session`, not a raw SQL
+    /// insertion, so callers exercise the exact durable profile boundary.
+    pub(crate) async fn seed(
+        db: &Db,
+        daemon_agents_dir: &Path,
+        workspace: &Path,
+    ) -> Result<SessionSetupFixture> {
+        let workspace = std::fs::canonicalize(workspace)
+            .context("canonicalizing session-setup fixture workspace")?;
+        std::fs::create_dir_all(workspace.join(".cockpit/agents"))?;
+        let workspace_id = workspace_id(&workspace);
+        let reviewer = markdown("authored/reviewer", "text_generation");
+        let reviewer_digest = digest("reviewer", &reviewer)?;
+        let unavailable = markdown("authored/unavailable", "tool_calling");
+        let unavailable_digest = digest("unavailable", &unavailable)?;
+        let stale_observed = markdown("authored/stale", "text_generation");
+        let stale_observed_digest = digest("stale", &stale_observed)?;
+        // The durable observation/binding records the reviewed definition,
+        // while the owned file simulates an ordinary source update that has
+        // not yet been rebound. This is the real stale path, rather than an
+        // artificially incomplete installation row.
+        let stale = stale_observed.replace("minContextTokens: 1", "minContextTokens: 2");
+
+        let global_id = Uuid::now_v7();
+        let selected_installation_id = Uuid::now_v7();
+        let shared_id = Uuid::now_v7();
+        let unavailable_id = Uuid::now_v7();
+        let stale_id = Uuid::now_v7();
+
+        for (path, bytes) in [
+            (
+                owned_path(
+                    daemon_agents_dir,
+                    None,
+                    AgentInstallationScopeWire::Global,
+                    "reviewer",
+                )?,
+                reviewer.as_bytes(),
+            ),
+            (
+                owned_path(
+                    daemon_agents_dir,
+                    Some(&workspace),
+                    AgentInstallationScopeWire::WorkspacePrivate,
+                    "reviewer",
+                )?,
+                reviewer.as_bytes(),
+            ),
+            (
+                owned_path(
+                    daemon_agents_dir,
+                    None,
+                    AgentInstallationScopeWire::Global,
+                    "unavailable",
+                )?,
+                unavailable.as_bytes(),
+            ),
+            (
+                owned_path(
+                    daemon_agents_dir,
+                    None,
+                    AgentInstallationScopeWire::Global,
+                    "stale",
+                )?,
+                stale.as_bytes(),
+            ),
+        ] {
+            write_owned_file_new(&path, bytes, "writing session-setup fixture definition")?;
+        }
+        std::fs::write(workspace.join(".cockpit/agents/reviewer.md"), &reviewer)?;
+
+        install_observe_and_maybe_bind(
+            db,
+            input(
+                global_id,
+                AgentInstallationScope::Global,
+                None,
+                "reviewer",
+                reviewer_digest.clone(),
+            ),
+            Some(("credential-profile-global", "exact-a")),
+        )
+        .await?;
+        install_observe_and_maybe_bind(
+            db,
+            input(
+                selected_installation_id,
+                AgentInstallationScope::WorkspacePrivate,
+                Some(workspace_id.clone()),
+                "reviewer",
+                reviewer_digest.clone(),
+            ),
+            Some((SELECTED_PROFILE_HANDLE, "exact-a")),
+        )
+        .await?;
+        install_observe_and_maybe_bind(
+            db,
+            input(
+                shared_id,
+                AgentInstallationScope::WorkspaceShared,
+                Some(workspace_id.clone()),
+                "reviewer",
+                reviewer_digest.clone(),
+            ),
+            Some(("credential-profile-shared", "exact-a")),
+        )
+        .await?;
+        // A valid, observed definition whose requirement lacks hard evidence
+        // must remain visible but non-selectable.
+        install_observe_and_maybe_bind(
+            db,
+            input(
+                unavailable_id,
+                AgentInstallationScope::Global,
+                None,
+                "unavailable",
+                unavailable_digest,
+            ),
+            None,
+        )
+        .await?;
+        // A durable stale observation must not be silently replaced with a
+        // current config choice.
+        install_observe_and_maybe_bind(
+            db,
+            input(
+                stale_id,
+                AgentInstallationScope::Global,
+                None,
+                "stale",
+                stale_observed_digest,
+            ),
+            Some(("credential-profile-stale", "exact-a")),
+        )
+        .await?;
+
+        let selected = db
+            .agent_installation(selected_installation_id)
+            .await?
+            .context("selected session-setup fixture installation disappeared")?;
+        let observation = db
+            .agent_observation(selected_installation_id)
+            .await?
+            .context("selected session-setup fixture observation disappeared")?;
+        let binding = db
+            .current_agent_binding(
+                selected_installation_id,
+                reviewer_digest.clone(),
+                "primary".into(),
+            )
+            .await?
+            .context("selected session-setup fixture binding disappeared")?;
+        let profile = RedactedAgentProfileSnapshot {
+            agent_id: "authored/reviewer".into(),
+            execution_kind: AgentExecutionKind::Coding,
+            effective_delegation: None,
+            recommendations: Vec::new(),
+            question_policy: RedactedQuestionPolicy::Off,
+            verification_regions: Vec::new(),
+            bindings: vec![RedactedBindingEvidence {
+                slot_id: "primary".into(),
+                binding_revision: binding.binding_revision,
+                provider_profile_handle: SELECTED_PROFILE_HANDLE.into(),
+                model_id: "exact-a".into(),
+                selected_provider_alias: ProviderAlias {
+                    provider_id: "openai-compatible".into(),
+                    model_id: "exact-a".into(),
+                },
+                provenance_digest: binding.provenance_digest.clone(),
+                hard_capability_verified: true,
+            }],
+        };
+        let canonical_snapshot_payload = serde_json::to_vec(&profile)?;
+        let binding_revision_map_payload = serde_json::to_vec(&AgentBindingRevisionMap {
+            bindings: vec![AgentBindingRevision {
+                slot_id: "primary".into(),
+                binding_revision: binding.binding_revision,
+            }],
+        })?;
+        let session_id = Uuid::now_v7();
+        ensure!(matches!(
+            db.prepare_agent_session(PrepareAgentSessionInput {
+                session_id,
+                session_create: AgentSessionCreateInput {
+                    project_id: "session-setup-fixture-project".into(),
+                    project_root: workspace.to_string_lossy().into_owned(),
+                    active_agent: "reviewer".into(),
+                    started_at_unix_s: 4,
+                    last_active_at_unix_s: 4,
+                },
+                existing_session_claim_token: None,
+                idempotency_key: "session-setup-fixture-prepare".into(),
+                request_fingerprint: "session-setup-fixture-prepare-v1".into(),
+                installation_id: selected_installation_id,
+                expected_installation_revision: selected.installation_revision,
+                expected_observation_revision: observation.observation_revision,
+                expected_definition_digest: reviewer_digest,
+                expected_bindings: vec![AgentBindingExpectation {
+                    slot_id: "primary".into(),
+                    expected_binding_revision: binding.binding_revision,
+                }],
+                snapshot_schema_version: 1,
+                canonical_snapshot_digest: sha256_hex(&canonical_snapshot_payload),
+                canonical_snapshot_payload,
+                binding_revision_map_digest: sha256_hex(&binding_revision_map_payload),
+                binding_revision_map_payload,
+                now_unix_ms: 4,
+            })
+            .await?,
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+        Ok(SessionSetupFixture {
+            session_id,
+            selected_installation_id,
+            workspace_id,
+        })
     }
 }
 
@@ -4954,6 +8007,1128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn modes_session_setup_workspace_identity_is_canonical_and_fails_closed_for_missing_roots() {
+        let allowed = tempfile::tempdir().expect("allowed workspace");
+        let authorizer = LocalDaemonWorkspaceAuthorizer::new(vec![allowed.path().to_path_buf()])
+            .expect("authorizer");
+        let (canonical_id, canonical_root) = authorizer
+            .authorize_workspace(allowed.path().to_string_lossy().as_ref())
+            .await
+            .expect("canonical root is authorized");
+        let (dot_id, dot_root) = authorizer
+            .authorize_workspace(allowed.path().join(".").to_string_lossy().as_ref())
+            .await
+            .expect("dot spelling is canonicalized");
+        assert_eq!(dot_id, canonical_id);
+        assert_eq!(dot_root, canonical_root);
+        assert!(authorizer
+            .authorize_workspace(allowed.path().join("missing").to_string_lossy().as_ref())
+            .await
+            .is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn modes_session_setup_workspace_identity_ignores_mutable_directory_state() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let authorizer =
+            LocalDaemonWorkspaceAuthorizer::new(vec![workspace.path().to_path_buf()])
+                .expect("authorizer");
+        let workspace_path = workspace.path().to_string_lossy().into_owned();
+
+        std::fs::write(workspace.path().join("ordinary.txt"), "ordinary content")
+            .expect("write child file");
+        std::fs::create_dir(workspace.path().join("ordinary-dir"))
+            .expect("create child directory");
+        authorizer
+            .authorize_workspace(&workspace_path)
+            .await
+            .expect("ordinary child creation must retain workspace authority");
+        std::fs::remove_file(workspace.path().join("ordinary.txt")).expect("remove child file");
+        std::fs::remove_dir(workspace.path().join("ordinary-dir"))
+            .expect("remove child directory");
+        authorizer
+            .authorize_workspace(&workspace_path)
+            .await
+            .expect("ordinary child removal must retain workspace authority");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let original_mode = std::fs::metadata(workspace.path())
+                .expect("workspace metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            let changed_mode = (original_mode ^ 0o040) | 0o700;
+            std::fs::set_permissions(
+                workspace.path(),
+                std::fs::Permissions::from_mode(changed_mode),
+            )
+            .expect("change workspace metadata");
+            authorizer
+                .authorize_workspace(&workspace_path)
+                .await
+                .expect("ordinary metadata changes must retain workspace authority");
+            std::fs::set_permissions(
+                workspace.path(),
+                std::fs::Permissions::from_mode(original_mode),
+            )
+            .expect("restore workspace metadata");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn modes_session_setup_workspace_identity_rejects_symlink_and_renamed_root_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let allowed = parent.path().join("allowed");
+        let replacement = parent.path().join("replacement");
+        let alias = parent.path().join("alias");
+        std::fs::create_dir(&allowed).expect("allowed root");
+        std::fs::create_dir(&replacement).expect("replacement root");
+        symlink(&allowed, &alias).expect("workspace alias");
+        let authorizer = LocalDaemonWorkspaceAuthorizer::new(vec![allowed.clone()])
+            .expect("authorizer");
+        let (direct_id, direct_root) = authorizer
+            .authorize_workspace(allowed.to_string_lossy().as_ref())
+            .await
+            .expect("direct root");
+        let (alias_id, alias_root) = authorizer
+            .authorize_workspace(alias.to_string_lossy().as_ref())
+            .await
+            .expect("canonical symlink alias");
+        assert_eq!(alias_id, direct_id);
+        assert_eq!(alias_root, direct_root);
+        std::fs::rename(&allowed, parent.path().join("moved")).expect("rename allowed root");
+        std::fs::rename(&replacement, &allowed).expect("replace pathname");
+        assert!(authorizer
+            .authorize_workspace(allowed.to_string_lossy().as_ref())
+            .await
+            .is_err(), "renamed/replaced root must not inherit authority");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn modes_session_setup_workspace_shared_reads_hold_attach_directory_across_both_projections() {
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let workspace = parent.path().join("workspace");
+        let moved = parent.path().join("workspace-attached");
+        let replacement = parent.path().join("workspace-replacement");
+        std::fs::create_dir_all(workspace.join(".cockpit/agents")).expect("workspace agents");
+        std::fs::write(
+            workspace.join(".cockpit/agents/helper.md"),
+            "first attached definition",
+        )
+        .expect("attached definition");
+        let proof = AuthorizedWorkspaceRoot::capture(&workspace).expect("capture workspace");
+
+        // This is the first projection pass. The held root reads the attached
+        // directory, not a spelling that an attacker can replace afterwards.
+        assert_eq!(
+            proof
+                .read_workspace_shared_definition("helper")
+                .expect("first projection read"),
+            b"first attached definition"
+        );
+
+        // Deterministically swap the absolute spelling between the two
+        // projection passes, then restore it. A path-based second pass would
+        // observe the replacement while a final identity check could be fooled
+        // by the restore; the held capability must continue reading the
+        // original attached directory throughout.
+        std::fs::rename(&workspace, &moved).expect("move attached workspace");
+        std::fs::create_dir_all(replacement.join(".cockpit/agents"))
+            .expect("replacement agents");
+        std::fs::write(
+            replacement.join(".cockpit/agents/helper.md"),
+            "replacement definition",
+        )
+        .expect("replacement definition");
+        std::fs::rename(&replacement, &workspace).expect("install replacement spelling");
+        assert_eq!(
+            proof
+                .read_workspace_shared_definition("helper")
+                .expect("second projection read"),
+            b"first attached definition"
+        );
+        std::fs::rename(&workspace, &replacement).expect("remove replacement spelling");
+        std::fs::rename(&moved, &workspace).expect("restore original spelling");
+        assert!(
+            proof.verify(&workspace).is_ok(),
+            "a final pathname identity check alone cannot reveal a completed swap-and-restore"
+        );
+        assert_eq!(
+            proof
+                .read_workspace_shared_definition("helper")
+                .expect("post-restore projection read"),
+            b"first attached definition"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn modes_session_setup_retained_hook_refresh_rejects_swap_and_never_parses_replacement() {
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let ancestor = parent.path().join("ancestor");
+        let workspace = ancestor.join("workspace");
+        let moved_ancestor = parent.path().join("ancestor-attached");
+        std::fs::create_dir_all(ancestor.join(".cockpit")).expect("ancestor config directory");
+        std::fs::create_dir_all(workspace.join(".cockpit")).expect("workspace config directory");
+        std::fs::write(
+            ancestor.join(".cockpit/config.json"),
+            r#"{"hooks":{"sessionStart":[{"command":["retained-ancestor-hook"]}]}}"#,
+        )
+        .expect("retained ancestor hook");
+        std::fs::write(workspace.join(".cockpit/config.json"), "{}\n")
+            .expect("workspace config");
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace)
+                .expect("workspace trust root"),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = WorkerWorkspaceConfigAuthority::capture(&workspace, &policy)
+            .expect("capture retained workspace config authority");
+        assert!(authority
+            .resolve_hooks()
+            .expect("initial retained hook projection")
+            .hooks
+            .iter()
+            .any(|hook| hook.command == ["retained-ancestor-hook"]));
+
+        let source_index = authority
+            .hook_sources
+            .iter()
+            .position(|source| {
+                source.kind
+                    == cockpit_config::config::extended::hooks::HookSourceKind::Layer(
+                        crate::config::dirs::ConfigDirKind::Project,
+                    )
+                    && source.path == ancestor.join(".cockpit/config.json")
+            })
+            .expect("retained ancestor hook source");
+        let layer_index = authority.hook_source_layer_indexes[source_index]
+            .expect("retained ancestor hook layer");
+        let source = authority.hook_sources[source_index].clone();
+
+        // Hold the old ancestor under its open directory capability while an
+        // attacker owns the former absolute spelling. A live worker rejects
+        // the replacement at the final identity check; the capability bytes
+        // that would be parsed during a swap are still the retained bytes,
+        // never the attacker's pathname contents.
+        std::fs::rename(&ancestor, &moved_ancestor).expect("move retained ancestor");
+        std::fs::create_dir_all(workspace.join(".cockpit")).expect("replacement workspace");
+        std::fs::write(
+            ancestor.join(".cockpit/config.json"),
+            r#"{"hooks":{"sessionStart":[{"command":["attacker-hook"]}]}}"#,
+        )
+        .expect("replacement ancestor hook");
+        assert!(authority.resolve_hooks().is_err(), "replacement fails closed");
+
+        let retained_bytes = authority.config_layers[layer_index]
+            .config_directory
+            .read_regular_file_relative(&["config.json"])
+            .expect("read hook bytes through retained ancestor handle");
+        let parsed = cockpit_config::config::extended::hooks::resolve_hooks_from_captured_sources(
+            &[(source, Ok(Some(retained_bytes)))],
+        );
+        assert!(parsed
+            .hooks
+            .iter()
+            .any(|hook| hook.command == ["retained-ancestor-hook"]));
+        assert!(!parsed
+            .hooks
+            .iter()
+            .any(|hook| hook.command == ["attacker-hook"]));
+
+        std::fs::remove_dir_all(&ancestor).expect("remove replacement ancestor");
+        std::fs::rename(&moved_ancestor, &ancestor).expect("restore retained ancestor");
+        let restored = authority
+            .resolve_hooks()
+            .expect("restored retained hook refresh");
+        assert!(restored
+            .hooks
+            .iter()
+            .any(|hook| hook.command == ["retained-ancestor-hook"]));
+        assert!(!restored
+            .hooks
+            .iter()
+            .any(|hook| hook.command == ["attacker-hook"]));
+    }
+
+    #[test]
+    fn retained_favorite_rejects_higher_layer_insertion_before_any_lower_write() {
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let ancestor = parent.path().join("ancestor");
+        let workspace = ancestor.join("workspace");
+        let ancestor_config = ancestor.join(".cockpit/config.json");
+        let workspace_config = workspace.join(".cockpit/config.json");
+        std::fs::create_dir_all(ancestor_config.parent().expect("ancestor config parent"))
+            .expect("ancestor config parent");
+        std::fs::create_dir_all(workspace_config.parent().expect("workspace config parent"))
+            .expect("workspace config parent");
+        std::fs::write(&ancestor_config, "{}\n").expect("ancestor config");
+        std::fs::write(&workspace_config, "{}\n").expect("workspace config");
+        let lower_provider = cockpit_config::config::providers::provider_file_path_for_config(
+            &ancestor_config,
+            "p",
+        )
+        .expect("lower provider path");
+        std::fs::create_dir_all(lower_provider.parent().expect("lower provider parent"))
+            .expect("lower provider parent");
+        std::fs::write(
+            &lower_provider,
+            r#"{ "models": [{ "id": "m", "name": "lower" }] }"#,
+        )
+        .expect("lower provider");
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace)
+                .expect("workspace trust root"),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = Arc::new(
+            WorkerWorkspaceConfigAuthority::capture(&workspace, &policy)
+                .expect("capture retained config authority"),
+        );
+        let snapshot = authority
+            .capture_retained_effective_default_layer_chain()
+            .expect("initial complete retained provider snapshot");
+        let source = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+            &snapshot.layers,
+            "p",
+            "m",
+        )
+        .expect("source parse")
+        .expect("lower source");
+        assert_eq!(source.layer_index(), 0, "ancestor supplies initial model");
+        let target = authority
+            .retained_provider_model_favorite_target(source)
+            .expect("build retained favorite capability");
+
+        // The higher layer participated in attach but did not initially
+        // define p/m. Its insert must be caught before the lower source can
+        // be modified (and the same verifier is repeated under every source
+        // lock for an insertion racing the first check).
+        let higher_provider = cockpit_config::config::providers::provider_file_path_for_config(
+            &workspace_config,
+            "p",
+        )
+        .expect("higher provider path");
+        std::fs::create_dir_all(higher_provider.parent().expect("higher provider parent"))
+            .expect("higher provider parent");
+        std::fs::write(
+            &higher_provider,
+            r#"{ "models": [{ "id": "m", "name": "higher" }] }"#,
+        )
+        .expect("insert higher provider source");
+        let lower_before = std::fs::read(&lower_provider).expect("lower bytes before rejection");
+        assert!(target.write_model_favorite(true).is_err());
+        assert_eq!(
+            std::fs::read(&lower_provider).expect("lower bytes after rejection"),
+            lower_before,
+            "a stale lower source must not be mutated after higher-layer insertion",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_favorite_global_source_rejects_replaced_global_directory() {
+        let home = tempfile::tempdir().expect("isolated Cockpit home");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global_dir = home.path().join("home/.config/cockpit");
+        let global_config = global_dir.join("config.json");
+        std::fs::create_dir_all(&global_dir).expect("global config directory");
+        std::fs::write(&global_config, r#"{"providers":{"global":{}}}"#)
+            .expect("global config");
+        let provider = cockpit_config::config::providers::provider_file_path_for_config(
+            &global_config,
+            "global",
+        )
+        .expect("global provider path");
+        std::fs::create_dir_all(provider.parent().expect("global provider parent"))
+            .expect("global providers directory");
+        std::fs::write(
+            &provider,
+            r#"{"models":[{"id":"m","name":"captured","favorite":false}]}"#,
+        )
+        .expect("global provider");
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(workspace.path())
+                .expect("workspace trust root"),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = Arc::new(
+            WorkerWorkspaceConfigAuthority::capture(workspace.path(), &policy)
+                .expect("capture global retained authority"),
+        );
+        let snapshot = authority
+            .capture_retained_effective_default_layer_chain()
+            .expect("capture complete global source chain");
+        let source = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+            &snapshot.layers,
+            "global",
+            "m",
+        )
+        .expect("parse global source")
+        .expect("global source proof");
+        let target = authority
+            .retained_provider_model_favorite_target(source)
+            .expect("build global retained favorite capability");
+
+        let replacement = home.path().join("replacement-cockpit");
+        let replacement_config = replacement.join("config.json");
+        std::fs::create_dir_all(&replacement).expect("replacement global directory");
+        std::fs::write(&replacement_config, r#"{"providers":{"global":{}}}"#)
+            .expect("replacement config");
+        let replacement_provider = cockpit_config::config::providers::provider_file_path_for_config(
+            &replacement_config,
+            "global",
+        )
+        .expect("replacement provider path");
+        std::fs::create_dir_all(replacement_provider.parent().expect("replacement provider parent"))
+            .expect("replacement providers directory");
+        std::fs::write(
+            &replacement_provider,
+            r#"{"models":[{"id":"m","name":"replacement","favorite":false}]}"#,
+        )
+        .expect("replacement provider");
+        let replacement_bytes = std::fs::read(&replacement_provider).expect("replacement bytes");
+        std::fs::rename(&global_dir, home.path().join("moved-global"))
+            .expect("move captured global directory");
+        std::fs::rename(&replacement, &global_dir).expect("install replacement global directory");
+
+        assert!(target.write_model_favorite(true).is_err());
+        assert_eq!(
+            std::fs::read(global_dir.join("providers/global.json"))
+                .expect("replacement bytes after failure"),
+            replacement_bytes,
+            "a global directory replacement must never be reopened or mutated"
+        );
+    }
+
+    #[test]
+    fn retained_favorite_uses_higher_project_source_over_global_source() {
+        let home = tempfile::tempdir().expect("isolated Cockpit home");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
+        let project_config = workspace.path().join(".cockpit/config.json");
+        for config in [&global_config, &project_config] {
+            std::fs::create_dir_all(config.parent().expect("config parent")).unwrap();
+            std::fs::write(config, r#"{"providers":{"p":{}}}"#).unwrap();
+            let provider = cockpit_config::config::providers::provider_file_path_for_config(config, "p")
+                .expect("provider path");
+            std::fs::create_dir_all(provider.parent().expect("provider parent")).unwrap();
+            std::fs::write(
+                provider,
+                r#"{"models":[{"id":"m","name":"configured","favorite":false}]}"#,
+            )
+            .unwrap();
+        }
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(workspace.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = Arc::new(
+            WorkerWorkspaceConfigAuthority::capture(workspace.path(), &policy)
+                .expect("capture global and project sources"),
+        );
+        let snapshot = authority
+            .capture_retained_effective_default_layer_chain()
+            .expect("complete source chain");
+        let source = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+            &snapshot.layers,
+            "p",
+            "m",
+        )
+        .expect("parse layered source")
+        .expect("effective project source");
+        let project_layer = snapshot
+            .layers
+            .iter()
+            .rposition(|layer| {
+                layer
+                    .provider_files
+                    .iter()
+                    .any(|(provider, _)| provider == "p")
+            })
+            .expect("at least one p source");
+        assert_eq!(
+            source.layer_index(), project_layer,
+            "the highest project p source must supply the effective model"
+        );
+        authority
+            .retained_provider_model_favorite_target(source)
+            .expect("project retained target")
+            .write_model_favorite(true)
+            .expect("project favorite update");
+        let global = cockpit_config::config::providers::ConfigDoc::providers_from_paths(&[global_config]);
+        let project = cockpit_config::config::providers::ConfigDoc::providers_from_paths(&[project_config]);
+        assert!(!global.providers["p"].models[0].favorite);
+        assert!(project.providers["p"].models[0].favorite);
+    }
+
+    #[test]
+    fn retained_favorite_ignore_config_uses_global_without_project_authority() {
+        let home = tempfile::tempdir().expect("isolated Cockpit home");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
+        let project_config = workspace.path().join(".cockpit/config.json");
+        for (config, name) in [(&global_config, "global"), (&project_config, "project")] {
+            std::fs::create_dir_all(config.parent().expect("config parent")).unwrap();
+            std::fs::write(config, r#"{"providers":{"p":{}}}"#).unwrap();
+            let provider = cockpit_config::config::providers::provider_file_path_for_config(config, "p")
+                .expect("provider path");
+            std::fs::create_dir_all(provider.parent().expect("provider parent")).unwrap();
+            std::fs::write(
+                provider,
+                format!(r#"{{"models":[{{"id":"m","name":"{name}","favorite":false}}]}}"#),
+            )
+            .unwrap();
+        }
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(workspace.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        };
+        let authority = Arc::new(
+            WorkerWorkspaceConfigAuthority::capture(workspace.path(), &policy)
+                .expect("capture global-only attached source"),
+        );
+        let snapshot = authority
+            .capture_retained_effective_default_layer_chain()
+            .expect("global-only retained chain");
+        let source = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+            &snapshot.layers,
+            "p",
+            "m",
+        )
+        .expect("parse global-only source")
+        .expect("global source remains mutable");
+        authority
+            .retained_provider_model_favorite_target(source)
+            .expect("global retained target under IgnoreConfig")
+            .write_model_favorite(true)
+            .expect("global favorite update under IgnoreConfig");
+        let global = cockpit_config::config::providers::ConfigDoc::providers_from_paths(&[global_config]);
+        let project = cockpit_config::config::providers::ConfigDoc::providers_from_paths(&[project_config]);
+        assert!(global.providers["p"].models[0].favorite);
+        assert!(!project.providers["p"].models[0].favorite);
+    }
+
+    #[test]
+    fn retained_source_projection_tracks_trust_transitions_without_rediscovery() {
+        let home = tempfile::tempdir().expect("isolated Cockpit home");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
+        let project_config = workspace.path().join(".cockpit/config.json");
+        for (config, rounds, hook, name) in [
+            (&global_config, 11, "global-hook", "global"),
+            (&project_config, 22, "project-hook", "project"),
+        ] {
+            std::fs::create_dir_all(config.parent().expect("config parent")).unwrap();
+            std::fs::write(
+                config,
+                format!(
+                    r#"{{"providers":{{"p":{{}}}},"maxPrimaryRounds":{rounds},"hooks":{{"sessionStart":[{{"command":["{hook}"]}}]}}}}"#,
+                ),
+            )
+            .unwrap();
+            let provider = cockpit_config::config::providers::provider_file_path_for_config(config, "p")
+                .expect("provider path");
+            std::fs::create_dir_all(provider.parent().expect("provider parent")).unwrap();
+            std::fs::write(
+                provider,
+                format!(r#"{{"models":[{{"id":"m","name":"{name}","favorite":false}}]}}"#),
+            )
+            .unwrap();
+        }
+        let trusted = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(workspace.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = Arc::new(
+            WorkerWorkspaceConfigAuthority::capture(workspace.path(), &trusted)
+                .expect("capture both retained scopes"),
+        );
+        let source = crate::daemon::config_source::ConfigSource::production();
+        let trusted_chain = authority
+            .capture_retained_config_source_chain(&trusted)
+            .expect("trusted source projection");
+        let (_, trusted_extended) = source
+            .load_effective_for_daemon_with_retained_workspace_layer(
+                workspace.path(),
+                &trusted,
+                &trusted_chain,
+            )
+            .expect("trusted projected config");
+        assert_eq!(trusted_extended.max_primary_rounds, 22);
+        assert!(authority
+            .resolve_hooks_for_policy(&trusted)
+            .expect("trusted hooks")
+            .hooks
+            .iter()
+            .any(|hook| hook.command == ["project-hook"]));
+        let trusted_source = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+            &trusted_chain.layers,
+            "p",
+            "m",
+        )
+        .expect("trusted source parse")
+        .expect("project source proof");
+
+        let mut ignored = trusted.clone();
+        ignored.mode = crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig;
+        let trusted_default_authority = authority
+            .retained_effective_default_authority_binding_for_policy(&trusted, 41)
+            .expect("trusted default authority");
+        let ignored_default_authority = authority
+            .retained_effective_default_authority_binding_for_policy(&ignored, 41)
+            .expect("IgnoreConfig default authority");
+        assert_ne!(
+            trusted_default_authority.authority_revision,
+            ignored_default_authority.authority_revision,
+            "a receipt sealed for a project-authorized default must not replay after IgnoreConfig"
+        );
+        authority
+            .retained_effective_default_target_for_policy(&ignored)
+            .expect("IgnoreConfig chooses a retained global default target");
+        let ignored_chain = authority
+            .capture_retained_config_source_chain(&ignored)
+            .expect("global-only policy projection");
+        let ignored_providers = cockpit_config::config::providers::ConfigDoc::providers_from_workspace_layer_snapshots(
+            &ignored_chain.layers,
+        )
+        .expect("global-only provider view");
+        assert_eq!(ignored_providers.providers["p"].models[0].name, "global");
+        let (_, ignored_extended) = source
+            .load_effective_for_daemon_with_retained_workspace_layer(
+                workspace.path(),
+                &ignored,
+                &ignored_chain,
+            )
+            .expect("ignored projected config");
+        assert_eq!(ignored_extended.max_primary_rounds, 11);
+        let ignored_hooks = authority
+            .resolve_hooks_for_policy(&ignored)
+            .expect("global-only hooks");
+        assert!(ignored_hooks.hooks.iter().any(|hook| hook.command == ["global-hook"]));
+        assert!(!ignored_hooks.hooks.iter().any(|hook| hook.command == ["project-hook"]));
+        assert!(
+            authority
+                .retained_provider_model_favorite_target_for_policy(
+                    trusted_source,
+                    &ignored,
+                )
+                .is_err(),
+            "a project source observed before IgnoreConfig cannot remain mutable",
+        );
+        let global_source = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+            &ignored_chain.layers,
+            "p",
+            "m",
+        )
+        .expect("ignored source parse")
+        .expect("global source proof");
+        authority
+            .retained_provider_model_favorite_target_for_policy(global_source, &ignored)
+            .expect("global source stays capability-backed under IgnoreConfig")
+            .write_model_favorite(true)
+            .expect("global favorite update");
+        let global = cockpit_config::config::providers::ConfigDoc::providers_from_paths(&[global_config]);
+        let project = cockpit_config::config::providers::ConfigDoc::providers_from_paths(&[project_config]);
+        assert!(global.providers["p"].models[0].favorite);
+        assert!(!project.providers["p"].models[0].favorite);
+
+        let trusted_again = authority
+            .capture_retained_config_source_chain(&trusted)
+            .expect("Trust may re-enable only the captured project capability");
+        let providers_again = cockpit_config::config::providers::ConfigDoc::providers_from_workspace_layer_snapshots(
+            &trusted_again.layers,
+        )
+        .expect("restored provider view");
+        assert_eq!(providers_again.providers["p"].models[0].name, "project");
+        assert!(authority
+            .resolve_hooks_for_policy(&trusted)
+            .expect("restored project hooks")
+            .hooks
+            .iter()
+            .any(|hook| hook.command == ["project-hook"]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn modes_session_setup_retained_relative_hook_snapshot_survives_swap_and_updates_normally() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let workspace = parent.path().join("workspace");
+        let moved = parent.path().join("workspace-attached");
+        let executable = workspace.join(".cockpit/hooks/check");
+        std::fs::create_dir_all(executable.parent().expect("hook parent"))
+            .expect("hook parent");
+        std::fs::write(
+            workspace.join(".cockpit/config.json"),
+            r#"{"hooks":{"sessionStart":[{"command":["./hooks/check"]}]}}"#,
+        )
+        .expect("hook config");
+        std::fs::write(
+            workspace.join("project-sentinel"),
+            b"attached-project-v1\n",
+        )
+        .expect("attached project sentinel");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nIFS= read -r value < project-sentinel\nprintf '%s\\n' \"$value\"\n",
+        )
+        .expect("attached hook");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make attached hook executable");
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace)
+                .expect("workspace trust root"),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = WorkerWorkspaceConfigAuthority::capture(&workspace, &policy)
+            .expect("capture workspace config authority");
+        let initial = authority.resolve_hooks().expect("initial hook registry");
+        let initial_launch = initial.hooks[0]
+            .retained_execution_launch()
+            .expect("initial retained launch")
+            .expect("relative hook is retained");
+        assert_eq!(
+            std::fs::read(initial_launch.executable()).expect("read private v1 snapshot"),
+            b"#!/bin/sh\nIFS= read -r value < project-sentinel\nprintf '%s\\n' \"$value\"\n"
+        );
+        let cockpit_config::config::extended::hooks::HookWorkingDirectory::RetainedUnixDirectory(
+            initial_cwd,
+        ) = initial_launch.working_directory()
+        else {
+            panic!("a retained relative hook must carry an fd-backed workspace cwd");
+        };
+        assert_eq!(
+            initial_cwd.metadata().expect("retained workspace cwd metadata").ino(),
+            std::fs::metadata(&workspace).expect("workspace metadata").ino(),
+            "the executable may come from .cockpit, but project-relative script reads use the attached workspace root"
+        );
+        let (stdout, spawn_failed, timed_out) =
+            crate::engine::agent::hooks::spawn_real_hook_child_for_test(
+                initial_launch.executable(),
+                &[],
+                &std::collections::BTreeMap::new(),
+                initial_launch.working_directory(),
+                "",
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert!(!spawn_failed && !timed_out, "retained hook launches from private bundle");
+        assert_eq!(stdout, "attached-project-v1\n");
+
+        // A failing watcher refresh leaves this old registry live. Its program
+        // must stay the immutable v1 snapshot even while the original spelling
+        // is controlled by a replacement workspace.
+        std::fs::rename(&workspace, &moved).expect("move attached workspace");
+        let replacement_executable = workspace.join(".cockpit/hooks/check");
+        std::fs::create_dir_all(replacement_executable.parent().expect("replacement hook parent"))
+            .expect("replacement hook parent");
+        std::fs::write(
+            workspace.join(".cockpit/config.json"),
+            r#"{"hooks":{"sessionStart":[{"command":["./hooks/check"]}]}}"#,
+        )
+        .expect("replacement hook config");
+        std::fs::write(&replacement_executable, b"#!/bin/sh\necho attacker\n")
+            .expect("replacement hook");
+        std::fs::write(workspace.join("project-sentinel"), b"attacker-project\n")
+            .expect("replacement project sentinel");
+        std::fs::set_permissions(&replacement_executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make replacement hook executable");
+        assert!(authority.resolve_hooks().is_err(), "replacement must fail closed");
+        assert_eq!(
+            std::fs::read(initial_launch.executable()).expect("read retained v1 after swap"),
+            b"#!/bin/sh\nIFS= read -r value < project-sentinel\nprintf '%s\\n' \"$value\"\n",
+            "last-good registry cannot execute the replacement path"
+        );
+        assert_eq!(
+            initial_cwd.metadata().expect("retained cwd survives workspace swap").ino(),
+            std::fs::metadata(&moved).expect("moved original workspace metadata").ino(),
+            "the retained child cwd stays attached to the original project rather than replacement .cockpit"
+        );
+        let (stdout, spawn_failed, timed_out) =
+            crate::engine::agent::hooks::spawn_real_hook_child_for_test(
+                initial_launch.executable(),
+                &[],
+                &std::collections::BTreeMap::new(),
+                initial_launch.working_directory(),
+                "",
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert!(!spawn_failed && !timed_out, "retained bundle remains executable after swap");
+        assert_eq!(
+            stdout, "attached-project-v1\n",
+            "the private v1 script reads the original attached project, never replacement cwd"
+        );
+
+        std::fs::remove_dir_all(&workspace).expect("remove replacement workspace");
+        std::fs::rename(&moved, &workspace).expect("restore attached workspace");
+
+        // The retained openat walk refuses a replacement intermediate
+        // directory instead of following it while reconstructing a hook.
+        let hooks = workspace.join(".cockpit/hooks");
+        let parked_hooks = workspace.join(".cockpit/hooks-attached");
+        std::fs::rename(&hooks, &parked_hooks).expect("park original hooks directory");
+        std::os::unix::fs::symlink(parent.path(), &hooks).expect("install hostile hook symlink");
+        assert!(
+            authority.resolve_hooks().is_err(),
+            "intermediate symlink must not be traversed"
+        );
+        std::fs::remove_file(&hooks).expect("remove hostile hook symlink");
+        std::fs::rename(&parked_hooks, &hooks).expect("restore hooks directory");
+
+        // A normal in-place update of the still-authorized source produces a
+        // new v2 bundle while the live v1 bundle remains immutable.
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nIFS= read -r value < project-sentinel\nprintf '%s\\n' \"$value\"\n# attached-v2\n",
+        )
+        .expect("updated hook");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("keep updated hook executable");
+        let updated = authority.resolve_hooks().expect("normal hook refresh");
+        let updated_launch = updated.hooks[0]
+            .retained_execution_launch()
+            .expect("updated retained launch")
+            .expect("relative hook is retained");
+        assert_eq!(
+            std::fs::read(updated_launch.executable()).expect("read private v2 snapshot"),
+            b"#!/bin/sh\nIFS= read -r value < project-sentinel\nprintf '%s\\n' \"$value\"\n# attached-v2\n"
+        );
+        assert_eq!(
+            std::fs::read(initial_launch.executable()).expect("read private v1 after update"),
+            b"#!/bin/sh\nIFS= read -r value < project-sentinel\nprintf '%s\\n' \"$value\"\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modes_session_setup_reclaims_only_unleased_hook_bundle_roots_after_crash() {
+        let parent = tempfile::tempdir().expect("state parent");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let state_root = cockpit_config::config::resolve::cockpit_state_dir()
+            .expect("state directory")
+            .join("hook-execution");
+        cockpit_host::private_fs::ensure_private_dir(&state_root).expect("secure state root");
+        let orphan = tempfile::Builder::new()
+            .prefix(RetainedHookExecutionBundleRoot::PREFIX)
+            .tempdir_in(&state_root)
+            .expect("orphan root")
+            .keep();
+        std::fs::write(orphan.join(".lease"), b"abandoned").expect("orphan lease");
+
+        let live = RetainedHookExecutionBundleRoot::create().expect("new live root");
+        assert!(
+            !orphan.exists(),
+            "a new daemon root reclaims an unlocked crash leftover"
+        );
+        assert!(live.path().exists(), "the current leased root remains live");
+        let second_live = RetainedHookExecutionBundleRoot::create().expect("second live root");
+        assert!(
+            live.path().exists() && second_live.path().exists(),
+            "same-process live roots are never mistaken for abandoned state"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn modes_session_setup_windows_retained_relative_hook_uses_private_cmd_bundle_and_no_delete_cwd_lease() {
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let workspace = parent.path().join("workspace");
+        let moved = parent.path().join("workspace-attached");
+        std::fs::create_dir_all(workspace.join(".cockpit/hooks")).expect("hook parent");
+        std::fs::write(
+            workspace.join(".cockpit/config.json"),
+            r#"{"hooks":{"sessionStart":[{"command":["./hooks/check.cmd"]}]}}"#,
+        )
+        .expect("hook config");
+        let source = workspace.join(".cockpit/hooks/check.cmd");
+        std::fs::write(&source, "@type project-sentinel\r\n")
+            .expect("hook executable");
+        std::fs::write(workspace.join("project-sentinel"), "attached-project\r\n")
+            .expect("cwd sentinel");
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace)
+                .expect("workspace trust root"),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = WorkerWorkspaceConfigAuthority::capture(&workspace, &policy)
+            .expect("capture workspace config authority");
+        let registry = authority
+            .resolve_hooks()
+            .expect("attach/refresh snapshots the source program without acquiring a cwd lease");
+        let launch = registry.hooks[0]
+            .retained_execution_launch()
+            .expect("Windows launch lease acquisition")
+            .expect("relative hook has a retained launch");
+        assert_ne!(launch.executable(), source.as_path());
+        assert_eq!(
+            launch.executable().extension().and_then(|extension| extension.to_str()),
+            Some("cmd"),
+            "private snapshot retains the suffix required for normal Command/.cmd dispatch"
+        );
+        assert_eq!(
+            std::fs::read(launch.executable()).expect("read private bundled script"),
+            b"@type project-sentinel\r\n",
+            "source replacement cannot alter the retained program"
+        );
+        let cockpit_config::config::extended::hooks::HookWorkingDirectory::RetainedWindowsDirectory(
+            cwd,
+        ) = launch.working_directory()
+        else {
+            panic!("Windows retained hook must carry the typed cwd lease")
+        };
+        assert_eq!(
+            cockpit_config::config::extended::hooks::RetainedWindowsHookWorkingDirectory::canonical_path(
+                cwd.as_ref(),
+            ),
+            workspace.as_path()
+        );
+        cockpit_config::config::extended::hooks::RetainedWindowsHookWorkingDirectory::revalidate_before_spawn(cwd.as_ref())
+            .expect("captured workspace cwd still names its held FileId");
+
+        // `Command::new` deliberately retains Rust's native `.cmd` handling:
+        // it invokes the system command interpreter with Rust's batch-safe
+        // argument construction. Execute the bundled command through the real
+        // runner to prove the original extension is preserved, the attached
+        // workspace remains the cwd, and a clean child environment is enough.
+        let system_root = std::env::var("SystemRoot").expect("Windows SystemRoot");
+        let child_env = std::collections::BTreeMap::from([
+            ("SystemRoot".to_owned(), system_root.clone()),
+            ("WINDIR".to_owned(), system_root),
+        ]);
+        let (stdout, spawn_failed, timed_out) =
+            crate::engine::agent::hooks::spawn_real_hook_child_for_test(
+                launch.executable(),
+                &[],
+                &child_env,
+                launch.working_directory(),
+                "",
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            !spawn_failed && !timed_out,
+            "private bundled .cmd must preserve normal Command dispatch"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "attached-project",
+            "private bundled .cmd runs in the attached workspace cwd"
+        );
+
+        // The no-delete lease blocks a root A -> B substitution during the
+        // whole child lifetime. Do not weaken this to a post-hoc comparison:
+        // CreateProcess only accepts this same canonical path spelling.
+        assert!(
+            std::fs::rename(&workspace, &moved).is_err(),
+            "live retained cwd lease blocks workspace rename/replacement"
+        );
+
+        // Replacing either an intermediate directory or the source executable
+        // is a normal future refresh, but cannot change this
+        // in-flight/last-good bundle.
+        let hooks = workspace.join(".cockpit/hooks");
+        let parked_hooks = workspace.join(".cockpit/hooks-attached");
+        std::fs::rename(&hooks, &parked_hooks).expect("move attached hook directory");
+        std::fs::create_dir_all(&hooks).expect("replacement intermediate directory");
+        std::fs::write(hooks.join("check.cmd"), "@echo intermediate-attacker\r\n")
+            .expect("replacement intermediate executable");
+        assert_eq!(
+            std::fs::read(launch.executable()).expect("read original private bundle after intermediate swap"),
+            b"@type project-sentinel\r\n"
+        );
+        std::fs::remove_dir_all(&hooks).expect("remove replacement intermediate directory");
+        std::fs::rename(&parked_hooks, &hooks).expect("restore attached hook directory");
+        std::fs::write(&source, "@echo attacker\r\n").expect("replace source executable");
+        assert_eq!(
+            std::fs::read(launch.executable()).expect("read original private bundle"),
+            b"@type project-sentinel\r\n"
+        );
+
+        // Dropping the launch releases the cwd lease. Once A is moved and B
+        // occupies the old spelling, the original registry refuses a new
+        // launch rather than ever executing B's source or using B as cwd.
+        drop(launch);
+        std::fs::rename(&workspace, &moved).expect("lease cleanup permits root rename");
+        std::fs::create_dir_all(workspace.join(".cockpit/hooks"))
+            .expect("replacement hook parent");
+        std::fs::write(
+            workspace.join(".cockpit/config.json"),
+            r#"{"hooks":{"sessionStart":[{"command":["./hooks/check.cmd"]}]}}"#,
+        )
+        .expect("replacement hook config");
+        std::fs::write(workspace.join(".cockpit/hooks/check.cmd"), "@echo replacement\r\n")
+            .expect("replacement source executable");
+        assert!(
+            registry.hooks[0].retained_execution_launch().is_err(),
+            "identity-mismatched B must not receive a retained launch"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn modes_session_setup_windows_retained_hook_cwd_lease_lives_through_child_exit() {
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let workspace = parent.path().join("workspace");
+        let moved = parent.path().join("workspace-attached");
+        let system_root = std::env::var("SystemRoot").expect("Windows SystemRoot");
+        let cmd = Path::new(&system_root).join("System32").join("cmd.exe");
+        let source = workspace.join(".cockpit/hooks/cmd.exe");
+        std::fs::create_dir_all(source.parent().expect("hook parent")).expect("hook parent");
+        std::fs::copy(&cmd, &source).expect("copy normal Windows executable source");
+        std::fs::write(
+            workspace.join(".cockpit/config.json"),
+            r#"{"hooks":{"sessionStart":[{"command":["./hooks/cmd.exe"]}]}}"#,
+        )
+        .expect("hook config");
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace)
+                .expect("workspace trust root"),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = WorkerWorkspaceConfigAuthority::capture(&workspace, &policy)
+            .expect("capture workspace config authority");
+        let registry = authority.resolve_hooks().expect("snapshot executable bundle");
+        let launch = registry.hooks[0]
+            .retained_execution_launch()
+            .expect("acquire cwd lease")
+            .expect("retained exe launch");
+        assert_eq!(
+            launch.executable().extension().and_then(|extension| extension.to_str()),
+            Some("exe")
+        );
+        let executable = launch.executable().to_path_buf();
+        let working_directory = launch.working_directory().clone();
+        let mut child_env = std::collections::BTreeMap::new();
+        child_env.insert("SystemRoot".to_owned(), system_root.clone());
+        child_env.insert("WINDIR".to_owned(), system_root.clone());
+        // The private bundled cmd.exe writes a project-relative sentinel, then
+        // remains alive long enough for the test to prove the cwd lease stays
+        // held until wait/reap. No source pathname is used after launch.
+        let child_args = vec![
+            "/d".to_owned(),
+            "/c".to_owned(),
+            "echo attached>child-started & %SystemRoot%\\System32\\ping.exe -n 3 127.0.0.1 > nul"
+                .to_owned(),
+        ];
+        drop(launch);
+        let child = tokio::spawn(async move {
+            crate::engine::agent::hooks::spawn_real_hook_child_for_test(
+                &executable,
+                &child_args,
+                &child_env,
+                &working_directory,
+                "",
+                std::time::Duration::from_secs(10),
+            )
+            .await
+        });
+        let sentinel = workspace.join("child-started");
+        for _ in 0..40 {
+            if sentinel.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(sentinel.exists(), "child ran in retained attached workspace cwd");
+        assert!(
+            std::fs::rename(&workspace, &moved).is_err(),
+            "cwd path cannot be renamed while the retained child is live"
+        );
+        let (_stdout, spawn_failed, timed_out) = child.await.expect("child task join");
+        assert!(!spawn_failed && !timed_out, "private bundled .exe completed normally");
+        std::fs::rename(&workspace, &moved)
+            .expect("lease closes after child wait/reap and permits cleanup");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn modes_session_setup_oversized_project_hook_config_fails_closed_before_parse() {
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let workspace = parent.path().join("workspace");
+        let config = workspace.join(".cockpit/config.json");
+        std::fs::create_dir_all(config.parent().expect("project config parent"))
+            .expect("project config parent");
+        std::fs::write(&config, vec![b'x'; MAX_HOOK_CONFIG_BYTES + 1])
+            .expect("oversized project hook config");
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace)
+                .expect("workspace trust root"),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = WorkerWorkspaceConfigAuthority::capture(&workspace, &policy)
+            .expect("capture project hook authority");
+        assert!(
+            authority.resolve_hooks().is_err(),
+            "oversized retained project hook source must fail closed"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn modes_session_setup_oversized_explicit_hook_config_fails_closed_before_parse() {
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let workspace = parent.path().join("workspace");
+        let explicit = parent.path().join("explicit/config.json");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(explicit.parent().expect("explicit config parent"))
+            .expect("explicit config parent");
+        std::fs::write(&explicit, vec![b'x'; MAX_HOOK_CONFIG_BYTES + 1])
+            .expect("oversized explicit hook config");
+        env.set_cockpit_config(&explicit);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace)
+                .expect("workspace trust root"),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = WorkerWorkspaceConfigAuthority::capture(&workspace, &policy)
+            .expect("capture explicit hook authority");
+        assert!(
+            authority.resolve_hooks().is_err(),
+            "oversized retained explicit hook source must fail closed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn modes_session_setup_windows_workspace_identity_rejects_replaced_directory() {
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace root");
+        let proof = AuthorizedWorkspaceRoot::capture(&workspace)
+            .expect("capture opened Windows directory identity");
+
+        std::fs::rename(&workspace, parent.path().join("workspace-original"))
+            .expect("move original workspace");
+        std::fs::create_dir(&workspace).expect("replacement workspace");
+        assert!(
+            proof.verify(&workspace).is_err(),
+            "a replacement directory must have a different volume/file id proof"
+        );
+    }
+
+    #[tokio::test]
     async fn agent_installation_daemon_recovers_each_file_checkpoint_without_duplicate_installation_mutation()
      {
         for (index, checkpoint) in [
@@ -5853,6 +10028,688 @@ mod tests {
             "--yes selects only the first ordered exact author route"
         );
         assert!(first_exact_author_choice(&choices[4..]).is_none());
+    }
+
+    #[test]
+    fn modes_session_setup_exact_alias_order_unmatched_and_unsuggested_are_stable() {
+        let offerings = vec![
+            AgentProfileModelOffering {
+                offering_id: "route-b".into(),
+                provider_profile_handle: "credential-profile-b".into(),
+                provider_id: "vendor".into(),
+                model_id: "matching".into(),
+            },
+            AgentProfileModelOffering {
+                offering_id: "route-a".into(),
+                provider_profile_handle: "credential-profile-a".into(),
+                provider_id: "vendor".into(),
+                model_id: "matching".into(),
+            },
+            AgentProfileModelOffering {
+                offering_id: "route-fuzzy".into(),
+                provider_profile_handle: "credential-profile-c".into(),
+                provider_id: "vendor".into(),
+                model_id: "matching-newer".into(),
+            },
+        ];
+        let slot = slot(
+            vec![ModelCapability::TextGeneration],
+            vec![
+                recommendation("first", "upstream/one", &[("vendor", "matching")]),
+                recommendation("missing", "upstream/missing", &[("elsewhere", "none")]),
+            ],
+        );
+        let ranked = crate::agents::ranked_compatible_offerings(
+            &slot,
+            &offerings,
+            &providers_for(&offerings),
+        );
+        let (choices, unmatched) = binding_choices("primary", &slot, &ranked);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.recommendation_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("first"), Some("first"), None]
+        );
+        assert_eq!(unmatched[0].recommendation_id, "missing");
+        assert_eq!(choices[2].model_id, "matching-newer");
+        let wire = serde_json::to_string(&choices).expect("setup choices serialize");
+        assert!(!wire.contains("credential-profile"));
+        assert!(choices.iter().all(|choice| {
+            choice.exact_alias_match == choice.author_suggested
+                || (!choice.exact_alias_match && !choice.author_suggested)
+        }));
+    }
+
+    #[test]
+    fn modes_session_setup_unavailable_reason_is_closed_and_nonselectable() {
+        let slot = SessionSetupModelSlotV1 {
+            slot_id: "primary".into(),
+            choices: Vec::new(),
+            unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
+                recommendation_id: "requires-tools".into(),
+                canonical_upstream_identity: "upstream/tools".into(),
+                author_label: None,
+                rationale: None,
+            }],
+            unavailable_reason: Some(SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel),
+        };
+        let encoded = serde_json::to_value(&slot).expect("slot serializes");
+        assert_eq!(encoded["unavailable_reason"], "no_hard_compatible_local_model");
+        assert!(encoded.get("choices").is_none());
+        assert_eq!(
+            encoded["unmatched_recommendations"][0]["recommendation_id"],
+            "requires-tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_service_snapshot_projects_seeded_scopes_choices_and_redaction()
+    {
+        use cockpit_db::db::agent_installations::{AgentBindingInput, BindAgentOutcome};
+        use rusqlite::params;
+
+        let providers = binding_providers();
+        let harness = ServiceHarness::with_providers(
+            FetchReply::Failure("snapshot fixture never fetches".into()),
+            providers.clone(),
+        );
+        let workspace = harness._root.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".cockpit/agents")).expect("workspace agents");
+        let workspace_root = AuthorizedWorkspaceRoot::capture(&workspace).expect("workspace proof");
+        let workspace_id = "workspace:test".to_owned();
+
+        let reviewer =
+            String::from_utf8(fetched_with_binding_choices("text_generation").markdown)
+                .expect("fixture UTF-8")
+                .replace("authored/helper", "authored/reviewer");
+        let locked = reviewer.replace("authored/reviewer", "authored/locked");
+        let definition_digest = |name: &str, markdown: &str| {
+            let definition = crate::agents::parse_agent(
+                markdown,
+                name,
+                PathBuf::from(format!("<{name}-fixture>")),
+            )
+            .expect("fixture definition");
+            sha256_hex(&definition.vnext_digest_bytes().expect("fixture vNext digest"))
+        };
+        let reviewer_digest = definition_digest("reviewer", &reviewer);
+
+        let global_id = Uuid::now_v7();
+        let private_id = Uuid::now_v7();
+        let shared_id = Uuid::now_v7();
+        let locked_id = Uuid::now_v7();
+        let install =
+            |installation_id, scope, workspace_id: Option<String>, name: &str, digest: String| {
+                AgentInstallationInput {
+                    installation_id,
+                    scope,
+                    canonical_workspace_id: workspace_id,
+                    source_agent_id: format!("authored/{name}"),
+                    source_identity: format!("fixture/repository:agents/{name}.md"),
+                    source_revision: Some("a".repeat(40)),
+                    source_digest: digest,
+                    fetched_at_unix_ms: 1,
+                }
+            };
+        for input in [
+            install(
+                global_id,
+                AgentInstallationScope::Global,
+                None,
+                "reviewer",
+                reviewer_digest.clone(),
+            ),
+            install(
+                private_id,
+                AgentInstallationScope::WorkspacePrivate,
+                Some(workspace_id.clone()),
+                "reviewer",
+                reviewer_digest.clone(),
+            ),
+            install(
+                shared_id,
+                AgentInstallationScope::WorkspaceShared,
+                Some(workspace_id.clone()),
+                "reviewer",
+                reviewer_digest.clone(),
+            ),
+            // The durable observation intentionally differs from the held
+            // definition. This verifies that a stale binding is exposed as a
+            // closed, non-selectable rebind requirement rather than guessed.
+            install(
+                locked_id,
+                AgentInstallationScope::Global,
+                None,
+                "locked",
+                "f".repeat(64),
+            ),
+        ] {
+            assert!(matches!(
+                harness.db.install_agent(input).await.expect("seed installation"),
+                InstallAgentOutcome::Installed(_)
+            ));
+        }
+
+        let daemon_agents = harness._root.path().join("daemon-agents");
+        for path in [
+            owned_path(
+                &daemon_agents,
+                None,
+                AgentInstallationScopeWire::Global,
+                "reviewer",
+            )
+            .expect("global definition path"),
+            owned_path(
+                &daemon_agents,
+                Some(workspace_root.canonical_path()),
+                AgentInstallationScopeWire::WorkspacePrivate,
+                "reviewer",
+            )
+            .expect("private definition path"),
+            owned_path(
+                &daemon_agents,
+                None,
+                AgentInstallationScopeWire::Global,
+                "locked",
+            )
+            .expect("locked definition path"),
+        ] {
+            std::fs::create_dir_all(path.parent().expect("definition parent"))
+                .expect("definition parent");
+        }
+        std::fs::write(
+            owned_path(
+                &daemon_agents,
+                None,
+                AgentInstallationScopeWire::Global,
+                "reviewer",
+            )
+            .expect("global definition path"),
+            &reviewer,
+        )
+        .expect("global definition");
+        std::fs::write(
+            owned_path(
+                &daemon_agents,
+                Some(workspace_root.canonical_path()),
+                AgentInstallationScopeWire::WorkspacePrivate,
+                "reviewer",
+            )
+            .expect("private definition path"),
+            &reviewer,
+        )
+        .expect("private definition");
+        std::fs::write(
+            workspace.join(".cockpit/agents/reviewer.md"),
+            &reviewer,
+        )
+        .expect("shared definition");
+        std::fs::write(
+            owned_path(
+                &daemon_agents,
+                None,
+                AgentInstallationScopeWire::Global,
+                "locked",
+            )
+            .expect("locked definition path"),
+            &locked,
+        )
+        .expect("locked definition");
+
+        for (installation_id, profile_handle) in [
+            (global_id, "credential-profile-global"),
+            (private_id, "credential-profile-private"),
+            (shared_id, "credential-profile-shared"),
+        ] {
+            let provenance_payload =
+                format!("fixture-provenance:{installation_id}").into_bytes();
+            assert!(matches!(
+                harness
+                    .db
+                    .bind_agent_model(
+                        installation_id,
+                        reviewer_digest.clone(),
+                        None,
+                        format!("bind-{installation_id}"),
+                        "fixture-bind".into(),
+                        AgentBindingInput {
+                            slot_id: "primary".into(),
+                            provider_profile_handle: profile_handle.into(),
+                            model_id: "exact-a".into(),
+                            provenance_digest: sha256_hex(&provenance_payload),
+                            provenance_payload,
+                            hard_capability_verified: true,
+                        },
+                        2,
+                    )
+                    .await
+                    .expect("seed binding"),
+                BindAgentOutcome::Bound(_)
+            ));
+        }
+
+        let session = harness
+            .db
+            .create_session(
+                "fixture-project",
+                workspace.to_string_lossy().as_ref(),
+                "reviewer",
+            )
+            .await
+            .expect("session");
+        let snapshot_id = Uuid::now_v7();
+        let selected_digest = reviewer_digest.clone();
+        let selected_id = private_id;
+        let session_id = session.session_id;
+        harness
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO agent_profile_snapshots(\
+                        snapshot_id,session_id,installation_id,schema_version,canonical_payload,\
+                        canonical_payload_digest,definition_digest,binding_revision_map_payload,\
+                        binding_revision_map_digest,created_at_unix_ms\
+                     ) VALUES(?1,?2,?3,1,?4,?5,?6,?7,?8,1)",
+                    params![
+                        snapshot_id.to_string(),
+                        session_id.to_string(),
+                        selected_id.to_string(),
+                        b"fixture-profile".as_slice(),
+                        "a".repeat(64),
+                        selected_digest,
+                        b"fixture-bindings".as_slice(),
+                        "b".repeat(64),
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("selected immutable profile");
+
+        let fingerprint =
+            session_setup_config_fingerprint(&providers).expect("provider fingerprint");
+        let snapshot = harness
+            .service
+            .session_setup_snapshot(
+                session_id,
+                workspace_id,
+                Some(&workspace_root),
+                &providers,
+                41,
+                77,
+                &fingerprint,
+                true,
+            )
+            .await
+            .expect("seeded service snapshot");
+        let again = harness
+            .service
+            .session_setup_snapshot(
+                session_id,
+                "workspace:test".into(),
+                Some(&workspace_root),
+                &providers,
+                41,
+                77,
+                &fingerprint,
+                true,
+            )
+            .await
+            .expect("repeat seeded service snapshot");
+
+        assert_eq!(
+            snapshot, again,
+            "same durable/service authority is deterministic"
+        );
+        assert_eq!(snapshot.session_id, session_id.to_string());
+        assert_eq!(snapshot.config_generation, 41);
+        assert_ne!(snapshot.revision, 0);
+        assert_eq!(
+            snapshot.selected_installation_id,
+            Some(private_id.to_string())
+        );
+        assert_eq!(
+            snapshot
+                .candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.installation.scope,
+                    candidate.installation.source_agent_id.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (AgentInstallationScopeWire::Global, "authored/locked"),
+                (AgentInstallationScopeWire::Global, "authored/reviewer"),
+                (AgentInstallationScopeWire::WorkspacePrivate, "authored/reviewer"),
+                (AgentInstallationScopeWire::WorkspaceShared, "authored/reviewer"),
+            ],
+            "scope collisions must remain separate and stably ordered"
+        );
+        let private = snapshot
+            .candidates
+            .iter()
+            .find(|candidate| candidate.installation.installation_id == private_id.to_string())
+            .expect("selected private candidate");
+        assert!(private.selected);
+        let primary = private
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == "primary")
+            .expect("private primary slot");
+        assert_eq!(
+            primary
+                .choices
+                .iter()
+                .map(|choice| choice.recommendation_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("first"), Some("second"), None],
+            "exact author aliases precede compatible-but-unsuggested models"
+        );
+        assert!(primary.choices[..2]
+            .iter()
+            .all(|choice| choice.author_suggested && choice.exact_alias_match));
+        assert_eq!(primary.choices[2].model_id, "compatible");
+        assert!(!primary.choices[2].author_suggested && !primary.choices[2].exact_alias_match);
+        assert_eq!(primary.unmatched_recommendations.len(), 1);
+        assert_eq!(primary.unmatched_recommendations[0].recommendation_id, "missing");
+        let locked = snapshot
+            .candidates
+            .iter()
+            .find(|candidate| candidate.installation.installation_id == locked_id.to_string())
+            .expect("stale candidate");
+        assert_eq!(
+            locked.locked_reason,
+            Some(SessionSetupLockedReasonV1::RebindRequired)
+        );
+        assert!(locked.slots.iter().all(|slot| {
+            slot.choices.is_empty()
+                && slot.unavailable_reason == Some(SessionSetupUnavailableReasonV1::RebindRequired)
+        }));
+
+        let response = cockpit_proto::Response::SessionSetupSnapshot {
+            snapshot: snapshot.clone(),
+        };
+        let wire = serde_json::to_string(&response).expect("full Rust wire serialization");
+        let decoded: cockpit_proto::Response = serde_json::from_str(&wire).expect("wire decode");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-encode Rust wire"),
+            wire
+        );
+        assert!(!wire.contains("credential-profile"));
+        assert!(!wire.contains(workspace.to_string_lossy().as_ref()));
+        assert!(!wire.contains(daemon_agents.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_service_snapshot_uses_durable_prepared_fixture() {
+        let providers = session_setup_test_support::providers();
+        let harness = ServiceHarness::with_providers(
+            FetchReply::Failure("session setup fixture never fetches".into()),
+            providers.clone(),
+        );
+        let workspace = harness._root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace root");
+        let daemon_agents = harness._root.path().join("daemon-agents");
+        let fixture = session_setup_test_support::seed(
+            &harness.db,
+            &daemon_agents,
+            &workspace,
+        )
+        .await
+        .expect("durable session-setup fixture");
+        let workspace_root =
+            AuthorizedWorkspaceRoot::capture(&workspace).expect("attached workspace proof");
+        let fingerprint =
+            session_setup_config_fingerprint(&providers).expect("provider fingerprint");
+        let snapshot = harness
+            .service
+            .session_setup_snapshot(
+                fixture.session_id,
+                fixture.workspace_id,
+                Some(&workspace_root),
+                &providers,
+                41,
+                77,
+                &fingerprint,
+                true,
+            )
+            .await
+            .expect("durable fixture setup snapshot");
+
+        assert_eq!(
+            snapshot.selected_installation_id,
+            Some(fixture.selected_installation_id.to_string())
+        );
+        assert!(snapshot
+            .candidates
+            .iter()
+            .any(|candidate| candidate.installation.scope == AgentInstallationScopeWire::Global));
+        assert!(snapshot.candidates.iter().any(|candidate| {
+            candidate.installation.scope == AgentInstallationScopeWire::WorkspacePrivate
+                && candidate.installation.source_agent_id == "authored/reviewer"
+                && candidate.selected
+        }));
+        assert!(snapshot.candidates.iter().any(|candidate| {
+            candidate.installation.source_agent_id == "authored/unavailable"
+                && candidate.slots.iter().all(|slot| {
+                    slot.unavailable_reason
+                        == Some(SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel)
+                })
+        }));
+        let wire = serde_json::to_string(&cockpit_proto::Response::SessionSetupSnapshot {
+            snapshot,
+        })
+        .expect("redacted setup response");
+        assert!(!wire.contains(session_setup_test_support::SELECTED_PROFILE_HANDLE));
+        assert!(!wire.contains(workspace.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_untrusted_project_source_is_not_rendered() {
+        let providers = session_setup_test_support::providers();
+        let harness = ServiceHarness::with_providers(
+            FetchReply::Failure("session setup fixture never fetches".into()),
+            providers.clone(),
+        );
+        let workspace = harness._root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace root");
+        let daemon_agents = harness._root.path().join("daemon-agents");
+        let fixture = session_setup_test_support::seed(&harness.db, &daemon_agents, &workspace)
+            .await
+            .expect("durable session-setup fixture");
+        let workspace_root =
+            AuthorizedWorkspaceRoot::capture(&workspace).expect("attached workspace proof");
+        let fingerprint =
+            session_setup_config_fingerprint(&providers).expect("provider fingerprint");
+        let shared_scope = AgentInstallationScopeWire::WorkspaceShared;
+
+        // Trusted: the workspace-shared (project) definition is read, so the
+        // candidate is not "definition unavailable".
+        let trusted = harness
+            .service
+            .session_setup_snapshot(
+                fixture.session_id,
+                fixture.workspace_id.clone(),
+                Some(&workspace_root),
+                &providers,
+                41,
+                77,
+                &fingerprint,
+                true,
+            )
+            .await
+            .expect("trusted setup snapshot");
+        let trusted_shared = trusted
+            .candidates
+            .iter()
+            .find(|candidate| candidate.installation.scope == shared_scope)
+            .expect("trusted workspace-shared candidate");
+        assert_ne!(
+            trusted_shared.locked_reason,
+            Some(SessionSetupLockedReasonV1::DefinitionUnavailable),
+            "a trusted project source has its definition read"
+        );
+
+        // Untrusted (Trust -> IgnoreConfig): the project source must not be read
+        // or rendered; only its daemon-owned durable identity remains.
+        let untrusted = harness
+            .service
+            .session_setup_snapshot(
+                fixture.session_id,
+                fixture.workspace_id,
+                Some(&workspace_root),
+                &providers,
+                41,
+                77,
+                &fingerprint,
+                false,
+            )
+            .await
+            .expect("untrusted setup snapshot");
+        let untrusted_shared = untrusted
+            .candidates
+            .iter()
+            .find(|candidate| candidate.installation.scope == shared_scope)
+            .expect("untrusted workspace-shared candidate still listed by durable identity");
+        assert_eq!(
+            untrusted_shared.locked_reason,
+            Some(SessionSetupLockedReasonV1::DefinitionUnavailable),
+            "an untrusted project source must not render its definition"
+        );
+        assert!(
+            untrusted_shared.slots.is_empty(),
+            "an untrusted project source renders no slots or choices"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_scope_collisions_remain_distinct_and_revision_is_deterministic() {
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let candidate = |installation_id, scope| SessionSetupAgentCandidateV1 {
+            installation: AgentInstallationRecordV1 {
+                installation_id: installation_id.to_string(),
+                scope,
+                source_agent_id: "authored/reviewer".into(),
+                source_identity: "publisher/repository:agents/reviewer.md".into(),
+                source_revision: Some("a".repeat(40)),
+                source_digest: "b".repeat(64),
+                installation_revision: 3,
+                bindings: Vec::new(),
+            },
+            selected: installation_id == id_b,
+            slots: Vec::new(),
+            locked_reason: None,
+        };
+        let candidates = vec![
+            candidate(id_a, AgentInstallationScopeWire::Global),
+            candidate(id_b, AgentInstallationScopeWire::WorkspacePrivate),
+        ];
+        let revision = session_setup_revision(
+            Some(id_b),
+            &candidates,
+            "db-authority",
+            7,
+            11,
+            "provider-authority",
+        );
+        assert_eq!(
+            revision,
+            session_setup_revision(
+                Some(id_b),
+                &candidates,
+                "db-authority",
+                7,
+                11,
+                "provider-authority",
+            )
+        );
+        assert_ne!(
+            revision,
+            session_setup_revision(
+                Some(id_b),
+                &candidates,
+                "db-authority",
+                7,
+                11,
+                "replacement-provider-authority",
+            ),
+            "a private provider snapshot replacement must invalidate setup CAS authority"
+        );
+        assert_ne!(
+            revision,
+            session_setup_revision(
+                Some(id_b),
+                &candidates,
+                "db-authority",
+                7,
+                12,
+                "provider-authority",
+            ),
+            "a global config authority change must invalidate setup CAS authority"
+        );
+        let encoded = serde_json::to_string(&candidates).expect("candidates serialize");
+        assert!(encoded.contains("global"));
+        assert!(encoded.contains("workspace_private"));
+        assert_ne!(
+            candidates[0].installation.installation_id,
+            candidates[1].installation.installation_id
+        );
+        assert!(!candidates[0].selected);
+        assert!(candidates[1].selected);
+    }
+
+    #[test]
+    fn modes_session_setup_config_fingerprint_tracks_private_provider_authority() {
+        let baseline = ProvidersConfig::default();
+        let mut changed = ProvidersConfig::default();
+        changed.providers.insert(
+            "daemon-local-profile".into(),
+            ProviderEntry {
+                url: "https://provider.example.test/v1".into(),
+                ..ProviderEntry::default()
+            },
+        );
+        assert_ne!(
+            session_setup_config_fingerprint(&baseline).expect("baseline fingerprint"),
+            session_setup_config_fingerprint(&changed).expect("changed fingerprint"),
+            "private provider-route changes must invalidate setup authority even when the public generation is unchanged"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_db_fingerprint_frames_names_types_and_lengths() {
+        let one = 1_u64.to_be_bytes();
+        let digest = |fields: &[(&str, &str, &[u8])]| {
+            let mut hasher = Sha256::new();
+            hasher.update(b"cockpit-session-setup-db-snapshot-fingerprint-v1");
+            for (name, type_name, value) in fields {
+                session_setup_fingerprint_field(&mut hasher, name, type_name, value);
+            }
+            crate::intel::hex_lower(&hasher.finalize())
+        };
+        // Both inputs flatten to `abc` under the former concatenation scheme.
+        // Their framed authority representations must remain distinct.
+        assert_ne!(
+            digest(&[
+                ("selected_installation_id", "text", b"a"),
+                ("installation_id", "text", b"bc"),
+            ]),
+            digest(&[
+                ("selected_installation_id", "text", b"ab"),
+                ("installation_id", "text", b"c"),
+            ]),
+        );
+        assert_ne!(
+            digest(&[("source_revision", "optional-text:none", b"")]),
+            digest(&[("source_revision", "optional-text:some", b"")]),
+        );
+        assert_ne!(
+            digest(&[("binding_revision", "u64", &one)]),
+            digest(&[("binding_revision", "text", b"1")]),
+        );
     }
 
     #[test]

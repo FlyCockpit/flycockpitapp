@@ -52,11 +52,27 @@ impl Tool for OutlineTool {
             crate::tools::shell_sandbox::SandboxPathAccess::Read,
         )
         .await?;
+        // The gitignore gate canonicalizes/probes this path before choosing
+        // whether to prompt, so it is itself the first post-approval host
+        // access and must be behind the exact native access fence.
+        crate::tools::sandbox::recheck_native_access_effect_boundary(
+            &checked,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
         if let Some(refusal) = crate::tools::sandbox::check_gitignore_read(ctx, &checked).await? {
             return Ok(refusal);
         }
         let rel = rel_path(path_arg, ctx);
         let index = index_of(ctx);
+        // `ensure_fresh_scoped` may inspect/index the target.  The initial
+        // native approval is not authority across the gitignore/config gates;
+        // reclaim the exact checked path at this first host access instead.
+        crate::tools::sandbox::recheck_native_access_effect_boundary(
+            &checked,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
         let freshen = index
             .ensure_fresh_scoped(freshen_options(ctx, Some(rel.clone())))
             .await?;
@@ -67,8 +83,15 @@ impl Tool for OutlineTool {
 
         // Grammarless / not-indexed language → regex fallback (never errors).
         if language.is_empty() || Language::from_stored(&language).grammar().is_none() {
-            let abs = crate::tools::common::resolve(path_arg, &ctx.cwd);
-            let body = match std::fs::read_to_string(&abs) {
+            // Index refresh is async. Reclaim the exact native path again at
+            // the fallback's direct byte-read boundary rather than treating
+            // the earlier index fence as ambient authority.
+            crate::tools::sandbox::recheck_native_access_effect_boundary(
+                &checked,
+                crate::tools::shell_sandbox::SandboxPathAccess::Read,
+            )
+            .await?;
+            let body = match std::fs::read_to_string(&checked) {
                 Ok(b) => b,
                 Err(e) => {
                     return Err(invalid_input(format!("read `{rel}`: {e}")));

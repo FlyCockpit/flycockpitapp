@@ -199,7 +199,7 @@ cockpit init
 Turn local docs, URLs, pasted steps, or a recent workflow into a reusable skill:
 
 ```sh
-cockpit assistant learn ./sdk-docs
+cockpit assistants learn ./sdk-docs
 ```
 
 Ask questions against a registered dependency package's source:
@@ -214,7 +214,9 @@ cockpit packages prune --dry-run
 
 | Command | Purpose |
 | --- | --- |
-| `cockpit` | Launch the TUI in the current directory. |
+| `cockpit` / `cockpit code` | Launch the Code-mode TUI in the current directory. |
+| `cockpit assistant` | Launch the Assistant-mode TUI. |
+| `cockpit computer` | Launch the Computer-mode TUI. |
 | `cockpit ask <package> <question>` | Ask the read-only docs agent about a registered dependency package. |
 | `cockpit run [message]` | Run a non-interactive turn through the daemon; message args beat stdin. |
 | `cockpit invocation status <id>` | Show durable status for a run invocation by client_submission_id. |
@@ -223,6 +225,7 @@ cockpit packages prune --dry-run
 | `cockpit agent list [--json]` | List daemon-owned agent provenance for a scope. |
 | `cockpit agent inspect INSTALLATION_ID [--json]` | Inspect source revision and digest without exposing local binding routes. |
 | `cockpit assistant list` | List persistent assistants. |
+| `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
 | `cockpit provider list` | List built-in provider templates. |
 | `cockpit setup [wizard]` | Run an interactive setup wizard in the terminal. |
 | `cockpit models [provider]` | Show the effective default model for new sessions plus its scope, then list locally configured models. |

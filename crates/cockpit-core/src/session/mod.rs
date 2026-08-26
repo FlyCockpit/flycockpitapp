@@ -300,6 +300,9 @@ pub struct Session {
     /// not part of the provider/model identity.
     model_selection: Mutex<Option<crate::config::providers::ActiveModelRef>>,
     session_llm_mode: Mutex<Option<String>>,
+    /// Immutable daemon-owned setup metadata. It is never consulted for
+    /// agent/model/sandbox/approval authority.
+    session_entry_mode: crate::daemon::proto::SessionEntryMode,
     tool_surface_override_json: Mutex<Option<String>>,
     goal_settings_override_json: Mutex<Option<String>>,
     redaction_table_json: Mutex<Option<String>>,
@@ -2231,7 +2234,9 @@ mod tests {
         assert_eq!(approver.approval_mode(), ApprovalMode::Auto);
         assert!(!approver.yolo_mode());
         assert!(
-            !approver.auto_allows("bash", "rm -rf /").await,
+            !approver
+                .auto_allows(crate::agent_tree::HostEffectClass::Destructive, "rm -rf /")
+                .await,
             "Auto without guard model must fail closed"
         );
         s.clear_invocation_approval_override();

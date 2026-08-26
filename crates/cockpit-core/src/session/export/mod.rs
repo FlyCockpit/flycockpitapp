@@ -1679,6 +1679,7 @@ fn build_manifest_conn(
                 "parent_session_id": session.parent_session_id.map(|p| p.to_string()),
                 "fork_point_turn_id": session.fork_point_turn_id,
                 "active_model": active_model,
+                "session_entry_mode": session.session_entry_mode,
                 "active_agent": session.active_agent,
                 "started_at_unix_ms": session.started_at_unix_ms,
                 "ended_at_unix_ms": session.ended_at_unix_ms,

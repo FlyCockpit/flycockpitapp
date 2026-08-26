@@ -983,6 +983,11 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
     let object = value
         .as_object()
         .ok_or_else(|| anyhow!("import manifest session must be an object"))?;
+    let session_entry_mode = required_string(object, "session_entry_mode", "import manifest session")?;
+    anyhow::ensure!(
+        matches!(session_entry_mode.as_str(), "code" | "assistant" | "computer"),
+        "import manifest session has invalid session_entry_mode"
+    );
     Ok(ImportedSession {
         source_id: parse_uuid(
             required_string(object, "session_id", "import manifest session")?,
@@ -1012,6 +1017,7 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
             }
             None => bail!("import manifest session lacks active_model"),
         },
+        session_entry_mode,
         active_agent: required_string(object, "active_agent", "import manifest session")?,
         started_at_unix_ms: required_i64(object, "started_at_unix_ms", "import manifest session")?,
         ended_at_unix_ms: optional_i64(object.get("ended_at_unix_ms"), "ended_at_unix_ms")?,
@@ -1160,6 +1166,7 @@ fn parse_event_kind(raw: String) -> Result<SessionEventKind> {
         "notice" => Notice,
         "model_switch" => ModelSwitch,
         "hook_run" => HookRun,
+        "agent_tree" => AgentTree,
         _ => bail!("unsupported import event type `{raw}`"),
     };
     Ok(kind)
@@ -1203,6 +1210,7 @@ mod tests {
                 short_id: Some("imported".into()),
                 fork_point_turn_id: None,
                 active_model: None,
+                session_entry_mode: "code".into(),
                 active_agent: "Build".into(),
                 started_at_unix_ms: 1,
                 ended_at_unix_ms: None,
@@ -1269,11 +1277,60 @@ mod tests {
                 "provider": "test-provider",
                 "model": "test-model",
             },
+            "session_entry_mode": "code",
             "active_agent": "Build",
             "started_at_unix_ms": 100,
             "ended_at_unix_ms": null,
             "title": "Imported session",
         })
+    }
+
+    #[test]
+    fn modes_session_setup_archive_mode_is_required_and_exact() {
+        let id = Uuid::new_v4();
+        let mut missing = session(id, None);
+        missing
+            .as_object_mut()
+            .expect("session fixture is an object")
+            .remove("session_entry_mode");
+        assert!(
+            parse_session(&missing)
+                .expect_err("archive import must not default a missing entry mode")
+                .to_string()
+                .contains("session_entry_mode")
+        );
+
+        let mut invalid = session(id, None);
+        invalid["session_entry_mode"] = json!("operator");
+        assert!(
+            parse_session(&invalid)
+                .expect_err("archive import must reject an unknown entry mode")
+                .to_string()
+                .contains("invalid session_entry_mode")
+        );
+
+        let mut computer = session(id, None);
+        computer["session_entry_mode"] = json!("computer");
+        assert_eq!(
+            parse_session(&computer)
+                .expect("canonical entry mode imports")
+                .session_entry_mode,
+            "computer"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_rejects_prerelease_export_schema_three_without_a_shim() {
+        let archive = archive_bytes_with_schema(
+            "cockpit-session-export/3",
+            vec![session(Uuid::new_v4(), None)],
+            Vec::new(),
+            false,
+        );
+        let error = read_archive_bytes(&archive)
+            .expect_err("the obsolete export schema must not be parsed as v4")
+            .to_string();
+        assert!(error.contains("unsupported export schema"), "{error}");
     }
 
     fn archive_bytes(sessions: Vec<Value>, events: Vec<Value>, redacted: bool) -> Vec<u8> {
@@ -1802,6 +1859,16 @@ mod tests {
                     1234,
                     r#"{"text":"round trip"}"#,
                 )?;
+                Db::insert_session_event_json_conn(
+                    conn,
+                    source_id,
+                    SessionEventKind::AgentTree,
+                    None,
+                    None,
+                    SessionEventContext::default(),
+                    1234,
+                    r#"{"kind":"agent_transition","subject_kind":"agent","subject_id":"00000000-0000-0000-0000-000000000001","state":"running"}"#,
+                )?;
                 Db::insert_inference_call_conn(
                     conn,
                     &InferenceCallRow {
@@ -1862,6 +1929,15 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM inference_calls WHERE session_id = ?1", [destination_id.to_string()], |r| r.get(0))?,
         ))).await.unwrap();
         assert_eq!(destination_counts, source_counts);
+        assert!(
+            destination
+                .list_session_events(destination_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "agent_tree"),
+            "typed agent-tree timeline invalidations must survive export/import"
+        );
         let restored = destination
             .get_session(destination_id)
             .await

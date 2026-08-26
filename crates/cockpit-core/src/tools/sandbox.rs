@@ -159,6 +159,52 @@ pub async fn check_native_access(
     }
 }
 
+/// The exact path-access candidate used by `approve_path` and the concrete
+/// filesystem boundary.  Keeping this projection here prevents a native tool
+/// from checking one spelling before an async gate and then claiming a
+/// differently-normalized spelling when it actually reaches the host.
+pub(crate) fn native_access_effect(path: &Path, required: SandboxPathAccess) -> serde_json::Value {
+    serde_json::json!({
+        "access": {
+            "path": path.display().to_string(),
+            "required_access": format!("{required:?}"),
+        }
+    })
+}
+
+/// Claim the exact native path capability at the final filesystem boundary.
+///
+/// [`check_native_access`] deliberately runs early: it can prompt and wait,
+/// while later validation, lock acquisition, and revision changes may take an
+/// arbitrary amount of time.  An allow from that early gate is therefore not
+/// ambient authority for the first metadata/read/write/LSP access.  Every
+/// native caller invokes this immediately before its first host access, after
+/// its other gates.  Outside a host-approval handoff this is intentionally a
+/// no-op, preserving in-boundary and daemonless callers.
+pub(crate) async fn recheck_native_access_effect_boundary(
+    path: &Path,
+    required: SandboxPathAccess,
+) -> Result<()> {
+    crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+        "native_filesystem_access",
+        &[native_access_effect(path, required)],
+    )
+    .await
+}
+
+/// Revalidate an already-claimed native path at a read-only stability probe
+/// while leaving a later, still-ready content mutation claim untouched.
+pub(crate) async fn recheck_claimed_native_access_stability_boundary(
+    path: &Path,
+    required: SandboxPathAccess,
+) -> Result<()> {
+    crate::engine::interrupt::recheck_current_claimed_host_approval_effect_boundary(
+        "native_filesystem_stability_read",
+        &[native_access_effect(path, required)],
+    )
+    .await
+}
+
 // ---- gitignore read-allowlist gate (read only) ------------------
 
 /// Gate a `read` of `resolved` on gitignore status
@@ -223,8 +269,33 @@ pub async fn check_gitignore_read(
         .approve_gitignore_read(&display, &parent_label, &file_glob, &parent_glob)
         .await?;
     match outcome {
-        crate::approval::GitignoreReadOutcome::ApproveOnce => Ok(None),
+        crate::approval::GitignoreReadOutcome::ApproveOnce => {
+            // The read gate is the final common choke point for read/glob/
+            // grep/intel callers. Claim the exact once-only authorization
+            // before it returns permission to cross the filesystem boundary.
+            if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                "gitignore_read_authorization",
+                &[serde_json::json!({"effect": "gitignore_read_once"})],
+            )
+            .await
+            .is_err()
+            {
+                return Ok(Some(gitignore_refusal(&display)));
+            }
+            Ok(None)
+        }
         crate::approval::GitignoreReadOutcome::ApproveSession { glob } => {
+            if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                "gitignore_session_allow_persistence",
+                &[serde_json::json!({
+                    "persist_grant": {"glob": &glob, "scope": "session"}
+                })],
+            )
+            .await
+            .is_err()
+            {
+                return Ok(Some(gitignore_refusal(&display)));
+            }
             ctx.session.add_gitignore_session_allow(glob);
             // Push the now-current full session allowlist to attached client(s)
             // so the `@`-tag popup re-includes this entry without a restart
@@ -235,12 +306,28 @@ pub async fn check_gitignore_read(
             Ok(None)
         }
         crate::approval::GitignoreReadOutcome::ApproveProject { glob } => {
+            if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                "gitignore_project_allow_persistence",
+                &[serde_json::json!({
+                    "persist_grant": {"glob": &glob, "scope": "project"}
+                })],
+            )
+            .await
+            .is_err()
+            {
+                return Ok(Some(gitignore_refusal(&display)));
+            }
             if let Err(e) =
                 crate::config::extended::append_gitignore_allow_to_project(&ctx.cwd, &glob)
             {
-                // A persist failure must not strand the approved read: allow it
-                // this once and surface the failure in the log (priority #1).
-                tracing::warn!(error = %e, glob, "persisting gitignore allowlist glob failed; allowing once");
+                // The selected durable capability included this exact project
+                // allowlist mutation. Do not silently downgrade it to a
+                // one-off read when the mutation did not commit: that would
+                // execute an effect different from the user-selected
+                // candidate and incorrectly complete its receipt.
+                tracing::warn!(error = %e, glob, "persisting gitignore allowlist glob failed; rejecting selected capability");
+                crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                return Ok(Some(gitignore_refusal(&display)));
             }
             Ok(None)
         }
@@ -546,6 +633,7 @@ mod tests {
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
         ToolCtx {
             agent_id: "builder".to_string(),
+            agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
             current_tool_call_id: None,

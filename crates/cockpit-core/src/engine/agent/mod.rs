@@ -62,8 +62,11 @@ pub use backup::{
     suggested_action_for_failure_class, turn_with_backup,
 };
 pub use events::{
-    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress,
-    TurnEvent,
+    AgentTreeExecutorRequest, ControlRequestId, ControlRequestNotDelivered,
+    ControlRequestOutcome, IdleReason, ToolProgress, TurnEvent,
+};
+pub(crate) use events::{
+    AgentTreeEndpointGeneration, next_agent_tree_endpoint_generation,
 };
 pub use outcome::{BatchTaskEntry, TaskControlAction, TurnOutcome};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};
@@ -74,6 +77,126 @@ use gate::*;
 use loop_guard::*;
 pub use outcome::*;
 use text_recovery::*;
+
+// A concrete executor frame owns this identity, not the shared `Agent`
+// definition. Keep it task-local so same-named children cannot overwrite one
+// another while turn code stays reusable by daemonless callers.
+tokio::task_local! {
+    static CURRENT_AGENT_INSTANCE_ID: Option<uuid::Uuid>;
+}
+
+/// A revocable, durable permit for provider handoffs made while consuming an
+/// AgentTree late steer.
+///
+/// Mailbox delivery alone does not authorize inference: a cancellation or
+/// lifecycle transition can win after the mailbox has accepted the
+/// instruction. The model dispatch choke point rechecks the immutable steer
+/// identity immediately before it asks a provider to build a stream. That
+/// same final check is the acceptance boundary for a pending steer:
+/// queue/mailbox receipt is deliberately not acceptance. Once accepted, the
+/// same continuation can safely resume after its own QuestionTool/approval
+/// advances the owner revision; the immutable checkpoint remains unchanged.
+/// The shared turn cancellation token gives an already-running request the
+/// same abort signal used by the owning executor.
+#[derive(Clone)]
+pub(crate) struct AgentTreeSteerDispatchPermit {
+    session: Arc<Session>,
+    steer_id: uuid::Uuid,
+    continuation_id: uuid::Uuid,
+    agent_instance_id: uuid::Uuid,
+    recovery_epoch: uuid::Uuid,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl AgentTreeSteerDispatchPermit {
+    pub(crate) fn new(
+        session: Arc<Session>,
+        steer_id: uuid::Uuid,
+        continuation_id: uuid::Uuid,
+        agent_instance_id: uuid::Uuid,
+        recovery_epoch: uuid::Uuid,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            session,
+            steer_id,
+            continuation_id,
+            agent_instance_id,
+            recovery_epoch,
+            cancel,
+        }
+    }
+
+    async fn is_current(&self) -> bool {
+        if self.cancel.is_cancelled() {
+            return false;
+        }
+        self.session
+            .db
+            .late_user_decision_steer_dispatch_permit_is_current(
+                self.session.id,
+                self.steer_id,
+                self.continuation_id,
+                self.agent_instance_id,
+                self.recovery_epoch,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    %error,
+                    steer_id = %self.steer_id,
+                    agent_instance_id = %self.agent_instance_id,
+                    "late user steer permit recheck failed closed"
+                );
+                false
+            })
+    }
+}
+
+tokio::task_local! {
+    static CURRENT_AGENT_TREE_STEER_DISPATCH_PERMIT: Option<AgentTreeSteerDispatchPermit>;
+}
+
+pub(crate) async fn with_agent_tree_steer_dispatch_permit<F>(
+    permit: Option<AgentTreeSteerDispatchPermit>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_AGENT_TREE_STEER_DISPATCH_PERMIT
+        .scope(permit, future)
+        .await
+}
+
+/// The final pre-provider guard. Absence means this is an ordinary turn;
+/// presence means a durable late-steer continuation still owns this runnable
+/// agent executor and has not been revoked by cancellation.
+pub(crate) async fn current_agent_tree_steer_dispatch_permit_is_current() -> bool {
+    let permit = CURRENT_AGENT_TREE_STEER_DISPATCH_PERMIT
+        .try_with(|permit| permit.clone())
+        .ok()
+        .flatten();
+    match permit {
+        Some(permit) => permit.is_current().await,
+        None => true,
+    }
+}
+
+pub(crate) async fn with_agent_instance_id<F>(
+    agent_instance_id: Option<uuid::Uuid>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_AGENT_INSTANCE_ID.scope(agent_instance_id, future).await
+}
+
+pub(crate) fn current_agent_instance_id() -> Option<uuid::Uuid> {
+    CURRENT_AGENT_INSTANCE_ID.try_with(|id| *id).ok().flatten()
+}
 
 /// One built-in or user-defined agent.
 #[derive(Clone)]
@@ -888,13 +1011,15 @@ async fn raise_and_wait_in_turn(
     description: &str,
     set: crate::daemon::proto::InterruptQuestionSet,
 ) -> Result<crate::daemon::proto::ResolveResponse> {
-    Ok(crate::engine::interrupt::raise_and_wait(
+    Ok(crate::engine::interrupt::raise_and_wait_with_agent_tree(
         &ctx.session.db,
         &ctx.interrupts,
         ctx.session.id,
         &ctx.agent_id,
+        ctx.agent_instance_id,
         description,
         set,
+        crate::agent_tree::HostDecisionSubject::UserQuestion,
         "result injection override",
     )
     .await
@@ -1197,6 +1322,7 @@ mod redaction_placeholder_guard_tests {
         session.set_sandbox_enabled(false);
         ToolCtx {
             agent_id: "builder".to_string(),
+            agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
             current_tool_call_id: None,

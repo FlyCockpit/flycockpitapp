@@ -617,14 +617,14 @@ pub(super) fn validate_set_agent(
     att: &AttachedSession,
     name: &str,
 ) -> std::result::Result<(), ErrorPayload> {
+    let trust_policy = att.handle.current_trust_policy();
     let _ = ctx
         .config_source()
-        .load_effective_for_daemon(&att.handle.project_root, &att.handle.trust_policy)
+        .load_effective_for_daemon(&att.handle.project_root, &trust_policy)
         .map_err(super::dispatch::daemon_config_error)?;
-    let ownable =
-        crate::config::trust::with_workspace_trust_policy(att.handle.trust_policy.clone(), || {
-            crate::agents::chat_ownable_primaries(&att.handle.project_root)
-        });
+    let ownable = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+        crate::agents::chat_ownable_primaries(&att.handle.project_root)
+    });
     validate_set_agent_name(name, &ownable)
 }
 
@@ -692,6 +692,7 @@ mod sessions_activity_tests {
     fn summary(activity_state: Option<proto::SessionActivityState>) -> proto::SessionSummary {
         proto::SessionSummary {
             session_id: Uuid::new_v4(),
+            session_entry_mode: "code".into(),
             short_id: None,
             project_root: "/proj".into(),
             project_id: "pid".into(),

@@ -137,6 +137,15 @@ impl Tool for EditTool {
                     return Ok(crate::assistants::identity::tool_refusal(message));
                 }
             };
+        // An out-of-boundary access may have waited at the early native
+        // gate.  The first content read is its own host boundary, so consume
+        // the exact path capability only now, after identity policy has
+        // accepted the request and immediately before touching the file.
+        crate::tools::sandbox::recheck_native_access_effect_boundary(
+            &path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
         let existing =
             std::fs::read(&path).map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
         let want_crlf = detect_crlf(&existing);
@@ -201,12 +210,33 @@ impl Tool for EditTool {
                 true,
             )
             .await?;
+        // The content approval and lock wait may have parked after the first
+        // read. Recheck the claimed native path before the source-stability
+        // read without consuming the still-ready exact content mutation.
+        crate::tools::sandbox::recheck_claimed_native_access_stability_boundary(
+            &path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
         if std::fs::read(&path)? != existing {
             return Err(anyhow::anyhow!(
                 "`{}` changed while approval was pending; read it again before editing",
                 path.display()
             ));
         }
+        // `edit` reaches the same filesystem boundary as `write`. Rebuild
+        // the exact access and content commitments after the lock/stability
+        // checks, immediately before the helper begins to mutate disk.
+        let concrete_effects = crate::tools::write::host_approval_filesystem_write_effects(
+            &path,
+            Some(existing.as_slice()),
+            normalized.as_bytes(),
+        );
+        crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+            "edit_filesystem_mutation",
+            &concrete_effects,
+        )
+        .await?;
         let outcome = write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?;
         crate::assistants::identity::record_identity_write(ctx, &path).await?;
         if skill_validation.is_some() {

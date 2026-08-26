@@ -21,10 +21,12 @@ async fn prune_targets_foreground_subagent_only() {
             "default",
         ),
         agent: child,
+        agent_instance_id: None,
         history: dup_read_history(),
         answering: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
+        recovery_activation: None,
         _vnext_child_admission: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     });
@@ -2887,6 +2889,7 @@ fn compact_manual_registry() -> crate::config::extended::hooks::HookRegistry {
         origin: HookOrigin::for_test("project:abcdef0123456789:0"),
         source_config_path: std::path::PathBuf::from("/tmp/test/config.json"),
         source_directory: std::path::PathBuf::from("/tmp/test"),
+        execution: crate::config::extended::hooks::HookExecutionProvenance::Ambient,
     };
     HookRegistry {
         hooks: vec![hook(HookEvent::PreCompact), hook(HookEvent::PostCompact)],

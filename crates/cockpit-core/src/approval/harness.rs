@@ -8,7 +8,14 @@ impl Approver {
         policy: crate::harness::run::WritePolicy,
     ) -> Result<Decision> {
         let target = format!("harness:{harness}");
-        if self.yolo_mode() || self.auto_allows("harness_invoke", &target).await {
+        if self.yolo_mode()
+            || self
+                .auto_allows(
+                    crate::agent_tree::HostEffectClass::ExternalAction,
+                    &target,
+                )
+                .await
+        {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
         let offered = [Scope::Once, Scope::Session];
@@ -44,19 +51,58 @@ impl Approver {
                 ApprovalOptionId::Reject,
             ],
         );
-        let response = self.raise_and_wait(&prompt, question).await?;
+        let response = self
+            .raise_and_wait(
+                &prompt,
+                question,
+                crate::agent_tree::HostApprovalOperation::new(
+                    "external_harness_invoke",
+                    serde_json::json!({
+                        "harness": harness,
+                        "model": model,
+                        "write_policy": format!("{policy:?}"),
+                        "offered_scopes": ["once", "session"],
+                        // The approval may either authorize exactly this one
+                        // invocation or persist the precise harness session
+                        // grant. Bind both candidate mutations before the UI
+                        // renders; prompt prose is not an authority record.
+                        "candidate_effects": [
+                            {"selection": "approve_once", "execute": {"harness": harness, "model": model, "write_policy": format!("{policy:?}")}},
+                            {"selection": "approve_session", "persist_grant": {"kind": "harness", "key": harness, "scope": "session"}, "execute": {"harness": harness, "model": model, "write_policy": format!("{policy:?}")}},
+                            {"selection": "reject", "effect": "deny"}
+                        ],
+                    }),
+                )?,
+            )
+            .await?;
         let choice = response_to_approval_choice(&response, &set).unwrap_or_else(|foreign| {
             warn_foreign_option_id(&foreign);
             ApprovalChoice::Deny
         });
         let decision = match choice {
             ApprovalChoice::Approve(Scope::Session) => {
-                if let Err(e) = self.store.record_harness(harness, Scope::Session).await {
-                    tracing::warn!(error = %e, harness, "recording harness session grant failed; applying once");
-                    Decision::Allow { scope: Scope::Once }
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "harness_grant_persistence",
+                    &[serde_json::json!({
+                        "persist_grant": {"kind": "harness", "key": harness, "scope": "session"}
+                    })],
+                )
+                .await
+                .is_err()
+                {
+                    Decision::Deny
                 } else {
-                    Decision::Allow {
-                        scope: Scope::Session,
+                    if let Err(e) = self.store.record_harness(harness, Scope::Session).await {
+                        // The selected capability includes a session grant. Do
+                        // not silently downgrade it to a one-off external
+                        // execution when that mutation did not commit.
+                        tracing::warn!(error = %e, harness, "recording harness session grant failed; rejecting selected capability");
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                        Decision::Deny
+                    } else {
+                        Decision::Allow {
+                            scope: Scope::Session,
+                        }
                     }
                 }
             }

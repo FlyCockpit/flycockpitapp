@@ -134,6 +134,39 @@ pub async fn add_git(
     add_git_with_prepare_scope(db, cwd, identifier, url, branch, shallow, "global").await
 }
 
+/// Register a Git package after the docs resolver has obtained a one-use,
+/// concrete clone approval.  The caller supplies only facts that were shown
+/// in that prompt; the import layer reconstructs this exact effect immediately
+/// before every clone or registry mutation, so a changed URL, identifier, or
+/// cancellation cannot borrow the prior approval.
+pub(crate) async fn add_git_with_approved_clone(
+    db: &Db,
+    cwd: &Path,
+    identifier: &str,
+    url: &str,
+    branch: Option<&str>,
+    shallow: bool,
+    rationale: &str,
+) -> Result<PackageRow> {
+    self::import::add_git_with_prepare_scope_and_host_effect(
+        db,
+        cwd,
+        identifier,
+        url,
+        branch,
+        shallow,
+        "global",
+        serde_json::json!({
+            "execute": {
+                "identifier": identifier,
+                "clone_url": url,
+                "rationale": rationale,
+            }
+        }),
+    )
+    .await
+}
+
 #[derive(Debug, Clone)]
 pub struct PackagePruneOptions {
     pub days: u32,

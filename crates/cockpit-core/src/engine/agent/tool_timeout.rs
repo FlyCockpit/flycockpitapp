@@ -301,9 +301,41 @@ async fn dispatch_tool_with_policy(
     current_tool_call_id: Option<&str>,
     policy: &ToolTimeoutPolicy,
 ) -> Result<ToolOutput> {
+    crate::engine::interrupt::with_host_approval_effect_scope(
+        "tool_dispatch",
+        ctx.cancel.clone(),
+        dispatch_tool_with_policy_unscoped(tool, name, args, ctx, current_tool_call_id, policy),
+        // A shell's non-zero exit is a definitive rejected operation, not an
+        // ambiguous handoff. Other tool output shapes have no process-exit
+        // field and therefore report their successful return as completion.
+        |output: &ToolOutput| Some(output.exit_code.is_none_or(|code| code == 0)),
+    )
+    .await
+}
+
+/// The timeout/cancellation machinery runs inside the host-approval effect
+/// handoff scope above.  Keeping the body separate makes every exit path
+/// (normal return, timeout, cancellation grace expiry, or error) pass through
+/// the one definitive completion/submission-unknown boundary.
+async fn dispatch_tool_with_policy_unscoped(
+    tool: Arc<dyn Tool>,
+    name: &str,
+    args: Value,
+    ctx: &ToolCtx,
+    current_tool_call_id: Option<&str>,
+    policy: &ToolTimeoutPolicy,
+) -> Result<ToolOutput> {
     let args = crate::engine::model::wire_schema::strip_wire_nulls(&tool.parameters(), args);
     let mut ctx = ctx.clone();
     ctx.current_tool_call_id = current_tool_call_id.map(str::to_string);
+    // This dispatcher deliberately does *not* claim host-approval
+    // capabilities from a generic `(tool, wire_input)` projection. A selected
+    // command/MCP/harness/filesystem/package/computer candidate carries facts
+    // that only its lower concrete boundary can reconstruct. Claiming here
+    // would either reject valid rich candidates before they reach that
+    // boundary, or make a generic wrapper the irreversible submission point.
+    // Concrete effect implementations claim the ready capability immediately
+    // before their real spawn/request/mutation instead.
     let timeout = policy.lookup(name);
     let mut call = Box::pin(tool.call(args, &ctx));
     if ctx.cancel.is_cancelled() {

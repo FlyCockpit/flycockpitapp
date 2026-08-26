@@ -1075,6 +1075,10 @@ pub enum UtilityCallSite {
     PreflightRewrite,
     CompactionBrief,
     DelegationShrink,
+    /// A redacted low-risk AgentTree decision routed through the daemon's
+    /// installed resolver model. This is deliberately separate from ad-hoc
+    /// background work so its timeout/custody boundary remains auditable.
+    AgentTreeDecision,
     /// The leak-report trusted-child acquisition child turn (2c-3b). A
     /// non-persisting utility completion: the sensitive acquisition dispatch
     /// runs here rather than through the turn runner so the child's raw output
@@ -1109,6 +1113,7 @@ impl UtilityCallSite {
             | Self::SkillAutoSelect
             | Self::HarnessSummary
             | Self::TrustedChildAcquisition
+            | Self::AgentTreeDecision
             | Self::AdHocBackground => UtilityBudgetClass::Background,
         }
     }

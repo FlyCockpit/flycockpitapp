@@ -284,7 +284,20 @@ pub async fn invoke(
     // `(server, tool)` grant-or-ask seam. This sits after the builtin early
     // return and server validation so cockpit's own Monty tools are not
     // double-gated and typo'd servers never raise phantom approvals.
-    match approve_external_mcp_tool(host, server, tool).await? {
+    let oauth_scopes: &[String] = match &server_cfg.auth {
+        crate::mcp::config::Auth::Oauth(oauth) => &oauth.scopes,
+        _ => &[],
+    };
+    let effect_target = serde_json::json!({
+        "transport": format!("{:?}", server_cfg.transport),
+        "endpoint": &server_cfg.endpoint,
+        "command": &server_cfg.command,
+        "args": &server_cfg.args,
+        "mode": format!("{:?}", server_cfg.mode),
+        "auth_kind": server_cfg.auth.kind_str(),
+        "oauth_scopes": oauth_scopes,
+    });
+    match approve_external_mcp_tool(host, server, tool, &args, &effect_target).await? {
         crate::approval::Decision::Allow { .. } => {}
         crate::approval::Decision::Deny => return Ok(mcp_tool_denial(server, tool, false)),
         crate::approval::Decision::StandingReject { scope } => {
@@ -315,6 +328,21 @@ pub async fn invoke(
         bail!("unknown MCP tool `{server}.{tool}`");
     }
     let mut conn = client::connect_with_context(server, server_cfg, connect_context(host)).await?;
+    // `tools/call` is a distinct remote effect from client initialization.
+    // Recheck the task-local capability after discovery/connect and directly
+    // before the outbound request is issued.
+    crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+        "external_mcp_tools_call",
+        &[serde_json::json!({
+            "execute": {
+                "server": server,
+                "tool": tool,
+                "wire_input": &args,
+                "target": &effect_target,
+            }
+        })],
+    )
+    .await?;
     conn.call_tool(tool, args).await
 }
 
@@ -334,6 +362,8 @@ async fn approve_external_mcp_tool(
     host: &HostContext,
     server: &str,
     tool: &str,
+    input: &Value,
+    target: &Value,
 ) -> Result<crate::approval::Decision> {
     #[cfg(test)]
     host.test_external_approval_entered(server, tool);
@@ -344,7 +374,12 @@ async fn approve_external_mcp_tool(
         return Ok(crate::approval::Decision::NoninteractiveDeny);
     };
     approver
-        .authorize(crate::approval::AuthorizationRequest::ExternalMcpTool { server, tool })
+        .authorize(crate::approval::AuthorizationRequest::ExternalMcpTool {
+            server,
+            tool,
+            input,
+            target,
+        })
         .await
 }
 

@@ -17,7 +17,7 @@
 //!
 //! [`TurnEvent`]: crate::engine::TurnEvent
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -162,10 +162,14 @@ pub enum SessionEventKind {
     /// only — never tool arguments, title candidates, or provider bodies.
     /// Data/export only; never enters the model's context.
     ToolCallScheduling,
+    /// A durable recursive-agent lifecycle or decision invalidation.  This is
+    /// data/export only: the event is an ordered invalidation, not a tree
+    /// snapshot or a resolver-context carrier.
+    AgentTree,
 }
 
 impl SessionEventKind {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::UserMessage,
         Self::UserNote,
         Self::AssistantMessage,
@@ -194,6 +198,7 @@ impl SessionEventKind {
         Self::ModelSwitch,
         Self::HookRun,
         Self::ToolCallScheduling,
+        Self::AgentTree,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -226,6 +231,7 @@ impl SessionEventKind {
             SessionEventKind::ModelSwitch => "model_switch",
             SessionEventKind::HookRun => "hook_run",
             SessionEventKind::ToolCallScheduling => "tool_call_scheduling",
+            SessionEventKind::AgentTree => "agent_tree",
         }
     }
 }
@@ -698,6 +704,34 @@ pub struct ClientSubmissionTerminalReceiptRow {
     pub wire_fingerprint: String,
     pub origin_principal: Option<String>,
     pub disposition: ClientSubmissionTerminalDisposition,
+}
+
+/// Safe terminal payload for a config-only `SetDefaultModel` request.
+///
+/// The request itself acknowledges immediately and the terminal result is an
+/// event, so this row is the durable correlation boundary: it is committed
+/// before the event is attempted and before the adjacent config journal is
+/// retired. The payload is intentionally opaque to `cockpit-db`; protocol
+/// encoding/decoding remains owned by the daemon, while SQLite enforces one
+/// immutable outcome per `(session_id, default_update_id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultModelUpdateReceiptWrite {
+    Recorded,
+    Existing { receipt: DefaultModelUpdateReceipt },
+}
+
+/// One immutable terminal receipt for a config-only default-model mutation.
+///
+/// The authority fields are opaque, daemon-generated values.  Keeping them in
+/// dedicated columns (rather than merely inside the protocol JSON) lets
+/// replay/recovery prove that the caller is still attached to the exact
+/// retained authority and worker configuration generation that linearized the
+/// operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultModelUpdateReceipt {
+    pub outcome_json: String,
+    pub authority_revision: Option<String>,
+    pub config_generation: Option<u64>,
 }
 
 /// Bounded page of session events strictly before a cursor, ordered by `seq`
@@ -1355,6 +1389,118 @@ impl Db {
         .await
     }
 
+    /// Persist the sole safe terminal outcome for a config-only default-model
+    /// request. Repeating the exact payload is an idempotent lookup; attempting
+    /// to replace an existing outcome is an integrity error rather than a
+    /// second terminal state.
+    pub async fn record_default_model_update_receipt(
+        &self,
+        session_id: Uuid,
+        default_update_id: Uuid,
+        receipt: DefaultModelUpdateReceipt,
+    ) -> Result<DefaultModelUpdateReceiptWrite> {
+        self.transaction(move |conn| {
+            Self::record_default_model_update_receipt_conn(
+                conn,
+                session_id,
+                default_update_id,
+                &receipt,
+            )
+        })
+        .await
+    }
+
+    /// Synchronous form used by transactional recovery/maintenance code.
+    pub fn record_default_model_update_receipt_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        default_update_id: Uuid,
+        receipt: &DefaultModelUpdateReceipt,
+    ) -> Result<DefaultModelUpdateReceiptWrite> {
+        let config_generation = receipt
+            .config_generation
+            .map(|generation| i64::try_from(generation).context("default-model receipt generation exceeds SQLite range"))
+            .transpose()?;
+        ensure!(
+            receipt.authority_revision.is_some() == receipt.config_generation.is_some(),
+            "default-model receipt authority revision and config generation must be present together"
+        );
+        if let Some(authority_revision) = &receipt.authority_revision {
+            ensure!(
+                authority_revision.len() == 64
+                    && authority_revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "default-model receipt authority revision is not a SHA-256 digest"
+            );
+        }
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO default_model_update_receipts \
+                    (session_id, default_update_id, outcome_json, authority_revision, config_generation, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session_id.to_string(),
+                    default_update_id.to_string(),
+                    &receipt.outcome_json,
+                    receipt.authority_revision.as_deref(),
+                    config_generation,
+                    now_ms(),
+                ],
+            )
+            .context("recording default-model update terminal receipt")?;
+        if inserted == 1 {
+            return Ok(DefaultModelUpdateReceiptWrite::Recorded);
+        }
+
+        let existing = conn
+            .query_row(
+                "SELECT outcome_json, authority_revision, config_generation FROM default_model_update_receipts \
+                   WHERE session_id = ?1 AND default_update_id = ?2",
+                params![session_id.to_string(), default_update_id.to_string()],
+                |row| {
+                    Ok(DefaultModelUpdateReceipt {
+                        outcome_json: row.get(0)?,
+                        authority_revision: row.get(1)?,
+                        config_generation: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    })
+                },
+            )
+            .context("reading existing default-model update terminal receipt")?;
+        if existing != *receipt {
+            bail!(
+                "default-model update {default_update_id} already has a different terminal receipt"
+            );
+        }
+        Ok(DefaultModelUpdateReceiptWrite::Existing { receipt: existing })
+    }
+
+    /// Look up an immutable config-only terminal receipt for idempotent
+    /// request replay and retained-journal recovery.
+    pub async fn default_model_update_receipt(
+        &self,
+        session_id: Uuid,
+        default_update_id: Uuid,
+    ) -> Result<Option<DefaultModelUpdateReceipt>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT outcome_json, authority_revision, config_generation FROM default_model_update_receipts \
+                   WHERE session_id = ?1 AND default_update_id = ?2",
+                params![session_id.to_string(), default_update_id.to_string()],
+                |row| {
+                    Ok(DefaultModelUpdateReceipt {
+                        outcome_json: row.get(0)?,
+                        authority_revision: row.get(1)?,
+                        config_generation: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    })
+                },
+            )
+            .optional()
+            .context("looking up default-model update terminal receipt")
+        })
+        .await
+    }
+
     pub fn list_session_events_conn(
         conn: &Connection,
         session_id: Uuid,
@@ -1782,6 +1928,7 @@ mod tests {
             "model_switch",
             "hook_run",
             "tool_call_scheduling",
+            "agent_tree",
         ];
         let actual = SessionEventKind::ALL.map(SessionEventKind::as_str);
         assert_eq!(actual, expected);
@@ -1807,9 +1954,9 @@ mod tests {
             SessionEventKind::ToolCallScheduling.as_str(),
             "tool_call_scheduling"
         );
-        // The kind grew the inventory to 28 (appended, not substituted) and
+        // The closed inventory has 29 kinds (appended, not substituted) and
         // every wire string is distinct.
-        assert_eq!(SessionEventKind::ALL.len(), 28);
+        assert_eq!(SessionEventKind::ALL.len(), 29);
         let unique: std::collections::BTreeSet<&str> = kinds.iter().copied().collect();
         assert_eq!(
             unique.len(),
@@ -2219,6 +2366,107 @@ mod tests {
                 .unwrap()
                 .disposition,
             ClientSubmissionTerminalDisposition::PreflightRejected
+        );
+    }
+
+    #[tokio::test]
+    async fn default_model_update_receipt_is_immutable_and_session_scoped() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let other = db.create_session("p", "/y", "Build").await.unwrap();
+        let update_id = Uuid::new_v4();
+        let outcome = r#"{"generation":7,"status":"applied"}"#.to_string();
+        let receipt = DefaultModelUpdateReceipt {
+            outcome_json: outcome.clone(),
+            authority_revision: Some(
+                "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
+                    .to_string(),
+            ),
+            config_generation: Some(7),
+        };
+
+        assert_eq!(
+            db.record_default_model_update_receipt(
+                session.session_id,
+                update_id,
+                receipt.clone(),
+            )
+            .await
+            .unwrap(),
+            DefaultModelUpdateReceiptWrite::Recorded
+        );
+        assert_eq!(
+            db.record_default_model_update_receipt(
+                session.session_id,
+                update_id,
+                receipt.clone(),
+            )
+            .await
+            .unwrap(),
+            DefaultModelUpdateReceiptWrite::Existing {
+                receipt: receipt.clone(),
+            }
+        );
+        assert_eq!(
+            db.default_model_update_receipt(session.session_id, update_id)
+                .await
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            db.default_model_update_receipt(other.session_id, update_id)
+                .await
+                .unwrap(),
+            None,
+            "a terminal receipt cannot cross session ownership"
+        );
+        let error = db
+            .record_default_model_update_receipt(
+                session.session_id,
+                update_id,
+                DefaultModelUpdateReceipt {
+                    outcome_json: r#"{"status":"rejected"}"#.to_string(),
+                    authority_revision: None,
+                    config_generation: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("different terminal receipt"));
+        for conflicting_authority in [
+            DefaultModelUpdateReceipt {
+                outcome_json: outcome.clone(),
+                authority_revision: Some(
+                    "5d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
+                        .to_string(),
+                ),
+                config_generation: Some(7),
+            },
+            DefaultModelUpdateReceipt {
+                outcome_json: outcome.clone(),
+                authority_revision: receipt.authority_revision.clone(),
+                config_generation: Some(8),
+            },
+        ] {
+            let error = db
+                .record_default_model_update_receipt(
+                    session.session_id,
+                    update_id,
+                    conflicting_authority,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("different terminal receipt"),
+                "authority revision and generation are each write-once receipt identity"
+            );
+        }
+        assert_eq!(
+            db.default_model_update_receipt(session.session_id, update_id)
+                .await
+                .unwrap(),
+            Some(receipt),
+            "a conflicting retry cannot replace the original terminal outcome"
         );
     }
 

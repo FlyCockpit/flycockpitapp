@@ -124,6 +124,7 @@ fn switch_outcome_with_epoch(
     AsyncActionPayload::SessionSwitched(Box::new(SessionSwitchOutcome {
         target: SessionTarget::New,
         session_id,
+        session_entry_mode: cockpit_core::daemon::proto::SessionEntryMode::Code,
         short_id: short_id.to_string(),
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],

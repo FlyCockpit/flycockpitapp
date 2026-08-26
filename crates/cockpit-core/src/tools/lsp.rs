@@ -66,7 +66,7 @@ impl Tool for LspTool {
         let line = optional_u32(&args, "line")?;
         let character = optional_u32(&args, "character")?;
         let file = resolve(file, &ctx.cwd);
-        crate::tools::sandbox::check_native_access(
+        let file = crate::tools::sandbox::check_native_access(
             ctx,
             &file,
             crate::tools::shell_sandbox::SandboxPathAccess::Read,
@@ -76,6 +76,14 @@ impl Tool for LspTool {
             return Ok(ToolOutput::text("LSP is unavailable in this context."));
         };
         let config = ctx.config.extended();
+        // LSP servers may read the supplied file while serving navigation.
+        // Reclaim the exact path after the availability/config gates and
+        // directly before handing it to that host-facing subsystem.
+        crate::tools::sandbox::recheck_native_access_effect_boundary(
+            &file,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
         let out = lsp
             .navigate(
                 &ctx.cwd,

@@ -193,13 +193,15 @@ impl Tool for QuestionTool {
         // still find and answer the parked interrupt), then register the
         // wakeup, then emit the event. Registering before emitting
         // guarantees a fast client can't resolve before we're listening.
-        let response = crate::engine::interrupt::raise_and_wait(
+        let response = crate::engine::interrupt::raise_and_wait_with_agent_tree(
             &ctx.session.db,
             &ctx.interrupts,
             ctx.session.id,
             &ctx.agent_id,
+            ctx.agent_instance_id,
             &description,
             set.clone(),
+            crate::agent_tree::HostDecisionSubject::UserQuestion,
             "question tool",
         )
         .await

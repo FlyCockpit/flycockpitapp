@@ -315,7 +315,71 @@ impl Tool for AddPackageTool {
             }
         }
 
-        let row = match packages::add_git(&ctx.session.db, &ctx.cwd, &identifier, &repo, None, true)
+        // Approval is bound to the registry's concrete result, not the
+        // earlier display string. Re-resolve immediately before entering the
+        // clone/registry boundary and derive the whole candidate again: a
+        // registry URL change (or any cancellation/revision fence observed by
+        // the concrete boundary) refuses this invocation instead of letting
+        // the once-only approval authorize a different repository.
+        let current_identifier = packages::ecosystem_slug(eco, name);
+        let current_repo = match resolve_repo_url(eco, name).await {
+            Ok(RepoResolution::Resolved(url)) => url,
+            Ok(RepoResolution::NotDeclared) => {
+                return Ok(ToolOutput::text(format!(
+                    "The {} registry no longer declares a source repo for `{name}` after approval; refusing to clone it.",
+                    eco.registry_label()
+                )));
+            }
+            Err(error) => {
+                return Ok(ToolOutput::text(format!(
+                    "Could not re-check `{name}` on the {} registry before cloning: {error}",
+                    eco.registry_label()
+                )));
+            }
+        };
+        let current_rationale = format!(
+            "`{name}`'s official {} registry declares this repository.",
+            eco.registry_label()
+        );
+        if !clone_candidate_matches_approval(
+            &identifier,
+            &repo,
+            &rationale,
+            &current_identifier,
+            &current_repo,
+            &current_rationale,
+        ) {
+            return Ok(ToolOutput::text(format!(
+                "The registry source for `{identifier}` changed after approval; refusing to clone a different repository."
+            )));
+        }
+
+        // `add_git_with_approved_clone` is the concrete network/filesystem
+        // handoff. Re-check and atomically claim the exact immutable
+        // registry-derived candidate immediately before it can create the
+        // clone or registration row; the prior approval helper is never an
+        // ambient permission for a later URL or package mutation.
+        crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+            "package_clone_and_registration",
+            &[serde_json::json!({
+                "execute": {
+                    "identifier": &current_identifier,
+                    "clone_url": &current_repo,
+                    "rationale": &current_rationale,
+                }
+            })],
+        )
+        .await?;
+
+        let row = match packages::add_git_with_approved_clone(
+            &ctx.session.db,
+            &ctx.cwd,
+            &current_identifier,
+            &current_repo,
+            None,
+            true,
+            &current_rationale,
+        )
             .await
         {
             Ok(row) => row,
@@ -349,6 +413,23 @@ fn identifier_matches(identifier: &str, target: &str) -> bool {
         .is_some_and(|(_, rest)| rest == target)
 }
 
+/// A one-use package approval authorizes the exact registry-derived clone
+/// candidate, rather than just its package name. Keep this comparison separate
+/// from network resolution so the recheck's fail-closed boundary remains
+/// directly testable.
+fn clone_candidate_matches_approval(
+    approved_identifier: &str,
+    approved_repo: &str,
+    approved_rationale: &str,
+    current_identifier: &str,
+    current_repo: &str,
+    current_rationale: &str,
+) -> bool {
+    approved_identifier == current_identifier
+        && approved_repo == current_repo
+        && approved_rationale == current_rationale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +441,26 @@ mod tests {
         assert!(identifier_matches("cargo:tokio", "tokio"));
         assert!(identifier_matches("npm:@tanstack/query", "@tanstack/query"));
         assert!(!identifier_matches("cargo:tokio", "serde"));
+    }
+
+    #[test]
+    fn package_clone_recheck_rejects_changed_registry_url() {
+        assert!(!clone_candidate_matches_approval(
+            "cargo:tokio",
+            "https://github.com/tokio-rs/tokio",
+            "`tokio`'s official crates.io registry declares this repository.",
+            "cargo:tokio",
+            "https://example.invalid/rebound",
+            "`tokio`'s official crates.io registry declares this repository.",
+        ));
+        assert!(clone_candidate_matches_approval(
+            "cargo:tokio",
+            "https://github.com/tokio-rs/tokio",
+            "`tokio`'s official crates.io registry declares this repository.",
+            "cargo:tokio",
+            "https://github.com/tokio-rs/tokio",
+            "`tokio`'s official crates.io registry declares this repository.",
+        ));
     }
 
     #[tokio::test]

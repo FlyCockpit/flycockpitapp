@@ -2758,6 +2758,7 @@ async fn recovered_terminals_carry_a_generation_the_client_gate_accepts() {
     };
     let selection_id = uuid::Uuid::new_v4();
     let default_update_id = uuid::Uuid::new_v4();
+    let (receipt_ready, receipt_result) = tokio::sync::oneshot::channel();
     driver
         .run_control(
             DriverControl::EmitRecoveredDefaultTerminals {
@@ -2776,9 +2777,17 @@ async fn recovered_terminals_carry_a_generation_the_client_gate_accepts() {
                         requested: Some(requested.clone()),
                     },
                     RecoveredTransaction {
-                        correlation: TransactionCorrelation::DefaultUpdate {
+                        correlation: TransactionCorrelation::RetainedDefaultUpdate {
                             default_update_id,
                             session_id,
+                            authority: Some(
+                                crate::config::providers::DefaultUpdateAuthorityBinding::new(
+                                    "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
+                                        .to_string(),
+                                    3,
+                                )
+                                .unwrap(),
+                            ),
                         },
                         outcome: RecoveredOutcome::Restored {
                             restored: None,
@@ -2789,9 +2798,10 @@ async fn recovered_terminals_carry_a_generation_the_client_gate_accepts() {
                     },
                     // A transaction for a different session must be ignored.
                     RecoveredTransaction {
-                        correlation: TransactionCorrelation::DefaultUpdate {
+                        correlation: TransactionCorrelation::RetainedDefaultUpdate {
                             default_update_id: uuid::Uuid::new_v4(),
                             session_id: uuid::Uuid::new_v4(),
+                            authority: None,
                         },
                         outcome: RecoveredOutcome::Restored {
                             restored: None,
@@ -2801,10 +2811,34 @@ async fn recovered_terminals_carry_a_generation_the_client_gate_accepts() {
                         requested: Some(requested.clone()),
                     },
                 ],
+                respond_to: Some(receipt_ready),
             },
             &tx,
         )
         .await;
+    receipt_result
+        .await
+        .expect("recovered terminal driver acknowledges its durable receipt")
+        .expect("recovered terminal receipt is persisted before event fan-out");
+    let stored_receipt = driver
+        .session
+        .db
+        .default_model_update_receipt(session_id, default_update_id)
+        .await
+        .expect("read durable recovered default receipt")
+        .expect("default update terminal receipt is present");
+    assert!(
+        stored_receipt
+            .outcome_json
+            .contains("effective_default_restored_after_boundary"),
+        "the durable receipt carries the exact safe terminal outcome"
+    );
+    assert_eq!(
+        stored_receipt.authority_revision.as_deref(),
+        Some("4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"),
+        "even a recovered rejection remains tied to its retained authority"
+    );
+    assert_eq!(stored_receipt.config_generation, Some(3));
 
     match rx.try_recv().expect("recovered model-selection terminal") {
         TurnEvent::ModelSelectionResult {
@@ -2892,9 +2926,17 @@ async fn a_recovered_default_update_never_switches_the_live_session() {
         .run_control(
             DriverControl::EmitRecoveredDefaultTerminals {
                 transactions: vec![RecoveredTransaction {
-                    correlation: TransactionCorrelation::DefaultUpdate {
+                    correlation: TransactionCorrelation::RetainedDefaultUpdate {
                         default_update_id,
                         session_id,
+                        authority: Some(
+                            crate::config::providers::DefaultUpdateAuthorityBinding::new(
+                                "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
+                                    .to_string(),
+                                3,
+                            )
+                            .unwrap(),
+                        ),
                     },
                     outcome: RecoveredOutcome::Applied {
                         selection: Some(recovered.clone()),
@@ -2903,6 +2945,7 @@ async fn a_recovered_default_update_never_switches_the_live_session() {
                     scope_label: "user".into(),
                     requested: Some(recovered.clone()),
                 }],
+                respond_to: None,
             },
             &tx,
         )
@@ -2926,12 +2969,17 @@ async fn a_recovered_default_update_never_switches_the_live_session() {
                 crate::daemon::proto::DefaultModelStandaloneOutcome::Applied {
                     selection,
                     scope_label,
+                    generation,
                     ..
                 },
         } => {
             assert_eq!(got, default_update_id);
             assert_eq!(selection.as_ref(), Some(&recovered));
             assert_eq!(scope_label, "user");
+            assert_eq!(
+                generation, 3,
+                "recovered config-only terminal preserves its sealed config generation"
+            );
         }
         other => panic!("expected a recovered DefaultModelUpdateResult, got {other:?}"),
     }

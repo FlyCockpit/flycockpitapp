@@ -12,6 +12,10 @@ const LOST_RESTART_REPORT: &str = "lost: daemon restarted before this delegation
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationStatus {
+    /// The durable task/payload record exists, but no executor has been
+    /// advertised yet. A child leaves this state only in the transaction that
+    /// stores its first recoverable continuation snapshot.
+    Created,
     Running,
     Backgrounded,
     Completed,
@@ -22,7 +26,8 @@ pub enum DelegationStatus {
 }
 
 impl DelegationStatus {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
+        Self::Created,
         Self::Running,
         Self::Backgrounded,
         Self::Completed,
@@ -34,6 +39,7 @@ impl DelegationStatus {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Created => "created",
             Self::Running => "running",
             Self::Backgrounded => "backgrounded",
             Self::Completed => "completed",
@@ -46,6 +52,7 @@ impl DelegationStatus {
 
     fn from_str(value: &str) -> Self {
         match value {
+            "created" => Self::Created,
             "running" => Self::Running,
             "backgrounded" => Self::Backgrounded,
             "completed" => Self::Completed,
@@ -99,6 +106,116 @@ struct TaskDelegationJobWrite {
     parent_agent: String,
     original_args_json: Option<String>,
     children: Vec<DelegationChildInitOwned>,
+}
+
+/// Decode the DAG embedded in the canonical batch job record. The engine has
+/// already validated this at tool ingress, but the storage boundary repeats the
+/// checks before inserting foreign-keyed rows so recovery never sees an edge
+/// that could not have been scheduled by a live executor.
+fn declared_batch_dependency_edges(
+    original_args_json: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let Some(original_args_json) = original_args_json else {
+        return Ok(Vec::new());
+    };
+    let args: serde_json::Value = serde_json::from_str(original_args_json)
+        .context("decoding task delegation original args for dependency edges")?;
+    let Some(entries) = args.get("entries") else {
+        // Single and interactive delegations have no batch dependency graph.
+        return Ok(Vec::new());
+    };
+    let entries = entries
+        .as_array()
+        .context("batch task delegation entries must be an array")?;
+    let mut labels = std::collections::HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let label = entry
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .context("batch task delegation entry is missing label")?;
+        anyhow::ensure!(
+            labels.insert(label.to_string()),
+            "batch task delegation contains duplicate label `{label}`"
+        );
+    }
+
+    let mut edges = Vec::new();
+    let mut graph = std::collections::HashMap::<String, Vec<String>>::new();
+    for entry in entries {
+        let label = entry
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .expect("labels were validated above");
+        let dependencies = match entry.get("depends_on") {
+            None => Vec::new(),
+            Some(value) => value
+                .as_array()
+                .with_context(|| format!("batch entry `{label}` has non-array depends_on"))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|dependency| !dependency.is_empty())
+                        .map(str::to_string)
+                        .with_context(|| {
+                            format!("batch entry `{label}` has invalid depends_on label")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mut unique_dependencies = std::collections::HashSet::new();
+        for dependency in &dependencies {
+            anyhow::ensure!(
+                dependency != label,
+                "batch entry `{label}` cannot depend on itself"
+            );
+            anyhow::ensure!(
+                labels.contains(dependency),
+                "batch entry `{label}` depends on unknown label `{dependency}`"
+            );
+            anyhow::ensure!(
+                unique_dependencies.insert(dependency.as_str()),
+                "batch entry `{label}` lists dependency `{dependency}` more than once"
+            );
+            edges.push((label.to_string(), dependency.clone()));
+        }
+        graph.insert(label.to_string(), dependencies);
+    }
+
+    fn visit(
+        label: &str,
+        graph: &std::collections::HashMap<String, Vec<String>>,
+        visiting: &mut std::collections::HashSet<String>,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Result<()> {
+        if visited.contains(label) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            visiting.insert(label.to_string()),
+            "batch dependency cycle includes `{label}`"
+        );
+        for dependency in graph
+            .get(label)
+            .expect("dependency labels were validated above")
+        {
+            visit(dependency, graph, visiting, visited)?;
+        }
+        visiting.remove(label);
+        visited.insert(label.to_string());
+        Ok(())
+    }
+
+    let mut visiting = std::collections::HashSet::new();
+    let mut visited = std::collections::HashSet::new();
+    for label in &labels {
+        visit(label, &graph, &mut visiting, &mut visited)?;
+    }
+    Ok(edges)
 }
 
 impl From<TaskDelegationJobUpsert<'_>> for TaskDelegationJobWrite {
@@ -205,6 +322,101 @@ pub struct DelegationChildDetail {
 }
 
 impl Db {
+    /// Publish one or more newly-created delegated executors only after every
+    /// exact first continuation is durable.  A task child must never be
+    /// visible as `running` with a null snapshot: such a row has no legitimate
+    /// restart owner and used to strand a tree child indefinitely after a
+    /// crash between launch bookkeeping and the first model turn.
+    ///
+    /// This is intentionally a batch operation.  A batch task starts all
+    /// sibling lifecycle nodes as one graph, so publishing the first half and
+    /// failing the second would manufacture a partial recovery set.
+    pub async fn activate_task_delegation_children_with_snapshots(
+        &self,
+        task_call_id: &str,
+        snapshots: Vec<(String, String)>,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            !snapshots.is_empty(),
+            "task delegation activation requires at least one child snapshot"
+        );
+        let task_call_id = task_call_id.to_owned();
+        let now = Utc::now().timestamp();
+        self.transaction(move |conn| {
+            let mut labels = std::collections::HashSet::with_capacity(snapshots.len());
+            for (label, snapshot_json) in &snapshots {
+                anyhow::ensure!(
+                    labels.insert(label),
+                    "task delegation activation contains duplicate label `{label}`"
+                );
+                anyhow::ensure!(
+                    !snapshot_json.trim().is_empty(),
+                    "task delegation activation snapshot is empty"
+                );
+                let changed = conn.execute(
+                    "UPDATE task_delegation_children
+                        SET status = 'running', snapshot_json = ?3,
+                            started_at = COALESCE(started_at, ?4), updated_at = ?4
+                      WHERE task_call_id = ?1 AND label = ?2 AND status = 'created'",
+                    params![&task_call_id, label, snapshot_json, now],
+                )?;
+                if changed == 1 {
+                    continue;
+                }
+                // A transport retry can arrive after the executor has already
+                // advanced its snapshot. Never overwrite that continuation;
+                // merely prove that this exact child was published before the
+                // retry is allowed to bind another in-memory handle.
+                let existing: Option<(String, Option<String>)> = conn
+                    .query_row(
+                        "SELECT status, snapshot_json FROM task_delegation_children
+                          WHERE task_call_id = ?1 AND label = ?2",
+                        params![&task_call_id, label],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((status, existing_snapshot)) = existing else {
+                    anyhow::bail!("task delegation activation child `{label}` is missing");
+                };
+                anyhow::ensure!(
+                    matches!(status.as_str(), "running" | "backgrounded" | "paused_pending_tool")
+                        && existing_snapshot.is_some(),
+                    "task delegation child `{label}` is not safely published"
+                );
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Replace the durable continuation snapshot for one still-live child.
+    /// Recovery treats this as executor state, not an optional diagnostic: a
+    /// stale or malformed snapshot is rejected by the caller rather than
+    /// silently starting the task from a different prompt.
+    pub async fn persist_task_delegation_snapshot(
+        &self,
+        task_call_id: &str,
+        label: &str,
+        snapshot_json: &str,
+    ) -> Result<bool> {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        let snapshot_json = snapshot_json.to_owned();
+        let now = Utc::now().timestamp();
+        self.write(move |conn| {
+            let changed = conn.execute(
+                "UPDATE task_delegation_children
+                    SET snapshot_json = ?3, updated_at = ?4
+                  WHERE task_call_id = ?1
+                    AND label = ?2
+                    AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
+                params![task_call_id, label, snapshot_json, now],
+            )?;
+            Ok(changed == 1)
+        })
+        .await
+    }
+
     pub async fn upsert_task_delegation_job(
         &self,
         session_id: Uuid,
@@ -299,6 +511,10 @@ impl Db {
         let parent_agent = job.parent_agent;
         let original_args_json = job.original_args_json;
         let children = job.children;
+        // Treat the persisted original args as the durable source of the batch
+        // graph. Re-validate before writing so a malformed or hostile caller
+        // cannot create edges that the executor would not accept.
+        let dependency_edges = declared_batch_dependency_edges(original_args_json.as_deref())?;
         let existing_owner: Option<String> = conn
             .query_row(
                 "SELECT parent_session_id FROM task_delegation_jobs WHERE task_call_id = ?1",
@@ -340,7 +556,7 @@ impl Db {
                         task_call_id, label, child_uuid, child_agent, model, status, output_dir,
                         requested_cwd, resolved_cwd, todo_ids_json, started_at,
                         created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8, ?9, ?10, ?10, ?10)
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?8, ?9, NULL, ?10, ?10)
                      ON CONFLICT(task_call_id, label) DO UPDATE SET
                         child_agent = excluded.child_agent,
                         model = excluded.model,
@@ -363,6 +579,20 @@ impl Db {
                 ],
             )
             .context("upserting task delegation child")?;
+        }
+        conn.execute(
+            "DELETE FROM task_delegation_dependency_edges WHERE task_call_id = ?1",
+            [&task_call_id],
+        )
+        .context("replacing task delegation dependency edges")?;
+        for (dependent_label, prerequisite_label) in dependency_edges {
+            conn.execute(
+                "INSERT INTO task_delegation_dependency_edges (
+                        task_call_id, dependent_label, prerequisite_label
+                 ) VALUES (?1, ?2, ?3)",
+                params![&task_call_id, dependent_label, prerequisite_label],
+            )
+            .context("persisting task delegation dependency edge")?;
         }
         Ok(())
     }
@@ -743,57 +973,13 @@ impl Db {
     }
 
     pub async fn reconcile_orphaned_task_delegations(&self) -> Result<usize> {
-        let now = Utc::now().timestamp();
-        self.write(move |conn| {
-            immediate_transaction(
-                conn,
-                "beginning orphaned delegation reconcile",
-                "committing orphaned delegation reconcile",
-                || {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT task_call_id, label
-                           FROM task_delegation_children
-                          WHERE status IN ('running', 'backgrounded', 'paused_pending_tool')
-                          ORDER BY task_call_id ASC, label ASC",
-                        )
-                        .context("preparing orphaned delegation child scan")?;
-                    let rows = stmt
-                        .query_map([], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                        })
-                        .context("querying orphaned delegation children")?
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                        .context("decoding orphaned delegation children")?;
-                    drop(stmt);
-
-                    for (task_call_id, label) in &rows {
-                        mark_child_lost(conn, task_call_id, label, now)?;
-                    }
-
-                    let mut job_stmt = conn
-                        .prepare(
-                            "SELECT DISTINCT task_call_id
-                           FROM task_delegation_jobs
-                          WHERE status IN ('running', 'backgrounded')",
-                        )
-                        .context("preparing orphaned delegation job scan")?;
-                    let jobs = job_stmt
-                        .query_map([], |row| row.get::<_, String>(0))
-                        .context("querying orphaned delegation jobs")?
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                        .context("decoding orphaned delegation jobs")?;
-                    drop(job_stmt);
-
-                    for task_call_id in &jobs {
-                        reconcile_job_after_lost(conn, task_call_id, now)?;
-                    }
-
-                    Ok(rows.len())
-                },
-            )
-        })
-        .await
+        // Restart recovery reattaches these executors from their durable
+        // launch payload/snapshot. A missing in-memory worker is never proof
+        // that a child was lost, so this historical boot hook deliberately
+        // performs no lifecycle mutation. Explicit operator cancellation and
+        // irrecoverable descriptor validation retain their narrow terminal
+        // paths elsewhere.
+        Ok(0)
     }
 
     pub async fn enqueue_task_delegation_steer(
@@ -1043,7 +1229,96 @@ mod tests {
         )
         .await
         .unwrap();
+        db.activate_task_delegation_children_with_snapshots(
+            task_call_id,
+            children
+                .iter()
+                .map(|label| {
+                    (
+                        (*label).to_string(),
+                        r#"{"version":1,"history":[]}"#.to_string(),
+                    )
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
         session.session_id
+    }
+
+    async fn activate_test_children(db: &Db, task_call_id: &str, labels: &[&str]) {
+        db.activate_task_delegation_children_with_snapshots(
+            task_call_id,
+            labels
+                .iter()
+                .map(|label| {
+                    (
+                        (*label).to_string(),
+                        r#"{"version":1,"history":[]}"#.to_string(),
+                    )
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_dependency_edges_are_durable_and_reject_cycles() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
+        let children = ["independent", "base", "dependent"]
+            .iter()
+            .map(|label| DelegationChildInit {
+                label,
+                child_agent: "explore",
+                model: None,
+                output_dir: None,
+                requested_cwd: None,
+                resolved_cwd: None,
+                todo_ids_json: None,
+            })
+            .collect::<Vec<_>>();
+        let args = r#"{
+            "entries": [
+                {"label":"independent","depends_on":[]},
+                {"label":"base","depends_on":[]},
+                {"label":"dependent","depends_on":["base"]}
+            ]
+        }"#;
+        db.upsert_task_delegation_job(
+            session.session_id,
+            "dependency-job",
+            None,
+            "Build",
+            Some(args),
+            &children,
+        )
+        .await
+        .unwrap();
+        let edges = db
+            .read(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT dependent_label, prerequisite_label
+                       FROM task_delegation_dependency_edges
+                      WHERE task_call_id = 'dependency-job'",
+                )?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(edges, vec![("dependent".to_string(), "base".to_string())]);
+
+        let cycle = r#"{
+            "entries": [
+                {"label":"left","depends_on":["right"]},
+                {"label":"right","depends_on":["left"]}
+            ]
+        }"#;
+        assert!(declared_batch_dependency_edges(Some(cycle)).is_err());
     }
 
     #[tokio::test]
@@ -1056,6 +1331,54 @@ mod tests {
         assert_eq!(rows[0].task_call_id, "task-async-roundtrip");
         assert_eq!(rows[0].label, "default");
         assert_eq!(rows[0].status, DelegationStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn child_is_not_running_until_its_initial_snapshot_is_published() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
+        let children = [DelegationChildInit {
+            label: "default",
+            child_agent: "explore",
+            model: None,
+            output_dir: None,
+            requested_cwd: None,
+            resolved_cwd: None,
+            todo_ids_json: None,
+        }];
+        db.upsert_task_delegation_job(
+            session.session_id,
+            "task-initial-snapshot",
+            None,
+            "Build",
+            None,
+            &children,
+        )
+        .await
+        .unwrap();
+        let before = db
+            .list_task_delegation_children(session.session_id)
+            .await
+            .unwrap();
+        assert_eq!(before[0].status, DelegationStatus::Created);
+        assert!(before[0].started_at.is_none());
+
+        assert!(db
+            .activate_task_delegation_children_with_snapshots(
+                "task-initial-snapshot",
+                vec![(
+                    "default".to_string(),
+                    r#"{"version":2,"history":[],"next_prompt":{"User":{"content":[]}}}"#.to_string(),
+                )],
+            )
+            .await
+            .unwrap());
+        let after = db
+            .list_task_delegation_children(session.session_id)
+            .await
+            .unwrap();
+        assert_eq!(after[0].status, DelegationStatus::Running);
+        assert!(after[0].started_at.is_some());
     }
 
     #[tokio::test]
@@ -1264,6 +1587,8 @@ mod tests {
         .await
         .unwrap();
 
+        activate_test_children(&db, "task-1", &["default"]).await;
+
         assert!(
             db.background_task_delegation_child("task-1", "default")
                 .await
@@ -1322,6 +1647,8 @@ mod tests {
         .await
         .unwrap();
 
+        activate_test_children(&db, "task-1", &["default"]).await;
+
         db.enqueue_task_delegation_steer("task-1", "default", "first", "agent:task-1")
             .await
             .unwrap();
@@ -1378,7 +1705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_orphaned_task_delegations_marks_active_children_lost_once() {
+    async fn reconcile_orphaned_task_delegations_preserves_recoverable_children() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
         db.upsert_task_delegation_job(
@@ -1400,17 +1727,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(db.reconcile_orphaned_task_delegations().await.unwrap(), 1);
+        activate_test_children(&db, "task-1", &["default"]).await;
+
+        assert_eq!(db.reconcile_orphaned_task_delegations().await.unwrap(), 0);
         assert_eq!(db.reconcile_orphaned_task_delegations().await.unwrap(), 0);
 
         let rows = db
             .list_task_delegation_children(session.session_id)
             .await
             .unwrap();
-        assert_eq!(rows[0].status, DelegationStatus::Lost);
-        assert_eq!(rows[0].report.as_deref(), Some(LOST_RESTART_REPORT));
-        assert!(rows[0].finished_at.is_some());
-        assert_eq!(job_status(&db, "task-1").await, DelegationStatus::Lost);
+        assert_eq!(rows[0].status, DelegationStatus::Running);
+        assert!(rows[0].report.is_none());
+        assert!(rows[0].finished_at.is_none());
+        assert_eq!(job_status(&db, "task-1").await, DelegationStatus::Running);
     }
 
     #[tokio::test]
@@ -1446,6 +1775,7 @@ mod tests {
         )
         .await
         .unwrap();
+        activate_test_children(&db, "task-1", &["done", "orphan"]).await;
         db.complete_task_delegation_child("task-1", "done", "done report", false, None)
             .await
             .unwrap();
@@ -1468,7 +1798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lost_reconciled_child_delivers_report_once() {
+    async fn restart_reconcile_leaves_child_for_executor_recovery() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
         db.upsert_task_delegation_job(
@@ -1490,26 +1820,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(db.reconcile_orphaned_task_delegations().await.unwrap(), 1);
+        activate_test_children(&db, "task-1", &["default"]).await;
+
+        assert_eq!(db.reconcile_orphaned_task_delegations().await.unwrap(), 0);
         let rows = db
             .undelivered_task_delegation_children("task-1")
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, DelegationStatus::Lost);
-        assert_eq!(rows[0].report.as_deref(), Some(LOST_RESTART_REPORT));
-
-        assert!(
-            db.mark_task_delegation_child_delivered("task-1", "default")
-                .await
-                .unwrap()
-        );
-        assert!(
-            db.undelivered_task_delegation_children("task-1")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(rows.is_empty());
+        let children = db
+            .list_task_delegation_children(session.session_id)
+            .await
+            .unwrap();
+        assert_eq!(children[0].status, DelegationStatus::Running);
     }
 
     #[tokio::test]

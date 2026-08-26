@@ -204,6 +204,7 @@ describe("native session event helpers", () => {
     const runtime = nativeAttachRuntimeState(
       {
         session_id: sessionId,
+        session_entry_mode: "code",
         short_id: "s1",
         project_root: "/work/app",
         project_id: "project_1",

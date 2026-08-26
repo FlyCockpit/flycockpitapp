@@ -64,6 +64,8 @@ CREATE TABLE sessions (
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
     active_model_revision INTEGER NOT NULL DEFAULT 0 CHECK (active_model_revision >= 0),
     session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
+    session_entry_mode TEXT NOT NULL DEFAULT 'code'
+        CHECK (session_entry_mode IN ('code', 'assistant', 'computer')),
     tool_surface_override_json TEXT CHECK (
         tool_surface_override_json IS NULL OR (
             json_valid(tool_surface_override_json)
@@ -1201,9 +1203,22 @@ CREATE TABLE agent_instances (
     agent_instance_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
     parent_agent_instance_id TEXT,
-    task_delegation_job_id TEXT UNIQUE,
+    -- A task job can have several child agents.  The child UUID below is the
+    -- stable one-to-one binding; making the job id unique would silently
+    -- reject every sibling after the first.
+    task_delegation_job_id TEXT,
     task_delegation_child_uuid TEXT UNIQUE,
+    -- Stable daemon runtime identity for root/utility agents that are not
+    -- represented by a task child.  It is session-scoped and never carries
+    -- model context or a user-visible display name.
+    runtime_key TEXT,
     resolved_profile_snapshot_id TEXT,
+    -- Opaque daemon-owned workspace identity.  This is deliberately not a
+    -- resolver packet or a client-supplied filesystem authority.
+    workspace_ref TEXT,
+    -- Auto-resolution starts disabled and can only be enabled for this one
+    -- durable agent by a host-resolved profile/session reduction.
+    auto_answer_enabled INTEGER NOT NULL DEFAULT 0 CHECK (auto_answer_enabled IN (0, 1)),
     state TEXT NOT NULL CHECK (state IN (
         'created', 'running', 'waiting_for_user', 'waiting_for_approval',
         'completed', 'failed', 'cancelled'
@@ -1212,6 +1227,7 @@ CREATE TABLE agent_instances (
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (agent_instance_id, session_id),
+    UNIQUE (session_id, runtime_key),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (parent_agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
@@ -1227,17 +1243,117 @@ CREATE INDEX idx_agent_instances_parent
     ON agent_instances(parent_agent_instance_id)
     WHERE parent_agent_instance_id IS NOT NULL;
 
+CREATE INDEX idx_agent_instances_task_job
+    ON agent_instances(session_id, task_delegation_job_id)
+    WHERE task_delegation_job_id IS NOT NULL;
+
+-- The root has no task-delegation row to borrow for restart.  Its exact
+-- private continuation is therefore stored in its own one-per-session record
+-- before a late steer can cross a provider boundary.  The nullable
+-- continuation id is a durable proof that the snapshot belongs to the
+-- accepted steer rather than an arbitrary earlier root turn.
+CREATE TABLE root_agent_continuations (
+    session_id TEXT PRIMARY KEY,
+    agent_instance_id TEXT NOT NULL,
+    continuation_id TEXT,
+    snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+    updated_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_root_agent_continuations_recovery
+    ON root_agent_continuations(session_id, agent_instance_id, continuation_id);
+
+-- Recursive noninteractive children are not compatibility `task` rows. Their
+-- immutable launch descriptor and newest exact continuation therefore have a
+-- dedicated one-to-one durable record rather than borrowing (and overwriting)
+-- the enclosing task child's snapshot.
+CREATE TABLE recursive_noninteractive_executors (
+    agent_instance_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    parent_agent_instance_id TEXT NOT NULL,
+    launch_json TEXT NOT NULL CHECK (json_valid(launch_json) AND json_type(launch_json) = 'object'),
+    snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json) AND json_type(snapshot_json) = 'object'),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_recursive_noninteractive_executors_parent
+    ON recursive_noninteractive_executors(session_id, parent_agent_instance_id);
+
+-- A recursive batch persists each child outcome before releasing declared
+-- dependents.  The parent checkpoint can therefore survive a crash midway
+-- through a DAG without re-running an already-completed predecessor or
+-- losing its authored report during final aggregation.
+CREATE TABLE recursive_noninteractive_outcomes (
+    agent_instance_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    parent_agent_instance_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    child_agent TEXT NOT NULL,
+    report TEXT NOT NULL,
+    failed INTEGER NOT NULL CHECK (failed IN (0, 1)),
+    completed_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_recursive_noninteractive_outcomes_parent
+    ON recursive_noninteractive_outcomes(session_id, parent_agent_instance_id);
+
+-- One restart epoch may schedule a durable agent revision once. The daemon
+-- supplies a fresh boot UUID, so a later crash/restart can resume the same
+-- still-running revision without turning duplicate recovery calls in one boot
+-- into duplicate workers.
+CREATE TABLE agent_resume_claims (
+    agent_instance_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    agent_revision INTEGER NOT NULL CHECK (agent_revision >= 0),
+    recovery_epoch TEXT NOT NULL,
+    claimed_at_unix_ms INTEGER NOT NULL,
+    -- Claim consumption happens only after a fresh executor has accepted the
+    -- continuation.  A row with this field NULL is observable recovery work,
+    -- never a log-and-drop marker.
+    consumed_at_unix_ms INTEGER,
+    PRIMARY KEY (agent_instance_id, agent_revision, recovery_epoch),
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+);
+
 CREATE TABLE decision_requests (
     decision_request_id TEXT PRIMARY KEY,
     agent_instance_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
+    -- These two references are copied only from the owning durable agent in
+    -- the decision-creation transaction.  Presentation selectors supplied by
+    -- a tool, model, or protocol client are deliberately never persisted.
+    -- `task_call_id_ref` is an opaque compatibility/task lineage id, not a
+    -- prompt or a capability; `workspace_ref` is the daemon-minted workspace
+    -- identity already bound to the owner.
+    task_call_id_ref TEXT,
+    workspace_ref TEXT,
     options_contract_json TEXT NOT NULL,
     free_text_contract_json TEXT,
     recommendation_json TEXT,
     rationale_redaction_class TEXT NOT NULL CHECK (rationale_redaction_class IN ('public', 'sensitive', 'secret')),
+    -- Host-classified decision category.  The resolver never accepts an
+    -- agent-authored risk label as permission to auto-resolve.
+    decision_class TEXT NOT NULL CHECK (decision_class IN (
+        'user_question', 'low_risk', 'credential', 'authorization', 'destructive',
+        'external_action', 'publish', 'purchase', 'production', 'host_approval'
+    )),
+    -- Present only for a host-approval decision. The identity is allocated by
+    -- the trusted daemon host and checked again in the terminal CAS.
+    host_approval_operation_id TEXT UNIQUE,
     deadline_unix_ms INTEGER,
     policy_receipt_json TEXT NOT NULL,
-    resolver_route TEXT CHECK (resolver_route IN ('user', 'policy', 'utility', 'timeout', 'cancellation')),
+    resolver_route TEXT CHECK (resolver_route IN (
+        'user', 'warm_parent', 'policy', 'utility', 'timeout', 'cancellation'
+    )),
     state TEXT NOT NULL CHECK (state IN ('pending', 'resolving', 'answered', 'auto_resolved', 'timed_out', 'cancelled')),
     revision INTEGER NOT NULL CHECK (revision >= 0),
     created_at_unix_ms INTEGER NOT NULL,
@@ -1250,12 +1366,38 @@ CREATE TABLE decision_requests (
 CREATE INDEX idx_decision_requests_agent_state
     ON decision_requests(agent_instance_id, state, updated_at_unix_ms);
 
+-- Bounded recovery scans use this exact keyset order. Keeping the state
+-- predicate in the index makes a large settled history irrelevant to each
+-- maintenance turn, while the UUID tie-breaker prevents equal timestamps
+-- from being skipped.
+CREATE INDEX idx_decision_requests_recoverable_page
+    ON decision_requests(session_id, created_at_unix_ms, decision_request_id)
+    WHERE state IN ('pending', 'resolving');
+
+-- The public decision contract exposes only daemon-minted opaque option
+-- tokens.  This table is the private continuation-side mapping back to the
+-- caller's local option ID; it is deliberately never joined into Attention,
+-- resolver packets, or daemon wire DTOs.
+CREATE TABLE decision_private_option_mappings (
+    decision_request_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    opaque_option_id TEXT NOT NULL,
+    continuation_option_id TEXT NOT NULL,
+    PRIMARY KEY (decision_request_id, opaque_option_id),
+    UNIQUE (decision_request_id, continuation_option_id),
+    FOREIGN KEY (decision_request_id, session_id)
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE
+);
+
 CREATE TABLE decision_receipts (
     decision_request_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
     terminal_state TEXT NOT NULL CHECK (terminal_state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')),
     terminal_revision INTEGER NOT NULL CHECK (terminal_revision >= 0),
     receipt_json TEXT NOT NULL,
+    -- The approved answer envelope is an internal durable continuation input.
+    -- It is never projected through Attention or event APIs.
+    resume_payload_json TEXT,
     session_event_seq INTEGER,
     created_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (decision_request_id, session_id)
@@ -1279,6 +1421,666 @@ CREATE TABLE agent_transition_receipts (
         REFERENCES session_events(session_id, seq) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
+-- Only the trusted daemon host creates these identities, before it raises a
+-- host-approval decision.  Resolution joins this record rather than trusting
+-- a caller-authored boolean or a string-shaped "operation" token.
+CREATE TABLE agent_host_approval_operations (
+    operation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    -- Immutable host-owned effect binding. The prompt UUID alone is never
+    -- authority: the exact operation class and canonical candidate facts must
+    -- match again at the consume CAS immediately before the host resumes it.
+    operation_kind TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 128),
+    canonical_input_json TEXT NOT NULL CHECK (json_valid(canonical_input_json)),
+    input_digest TEXT NOT NULL CHECK (length(input_digest) = 64),
+    -- The real host composition point reserves the final operation before an
+    -- interactive decision exists. Binding it later is a one-way operation
+    -- checked by the trigger below; decision creation may never mint one.
+    decision_request_id TEXT UNIQUE,
+    -- `dispatching` is deliberately not replayable.  It is reached only
+    -- after a durable effect handoff has committed and before the host may
+    -- invoke a non-idempotent command/MCP/harness/filesystem action. A crash
+    -- there is submission-unknown, never permission to run it again.
+    state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'dispatching', 'completed', 'rejected', 'cancelled', 'submission_unknown')),
+    -- Approval belongs to one exact live executor revision.  The consume CAS
+    -- compares this value against `agent_instances` so a cancellation or a
+    -- later decision cannot dispatch an operation that an earlier revision
+    -- happened to approve.
+    approved_agent_revision INTEGER,
+    -- The exact response selected from the durable prompt. It is recorded in
+    -- the same transaction that approves this operation, so candidate facts
+    -- cannot be detached from the terminal selection during recovery.
+    selected_response_json TEXT CHECK (selected_response_json IS NULL OR json_valid(selected_response_json)),
+    -- The canonical candidate selected by that response. Persisting the
+    -- candidate itself (rather than only its UI option id) binds both the
+    -- exact final host effect and any persistent grant mutation/scope that
+    -- choice authorizes.
+    selected_candidate_json TEXT CHECK (selected_candidate_json IS NULL OR json_valid(selected_candidate_json)),
+    created_at_unix_ms INTEGER NOT NULL,
+    resolved_at_unix_ms INTEGER,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+);
+
+-- The operation row proves a user approved one canonical host effect. This
+-- companion journal proves the different and stricter fact that the host
+-- handed that exact effect to its execution boundary.  The idempotency key is
+-- intentionally the preallocated operation UUID, not a prompt UUID or UI
+-- path.  Recovery may complete/reconcile a known handoff, but it may never
+-- issue another non-idempotent dispatch for a `dispatching` record.
+CREATE TABLE agent_host_approval_effect_handoffs (
+    operation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    operation_kind TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 128),
+    canonical_input_json TEXT NOT NULL CHECK (json_valid(canonical_input_json)),
+    input_digest TEXT NOT NULL CHECK (length(input_digest) = 64),
+    selected_candidate_json TEXT NOT NULL CHECK (json_valid(selected_candidate_json)),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    -- `ready` means approval was accepted but no concrete host boundary has
+    -- yet claimed this capability.  Only `dispatching` is an irrevocable
+    -- submission state; boot reconciliation turns that state into
+    -- `submission_unknown` and never replays it.
+    state TEXT NOT NULL CHECK (state IN ('ready', 'dispatching', 'succeeded', 'rejected', 'submission_unknown')),
+    dispatch_started_at_unix_ms INTEGER NOT NULL,
+    completed_at_unix_ms INTEGER,
+    completion_receipt_json TEXT,
+    FOREIGN KEY (operation_id) REFERENCES agent_host_approval_operations(operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER agent_host_approval_effect_handoff_matches_operation
+BEFORE INSERT ON agent_host_approval_effect_handoffs
+WHEN NOT EXISTS (
+    SELECT 1 FROM agent_host_approval_operations operation
+     WHERE operation.operation_id = NEW.operation_id
+       AND operation.session_id = NEW.session_id
+       AND operation.agent_instance_id = NEW.agent_instance_id
+       AND operation.operation_kind = NEW.operation_kind
+       AND operation.canonical_input_json = NEW.canonical_input_json
+       AND operation.input_digest = NEW.input_digest
+       AND operation.selected_candidate_json = NEW.selected_candidate_json
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host approval effect handoff does not match canonical operation');
+END;
+
+-- The handoff is an immutable record of the one effect offered to its
+-- boundary.  Completion may change only its lifecycle fields; neither a
+-- recovery worker nor a generic SQL caller may retarget an already-dispatched
+-- operation while keeping its idempotency key.
+CREATE TRIGGER agent_host_approval_effect_handoff_binding_immutable
+BEFORE UPDATE OF operation_id, session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest, selected_candidate_json, idempotency_key
+ON agent_host_approval_effect_handoffs
+WHEN NEW.operation_id IS NOT OLD.operation_id
+ OR NEW.session_id IS NOT OLD.session_id
+ OR NEW.agent_instance_id IS NOT OLD.agent_instance_id
+ OR NEW.operation_kind IS NOT OLD.operation_kind
+ OR NEW.canonical_input_json IS NOT OLD.canonical_input_json
+ OR NEW.input_digest IS NOT OLD.input_digest
+ OR NEW.selected_candidate_json IS NOT OLD.selected_candidate_json
+ OR NEW.idempotency_key IS NOT OLD.idempotency_key
+BEGIN
+    SELECT RAISE(ABORT, 'host approval effect handoff binding is immutable');
+END;
+
+CREATE TRIGGER agent_host_approval_effect_handoff_state_is_forward_only
+BEFORE UPDATE OF state ON agent_host_approval_effect_handoffs
+WHEN NOT (
+    (OLD.state = 'ready' AND NEW.state IN ('dispatching', 'rejected'))
+    OR (OLD.state = 'dispatching' AND NEW.state IN ('succeeded', 'rejected', 'submission_unknown'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host approval effect handoff state transition is invalid');
+END;
+
+CREATE UNIQUE INDEX idx_agent_host_approval_pending
+    ON agent_host_approval_operations(session_id, agent_instance_id)
+    WHERE state = 'pending';
+
+-- A host operation is reserved first by the host composition boundary. It may
+-- not be inserted already bound by a generic decision caller.
+CREATE TRIGGER agent_host_approval_operation_matches_decision
+BEFORE UPDATE OF decision_request_id ON agent_host_approval_operations
+WHEN NEW.decision_request_id IS NULL
+ OR NOT EXISTS (
+    SELECT 1 FROM decision_requests d
+    WHERE d.decision_request_id = NEW.decision_request_id
+      AND d.session_id = NEW.session_id
+      AND d.agent_instance_id = NEW.agent_instance_id
+      AND d.decision_class = 'host_approval'
+      AND d.host_approval_operation_id = NEW.operation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host approval operation does not match final decision operation');
+END;
+
+CREATE TRIGGER agent_host_approval_operation_must_start_unbound
+BEFORE INSERT ON agent_host_approval_operations
+WHEN NEW.decision_request_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'host approval operation must exist before its decision');
+END;
+
+CREATE TRIGGER agent_host_approval_operation_binding_immutable
+BEFORE UPDATE OF operation_kind, canonical_input_json, input_digest ON agent_host_approval_operations
+WHEN NEW.operation_kind IS NOT OLD.operation_kind
+ OR NEW.canonical_input_json IS NOT OLD.canonical_input_json
+ OR NEW.input_digest IS NOT OLD.input_digest
+BEGIN
+    SELECT RAISE(ABORT, 'host approval operation binding is immutable');
+END;
+
+-- The approved candidate is a one-time resolution of an immutable candidate
+-- set. It may be introduced only by the pending→approved transition and can
+-- never be altered, cleared, or paired with a different selected response.
+CREATE TRIGGER agent_host_approval_operation_selected_candidate_is_bound
+BEFORE UPDATE OF selected_response_json, selected_candidate_json, state
+ON agent_host_approval_operations
+WHEN (
+    (OLD.selected_response_json IS NOT NULL AND NEW.selected_response_json IS NOT OLD.selected_response_json)
+    OR (OLD.selected_candidate_json IS NOT NULL AND NEW.selected_candidate_json IS NOT OLD.selected_candidate_json)
+    OR (
+        OLD.selected_response_json IS NULL
+        AND NEW.selected_response_json IS NOT NULL
+        AND (
+            OLD.state <> 'pending'
+            OR NEW.state <> 'approved'
+            OR NEW.selected_candidate_json IS NULL
+        )
+    )
+    OR (
+        OLD.selected_candidate_json IS NULL
+        AND NEW.selected_candidate_json IS NOT NULL
+        AND (
+            OLD.state <> 'pending'
+            OR NEW.state <> 'approved'
+            OR NEW.selected_response_json IS NULL
+        )
+    )
+    OR (
+        OLD.state = 'pending'
+        AND NEW.state = 'approved'
+        AND (
+            NEW.selected_response_json IS NULL
+            OR NEW.selected_candidate_json IS NULL
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host approval selected candidate is not bound to its approval transition');
+END;
+
+-- Host-approval state is a one-way handoff protocol. In particular,
+-- `dispatching` cannot become `approved` after a restart: that would turn an
+-- unknown external submission into permission to perform it again.
+CREATE TRIGGER agent_host_approval_operation_state_is_forward_only
+BEFORE UPDATE OF state ON agent_host_approval_operations
+WHEN NOT (
+    (OLD.state = 'pending' AND NEW.state IN ('approved', 'cancelled'))
+    OR (OLD.state = 'approved' AND NEW.state IN ('dispatching', 'rejected', 'cancelled'))
+    OR (OLD.state = 'dispatching' AND NEW.state IN ('completed', 'rejected', 'submission_unknown'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host approval operation state transition is invalid');
+END;
+
+-- Refreshing the daemon-local host capability snapshot is a low-risk effect,
+-- but it still crosses a real host probe boundary.  Its request/interrupt/
+-- decision identity and execution phase must survive a worker restart: an
+-- accepted decision is not permission for an in-memory task to disappear.
+--
+-- This is deliberately daemon-global rather than session-scoped. A refresh
+-- receipt can be recovered by a worker for a different session, and a newly
+-- started process must never reuse a generation which an older process has
+-- already reserved or published. Every real probe claim reserves exactly one
+-- successor in the same IMMEDIATE transaction as its execution fence.
+CREATE TABLE host_capability_refresh_generation_allocator (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    high_water_generation INTEGER NOT NULL CHECK (high_water_generation >= 0)
+);
+INSERT INTO host_capability_refresh_generation_allocator(singleton, high_water_generation)
+VALUES (1, 0);
+
+-- The host-refresh child is not an ordinary model executor.  It needs a
+-- durable identity before the real QuestionTool row exists, because creating
+-- a child and then crashing before its interrupt/decision binding otherwise
+-- leaves an unclassifiable nonterminal descendant which recovery cannot
+-- safely attach or cancel.  This initialization descriptor is inserted in
+-- the same transaction as that child.  The later decision transaction either
+-- binds all of interrupt/decision/operation together or leaves this row in
+-- `initializing`, which boot terminalizes deterministically.
+CREATE TABLE host_capability_refresh_initializations (
+    operation_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL UNIQUE,
+    parent_agent_instance_id TEXT NOT NULL,
+    interrupt_id TEXT UNIQUE,
+    decision_request_id TEXT UNIQUE,
+    state TEXT NOT NULL CHECK (state IN ('initializing', 'bound', 'cancelled')),
+    terminal_reason TEXT,
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    completed_at_unix_ms INTEGER,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+    FOREIGN KEY (interrupt_id) REFERENCES needs_attention(interrupt_id) ON DELETE RESTRICT,
+    FOREIGN KEY (decision_request_id, session_id)
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE RESTRICT,
+    CHECK (
+        (state = 'initializing'
+            AND interrupt_id IS NULL AND decision_request_id IS NULL
+            AND terminal_reason IS NULL AND completed_at_unix_ms IS NULL)
+        OR (state = 'bound'
+            AND interrupt_id IS NOT NULL AND decision_request_id IS NOT NULL
+            AND terminal_reason IS NULL AND completed_at_unix_ms IS NULL)
+        OR (state = 'cancelled'
+            AND interrupt_id IS NULL AND decision_request_id IS NULL
+            AND terminal_reason IS NOT NULL AND completed_at_unix_ms IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_host_capability_refresh_initializations_recovery
+    ON host_capability_refresh_initializations(session_id, state, created_at_unix_ms)
+    WHERE state = 'initializing';
+
+CREATE TRIGGER host_capability_refresh_initialization_state_is_forward_only
+BEFORE UPDATE OF state ON host_capability_refresh_initializations
+WHEN NOT (
+    OLD.state = 'initializing' AND NEW.state IN ('bound', 'cancelled')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh initialization state transition is invalid');
+END;
+
+CREATE TRIGGER host_capability_refresh_initialization_binding_is_immutable
+BEFORE UPDATE OF operation_id, request_id, session_id, agent_instance_id,
+                 parent_agent_instance_id, interrupt_id, decision_request_id
+ON host_capability_refresh_initializations
+WHEN NEW.operation_id IS NOT OLD.operation_id
+ OR NEW.request_id IS NOT OLD.request_id
+ OR NEW.session_id IS NOT OLD.session_id
+ OR NEW.agent_instance_id IS NOT OLD.agent_instance_id
+ OR NEW.parent_agent_instance_id IS NOT OLD.parent_agent_instance_id
+ OR (OLD.state <> 'initializing'
+     AND (NEW.interrupt_id IS NOT OLD.interrupt_id
+          OR NEW.decision_request_id IS NOT OLD.decision_request_id))
+ OR (OLD.state = 'initializing' AND NEW.state = 'initializing'
+     AND (NEW.interrupt_id IS NOT OLD.interrupt_id
+          OR NEW.decision_request_id IS NOT OLD.decision_request_id))
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh initialization binding is immutable');
+END;
+
+CREATE TABLE host_capability_refresh_operations (
+    operation_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    interrupt_id TEXT NOT NULL UNIQUE,
+    decision_request_id TEXT UNIQUE,
+    -- The exact nonterminal owner revision that crossed the probe boundary.
+    -- Completion must still observe this revision, so a cancellation or newer
+    -- lifecycle transition between probing and publication fences the staged
+    -- result instead of exposing it after its authority disappeared.
+    execution_agent_revision INTEGER CHECK (
+        execution_agent_revision IS NULL OR execution_agent_revision >= 0
+    ),
+    -- A monotonic execution epoch plus an opaque task-owned lease token fence
+    -- each actual local probe. The process may renew only this exact claim;
+    -- reaping and terminal writes never trust an operation id by itself.
+    execution_epoch INTEGER NOT NULL DEFAULT 0 CHECK (execution_epoch >= 0),
+    execution_lease_owner_token TEXT,
+    execution_lease_expires_at_unix_ms INTEGER,
+    -- Reserved at allowed→executing, before the probe begins. The completed
+    -- receipt must carry this exact generation; a caller cannot choose it.
+    reserved_snapshot_generation INTEGER CHECK (
+        reserved_snapshot_generation IS NULL OR reserved_snapshot_generation >= 1
+    ),
+    state TEXT NOT NULL CHECK (state IN (
+        'pending', 'allowed', 'executing', 'completed', 'failed', 'cancelled'
+    )),
+    result_snapshot_json TEXT CHECK (
+        result_snapshot_json IS NULL OR json_valid(result_snapshot_json)
+    ),
+    -- Canonical, parsed snapshot identity. The JSON body is retained for
+    -- recovery, but publication and acknowledgement use these independently
+    -- persisted values so a raw write cannot acknowledge different bytes.
+    result_snapshot_generation INTEGER CHECK (
+        result_snapshot_generation IS NULL OR result_snapshot_generation >= 1
+    ),
+    result_snapshot_digest TEXT CHECK (
+        result_snapshot_digest IS NULL
+        OR (length(result_snapshot_digest) = 64
+            AND result_snapshot_digest NOT GLOB '*[^0-9a-f]*')
+    ),
+    -- Completion and publication are two different durability boundaries.
+    -- A process can die after committing the exact snapshot but before the
+    -- in-memory capability store observes it. Keep an explicit outbox fence
+    -- so the next worker publishes that same generation once instead of
+    -- probing again or silently losing the committed result.
+    published_at_unix_ms INTEGER,
+    error_text TEXT,
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    completed_at_unix_ms INTEGER,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (interrupt_id) REFERENCES needs_attention(interrupt_id) ON DELETE CASCADE,
+    FOREIGN KEY (decision_request_id, session_id)
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE,
+    CHECK (state NOT IN ('executing', 'completed') OR execution_agent_revision IS NOT NULL),
+    CHECK (
+        state <> 'executing' OR (
+            execution_epoch > 0
+            AND execution_lease_owner_token IS NOT NULL
+            AND execution_lease_expires_at_unix_ms IS NOT NULL
+            AND reserved_snapshot_generation IS NOT NULL
+        )
+    ),
+    CHECK (
+        (execution_lease_owner_token IS NULL AND execution_lease_expires_at_unix_ms IS NULL)
+        OR (execution_lease_owner_token IS NOT NULL AND execution_lease_expires_at_unix_ms IS NOT NULL)
+    ),
+    CHECK (published_at_unix_ms IS NULL OR state = 'completed'),
+    CHECK (
+        (state IN ('pending', 'allowed', 'executing')
+            AND result_snapshot_json IS NULL
+            AND result_snapshot_generation IS NULL
+            AND result_snapshot_digest IS NULL
+            AND error_text IS NULL
+            AND completed_at_unix_ms IS NULL)
+        OR (state = 'completed'
+            AND result_snapshot_json IS NOT NULL
+            AND result_snapshot_generation = reserved_snapshot_generation
+            AND result_snapshot_digest IS NOT NULL
+            AND error_text IS NULL
+            AND completed_at_unix_ms IS NOT NULL)
+        OR (state IN ('failed', 'cancelled')
+            AND result_snapshot_json IS NULL
+            AND result_snapshot_generation IS NULL
+            AND result_snapshot_digest IS NULL
+            AND error_text IS NOT NULL
+            AND completed_at_unix_ms IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_host_capability_refresh_recovery
+    ON host_capability_refresh_operations(session_id, created_at_unix_ms)
+    WHERE state IN ('pending', 'allowed', 'executing')
+       OR (state = 'completed' AND published_at_unix_ms IS NULL);
+
+-- Maintenance reads are explicitly keyset-paginated. These partial indexes
+-- match their exact predicates and orderings so a large durable backlog does
+-- not become an unbounded scan before a worker applies its per-turn limit.
+CREATE INDEX idx_host_capability_refresh_allowed_page
+    ON host_capability_refresh_operations(session_id, created_at_unix_ms, operation_id)
+    WHERE state = 'allowed';
+
+CREATE INDEX idx_host_capability_refresh_completed_outbox_page
+    ON host_capability_refresh_operations(
+        result_snapshot_generation, completed_at_unix_ms, operation_id
+    )
+    WHERE state = 'completed' AND published_at_unix_ms IS NULL;
+
+CREATE TRIGGER host_capability_refresh_operation_state_is_forward_only
+BEFORE UPDATE OF state ON host_capability_refresh_operations
+WHEN NOT (
+    OLD.state = NEW.state
+    OR (OLD.state = 'pending' AND NEW.state IN ('allowed', 'cancelled', 'failed'))
+    OR (OLD.state = 'allowed' AND NEW.state IN ('executing', 'cancelled', 'failed'))
+    -- Subtree/root cancellation remains the terminal authority even after a
+    -- daemon-local probe crossed its execution boundary. The cancelled row
+    -- fences that in-flight result and is paired atomically with the child.
+    OR (OLD.state = 'executing' AND NEW.state IN ('completed', 'failed', 'cancelled'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh operation state transition is invalid');
+END;
+
+CREATE TRIGGER host_capability_refresh_operation_binding_immutable
+BEFORE UPDATE OF operation_id, request_id, session_id, agent_instance_id, interrupt_id,
+                 decision_request_id ON host_capability_refresh_operations
+WHEN NEW.operation_id IS NOT OLD.operation_id
+ OR NEW.request_id IS NOT OLD.request_id
+ OR NEW.session_id IS NOT OLD.session_id
+ OR NEW.agent_instance_id IS NOT OLD.agent_instance_id
+ OR NEW.interrupt_id IS NOT OLD.interrupt_id
+ OR (OLD.decision_request_id IS NOT NULL
+     AND NEW.decision_request_id IS NOT OLD.decision_request_id)
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh operation binding is immutable');
+END;
+
+-- Publication is a one-way outbox acknowledgement. It is intentionally
+-- separate from `state`: completion is the linearization point, and a later
+-- subtree cancellation must not erase the completed winner while a successor
+-- worker is still making its exact durable snapshot visible.
+CREATE TRIGGER host_capability_refresh_operation_publication_is_forward_only
+BEFORE UPDATE OF published_at_unix_ms ON host_capability_refresh_operations
+WHEN NEW.published_at_unix_ms IS NULL
+ OR OLD.published_at_unix_ms IS NOT NULL
+ OR OLD.state <> 'completed'
+ OR NEW.state <> 'completed'
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh publication acknowledgement is invalid');
+END;
+
+-- The revision fence is written exactly once with the allowed→executing
+-- probe-boundary transition.  A later update must not replace it with a newer
+-- owner revision, otherwise a cancelled/revived subtree could publish the
+-- old probe under fresh authority.
+CREATE TRIGGER host_capability_refresh_operation_execution_revision_is_bound
+BEFORE UPDATE OF execution_agent_revision ON host_capability_refresh_operations
+WHEN NEW.execution_agent_revision IS NULL
+ OR OLD.execution_agent_revision IS NOT NULL
+ OR OLD.state <> 'allowed'
+ OR NEW.state <> 'executing'
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh execution revision is immutable');
+END;
+
+-- The execution identity is written exactly once with the
+-- allowed→executing transition. Expiry changes are permitted only by the
+-- token-fenced renewal query in the DB owner; the epoch/token itself cannot
+-- be replaced by a stale worker after the probe boundary has been crossed.
+CREATE TRIGGER host_capability_refresh_operation_execution_lease_identity_is_bound
+BEFORE UPDATE OF execution_epoch, execution_lease_owner_token ON host_capability_refresh_operations
+WHEN NEW.execution_epoch <= OLD.execution_epoch
+ OR OLD.execution_epoch <> 0
+ OR OLD.state <> 'allowed'
+ OR NEW.state <> 'executing'
+ OR NEW.execution_lease_owner_token IS NULL
+ OR NEW.execution_lease_expires_at_unix_ms IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh execution lease identity is immutable');
+END;
+
+CREATE TRIGGER host_capability_refresh_operation_reserved_generation_is_bound
+BEFORE UPDATE OF reserved_snapshot_generation ON host_capability_refresh_operations
+WHEN NEW.reserved_snapshot_generation IS NULL
+ OR OLD.reserved_snapshot_generation IS NOT NULL
+ OR OLD.state <> 'allowed'
+ OR NEW.state <> 'executing'
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh reserved generation is immutable');
+END;
+
+-- The globally allocated generation is a durable monotonic counter. No raw
+-- repair may reset, skip backwards, or delete this singleton after a daemon
+-- has observed a receipt.
+CREATE TRIGGER host_capability_refresh_generation_allocator_is_monotonic
+BEFORE UPDATE OF high_water_generation ON host_capability_refresh_generation_allocator
+WHEN NEW.singleton <> 1
+ OR NEW.high_water_generation <> OLD.high_water_generation + 1
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh generation allocator must advance by one');
+END;
+
+CREATE TRIGGER host_capability_refresh_generation_allocator_delete_forbidden
+BEFORE DELETE ON host_capability_refresh_generation_allocator
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh generation allocator is durable');
+END;
+
+-- A completed receipt is an append-only exact fact. In particular, an
+-- outbox reader which parsed snapshot A must not subsequently acknowledge a
+-- raw-mutated snapshot B. Completion code also carries digest and generation
+-- in its acknowledgement CAS, but this trigger makes a bypass fail closed.
+CREATE TRIGGER host_capability_refresh_completed_receipt_is_immutable
+BEFORE UPDATE OF result_snapshot_json, result_snapshot_generation,
+                 result_snapshot_digest, reserved_snapshot_generation
+ON host_capability_refresh_operations
+WHEN OLD.state = 'completed'
+ AND (
+        NEW.result_snapshot_json IS NOT OLD.result_snapshot_json
+     OR NEW.result_snapshot_generation IS NOT OLD.result_snapshot_generation
+     OR NEW.result_snapshot_digest IS NOT OLD.result_snapshot_digest
+     OR NEW.reserved_snapshot_generation IS NOT OLD.reserved_snapshot_generation
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'host capability refresh completed receipt is immutable');
+END;
+
+-- A user reply that arrives after an automatic resolution is a new durable
+-- steer to the requesting agent. It deliberately does not rewrite the
+-- immutable automatic receipt. One decision has one idempotent late steer;
+-- a retried client request therefore cannot restart the agent twice.
+CREATE TABLE agent_decision_steers (
+    steer_id TEXT PRIMARY KEY,
+    -- A steer owns one immutable continuation identity.  It is also the
+    -- inference idempotency identity for the turn which consumes the steer;
+    -- recovery must resume this identity, never manufacture a second turn.
+    continuation_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    -- The decision owner which requested the original automatic resolution.
+    -- Most steers target this same agent. A daemon-owned host-operation child
+    -- has no model mailbox, so its one post-auto user steer is durably
+    -- rerouted to its direct requesting parent while retaining this immutable
+    -- provenance field.
+    requesting_agent_instance_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    decision_request_id TEXT NOT NULL UNIQUE,
+    origin_principal TEXT NOT NULL CHECK (origin_principal = 'user'),
+    payload_json TEXT NOT NULL,
+    -- A post-auto user steer is ordered after the exact parked QuestionTool
+    -- replay that consumed the automatic terminal result.  This is a durable
+    -- predecessor identity, not an advisory worker flag: recovery cannot
+    -- claim the steer until that same interrupt reached `resolved`.
+    predecessor_interrupt_id TEXT,
+    created_at_unix_ms INTEGER NOT NULL,
+    claimed_recovery_epoch TEXT,
+    -- This is a monotonic continuation state machine, rather than an advisory
+    -- delivery bit.  In particular, an `accepted` steer is a durable
+    -- no-redelivery fence: a successor must resume its exact checkpoint or
+    -- reconcile its result, never enqueue the user body again.
+    execution_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (execution_state IN ('pending', 'accepted', 'completed', 'rejected')),
+    -- The exact executor persists acceptance and an immutable restart
+    -- checkpoint before it begins the continuation. A completed invocation is
+    -- then receipt-only recoverable; a rejected one is terminal (for example
+    -- because its owner subtree was cancelled).
+    accepted_recovery_epoch TEXT,
+    accepted_at_unix_ms INTEGER,
+    -- Acceptance snapshots the exact owner revision and byte-exact payload
+    -- length.  Recovery verifies these fields against both the canonical row
+    -- and its immutable checkpoint before it can reattach a model turn.
+    accepted_agent_revision INTEGER,
+    payload_bytes INTEGER,
+    continuation_checkpoint_json TEXT,
+    completed_at_unix_ms INTEGER,
+    rejected_at_unix_ms INTEGER,
+    rejection_reason TEXT,
+    delivered_at_unix_ms INTEGER,
+    CHECK (
+        (execution_state = 'pending'
+            AND accepted_recovery_epoch IS NULL
+            AND accepted_at_unix_ms IS NULL
+            AND continuation_checkpoint_json IS NULL
+            AND completed_at_unix_ms IS NULL
+            AND rejected_at_unix_ms IS NULL
+            AND rejection_reason IS NULL)
+        OR (execution_state = 'accepted'
+            AND accepted_recovery_epoch IS NOT NULL
+            AND accepted_at_unix_ms IS NOT NULL
+            AND accepted_agent_revision IS NOT NULL
+            AND payload_bytes IS NOT NULL
+            AND continuation_checkpoint_json IS NOT NULL
+            AND completed_at_unix_ms IS NULL
+            AND rejected_at_unix_ms IS NULL
+            AND rejection_reason IS NULL)
+        OR (execution_state = 'completed'
+            AND accepted_recovery_epoch IS NOT NULL
+            AND accepted_at_unix_ms IS NOT NULL
+            AND accepted_agent_revision IS NOT NULL
+            AND payload_bytes IS NOT NULL
+            AND continuation_checkpoint_json IS NOT NULL
+            AND completed_at_unix_ms IS NOT NULL
+            AND rejected_at_unix_ms IS NULL
+            AND rejection_reason IS NULL)
+        OR (execution_state = 'rejected'
+            AND completed_at_unix_ms IS NULL
+            AND rejected_at_unix_ms IS NOT NULL
+            AND rejection_reason IS NOT NULL)
+    ),
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (requesting_agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (decision_request_id, session_id)
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_agent_decision_steers_pending
+    ON agent_decision_steers(session_id, created_at_unix_ms)
+    WHERE delivered_at_unix_ms IS NULL;
+
+-- Late steers are an immutable user-authored continuation.  In particular a
+-- recovery worker may move its delivery lease, but it may never retarget the
+-- owner/decision/continuation, replace the user body, or rewrite the
+-- acceptance checkpoint that fences an inference identity.
+CREATE TRIGGER agent_decision_steers_immutable_identity
+BEFORE UPDATE OF steer_id, continuation_id, session_id, requesting_agent_instance_id, agent_instance_id,
+                 decision_request_id, origin_principal, payload_json,
+                 predecessor_interrupt_id, created_at_unix_ms
+ON agent_decision_steers
+BEGIN
+    SELECT RAISE(ABORT, 'agent decision steer identity and payload are immutable');
+END;
+
+CREATE TRIGGER agent_decision_steers_checkpoint_immutable_after_accept
+BEFORE UPDATE OF accepted_recovery_epoch, accepted_at_unix_ms,
+                 accepted_agent_revision, payload_bytes,
+                 continuation_checkpoint_json
+ON agent_decision_steers
+WHEN OLD.execution_state IN ('accepted', 'completed', 'rejected')
+  OR OLD.accepted_recovery_epoch IS NOT NULL
+  OR OLD.accepted_at_unix_ms IS NOT NULL
+  OR OLD.accepted_agent_revision IS NOT NULL
+  OR OLD.payload_bytes IS NOT NULL
+  OR OLD.continuation_checkpoint_json IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'accepted agent decision steer checkpoint is immutable');
+END;
+
+-- `rejected` is a cancellation terminal winner; completed continuation
+-- receipts remain completed and are acknowledged without being relabelled.
+CREATE TRIGGER agent_decision_steers_execution_state_forward_only
+BEFORE UPDATE OF execution_state ON agent_decision_steers
+WHEN NOT (
+    OLD.execution_state = NEW.execution_state
+    OR (OLD.execution_state = 'pending' AND NEW.execution_state IN ('accepted', 'rejected'))
+    OR (OLD.execution_state = 'accepted' AND NEW.execution_state IN ('completed', 'rejected'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'agent decision steer execution state is not forward-only');
+END;
+
 CREATE TRIGGER decision_receipts_immutable
 BEFORE UPDATE ON decision_receipts
 BEGIN
@@ -1294,7 +2096,13 @@ END;
 CREATE TABLE needs_attention (
     interrupt_id   TEXT    PRIMARY KEY,
     session_id     TEXT    NOT NULL,
+    -- Human-readable executor/profile name for display only. Never use this
+    -- mutable/shared label to choose a parked continuation.
     agent_id       TEXT    NOT NULL,
+    -- Exact durable owner of an AgentTree QuestionTool continuation. Legacy
+    -- attention rows have no tree owner and retain NULL. This must remain
+    -- separate from `agent_id`: recursive siblings may share a display name.
+    agent_instance_id TEXT,
     description    TEXT    NOT NULL,
     state          TEXT    NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'parked', 'executing', 'interrupted', 'resolved')),
     question_json  TEXT,                            -- serialized proto::InterruptQuestion or NULL
@@ -1307,9 +2115,9 @@ CREATE TABLE needs_attention (
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
-    -- Recursive-agent decisions use this typed ownership edge. Legacy
-    -- interrupts leave it NULL; a decision row never carries legacy question
-    -- or parked-call authority.
+    -- Recursive-agent decisions use this typed ownership edge. A linked real
+    -- QuestionTool interrupt retains its immutable question and parked-call
+    -- continuation; synthetic attention rows carry neither.
     decision_request_id TEXT UNIQUE,
     -- A decision-owned row is a durable projection of its decision state,
     -- rather than an independently mutable interrupt.  Legacy rows retain
@@ -1327,13 +2135,20 @@ CREATE TABLE needs_attention (
     CHECK (state IN ('executing', 'interrupted', 'resolved') OR response_json IS NULL),
     CHECK (state <> 'executing' OR response_json IS NOT NULL),
     CHECK (
-        decision_request_id IS NULL OR
-        (question_json IS NULL AND questions_json IS NULL
-         AND parked_tool IS NULL AND parked_args_json IS NULL
-         AND parked_call_id IS NULL AND parked_resume_json IS NULL
-         AND parked_gate_json IS NULL)
+        decision_request_id IS NULL
+        -- Synthetic decision Attention has no legacy continuation.
+        OR (question_json IS NULL AND questions_json IS NULL
+            AND parked_tool IS NULL AND parked_args_json IS NULL
+            AND parked_call_id IS NULL AND parked_resume_json IS NULL
+            AND parked_gate_json IS NULL)
+        -- A real QuestionTool row is linked after it has durably captured its
+        -- exact question and optional parked replay anchor. The decision
+        -- state machine owns terminal projection, not the data itself.
+        OR question_json IS NOT NULL OR questions_json IS NOT NULL
     ),
     FOREIGN KEY (decision_request_id) REFERENCES decision_requests(decision_request_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
@@ -1358,20 +2173,20 @@ WHEN NEW.decision_request_id IS NOT NULL
     SELECT 1 FROM decision_requests d
     WHERE d.decision_request_id = NEW.decision_request_id
       AND d.session_id = NEW.session_id
-      AND d.agent_instance_id = NEW.agent_id
+      AND d.agent_instance_id = NEW.agent_instance_id
  )
 BEGIN
     SELECT RAISE(ABORT, 'decision needs-attention session mismatch');
 END;
 
 CREATE TRIGGER needs_attention_decision_session_update
-BEFORE UPDATE OF decision_request_id, session_id, agent_id ON needs_attention
+BEFORE UPDATE OF decision_request_id, session_id, agent_instance_id ON needs_attention
 WHEN NEW.decision_request_id IS NOT NULL
  AND NOT EXISTS (
     SELECT 1 FROM decision_requests d
     WHERE d.decision_request_id = NEW.decision_request_id
       AND d.session_id = NEW.session_id
-      AND d.agent_instance_id = NEW.agent_id
+      AND d.agent_instance_id = NEW.agent_instance_id
  )
 BEGIN
     SELECT RAISE(ABORT, 'decision needs-attention session mismatch');
@@ -1384,6 +2199,7 @@ WHEN OLD.decision_request_id IS NOT NULL
     NEW.interrupt_id IS NOT OLD.interrupt_id
     OR NEW.session_id IS NOT OLD.session_id
     OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.agent_instance_id IS NOT OLD.agent_instance_id
     OR NEW.description IS NOT OLD.description
     OR NEW.question_json IS NOT OLD.question_json
     OR NEW.raised_at IS NOT OLD.raised_at
@@ -1394,8 +2210,21 @@ WHEN OLD.decision_request_id IS NOT NULL
     OR NEW.parked_resume_json IS NOT OLD.parked_resume_json
     OR NEW.parked_gate_json IS NOT OLD.parked_gate_json
     OR NEW.decision_request_id IS NOT OLD.decision_request_id
-    OR NEW.state <> 'resolved'
-    OR NEW.resolved_at IS NULL
+    OR NOT (
+        (NEW.state = 'resolved' AND NEW.resolved_at IS NOT NULL)
+        OR (
+            (OLD.question_json IS NOT NULL OR OLD.questions_json IS NOT NULL)
+            AND OLD.state IN ('parked', 'executing')
+            AND NEW.state = 'executing'
+            AND NEW.resolved_at IS OLD.resolved_at
+        )
+        OR (
+            (OLD.question_json IS NOT NULL OR OLD.questions_json IS NOT NULL)
+            AND OLD.state = 'open'
+            AND NEW.state = 'parked'
+            AND NEW.resolved_at IS OLD.resolved_at
+        )
+    )
     OR NEW.revision <> OLD.revision + 1
     OR NOT EXISTS (
         SELECT 1 FROM decision_attention_mutation_guards g
@@ -1406,7 +2235,14 @@ WHEN OLD.decision_request_id IS NOT NULL
         SELECT 1 FROM decision_requests d
         WHERE d.decision_request_id = OLD.decision_request_id
           AND d.session_id = OLD.session_id
-          AND d.state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')
+          AND (
+              d.state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')
+              OR (
+                  (OLD.question_json IS NOT NULL OR OLD.questions_json IS NOT NULL)
+                  AND OLD.state = 'open'
+                  AND NEW.state = 'parked'
+              )
+          )
     )
  )
 BEGIN
@@ -1686,7 +2522,7 @@ CREATE TABLE session_events (
         'permission_decision', 'interrupt_decision', 'tool_rejected',
         'primary_swap', 'inference_failure', 'failed_turn_recovery',
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
-        'goal_progress_diagnostic', 'resource_promotion', 'notice',
+        'goal_progress_diagnostic', 'resource_promotion', 'notice', 'agent_tree',
         'model_switch', 'hook_run', 'tool_call_scheduling'
     )),
     agent       TEXT,                              -- emitting agent, when known
@@ -1950,6 +2786,40 @@ CREATE TABLE client_submission_terminal_receipts (
     created_at_ms       INTEGER NOT NULL,
     PRIMARY KEY (session_id, client_submission_id),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+);
+
+-- Authoritative terminal receipts for config-only SetDefaultModel requests.
+-- The request returns Ack and the result travels on the event stream, so the
+-- durable receipt is the recovery/idempotency source of truth.  It is written
+-- before an event is attempted and before the private config transaction
+-- journal is retired; reusing an id can therefore replay only this exact safe
+-- terminal outcome, never perform a second configuration mutation.
+CREATE TABLE default_model_update_receipts (
+    session_id          TEXT NOT NULL,
+    default_update_id   TEXT NOT NULL,
+    outcome_json        TEXT NOT NULL CHECK (
+        typeof(outcome_json) = 'text'
+        AND length(CAST(outcome_json AS BLOB)) BETWEEN 2 AND 65536
+        AND json_valid(outcome_json)
+    ),
+    -- Opaque retained-attachment receipt fence.  Both values are present for
+    -- a retained authority-bound terminal result (Applied or a recovered
+    -- Restored rejection) and absent for a pre-mutation rejection; raw
+    -- paths/configuration never enter this ledger.
+    authority_revision  TEXT CHECK (
+        authority_revision IS NULL
+        OR (
+            length(authority_revision) = 64
+            AND authority_revision NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    config_generation   INTEGER CHECK (
+        config_generation IS NULL OR config_generation >= 0
+    ),
+    created_at_ms       INTEGER NOT NULL,
+    CHECK ((authority_revision IS NULL) = (config_generation IS NULL)),
+    PRIMARY KEY (session_id, default_update_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 -- Authoritative exactly-once ledger for typed user-message submissions. UUID
@@ -3319,6 +4189,9 @@ CREATE INDEX idx_text_artifact_reservations_expiry
 CREATE TABLE workspace_trust (
     root_path TEXT PRIMARY KEY CHECK (length(CAST(root_path AS BLOB)) BETWEEN 1 AND 32768),
     mode TEXT NOT NULL CHECK (mode IN ('trust', 'ignore-config', 'untrusted')),
+    -- Monotonic per-root policy fence.  Timestamps are observability only and
+    -- cannot safely linearize two decisions made in the same clock tick.
+    revision INTEGER NOT NULL,
     -- Daemon-observed wall-clock times, signed Unix milliseconds.
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms)
@@ -3340,6 +4213,7 @@ CREATE TABLE task_delegation_jobs (
     parent_agent TEXT NOT NULL,
     original_args_json TEXT,
     status TEXT NOT NULL CHECK (status IN (
+        'created',
         'running',
         'backgrounded',
         'completed',
@@ -3362,6 +4236,7 @@ CREATE TABLE task_delegation_children (
     child_agent TEXT NOT NULL,
     model TEXT,
     status TEXT NOT NULL CHECK (status IN (
+        'created',
         'running',
         'backgrounded',
         'completed',
@@ -3390,6 +4265,24 @@ CREATE INDEX idx_task_delegation_jobs_session_status
 
 CREATE INDEX idx_task_delegation_children_status
     ON task_delegation_children(status, updated_at DESC);
+
+-- The task batch DAG is host-validated at ingress and retained independently
+-- of ephemeral executor state. A dependent edge is an ordering relationship
+-- only; it never transfers the predecessor's authority, prompt, or report.
+CREATE TABLE task_delegation_dependency_edges (
+    task_call_id TEXT NOT NULL,
+    dependent_label TEXT NOT NULL,
+    prerequisite_label TEXT NOT NULL,
+    PRIMARY KEY (task_call_id, dependent_label, prerequisite_label),
+    CHECK (dependent_label <> prerequisite_label),
+    FOREIGN KEY (task_call_id, dependent_label)
+        REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE,
+    FOREIGN KEY (task_call_id, prerequisite_label)
+        REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_task_delegation_dependency_edges_prerequisite
+    ON task_delegation_dependency_edges(task_call_id, prerequisite_label);
 
 CREATE TABLE task_delegation_steers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5877,7 +6770,11 @@ CREATE TABLE agent_binding_receipts (
 
 CREATE TABLE agent_profile_snapshots (
     snapshot_id                   TEXT PRIMARY KEY,
-    session_id                    TEXT NOT NULL UNIQUE REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    -- A session has one prepared/root snapshot but may also pin distinct
+    -- immutable snapshots for delegated children. The preparation receipt
+    -- owns root selection; a UNIQUE session_id here would silently force
+    -- every child utility decision onto the root binding.
+    session_id                    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     schema_version                INTEGER NOT NULL CHECK (schema_version >= 1),
     canonical_payload             BLOB NOT NULL,
@@ -5943,6 +6840,9 @@ BEFORE UPDATE ON agent_profile_snapshots
 BEGIN
     SELECT RAISE(ABORT, 'agent profile snapshots are immutable');
 END;
+
+CREATE INDEX agent_profile_snapshots_session_root_lookup
+    ON agent_profile_snapshots(session_id, created_at_unix_ms, snapshot_id);
 
 CREATE INDEX agent_model_bindings_lookup
     ON agent_model_bindings(installation_id, definition_digest, slot_id, retired_at_unix_ms);

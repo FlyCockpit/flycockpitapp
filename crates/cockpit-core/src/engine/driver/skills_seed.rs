@@ -304,6 +304,7 @@ impl Driver {
         let args = serde_json::json!({ "name": skill_name });
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            agent_instance_id: None,
             lock_identity: agent.name.clone().clone(),
             write_scope: None,
             current_tool_call_id: None,
@@ -343,7 +344,19 @@ impl Driver {
         };
 
         let started = std::time::Instant::now();
-        let result = tool.call(args.clone(), &ctx).await;
+        // Forced skills bypass the ordinary tool-timeout dispatcher, but they
+        // remain a real production effect boundary. Keep any approval
+        // handoff raised by the skill inside the same definitive completion
+        // scope rather than letting it escape as an unowned dispatch.
+        let result = crate::engine::interrupt::with_host_approval_effect_scope(
+            "forced_skill_execution",
+            ctx.cancel.clone(),
+            tool.call(args.clone(), &ctx),
+            |output: &crate::engine::tool::ToolOutput| {
+                Some(output.exit_code.is_none_or(|code| code == 0))
+            },
+        )
+        .await;
         let (body, hard_fail) = match result {
             Ok(out) => (out.content, false),
             // An unknown/ambiguous skill surfaces the tool's invalid-input

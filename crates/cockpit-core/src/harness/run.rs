@@ -463,9 +463,23 @@ async fn run_harness_inner(
         env.push(pair);
     }
 
-    // 5. Spawn + drain + timeout. Count the spawn attempt at the exact moment
-    //    we reach the runner, so a test can assert the runner is never called
-    //    when an earlier fail-closed step aborts the run.
+    // 5. Spawn + drain + timeout. Recheck any opaque host-approval capability
+    //    after all local preparation and immediately before the harness
+    //    subprocess can start. Count the spawn attempt at that same moment so
+    //    a test can assert the runner is never called when an earlier
+    //    fail-closed step aborts the run.
+    crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+        "external_harness_spawn",
+        &[serde_json::json!({
+            "execute": {
+                "harness": ctx.harness_name,
+                "model": ctx.model,
+                "write_policy": format!("{:?}", ctx.policy),
+            }
+        })],
+    )
+    .await
+    .map_err(|error| format!("host approval fence before harness spawn: {error}"))?;
     if let Some(counter) = spawn_counter {
         counter.fetch_add(1, Ordering::SeqCst);
     }

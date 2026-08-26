@@ -296,6 +296,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
                     initial_model: None,
                     no_sandbox: false,
                     interactive: false,
+                    session_entry_mode: None,
                     model_override: None,
                     client_protocol_version: client.negotiated().version,
                     env_snapshot: Some(env_snapshot.to_wire()),

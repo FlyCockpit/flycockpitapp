@@ -320,15 +320,18 @@ fn atomic_first_default_initialization_has_one_winner_across_file_handles() {
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let lock_dir = tmp.path().join("state/cockpit/config-locks");
-        assert_eq!(
-            std::fs::metadata(&lock_dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        let lock_files = std::fs::read_dir(&lock_dir)
+        let lock_files = std::fs::read_dir(tmp.path())
             .unwrap()
             .collect::<std::io::Result<Vec<_>>>()
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".cockpit-effective-default-lock-")
+            })
+            .collect::<Vec<_>>();
         assert_eq!(lock_files.len(), 1);
         assert_eq!(
             lock_files[0].metadata().unwrap().permissions().mode() & 0o777,
@@ -338,7 +341,7 @@ fn atomic_first_default_initialization_has_one_winner_across_file_handles() {
 }
 
 #[test]
-fn config_namespace_lock_intersects_home_and_project_targets() {
+fn target_local_lock_does_not_block_a_distinct_home_or_project_target() {
     let tmp = TempDir::new().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let home_config = tmp.path().join("home/.config/cockpit/config.json");
@@ -380,19 +383,12 @@ fn config_namespace_lock_intersects_home_and_project_targets() {
     });
 
     ready.wait();
-    assert!(
-        matches!(
-            completed_rx.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ),
-        "a project writer must remain blocked while a distinct home-layer lock is held"
-    );
-    drop(held_home_lock);
     let result = completed_rx
         .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("project writer completed after the namespace lock was released")
+        .expect("a project writer must not wait on a distinct home-layer target lock")
         .unwrap();
     assert!(result.wrote);
+    drop(held_home_lock);
     handle.join().unwrap();
 }
 
@@ -543,18 +539,39 @@ fn stale_initializer_observes_the_locked_winner_without_writing_a_second_layer()
     assert_eq!(project_raw["project_opaque"], "preserved");
     assert!(project_raw.get("active_model").is_some());
 
-    let lock_files = std::fs::read_dir(tmp.path().join("state/cockpit/config-locks"))
+    let home_lock_files = std::fs::read_dir(home_config.parent().unwrap())
         .unwrap()
         .collect::<std::io::Result<Vec<_>>>()
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cockpit-effective-default-lock-")
+        })
+        .collect::<Vec<_>>();
+    let project_lock_files = std::fs::read_dir(project_config.parent().unwrap())
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap()
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cockpit-effective-default-lock-")
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        lock_files.len(),
-        1,
-        "home and project mutations must resolve to one stable namespace lock"
+        home_lock_files.len(),
+        0,
+        "the untouched lower-precedence home layer must not allocate a lock leaf"
     );
     assert_eq!(
-        lock_files[0].file_name(),
-        std::ffi::OsStr::new("effective-config.lock")
+        project_lock_files.len(),
+        1,
+        "the effective project layer owns an independent target-local lock"
     );
 }
 
@@ -1664,6 +1681,294 @@ fn raw_model_favorite_write_is_partial_model_override() {
         .unwrap();
     assert_eq!(model.name.as_deref(), Some("Model M"));
     assert!(model.favorite);
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_model_favorite_target_writes_a_and_rejects_a_replaced_by_b() {
+    let tmp = TempDir::new().unwrap();
+    let live = tmp.path().join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let config = live.join("config.json");
+    std::fs::write(&config, "{}\n").unwrap();
+    write_provider_file(
+        &config,
+        "p",
+        r#"{ "models": [{ "id": "m", "name": "Model M" }] }"#,
+    );
+
+    let canonical_config = std::fs::canonicalize(&config).unwrap();
+    let initial = std::fs::read(provider_file_path_for_config(&config, "p").unwrap()).unwrap();
+    let source_for = |bytes: Vec<u8>| {
+        retained_provider_model_source_from_workspace_layer_snapshots(
+            &[crate::config::WorkspaceConfigLayerSnapshot {
+                config_json: None,
+                provider_files: vec![("p".to_string(), bytes)],
+                effective_default_artifact_digest: None,
+                digest: "test-only-retained-provider-source".to_string(),
+            }],
+            "p",
+            "m",
+        )
+        .unwrap()
+        .expect("captured model source")
+    };
+    let target = RetainedProviderModelFavoriteTarget::new(
+        std::fs::File::open(&live).unwrap(),
+        canonical_config.clone(),
+        source_for(initial),
+    )
+    .unwrap();
+    let receipt = target.write_model_favorite(true).unwrap();
+    assert_eq!(
+        read_provider_file(&config, "p")["models"][0]["favorite"],
+        Value::Bool(true),
+        "the capability-relative normal update is visible in A",
+    );
+    let observed_after_write = source_for(
+        std::fs::read(provider_file_path_for_config(&config, "p").unwrap()).unwrap(),
+    );
+    assert!(
+        receipt.matches_committed_source(&observed_after_write),
+        "the write receipt must bind the exact committed provider/model bytes"
+    );
+
+    // Capture the updated A source, then make its old path name B. The
+    // verifier is the daemon's attach-chain fence in miniature; rejecting it
+    // before the retained operation proves the B directory never receives a
+    // provider replacement or shared config lock sidecar.
+    let updated = std::fs::read(provider_file_path_for_config(&config, "p").unwrap()).unwrap();
+    let expected_live = std::fs::canonicalize(&live).unwrap();
+    let live_for_verifier = live.clone();
+    let target = RetainedProviderModelFavoriteTarget::new(
+        std::fs::File::open(&live).unwrap(),
+        canonical_config,
+        source_for(updated),
+    )
+    .unwrap()
+    .with_pre_write_verifier(std::sync::Arc::new(move || {
+        anyhow::ensure!(
+            std::fs::canonicalize(&live_for_verifier)? == expected_live,
+            "captured provider source has been replaced"
+        );
+        Ok(())
+    }));
+
+    let replacement = tmp.path().join("replacement");
+    std::fs::create_dir_all(&replacement).unwrap();
+    let replacement_config = replacement.join("config.json");
+    std::fs::write(&replacement_config, "{}\n").unwrap();
+    write_provider_file(
+        &replacement_config,
+        "p",
+        r#"{ "models": [{ "id": "m", "name": "Replacement" }] }"#,
+    );
+    let b_provider = provider_file_path_for_config(&replacement_config, "p").unwrap();
+    let b_before = std::fs::read(&b_provider).unwrap();
+    let moved_a = tmp.path().join("moved-a");
+    std::fs::rename(&live, &moved_a).unwrap();
+    std::fs::rename(&replacement, &live).unwrap();
+
+    assert!(target.write_model_favorite(false).is_err());
+    assert_eq!(
+        std::fs::read(live.join("providers/p.json")).unwrap(),
+        b_before,
+        "a replaced source B must remain untouched",
+    );
+    assert!(
+        std::fs::read_dir(&live)
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("effective-default-lock")),
+        "the rejected operation must not create B's shared lock sidecar",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_model_favorite_post_write_authority_failure_is_durable_but_unpublished() {
+    let tmp = TempDir::new().unwrap();
+    let live = tmp.path().join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let config = live.join("config.json");
+    std::fs::write(&config, "{}\n").unwrap();
+    write_provider_file(
+        &config,
+        "p",
+        r#"{ "models": [{ "id": "m", "name": "Model M" }] }"#,
+    );
+    let provider_path = provider_file_path_for_config(&config, "p").unwrap();
+    let original = std::fs::read(&provider_path).unwrap();
+    let source = retained_provider_model_source_from_workspace_layer_snapshots(
+        &[crate::config::WorkspaceConfigLayerSnapshot {
+            config_json: None,
+            provider_files: vec![("p".to_string(), original.clone())],
+            effective_default_artifact_digest: None,
+            digest: "test-only-retained-provider-source".to_string(),
+        }],
+        "p",
+        "m",
+    )
+    .unwrap()
+    .expect("captured model source");
+    let target = RetainedProviderModelFavoriteTarget::new(
+        std::fs::File::open(&live).unwrap(),
+        std::fs::canonicalize(&config).unwrap(),
+        source,
+    )
+    .unwrap()
+    .with_post_write_verifier(std::sync::Arc::new(|_| anyhow::bail!("forced post-write fence")));
+
+    let error = target.write_model_favorite(true).unwrap_err();
+    assert!(matches!(
+        error,
+        RetainedProviderModelFavoriteWriteError::DurableButUnpublished { .. }
+    ));
+    assert_eq!(
+        read_provider_file(&config, "p")["models"][0]["favorite"],
+        serde_json::Value::Bool(true),
+        "the durable bytes stay intact for a later authoritative reattach; they must not be compensated"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_model_favorite_post_write_fence_preserves_external_replacement() {
+    let tmp = TempDir::new().unwrap();
+    let live = tmp.path().join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let config = live.join("config.json");
+    std::fs::write(&config, "{}\n").unwrap();
+    write_provider_file(
+        &config,
+        "p",
+        r#"{ "models": [{ "id": "m", "name": "Model M" }] }"#,
+    );
+    let provider_path = provider_file_path_for_config(&config, "p").unwrap();
+    let original = std::fs::read(&provider_path).unwrap();
+    let source = retained_provider_model_source_from_workspace_layer_snapshots(
+        &[crate::config::WorkspaceConfigLayerSnapshot {
+            config_json: None,
+            provider_files: vec![("p".to_string(), original)],
+            effective_default_artifact_digest: None,
+            digest: "test-only-retained-provider-source".to_string(),
+        }],
+        "p",
+        "m",
+    )
+    .unwrap()
+    .expect("captured model source");
+    let replacement_path = provider_path.clone();
+    let target = RetainedProviderModelFavoriteTarget::new(
+        std::fs::File::open(&live).unwrap(),
+        std::fs::canonicalize(&config).unwrap(),
+        source,
+    )
+    .unwrap()
+    .with_post_write_verifier(std::sync::Arc::new(move |_| {
+        // Deterministic compare→external-write seam: our pre-write source
+        // compare and atomic replacement have completed, then a
+        // non-cooperating writer wins before the post-write fence. There is
+        // no portable conditional compensation, so these bytes must survive.
+        std::fs::write(
+            &replacement_path,
+            r#"{ "models": [{ "id": "m", "name": "External replacement" }] }"#,
+        )?;
+        anyhow::bail!("forced post-write replacement")
+    }));
+
+    let error = target.write_model_favorite(true).unwrap_err();
+    assert!(matches!(
+        error,
+        RetainedProviderModelFavoriteWriteError::DurableButUnpublished { receipt, .. }
+            if receipt.source().provider_id() == "p"
+    ));
+    assert_eq!(
+        read_provider_file(&config, "p")["models"][0]["name"],
+        "External replacement",
+        "a later writer must never be overwritten after the durable boundary"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_model_favorite_target_rejects_changed_or_missing_captured_model() {
+    let tmp = TempDir::new().unwrap();
+    let live = tmp.path().join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let config = live.join("config.json");
+    std::fs::write(&config, "{}\n").unwrap();
+    let provider_path = provider_file_path_for_config(&config, "p").unwrap();
+    let capture_source = |bytes: Vec<u8>| {
+        retained_provider_model_source_from_workspace_layer_snapshots(
+            &[crate::config::WorkspaceConfigLayerSnapshot {
+                config_json: None,
+                provider_files: vec![("p".to_string(), bytes)],
+                effective_default_artifact_digest: None,
+                digest: "test-only-retained-provider-source".to_string(),
+            }],
+            "p",
+            "m",
+        )
+        .unwrap()
+        .expect("captured model source")
+    };
+
+    for replacement in [
+        r#"{ "models": [{ "id": "m", "name": "Changed" }] }"#,
+        r#"{ "models": [{ "id": "other" }] }"#,
+    ] {
+        write_provider_file(
+            &config,
+            "p",
+            r#"{ "models": [{ "id": "m", "name": "Captured" }] }"#,
+        );
+        let initial = std::fs::read(&provider_path).unwrap();
+        let target = RetainedProviderModelFavoriteTarget::new(
+            std::fs::File::open(&live).unwrap(),
+            std::fs::canonicalize(&config).unwrap(),
+            capture_source(initial),
+        )
+        .unwrap();
+        std::fs::write(&provider_path, replacement).unwrap();
+        let before = std::fs::read(&provider_path).unwrap();
+        assert!(target.write_model_favorite(true).is_err());
+        assert_eq!(
+            std::fs::read(&provider_path).unwrap(),
+            before,
+            "a changed or removed captured model must not be recreated or rewritten",
+        );
+    }
+}
+
+#[test]
+fn retained_model_favorite_source_uses_the_observed_highest_precedence_layer() {
+    let layer = |provider: &str| crate::config::WorkspaceConfigLayerSnapshot {
+        config_json: None,
+        provider_files: vec![("p".to_string(), provider.as_bytes().to_vec())],
+        effective_default_artifact_digest: None,
+        digest: provider.to_string(),
+    };
+    let lower = layer(r#"{ "models": [{ "id": "m", "name": "lower" }] }"#);
+    let higher = layer(r#"{ "models": [{ "id": "m", "name": "higher" }] }"#);
+    let source = retained_provider_model_source_from_workspace_layer_snapshots(
+        &[lower.clone(), higher],
+        "p",
+        "m",
+    )
+    .unwrap()
+    .expect("highest source proof");
+    assert_eq!(source.layer_index(), 1);
+
+    // An already-dispatched request retains the lower snapshot proof. A
+    // subsequently discovered higher file is not silently selected by the
+    // source helper; the daemon must refresh first and obtain a new proof.
+    let observed_lower = retained_provider_model_source_from_workspace_layer_snapshots(
+        &[lower], "p", "m",
+    )
+    .unwrap()
+    .expect("lower source proof");
+    assert_eq!(observed_lower.layer_index(), 0);
+    assert!(!observed_lower.has_same_source_slot(&source));
 }
 
 #[test]

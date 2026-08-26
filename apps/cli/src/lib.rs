@@ -240,6 +240,9 @@ pub mod integration {
                     initial_model: None,
                     no_sandbox: false,
                     interactive,
+                    session_entry_mode: session_id.is_none().then_some(
+                        crate::daemon::proto::SessionEntryMode::Code,
+                    ),
                     model_override: None,
                     client_protocol_version: self.inner.negotiated().version,
                     env_snapshot: None,
@@ -765,18 +768,24 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         install_cli_trust_policy(cli.project.as_deref()).await?;
     }
 
-    match cli.command {
-        None => {
-            commands::tui::run(cli.project.as_deref(), cli.no_sandbox, Some(launch_start)).await
-        }
+    if let Some(mode) = tui_mode_for_command(cli.command.as_ref()) {
+        return commands::tui::run_mode(
+            cli.project.as_deref(),
+            cli.no_sandbox,
+            mode,
+            Some(launch_start),
+        )
+        .await;
+    }
 
+    match cli.command {
         Some(Command::Ask(args)) => commands::ask::run(args).await,
         Some(Command::Run(args)) => {
             commands::run::run(args, cli.no_sandbox, cli.project.as_deref()).await
         }
         Some(Command::Invocation(sub)) => commands::invocation::run(sub).await,
         Some(Command::Agent(sub)) => commands::agent::run(sub).await,
-        Some(Command::Assistant(sub)) => {
+        Some(Command::Assistants(sub)) => {
             commands::assistant::run(sub, cli.no_sandbox, Some(launch_start)).await
         }
         #[cfg(feature = "remote")]
@@ -829,6 +838,18 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             );
             Ok(())
         }
+        None | Some(Command::Code | Command::Assistant | Command::Computer) => {
+            unreachable!("interactive mode commands return through tui_mode_for_command")
+        }
+    }
+}
+
+fn tui_mode_for_command(command: Option<&Command>) -> Option<commands::tui::SessionMode> {
+    match command {
+        None | Some(Command::Code) => Some(commands::tui::SessionMode::Code),
+        Some(Command::Assistant) => Some(commands::tui::SessionMode::Assistant),
+        Some(Command::Computer) => Some(commands::tui::SessionMode::Computer),
+        _ => None,
     }
 }
 
@@ -1149,6 +1170,29 @@ mod tests {
         assert!(command_requires_workspace_trust(Some(&Command::Debug(
             crate::cli::DebugCommand::Config,
         ))));
+    }
+
+    #[test]
+    fn modes_session_setup_cli_entries_share_one_tui_dispatch_mapping() {
+        use crate::commands::tui::SessionMode;
+
+        assert_eq!(tui_mode_for_command(None), Some(SessionMode::Code));
+        assert_eq!(
+            tui_mode_for_command(Some(&Command::Code)),
+            Some(SessionMode::Code)
+        );
+        assert_eq!(
+            tui_mode_for_command(Some(&Command::Assistant)),
+            Some(SessionMode::Assistant)
+        );
+        assert_eq!(
+            tui_mode_for_command(Some(&Command::Computer)),
+            Some(SessionMode::Computer)
+        );
+        assert_eq!(
+            tui_mode_for_command(Some(&Command::Jq(crate::cli::JqArgs { args: Vec::new() }))),
+            None
+        );
     }
 
     #[test]

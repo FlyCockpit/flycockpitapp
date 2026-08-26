@@ -14,6 +14,7 @@
 //! the lower crates do not depend on `cockpit-core` or `cockpit-cli`.
 
 pub mod agents;
+pub mod agent_tree;
 pub mod approval;
 pub mod assistants;
 pub mod audio_transcription;

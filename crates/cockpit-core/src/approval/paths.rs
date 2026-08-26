@@ -1,5 +1,6 @@
 use super::*;
 use crate::tools::shell_sandbox::SandboxPathAccess;
+use sha2::{Digest as _, Sha256};
 
 impl Approver {
     /// Decide a path access (part 2's native confinement). Granted →
@@ -48,7 +49,11 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if self.yolo_mode() || self.auto_allows("path", &target).await {
+        if self.yolo_mode()
+            || self
+                .auto_allows(crate::agent_tree::HostEffectClass::Authorization, &target)
+                .await
+        {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
         // Paths are never wrappers → all four scopes are offered.
@@ -67,9 +72,27 @@ impl Approver {
         );
         let set = approval_option_set("path_approval", false, &offered, None);
         let choice = self
-            .raise_and_decode(&description, question, |response| {
-                response_to_approval_choice(response, &set)
-            })
+            .raise_and_decode(
+                &description,
+                question,
+                "path_access",
+                serde_json::json!({
+                    "path": target.clone(),
+                    "required_access": format!("{required:?}"),
+                    "offered_scopes": offered.iter().map(|scope| scope_label(*scope)).collect::<Vec<_>>(),
+                    "candidate_effects": offered.iter().map(|scope| serde_json::json!({
+                        "selection": approve_option_id_for_scope(*scope).as_str(),
+                        "access": {"path": target, "required_access": format!("{required:?}")},
+                        "persist_grant": if *scope == Scope::Once { serde_json::Value::Null } else { serde_json::json!({"kind": "path", "path": target, "scope": scope_label(*scope), "access": format!("{required:?}")}) },
+                    })).chain(offered.iter().copied().filter(|scope| *scope != Scope::Once).map(|scope| serde_json::json!({
+                        "selection": reject_option_id_for_scope(scope).as_str(),
+                        "persist_reject": {"kind": "path", "path": target, "scope": scope_label(scope), "access": format!("{required:?}")},
+                    }))).chain(std::iter::once(serde_json::json!({
+                        "selection": "reject", "persist_reject": {"kind": "path", "path": target}
+                    }))).collect::<Vec<_>>(),
+                }),
+                |response| response_to_approval_choice(response, &set),
+            )
             .await?;
         let decision = match choice {
             ApprovalChoice::Deny => Decision::Deny,
@@ -77,14 +100,42 @@ impl Approver {
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
             ApprovalChoice::GrantPaths(_) => Decision::Deny,
             ApprovalChoice::Approve(scope) => {
-                self.store.record_path(path, scope, required).await?;
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "path_grant_persistence",
+                    &[serde_json::json!({
+                        "persist_grant": {"kind": "path", "path": &target, "scope": scope_label(scope), "access": format!("{required:?}")}
+                    })],
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(Decision::Deny);
+                }
+                if let Err(error) = self.store.record_path(path, scope, required).await {
+                    crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                    return Err(error.into());
+                }
                 Decision::Allow { scope }
             }
             ApprovalChoice::ApproveAllOnce => Decision::Deny,
             // A persistable path reject: record the standing reject, then deny
             // this access. (`Reject(Once)` is mapped to `Deny` upstream.)
             ApprovalChoice::Reject(scope) => {
-                self.store.record_path_reject(path, scope).await?;
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "path_reject_persistence",
+                    &[serde_json::json!({
+                        "persist_reject": {"kind": "path", "path": &target, "scope": scope_label(scope), "access": format!("{required:?}")}
+                    })],
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(Decision::Deny);
+                }
+                if let Err(error) = self.store.record_path_reject(path, scope).await {
+                    crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                    return Err(error.into());
+                }
                 Decision::Deny
             }
         };
@@ -119,13 +170,41 @@ impl Approver {
         file_glob: &str,
         parent_glob: &str,
     ) -> Result<GitignoreReadOutcome> {
-        if self.yolo_mode() || self.auto_allows("gitignore_read", display_path).await {
+        if self.yolo_mode()
+            || self
+                .auto_allows(
+                    crate::agent_tree::HostEffectClass::Authorization,
+                    display_path,
+                )
+                .await
+        {
             return Ok(GitignoreReadOutcome::ApproveOnce);
         }
         // Stage 1 — scope (file / parent dir / reject).
         let shape = self
-            .prompt_gitignore_stage1(display_path, parent_label)
+            .prompt_gitignore_stage1(display_path, parent_label, file_glob, parent_glob)
             .await?;
+        // Shape selection is itself an irreversible control decision: it
+        // determines which immutable glob the next prompt may persist. Claim
+        // that exact selector before carrying it into stage two, rather than
+        // leaving an earlier ready handoff to poison the later persistence
+        // boundary.
+        let shape_effect = match shape {
+            GitignoreShape::File => Some("gitignore_read_select_file"),
+            GitignoreShape::Parent => Some("gitignore_read_select_parent"),
+            GitignoreShape::Reject | GitignoreShape::NoninteractiveReject => None,
+        };
+        if let Some(effect) = shape_effect
+            && crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                "gitignore_shape_selection",
+                &[serde_json::json!({"effect": effect})],
+            )
+            .await
+            .is_err()
+        {
+            return Ok(GitignoreReadOutcome::Reject);
+        }
+        validate_gitignore_shape_binding(file_glob, parent_glob, shape)?;
         let glob = match shape {
             GitignoreShape::NoninteractiveReject => {
                 self.record_permission_decision(
@@ -155,7 +234,25 @@ impl Approver {
 
         // Stage 2 — persistence (once / session / project).
         let offered = [Scope::Once, Scope::Session, Scope::Project];
-        let persistence = self.prompt_gitignore_stage2(display_path).await?;
+        let persistence = self
+            .prompt_gitignore_stage2(
+                display_path,
+                file_glob,
+                parent_glob,
+                match shape {
+                    GitignoreShape::File => "file",
+                    GitignoreShape::Parent => "parent",
+                    // Reject branches returned above. Keep this arm explicit
+                    // so a future new shape cannot accidentally receive a
+                    // persistence prompt with an unbound effect.
+                    GitignoreShape::Reject | GitignoreShape::NoninteractiveReject => {
+                        unreachable!("gitignore rejection returned before persistence")
+                    }
+                },
+                &glob,
+            )
+            .await?;
+        validate_gitignore_persistence_binding(&glob, persistence)?;
         let (outcome, decision) = match persistence {
             GitignorePersistence::NoninteractiveReject => (
                 GitignoreReadOutcome::NoninteractiveReject,
@@ -195,6 +292,8 @@ impl Approver {
         &self,
         display_path: &str,
         parent_label: &str,
+        file_glob: &str,
+        parent_glob: &str,
     ) -> Result<GitignoreShape> {
         let prompt = format!("`{display_path}` is gitignored. Allow the agent to read it?");
         let question = InterruptQuestion::Single {
@@ -222,7 +321,25 @@ impl Approver {
                 ApprovalOptionId::GitignoreReject,
             ],
         );
-        self.raise_and_decode(&description, question, |response| {
+        self.raise_and_decode(
+            &description,
+            question,
+            "gitignore_read_shape",
+            // Prompt text is not authority.  Bind both exact candidate globs
+            // before showing the shape choice, so a later caller cannot
+            // preserve the UI path while swapping the file/parent effect.
+            serde_json::json!({
+                "display_path": display_path,
+                "parent_label": parent_label,
+                "file_glob": file_glob,
+                "parent_glob": parent_glob,
+                "candidate_effects": [
+                    {"selection": ID_GITIGNORE_FILE, "glob": file_glob, "effect": "gitignore_read_select_file"},
+                    {"selection": ID_GITIGNORE_PARENT, "glob": parent_glob, "effect": "gitignore_read_select_parent"},
+                    {"selection": ID_GITIGNORE_REJECT, "effect": "gitignore_read_reject"}
+                ]
+            }),
+            |response| {
             if matches!(
                 response,
                 ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
@@ -238,13 +355,21 @@ impl Approver {
                 ApprovalOptionId::GitignoreReject => GitignoreShape::Reject,
                 _ => return Err(ForeignOptionId::new(&set, id.as_str())),
             })
-        })
+            },
+        )
         .await
     }
 
     /// Raise the stage-2 (persistence) gitignore prompt and block for the
     /// answer.
-    async fn prompt_gitignore_stage2(&self, display_path: &str) -> Result<GitignorePersistence> {
+    async fn prompt_gitignore_stage2(
+        &self,
+        display_path: &str,
+        file_glob: &str,
+        parent_glob: &str,
+        selected_shape: &str,
+        selected_glob: &str,
+    ) -> Result<GitignorePersistence> {
         let prompt = format!("Allow reading `{display_path}` — for how long?");
         let question = InterruptQuestion::Single {
             prompt,
@@ -268,7 +393,29 @@ impl Approver {
                 ApprovalOptionId::ApproveProject,
             ],
         );
-        self.raise_and_decode(&description, question, |response| {
+        self.raise_and_decode(
+            &description,
+            question,
+            "gitignore_read_persistence",
+            // The persistence selection mutates an allowlist (or grants a
+            // single read), so bind the whole operation candidate set, its
+            // exact selected shape/glob, and every allowed persistence
+            // scope.  Decode below remains a second, local revalidation of
+            // the offered choices before the caller writes a session/project
+            // grant.
+            serde_json::json!({
+                "display_path": display_path,
+                "file_glob": file_glob,
+                "parent_glob": parent_glob,
+                "selected_shape": selected_shape,
+                "selected_glob": selected_glob,
+                "candidate_effects": [
+                    {"selection": ID_APPROVE_ONCE, "effect": "gitignore_read_once", "glob": selected_glob},
+                    {"selection": ID_APPROVE_SESSION, "effect": "gitignore_read_session_allow", "glob": selected_glob, "persist_grant": {"glob": selected_glob, "scope": "session"}},
+                    {"selection": ID_APPROVE_PROJECT, "effect": "gitignore_read_project_allow", "glob": selected_glob, "persist_grant": {"glob": selected_glob, "scope": "project"}}
+                ]
+            }),
+            |response| {
             if matches!(
                 response,
                 ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
@@ -284,8 +431,98 @@ impl Approver {
                 ApprovalOptionId::ApproveProject => GitignorePersistence::Project,
                 _ => return Err(ForeignOptionId::new(&set, id.as_str())),
             })
-        })
+            },
+        )
         .await
+    }
+}
+
+/// Revalidate the post-prompt selection against the exact durable candidate
+/// set.  The digest created before the prompt contains these values; this
+/// local check keeps a malformed/stale response from turning a file choice
+/// into a parent grant (or an empty glob into a broad allowlist) before the
+/// host consumes the final effect.
+fn validate_gitignore_shape_binding(
+    file_glob: &str,
+    parent_glob: &str,
+    shape: GitignoreShape,
+) -> Result<()> {
+    anyhow::ensure!(
+        !file_glob.is_empty() && !file_glob.contains('\0') && !parent_glob.contains('\0'),
+        "gitignore approval candidates are invalid"
+    );
+    match shape {
+        GitignoreShape::File => anyhow::ensure!(
+            !file_glob.ends_with('/'),
+            "gitignore file approval candidate is a directory"
+        ),
+        GitignoreShape::Parent => anyhow::ensure!(
+            parent_glob.is_empty() || parent_glob.ends_with('/'),
+            "gitignore parent approval candidate is not a directory glob"
+        ),
+        GitignoreShape::Reject | GitignoreShape::NoninteractiveReject => {}
+    }
+    Ok(())
+}
+
+fn validate_gitignore_persistence_binding(
+    selected_glob: &str,
+    persistence: GitignorePersistence,
+) -> Result<()> {
+    anyhow::ensure!(
+        !selected_glob.contains('\0'),
+        "gitignore persistence effect has an invalid selected glob"
+    );
+    // Every non-reject option is represented in the exact candidate set
+    // bound before the prompt. Keep these variants exhaustive: adding a new
+    // persistence scope requires adding its host-effect binding above.
+    match persistence {
+        GitignorePersistence::Once
+        | GitignorePersistence::Session
+        | GitignorePersistence::Project
+        | GitignorePersistence::Reject
+        | GitignorePersistence::NoninteractiveReject => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod gitignore_binding_tests {
+    use super::*;
+
+    #[test]
+    fn gitignore_shape_requires_exact_nonempty_candidates() {
+        assert!(validate_gitignore_shape_binding(
+            "ignored/private.txt",
+            "ignored/",
+            GitignoreShape::File,
+        )
+        .is_ok());
+        assert!(validate_gitignore_shape_binding("", "ignored/", GitignoreShape::File).is_err());
+        assert!(validate_gitignore_shape_binding(
+            "ignored/private.txt",
+            "not-a-directory",
+            GitignoreShape::Parent,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gitignore_root_parent_and_persistence_scope_are_not_reinterpreted() {
+        assert!(validate_gitignore_shape_binding(
+            "ignored-at-root.txt",
+            "",
+            GitignoreShape::Parent,
+        )
+        .is_ok());
+        for persistence in [
+            GitignorePersistence::Once,
+            GitignorePersistence::Session,
+            GitignorePersistence::Project,
+        ] {
+            assert!(validate_gitignore_persistence_binding("ignored/", persistence).is_ok());
+        }
+        assert!(validate_gitignore_persistence_binding("bad\0glob", GitignorePersistence::Once)
+            .is_err());
     }
 }
 
@@ -359,7 +596,11 @@ impl Approver {
             });
         }
         let target = path.display().to_string();
-        if self.yolo_mode() || self.auto_allows("file_write", &target).await {
+        if self.yolo_mode()
+            || self
+                .auto_allows(crate::agent_tree::HostEffectClass::Destructive, &target)
+                .await
+        {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
         let question = InterruptQuestion::Single {
@@ -415,10 +656,38 @@ impl Approver {
             approval_class: Some(GrantKind::Path),
             sandbox_escalation: None,
         };
+        let previous_commitment = write_content_commitment(previous);
+        let next_commitment = write_content_commitment(next);
+        let write_effect = serde_json::json!({
+            "path": path.display().to_string(),
+            "previous": previous_commitment,
+            "next": next_commitment,
+        });
         let choice = self
             .raise_and_decode(
                 "Existing file modification requires approval",
                 question,
+                "existing_file_write",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    // Persist commitments, never the file body. The caller
+                    // reconstructs these exact facts from the real before/
+                    // after bytes on replay, while the digest keeps a large
+                    // (and potentially sensitive) replacement out of the
+                    // durable approval ledger.
+                    "previous": write_effect["previous"].clone(),
+                    "next": write_effect["next"].clone(),
+                    // These are materially different persistent mutations:
+                    // a session grant for this exact file versus its parent
+                    // directory. Bind both complete candidate effects before
+                    // the response can select one.
+                    "candidate_effects": [
+                        {"selection": "approve_once", "write": write_effect.clone()},
+                        {"selection": FILE_SESSION, "write": write_effect.clone(), "persist_grant": {"kind": "path", "path": path.display().to_string(), "scope": "session", "access": "read_write"}},
+                        {"selection": DIRECTORY_SESSION, "write": write_effect, "persist_grant": {"kind": "path", "path": path.parent().unwrap_or(path).display().to_string(), "scope": "session", "access": "read_write"}},
+                        {"selection": "reject", "effect": "deny"}
+                    ],
+                }),
                 |response| {
                     let selected = response_single_id(response).map(str::to_owned);
                     match selected.as_deref() {
@@ -443,21 +712,60 @@ impl Approver {
         match choice.as_deref() {
             Some("approve_once") => Ok(Decision::Allow { scope: Scope::Once }),
             Some(FILE_SESSION) => {
-                self.store
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "file_write_grant_persistence",
+                    &[serde_json::json!({
+                        "persist_grant": {
+                            "kind": "path",
+                            "path": path.display().to_string(),
+                            "scope": "session",
+                            "access": "read_write",
+                        }
+                    })],
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(Decision::Deny);
+                }
+                if let Err(error) = self
+                    .store
                     .record_path(path, Scope::Session, SandboxPathAccess::ReadWrite)
-                    .await?;
+                    .await
+                {
+                    crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                    return Err(error.into());
+                }
                 Ok(Decision::Allow {
                     scope: Scope::Session,
                 })
             }
             Some(DIRECTORY_SESSION) => {
-                self.store
-                    .record_path(
-                        path.parent().unwrap_or(path),
-                        Scope::Session,
-                        SandboxPathAccess::ReadWrite,
-                    )
-                    .await?;
+                let parent = path.parent().unwrap_or(path);
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "file_write_directory_grant_persistence",
+                    &[serde_json::json!({
+                        "persist_grant": {
+                            "kind": "path",
+                            "path": parent.display().to_string(),
+                            "scope": "session",
+                            "access": "read_write",
+                        }
+                    })],
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(Decision::Deny);
+                }
+                if let Err(error) = self
+                    .store
+                    .record_path(parent, Scope::Session, SandboxPathAccess::ReadWrite)
+                    .await
+                {
+                    crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                    return Err(error.into());
+                }
                 Ok(Decision::Allow {
                     scope: Scope::Session,
                 })
@@ -465,6 +773,13 @@ impl Approver {
             _ => Ok(Decision::Deny),
         }
     }
+}
+
+pub(crate) fn write_content_commitment(bytes: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "byte_len": bytes.len(),
+        "sha256": format!("{:x}", Sha256::digest(bytes)),
+    })
 }
 
 #[cfg(test)]

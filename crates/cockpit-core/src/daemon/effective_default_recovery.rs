@@ -151,16 +151,36 @@ pub async fn recover_effective_default_journals_before_socket(
 /// Hand converged transactions to the sessions that own them.
 ///
 /// Routed through `SessionWork` so the driver stamps its own
-/// active-model-state generation onto the terminal event. A session with no
-/// live worker has no client waiting on this daemon, so the converged durable
-/// state — which the next attach serves — is the whole result; the undelivered
-/// correlation is logged rather than silently discarded.
+/// active-model-state generation onto the terminal event. This ambient wrapper
+/// preserves legacy startup/attach behavior for journals whose filesystem
+/// recovery already completed: a missing worker is logged rather than blocking
+/// daemon startup. Retained config-only journals use
+/// [`deliver_retained_default_terminals`] instead, which requires a durable
+/// receipt before cleanup.
 pub async fn deliver_recovered_terminals(
     ctx: &crate::daemon::server::DaemonContext,
     recovered: Vec<RecoveredTransaction>,
-) {
+) -> Result<()> {
+    deliver_recovered_terminals_inner(ctx, recovered, false).await
+}
+
+/// Strict delivery used by the retained config-only backend. Unlike ambient
+/// recovery, its private journal still exists and must not be retired unless a
+/// live worker has durably recorded the exact terminal receipt.
+pub async fn deliver_retained_default_terminals(
+    ctx: &crate::daemon::server::DaemonContext,
+    recovered: Vec<RecoveredTransaction>,
+) -> Result<()> {
+    deliver_recovered_terminals_inner(ctx, recovered, true).await
+}
+
+async fn deliver_recovered_terminals_inner(
+    ctx: &crate::daemon::server::DaemonContext,
+    recovered: Vec<RecoveredTransaction>,
+    require_durable_receipt: bool,
+) -> Result<()> {
     if recovered.is_empty() {
-        return;
+        return Ok(());
     }
     let mut by_session: std::collections::HashMap<Uuid, Vec<RecoveredTransaction>> =
         std::collections::HashMap::new();
@@ -172,25 +192,70 @@ pub async fn deliver_recovered_terminals(
     }
     for (session_id, transactions) in by_session {
         let Some(handle) = ctx.registry.live_handle(session_id) else {
+            if require_durable_receipt {
+                anyhow::bail!(
+                    "cannot durably record recovered default terminal receipt: session {session_id} has no live worker"
+                );
+            }
             tracing::info!(
                 %session_id,
                 count = transactions.len(),
-                "converged effective-default transactions for a session with no live worker; \
-                 the next attach serves the converged snapshot"
+                "converged ambient effective-default transactions for a session with no live worker"
             );
             continue;
         };
+        let (respond_to, receipt_ready) = tokio::sync::oneshot::channel();
         if let Err(error) = handle
             .send_work(
                 crate::daemon::session_worker::SessionWork::EmitRecoveredDefaultTerminals {
                     transactions,
+                    respond_to,
                 },
             )
             .await
         {
-            tracing::warn!(%error, %session_id, "could not deliver recovered terminal results");
+            if require_durable_receipt {
+                return Err(error).with_context(|| {
+                    format!("delivering recovered terminal results for session {session_id}")
+                });
+            }
+            tracing::warn!(
+                %session_id,
+                %error,
+                "ambient recovered default terminal worker rejected delivery"
+            );
+            continue;
+        }
+        let receipt_result = match receipt_ready.await {
+            Ok(result) => result,
+            Err(error) if require_durable_receipt => {
+                return Err(error)
+                    .context("recovered default terminal worker stopped before durable receipt");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "ambient recovered default terminal worker stopped before receipt"
+                );
+                continue;
+            }
+        };
+        if require_durable_receipt {
+            receipt_result
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!("persisting recovered terminal receipt for session {session_id}")
+                })?;
+        } else if let Err(error) = receipt_result {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "ambient recovered default terminal receipt could not be persisted"
+            );
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

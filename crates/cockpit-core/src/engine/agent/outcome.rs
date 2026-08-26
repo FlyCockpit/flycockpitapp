@@ -181,6 +181,11 @@ pub enum TaskControlAction {
 #[derive(Debug, Clone)]
 pub struct BatchTaskEntry {
     pub label: String,
+    /// Labels of batch siblings that must reach a terminal outcome before this
+    /// entry may begin. This is an execution-order edge only: the dependent
+    /// still receives its own self-contained brief and does not inherit a
+    /// sibling's capability or report.
+    pub depends_on: Vec<String>,
     pub child_agent: String,
     pub prompt: String,
     pub model: Option<crate::engine::model_roles::DelegationModelSelector>,
@@ -191,6 +196,77 @@ pub struct BatchTaskEntry {
     pub granted_tools: Vec<String>,
     pub todo_ids: Vec<uuid::Uuid>,
     pub write_scope: Option<String>,
+}
+
+/// Validate the directed dependency graph carried by a parsed task batch.
+///
+/// Keeping this beside the durable entry type makes the parser, scheduler, and
+/// recovery writer agree on one contract: every edge names a sibling, no node
+/// depends on itself, and a batch is acyclic.  A dependency deliberately does
+/// *not* imply a global barrier; the scheduler waits only on these edges.
+pub(crate) fn validate_batch_dependencies(entries: &[BatchTaskEntry]) -> Result<(), String> {
+    let labels = entries
+        .iter()
+        .map(|entry| entry.label.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    for entry in entries {
+        let mut seen = std::collections::HashSet::new();
+        for dependency in &entry.depends_on {
+            if dependency == &entry.label {
+                return Err(format!(
+                    "batch entry `{}` cannot depend on itself",
+                    entry.label
+                ));
+            }
+            if !labels.contains(dependency.as_str()) {
+                return Err(format!(
+                    "batch entry `{}` depends on unknown label `{dependency}`",
+                    entry.label
+                ));
+            }
+            if !seen.insert(dependency.as_str()) {
+                return Err(format!(
+                    "batch entry `{}` lists dependency `{dependency}` more than once",
+                    entry.label
+                ));
+            }
+        }
+    }
+
+    fn visit<'a>(
+        label: &'a str,
+        by_label: &std::collections::HashMap<&'a str, &'a BatchTaskEntry>,
+        visiting: &mut std::collections::HashSet<&'a str>,
+        visited: &mut std::collections::HashSet<&'a str>,
+    ) -> Result<(), String> {
+        if visited.contains(label) {
+            return Ok(());
+        }
+        if !visiting.insert(label) {
+            return Err(format!("batch dependency cycle includes `{label}`"));
+        }
+        let entry = by_label
+            .get(label)
+            .expect("dependency labels were validated before cycle detection");
+        for dependency in &entry.depends_on {
+            visit(dependency, by_label, visiting, visited)?;
+        }
+        visiting.remove(label);
+        visited.insert(label);
+        Ok(())
+    }
+
+    let by_label = entries
+        .iter()
+        .map(|entry| (entry.label.as_str(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut visiting = std::collections::HashSet::new();
+    let mut visited = std::collections::HashSet::new();
+    for label in &labels {
+        visit(label, &by_label, &mut visiting, &mut visited)?;
+    }
+    Ok(())
 }
 
 /// Resolve whether a `task` delegation runs **noninteractively** (synchronous

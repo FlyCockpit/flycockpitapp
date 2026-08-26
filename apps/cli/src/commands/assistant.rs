@@ -745,6 +745,10 @@ mod tests {
 
         let fetched = db.get_session(session.session_id).await.unwrap().unwrap();
         assert_eq!(fetched.assistant_name.as_deref(), Some("helper-bot"));
+        assert_eq!(
+            fetched.session_entry_mode, "assistant",
+            "direct assistant rows must not inherit the generic Code default"
+        );
 
         let filtered = db
             .list_sessions_for_assistant("helper-bot", false, 100)

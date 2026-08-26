@@ -1086,6 +1086,26 @@ async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value)
         .native_tool_ctx
         .clone()
         .context("native Monty tool requires a live tool context")?;
+    // Monty authorizes the nested native call before it enters the normal
+    // timeout dispatcher. Give that direct authorization+dispatch pair its
+    // own effect scope: the outer `mcp` tool scope remains responsible for the
+    // transport call, while this scope owns any approval consumed for the
+    // actual native tool it invokes.
+    crate::engine::interrupt::with_host_approval_effect_scope(
+        "monty_native_tool",
+        tool_ctx.cancel.clone(),
+        invoke_native_tool_unscoped(ctx, tool, args, tool_ctx),
+        |_| None,
+    )
+    .await
+}
+
+async fn invoke_native_tool_unscoped(
+    ctx: &HostContext,
+    tool: Arc<dyn Tool>,
+    args: Value,
+    tool_ctx: crate::engine::tool::ToolCtx,
+) -> Result<Value> {
     match crate::engine::agent::tool_dispatch::authorize_monty_native_call(
         tool.as_ref(),
         &args,
@@ -1107,6 +1127,12 @@ async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value)
         current_tool_call_id.as_deref(),
     )
     .await?;
+    // The nested timeout scope has already settled approvals raised *inside*
+    // the native tool. This records the exact tool result for an approval
+    // raised by Monty's shared pre-dispatch authorization gate.
+    crate::engine::interrupt::record_host_approval_effect_boundary_outcome(
+        output.exit_code.is_none_or(|code| code == 0),
+    );
     let mut delivered = ctx
         .native_tool_ctx
         .as_ref()

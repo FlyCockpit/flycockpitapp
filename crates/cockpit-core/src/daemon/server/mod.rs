@@ -318,6 +318,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         proto::Response::Attached {
             session_id: _,
+            session_entry_mode: _,
             short_id: _,
             project_root,
             project_id: _,
@@ -391,6 +392,22 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_string(label, redact);
             scrub_history_entries(entries, redact);
         }
+        // Agent-tree snapshots are already constrained durable projections.
+        // Their display strings still pass through the normal vault-redaction
+        // backstop before a non-owner receives them.
+        proto::Response::AgentTreePage { nodes, .. } => {
+            for node in nodes {
+                scrub_option_string(&mut node.workspace_ref, redact);
+            }
+        }
+        proto::Response::AgentAttentionPage { entries, .. } => {
+            for entry in entries {
+                scrub_string(&mut entry.options_contract_json, redact);
+                scrub_option_string(&mut entry.free_text_contract_json, redact);
+                scrub_option_string(&mut entry.recommendation_json, redact);
+            }
+        }
+        proto::Response::AgentDecisionSteered { .. } => {}
         proto::Response::GoalStatus { goal } => {
             if let Some(goal) = goal {
                 scrub_goal_summary(goal, redact);
@@ -441,6 +458,35 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
             for model in models {
                 scrub_model_summary(model, redact);
+            }
+        }
+        proto::Response::SessionSetupSnapshot { snapshot } => {
+            for candidate in &mut snapshot.candidates {
+                scrub_string(&mut candidate.installation.source_agent_id, redact);
+                scrub_string(&mut candidate.installation.source_identity, redact);
+                if let Some(revision) = &mut candidate.installation.source_revision {
+                    scrub_string(revision, redact);
+                }
+                for slot in &mut candidate.slots {
+                    for choice in &mut slot.choices {
+                        scrub_string(&mut choice.provider_id, redact);
+                        scrub_string(&mut choice.model_id, redact);
+                        if let Some(label) = &mut choice.author_label {
+                            scrub_string(label, redact);
+                        }
+                        if let Some(rationale) = &mut choice.rationale {
+                            scrub_string(rationale, redact);
+                        }
+                    }
+                    for recommendation in &mut slot.unmatched_recommendations {
+                        if let Some(label) = &mut recommendation.author_label {
+                            scrub_string(label, redact);
+                        }
+                        if let Some(rationale) = &mut recommendation.rationale {
+                            scrub_string(rationale, redact);
+                        }
+                    }
+                }
             }
         }
         proto::Response::ResourceSnapshot { snapshot } => {
@@ -1331,6 +1377,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         proto::Event::HostCapabilitiesChanged { snapshot } => {
             scrub_host_capability_snapshot(snapshot, redact);
         }
+        proto::Event::AgentTreeChanged { .. } => {}
         proto::Event::Unknown => {}
     }
 }
@@ -1560,6 +1607,7 @@ fn scrub_resume_repair_state(state: &mut proto::ResumeRepairState, redact: &Reda
 fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &RedactionTable) {
     let proto::SessionSummary {
         session_id: _,
+        session_entry_mode: _,
         short_id: _,
         project_root,
         project_id: _,
@@ -2517,7 +2565,13 @@ impl DaemonContext {
             registry.set_scheduler(handle.clone());
         }
         let host_capabilities = crate::host_capabilities::HostCapabilitySnapshotStore::new();
-        registry.set_host_capabilities(host_capabilities.clone());
+        let host_capability_probes = crate::host_capabilities::HostCapabilityProbeInputs::production(
+            canonical_cwd.clone(),
+        );
+        registry.set_host_capabilities(
+            host_capabilities.clone(),
+            host_capability_probes.clone(),
+        );
         struct DaemonMediaClock(Instant);
         impl crate::media_reservation::MonotonicClock for DaemonMediaClock {
             fn now_ms(&self) -> u64 {
@@ -2646,9 +2700,7 @@ impl DaemonContext {
                 crate::daemon::remote_project_resolver::StaticRemoteProjectResolver::new(),
             ),
             host_capabilities,
-            host_capability_probes: crate::host_capabilities::HostCapabilityProbeInputs::production(
-                canonical_cwd.clone(),
-            ),
+            host_capability_probes,
             redaction_publication_poisoned: AtomicBool::new(false),
             #[cfg(test)]
             redaction_refresh_failure: Arc::new(AtomicBool::new(false)),
@@ -2776,20 +2828,75 @@ impl DaemonContext {
     pub(crate) fn agent_installation_service(
         &self,
     ) -> Result<Arc<crate::daemon::agent_installation::AgentInstallationService>> {
+        self.agent_installation_service_for_authorized_workspace(None)
+    }
+
+    /// Construct the installation boundary with the already-attached
+    /// session's workspace proof in the local-owner authorization contract.
+    /// The caller receives that immutable proof only from a daemon-owned
+    /// attachment, never from request data or a later path lookup.
+    pub(crate) fn agent_installation_service_for_authorized_workspace(
+        &self,
+        attached_workspace_root: Option<
+            &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+        >,
+    ) -> Result<Arc<crate::daemon::agent_installation::AgentInstallationService>> {
+        self.agent_installation_service_for_authorized_workspace_with_providers(
+            attached_workspace_root,
+            None,
+        )
+    }
+
+    /// Same installation boundary, but lets a read-only projection reuse the
+    /// attached worker's already-authoritative provider snapshot. This avoids
+    /// reopening `canonical_cwd` while a setup request holds an attach-time
+    /// workspace capability.
+    pub(crate) fn agent_installation_service_for_authorized_workspace_with_providers(
+        &self,
+        attached_workspace_root: Option<
+            &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+        >,
+        providers: Option<crate::config::providers::ProvidersConfig>,
+    ) -> Result<Arc<crate::daemon::agent_installation::AgentInstallationService>> {
         #[cfg(debug_assertions)]
         if let Some(service) = &self.agent_installation_fixture {
             return Ok(service.clone());
         }
+        let authorized_roots = match attached_workspace_root {
+            // If the session was attached at the daemon cwd, do not capture
+            // that spelling again: a replacement directory would otherwise
+            // be accidentally admitted alongside the attach-time proof.
+            Some(root) if root.canonical_path() == self.canonical_cwd => {
+                vec![root.clone()]
+            }
+            Some(root) => {
+                vec![
+                    crate::daemon::agent_installation::AuthorizedWorkspaceRoot::capture(
+                        &self.canonical_cwd,
+                    )?,
+                    root.clone(),
+                ]
+            }
+            None => vec![
+                crate::daemon::agent_installation::AuthorizedWorkspaceRoot::capture(
+                    &self.canonical_cwd,
+                )?,
+            ],
+        };
         Ok(Arc::new(
-            crate::daemon::agent_installation::default_daemon_service(
+            crate::daemon::agent_installation::default_daemon_service_with_captured_workspace_roots(
                 self.db.clone(),
                 &self.paths,
                 self.secret_vault.clone(),
-                self.config_source()
-                    .load(&self.canonical_cwd)
-                    .context("loading daemon provider configuration")?
-                    .0,
-                vec![self.canonical_cwd.clone()],
+                match providers {
+                    Some(providers) => providers,
+                    None => self
+                        .config_source()
+                        .load(&self.canonical_cwd)
+                        .context("loading daemon provider configuration")?
+                        .0,
+                },
+                authorized_roots,
             )?,
         ))
     }
@@ -3483,8 +3590,155 @@ pub(crate) async fn boot_with_db(
     timer.phase("lock_manager");
     run_boot_housekeeping(&db).await;
     timer.phase("prune_and_sweep");
+    let fenced_refreshes = db
+        .reconcile_host_capability_refresh_execution_leases_at_boot(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+        .context("fencing prior-process host capability refresh executions")?;
+    if fenced_refreshes > 0 {
+        tracing::warn!(fenced_refreshes, "fenced global host capability refresh executions from a prior daemon process");
+    }
+    anyhow::ensure!(
+        !db
+            .has_executing_host_capability_refresh_operations(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+            )
+            .await
+            .context("checking global host capability refresh execution fence")?,
+        "host capability refresh execution fence remains live after boot reconciliation"
+    );
     #[cfg_attr(test, allow(unused_mut))]
     let mut ctx = DaemonContext::new(db.clone(), locks, paths, terminal_factory, config_source);
+    // A capability refresh receipt is daemon-global state, not a per-session
+    // cache. Seed only from an already-published durable generation, then
+    // replay the completed outbox below in order. Seeding from the newest
+    // *unpublished* receipt would make an older outbox entry impossible to
+    // publish and could overtake its generation at boot.
+    match db
+        .latest_published_host_capability_refresh_snapshot_receipt(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+        )
+        .await
+            .context("loading published host capability refresh receipt")?
+    {
+        Some(receipt) => {
+            let snapshot: cockpit_proto::HostCapabilitySnapshot = serde_json::from_str(
+                &receipt.result_snapshot_json,
+            )
+            .context("durable host capability refresh receipt is not a HostCapabilitySnapshot")?;
+            anyhow::ensure!(
+                snapshot.generation == receipt.generation,
+                "durable host capability refresh receipt generation disagrees with its snapshot"
+            );
+            ctx.host_capabilities.observe_durable_generation(receipt.generation);
+            ctx.host_capabilities
+                .publish_committed(snapshot)
+                .map_err(anyhow::Error::msg)
+                .context("seeding host capability store from published refresh receipt")?;
+        }
+        None => {
+            let high_water = db
+                .host_capability_refresh_generation_high_water(
+                    crate::agent_tree::daemon_host_capability_refresh_authority(),
+                )
+                .await
+                .context("loading host capability refresh generation high-water")?;
+            ctx.host_capabilities.observe_durable_generation(high_water);
+        }
+    };
+    // Drain every completed global publication receipt before reserving the
+    // boot generation. Each SQL read is keyset-bounded even for a large crash
+    // backlog; publishing still advances strictly in durable generation
+    // order, and the acknowledgement fences a later boot/probe.
+    let mut outbox_after = None;
+    loop {
+        let page = db
+            .completed_unpublished_host_capability_refresh_operations_page(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                outbox_after.clone(),
+                crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE,
+            )
+            .await
+            .context("loading host capability refresh boot outbox page")?;
+        let next_cursor = page.next_cursor;
+        for operation in page.entries {
+            let raw = operation
+                .result_snapshot_json
+                .as_deref()
+                .context("completed host capability refresh outbox row has no snapshot")?;
+            let generation = operation
+                .result_snapshot_generation
+                .context("completed host capability refresh outbox row has no generation")?;
+            let digest = operation
+                .result_snapshot_digest
+                .clone()
+                .context("completed host capability refresh outbox row has no digest")?;
+            let snapshot: cockpit_proto::HostCapabilitySnapshot = serde_json::from_str(raw)
+                .context("completed host capability refresh outbox snapshot is malformed")?;
+            anyhow::ensure!(
+                snapshot.generation == generation,
+                "completed host capability refresh outbox generation is inconsistent"
+            );
+            anyhow::ensure!(
+                ctx.host_capabilities
+                    .current()
+                    .is_none_or(|current| current.generation <= generation),
+                "host capability refresh boot outbox is behind an already-live completed generation"
+            );
+            ctx.host_capabilities
+                .publish_committed(snapshot)
+                .map_err(anyhow::Error::msg)
+                .context("publishing completed host capability refresh boot outbox snapshot")?;
+            db.mark_host_capability_refresh_published(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                operation.session_id,
+                operation.operation_id,
+                generation,
+                digest,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .context("acknowledging completed host capability refresh boot outbox")?;
+        }
+        let Some(cursor) = next_cursor else {
+            break;
+        };
+        outbox_after = Some(cursor);
+    }
+    // A completed receipt which has not reached the live store is a hard
+    // ordering fence: boot must replay that exact snapshot rather than probe
+    // and expose a later generation first. Once that outbox is empty, the
+    // normal boot probe may still refresh current host facts.
+    let host_capability_boot_probe_blocked = !db
+        .completed_unpublished_host_capability_refresh_operations_page(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            None,
+            1,
+        )
+        .await
+        .context("checking host capability refresh publication outbox")?
+        .entries
+        .is_empty();
+    // The initial daemon probe shares the public snapshot generation
+    // namespace with later approved refreshes. Reserve it durably rather than
+    // leaving the first AgentTree refresh to collide with the live boot
+    // snapshot at generation one. An acknowledged N therefore produces a
+    // boot N+1 (and later approved work N+2), while an unpublished receipt
+    // defers the probe until recovery makes its exact generation visible.
+    let initial_host_capability_snapshot_generation = if !host_capability_boot_probe_blocked {
+        let generation = db
+            .reserve_host_capability_boot_snapshot_generation(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+            )
+            .await
+            .context("reserving initial host capability snapshot generation")?;
+        ctx.host_capabilities.observe_durable_generation(generation);
+        Some(generation)
+    } else {
+        None
+    };
     db.reconcile_delegation_sidecar_prepare_intents()
         .await
         .context("reconciling delegation sidecar prepare intents")?;
@@ -3548,45 +3802,47 @@ pub(crate) async fn boot_with_db(
                 Ok(Ok(actor)) => {
                     ctx.attach_secure_key_actor(actor);
                     timer.phase("secure_key_actor");
-                    let generation = ctx.host_capabilities.begin_refresh();
-                    let authority = db
-                        .blocking_write_for_sync_maintenance(
-                            crate::db::secret_vault::load_authority_conn,
-                        )
-                        .ok()
-                        .flatten();
-                    let secret_store = crate::secure_key::project_secret_store_snapshot(
-                        authority.as_ref(),
-                        &probes.keyring,
-                    );
-                    let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-                        generation,
-                        &probes,
-                        secret_store,
-                    );
-                    let _ = ctx.host_capabilities.publish(snapshot);
+                    if let Some(generation) = initial_host_capability_snapshot_generation {
+                        let authority = db
+                            .blocking_write_for_sync_maintenance(
+                                crate::db::secret_vault::load_authority_conn,
+                            )
+                            .ok()
+                            .flatten();
+                        let secret_store = crate::secure_key::project_secret_store_snapshot(
+                            authority.as_ref(),
+                            &probes.keyring,
+                        );
+                        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                            generation,
+                            &probes,
+                            secret_store,
+                        );
+                        let _ = ctx.host_capabilities.publish(snapshot);
+                    }
                     timer.phase("host_capabilities");
                 }
                 Ok(Err(error)) => {
-                    let generation = ctx.host_capabilities.begin_refresh();
-                    let secret_store = match &error {
-                        crate::secure_key::SecureKeyError::KekUnavailable {
-                            reason,
-                            fix_command,
-                        } => cockpit_proto::SecretStoreSnapshot {
-                            intent: cockpit_proto::SecretStoreIntent::Keyring,
-                            effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
-                            fail_closed_reason: Some(reason.clone()),
-                            fix_command: fix_command.clone(),
-                        },
-                        _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
-                    };
-                    let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-                        generation,
-                        &probes,
-                        secret_store,
-                    );
-                    let _ = ctx.host_capabilities.publish(snapshot);
+                    if let Some(generation) = initial_host_capability_snapshot_generation {
+                        let secret_store = match &error {
+                            crate::secure_key::SecureKeyError::KekUnavailable {
+                                reason,
+                                fix_command,
+                            } => cockpit_proto::SecretStoreSnapshot {
+                                intent: cockpit_proto::SecretStoreIntent::Keyring,
+                                effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
+                                fail_closed_reason: Some(reason.clone()),
+                                fix_command: fix_command.clone(),
+                            },
+                            _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+                        };
+                        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                            generation,
+                            &probes,
+                            secret_store,
+                        );
+                        let _ = ctx.host_capabilities.publish(snapshot);
+                    }
                     timer.phase("host_capabilities");
                     return Err(anyhow::anyhow!("secure key vault: {error}"));
                 }
@@ -3604,11 +3860,19 @@ pub(crate) async fn boot_with_db(
     #[cfg(test)]
     {
         let _ = &db;
-        crate::host_capabilities::publish_initial_host_capabilities(
-            &ctx.host_capabilities,
-            &ctx.host_capability_probes,
-        )
-        .await;
+        if let Some(generation) = initial_host_capability_snapshot_generation {
+            let probes = crate::host_capabilities::collect_shared_host_probes(
+                &ctx.host_capability_probes,
+                false,
+            )
+            .await;
+            let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                generation,
+                &probes,
+                cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+            );
+            let _ = ctx.host_capabilities.publish(snapshot);
+        }
         timer.phase("host_capabilities");
         timer.phase("secure_key_actor_skipped");
     }
@@ -3867,15 +4131,11 @@ async fn run_boot_housekeeping(db: &Db) {
         chrono::Utc::now().timestamp(),
     )
     .await;
-    match db.reconcile_orphaned_task_delegations().await {
-        Ok(n) if n > 0 => {
-            tracing::info!(count = n, "marked orphaned task delegations lost on boot")
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "reconciling orphaned task delegations on boot failed")
-        }
-    }
+    // Durable task executors are recovered by the owning session worker. A
+    // daemon restart is not evidence that a running child was lost; marking
+    // every live row failed here would discard its exact lifecycle claim,
+    // pending decision, and approved host-effect receipt before reattachment
+    // gets a chance to run.
 }
 
 /// Complete fail-closed local authority recovery before either daemon socket
@@ -3970,7 +4230,9 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         )
     .await
     .context("startup effective-default journal recovery failed")?;
-    crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered).await;
+    crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered)
+        .await
+        .context("startup recovered effective-default receipt delivery failed")?;
     Ok(())
 }
 
@@ -4207,6 +4469,12 @@ pub(super) struct SharedClientState {
 pub(super) struct SharedAttachedSession {
     session_id: Uuid,
     project_root: PathBuf,
+    workspace_identity: Option<crate::daemon::agent_installation::AuthorizedWorkspaceRoot>,
+    /// A concurrent request still has to enter the one attached session worker
+    /// for durable decision ownership. Keeping this immutable handle in the
+    /// per-request snapshot lets a long-lived operation wait outside the
+    /// client's serialized decoder without borrowing mutable client state.
+    handle: SessionWorkerHandle,
     redaction_table: Arc<RedactionTable>,
     #[allow(dead_code)] // retained for attach-time toolbox identity snapshots
     active_tool_names: Vec<String>,
@@ -4326,6 +4594,8 @@ impl MutableClientState {
             attached: self.attached.as_ref().map(|att| SharedAttachedSession {
                 session_id: att.handle.session_id,
                 project_root: att.handle.project_root.clone(),
+                workspace_identity: att.workspace_identity.clone(),
+                handle: att.handle.clone(),
                 redaction_table: att.handle.redaction_table(),
                 active_tool_names: att.handle.active_tool_names(),
             }),
@@ -4470,6 +4740,10 @@ struct ReadyAttachment {
 
 struct AttachedSession {
     handle: SessionWorkerHandle,
+    /// Captured at attach before this connection can issue setup reads. The
+    /// setup projection verifies this stable directory identity rather than
+    /// authorizing a later object that happens to reuse the same pathname.
+    workspace_identity: Option<crate::daemon::agent_installation::AuthorizedWorkspaceRoot>,
     /// Held for the lifetime of the attachment when this client is
     /// interactive (can answer interrupts). Dropping it on detach /
     /// re-attach / disconnect decrements the worker's interactive-client

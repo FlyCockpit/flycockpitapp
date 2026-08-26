@@ -95,6 +95,15 @@ impl Tool for ReadTool {
                 crate::tools::shell_sandbox::SandboxPathAccess::Read,
             )
             .await?;
+            // `check_gitignore_read` resolves the effective path and probes
+            // repository status. Those are already host filesystem effects,
+            // so the once-only native access cannot remain ambient authority
+            // until the eventual byte read.
+            crate::tools::sandbox::recheck_native_access_effect_boundary(
+                &checked,
+                crate::tools::shell_sandbox::SandboxPathAccess::Read,
+            )
+            .await?;
             // Gitignore read-allowlist gate (read only): a gitignored,
             // un-allowlisted path raises the two-stage approval; a refusal is a
             // non-fatal tool result the model sees, never a crash.
@@ -103,6 +112,15 @@ impl Tool for ReadTool {
             {
                 return Ok(refusal);
             }
+            // The gitignore gate can itself await. Recheck its original exact
+            // native access immediately before `read_impl_*` inspects metadata
+            // or file bytes, so cancellation/revision races after that gate
+            // also fail closed.
+            crate::tools::sandbox::recheck_native_access_effect_boundary(
+                &checked,
+                crate::tools::shell_sandbox::SandboxPathAccess::Read,
+            )
+            .await?;
             let mut output = read_impl_with_path(args, ctx, false, checked.clone()).await?;
             if ctx
                 .session

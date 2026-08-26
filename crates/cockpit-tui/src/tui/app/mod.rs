@@ -1888,8 +1888,15 @@ fn providers_from_view(
     }
 }
 
+/// Canonical daemon-owned entry setup. The App uses this only for attach
+/// requests until it adopts the daemon-returned authoritative value.
+pub type SessionMode = cockpit_core::daemon::proto::SessionEntryMode;
+
 #[allow(private_interfaces)]
 pub struct App {
+    /// Requested before attach, then replaced by the daemon-owned session
+    /// value from `Attached`. It never grants or changes execution authority.
+    pub(super) session_mode: Option<SessionMode>,
     /// Typed channel to the CLI-owned lifecycle composition task.
     pub(super) lifecycle: cockpit_client::LifecycleClient,
     pub(super) monotonic_origin: Instant,
@@ -3394,6 +3401,7 @@ impl App {
         Self::new_inner(
             project,
             no_sandbox,
+            Some(SessionMode::Code),
             StartupWorkspaceTrust::Decided,
             None,
             None,
@@ -3414,7 +3422,35 @@ impl App {
         trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
     ) -> Self {
-        Self::new_inner(project, no_sandbox, trust, launch_start, None)
+        Self::new_inner(
+            project,
+            no_sandbox,
+            Some(SessionMode::Code),
+            trust,
+            launch_start,
+            None,
+        )
+    }
+
+    pub fn new_with_session_mode_and_workspace_trust_and_launch_start(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        session_mode: SessionMode,
+        trust: StartupWorkspaceTrust,
+        launch_start: Option<Instant>,
+    ) -> Self {
+        Self::new_inner(
+            project,
+            no_sandbox,
+            Some(session_mode),
+            trust,
+            launch_start,
+            None,
+        )
+    }
+
+    pub fn session_mode(&self) -> Option<SessionMode> {
+        self.session_mode
     }
 
     pub fn new_composed(
@@ -3424,7 +3460,14 @@ impl App {
         launch_start: Option<Instant>,
         lifecycle: cockpit_client::LifecycleClient,
     ) -> Self {
-        Self::new_inner(project, no_sandbox, trust, launch_start, Some(lifecycle))
+        Self::new_inner(
+            project,
+            no_sandbox,
+            Some(SessionMode::Code),
+            trust,
+            launch_start,
+            Some(lifecycle),
+        )
     }
 
     pub fn new_composed_with_session(
@@ -3435,7 +3478,14 @@ impl App {
         launch_start: Option<Instant>,
         lifecycle: cockpit_client::LifecycleClient,
     ) -> Self {
-        let mut app = Self::new_inner(project, no_sandbox, trust, launch_start, Some(lifecycle));
+        let mut app = Self::new_inner(
+            project,
+            no_sandbox,
+            Some(SessionMode::Code),
+            trust,
+            launch_start,
+            Some(lifecycle),
+        );
         app.launch.session_id = Some(session_id);
         app
     }
@@ -3457,6 +3507,10 @@ impl App {
         let mut app = Self::new_inner(
             project,
             no_sandbox,
+            // Existing sessions receive their mode only from the Attach
+            // response; never prefill a Code placeholder that could leak
+            // into a resume request or initial chrome.
+            None,
             StartupWorkspaceTrust::Decided,
             launch_start,
             None,
@@ -3474,6 +3528,7 @@ impl App {
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,
+        session_mode: Option<SessionMode>,
         startup_trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
         lifecycle: Option<cockpit_client::LifecycleClient>,
@@ -3591,6 +3646,7 @@ impl App {
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
+            session_mode,
             lifecycle: lifecycle.unwrap_or_else(cockpit_client::LifecycleClient::disconnected),
             monotonic_origin: Instant::now(),
             paste_client_instance_id: uuid::Uuid::new_v4(),

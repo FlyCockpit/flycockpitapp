@@ -645,8 +645,59 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    let depends_on = match item.get("depends_on") {
+                        None => Vec::new(),
+                        Some(Value::Array(values)) => {
+                            let mut dependencies = Vec::with_capacity(values.len());
+                            for value in values {
+                                let Some(dependency_label) = value.as_str().map(str::trim) else {
+                                    return_structural!(task_refusal(
+                                        &tc.id,
+                                        tc.provider
+                                            .as_ref()
+                                            .and_then(|provider| provider.item_id.clone()),
+                                        tc.provider
+                                            .as_ref()
+                                            .map(|provider| provider.call_id.clone()),
+                                        format!(
+                                            "batch entry `{label}` has non-string `depends_on` item"
+                                        ),
+                                    ));
+                                };
+                                if dependency_label.is_empty() {
+                                    return_structural!(task_refusal(
+                                        &tc.id,
+                                        tc.provider
+                                            .as_ref()
+                                            .and_then(|provider| provider.item_id.clone()),
+                                        tc.provider
+                                            .as_ref()
+                                            .map(|provider| provider.call_id.clone()),
+                                        format!(
+                                            "batch entry `{label}` has empty `depends_on` label"
+                                        ),
+                                    ));
+                                }
+                                dependencies.push(dependency_label.to_string());
+                            }
+                            dependencies
+                        }
+                        Some(_) => {
+                            return_structural!(task_refusal(
+                                &tc.id,
+                                tc.provider
+                                    .as_ref()
+                                    .and_then(|provider| provider.item_id.clone()),
+                                tc.provider
+                                    .as_ref()
+                                    .map(|provider| provider.call_id.clone()),
+                                format!("batch entry `{label}` requires array `depends_on`"),
+                            ));
+                        }
+                    };
                     entries.push(BatchTaskEntry {
                         label,
+                        depends_on,
                         child_agent: child.to_string(),
                         prompt: prompt.to_string(),
                         model,
@@ -658,6 +709,18 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         todo_ids: task_todo_ids(item),
                         write_scope,
                     });
+                }
+                if let Err(error) = validate_batch_dependencies(&entries) {
+                    return_structural!(task_refusal(
+                        &tc.id,
+                        tc.provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        tc.provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        error,
+                    ));
                 }
                 return_structural!(TurnOutcome::SpawnNoninteractiveBatch {
                     entries,
@@ -2180,6 +2243,7 @@ pub(crate) async fn run_turn(
     // Tool dispatch.
     let ctx = ToolCtx {
         agent_id: agent.name.clone(),
+        agent_instance_id: crate::engine::agent::current_agent_instance_id(),
         lock_identity: agent.lock_identity.clone(),
         write_scope: agent.write_scope.clone(),
         current_tool_call_id: None,

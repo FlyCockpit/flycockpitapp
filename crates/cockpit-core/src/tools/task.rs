@@ -188,6 +188,11 @@ impl TaskTool {
             "type": "object",
             "properties": {
                 "label": { "type": "string" },
+                "depends_on": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 },
+                    "description": "Optional sibling labels that must finish before this entry starts; unrelated entries still run concurrently"
+                },
                 "agent":  {
                     "type": "string",
                     "description": "`docs` for dependency API usage; `explore`",

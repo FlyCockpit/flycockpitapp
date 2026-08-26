@@ -41,6 +41,7 @@ const empty = {
 
 const attachFixture = {
   session_id: sessionId,
+  session_entry_mode: "code" as const,
   short_id: "s1",
   project_root: "/work/app",
   project_id: "project_1",
@@ -1388,6 +1389,7 @@ describe("remote session reducers", () => {
     expect(attach).toHaveBeenNthCalledWith(1, {
       project_root: "/work/new-project",
       interactive: true,
+      session_entry_mode: "code",
       initial_model: undefined,
     });
     expect(attach).toHaveBeenNthCalledWith(2, {

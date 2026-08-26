@@ -142,6 +142,176 @@ pub struct HeldDirectoryAuthority {
     identity: DirectoryIdentity,
 }
 
+/// Read-only authority for an attached workspace directory.  Unlike
+/// [`HeldDirectoryAuthority`], this deliberately does not require a private
+/// owner-only directory: a user workspace can be shared with their tools.
+/// It still anchors every child lookup in the originally opened directory and
+/// refuses symlink/reparse traversal, so a later pathname replacement cannot
+/// change what an already-attached session reads.
+#[derive(Debug)]
+pub struct HeldWorkspaceDirectoryAuthority {
+    imp: imp::HeldDirectory,
+    identity: String,
+}
+
+/// A Windows-only lifetime lease for using a retained workspace as a child
+/// process current directory. Windows' `CreateProcess` takes a path rather
+/// than an open directory object, so the lease keeps every component from the
+/// drive root through the workspace open without `FILE_SHARE_DELETE`.  That
+/// makes a rename/delete substitution impossible from the final identity
+/// verification until the child has exited.
+#[cfg(windows)]
+pub(crate) struct WindowsWorkspaceExecutionLease {
+    chain: Vec<File>,
+    canonical_path: PathBuf,
+    expected_identity: String,
+}
+
+#[cfg(windows)]
+impl WindowsWorkspaceExecutionLease {
+    pub(crate) fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    /// Re-open the configured spelling through no-reparse, no-delete handles
+    /// and compare the resulting FileId to the attach-time proof. The original
+    /// chain remains live during this check and through child completion, so a
+    /// successful check cannot be followed by a pathname substitution before
+    /// `CreateProcess` consumes `canonical_path`.
+    pub(crate) fn revalidate_before_spawn(&self) -> Result<()> {
+        self.imp_revalidate()
+    }
+
+    fn imp_revalidate(&self) -> Result<()> {
+        ensure!(
+            !self.chain.is_empty(),
+            "Windows workspace execution lease has no directory handle"
+        );
+        imp::revalidate_workspace_execution_lease(
+            &self.chain,
+            &self.canonical_path,
+            &self.expected_identity,
+        )
+    }
+}
+
+#[cfg(windows)]
+impl cockpit_config::config::extended::hooks::HookExecutionLease
+    for WindowsWorkspaceExecutionLease
+{
+}
+
+#[cfg(windows)]
+impl cockpit_config::config::extended::hooks::RetainedWindowsHookWorkingDirectory
+    for WindowsWorkspaceExecutionLease
+{
+    fn canonical_path(&self) -> &Path {
+        WindowsWorkspaceExecutionLease::canonical_path(self)
+    }
+
+    fn revalidate_before_spawn(&self) -> std::result::Result<(), String> {
+        WindowsWorkspaceExecutionLease::revalidate_before_spawn(self)
+            .map_err(|error| format!("Windows retained hook cwd lease verification failed: {error:#}"))
+    }
+}
+
+/// Exact bytes and executable eligibility read through a held workspace
+/// directory. This is intentionally not serializable: it is only the bridge
+/// from a no-follow source lookup to a daemon-private hook execution snapshot.
+pub struct HeldWorkspaceExecutableFile {
+    pub bytes: Vec<u8>,
+    #[cfg(unix)]
+    pub executable: bool,
+}
+
+impl HeldWorkspaceDirectoryAuthority {
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        let imp = imp::HeldDirectory::open_existing_workspace(path)?;
+        let identity = imp.workspace_identity()?;
+        Ok(Self { imp, identity })
+    }
+
+    /// Stable platform identity only: Unix device/inode or Windows volume
+    /// serial/file index.  Mutable metadata is intentionally excluded.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn read_regular_file_relative(&self, components: &[&str]) -> Result<Vec<u8>> {
+        ensure!(
+            !components.is_empty(),
+            "held workspace read requires a relative file"
+        );
+        for component in components {
+            validate_component(component)?;
+        }
+        self.imp.read_regular_file(components)
+    }
+
+    /// Read a regular descendant through the retained directory capability,
+    /// refusing an oversized file before allocating its full contents.  The
+    /// streaming cap also protects against a file that grows after metadata
+    /// is read.
+    pub fn read_regular_file_relative_bounded(
+        &self,
+        components: &[&str],
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            !components.is_empty(),
+            "held workspace read requires a relative file"
+        );
+        for component in components {
+            validate_component(component)?;
+        }
+        self.imp.read_regular_file_bounded(components, max_bytes)
+    }
+
+    /// Read one executable descendant through the held root. On Unix this also
+    /// preserves the source file's execute permission as an authority check so
+    /// snapshotting never turns a non-executable workspace file into code.
+    pub fn read_regular_executable_file_relative_bounded(
+        &self,
+        components: &[&str],
+        max_bytes: usize,
+    ) -> Result<HeldWorkspaceExecutableFile> {
+        ensure!(
+            !components.is_empty(),
+            "held workspace executable read requires a relative file"
+        );
+        for component in components {
+            validate_component(component)?;
+        }
+        self.imp.read_regular_executable_file_bounded(components, max_bytes)
+    }
+
+    /// Clone the retained root handle for a lower-layer, capability-neutral
+    /// parser.  The caller receives no path authority: all descendant lookup
+    /// remains relative to this exact directory object.
+    pub fn retained_directory_handle(&self) -> Result<File> {
+        self.imp.directory_handle_clone()
+    }
+
+    /// Acquire a Windows lease only at hook launch, not while the hook
+    /// registry is loaded. That keeps attach and watcher refresh available
+    /// when another process temporarily prevents a safe cwd lease, while the
+    /// actual launch still fails closed rather than using a mutable path.
+    #[cfg(windows)]
+    pub(crate) fn acquire_windows_execution_lease(
+        &self,
+        canonical_path: &Path,
+    ) -> Result<WindowsWorkspaceExecutionLease> {
+        let chain = self
+            .imp
+            .open_workspace_execution_lease(canonical_path, &self.identity)?;
+        Ok(WindowsWorkspaceExecutionLease {
+            chain,
+            canonical_path: canonical_path.to_path_buf(),
+            expected_identity: self.identity.clone(),
+        })
+    }
+}
+
 impl HeldDirectoryAuthority {
     #[cfg(test)]
     pub fn force_next_directory_sync_failure(&self) {
@@ -444,6 +614,7 @@ fn digest(parts: &[&[u8]]) -> String {
 #[cfg(unix)]
 mod imp {
     use std::ffi::{CString, OsStr};
+    use std::io::Read as _;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
@@ -463,6 +634,14 @@ mod imp {
             &self.dir
         }
         pub(super) fn open_existing(path: &Path) -> Result<Self> {
+            Self::open_existing_with_policy(path, true)
+        }
+
+        pub(super) fn open_existing_workspace(path: &Path) -> Result<Self> {
+            Self::open_existing_with_policy(path, false)
+        }
+
+        fn open_existing_with_policy(path: &Path, require_private: bool) -> Result<Self> {
             ensure!(path.is_absolute(), "held directory path must be absolute");
             let mut names = Vec::new();
             for component in path.components() {
@@ -491,14 +670,16 @@ mod imp {
             }
             let metadata = dir.metadata()?;
             ensure!(metadata.is_dir(), "held authority is not a directory");
-            ensure!(
-                metadata.uid() == unsafe { libc::geteuid() },
-                "held directory owner differs from daemon user"
-            );
-            ensure!(
-                metadata.mode() & 0o777 == 0o700,
-                "held directory must have mode 0700"
-            );
+            if require_private {
+                ensure!(
+                    metadata.uid() == unsafe { libc::geteuid() },
+                    "held directory owner differs from daemon user"
+                );
+                ensure!(
+                    metadata.mode() & 0o777 == 0o700,
+                    "held directory must have mode 0700"
+                );
+            }
             Ok(Self {
                 dir,
                 diagnostic_path: walked,
@@ -519,6 +700,145 @@ mod imp {
                 stable_digest,
                 canonical_binding_digest,
             })
+        }
+
+        pub(super) fn workspace_identity(&self) -> Result<String> {
+            let metadata = self.dir.metadata()?;
+            Ok(digest(&[
+                b"attached-workspace-unix-v1",
+                &metadata.dev().to_be_bytes(),
+                &metadata.ino().to_be_bytes(),
+            ]))
+        }
+
+        pub(super) fn directory_handle_clone(&self) -> Result<File> {
+            Ok(self.dir.try_clone()?)
+        }
+
+        pub(super) fn read_regular_file(&self, components: &[&str]) -> Result<Vec<u8>> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace read requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let name = CString::new(*component).context("workspace component has NUL")?;
+                parent = held_fd::openat(
+                    parent.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+                .context("opening held workspace directory component")?;
+                ensure!(
+                    parent.metadata()?.is_dir(),
+                    "held workspace component is not a directory"
+                );
+            }
+            let leaf = CString::new(*leaf).context("workspace leaf has NUL")?;
+            let mut file = held_fd::openat(
+                parent.as_raw_fd(),
+                &leaf,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+            .context("opening held workspace definition")?;
+            ensure!(
+                file.metadata()?.is_file(),
+                "held workspace definition is not a regular file"
+            );
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .context("reading held workspace definition")?;
+            Ok(bytes)
+        }
+
+        pub(super) fn read_regular_file_bounded(
+            &self,
+            components: &[&str],
+            max_bytes: usize,
+        ) -> Result<Vec<u8>> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace read requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let name = CString::new(*component).context("workspace component has NUL")?;
+                parent = held_fd::openat(
+                    parent.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+                .context("opening held workspace directory component")?;
+                ensure!(
+                    parent.metadata()?.is_dir(),
+                    "held workspace component is not a directory"
+                );
+            }
+            let leaf = CString::new(*leaf).context("workspace leaf has NUL")?;
+            let mut file = held_fd::openat(
+                parent.as_raw_fd(),
+                &leaf,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+            .context("opening held workspace definition")?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.is_file() && metadata.len() <= max_bytes as u64,
+                "held workspace definition is not a bounded regular file"
+            );
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .context("reading held workspace definition")?;
+            ensure!(
+                bytes.len() <= max_bytes,
+                "held workspace definition exceeds the byte limit"
+            );
+            Ok(bytes)
+        }
+
+        pub(super) fn read_regular_executable_file_bounded(
+            &self,
+            components: &[&str],
+            max_bytes: usize,
+        ) -> Result<HeldWorkspaceExecutableFile> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace executable read requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let name = CString::new(*component).context("workspace component has NUL")?;
+                parent = held_fd::openat(
+                    parent.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+                .context("opening held workspace executable directory component")?;
+                ensure!(
+                    parent.metadata()?.is_dir(),
+                    "held workspace executable component is not a directory"
+                );
+            }
+            let leaf = CString::new(*leaf).context("workspace executable leaf has NUL")?;
+            let mut file = held_fd::openat(
+                parent.as_raw_fd(),
+                &leaf,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+            .context("opening held workspace executable")?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.is_file() && metadata.len() <= max_bytes as u64,
+                "held workspace executable is not a bounded regular file"
+            );
+            let executable = metadata.mode() & 0o111 != 0;
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .context("reading held workspace executable")?;
+            ensure!(
+                bytes.len() <= max_bytes,
+                "held workspace executable exceeds the byte limit"
+            );
+            Ok(HeldWorkspaceExecutableFile { bytes, executable })
         }
 
         pub(super) fn diagnostic_path(&self) -> &Path {
@@ -975,6 +1295,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
+    use std::io::Read as _;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
@@ -996,6 +1317,10 @@ mod imp {
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
     const FILE_SHARE_ALL: u32 = 0x7;
+    // The execution cwd lease deliberately permits normal read/write access
+    // but refuses DELETE. Windows requires every existing handle to share
+    // DELETE before a directory can be renamed or removed.
+    const FILE_SHARE_READ_WRITE: u32 = 0x3;
     const FILE_OPEN: u32 = 1;
     const FILE_CREATE: u32 = 2;
     const FILE_DIRECTORY_FILE: u32 = 0x1;
@@ -1109,6 +1434,34 @@ mod imp {
     }
     impl HeldDirectory {
         pub(super) fn open_existing(path: &Path) -> Result<Self> {
+            Self::open_existing_with_policy(path, true)
+        }
+
+        pub(super) fn open_existing_workspace(path: &Path) -> Result<Self> {
+            Self::open_existing_with_policy(path, false)
+        }
+
+        pub(super) fn open_workspace_execution_lease(
+            &self,
+            canonical_path: &Path,
+            expected_identity: &str,
+        ) -> Result<Vec<File>> {
+            let chain = open_workspace_execution_lease(canonical_path, expected_identity)?;
+            // The newly opened final component must agree with the authority
+            // that was retained at attach, not merely with an independently
+            // supplied digest.
+            ensure!(
+                workspace_identity_for_handle(
+                    chain
+                        .last()
+                        .context("Windows workspace execution lease has no final handle")?
+                )? == self.workspace_identity()?,
+                "Windows workspace execution lease differs from retained authority"
+            );
+            Ok(chain)
+        }
+
+        fn open_existing_with_policy(path: &Path, require_private: bool) -> Result<Self> {
             use std::path::Prefix;
             ensure!(path.is_absolute(), "held directory path must be absolute");
             let mut components = path.components();
@@ -1160,7 +1513,9 @@ mod imp {
                 verify_directory_handle(&dir)?;
             }
             verify_directory_handle(&dir)?;
-            verify_private_dacl_handle(&dir)?;
+            if require_private {
+                verify_private_dacl_handle(&dir)?;
+            }
             Ok(Self {
                 dir,
                 diagnostic_path: path.to_path_buf(),
@@ -1181,6 +1536,143 @@ mod imp {
                 stable_digest,
                 canonical_binding_digest,
             })
+        }
+        pub(super) fn workspace_identity(&self) -> Result<String> {
+            workspace_identity_for_handle(&self.dir)
+        }
+        pub(super) fn directory_handle_clone(&self) -> Result<File> {
+            Ok(self.dir.try_clone()?)
+        }
+        pub(super) fn read_regular_file(&self, components: &[&str]) -> Result<Vec<u8>> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace read requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let wide = std::ffi::OsStr::new(component)
+                    .encode_wide()
+                    .collect::<Vec<_>>();
+                parent = open_relative(
+                    &parent,
+                    &wide,
+                    FILE_OPEN,
+                    FILE_DIRECTORY_FILE,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )?;
+                verify_directory_handle(&parent)?;
+            }
+            let wide = std::ffi::OsStr::new(leaf)
+                .encode_wide()
+                .collect::<Vec<_>>();
+            let mut file = open_relative(
+                &parent,
+                &wide,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?;
+            verify_regular_handle(&file)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .context("reading held workspace definition")?;
+            Ok(bytes)
+        }
+        pub(super) fn read_regular_file_bounded(
+            &self,
+            components: &[&str],
+            max_bytes: usize,
+        ) -> Result<Vec<u8>> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace read requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let wide = std::ffi::OsStr::new(component)
+                    .encode_wide()
+                    .collect::<Vec<_>>();
+                parent = open_relative(
+                    &parent,
+                    &wide,
+                    FILE_OPEN,
+                    FILE_DIRECTORY_FILE,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )?;
+                verify_directory_handle(&parent)?;
+            }
+            let wide = std::ffi::OsStr::new(leaf)
+                .encode_wide()
+                .collect::<Vec<_>>();
+            let mut file = open_relative(
+                &parent,
+                &wide,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?;
+            verify_regular_handle(&file)?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.is_file() && metadata.len() <= max_bytes as u64,
+                "held workspace definition is not a bounded regular file"
+            );
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .context("reading held workspace definition")?;
+            ensure!(
+                bytes.len() <= max_bytes,
+                "held workspace definition exceeds the byte limit"
+            );
+            Ok(bytes)
+        }
+
+        pub(super) fn read_regular_executable_file_bounded(
+            &self,
+            components: &[&str],
+            max_bytes: usize,
+        ) -> Result<HeldWorkspaceExecutableFile> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace executable read requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let wide = std::ffi::OsStr::new(component)
+                    .encode_wide()
+                    .collect::<Vec<_>>();
+                parent = open_relative(
+                    &parent,
+                    &wide,
+                    FILE_OPEN,
+                    FILE_DIRECTORY_FILE,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )?;
+                verify_directory_handle(&parent)?;
+            }
+            let wide = std::ffi::OsStr::new(leaf)
+                .encode_wide()
+                .collect::<Vec<_>>();
+            let mut file = open_relative(
+                &parent,
+                &wide,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?;
+            verify_regular_handle(&file)?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.len() <= max_bytes as u64,
+                "held workspace executable exceeds the byte limit"
+            );
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .context("reading held workspace executable")?;
+            ensure!(
+                bytes.len() <= max_bytes,
+                "held workspace executable exceeds the byte limit"
+            );
+            Ok(HeldWorkspaceExecutableFile { bytes })
         }
         pub(super) fn diagnostic_path(&self) -> &Path {
             &self.diagnostic_path
@@ -1597,12 +2089,149 @@ mod imp {
         }
     }
 
+    fn workspace_identity_for_handle(file: &File) -> Result<String> {
+        let info = handle_information(file)?;
+        Ok(digest(&[
+            b"attached-workspace-windows-v1",
+            &info.volume_serial.to_be_bytes(),
+            &info.file_index_high.to_be_bytes(),
+            &info.file_index_low.to_be_bytes(),
+        ]))
+    }
+
+    /// Open every component of `canonical_path` from its drive root through
+    /// no-reparse relative opens, retaining every handle without DELETE share.
+    /// Retaining the whole chain matters: holding only the final workspace
+    /// directory still leaves an attacker able to rename an ancestor and reuse
+    /// the canonical spelling for a replacement workspace before
+    /// `CreateProcess` resolves its cwd path.
+    fn open_workspace_execution_lease(
+        canonical_path: &Path,
+        expected_identity: &str,
+    ) -> Result<Vec<File>> {
+        use std::path::Prefix;
+
+        ensure!(
+            canonical_path.is_absolute(),
+            "Windows workspace execution lease requires an absolute canonical path"
+        );
+        let mut components = canonical_path.components();
+        let drive = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+                _ => anyhow::bail!("Windows workspace execution lease requires a local drive"),
+            },
+            _ => anyhow::bail!("Windows workspace execution lease requires a drive path"),
+        };
+        ensure!(
+            matches!(components.next(), Some(Component::RootDir)),
+            "Windows workspace execution lease requires a rooted path"
+        );
+        let root = format!("{}:\\", char::from(drive));
+        let root_wide = std::ffi::OsStr::new(&root)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        // The root handle is also part of the chain. A drive root cannot be
+        // renamed, so leave its normal share mode intact; denying DELETE on it
+        // would needlessly conflict with unrelated volume handles. Every
+        // mutable named component beneath it is opened without DELETE share.
+        let raw = unsafe {
+            CreateFileW(
+                root_wide.as_ptr(),
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_ALL,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        ensure!(
+            raw != INVALID_HANDLE_VALUE,
+            "opening Windows workspace execution lease root failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut chain = vec![unsafe { File::from_raw_handle(raw) }];
+        verify_directory_handle(
+            chain
+                .last()
+                .context("Windows workspace execution lease root missing")?,
+        )?;
+        for component in components {
+            let Component::Normal(name) = component else {
+                anyhow::bail!("Windows workspace execution lease path is not lexical")
+            };
+            let wide = name.encode_wide().collect::<Vec<_>>();
+            let next = open_relative_with_share(
+                chain
+                    .last()
+                    .context("Windows workspace execution lease parent missing")?,
+                &wide,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ_WRITE,
+            )?;
+            verify_directory_handle(&next)?;
+            chain.push(next);
+        }
+        ensure!(
+            workspace_identity_for_handle(
+                chain
+                    .last()
+                    .context("Windows workspace execution lease final handle missing")?
+            )? == expected_identity,
+            "Windows workspace execution lease identity differs from attached workspace"
+        );
+        Ok(chain)
+    }
+
+    pub(super) fn revalidate_workspace_execution_lease(
+        chain: &[File],
+        canonical_path: &Path,
+        expected_identity: &str,
+    ) -> Result<()> {
+        let held = chain
+            .last()
+            .context("Windows workspace execution lease has no final handle")?;
+        verify_directory_handle(held)?;
+        ensure!(
+            workspace_identity_for_handle(held)? == expected_identity,
+            "Windows workspace execution lease handle identity changed"
+        );
+        // Re-walk while the original no-delete chain remains live. This proves
+        // the spelling passed to CreateProcess still reaches the attached
+        // object. The original chain blocks a rename/delete race after this
+        // revalidation through child exit.
+        let observed = open_workspace_execution_lease(canonical_path, expected_identity)?;
+        let observed_final = observed
+            .last()
+            .context("Windows workspace execution revalidation has no final handle")?;
+        ensure!(
+            workspace_identity_for_handle(observed_final)? == workspace_identity_for_handle(held)?,
+            "Windows workspace execution lease path identity changed"
+        );
+        Ok(())
+    }
+
     fn open_relative(
         parent: &File,
         name: &[u16],
         disposition: u32,
         kind: u32,
         access: u32,
+    ) -> Result<File> {
+        open_relative_with_share(parent, name, disposition, kind, access, FILE_SHARE_ALL)
+    }
+
+    fn open_relative_with_share(
+        parent: &File,
+        name: &[u16],
+        disposition: u32,
+        kind: u32,
+        access: u32,
+        share: u32,
     ) -> Result<File> {
         ensure!(
             !name.is_empty() && name.len() <= (u16::MAX as usize / 2),
@@ -1635,7 +2264,7 @@ mod imp {
                 &mut io,
                 ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_ALL,
+                share,
                 disposition,
                 kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
                 ptr::null(),
@@ -1768,8 +2397,34 @@ mod imp {
         pub(super) fn open_existing(_: &Path) -> Result<Self> {
             anyhow::bail!("held directory authority is unavailable")
         }
+        pub(super) fn open_existing_workspace(_: &Path) -> Result<Self> {
+            anyhow::bail!("held workspace directory authority is unavailable")
+        }
         pub(super) fn identity(&self) -> Result<DirectoryIdentity> {
             anyhow::bail!("held directory authority is unavailable")
+        }
+        pub(super) fn workspace_identity(&self) -> Result<String> {
+            anyhow::bail!("held workspace directory authority is unavailable")
+        }
+        pub(super) fn directory_handle_clone(&self) -> Result<File> {
+            anyhow::bail!("held workspace directory authority is unavailable")
+        }
+        pub(super) fn read_regular_file(&self, _: &[&str]) -> Result<Vec<u8>> {
+            anyhow::bail!("held workspace directory authority is unavailable")
+        }
+        pub(super) fn read_regular_file_bounded(
+            &self,
+            _: &[&str],
+            _: usize,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("held workspace directory authority is unavailable")
+        }
+        pub(super) fn read_regular_executable_file_bounded(
+            &self,
+            _: &[&str],
+            _: usize,
+        ) -> Result<HeldWorkspaceExecutableFile> {
+            anyhow::bail!("held workspace directory authority is unavailable")
         }
         pub(super) fn diagnostic_path(&self) -> &Path {
             Path::new("")

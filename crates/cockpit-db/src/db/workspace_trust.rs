@@ -49,6 +49,9 @@ impl FromStr for WorkspaceTrustMode {
 pub struct WorkspaceTrustDecision {
     pub root_path: String,
     pub mode: WorkspaceTrustMode,
+    /// Monotonic durable version for one root. Consumers use this as a
+    /// publication fence; `updated_at_unix_ms` is not sufficiently precise.
+    pub revision: i64,
     /// Daemon-observed creation time as signed Unix milliseconds.
     pub created_at_unix_ms: i64,
     /// Daemon-observed last-update time as signed Unix milliseconds.
@@ -77,10 +80,11 @@ impl Db {
             bail!("workspace trust root must contain between 1 and 32768 bytes");
         }
         conn.execute(
-            "INSERT INTO workspace_trust (root_path, mode, created_at_unix_ms, updated_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?3)
+            "INSERT INTO workspace_trust (root_path, mode, revision, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, 1, ?3, ?3)
              ON CONFLICT(root_path) DO UPDATE SET
                 mode = excluded.mode,
+                revision = workspace_trust.revision + 1,
                 updated_at_unix_ms = excluded.updated_at_unix_ms",
             params![normalized_root, mode.as_str(), now_unix_ms],
         )
@@ -130,7 +134,7 @@ fn canonical_dir_path(path: &Path) -> Result<PathBuf> {
 
 fn query_decision_by_root(conn: &Connection, root: &str) -> Result<Option<WorkspaceTrustDecision>> {
     conn.query_row(
-        "SELECT root_path, mode, created_at_unix_ms, updated_at_unix_ms
+        "SELECT root_path, mode, revision, created_at_unix_ms, updated_at_unix_ms
            FROM workspace_trust
           WHERE root_path = ?1",
         [root],
@@ -151,6 +155,7 @@ fn decode_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceTrustDe
                 Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
             )
         })?,
+        revision: row.get("revision")?,
         created_at_unix_ms: row.get("created_at_unix_ms")?,
         updated_at_unix_ms: row.get("updated_at_unix_ms")?,
     })
@@ -175,6 +180,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.mode, WorkspaceTrustMode::Trust);
         assert_eq!(first.root_path, canonical_root);
+        assert_eq!(first.revision, 1);
         assert_eq!(first.created_at_unix_ms, first.updated_at_unix_ms);
 
         let second = db
@@ -183,6 +189,7 @@ mod tests {
             .unwrap();
         assert_eq!(second.mode, WorkspaceTrustMode::IgnoreConfig);
         assert_eq!(second.root_path, first.root_path);
+        assert_eq!(second.revision, first.revision + 1);
         assert_eq!(second.created_at_unix_ms, first.created_at_unix_ms);
         assert!(second.updated_at_unix_ms >= first.updated_at_unix_ms);
 

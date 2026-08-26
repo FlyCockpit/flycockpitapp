@@ -363,9 +363,20 @@ pub(crate) fn provider_rejected_xai_multi_agent_tools(detail: &str) -> bool {
 #[error("inference attempt cancelled by user")]
 struct AttemptCancelled;
 
+/// Sentinel for an AgentTree late steer whose exact owner stopped being
+/// runnable before the provider handoff. Unlike `AttemptCancelled`, this must
+/// preserve the owner's live continuation and its pending durable steer.
+#[derive(Debug, thiserror::Error)]
+#[error("late user steer owner is no longer runnable")]
+struct AttemptLateUserSteerDeferred;
+
 /// Build the cancellation sentinel as a `CompletionError`.
 pub(crate) fn attempt_cancelled() -> rig::completion::CompletionError {
     rig::completion::CompletionError::RequestError(Box::new(AttemptCancelled))
+}
+
+pub(crate) fn attempt_late_user_steer_deferred() -> rig::completion::CompletionError {
+    rig::completion::CompletionError::RequestError(Box::new(AttemptLateUserSteerDeferred))
 }
 
 /// Detect the [`AttemptCancelled`] sentinel in a `CompletionError`.
@@ -377,6 +388,21 @@ pub(crate) fn is_attempt_cancelled(err: &rig::completion::CompletionError) -> bo
                 return true;
             }
             current = e.source();
+        }
+    }
+    false
+}
+
+pub(crate) fn is_attempt_late_user_steer_deferred(
+    err: &rig::completion::CompletionError,
+) -> bool {
+    if let rig::completion::CompletionError::RequestError(inner) = err {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(inner.as_ref());
+        while let Some(error) = current {
+            if error.downcast_ref::<AttemptLateUserSteerDeferred>().is_some() {
+                return true;
+            }
+            current = error.source();
         }
     }
     false

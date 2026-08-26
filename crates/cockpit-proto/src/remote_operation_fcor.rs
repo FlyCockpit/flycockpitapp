@@ -270,6 +270,11 @@ canonical_unit_enum16!(crate::EnvDriftPolicy, {
     UpdateDaemon = 3,
     ErrorOnDrift = 4,
 });
+canonical_unit_enum16!(crate::SessionEntryMode, {
+    Code = 1,
+    Assistant = 2,
+    Computer = 3,
+});
 canonical_unit_enum16!(crate::CaffeinateMode, {
     Toggle = 1,
     On = 2,

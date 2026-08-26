@@ -22,6 +22,8 @@ pub enum MessageRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: Uuid,
+    /// Immutable daemon-owned entry setup copied from the durable session row.
+    pub session_entry_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub short_id: Option<String>,
     pub project_root: String,

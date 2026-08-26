@@ -433,6 +433,22 @@ impl Tool for HarnessInvokeTool {
         // (reusing the auto_title-style path).
         let (extended, providers) = ctx.config.configs();
 
+        // `approve_harness_invoke` can park while the session changes or is
+        // cancelled.  The configured process is an external side effect, so
+        // claim the exact ready approval in the same final pre-spawn step
+        // rather than treating the generic tool dispatcher as its boundary.
+        crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+            "harness_process_spawn",
+            &[serde_json::json!({
+                "execute": {
+                    "harness": &harness_name,
+                    "model": &model,
+                    "write_policy": format!("{policy:?}"),
+                }
+            })],
+        )
+        .await?;
+
         let result = run_harness(RunContext {
             harness_name: &harness_name,
             cfg: hc,

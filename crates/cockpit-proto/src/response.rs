@@ -108,6 +108,10 @@ pub enum Response {
 
     Attached {
         session_id: Uuid,
+        /// Authoritative immutable entry setup read from the session by the
+        /// daemon. Clients render this value rather than trusting local CLI
+        /// parsing after attach/reconnect.
+        session_entry_mode: crate::SessionEntryMode,
         /// 6-char display id (GOALS §17b). Used by the TUI as the
         /// predecessor short-id when this session later spawns a
         /// `/compact` handoff. Empty for pre-§17 rows not yet backfilled.
@@ -184,6 +188,32 @@ pub enum Response {
         has_more: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         oldest_seq: Option<i64>,
+    },
+
+    /// Stable snapshot page for `Request::ReadAgentTree`. This carries only
+    /// daemon-owned lifecycle metadata, never a worker or resolver handle.
+    AgentTreePage {
+        session_id: Uuid,
+        nodes: Vec<AgentTreeNode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<AgentTreeCursor>,
+    },
+
+    /// Ordered, redacted Attention page for `Request::ReadAgentAttention`.
+    AgentAttentionPage {
+        session_id: Uuid,
+        entries: Vec<AgentDecisionAttention>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<AgentTreeCursor>,
+    },
+
+    /// Durable outcome of a user-authored decision steer. A terminal receipt
+    /// remains daemon-owned; the response exposes only its public state.
+    AgentDecisionSteered {
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        status: String,
+        decision_state: String,
     },
 
     /// A `/note` session-history note was recorded ([`Request::RecordSessionNote`]).
@@ -674,6 +704,12 @@ pub enum Response {
         session_generation: u64,
         config_generation: u64,
         inventory_generation: u64,
+    },
+
+    /// Answer to [`Request::GetSessionSetupSnapshot`]. All selection and
+    /// availability facts are daemon-owned, credential-free snapshot data.
+    SessionSetupSnapshot {
+        snapshot: crate::SessionSetupSnapshotV1,
     },
 
     /// Answer to [`Request::ResourceSnapshot`].
@@ -1333,6 +1369,9 @@ macro_rules! response_variants {
             (Response::ClientSubmissionReceipt { .. }, "client_submission_receipt");
             (Response::HistoryPage { .. }, "history_page");
             (Response::SubagentHistoryPage { .. }, "subagent_history_page");
+            (Response::AgentTreePage { .. }, "agent_tree_page");
+            (Response::AgentAttentionPage { .. }, "agent_attention_page");
+            (Response::AgentDecisionSteered { .. }, "agent_decision_steered");
             (Response::NoteRecorded { .. }, "note_recorded");
             (Response::GoalStatus { .. }, "goal_status");
             (Response::GoalUpdated { .. }, "goal_updated");
@@ -1410,6 +1449,7 @@ macro_rules! response_variants {
             (Response::Forked { .. }, "forked");
             (Response::BtwFork { .. }, "btw_fork");
             (Response::InventoryBundle { .. }, "inventory_bundle");
+            (Response::SessionSetupSnapshot { .. }, "session_setup_snapshot");
             (Response::ResourceSnapshot { .. }, "resource_snapshot");
             (Response::PromoteResourceResult { .. }, "promote_resource_result");
             (Response::ScheduledJob { .. }, "scheduled_job");

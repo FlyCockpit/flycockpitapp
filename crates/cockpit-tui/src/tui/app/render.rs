@@ -4231,6 +4231,18 @@ impl App {
             chrome::LongcacheStatus::new(self.longcache_enabled, self.longcache_supported),
         );
         let mut left = status.spans;
+        // Textual setup label is intentionally not color-only. This reports
+        // the daemon-confirmed immutable entry contract, never local CLI
+        // intent or broad authority state.
+        left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
+        let setup_label = self
+            .session_mode
+            .map(|mode| format!("Setup: {}", mode.display_name()))
+            .unwrap_or_else(|| "Setup: loading…".to_string());
+        left.push(Span::styled(
+            setup_label,
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        ));
         // Transient async-schedule strip (GOALS §22): only when ≥1 scheduled
         // task is active, appended to the bottom-left so the fixed chrome
         // (model/agent) is undisturbed.

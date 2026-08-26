@@ -14,6 +14,19 @@ workspace = true
 # ledgers are excluded from the public local v0.1 dependency surface.
 default = []
 remote = []
+# Host-approval settlement is an internal daemon composition capability, not a
+# general storage API. `cockpit-core` is the only production consumer that
+# enables it; consumers which depend on cockpit-db directly do not expose
+# approval-terminalization methods in their default API surface.
+host-approval-composition = []
+# Enables the DB-owned test authority marker used only by cockpit-core's
+# dev-dependency graph. Normal and release consumers cannot construct the
+# nil-interrupt fixture authority.
+host-approval-test-support = []
+# Host-capability refresh decision creation is likewise an internal daemon
+# composition capability.  A generic Db caller must not be able to persist an
+# automatically resolvable `low_risk` request merely by choosing that string.
+host-capability-refresh-composition = []
 # Future local-only product domains that are deliberately outside the public
 # v0.1 schema: durable cron and image generation/spend ledgers.
 extended = []

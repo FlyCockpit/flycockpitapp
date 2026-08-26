@@ -127,6 +127,50 @@ impl Model {
         .await
     }
 
+    /// Resolve a small, structured request through an already-live agent
+    /// context.  Unlike [`Self::text_completion_with_params`], this preserves
+    /// the owning frame's system prompt, wire history, and model parameters,
+    /// which is required when a parent executor lends its warm inference
+    /// boundary to a durable child decision.  The caller deliberately supplies
+    /// no tools: this is a constrained JSON-answer request, not another turn.
+    ///
+    /// The normal completion path remains the sole request-assembly and
+    /// redaction choke point, so a warm resolver cannot bypass history
+    /// scrubbing, provider recovery, or the parent's cancellation token.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn text_completion_with_live_context(
+        &self,
+        site: UtilityCallSite,
+        params: ModelParams,
+        system: &str,
+        history: &[Message],
+        prompt: &str,
+        agent_name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        if site.budget_class() == UtilityBudgetClass::Background && self.gate().is_draining() {
+            return Err(anyhow::Error::new(InferenceGated));
+        }
+        let params = self.utility_params_for(site, params);
+        self.with_utility_timeout(site, async {
+            let ((_, choice, _), _, _) = self
+                .complete_captured(
+                    system,
+                    history,
+                    Message::user(prompt),
+                    &[],
+                    params,
+                    agent_name,
+                    None,
+                    cancel,
+                    None,
+                )
+                .await?;
+            Ok(choice_text(&choice).trim().to_string())
+        })
+        .await
+    }
+
     /// One-shot, history-free text completion with a fixed `system`
     /// preamble. Like [`Self::text_completion`] but lets a background
     /// caller (the request-preflight rewrite, implementation note)
@@ -1075,6 +1119,9 @@ impl Model {
                 // during a backoff wait) unwinds the turn cleanly rather
                 // than logging a real failure — keep the dedicated
                 // sentinels the driver already special-cases.
+                if is_attempt_late_user_steer_deferred(&err) {
+                    return Err(anyhow::Error::new(LateUserSteerDeferred));
+                }
                 if cancel.is_cancelled() || is_attempt_cancelled(&err) {
                     if let Some(slot) = display.as_ref() {
                         slot.finish_as_error(
@@ -2065,6 +2112,15 @@ where
     // or cancellation from that poll is conservatively post-handoff.
     if cancel.is_cancelled() {
         return Err(attempt_cancelled());
+    }
+    // A late steer carries a revocable executor permit. Check it at the
+    // irreversible provider boundary, after request assembly but immediately
+    // before `stream()` can put bytes on the wire. For a pending steer this
+    // transaction is also the immutable acceptance boundary; a lifecycle
+    // revision that parked the owner first leaves the row pending instead of
+    // inventing an unrecoverable accepted checkpoint.
+    if !crate::engine::agent::current_agent_tree_steer_dispatch_permit_is_current().await {
+        return Err(attempt_late_user_steer_deferred());
     }
     bump_phase(phase, InferencePhase::Dispatched);
     let mut stream = tokio::select! {

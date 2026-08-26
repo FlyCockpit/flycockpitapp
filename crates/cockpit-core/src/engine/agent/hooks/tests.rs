@@ -124,6 +124,26 @@ impl CommandRunner for FakeCommandRunner {
     }
 }
 
+/// Minimal daemon-side capability stand-in for dispatch testing. The command
+/// spelling in the hook must never reach the `ProcessEnv` lookup once this is
+/// bound; only this synthetic private bundle path may reach the runner.
+struct StaticRetainedHookAuthority;
+
+impl crate::config::extended::hooks::RetainedHookExecutionAuthority
+    for StaticRetainedHookAuthority
+{
+    fn launch(
+        &self,
+        components: &[String],
+    ) -> Result<crate::config::extended::hooks::HookExecutionLaunch, String> {
+        assert_eq!(components, &["hooks".to_owned(), "check".to_owned()]);
+        Ok(crate::config::extended::hooks::HookExecutionLaunch::ambient(
+            PathBuf::from("/daemon-private/snapshots/check"),
+            PathBuf::from("/retained-source-cwd"),
+        ))
+    }
+}
+
 /// Build a `ResolvedHook` for tests.
 fn test_hook(
     event: HookEvent,
@@ -141,6 +161,7 @@ fn test_hook(
         origin: HookOrigin::for_test("project:abcdef0123456789:0"),
         source_config_path: PathBuf::from("/tmp/test/config.json"),
         source_directory: PathBuf::from("/tmp/test"),
+        execution: crate::config::extended::hooks::HookExecutionProvenance::Ambient,
     }
 }
 
@@ -673,6 +694,96 @@ async fn observe_capture(
         .expect("observe hook invoked exactly once");
     let envelope: Value = serde_json::from_str(&inv.stdin).expect("observe envelope is valid JSON");
     (inv, envelope)
+}
+
+#[tokio::test]
+async fn retained_relative_hook_dispatch_never_reopens_command_or_workspace_cwd() {
+    let (db, session_id) = db_session().await;
+    let mut hook = test_hook(
+        HookEvent::SessionStart,
+        vec!["hooks/check".into()],
+        Some(vec!["fresh".into()]),
+        BTreeMap::new(),
+        5,
+    );
+    hook.execution = crate::config::extended::hooks::HookExecutionProvenance::RetainedRelative {
+        components: vec!["hooks".into(), "check".into()],
+        authority: None,
+    };
+    hook.bind_retained_execution_authority(Arc::new(StaticRetainedHookAuthority))
+        .expect("bind retained authority");
+    let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+    let process_env = FakeProcessEnv::default();
+    run_observe_hooks(
+        &runner,
+        &process_env,
+        &registry(vec![hook]),
+        HookEvent::SessionStart,
+        "fresh",
+        session_id,
+        workspace(),
+        &db,
+        None,
+        None,
+        None,
+        None,
+        ObserveFields {
+            start_source: Some("fresh"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let invocation = runner
+        .invocations()
+        .into_iter()
+        .next()
+        .expect("retained hook invoked");
+    assert_eq!(
+        invocation.executable,
+        PathBuf::from("/daemon-private/snapshots/check"),
+        "the mutable source-relative command spelling is never reopened"
+    );
+    assert_eq!(
+        invocation.cwd,
+        PathBuf::from("/retained-source-cwd"),
+        "dispatch uses the authority-selected cwd rather than the workspace spelling"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retained_unix_cwd_fd_survives_source_directory_swap() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let parent = tempfile::tempdir().expect("parent");
+    let source = parent.path().join("source");
+    let moved = parent.path().join("source-attached");
+    std::fs::create_dir_all(&source).expect("source directory");
+    std::fs::write(source.join("value"), "attached\n").expect("attached value");
+    let source_fd = Arc::new(std::fs::File::open(&source).expect("open source directory"));
+
+    let bundle = tempfile::tempdir().expect("private bundle");
+    let executable = bundle.path().join("check");
+    std::fs::write(&executable, "#!/bin/sh\ncat value\n").expect("bundle script");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+        .expect("make bundle executable");
+
+    std::fs::rename(&source, &moved).expect("move attached source");
+    std::fs::create_dir(&source).expect("replacement source");
+    std::fs::write(source.join("value"), "replacement\n").expect("replacement value");
+
+    let output = spawn_real_hook_child(
+        &executable,
+        &[],
+        &BTreeMap::new(),
+        &crate::config::extended::hooks::HookWorkingDirectory::RetainedUnixDirectory(source_fd),
+        "",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(!output.spawn_failed && !output.timed_out);
+    assert_eq!(output.stdout, "attached\n");
 }
 
 #[tokio::test]

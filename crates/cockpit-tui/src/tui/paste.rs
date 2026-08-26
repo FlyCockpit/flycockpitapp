@@ -151,6 +151,14 @@ pub struct EditorPasteRebuild {
     pub registry: PasteRegistry,
 }
 
+#[derive(Debug, Clone)]
+pub struct EditorPasteSnapshot {
+    images: BTreeMap<u32, RetainedImage>,
+    text_numbers_by_nonce: BTreeMap<String, u32>,
+    next_text_number: u32,
+    next_image_number: u32,
+}
+
 impl Default for PasteRegistry {
     fn default() -> Self {
         Self {
@@ -312,8 +320,24 @@ impl PasteRegistry {
         tokens: Option<usize>,
         nonce: String,
     ) -> (u64, String) {
-        let id = self.next_block_id();
         let number = self.next_text_number();
+        self.register_text_with_number_and_nonce(at, full, tokens, nonce, number)
+    }
+
+    fn register_text_with_number_and_nonce(
+        &mut self,
+        at: usize,
+        full: String,
+        tokens: Option<usize>,
+        nonce: String,
+        number: u32,
+    ) -> (u64, String) {
+        let id = self.next_block_id();
+        self.next_text_number = self.next_text_number.max(
+            number
+                .checked_add(1)
+                .expect("paste text numbering exhausted"),
+        );
         let placeholder = match tokens {
             Some(tokens) => Self::text_placeholder(number, tokens),
             None => Self::pending_text_placeholder(number),
@@ -344,6 +368,34 @@ impl PasteRegistry {
     pub fn register_image_with_id(&mut self, at: usize, png: Vec<u8>) -> (u64, String) {
         let hash = hash_bytes(&png);
         let (number, reference) = self.image_number_for(hash);
+        self.insert_image_with_number(at, png, hash, number, reference)
+    }
+
+    fn register_image_with_number(&mut self, at: usize, png: Vec<u8>, number: u32) -> String {
+        let hash = hash_bytes(&png);
+        let reference = self.blocks.iter().any(|block| match &block.kind {
+            PasteKind::Image { hash: other, .. } | PasteKind::ImageHandle { hash: other, .. } => {
+                *other == hash
+            }
+            PasteKind::Text { .. } => false,
+        });
+        self.next_image_number = self.next_image_number.max(
+            number
+                .checked_add(1)
+                .expect("paste image numbering exhausted"),
+        );
+        self.insert_image_with_number(at, png, hash, number, reference)
+            .1
+    }
+
+    fn insert_image_with_number(
+        &mut self,
+        at: usize,
+        png: Vec<u8>,
+        hash: u64,
+        number: u32,
+        reference: bool,
+    ) -> (u64, String) {
         let placeholder = Self::image_placeholder(number);
         let end = at + placeholder.len();
         let id = self.next_block_id();
@@ -383,6 +435,64 @@ impl PasteRegistry {
     ) -> (u64, String) {
         let hash = hash_bytes(sha256.as_bytes());
         let (number, reference) = self.image_number_for(hash);
+        self.insert_image_handle_with_number(
+            at,
+            draft,
+            image_ref,
+            normalized_byte_length,
+            sha256,
+            hash,
+            number,
+            reference,
+        )
+    }
+
+    fn register_image_handle_with_number(
+        &mut self,
+        at: usize,
+        draft: ImageIngressDraftAuthority,
+        image_ref: cockpit_proto::ImageAttachmentRef,
+        normalized_byte_length: u64,
+        sha256: String,
+        number: u32,
+    ) -> String {
+        let hash = hash_bytes(sha256.as_bytes());
+        let reference = self.blocks.iter().any(|block| match &block.kind {
+            PasteKind::Image { hash: other, .. } | PasteKind::ImageHandle { hash: other, .. } => {
+                *other == hash
+            }
+            PasteKind::Text { .. } => false,
+        });
+        self.next_image_number = self.next_image_number.max(
+            number
+                .checked_add(1)
+                .expect("paste image numbering exhausted"),
+        );
+        self.insert_image_handle_with_number(
+            at,
+            draft,
+            image_ref,
+            normalized_byte_length,
+            sha256,
+            hash,
+            number,
+            reference,
+        )
+        .1
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_image_handle_with_number(
+        &mut self,
+        at: usize,
+        draft: ImageIngressDraftAuthority,
+        image_ref: cockpit_proto::ImageAttachmentRef,
+        normalized_byte_length: u64,
+        sha256: String,
+        hash: u64,
+        number: u32,
+        reference: bool,
+    ) -> (u64, String) {
         let placeholder = Self::image_placeholder(number);
         let end = at + placeholder.len();
         let id = self.next_block_id();
@@ -853,6 +963,23 @@ impl PasteRegistry {
         images
     }
 
+    pub fn editor_snapshot(&self) -> EditorPasteSnapshot {
+        let text_numbers_by_nonce = self
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                PasteKind::Text { nonce, .. } => Some((nonce.clone(), block.number)),
+                PasteKind::Image { .. } | PasteKind::ImageHandle { .. } => None,
+            })
+            .collect();
+        EditorPasteSnapshot {
+            images: self.image_payloads_by_number(),
+            text_numbers_by_nonce,
+            next_text_number: self.next_text_number,
+            next_image_number: self.next_image_number,
+        }
+    }
+
     /// Exact ingress drafts still represented by at least one composer block.
     /// Duplicate/reference placeholders collapse to their admission identity.
     pub fn image_ingress_drafts(&self) -> Vec<ImageIngressDraftAuthority> {
@@ -898,17 +1025,38 @@ impl PasteRegistry {
         retained_images: &BTreeMap<u32, RetainedImage>,
         mut count_text: impl FnMut(&str) -> usize,
     ) -> EditorPasteRebuild {
+        let snapshot = EditorPasteSnapshot {
+            images: retained_images.clone(),
+            text_numbers_by_nonce: BTreeMap::new(),
+            next_text_number: 1,
+            next_image_number: retained_images
+                .keys()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .expect("external-editor image numbering exhausted"),
+        };
+        Self::rebuild_from_editor_snapshot(editor_text, &snapshot, count_text)
+    }
+
+    pub fn rebuild_from_editor_snapshot(
+        editor_text: &str,
+        snapshot: &EditorPasteSnapshot,
+        mut count_text: impl FnMut(&str) -> usize,
+    ) -> EditorPasteRebuild {
         let mut buffer = String::with_capacity(editor_text.len());
         let mut registry = PasteRegistry::new();
-        registry.next_image_number = editor_text
+        let unknown_image_floor = editor_text
             .match_indices(PASTED_IMAGE_PREFIX)
             .filter_map(|(start, _)| Self::parse_image_placeholder_at(&editor_text[start..]))
             .map(|(number, _)| number)
-            .filter(|number| !retained_images.contains_key(number))
             .max()
             .unwrap_or(0)
             .checked_add(1)
             .expect("external-editor image numbering exhausted");
+        registry.next_text_number = snapshot.next_text_number;
+        registry.next_image_number = snapshot.next_image_number.max(unknown_image_floor);
         let mut pos = 0usize;
 
         while pos < editor_text.len() {
@@ -941,11 +1089,18 @@ impl PasteRegistry {
                 let full = editor_text[content_start..close_start].to_string();
                 let at = buffer.len();
                 let tokens = count_text(&full);
-                let (_id, placeholder) = registry.register_text_with_state_and_nonce(
+                let nonce = nonce.to_string();
+                let number = snapshot
+                    .text_numbers_by_nonce
+                    .get(&nonce)
+                    .copied()
+                    .unwrap_or_else(|| registry.next_text_number());
+                let (_id, placeholder) = registry.register_text_with_number_and_nonce(
                     at,
                     full,
                     Some(tokens),
-                    nonce.into(),
+                    nonce,
+                    number,
                 );
                 buffer.push_str(&placeholder);
                 pos = close_start + close_tag.len();
@@ -959,20 +1114,23 @@ impl PasteRegistry {
             buffer.push_str(&rest[..image_start]);
             let image_text_start = pos + image_start;
             let image_text = &editor_text[image_text_start..image_text_start + image_len];
-            if let Some(image) = retained_images.get(&image_number) {
+            if let Some(image) = snapshot.images.get(&image_number) {
                 let placeholder = match image {
-                    RetainedImage::Bytes(png) => registry.register_image(buffer.len(), png.clone()),
+                    RetainedImage::Bytes(png) => {
+                        registry.register_image_with_number(buffer.len(), png.clone(), image_number)
+                    }
                     RetainedImage::Handle {
                         draft,
                         image_ref,
                         normalized_byte_length,
                         sha256,
-                    } => registry.register_image_handle(
+                    } => registry.register_image_handle_with_number(
                         buffer.len(),
                         draft.clone(),
                         image_ref.clone(),
                         *normalized_byte_length,
                         sha256.clone(),
+                        image_number,
                     ),
                 };
                 buffer.push_str(&placeholder);
@@ -1535,6 +1693,43 @@ text"
     }
 
     #[test]
+    fn editor_round_trip_preserves_sparse_numbers_and_prior_floors() {
+        let mut registry = PasteRegistry::new();
+        registry.next_text_number = 10;
+        let text = registry.register_text(0, "sparse text".into(), 2);
+        registry.next_image_number = 10;
+        let image = registry.register_image(text.len() + 1, vec![10]);
+        registry.next_text_number = 40;
+        registry.next_image_number = 50;
+
+        let buffer = format!("{text} {image}");
+        let snapshot = registry.editor_snapshot();
+        let editor = format!(
+            "{} unknown [Pasted image #60]",
+            registry.expand_editor(&buffer)
+        );
+        let mut rebuilt = PasteRegistry::rebuild_from_editor_snapshot(&editor, &snapshot, |_| 3);
+
+        assert!(rebuilt.buffer.contains("[Pasted text #10, 3 tokens]"));
+        assert!(rebuilt.buffer.contains("[Pasted image #10]"));
+        assert!(rebuilt.buffer.contains("[Pasted image #60]"));
+        assert_eq!(rebuilt.registry.blocks()[0].number, 10);
+        assert_eq!(rebuilt.registry.blocks()[1].number, 10);
+        assert_eq!(
+            rebuilt
+                .registry
+                .register_text(rebuilt.buffer.len(), "new".into(), 1),
+            "[Pasted text #40, 1 tokens]"
+        );
+        assert_eq!(
+            rebuilt
+                .registry
+                .register_image(rebuilt.buffer.len(), vec![61]),
+            "[Pasted image #61]"
+        );
+    }
+
+    #[test]
     fn editor_round_trip_malformed_user_paste_stays_raw() {
         let mut c = Composer::new(false);
         let mut r = PasteRegistry::new();
@@ -1575,7 +1770,7 @@ gamma",
         let rebuilt =
             PasteRegistry::rebuild_from_editor("keep [Pasted image #2]", &retained, |_| 1);
 
-        assert_eq!(rebuilt.buffer, "keep [Pasted image #1]");
+        assert_eq!(rebuilt.buffer, "keep [Pasted image #2]");
         let (wire, images) = rebuilt.registry.build_wire(&rebuilt.buffer, true);
         assert_eq!(images, vec![second]);
         assert!(wire.contains(IMAGE_PART_SENTINEL));

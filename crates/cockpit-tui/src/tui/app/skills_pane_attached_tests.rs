@@ -199,7 +199,15 @@ async fn skills_pane_stale_result_dropped() {
             generation: stale_generation,
             source: SkillsPaneSource::Session,
             skills: Ok(vec![summary("stale-session", "old result", "/session")]),
-            bundle: None,
+            bundle: Some(Response::InventoryBundle {
+                selected_agent: "stale-agent".into(),
+                agents: Vec::new(),
+                models: Vec::new(),
+                skills: vec![summary("stale-global", "must remain inert", "/stale")],
+                session_generation: 99,
+                config_generation: 99,
+                inventory_generation: 99,
+            }),
         })),
     });
 
@@ -207,4 +215,9 @@ async fn skills_pane_stale_result_dropped() {
     // Detached reopen shows unavailable; stale attached generation is dropped.
     assert!(text.contains("inventory unavailable until attached") || text.contains("unavailable"));
     assert!(!text.contains("stale-session"));
+    assert!(
+        !app.skill_commands
+            .iter()
+            .any(|command| command.name == "stale-global")
+    );
 }

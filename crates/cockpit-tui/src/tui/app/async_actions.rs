@@ -1114,6 +1114,13 @@ impl App {
             }
             AsyncActionKind::DaemonRpc("skills.list") => {
                 if let Ok(AsyncActionPayload::Skills(result)) = result.payload {
+                    let owns_result = matches!(
+                        &self.overlay,
+                        Overlay::Skills(pane) if pane.owns_fetch_generation(result.generation)
+                    );
+                    if !owns_result {
+                        return;
+                    }
                     if let Some(bundle) = result.bundle.clone() {
                         self.apply_inventory_bundle_response(bundle);
                     }

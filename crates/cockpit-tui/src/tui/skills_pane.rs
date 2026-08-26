@@ -62,6 +62,10 @@ pub struct SkillsPaneFetchResult {
 }
 
 impl SkillsPane {
+    pub(crate) fn owns_fetch_generation(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
     pub fn loading(generation: u64) -> Self {
         Self::new(generation, SkillsPaneState::Loading)
     }

@@ -540,6 +540,13 @@ impl<'ast> Visit<'ast> for Audit {
     }
 
     fn visit_item_use(&mut self, node: &'ast ItemUse) {
+        let import = node.to_token_stream().to_string().replace(' ', "");
+        if import.contains("crate::tui::composer::*")
+            || (import.contains("crate::tui::composeras")
+                && !import.contains("crate::tui::composer::Composeras"))
+        {
+            self.reject(node, "unresolved Composer module import");
+        }
         let mut prefix = Vec::new();
         self.register_use(&node.tree, &mut prefix);
         visit::visit_item_use(self, node);
@@ -603,6 +610,23 @@ impl<'ast> Visit<'ast> for Audit {
         let scope = self.scopes.last_mut().expect("function scope");
         for binding in bindings {
             scope.insert(binding.clone(), tainted.contains(&binding));
+        }
+        if let (Pat::Ident(binding), Some(init)) = (&node.pat, &node.init)
+            && let Expr::Path(path) = &*init.expr
+        {
+            let segments = path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if segments.len() >= 2
+                && self.composer_types.contains(&segments[segments.len() - 2])
+                && matches!(segments.last().map(String::as_str), Some("set" | "clear"))
+            {
+                self.composer_method_aliases
+                    .insert(binding.ident.to_string());
+            }
         }
         visit::visit_local(self, node);
     }
@@ -678,6 +702,22 @@ impl<'ast> Visit<'ast> for Audit {
     fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
         if self.targets(&node.left) {
             self.reject(node, "Composer assignment bypass");
+        }
+        if let (Expr::Path(binding), Expr::Path(value)) = (&*node.left, &*node.right)
+            && let Some(binding) = binding.path.get_ident()
+        {
+            let segments = value
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if segments.len() >= 2
+                && self.composer_types.contains(&segments[segments.len() - 2])
+                && matches!(segments.last().map(String::as_str), Some("set" | "clear"))
+            {
+                self.composer_method_aliases.insert(binding.to_string());
+            }
         }
         visit::visit_expr_assign(self, node);
     }
@@ -795,6 +835,22 @@ fn ast_gate_rejects_adversarial_alias_ufcs_macro_and_nested_bypasses() {
         (
             "UseTree name operation import",
             "use crate::tui::composer::Composer; use Composer::clear; impl App { fn bypass(&mut self) { clear(&mut self.composer); } }",
+        ),
+        (
+            "Composer glob import fails closed",
+            "use crate::tui::composer::*; impl App { fn bypass(&mut self) {} }",
+        ),
+        (
+            "Composer module alias fails closed",
+            "use crate::tui::composer as editor; impl App { fn bypass(&mut self) { editor::Composer::clear(&mut self.composer); } }",
+        ),
+        (
+            "Composer function item",
+            "use crate::tui::composer::Composer; impl App { fn bypass(&mut self) { let wipe = Composer::clear; wipe(&mut self.composer); } }",
+        ),
+        (
+            "Composer function item assignment",
+            "use crate::tui::composer::Composer; impl App { fn bypass(&mut self) { let mut wipe = unrelated; wipe = Composer::clear; wipe(&mut self.composer); } }",
         ),
         (
             "macro alias argument",

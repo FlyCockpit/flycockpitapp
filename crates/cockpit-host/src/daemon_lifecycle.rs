@@ -66,6 +66,13 @@ pub struct ProcessStartIdentity {
     pub secondary: u64,
 }
 
+/// Capture the kernel process-start identity for an already-owned child.
+/// Callers must retain a stable child/process handle while using this value so
+/// a numeric PID cannot be recycled between capture and comparison.
+pub fn process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
+    read_process_start_identity(pid)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonPidRecord {
     Receipt(DaemonPidReceipt),

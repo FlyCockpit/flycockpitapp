@@ -998,6 +998,7 @@ fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> 
 /// attach time, not a daemon-level one (sandboxing part 2 precedence).
 pub struct DetachedEphemeralChild {
     child: std::process::Child,
+    process_start: cockpit_host::daemon_lifecycle::ProcessStartIdentity,
 }
 
 impl DetachedEphemeralChild {
@@ -1008,11 +1009,27 @@ impl DetachedEphemeralChild {
     fn into_child(self) -> std::process::Child {
         self.child
     }
+
+    fn process_start(&self) -> cockpit_host::daemon_lifecycle::ProcessStartIdentity {
+        self.process_start
+    }
 }
 
 pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<DetachedEphemeralChild> {
     ephemeral_guard::initialize_process_reaper()?;
-    spawn_detached_child(Some(paths), false, false).map(|child| DetachedEphemeralChild { child })
+    let mut child = spawn_detached_child(Some(paths), false, false)?;
+    let process_start = match cockpit_host::daemon_lifecycle::process_start_identity(child.id()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("capturing ephemeral child start identity");
+        }
+    };
+    Ok(DetachedEphemeralChild {
+        child,
+        process_start,
+    })
 }
 
 #[cfg(unix)]

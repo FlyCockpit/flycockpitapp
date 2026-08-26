@@ -2322,13 +2322,16 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         .items
         .iter()
         .find_map(|item| match item {
-            syn::Item::Fn(function) if function.sig.ident == "finish_lifecycle" => Some(function),
+            syn::Item::Fn(function) if function.sig.ident == "finish_lifecycle_with_deadline" => {
+                Some(function)
+            }
             _ => None,
         })
         .expect("missing bounded CLI lifecycle teardown");
     struct FinishCalls {
         timeout: bool,
         abort: bool,
+        unbounded_task_await: bool,
     }
     impl<'ast> Visit<'ast> for FinishCalls {
         fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
@@ -2342,13 +2345,18 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
             self.abort |= call.method == "abort";
             syn::visit::visit_expr_method_call(self, call);
         }
+        fn visit_expr_await(&mut self, awaited: &'ast syn::ExprAwait) {
+            self.unbounded_task_await |= matches!(awaited.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("task"));
+            syn::visit::visit_expr_await(self, awaited);
+        }
     }
     let mut finish_calls = FinishCalls {
         timeout: false,
         abort: false,
+        unbounded_task_await: false,
     };
     finish_calls.visit_block(&finish.block);
-    assert!(finish_calls.timeout && !finish_calls.abort);
+    assert!(finish_calls.timeout && finish_calls.abort && !finish_calls.unbounded_task_await);
     let cli_source = production_source(&read("apps/cli/src/commands/tui.rs"));
     assert!(cli_source.contains("combine_app_and_lifecycle(result, lifecycle_result)"));
     let daemon_source = production_source(&read("crates/cockpit-core/src/daemon/mod.rs"));

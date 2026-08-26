@@ -20,16 +20,27 @@ fn lifecycle_composition() -> (
 }
 
 async fn finish_lifecycle(mut task: tokio::task::JoinHandle<anyhow::Result<()>>) -> Result<()> {
-    match tokio::time::timeout(std::time::Duration::from_secs(35), &mut task).await {
+    finish_lifecycle_with_deadline(&mut task, std::time::Duration::from_secs(35)).await
+}
+
+async fn finish_lifecycle_with_deadline(
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    deadline: std::time::Duration,
+) -> Result<()> {
+    match tokio::time::timeout(deadline, &mut *task).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(error).context("daemon lifecycle task failed"),
         Err(_) => {
-            // The lifecycle service owns a runtime-independent supervisor for
-            // every in-process daemon and does not return until each is
-            // joined. Do not abort it and let the top-level runtime disappear
-            // beneath cleanup.
-            task.await
-                .context("daemon lifecycle task failed after its grace deadline")?
+            // Aborting only retires the async request actor. Every accepted or
+            // provisional daemon owner is RAII-bound to a process-lifetime OS
+            // reaper/supervisor, so dropping the actor transfers cleanup
+            // rather than cancelling it. Bound the abort acknowledgement too:
+            // top-level CLI exit must never turn 35 seconds into infinity.
+            task.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut *task).await;
+            anyhow::bail!(
+                "daemon lifecycle cleanup exceeded {deadline:?}; ownership transferred to the runtime-independent reaper"
+            )
         }
     }
 }
@@ -117,6 +128,32 @@ mod tests {
     use super::*;
     use crate::config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
     use cockpit_test_support::TestEnvGuard;
+
+    #[tokio::test]
+    async fn wedged_lifecycle_actor_is_bounded_and_drops_its_owner() {
+        struct DropNotice(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropNotice {
+            fn drop(&mut self) {
+                if let Some(notice) = self.0.take() {
+                    let _ = notice.send(());
+                }
+            }
+        }
+
+        let (dropped, drop_notice) = tokio::sync::oneshot::channel();
+        let mut task = tokio::spawn(async move {
+            let _owner = DropNotice(Some(dropped));
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        });
+        let result =
+            finish_lifecycle_with_deadline(&mut task, std::time::Duration::from_millis(10)).await;
+        assert!(result.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(1), drop_notice)
+            .await
+            .expect("wedged lifecycle owner was not transferred/dropped")
+            .expect("drop notice sender disappeared");
+    }
 
     fn write_provider_config(cwd: &Path) {
         let cockpit = cwd.join(".cockpit");

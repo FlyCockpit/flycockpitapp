@@ -34,6 +34,7 @@ struct ProcessCleanup {
     paths: crate::daemon::DaemonPaths,
     child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
     receipt: Arc<std::sync::Mutex<Option<DaemonPidReceipt>>>,
+    launch_start: cockpit_host::daemon_lifecycle::ProcessStartIdentity,
 }
 
 struct ProcessReap {
@@ -52,7 +53,10 @@ pub(crate) fn initialize_process_reaper() -> anyhow::Result<()> {
                 .name("cockpit-ephemeral-process-reaper".to_string())
                 .spawn(move || {
                     while let Ok(reap) = receive.recv() {
-                        let result = cleanup_exact_process(&reap.cleanup);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            cleanup_exact_process(&reap.cleanup)
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("process cleanup panicked")));
                         if let Some(completed) = reap.completed {
                             let _ = completed.send(result);
                         } else if let Err(error) = result {
@@ -109,6 +113,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+    let bound_expected = expected.clone();
     let result = if let Some(expected) = expected {
         if read_daemon_pid_record(&cleanup.paths.pid_file)
             != Some(DaemonPidRecord::Receipt(expected.clone()))
@@ -137,6 +142,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
         child
             .wait()
             .context("reaping unpublished ephemeral child")?;
+        retire_late_exact_metadata(cleanup, expected_pid, None)?;
         anyhow::bail!(
             "ephemeral child never published an exact v2 PID receipt; terminated exact child"
         )
@@ -144,6 +150,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
     if result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
+        let _ = retire_late_exact_metadata(cleanup, expected_pid, bound_expected.as_ref());
         *child_slot = None;
         return result;
     }
@@ -163,9 +170,35 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
     }
     *child_slot = None;
     if forced_exit && result.is_ok() {
+        retire_late_exact_metadata(cleanup, expected_pid, bound_expected.as_ref())?;
         anyhow::bail!("ephemeral daemon did not exit after verified stop; exact child was forced")
     }
     result
+}
+
+fn retire_late_exact_metadata(
+    cleanup: &ProcessCleanup,
+    expected_pid: u32,
+    bound_expected: Option<&DaemonPidReceipt>,
+) -> anyhow::Result<()> {
+    let Some(DaemonPidRecord::Receipt(receipt)) = read_daemon_pid_record(&cleanup.paths.pid_file)
+    else {
+        return Ok(());
+    };
+    let exact = bound_expected.map_or_else(
+        || receipt.pid == expected_pid && receipt.process_start == cleanup.launch_start,
+        |expected| &receipt == expected,
+    );
+    if !exact {
+        return Ok(());
+    }
+    cockpit_host::daemon_lifecycle::retire_metadata_if_receipt_matches(
+        &cleanup.paths.pid_file,
+        &cleanup.paths.socket,
+        None,
+        &receipt,
+    )?;
+    Ok(())
 }
 
 /// RAII backstop that shuts down an ephemeral daemon the current process
@@ -192,12 +225,14 @@ impl EphemeralDaemonGuard {
         paths: crate::daemon::DaemonPaths,
         child: crate::daemon::DetachedEphemeralChild,
     ) -> Self {
+        let launch_start = child.process_start();
         Self {
             socket: paths.socket.clone(),
             process: Some(ProcessCleanup {
                 paths,
                 child: Arc::new(std::sync::Mutex::new(Some(child.into_child()))),
                 receipt: Arc::new(std::sync::Mutex::new(None)),
+                launch_start,
             }),
             armed: Arc::new(AtomicBool::new(true)),
         }
@@ -279,16 +314,24 @@ impl Drop for EphemeralDaemonGuard {
             return;
         }
         if let Some(cleanup) = self.process.clone() {
-            match process_reaper().and_then(|reaper| {
-                reaper
-                    .send(ProcessReap {
-                        cleanup,
-                        completed: None,
-                    })
-                    .map_err(|_| anyhow::anyhow!("ephemeral process reaper stopped"))
-            }) {
-                Ok(()) => {}
-                Err(error) => tracing::error!(%error, "failed to enqueue ephemeral process reap"),
+            let reap = ProcessReap {
+                cleanup,
+                completed: None,
+            };
+            match process_reaper() {
+                Ok(reaper) => {
+                    if let Err(error) = reaper.send(reap) {
+                        if let Err(cleanup_error) = cleanup_exact_process(&error.0.cleanup) {
+                            tracing::error!(%cleanup_error, "emergency ephemeral cleanup failed");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "ephemeral process reaper unavailable during drop");
+                    if let Err(cleanup_error) = cleanup_exact_process(&reap.cleanup) {
+                        tracing::error!(%cleanup_error, "emergency ephemeral cleanup failed");
+                    }
+                }
             }
         } else {
             stop_daemon_blocking(&self.socket);
@@ -389,6 +432,10 @@ pub fn spawn_signal_shutdown(
                     },
                     Err(error) => {
                         tracing::error!(%error, "signal-triggered daemon reaper unavailable");
+                        let cleanup = reap.cleanup;
+                        let _ =
+                            tokio::task::spawn_blocking(move || cleanup_exact_process(&cleanup))
+                                .await;
                     }
                 }
             } else {
@@ -425,9 +472,14 @@ mod tests {
             .spawn()
             .expect("spawn fixture child");
         let pid = child.id();
+        let process_start = cockpit_host::daemon_lifecycle::process_start_identity(pid)
+            .expect("fixture child start identity");
         let guard = EphemeralDaemonGuard::new(
             paths.clone(),
-            crate::daemon::DetachedEphemeralChild { child },
+            crate::daemon::DetachedEphemeralChild {
+                child,
+                process_start,
+            },
         );
         (guard, paths, pid)
     }
@@ -568,11 +620,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (guard, paths, pid) = child_guard(root.path(), "late-publication");
         let receipt = guard.process.as_ref().unwrap().receipt.clone();
+        let child = guard.process.as_ref().unwrap().child.clone();
+        let published_paths = paths.clone();
         let publisher = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let executable = std::fs::canonicalize("/bin/sleep").unwrap();
-            cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
-                .unwrap()
+            let receipt = cockpit_host::daemon_lifecycle::write_pid_file(
+                &published_paths.pid_file,
+                pid,
+                &executable,
+            )
+            .unwrap();
+            std::fs::write(&published_paths.socket, b"stale socket").unwrap();
+            receipt
         });
         drop(guard);
         let published = publisher.join().unwrap();
@@ -584,5 +644,14 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        while child.lock().unwrap().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reaper did not finish late-publication cleanup"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(!paths.pid_file.exists());
+        assert!(!paths.socket.exists());
     }
 }

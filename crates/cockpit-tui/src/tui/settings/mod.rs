@@ -9203,9 +9203,14 @@ fn help_line(text: &str) -> Paragraph<'static> {
 /// the read-allowlist always lands in the project layer
 /// (implementation note).
 fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
+    // `discover_config_dirs` yields project layers nearest-first, so `find`
+    // (not `rfind`) selects the nearest project — the layer load precedence
+    // reads and the one `/gitignore-allow` must target so it is not masked by a
+    // nearer project layer. Mirrors `cockpit_config`'s own nearest-project
+    // selection.
     if let Some(dir) = discover_config_dirs(cwd)
         .into_iter()
-        .rfind(|d| d.kind == ConfigDirKind::Project)
+        .find(|d| d.kind == ConfigDirKind::Project)
     {
         return dir.path.join(cockpit_config::dirs::CONFIG_FILE);
     }

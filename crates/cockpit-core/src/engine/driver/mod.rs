@@ -5438,18 +5438,44 @@ impl Driver {
                 .role(scratch_role)?
                 .display()
                 .to_string();
-            self.schedule
-                .spawn_swarm(crate::engine::schedule::authority::SpawnSpec {
-                    job_id: Some(job_id.clone()),
-                    goal_provenance: Some((job.goal_id, job.attempt_generation)),
-                    worker,
-                    prompt: job.request_json.clone(),
-                    write_scope,
-                    model,
-                    model_origin: crate::engine::schedule::authority::SpawnModelOrigin::HostConfig,
-                    depth: 0,
-                    max_depth: 0,
-                });
+            let spawn_result =
+                self.schedule
+                    .spawn_swarm(crate::engine::schedule::authority::SpawnSpec {
+                        job_id: Some(job_id.clone()),
+                        goal_provenance: Some((job.goal_id, job.attempt_generation)),
+                        worker,
+                        prompt: job.request_json.clone(),
+                        write_scope,
+                        model,
+                        model_origin:
+                            crate::engine::schedule::authority::SpawnModelOrigin::HostConfig,
+                        depth: 0,
+                        max_depth: 0,
+                    });
+            // A refused spawn (oversized prompt or a full swarm queue) registers
+            // no job and will emit no `Completed`. Counting it into the round
+            // would wedge goal supervision permanently, since the round only
+            // retires once its job set empties. Skip it and surface the refusal.
+            // The control job stays `leased` — so a Verifying panel's
+            // terminal-verdict gate (which counts pending+leased panelists) still
+            // correctly blocks on it rather than resolving a verdict short a
+            // panelist — and is re-leased after its 300s TTL on a later
+            // supervision round. This downgrades the former permanent wedge to a
+            // soft stall that self-heals the next time the goal loop wakes (a
+            // full queue drains and each completion wakes it; an oversized prompt
+            // is a logged user error). `queued`/`scheduled` spawns DO run and
+            // emit `Completed`, so they are still tracked. Deliberately NOT
+            // finished-as-failed here: `finish_goal_control_job(Err)` coerces a
+            // panelist to a fabricated `Refute`/pauses the goal on a transient
+            // full queue.
+            if let Some(refusal) = spawn_result.strip_prefix("refused:") {
+                tracing::warn!(
+                    job_id = %job_id,
+                    reason = refusal.trim(),
+                    "goal-supervision swarm spawn refused; not tracking it in this round"
+                );
+                continue;
+            }
             let round = self
                 .goal_supervision_round
                 .as_mut()

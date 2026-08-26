@@ -639,6 +639,30 @@ mod tests {
     }
 
     #[test]
+    fn safety_and_risk_tools_are_strict_compatible_after_responses_wire() {
+        // The utility safety/injection verdict tools do NOT declare
+        // `additionalProperties:false` in canonical form. A strict Responses
+        // model (ChatGPT/Codex) requires a closed schema; the dispatch path
+        // normalizes these through `definitions_for_wire` before sending
+        // (rather than relying on rig's own strict-tool sanitizer) so the
+        // safety-critical verdict schemas are closed by Cockpit itself. Guard
+        // that the wire normalization closes both.
+        for tool in [
+            crate::engine::safety_gate::safety_tool(),
+            crate::engine::injection_check::risk_tool(),
+        ] {
+            assert!(
+                tool.parameters.get("additionalProperties").is_none(),
+                "canonical `{}` is already closed; the wire-normalization test premise is stale",
+                tool.name
+            );
+            let wire = definitions_for_wire(WireApi::Responses, std::slice::from_ref(&tool));
+            let wire_tool = wire.as_ref().first().expect("one normalized wire tool");
+            assert_objects_are_closed(&wire_tool.parameters);
+        }
+    }
+
+    #[test]
     fn nullable_object_arm_is_closed() {
         let canonical = json!({
             "type": "object",

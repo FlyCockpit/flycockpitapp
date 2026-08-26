@@ -3528,7 +3528,7 @@ impl Driver {
                             .await;
                     }
                     if was_backgrounded {
-                        self.record_background_noninteractive_error(&task_call_id, &body)
+                        self.settle_live_noninteractive_children_failed(&task_call_id, &body)
                             .await;
                         Ok(self
                             .async_delegation_result(&task_call_id)
@@ -3536,6 +3536,23 @@ impl Driver {
                             .map(NoninteractiveCompletionDelivery::AsyncUser)
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
+                        // Inline runtime failure: settle the child to Failed
+                        // (DB + registry) so `task.control` does not report a
+                        // dead child as running, then mark it delivered (the
+                        // error is returned inline as the tool result). The
+                        // backgrounded arm above already does this via
+                        // `async_delegation_result`; the inline arm previously
+                        // did neither, leaving the child stuck `Running`.
+                        self.settle_live_noninteractive_children_failed(&task_call_id, &body)
+                            .await;
+                        if let Err(e) = self
+                            .session
+                            .db
+                            .mark_task_delegation_child_delivered(&task_call_id, "default")
+                            .await
+                        {
+                            tracing::warn!(error = %e, task_call_id, "mark failed inline single delegation delivered failed");
+                        }
                         Ok(NoninteractiveCompletionDelivery::Inline(
                             crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
@@ -3628,7 +3645,7 @@ impl Driver {
                             .await;
                     }
                     if was_backgrounded {
-                        self.record_background_noninteractive_error(&task_call_id, &body)
+                        self.settle_live_noninteractive_children_failed(&task_call_id, &body)
                             .await;
                         Ok(self
                             .async_delegation_result(&task_call_id)
@@ -3636,6 +3653,38 @@ impl Driver {
                             .map(NoninteractiveCompletionDelivery::AsyncUser)
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
+                        // Inline runtime failure: settle every batch child to
+                        // Failed (DB + registry) so `task.control` does not
+                        // report dead children as running, then mark them
+                        // delivered (the error is returned inline as the tool
+                        // result). Previously the inline arm did neither.
+                        self.settle_live_noninteractive_children_failed(&task_call_id, &body)
+                            .await;
+                        match self
+                            .session
+                            .db
+                            .undelivered_task_delegation_children(&task_call_id)
+                            .await
+                        {
+                            Ok(rows) => {
+                                for row in rows {
+                                    if let Err(e) = self
+                                        .session
+                                        .db
+                                        .mark_task_delegation_child_delivered(
+                                            &task_call_id,
+                                            &row.label,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(error = %e, task_call_id, label = %row.label, "mark failed inline batch delegation delivered failed");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, task_call_id, "load failed inline batch delegation rows failed");
+                            }
+                        }
                         Ok(NoninteractiveCompletionDelivery::Inline(
                             crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
@@ -3685,7 +3734,13 @@ impl Driver {
         }
     }
 
-    pub(in crate::engine::driver) async fn record_background_noninteractive_error(
+    /// Settle every still-live child of `task_call_id` to `Failed` in the DB
+    /// and the in-memory registry, with `body` as the failure report. Called
+    /// when a delegation's spawned task itself returned `Err` (so no child was
+    /// `complete()`d), for BOTH backgrounded and inline delegations — otherwise
+    /// an inline runtime failure would leave the child stuck `Running`, and
+    /// `task.control` would report a dead child as running.
+    pub(in crate::engine::driver) async fn settle_live_noninteractive_children_failed(
         &mut self,
         task_call_id: &str,
         body: &str,

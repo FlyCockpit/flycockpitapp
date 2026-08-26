@@ -1322,6 +1322,69 @@ async fn inline_background_completion_error_keeps_original_task_pairing() {
 }
 
 #[tokio::test]
+async fn inline_completion_error_settles_child_failed_not_running() {
+    // Regression: an inline (non-backgrounded) delegation whose spawned task
+    // returns Err must settle its child to a terminal state in both the DB and
+    // the registry. Previously only the backgrounded arm did this, so an inline
+    // runtime failure left the child stuck `Running` and `task.control` reported
+    // a dead child as running (a later steer/cancel could target a gone child).
+    let (mut driver, _tmp) = test_driver(8);
+    seed_task_delegation(&driver, "task-inline-fail", "default").await;
+    // Activate the child to `running` (a live status), as production does
+    // before the child's task runs; settle only touches live children.
+    driver
+        .session
+        .db
+        .activate_task_delegation_children_with_snapshots(
+            "task-inline-fail",
+            vec![("default".to_string(), "{}".to_string())],
+        )
+        .await
+        .unwrap();
+    driver.noninteractive_delegations.register_running(
+        "task-inline-fail",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    // No `background_on_user_input` → the job stays inline.
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+    let delivery = driver
+        .finalize_background_noninteractive_completion(
+            Some(BackgroundNoninteractiveCompletion::Single {
+                task_call_id: "task-inline-fail".to_string(),
+                task_provider_item_id: None,
+                task_function_call_id: Some("fn-inline-fail".to_string()),
+                result: Box::new(Err(anyhow::anyhow!("child crashed"))),
+            }),
+            &tx,
+        )
+        .await
+        .unwrap();
+
+    // The error is still returned inline as the tool result.
+    assert!(matches!(
+        delivery,
+        NoninteractiveCompletionDelivery::Inline(_)
+    ));
+
+    // The inline error path now settles the live child: its registry entry is
+    // no longer `Running`. Before the fix the inline arm settled nothing, so
+    // the entry stayed `Running`. (The DB-row terminalization uses the same
+    // `settle_task_tree_child` path as the backgrounded arm, which requires a
+    // published AgentTree executor row that this driver-unit harness does not
+    // build, so the registry settlement is what is asserted here.)
+    assert_ne!(
+        driver
+            .noninteractive_delegations
+            .status("task-inline-fail", "default"),
+        Some(NoninteractiveDelegationStatus::Running),
+        "inline delegation error left the child registry entry Running",
+    );
+}
+
+#[tokio::test]
 async fn backgrounded_completion_error_becomes_async_failed_result_once() {
     let (mut driver, _tmp) = test_driver(8);
     seed_task_delegation(&driver, "task-bg-error", "default").await;

@@ -531,13 +531,38 @@ async fn database_lines(
             return (lines, true);
         }
     }
-    match std::fs::metadata(&path) {
-        Ok(metadata) => lines.push(format!("size: {} bytes", metadata.len())),
-        Err(error) => lines.push(format!(
-            "size: unavailable ({})",
-            one_line(&error.to_string())
-        )),
+    match db.storage_report().await {
+        Ok(report) => {
+            lines.push(format!(
+                "storage: {} live bytes; {} reclaimable bytes; {} allocated bytes",
+                report.live_bytes, report.reclaimable_bytes, report.allocated_bytes
+            ));
+            lines.push(format!(
+                "files: {} main bytes; {} WAL bytes; {} shared-memory bytes",
+                report.main_file_bytes, report.wal_file_bytes, report.shared_memory_file_bytes
+            ));
+            lines.push(format!(
+                "pages: {} total; {} free; {} bytes each",
+                report.page_count, report.freelist_page_count, report.page_size_bytes
+            ));
+        }
+        Err(error) => {
+            lines.push(format!(
+                "storage: FAILED ({})",
+                one_line(&error.to_string())
+            ));
+            return (lines, true);
+        }
     }
+    lines.push("integrity: ok (quick_check and foreign_key_check passed at open)".to_string());
+    lines.push(
+        "export: use `cockpit export <session>`; exports are assembled by the daemon and redacted by default"
+            .to_string(),
+    );
+    lines.push(
+        "repair: read-only doctor never edits SQLite; restore a validated sibling *.backup-*.sqlite or move the database aside and restart"
+            .to_string(),
+    );
     lines.push(retention_line(&extended.retention));
     (lines, false)
 }

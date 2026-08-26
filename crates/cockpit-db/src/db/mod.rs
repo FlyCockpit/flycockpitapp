@@ -421,6 +421,25 @@ pub struct Db {
     read_only: bool,
 }
 
+/// Read-only physical storage accounting for diagnostics and retention UX.
+///
+/// `allocated_bytes` is SQLite's main-file page allocation, while
+/// `reclaimable_bytes` is the freelist portion of that allocation. The WAL and
+/// shared-memory sidecars are reported separately because they are bounded by
+/// the daemon's checkpoint policy rather than retention deletes alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseStorageReport {
+    pub page_size_bytes: u64,
+    pub page_count: u64,
+    pub freelist_page_count: u64,
+    pub allocated_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub live_bytes: u64,
+    pub main_file_bytes: u64,
+    pub wal_file_bytes: u64,
+    pub shared_memory_file_bytes: u64,
+}
+
 impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Db")
@@ -618,6 +637,18 @@ impl Db {
     /// checksum-backed migration ledger replaces `schema_version`.
     pub async fn applied_migration_version(&self) -> Result<i64> {
         self.read(current_schema_version).await
+    }
+
+    /// Return physical database accounting without mutating or checkpointing.
+    ///
+    /// This is safe for both the live daemon handle and the hidden read-only
+    /// diagnostic opener. Missing WAL/SHM sidecars count as zero; all other
+    /// metadata failures are surfaced so `doctor` cannot claim a complete
+    /// report from partial evidence.
+    pub async fn storage_report(&self) -> Result<DatabaseStorageReport> {
+        let path = self.path.clone();
+        self.read(move |conn| database_storage_report(conn, path.as_deref()))
+            .await
     }
 
     pub async fn read<F, T>(&self, f: F) -> Result<T>
@@ -1579,6 +1610,74 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
 fn sqlite_schema_version(conn: &Connection) -> Result<i64> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
         .context("reading SQLite schema version")
+}
+
+fn database_storage_report(
+    conn: &Connection,
+    path: Option<&Path>,
+) -> Result<DatabaseStorageReport> {
+    let nonnegative = |name: &str, value: i64| -> Result<u64> {
+        u64::try_from(value).with_context(|| format!("SQLite {name} was negative: {value}"))
+    };
+    let page_size_bytes = nonnegative(
+        "page_size",
+        conn.pragma_query_value(None, "page_size", |row| row.get(0))
+            .context("reading SQLite page_size")?,
+    )?;
+    let page_count = nonnegative(
+        "page_count",
+        conn.pragma_query_value(None, "page_count", |row| row.get(0))
+            .context("reading SQLite page_count")?,
+    )?;
+    let freelist_page_count = nonnegative(
+        "freelist_count",
+        conn.pragma_query_value(None, "freelist_count", |row| row.get(0))
+            .context("reading SQLite freelist_count")?,
+    )?;
+    anyhow::ensure!(
+        freelist_page_count <= page_count,
+        "SQLite freelist_count {freelist_page_count} exceeds page_count {page_count}"
+    );
+    let allocated_bytes = page_size_bytes
+        .checked_mul(page_count)
+        .context("SQLite allocated byte count overflow")?;
+    let reclaimable_bytes = page_size_bytes
+        .checked_mul(freelist_page_count)
+        .context("SQLite reclaimable byte count overflow")?;
+
+    let file_size = |candidate: &Path| -> Result<u64> {
+        match std::fs::metadata(candidate) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error)
+                .with_context(|| format!("reading database file size {}", candidate.display())),
+        }
+    };
+    let sidecar = |base: &Path, suffix: &str| {
+        let mut name = base.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let (main_file_bytes, wal_file_bytes, shared_memory_file_bytes) = match path {
+        Some(path) => (
+            file_size(path)?,
+            file_size(&sidecar(path, "-wal"))?,
+            file_size(&sidecar(path, "-shm"))?,
+        ),
+        None => (0, 0, 0),
+    };
+
+    Ok(DatabaseStorageReport {
+        page_size_bytes,
+        page_count,
+        freelist_page_count,
+        allocated_bytes,
+        reclaimable_bytes,
+        live_bytes: allocated_bytes - reclaimable_bytes,
+        main_file_bytes,
+        wal_file_bytes,
+        shared_memory_file_bytes,
+    })
 }
 
 fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {

@@ -2359,7 +2359,7 @@ impl App {
         report_unavailable: bool,
     ) {
         if let Some(admission) = admission.as_ref() {
-            let draft = crate::tui::paste::ImageIngressDraftAuthority {
+            let draft = crate::tui::composer::ImageIngressDraftAuthority {
                 session_id: admission.session_id,
                 admission_id: admission.admission_id,
                 attachment_id: admission.image_ref.id,
@@ -2405,7 +2405,7 @@ impl App {
                     "[image]".to_string(),
                     String::new(),
                     Some(crate::tui::structured_paste::PasteImageAdmission::Handle {
-                        draft: crate::tui::paste::ImageIngressDraftAuthority {
+                        draft: crate::tui::composer::ImageIngressDraftAuthority {
                             session_id: admission.session_id,
                             admission_id: admission.admission_id,
                             attachment_id: admission.image_ref.id,

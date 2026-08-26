@@ -783,7 +783,7 @@ pub(crate) struct WorkspaceTrustCompletion {
 
 #[derive(Debug)]
 pub(crate) struct ImageIngressDraftDiscardCompletion {
-    pub(crate) draft: crate::tui::paste::ImageIngressDraftAuthority,
+    pub(crate) draft: crate::tui::composer::ImageIngressDraftAuthority,
     pub(crate) response: Result<cockpit_proto::Response, String>,
 }
 
@@ -2295,7 +2295,7 @@ pub struct App {
     /// receipt, or are explicitly transferred to a possibly-sent message.
     pub(super) image_ingress_draft_discards: std::collections::HashMap<
         uuid::Uuid,
-        (crate::tui::paste::ImageIngressDraftAuthority, bool),
+        (crate::tui::composer::ImageIngressDraftAuthority, bool),
     >,
     pub(super) terminal_paste_classifier: crate::tui::structured_paste::TerminalPasteClassifier,
     pub(super) terminal_input_generation: Option<u64>,

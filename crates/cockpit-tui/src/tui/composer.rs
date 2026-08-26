@@ -25,8 +25,13 @@
 
 pub use cockpit_core::welcome::INPUT_PREFIX;
 
+#[path = "paste.rs"]
+mod paste;
 mod registered;
 
+pub(crate) use paste::ImageIngressDraftAuthority;
+#[cfg(test)]
+pub(crate) use paste::{PasteKind, PasteRegistry};
 pub(crate) use registered::{ComposerMotion, RegisteredComposer};
 
 /// Display width of [`INPUT_PREFIX`] in terminal columns. Computed via

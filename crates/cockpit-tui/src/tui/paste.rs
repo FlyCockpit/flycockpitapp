@@ -18,8 +18,8 @@
 //! [`super::composer::Composer`] and routes every application edit through
 //! [`PasteRegistry::shift_for_edit`] so the two stay in lockstep.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 const USER_PASTE_TAG: &str = "user_paste";
@@ -137,7 +137,7 @@ pub struct PasteBlock {
 
 /// The per-composer block registry. Blocks are kept sorted by `start`.
 #[derive(Debug)]
-pub struct PasteRegistry {
+pub(super) struct PasteRegistry {
     blocks: Vec<PasteBlock>,
     next_block_id: u64,
     next_text_number: u32,
@@ -147,13 +147,13 @@ pub struct PasteRegistry {
 }
 
 #[derive(Debug)]
-pub struct EditorPasteRebuild {
-    pub buffer: String,
-    pub registry: PasteRegistry,
+pub(super) struct EditorPasteRebuild {
+    pub(super) buffer: String,
+    pub(super) registry: PasteRegistry,
 }
 
 #[derive(Debug, Clone)]
-pub struct EditorPasteSnapshot {
+pub(crate) struct EditorPasteSnapshot {
     images: BTreeMap<u32, RetainedImage>,
     text_numbers_by_nonce: BTreeMap<String, u32>,
     next_text_number: u32,
@@ -194,7 +194,7 @@ impl PasteRegistry {
     /// Reconcile presentation blocks after a full-buffer edit. Any block
     /// whose exact placeholder identity or semantic-grapheme boundaries were
     /// disturbed is retired rather than retaining corrupt payload authority.
-    pub fn reconcile_buffer(&mut self, buffer: &str) {
+    pub(super) fn reconcile_buffer(&mut self, buffer: &str) {
         let mut offset = 0usize;
         let mut boundaries = std::collections::BTreeSet::from([0usize]);
         for grapheme in crate::tui::markdown::semantic_graphemes(buffer) {
@@ -210,20 +210,21 @@ impl PasteRegistry {
                     .get(block.start..block.end)
                     .is_some_and(|text| text == Self::expected_placeholder(block))
         });
-        debug_assert!(self
-            .blocks
-            .windows(2)
-            .all(|pair| pair[0].end <= pair[1].start));
+        debug_assert!(
+            self.blocks
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start)
+        );
     }
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::default()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
 
-    pub fn blocks(&self) -> &[PasteBlock] {
+    pub(super) fn blocks(&self) -> &[PasteBlock] {
         &self.blocks
     }
 
@@ -342,7 +343,7 @@ impl PasteRegistry {
     }
 
     /// Clear all blocks (after submit / composer clear).
-    pub fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.blocks.clear();
     }
 
@@ -377,17 +378,17 @@ impl PasteRegistry {
 
     /// Format a condensed text placeholder with an exact count:
     /// `[Pasted text #N, X tokens]`.
-    pub fn text_placeholder(number: u32, tokens: usize) -> String {
+    pub(super) fn text_placeholder(number: u32, tokens: usize) -> String {
         format!("[Pasted text #{number}, {tokens} tokens]")
     }
 
     /// Format a condensed text placeholder whose exact count is pending.
-    pub fn pending_text_placeholder(number: u32) -> String {
+    pub(super) fn pending_text_placeholder(number: u32) -> String {
         format!("[Pasted text #{number}, counting tokens]")
     }
 
     /// Format an image placeholder: `[Pasted image #N]`.
-    pub fn image_placeholder(number: u32) -> String {
+    pub(super) fn image_placeholder(number: u32) -> String {
         format!("[Pasted image #{number}]")
     }
 
@@ -403,7 +404,7 @@ impl PasteRegistry {
     /// Insert a block record for a condensed text paste whose exact token
     /// count will arrive later. Returns the stable block id plus the
     /// pending placeholder the caller must insert into the composer buffer.
-    pub fn register_text_pending(&mut self, at: usize, full: String) -> (u64, String) {
+    pub(super) fn register_text_pending(&mut self, at: usize, full: String) -> (u64, String) {
         self.register_text_with_state(at, full, None)
     }
 
@@ -466,12 +467,17 @@ impl PasteRegistry {
     /// flagged a `reference` (sent as text at send time). Returns the
     /// placeholder string the caller must insert into the buffer, or `None`
     /// when every representable stable image number has been consumed.
-    pub fn register_image(&mut self, at: usize, png: Vec<u8>) -> Option<String> {
+    #[cfg(test)]
+    pub(super) fn register_image(&mut self, at: usize, png: Vec<u8>) -> Option<String> {
         self.register_image_with_id(at, png)
             .map(|(_, placeholder)| placeholder)
     }
 
-    pub fn register_image_with_id(&mut self, at: usize, png: Vec<u8>) -> Option<(u64, String)> {
+    pub(super) fn register_image_with_id(
+        &mut self,
+        at: usize,
+        png: Vec<u8>,
+    ) -> Option<(u64, String)> {
         let hash = hash_bytes(&png);
         let existing = self.blocks.iter().find_map(|block| match &block.kind {
             PasteKind::Image {
@@ -527,19 +533,7 @@ impl PasteRegistry {
         (id, placeholder)
     }
 
-    pub fn register_image_handle(
-        &mut self,
-        at: usize,
-        draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
-        normalized_byte_length: u64,
-        sha256: String,
-    ) -> Option<String> {
-        self.register_image_handle_with_id(at, draft, image_ref, normalized_byte_length, sha256)
-            .map(|(_, placeholder)| placeholder)
-    }
-
-    pub fn register_image_handle_with_id(
+    pub(super) fn register_image_handle_with_id(
         &mut self,
         at: usize,
         draft: ImageIngressDraftAuthority,
@@ -646,7 +640,7 @@ impl PasteRegistry {
         (id, placeholder)
     }
 
-    pub fn apply_text_token_count(
+    pub(super) fn apply_text_token_count(
         &mut self,
         block_id: u64,
         tokens: usize,
@@ -772,7 +766,12 @@ impl PasteRegistry {
 
     /// Shift every pre-existing block at or after an insertion point while
     /// preserving the just-registered block's exact range and identity.
-    pub fn shift_other_blocks_after_insert(&mut self, inserted_id: u64, at: usize, len: usize) {
+    pub(super) fn shift_other_blocks_after_insert(
+        &mut self,
+        inserted_id: u64,
+        at: usize,
+        len: usize,
+    ) {
         for block in &mut self.blocks {
             if block.id != inserted_id && block.start >= at {
                 block.start += len;
@@ -794,7 +793,7 @@ impl PasteRegistry {
     ///   edits outside any block, blocks entirely after the deleted range
     ///   shift left, and the deleted range never overlaps a block
     ///   interior.
-    pub fn shift_for_edit(&mut self, at: usize, delta: isize) {
+    pub(super) fn shift_for_edit(&mut self, at: usize, delta: isize) {
         if delta == 0 {
             return;
         }
@@ -832,28 +831,28 @@ impl PasteRegistry {
     /// The block whose closing boundary (`end`) is exactly at `cursor` —
     /// i.e. the cursor sits immediately right of `]`. Used by Backspace
     /// to delete the whole block.
-    pub fn block_ending_at(&self, cursor: usize) -> Option<&PasteBlock> {
+    pub(super) fn block_ending_at(&self, cursor: usize) -> Option<&PasteBlock> {
         self.blocks.iter().find(|b| b.end == cursor)
     }
 
     /// The block whose opening boundary (`start`) is exactly at `cursor` —
     /// i.e. the cursor sits immediately left of `[`. Used by
     /// forward-`Delete`.
-    pub fn block_starting_at(&self, cursor: usize) -> Option<&PasteBlock> {
+    pub(super) fn block_starting_at(&self, cursor: usize) -> Option<&PasteBlock> {
         self.blocks.iter().find(|b| b.start == cursor)
     }
 
     /// The block strictly containing `pos` in its interior
     /// (`start < pos < end`). Used to forbid the cursor landing inside a
     /// block and to resolve insertion points to a boundary.
-    pub fn block_containing(&self, pos: usize) -> Option<&PasteBlock> {
+    pub(super) fn block_containing(&self, pos: usize) -> Option<&PasteBlock> {
         self.blocks.iter().find(|b| pos > b.start && pos < b.end)
     }
 
     /// Resolve an insertion point so it never lands inside a block. A
     /// position strictly inside a block snaps to that block's nearer
     /// boundary (ties favor the right edge, matching `@`-tag feel).
-    pub fn resolve_insertion(&self, pos: usize) -> usize {
+    pub(super) fn resolve_insertion(&self, pos: usize) -> usize {
         match self.block_containing(pos) {
             Some(b) => {
                 if pos - b.start < b.end - pos {
@@ -871,7 +870,7 @@ impl PasteRegistry {
     /// (`forward = true`) land on the far (`end`) boundary; when moving
     /// left land on the near (`start`) boundary. This is what makes arrow
     /// keys and vim motions treat a block as one unit.
-    pub fn skip_cursor(&self, pos: usize, forward: bool) -> usize {
+    pub(super) fn skip_cursor(&self, pos: usize, forward: bool) -> usize {
         match self.block_containing(pos) {
             Some(b) => {
                 if forward {
@@ -889,7 +888,7 @@ impl PasteRegistry {
     /// `[lo, hi)` overlaps the block — so a vim delete/change crossing it
     /// should remove the whole block. Returns the block's full span so the
     /// caller can widen the delete range to a block boundary.
-    pub fn block_crossed_by(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+    pub(super) fn block_crossed_by(&self, from: usize, to: usize) -> Option<(usize, usize)> {
         let (mut lo, mut hi) = if from <= to { (from, to) } else { (to, from) };
         let mut intersected = false;
         loop {
@@ -912,7 +911,7 @@ impl PasteRegistry {
     /// block whose stored content equals `pasted`, return that block's
     /// span — the caller replaces `[start, end)` with the raw text and
     /// drops the block (re-paste-to-expand). `None` otherwise.
-    pub fn expandable_text_at(
+    pub(super) fn expandable_text_at(
         &self,
         cursor: usize,
         pasted: &str,
@@ -928,7 +927,7 @@ impl PasteRegistry {
     /// Drop the block whose range is exactly `[start, end)` (used after a
     /// whole-block delete the caller performed on the buffer). Also
     /// shifts the trailing blocks left by the removed length.
-    pub fn remove_range(&mut self, start: usize, end: usize) {
+    pub(super) fn remove_range(&mut self, start: usize, end: usize) {
         self.shift_for_edit(start, -((end - start) as isize));
     }
 
@@ -967,7 +966,7 @@ impl PasteRegistry {
     /// image part should appear; the caller splits on them to interleave
     /// text and image content parts. (For non-vision and reference cases
     /// no sentinel is emitted — those are pure text.)
-    pub fn build_wire(
+    pub(super) fn build_wire(
         &self,
         buffer: &str,
         vision: bool,
@@ -1018,7 +1017,7 @@ impl PasteRegistry {
     /// Build the marker-free transcript display for send time. Text
     /// blocks expand to their full pasted content inside display-only
     /// boundaries; image placeholders remain literal.
-    pub fn expand_display(&self, buffer: &str) -> String {
+    pub(super) fn expand_display(&self, buffer: &str) -> String {
         self.expand_blocks(buffer, |out, block| match &block.kind {
             PasteKind::Text { full, .. } => {
                 Self::append_display_paste(out, full, block.number);
@@ -1033,7 +1032,7 @@ impl PasteRegistry {
     /// no transcript or wire markers. Returns `None` when any image block is
     /// present because a text-only consumer must choose an explicit image
     /// attachment contract rather than leaking a placeholder literal.
-    pub fn expand_plain_payload(&self, buffer: &str) -> Option<String> {
+    pub(super) fn expand_plain_payload(&self, buffer: &str) -> Option<String> {
         if self.blocks.iter().any(|block| {
             matches!(
                 block.kind,
@@ -1051,7 +1050,7 @@ impl PasteRegistry {
     /// Build the text handed to `$EDITOR`. Text paste blocks are expanded
     /// with stable nonce tags so they can be rebuilt on return; images stay
     /// as visible placeholders because their bytes cannot live in the file.
-    pub fn expand_editor(&self, buffer: &str) -> String {
+    pub(super) fn expand_editor(&self, buffer: &str) -> String {
         self.expand_blocks(buffer, |out, block| match &block.kind {
             PasteKind::Text { full, nonce, .. } => {
                 Self::append_user_paste_wire(out, full, nonce);
@@ -1065,7 +1064,7 @@ impl PasteRegistry {
     /// Retain one payload for each visible image number before an external
     /// editor round-trip. Returned text maps `[Pasted image #N]` back through
     /// this table; missing placeholders are dropped.
-    pub fn image_payloads_by_number(&self) -> BTreeMap<u32, RetainedImage> {
+    pub(super) fn image_payloads_by_number(&self) -> BTreeMap<u32, RetainedImage> {
         let mut images = BTreeMap::new();
         for block in &self.blocks {
             match &block.kind {
@@ -1096,7 +1095,7 @@ impl PasteRegistry {
         images
     }
 
-    pub fn editor_snapshot(&self) -> EditorPasteSnapshot {
+    pub(super) fn editor_snapshot(&self) -> EditorPasteSnapshot {
         let text_numbers_by_nonce = self
             .blocks
             .iter()
@@ -1115,7 +1114,7 @@ impl PasteRegistry {
 
     /// Exact ingress drafts still represented by at least one composer block.
     /// Duplicate/reference placeholders collapse to their admission identity.
-    pub fn image_ingress_drafts(&self) -> Vec<ImageIngressDraftAuthority> {
+    pub(super) fn image_ingress_drafts(&self) -> Vec<ImageIngressDraftAuthority> {
         let mut seen = std::collections::HashSet::new();
         self.blocks
             .iter()
@@ -1131,7 +1130,10 @@ impl PasteRegistry {
     /// Exact daemon-admitted handles emitted as retained image parts by
     /// `build_wire`. Reference-only duplicate placeholders remain text and
     /// therefore must keep frontend disposal ownership.
-    pub fn wire_image_ingress_drafts(&self, vision: bool) -> Vec<ImageIngressDraftAuthority> {
+    pub(super) fn wire_image_ingress_drafts(
+        &self,
+        vision: bool,
+    ) -> Vec<ImageIngressDraftAuthority> {
         if !vision {
             return Vec::new();
         }
@@ -1153,7 +1155,7 @@ impl PasteRegistry {
     /// registry. Well-formed `<user_paste id="...">...</user_paste id="...">`
     /// regions become condensed text blocks. Surviving image placeholders
     /// are rebuilt from `retained_images`; unknown image numbers remain text.
-    pub fn rebuild_from_editor(
+    pub(super) fn rebuild_from_editor(
         editor_text: &str,
         retained_images: &BTreeMap<u32, RetainedImage>,
         mut count_text: impl FnMut(&str) -> usize,
@@ -1171,7 +1173,7 @@ impl PasteRegistry {
         Self::rebuild_from_editor_snapshot(editor_text, &snapshot, count_text)
     }
 
-    pub fn rebuild_from_editor_snapshot(
+    pub(super) fn rebuild_from_editor_snapshot(
         editor_text: &str,
         snapshot: &EditorPasteSnapshot,
         mut count_text: impl FnMut(&str) -> usize,
@@ -1291,9 +1293,9 @@ mod tests {
         // Under both thresholds → raw.
         assert!(!should_condense("one line"));
         assert!(!should_condense("line1\nline2")); // exactly 2 lines
-                                                   // Over the line threshold.
+        // Over the line threshold.
         assert!(should_condense("a\nb\nc")); // 3 lines
-                                             // Over the char threshold (one line, 321 chars).
+        // Over the char threshold (one line, 321 chars).
         let long = "x".repeat(321);
         assert!(should_condense(&long));
         // Exactly at the char threshold is not over.
@@ -1995,10 +1997,12 @@ gamma",
         assert_eq!(rebuilt.buffer, raw);
         assert!(rebuilt.registry.is_empty());
         assert_eq!(rebuilt.registry.next_image_number, u64::from(u32::MAX) + 1);
-        assert!(rebuilt
-            .registry
-            .register_image(raw.len(), vec![1])
-            .is_none());
+        assert!(
+            rebuilt
+                .registry
+                .register_image(raw.len(), vec![1])
+                .is_none()
+        );
     }
 
     #[test]
@@ -2009,10 +2013,12 @@ gamma",
 
         assert_eq!(rebuilt.buffer, raw);
         assert_eq!(rebuilt.registry.blocks()[0].number, u32::MAX);
-        assert!(rebuilt
-            .registry
-            .register_image(raw.len(), vec![1])
-            .is_none());
+        assert!(
+            rebuilt
+                .registry
+                .register_image(raw.len(), vec![1])
+                .is_none()
+        );
         assert_eq!(
             rebuilt
                 .registry

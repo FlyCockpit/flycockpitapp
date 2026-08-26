@@ -359,7 +359,7 @@ pub enum PasteSlotState {
 pub enum PasteImageAdmission {
     Bytes(Vec<u8>),
     Handle {
-        draft: crate::tui::paste::ImageIngressDraftAuthority,
+        draft: crate::tui::composer::ImageIngressDraftAuthority,
         image_ref: cockpit_proto::ImageAttachmentRef,
         normalized_byte_length: u64,
         sha256: String,
@@ -393,7 +393,7 @@ pub struct SubmissionFenceV1 {
     pub slots: Vec<PasteSlotState>,
     /// Daemon-admitted drafts already present when Enter was pressed. The
     /// fence owns them until its request is possibly sent.
-    pub retained_drafts: Vec<crate::tui::paste::ImageIngressDraftAuthority>,
+    pub retained_drafts: Vec<crate::tui::composer::ImageIngressDraftAuthority>,
     pub lifecycle: FenceLifecycle,
 }
 

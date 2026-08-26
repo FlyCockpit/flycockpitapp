@@ -3800,7 +3800,7 @@ impl App {
         &mut self,
         admission: crate::tui::async_action::DaemonImagePathAdmission,
     ) {
-        let draft = crate::tui::paste::ImageIngressDraftAuthority {
+        let draft = crate::tui::composer::ImageIngressDraftAuthority {
             session_id: admission.session_id,
             admission_id: admission.admission_id,
             attachment_id: admission.image_ref.id,
@@ -4947,8 +4947,8 @@ mod queued_message_edit_tests {
 mod paste_routing_tests {
     use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
     use crate::tui::app::{App, Overlay, PendingModelSelection};
+    use crate::tui::composer::{PasteKind, PasteRegistry};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
-    use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
     use cockpit_proto::PinnedMessage;

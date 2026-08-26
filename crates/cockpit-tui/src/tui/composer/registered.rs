@@ -7,11 +7,11 @@
 
 use std::ops::Deref;
 
-use super::{Composer, EditOutcome, FindSpec, Operator, Register, VimMode};
-use crate::tui::paste::{
+use super::paste::{
     EditorPasteRebuild, EditorPasteSnapshot, ImageIngressDraftAuthority, PasteBlock, PasteKind,
     PasteRegistry,
 };
+use super::{Composer, EditOutcome, FindSpec, Operator, Register, VimMode};
 
 /// A closed inventory of cursor motions accepted by [`RegisteredComposer`].
 ///
@@ -474,7 +474,7 @@ impl RegisteredComposer {
             self.insert_str(&full);
             return None;
         }
-        if !crate::tui::paste::should_condense(&data) {
+        if !super::paste::should_condense(&data) {
             self.insert_str(&data);
             return None;
         }
@@ -909,9 +909,9 @@ impl RegisteredComposer {
 mod tests {
     use std::collections::BTreeMap;
 
+    use super::super::paste::{ImageIngressDraftAuthority, PasteRegistry, RetainedImage};
     use super::{ComposerMotion, RegisteredComposer};
     use crate::tui::composer::Operator;
-    use crate::tui::paste::{ImageIngressDraftAuthority, PasteRegistry, RetainedImage};
 
     fn image_authority() -> (
         ImageIngressDraftAuthority,
@@ -993,13 +993,15 @@ mod tests {
         owner.insert_char('!');
 
         assert!(owner.text().contains("👨‍👩‍👧‍👦"));
-        assert!(crate::tui::markdown::semantic_graphemes(owner.text())
-            .iter()
-            .scan(0usize, |offset, grapheme| {
-                *offset += grapheme.len();
-                Some(*offset)
-            })
-            .any(|boundary| boundary == owner.cursor()));
+        assert!(
+            crate::tui::markdown::semantic_graphemes(owner.text())
+                .iter()
+                .scan(0usize, |offset, grapheme| {
+                    *offset += grapheme.len();
+                    Some(*offset)
+                })
+                .any(|boundary| boundary == owner.cursor())
+        );
     }
 
     #[test]

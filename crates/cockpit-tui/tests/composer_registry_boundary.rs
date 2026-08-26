@@ -7,6 +7,8 @@ use syn::{Fields, ImplItem, Item, Meta, Visibility};
 const COMPOSER_SOURCE: &str = include_str!("../src/tui/composer.rs");
 const OWNER_SOURCE: &str = include_str!("../src/tui/composer/registered.rs");
 const APP_SOURCE: &str = include_str!("../src/tui/app/mod.rs");
+const TUI_MODULE_SOURCE: &str = include_str!("../src/tui/mod.rs");
+const PASTE_SOURCE: &str = include_str!("../src/tui/paste.rs");
 
 fn compact(tokens: impl ToTokens) -> String {
     tokens.to_token_stream().to_string().replace(' ', "")
@@ -122,6 +124,58 @@ fn registered_composer_is_the_exact_private_two_value_owner() {
         !has_mutable_escape_trait(OWNER_SOURCE),
         "mutable component escape trait"
     );
+}
+
+#[test]
+fn raw_paste_authority_is_nested_and_restricted_to_the_composer_owner() {
+    let tui = syn::parse_file(TUI_MODULE_SOURCE).expect("tui module parses");
+    assert!(
+        tui.items
+            .iter()
+            .all(|item| { !matches!(item, Item::Mod(module) if module.ident == "paste") })
+    );
+
+    let composer = syn::parse_file(COMPOSER_SOURCE).expect("composer module parses");
+    let paste_module = composer
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Mod(module) if module.ident == "paste" => Some(module),
+            _ => None,
+        })
+        .expect("paste implementation is nested beneath composer");
+    assert!(matches!(paste_module.vis, Visibility::Inherited));
+
+    let paste = syn::parse_file(PASTE_SOURCE).expect("paste source parses");
+    for name in ["PasteRegistry", "EditorPasteRebuild"] {
+        let item = named_struct(&paste, name);
+        assert!(matches!(item.vis, Visibility::Restricted(_)));
+    }
+    let rebuild = named_struct(&paste, "EditorPasteRebuild");
+    let Fields::Named(fields) = &rebuild.fields else {
+        panic!("EditorPasteRebuild has named fields");
+    };
+    assert!(
+        fields
+            .named
+            .iter()
+            .all(|field| matches!(field.vis, Visibility::Restricted(_)))
+    );
+
+    let registry = inherent_impl(&paste, "PasteRegistry");
+    for item in &registry.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        assert!(
+            matches!(
+                method.vis,
+                Visibility::Inherited | Visibility::Restricted(_)
+            ) || cfg_test(&method.attrs),
+            "raw registry method is over-visible: {}",
+            method.sig.ident
+        );
+    }
 }
 
 #[test]
@@ -322,7 +376,11 @@ impl ProductionInventory<'_> {
     }
 
     fn is_authority_owner(&self) -> bool {
-        matches!(self.relative, "tui/composer/registered.rs" | "tui/paste.rs")
+        self.relative == "tui/composer/registered.rs"
+    }
+
+    fn is_raw_registry_implementation(&self) -> bool {
+        self.relative == "tui/paste.rs"
     }
 
     fn is_canonical_authority_container(&self, item: &str) -> bool {
@@ -566,6 +624,7 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
         }
         if self.test_depth == 0
             && !self.is_authority_owner()
+            && !self.is_raw_registry_implementation()
             && authority_name(&path.path) == Some("PasteRegistry")
         {
             self.violation("production code references raw PasteRegistry as a value");
@@ -574,7 +633,10 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
     }
 
     fn visit_macro(&mut self, invocation: &'ast syn::Macro) {
-        if self.test_depth == 0 && !self.is_authority_owner() {
+        if self.test_depth == 0
+            && !self.is_authority_owner()
+            && !self.is_raw_registry_implementation()
+        {
             let tokens = invocation.tokens.to_string();
             if ["RegisteredComposer", "PasteRegistry"].iter().any(|name| {
                 tokens

@@ -325,6 +325,15 @@ impl ProductionInventory<'_> {
         matches!(self.relative, "tui/composer/registered.rs" | "tui/paste.rs")
     }
 
+    fn is_canonical_authority_container(&self, item: &str) -> bool {
+        matches!(
+            (self.relative, item),
+            ("tui/app/mod.rs", "App")
+                | ("tui/composer/registered.rs", "RegisteredComposer")
+                | ("tui/paste.rs", "EditorPasteRebuild")
+        )
+    }
+
     fn authority_storage(&mut self, owner: &str, tokens: impl ToTokens) {
         if self.test_depth != 0 {
             return;
@@ -431,28 +440,32 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
 
     fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
         self.authority_storage("type alias", &item.ty);
+        self.authority_storage("type alias generic surface", &item.generics);
         visit::visit_item_type(self, item);
     }
 
     fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
-        self.authority_storage("associated type alias", &item.ty);
+        self.authority_storage("associated type alias", item);
         visit::visit_impl_item_type(self, item);
     }
 
     fn visit_trait_item_type(&mut self, item: &'ast syn::TraitItemType) {
-        if let Some((_, ty)) = &item.default {
-            self.authority_storage("trait associated type default", ty);
-        }
+        self.authority_storage("trait associated type surface", item);
         visit::visit_trait_item_type(self, item);
     }
 
+    fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
+        self.authority_storage("associated const type", &item.ty);
+        visit::visit_impl_item_const(self, item);
+    }
+
+    fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
+        self.authority_storage("trait associated const surface", item);
+        visit::visit_trait_item_const(self, item);
+    }
+
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
-        if self.test_depth == 0
-            && !matches!(
-                item.ident.to_string().as_str(),
-                "App" | "RegisteredComposer" | "EditorPasteRebuild"
-            )
-        {
+        if self.test_depth == 0 && !self.is_canonical_authority_container(&item.ident.to_string()) {
             for field in &item.fields {
                 self.authority_storage(&format!("wrapper `{}`", item.ident), &field.ty);
             }
@@ -658,12 +671,17 @@ fn ratchet_detectors_reject_adversarial_aliases_and_extra_authorities() {
         "use crate::tui::composer::RegisteredComposer as Owner; fn f() { Owner::new(false); }",
         "use crate::tui::composer as editing; fn f() { editing::RegisteredComposer::new(false); }",
         "type Owner = RegisteredComposer;",
+        "type Owner<T: Into<RegisteredComposer> = RegisteredComposer> = T;",
         "struct Wrapper { owner: RegisteredComposer }",
         "struct Generic<T = RegisteredComposer>(std::marker::PhantomData<T>);",
         "enum Wrapper { Owner(RegisteredComposer) }",
         "union Wrapper { owner: std::mem::ManuallyDrop<RegisteredComposer> }",
         "trait Authority { type Owner; } impl Authority for () { type Owner = RegisteredComposer; }",
         "trait Authority { type Owner = RegisteredComposer; }",
+        "trait Authority { type Owner<T: Into<RegisteredComposer>>; }",
+        "trait Authority { const OWNER: Option<RegisteredComposer>; }",
+        "trait Authority { const OWNER: Option<()> = Some(RegisteredComposer::new(false)); }",
+        "impl Authority for () { const OWNER: Option<RegisteredComposer> = None; }",
         "static OWNER: Option<RegisteredComposer> = None;",
         "const OWNER: Option<RegisteredComposer> = None;",
         "fn leak(owner: &mut RegisteredComposer) -> &mut RegisteredComposer { owner }",
@@ -674,6 +692,27 @@ fn ratchet_detectors_reject_adversarial_aliases_and_extra_authorities() {
     ] {
         let inventory = inspect_production(source, "tui/adversarial.rs");
         assert!(!inventory.violations.is_empty(), "accepted: {source}");
+    }
+
+    for (source, relative) in [
+        (
+            "struct App { owner: RegisteredComposer }",
+            "tui/adversarial.rs",
+        ),
+        (
+            "struct RegisteredComposer { owner: PasteRegistry }",
+            "tui/adversarial.rs",
+        ),
+        (
+            "struct EditorPasteRebuild { registry: PasteRegistry }",
+            "tui/adversarial.rs",
+        ),
+    ] {
+        let inventory = inspect_production(source, relative);
+        assert!(
+            !inventory.violations.is_empty(),
+            "leaf-name exemption accepted outside canonical file: {source}"
+        );
     }
 
     let unlisted = inspect_production(

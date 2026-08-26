@@ -41,9 +41,8 @@ pub fn should_condense(content: &str) -> bool {
     lines > CONDENSE_LINE_THRESHOLD || content.chars().count() > CONDENSE_CHAR_THRESHOLD
 }
 
-/// Content hash of decoded image bytes, used to dedup repeat pastes of
-/// the same image so the second one is sent as a `[reference image #N]`
-/// rather than re-transmitting the bytes.
+/// Content hash accelerator. Duplicate authority always requires an exact
+/// same-kind payload identity comparison after the hash matches.
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
@@ -65,8 +64,8 @@ pub enum PasteKind {
         tokens: Option<usize>,
         nonce: String,
     },
-    /// Pasted image. `png` is the PNG-encoded bytes; `hash` dedups
-    /// repeats; `reference` is true when this is a duplicate paste of an
+    /// Pasted image. `png` is the PNG-encoded bytes; `hash` accelerates exact
+    /// comparisons; `reference` is true when this is a duplicate paste of an
     /// image already in the buffer (sent as `[reference image #N]`, bytes
     /// carried only by the first occurrence).
     Image {
@@ -229,20 +228,117 @@ impl PasteRegistry {
     }
 
     pub(crate) fn contains_image_bytes(&self, png: &[u8]) -> bool {
-        self.contains_image_hash(hash_bytes(png))
+        let hash = hash_bytes(png);
+        self.contains_image_bytes_at_hash(png, hash)
     }
 
-    pub(crate) fn contains_image_sha256(&self, sha256: &str) -> bool {
-        self.contains_image_hash(hash_bytes(sha256.as_bytes()))
-    }
-
-    fn contains_image_hash(&self, hash: u64) -> bool {
-        self.blocks.iter().any(|block| match &block.kind {
-            PasteKind::Image { hash: other, .. } | PasteKind::ImageHandle { hash: other, .. } => {
-                *other == hash
-            }
-            PasteKind::Text { .. } => false,
+    fn contains_image_bytes_at_hash(&self, png: &[u8], hash: u64) -> bool {
+        self.blocks.iter().any(|block| {
+            matches!(&block.kind, PasteKind::Image { png: retained, hash: retained_hash, .. }
+                if *retained_hash == hash && retained == png)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_image_bytes_with_forced_hash(&self, png: &[u8], hash: u64) -> bool {
+        self.contains_image_bytes_at_hash(png, hash)
+    }
+
+    pub(crate) fn retained_handle_metadata_matches(
+        &self,
+        sha256: &str,
+        normalized_byte_length: u64,
+    ) -> Option<bool> {
+        let hash = hash_bytes(sha256.as_bytes());
+        self.retained_handle_metadata_matches_at_hash(sha256, normalized_byte_length, hash)
+    }
+
+    fn retained_handle_metadata_matches_at_hash(
+        &self,
+        sha256: &str,
+        normalized_byte_length: u64,
+        hash: u64,
+    ) -> Option<bool> {
+        let mut lengths = self.blocks.iter().filter_map(|block| match &block.kind {
+            PasteKind::ImageHandle {
+                sha256: retained,
+                normalized_byte_length,
+                hash: retained_hash,
+                ..
+            } if *retained_hash == hash && retained == sha256 => Some(*normalized_byte_length),
+            _ => None,
+        });
+        let first = lengths.next()?;
+        Some(
+            first == normalized_byte_length
+                && lengths.all(|length| length == normalized_byte_length),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_handle_metadata_matches_with_forced_hash(
+        &self,
+        sha256: &str,
+        normalized_byte_length: u64,
+        hash: u64,
+    ) -> Option<bool> {
+        self.retained_handle_metadata_matches_at_hash(sha256, normalized_byte_length, hash)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_image_with_forced_hash(
+        &mut self,
+        at: usize,
+        png: Vec<u8>,
+        hash: u64,
+    ) -> (u64, String) {
+        let existing = self.blocks.iter().find_map(|block| match &block.kind {
+            PasteKind::Image {
+                png: retained,
+                hash: retained_hash,
+                ..
+            } if *retained_hash == hash && retained == &png => Some(block.number),
+            _ => None,
+        });
+        let (number, reference) = self.distinct_image_number(existing).unwrap();
+        self.insert_image_with_number(at, png, hash, number, reference)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_image_handle_with_forced_hash(
+        &mut self,
+        at: usize,
+        draft: ImageIngressDraftAuthority,
+        image_ref: cockpit_proto::ImageAttachmentRef,
+        normalized_byte_length: u64,
+        sha256: String,
+        hash: u64,
+    ) -> (u64, String) {
+        let existing = self.blocks.iter().find_map(|block| match &block.kind {
+            PasteKind::ImageHandle {
+                sha256: retained,
+                normalized_byte_length: retained_length,
+                hash: retained_hash,
+                ..
+            } if *retained_hash == hash
+                && retained == &sha256
+                && *retained_length == normalized_byte_length =>
+            {
+                Some(block.number)
+            }
+            _ => None,
+        });
+        let (number, reference) = self.distinct_image_number(existing).unwrap();
+        self.insert_image_handle_with_number(
+            at,
+            draft,
+            image_ref,
+            normalized_byte_length,
+            sha256,
+            hash,
+            number,
+            reference,
+        )
     }
 
     /// Clear all blocks (after submit / composer clear).
@@ -260,19 +356,12 @@ impl PasteRegistry {
         number
     }
 
-    /// The display number to use for an image with this content hash. A
-    /// prior occurrence of the same image reuses its number (and the new
+    /// Allocate a display number after exact typed identity resolution. A
+    /// prior occurrence of the same typed payload reuses its number (and the new
     /// block becomes a `reference`); otherwise it's the next distinct
     /// image index. Returns `(number, is_duplicate)`.
-    fn image_number_for(&mut self, hash: u64) -> Option<(u32, bool)> {
-        if let Some(existing) = self.blocks.iter().find_map(|b| match &b.kind {
-            PasteKind::Image { hash: h, .. } | PasteKind::ImageHandle { hash: h, .. }
-                if *h == hash =>
-            {
-                Some(b.number)
-            }
-            _ => None,
-        }) {
+    fn distinct_image_number(&mut self, existing: Option<u32>) -> Option<(u32, bool)> {
+        if let Some(existing) = existing {
             return Some((existing, true));
         }
         let number = u32::try_from(self.next_image_number).ok()?;
@@ -372,8 +461,8 @@ impl PasteRegistry {
         (id, placeholder)
     }
 
-    /// Insert a block record for a pasted image at byte `at`. Dedups by
-    /// content hash: a repeat paste reuses the original's `#N` and is
+    /// Insert a block record for a pasted image at byte `at`. A byte-exact
+    /// same-kind repeat reuses the original's `#N` and is
     /// flagged a `reference` (sent as text at send time). Returns the
     /// placeholder string the caller must insert into the buffer, or `None`
     /// when every representable stable image number has been consumed.
@@ -384,17 +473,29 @@ impl PasteRegistry {
 
     pub fn register_image_with_id(&mut self, at: usize, png: Vec<u8>) -> Option<(u64, String)> {
         let hash = hash_bytes(&png);
-        let (number, reference) = self.image_number_for(hash)?;
+        let existing = self.blocks.iter().find_map(|block| match &block.kind {
+            PasteKind::Image {
+                png: retained,
+                hash: retained_hash,
+                ..
+            } if *retained_hash == hash && retained == &png => Some(block.number),
+            PasteKind::Text { .. } | PasteKind::Image { .. } | PasteKind::ImageHandle { .. } => {
+                None
+            }
+        });
+        let (number, reference) = self.distinct_image_number(existing)?;
         Some(self.insert_image_with_number(at, png, hash, number, reference))
     }
 
     fn register_image_with_number(&mut self, at: usize, png: Vec<u8>, number: u32) -> String {
         let hash = hash_bytes(&png);
         let reference = self.blocks.iter().any(|block| match &block.kind {
-            PasteKind::Image { hash: other, .. } | PasteKind::ImageHandle { hash: other, .. } => {
-                *other == hash
-            }
-            PasteKind::Text { .. } => false,
+            PasteKind::Image {
+                png: retained,
+                hash: retained_hash,
+                ..
+            } => *retained_hash == hash && retained == &png,
+            PasteKind::Text { .. } | PasteKind::ImageHandle { .. } => false,
         });
         self.next_image_number = self.next_image_number.max(u64::from(number) + 1);
         self.insert_image_with_number(at, png, hash, number, reference)
@@ -447,7 +548,23 @@ impl PasteRegistry {
         sha256: String,
     ) -> Option<(u64, String)> {
         let hash = hash_bytes(sha256.as_bytes());
-        let (number, reference) = self.image_number_for(hash)?;
+        let existing = self.blocks.iter().find_map(|block| match &block.kind {
+            PasteKind::ImageHandle {
+                sha256: retained,
+                normalized_byte_length: retained_length,
+                hash: retained_hash,
+                ..
+            } if *retained_hash == hash
+                && retained == &sha256
+                && *retained_length == normalized_byte_length =>
+            {
+                Some(block.number)
+            }
+            PasteKind::Text { .. } | PasteKind::Image { .. } | PasteKind::ImageHandle { .. } => {
+                None
+            }
+        });
+        let (number, reference) = self.distinct_image_number(existing)?;
         Some(self.insert_image_handle_with_number(
             at,
             draft,
@@ -471,10 +588,17 @@ impl PasteRegistry {
     ) -> String {
         let hash = hash_bytes(sha256.as_bytes());
         let reference = self.blocks.iter().any(|block| match &block.kind {
-            PasteKind::Image { hash: other, .. } | PasteKind::ImageHandle { hash: other, .. } => {
-                *other == hash
+            PasteKind::ImageHandle {
+                sha256: retained,
+                normalized_byte_length: retained_length,
+                hash: retained_hash,
+                ..
+            } => {
+                *retained_hash == hash
+                    && retained == &sha256
+                    && *retained_length == normalized_byte_length
             }
-            PasteKind::Text { .. } => false,
+            PasteKind::Text { .. } | PasteKind::Image { .. } => false,
         });
         self.next_image_number = self.next_image_number.max(u64::from(number) + 1);
         self.insert_image_handle_with_number(

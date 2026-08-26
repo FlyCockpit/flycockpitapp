@@ -377,6 +377,8 @@ impl StatsPane {
             *self.list.offset_mut() = max_scroll;
         }
         self.list.select(self.cursor_body_line());
+        let mut viewport = self.list.clone();
+        viewport.select(None);
         frame.render_stateful_widget(
             List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
                 .highlight_style(
@@ -386,8 +388,9 @@ impl StatsPane {
                 )
                 .scroll_padding(1),
             body,
-            &mut self.list,
+            &mut viewport,
         );
+        *self.list.offset_mut() = viewport.offset();
         render_scrollbar(
             frame,
             body,
@@ -1393,6 +1396,10 @@ mod tests {
             }
             let _ = rendered_buffer(&mut pane, width, 9);
             assert!(pane.list.offset() > 0);
+            let manual = pane.list.offset().saturating_sub(1);
+            pane.scroll_up();
+            let _ = rendered_buffer(&mut pane, width, 9);
+            assert_eq!(pane.list.offset(), manual);
         }
 
         let mut empty = pane_with(empty_rollup());

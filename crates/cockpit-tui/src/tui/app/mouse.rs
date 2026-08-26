@@ -700,7 +700,7 @@ impl App {
             }
             crate::tui::button::ButtonDispatch::ResourcePromote { request_id } => {
                 let outcome = match &mut self.overlay {
-                    Overlay::Resources(pane) => pane.pointer_promote(&request_id),
+                    Overlay::Resources(pane) => pane.pointer_promote(request_id),
                     _ => None,
                 };
                 if let Some(outcome) = outcome {
@@ -2786,12 +2786,14 @@ mod resource_button_dispatch_tests {
     async fn promote_button_enqueues_daemon_mutation_for_clicked_request() {
         let _ = crate::tui::agent_runner::take_test_resource_promote_requests();
         let mut pane = ResourcesPane::open();
-        pane.apply_snapshot_result(Ok(scheduler_snapshot(&["rs-first", "rs-clicked"])));
+        let snapshot = scheduler_snapshot(&["rs-first", "rs-clicked"]);
+        let clicked_id = snapshot.queued[1].id;
+        pane.apply_snapshot_result(Ok(snapshot));
         let mut app = App::new(None, false);
         app.overlay = Overlay::Resources(pane);
 
         app.dispatch_button(ButtonDispatch::ResourcePromote {
-            request_id: "rs-clicked".to_string(),
+            request_id: clicked_id,
         });
 
         assert_eq!(
@@ -2801,7 +2803,7 @@ mod resource_button_dispatch_tests {
         assert!(matches!(
             crate::tui::agent_runner::take_test_resource_promote_requests().as_slice(),
             [cockpit_proto::Request::PromoteResource { request_id, .. }]
-                if request_id == "rs-clicked"
+                if request_id == &clicked_id.to_string()
         ));
         assert!(matches!(app.overlay, Overlay::Resources(_)));
     }
@@ -2809,14 +2811,17 @@ mod resource_button_dispatch_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn earlier_fifo_success_survives_later_resource_failure() {
         let mut pane = ResourcesPane::open();
-        pane.apply_snapshot_result(Ok(scheduler_snapshot(&["rs-first", "rs-clicked"])));
+        let snapshot = scheduler_snapshot(&["rs-first", "rs-clicked"]);
+        let first_id = snapshot.queued[0].id;
+        let clicked_id = snapshot.queued[1].id;
+        pane.apply_snapshot_result(Ok(snapshot));
         let mut app = App::new(None, false);
         app.overlay = Overlay::Resources(pane);
         app.dispatch_button(ButtonDispatch::ResourcePromote {
-            request_id: "rs-first".to_string(),
+            request_id: first_id,
         });
         app.dispatch_button(ButtonDispatch::ResourcePromote {
-            request_id: "rs-clicked".to_string(),
+            request_id: clicked_id,
         });
         let ids = app.async_actions.pending_ids();
         assert_eq!(
@@ -2858,7 +2863,7 @@ mod resource_button_dispatch_tests {
         app.overlay = Overlay::Resources(ResourcesPane::open());
         app.start_resources_snapshot_action();
         app.dispatch_button(ButtonDispatch::ResourcePromote {
-            request_id: "not-yet-rendered".to_string(),
+            request_id: uuid::Uuid::new_v4(),
         });
         // A button for an absent stable id is rejected before RPC enqueue.
         assert_eq!(app.async_actions.pending_ids().len(), 1);
@@ -2866,9 +2871,11 @@ mod resource_button_dispatch_tests {
         let Overlay::Resources(pane) = &mut app.overlay else {
             panic!("resources overlay")
         };
-        pane.apply_snapshot_result(Ok(scheduler_snapshot(&["rs-clicked"])));
+        let snapshot = scheduler_snapshot(&["rs-clicked"]);
+        let clicked_id = snapshot.queued[0].id;
+        pane.apply_snapshot_result(Ok(snapshot));
         app.dispatch_button(ButtonDispatch::ResourcePromote {
-            request_id: "rs-clicked".to_string(),
+            request_id: clicked_id,
         });
         let ids = app.async_actions.pending_ids();
         assert_eq!(ids.len(), 2, "read and mutation must share the FIFO lane");

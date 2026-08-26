@@ -25,7 +25,7 @@ pub(crate) enum ButtonDispatch {
     SessionsConfirmDelete,
     SessionsConfirmCancel,
     ResourcePromote {
-        request_id: String,
+        request_id: uuid::Uuid,
     },
     NoteNew,
     OverlayAction {

@@ -2915,7 +2915,7 @@ impl App {
         );
     }
 
-    pub(super) fn start_resource_promote_action(&mut self, request_id: String) {
+    pub(super) fn start_resource_promote_action(&mut self, request_id: uuid::Uuid) {
         let session_id = self.current_session_id();
         let request = crate::tui::agent_runner::promote_resource_request(request_id, session_id);
         let lifecycle = self.lifecycle.clone();

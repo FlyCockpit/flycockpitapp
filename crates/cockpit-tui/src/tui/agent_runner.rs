@@ -3347,11 +3347,11 @@ pub(crate) fn resource_snapshot_blocking(
 }
 
 pub(crate) fn promote_resource_request(
-    request_id: String,
+    request_id: uuid::Uuid,
     session_id: Option<uuid::Uuid>,
 ) -> Request {
     let request = Request::PromoteResource {
-        request_id,
+        request_id: request_id.to_string(),
         session_id,
     };
     #[cfg(test)]

@@ -116,11 +116,11 @@ fn button_primitive_exact_bounds() {
     registry.begin_frame(true, 1);
     let zero = ButtonSpec::new(
         ButtonId::ResourcePromote {
-            request_id: "rs-zero".to_string(),
+            request_id: uuid::Uuid::nil(),
         },
         "promote",
         ButtonDispatch::ResourcePromote {
-            request_id: "rs-zero".to_string(),
+            request_id: uuid::Uuid::nil(),
         },
     );
     let backend = TestBackend::new(40, 3);

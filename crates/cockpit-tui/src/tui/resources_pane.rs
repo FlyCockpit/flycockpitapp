@@ -20,7 +20,7 @@ use cockpit_core::engine::resource_scheduler::{
 pub enum ResourcesOutcome {
     Close,
     Refresh,
-    Promote(String),
+    Promote(uuid::Uuid),
 }
 
 pub struct ResourcesPane {
@@ -28,7 +28,7 @@ pub struct ResourcesPane {
     error: Option<String>,
     loading: bool,
     list: ListState,
-    selected_request_id: Option<String>,
+    selected_request_id: Option<uuid::Uuid>,
     follow_selection: bool,
     last_body_height: usize,
     last_content_rows: usize,
@@ -82,33 +82,29 @@ impl ResourcesPane {
         match result {
             Ok(snapshot) => {
                 self.error = None;
-                let previous_index = self.selected_index();
-                self.selected_request_id = self
-                    .selected_request_id
-                    .take()
-                    .filter(|id| snapshot.queued.iter().any(|entry| entry.display_id == *id))
-                    .or_else(|| {
-                        snapshot
-                            .queued
-                            .get(previous_index.min(snapshot.queued.len().saturating_sub(1)))
-                            .map(|entry| entry.display_id.clone())
-                    });
+                self.selected_request_id = match self.selected_request_id.take() {
+                    Some(id) => snapshot
+                        .queued
+                        .iter()
+                        .any(|entry| entry.id == id)
+                        .then_some(id),
+                    None => snapshot.queued.first().map(|entry| entry.id),
+                };
                 self.snapshot = Some(snapshot);
             }
             Err(e) => self.error = Some(e),
         }
     }
 
-    pub(crate) fn pointer_promote(&mut self, request_id: &str) -> Option<ResourcesOutcome> {
+    pub(crate) fn pointer_promote(&mut self, request_id: uuid::Uuid) -> Option<ResourcesOutcome> {
         let request_id = self
             .snapshot
             .as_ref()?
             .queued
             .iter()
-            .find(|entry| entry.display_id == request_id)?
-            .display_id
-            .clone();
-        self.selected_request_id = Some(request_id.clone());
+            .find(|entry| entry.id == request_id)?
+            .id;
+        self.selected_request_id = Some(request_id);
         self.follow_selection = true;
         Some(ResourcesOutcome::Promote(request_id))
     }
@@ -132,7 +128,7 @@ impl ResourcesPane {
             }
             KeyCode::Enter | KeyCode::Char(' ') => self
                 .selected_request()
-                .map(|entry| ResourcesOutcome::Promote(entry.display_id.clone())),
+                .map(|entry| ResourcesOutcome::Promote(entry.id)),
             _ => None,
         }
     }
@@ -200,15 +196,11 @@ impl ResourcesPane {
                     continue;
                 }
                 let spec = crate::tui::button::ButtonSpec::new(
-                    crate::tui::button::ButtonId::ResourcePromote {
-                        request_id: request_id.clone(),
-                    },
+                    crate::tui::button::ButtonId::ResourcePromote { request_id },
                     "promote",
-                    crate::tui::button::ButtonDispatch::ResourcePromote {
-                        request_id: request_id.clone(),
-                    },
+                    crate::tui::button::ButtonDispatch::ResourcePromote { request_id },
                 )
-                .focused(self.selected_request_id.as_deref() == Some(&request_id));
+                .focused(self.selected_request_id == Some(request_id));
                 let _ = registry.paint(frame, body.right().saturating_sub(10), y, 9, spec);
             }
         }
@@ -227,8 +219,7 @@ impl ResourcesPane {
         let snapshot = self.snapshot.as_ref()?;
         self.selected_request_id
             .as_ref()
-            .and_then(|id| snapshot.queued.iter().find(|entry| entry.display_id == *id))
-            .or_else(|| snapshot.queued.first())
+            .and_then(|id| snapshot.queued.iter().find(|entry| entry.id == *id))
     }
 
     fn help_line(&self) -> Line<'static> {
@@ -257,7 +248,7 @@ impl ResourcesPane {
     fn body_lines_with_selected_row(
         &self,
         show_inline_action: bool,
-    ) -> (Vec<Line<'static>>, Option<usize>, Vec<(String, usize)>) {
+    ) -> (Vec<Line<'static>>, Option<usize>, Vec<(uuid::Uuid, usize)>) {
         let mut lines = Vec::new();
         let mut selected_row = None;
         let mut queued_rows = Vec::new();
@@ -311,12 +302,12 @@ impl ResourcesPane {
         if snapshot.queued.is_empty() {
             lines.push(muted("  none"));
         } else {
-            for (i, entry) in snapshot.queued.iter().enumerate() {
-                let selected = i == self.selected_index();
+            for entry in &snapshot.queued {
+                let selected = self.selected_request_id == Some(entry.id);
                 if selected {
                     selected_row = Some(lines.len());
                 }
-                queued_rows.push((entry.display_id.clone(), lines.len()));
+                queued_rows.push((entry.id, lines.len()));
                 lines.push(queued_line(entry, selected, show_inline_action));
             }
         }
@@ -329,12 +320,7 @@ impl ResourcesPane {
         };
         self.selected_request_id
             .as_ref()
-            .and_then(|id| {
-                snapshot
-                    .queued
-                    .iter()
-                    .position(|entry| entry.display_id == *id)
-            })
+            .and_then(|id| snapshot.queued.iter().position(|entry| entry.id == *id))
             .unwrap_or(0)
     }
 
@@ -343,7 +329,7 @@ impl ResourcesPane {
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.queued.get(index))
-            .map(|entry| entry.display_id.clone());
+            .map(|entry| entry.id);
     }
 
     fn move_selection(&mut self, delta: isize, total: usize) {
@@ -624,10 +610,12 @@ mod tests {
     #[test]
     fn enter_promotes_selected_queued_request() {
         let mut pane = ResourcesPane::open();
-        pane.apply_snapshot_result(Ok(snapshot()));
+        let value = snapshot();
+        let expected_id = value.queued[0].id;
+        pane.apply_snapshot_result(Ok(value));
 
         match pane.handle_key(press(KeyCode::Enter)) {
-            Some(ResourcesOutcome::Promote(id)) => assert_eq!(id, "rs-0002"),
+            Some(ResourcesOutcome::Promote(id)) => assert_eq!(id, expected_id),
             other => panic!("expected promote outcome, got {other:?}"),
         }
     }
@@ -666,9 +654,58 @@ mod tests {
     }
 
     #[test]
+    fn reused_display_id_does_not_transfer_selection_or_accept_stale_click() {
+        let mut first = snapshot();
+        let stale_id = first.queued[0].id;
+        let mut pane = ResourcesPane::open();
+        pane.apply_snapshot_result(Ok(first.clone()));
+        assert_eq!(pane.selected_request_id, Some(stale_id));
+        let mut registry = crate::tui::button::ButtonRegistry::default();
+        registry.begin_frame(true, 11);
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                pane.render_with_buttons(frame, Rect::new(0, 0, 80, 14), Some(&mut registry))
+            })
+            .expect("original render");
+        registry.end_frame();
+        let original = registry.targets()[0].rect;
+        let _ = registry.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            original.x,
+            original.y,
+        ));
+
+        first.queued[0].id = Uuid::new_v4();
+        let replacement_id = first.queued[0].id;
+        pane.apply_snapshot_result(Ok(first));
+        registry.begin_frame(true, 11);
+        terminal
+            .draw(|frame| {
+                pane.render_with_buttons(frame, Rect::new(0, 0, 80, 14), Some(&mut registry))
+            })
+            .expect("replacement render");
+        registry.end_frame();
+        let replacement = registry.targets()[0].rect;
+        assert_eq!(pane.selected_request_id, None);
+        assert!(pane.pointer_promote(stale_id).is_none());
+        assert!(!matches!(
+            registry.handle_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                replacement.x,
+                replacement.y,
+            )),
+            Some(crate::tui::button::ButtonPointerOutcome::Activated(_))
+        ));
+        assert_ne!(stale_id, replacement_id);
+    }
+
+    #[test]
     fn visible_promote_button_uses_same_pass_row_geometry() {
         let mut pane = ResourcesPane::open();
-        pane.apply_snapshot_result(Ok(snapshot()));
+        let value = snapshot();
+        let expected_id = value.queued[0].id;
+        pane.apply_snapshot_result(Ok(value));
         let mut registry = crate::tui::button::ButtonRegistry::default();
         registry.begin_frame(true, 1);
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
@@ -681,7 +718,7 @@ mod tests {
         assert!(matches!(
             &registry.targets()[0].id,
             crate::tui::button::ButtonId::ResourcePromote { request_id }
-                if request_id == "rs-0002"
+                if *request_id == expected_id
         ));
         assert!(registry.targets()[0].rect.y < 11);
     }
@@ -695,6 +732,12 @@ mod tests {
         value.queued.push(other);
         let mut pane = ResourcesPane::open();
         pane.apply_snapshot_result(Ok(value.clone()));
+        let pressed_id = value
+            .queued
+            .iter()
+            .find(|entry| entry.display_id == "rs-0002")
+            .unwrap()
+            .id;
         let mut registry = crate::tui::button::ButtonRegistry::default();
         registry.begin_frame(true, 7);
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("terminal");
@@ -707,7 +750,7 @@ mod tests {
         let pressed = registry
             .targets()
             .iter()
-            .find(|target| matches!(&target.id, crate::tui::button::ButtonId::ResourcePromote { request_id } if request_id == "rs-0002"))
+            .find(|target| matches!(&target.id, crate::tui::button::ButtonId::ResourcePromote { request_id } if *request_id == pressed_id))
             .expect("original request target")
             .rect;
         assert!(matches!(
@@ -731,7 +774,7 @@ mod tests {
         let moved = registry
             .targets()
             .iter()
-            .find(|target| matches!(&target.id, crate::tui::button::ButtonId::ResourcePromote { request_id } if request_id == "rs-0002"))
+            .find(|target| matches!(&target.id, crate::tui::button::ButtonId::ResourcePromote { request_id } if *request_id == pressed_id))
             .expect("same request after reorder")
             .rect;
         assert!(matches!(
@@ -742,7 +785,7 @@ mod tests {
             )),
             Some(crate::tui::button::ButtonPointerOutcome::Activated(
                 crate::tui::button::ButtonDispatch::ResourcePromote { request_id }
-            )) if request_id == "rs-0002"
+            )) if request_id == pressed_id
         ));
     }
 
@@ -806,7 +849,7 @@ mod tests {
         );
 
         pane.handle_key(press(KeyCode::Down));
-        let selected_id = pane.selected_request_id.clone().expect("selection");
+        let selected_id = pane.selected_request_id.expect("selection");
         let _ = rendered_buffer(&mut pane, 80, 10);
         let selected_row = pane.body_lines_with_selected_row(true).1.unwrap();
         assert!(selected_row >= pane.list.offset());
@@ -815,10 +858,7 @@ mod tests {
         value.queued.reverse();
         pane.apply_snapshot_result(Ok(value));
         let _ = rendered_buffer(&mut pane, 80, 10);
-        assert_eq!(
-            pane.selected_request_id.as_deref(),
-            Some(selected_id.as_str())
-        );
+        assert_eq!(pane.selected_request_id, Some(selected_id));
         let reordered_row = pane.body_lines_with_selected_row(true).1.unwrap();
         assert!(reordered_row >= pane.list.offset());
         assert!(reordered_row < pane.list.offset() + pane.last_body_height);

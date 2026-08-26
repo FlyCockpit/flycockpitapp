@@ -2398,11 +2398,11 @@ impl App {
     /// `/version` — render a transcript message with the running cockpit
     /// version (Cargo package version) and the OS/platform string cockpit
     /// already gathers for the cached system block
-    /// ([`cockpit_core::sysinfo::os_string`]); no build metadata. One `Plain` line
+    /// ([`cockpit_host::sysinfo::os_string`]); no build metadata. One `Plain` line
     /// per field, matching how other informational commands list output.
     pub(super) fn handle_version_command(&mut self) {
         self.push_plain(format!("cockpit {}", env!("CARGO_PKG_VERSION")));
-        self.push_plain(format!("OS: {}", cockpit_core::sysinfo::os_string()));
+        self.push_plain(format!("OS: {}", cockpit_host::sysinfo::os_string()));
     }
 
     /// `/note <text>` — append a session-history note to self. The note is a

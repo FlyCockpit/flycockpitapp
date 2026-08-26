@@ -544,6 +544,12 @@ fn production_uses_cockpit_proto_directly() {
                     path.display()
                 ));
             }
+            if compact.contains("cockpit_core::sysinfo::") {
+                findings.push(format!(
+                    "{}: host environment probes are owned by cockpit-host",
+                    path.display()
+                ));
+            }
             for frontend_probe in [
                 "cockpit_core::container::availability_snapshot",
                 "cockpit_core::container::initial_availability_unknown",
@@ -580,6 +586,9 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::text"
                     || imported == "cockpit_core::text::self"
                     || imported.starts_with("cockpit_core::text::")
+                    || imported == "cockpit_core::sysinfo"
+                    || imported == "cockpit_core::sysinfo::self"
+                    || imported.starts_with("cockpit_core::sysinfo::")
                     || imported == "cockpit_core::container::ContainerAvailability"
                     || imported == "cockpit_core::container::ContainerRuntimeKind"
                     || imported == "cockpit_core::container::ContainerUnavailableReason"

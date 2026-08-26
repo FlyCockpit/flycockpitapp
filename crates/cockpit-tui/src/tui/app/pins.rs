@@ -724,7 +724,7 @@ impl App {
             clicked_chat_row: 0,
             cursor: 0,
             items: crate::tui::context_menu::ContextMenu::build_items(
-                cockpit_core::sysinfo::is_ssh(),
+                cockpit_host::sysinfo::is_ssh(),
                 false,
             ),
         });

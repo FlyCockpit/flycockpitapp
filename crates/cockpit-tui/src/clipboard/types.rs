@@ -278,7 +278,7 @@ impl SessionContext {
     /// Probe production environment. Conservative: untrusted remote and
     /// host-bridge markers force desktop routes off.
     pub fn detect() -> Self {
-        let ssh = cockpit_core::sysinfo::is_ssh();
+        let ssh = cockpit_host::sysinfo::is_ssh();
         let tmux = std::env::var_os("TMUX").is_some();
         let wsl_or_container = detect_wsl_or_container();
         let host_bridge = detect_host_bridge();

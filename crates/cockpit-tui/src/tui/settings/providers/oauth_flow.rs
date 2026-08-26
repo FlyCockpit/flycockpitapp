@@ -221,7 +221,7 @@ impl OAuthEffects {
     pub(crate) fn production() -> Self {
         Self {
             copy: copy_plain_no_recovery,
-            is_ssh: cockpit_core::sysinfo::is_ssh,
+            is_ssh: cockpit_host::sysinfo::is_ssh,
             open: cockpit_core::browser::open,
             #[cfg(test)]
             bind: cockpit_core::auth::xai_oauth::bind_callback_listener,

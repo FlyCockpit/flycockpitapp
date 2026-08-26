@@ -156,7 +156,7 @@ impl App {
             return;
         }
         if let crate::tui::links::LinkGestureOutcome::Activate(url) = link_outcome {
-            if cockpit_core::sysinfo::is_ssh() {
+            if cockpit_host::sysinfo::is_ssh() {
                 match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
                     Ok(result) => {
                         let (msg, kind) = super::copy_actions::describe_delivered(
@@ -453,7 +453,7 @@ impl App {
                     .get(chat_row)
                     .is_some_and(|meta| meta.diff_path.is_some());
             let items = crate::tui::context_menu::ContextMenu::build_items(
-                cockpit_core::sysinfo::is_ssh(),
+                cockpit_host::sysinfo::is_ssh(),
                 diff_editor,
             );
             self.context_menu = Some(crate::tui::context_menu::ContextMenu {
@@ -833,7 +833,7 @@ impl App {
         let outcome = self.link_pointer_gesture.check_activation(pa.token, now);
         self.pending_link_activation = None;
         if let crate::tui::links::LinkGestureOutcome::Activate(url) = outcome {
-            if cockpit_core::sysinfo::is_ssh() {
+            if cockpit_host::sysinfo::is_ssh() {
                 match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
                     Ok(result) => {
                         let (msg, kind) = super::copy_actions::describe_delivered(

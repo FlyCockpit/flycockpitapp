@@ -440,6 +440,65 @@ pub struct DatabaseStorageReport {
     pub shared_memory_file_bytes: u64,
 }
 
+/// Stable recovery category for storage failures that require user action.
+///
+/// Callers must not retry these as ordinary contention. In particular,
+/// `Capacity` and `Io` leave the outcome of an interrupted commit unknown;
+/// recovery must reopen through the daemon and reconcile durable state before
+/// reporting success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseStorageFailure {
+    Capacity,
+    ReadOnly,
+    Io,
+    Corrupt,
+}
+
+impl DatabaseStorageFailure {
+    pub const fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::Capacity => "FCDB_STORAGE_FULL",
+            Self::ReadOnly => "FCDB_STORAGE_READ_ONLY",
+            Self::Io => "FCDB_STORAGE_IO",
+            Self::Corrupt => "FCDB_STORAGE_CORRUPT",
+        }
+    }
+}
+
+/// Classify an SQLite storage failure through any `anyhow` context chain.
+pub fn classify_database_storage_failure(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<DatabaseStorageFailure> {
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        if let Some(rusqlite::Error::SqliteFailure(info, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            return match info.code {
+                rusqlite::ErrorCode::DiskFull | rusqlite::ErrorCode::OutOfMemory => {
+                    Some(DatabaseStorageFailure::Capacity)
+                }
+                rusqlite::ErrorCode::ReadOnly
+                | rusqlite::ErrorCode::PermissionDenied
+                | rusqlite::ErrorCode::AuthorizationForStatementDenied => {
+                    Some(DatabaseStorageFailure::ReadOnly)
+                }
+                rusqlite::ErrorCode::SystemIoFailure
+                | rusqlite::ErrorCode::CannotOpen
+                | rusqlite::ErrorCode::FileLockingProtocolFailed => {
+                    Some(DatabaseStorageFailure::Io)
+                }
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+                    Some(DatabaseStorageFailure::Corrupt)
+                }
+                _ => None,
+            };
+        }
+        current = cause.source();
+    }
+    None
+}
+
 impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Db")
@@ -1747,6 +1806,45 @@ mod tests {
             })
             .collect::<Vec<_>>();
         migrate_with(conn, &migrations)
+    }
+
+    #[test]
+    fn storage_failure_contract_is_stable_through_context() {
+        let cases = [
+            (
+                rusqlite::ErrorCode::DiskFull,
+                DatabaseStorageFailure::Capacity,
+                "FCDB_STORAGE_FULL",
+            ),
+            (
+                rusqlite::ErrorCode::ReadOnly,
+                DatabaseStorageFailure::ReadOnly,
+                "FCDB_STORAGE_READ_ONLY",
+            ),
+            (
+                rusqlite::ErrorCode::SystemIoFailure,
+                DatabaseStorageFailure::Io,
+                "FCDB_STORAGE_IO",
+            ),
+            (
+                rusqlite::ErrorCode::DatabaseCorrupt,
+                DatabaseStorageFailure::Corrupt,
+                "FCDB_STORAGE_CORRUPT",
+            ),
+        ];
+        for (code, expected, diagnostic_code) in cases {
+            let sqlite = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code: 0,
+                },
+                None,
+            );
+            let error = anyhow::Error::new(sqlite).context("writer commit failed");
+            let classified = classify_database_storage_failure(error.as_ref());
+            assert_eq!(classified, Some(expected));
+            assert_eq!(classified.unwrap().diagnostic_code(), diagnostic_code);
+        }
     }
 
     #[tokio::test]

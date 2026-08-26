@@ -1786,11 +1786,11 @@ fn reserve_input_locked(state: &TerminalState, bytes: Vec<u8>) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("terminal input queue rejected frame: {error}"))
 }
 
-fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
+fn bracketed_paste_bytes(text: &[u8]) -> Vec<u8> {
     let mut out =
         Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
     out.extend_from_slice(BRACKETED_PASTE_START);
-    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(text);
     out.extend_from_slice(BRACKETED_PASTE_END);
     out
 }
@@ -2894,7 +2894,7 @@ mod tests {
     #[test]
     fn bracketed_paste_wraps_path() {
         assert_eq!(
-            bracketed_paste_bytes("/tmp/img.png"),
+            bracketed_paste_bytes(b"/tmp/img.png"),
             b"\x1b[200~/tmp/img.png\x1b[201~".to_vec()
         );
     }
@@ -3230,7 +3230,11 @@ mod tests {
             );
         }
         let exact =
-            bracketed_paste_bytes(&shell_path_literal(path, IngressShellDialect::Posix).unwrap());
+            bracketed_paste_bytes(
+                shell_path_literal(path, IngressShellDialect::Posix)
+                    .unwrap()
+                    .as_bytes(),
+            );
         assert!(exact.starts_with(BRACKETED_PASTE_START));
         assert!(exact.ends_with(BRACKETED_PASTE_END));
         assert!(!exact.ends_with(b"\n"));

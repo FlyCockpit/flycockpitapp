@@ -778,7 +778,10 @@ impl Approver {
 pub(crate) fn write_content_commitment(bytes: &[u8]) -> serde_json::Value {
     serde_json::json!({
         "byte_len": bytes.len(),
-        "sha256": format!("{:x}", Sha256::digest(bytes)),
+        "sha256": Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
     })
 }
 

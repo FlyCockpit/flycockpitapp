@@ -1047,11 +1047,13 @@ fn push_test_child(driver: &mut Driver, history: Vec<Message>) {
         ),
         agent: child,
         agent_instance_id: None,
+        endpoint_generation: None,
         history,
         answering: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
         recovery_activation: None,
+        late_user_steer_permit: None,
         _vnext_child_admission: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     });
@@ -1113,6 +1115,7 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         ),
         agent: Arc::new(child),
         agent_instance_id: None,
+        endpoint_generation: None,
         history: vec![],
         answering: Some(PendingTaskCall {
             call_id: call_id.to_string(),
@@ -1123,6 +1126,7 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
         recovery_activation: None,
+        late_user_steer_permit: None,
         _vnext_child_admission: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     });

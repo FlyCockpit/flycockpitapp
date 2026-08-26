@@ -1696,7 +1696,10 @@ VERY LONG TEXT
         let (wire, images) = r.build_wire(&buffer, true);
         // First image → one real part (sentinel); duplicate → text ref.
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0], png);
+        assert_eq!(
+            images[0],
+            cockpit_client::image_upload::SubmissionImage::png(png)
+        );
         assert!(wire.contains(IMAGE_PART_SENTINEL));
         assert!(wire.contains("[reference image #1]"));
     }
@@ -1846,7 +1849,10 @@ gamma";
             _ => panic!("expected rebuilt text block"),
         }
         let (wire, images) = rebuilt.registry.build_wire(&rebuilt.buffer, true);
-        assert_eq!(images, vec![png]);
+        assert_eq!(
+            images,
+            vec![cockpit_client::image_upload::SubmissionImage::png(png)]
+        );
         assert!(wire.contains(&format!(
             "<user_paste id=\"{nonce}\">{full}</user_paste id=\"{nonce}\">"
         )));
@@ -2012,7 +2018,10 @@ gamma",
 
         assert_eq!(rebuilt.buffer, "keep [Pasted image #2]");
         let (wire, images) = rebuilt.registry.build_wire(&rebuilt.buffer, true);
-        assert_eq!(images, vec![second]);
+        assert_eq!(
+            images,
+            vec![cockpit_client::image_upload::SubmissionImage::png(second)]
+        );
         assert!(wire.contains(IMAGE_PART_SENTINEL));
     }
 
@@ -2205,7 +2214,10 @@ gamma",
         assert!(no_imgs.is_empty());
         assert!(non_vision.contains("not sent"));
         let (vision, imgs) = r.build_wire(&buffer, true);
-        assert_eq!(imgs, vec![png]);
+        assert_eq!(
+            imgs,
+            vec![cockpit_client::image_upload::SubmissionImage::png(png)]
+        );
         assert!(vision.contains(IMAGE_PART_SENTINEL));
     }
 

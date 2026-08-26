@@ -3,6 +3,7 @@ use crate::tui::agent_runner::AgentRunner;
 use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
+use cockpit_client::submission::ClientUserSubmission;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use std::fs;
 use tokio::sync::mpsc;
@@ -41,7 +42,7 @@ fn passive_same_generation_terminal_result_corrects_default_and_divergence() {
     assert!(app.launch.active_model_diverged);
     assert!(app.config_drift.is_some());
 
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id: uuid::Uuid::new_v4(),
         provider: active.provider.clone(),
         model: active.model.clone(),
@@ -85,7 +86,7 @@ fn passive_same_generation_terminal_result_corrects_default_and_divergence() {
     assert!(app.pending_model_selection.is_none());
 
     let older = selection("p", "older-event");
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id: uuid::Uuid::new_v4(),
         provider: older.provider.clone(),
         model: older.model.clone(),
@@ -416,7 +417,7 @@ fn picker_make_default_sends_correlated_request_without_local_write() {
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id,
         provider: "p".into(),
         model: "a".into(),
@@ -539,7 +540,7 @@ fn chrome_active_model_unchanged_on_rejected_switch() {
         .as_mut()
         .unwrap()
         .queued_submission = Some(queued);
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id,
         provider: "p".to_string(),
         model: "a".to_string(),
@@ -659,7 +660,7 @@ fn terminal_daemon_link_preserves_full_pending_selection_and_exact_submission() 
             ))
     );
 
-    app.apply_event(cockpit_core::engine::TurnEvent::DaemonLinkTerminal {
+    app.apply_event(cockpit_client::presentation::TurnEvent::DaemonLinkTerminal {
         error: "protocol link ended".to_string(),
     });
 
@@ -762,7 +763,7 @@ fn cancelling_attached_add_model_settings_immediately_reopens_picker() {
     assert!(matches!(app.overlay, Overlay::None));
     assert!(app.refresh_reopened_model_picker_after_settings.is_none());
     let generation = app.config_snapshot.generation.saturating_add(1);
-    app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ConfigSnapshot {
         snapshot: Box::new(cockpit_proto::ConfigSnapshot {
             session_id: uuid::Uuid::new_v4(),
             generation,
@@ -819,7 +820,7 @@ fn changed_snapshot_after_settings_close_refreshes_open_picker_inventory_once() 
             ..Default::default()
         });
     let generation = app.config_snapshot.generation.saturating_add(1);
-    app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ConfigSnapshot {
         snapshot: Box::new(cockpit_proto::ConfigSnapshot {
             session_id: uuid::Uuid::new_v4(),
             generation,
@@ -864,7 +865,7 @@ fn add_model_waits_through_unrelated_and_saved_snapshots_then_reopens_on_close()
     // still open. It updates held config but cannot consume the add-model
     // causal marker or rebuild a hidden picker under the dialog.
     let generation = app.config_snapshot.generation.saturating_add(1);
-    app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ConfigSnapshot {
         snapshot: Box::new(cockpit_proto::ConfigSnapshot {
             session_id: uuid::Uuid::new_v4(),
             generation,
@@ -889,7 +890,7 @@ fn add_model_waits_through_unrelated_and_saved_snapshots_then_reopens_on_close()
             id: "b".to_string(),
             ..Default::default()
         });
-    app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ConfigSnapshot {
         snapshot: Box::new(cockpit_proto::ConfigSnapshot {
             session_id: uuid::Uuid::new_v4(),
             generation: generation + 1,
@@ -975,7 +976,7 @@ fn quick_model_change_waits_for_terminal_confirmation() {
         .expect("control request pending");
     app.apply_control_request_outcome(
         request_id,
-        cockpit_core::engine::ControlRequestOutcome::Applied,
+        cockpit_client::presentation::ControlRequestOutcome::Applied,
     );
     assert!(
         !app.history.iter().any(
@@ -985,7 +986,7 @@ fn quick_model_change_waits_for_terminal_confirmation() {
     );
 
     let confirmed = selection("p", "a");
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id,
         provider: confirmed.provider.clone(),
         model: confirmed.model.clone(),
@@ -1030,7 +1031,7 @@ fn quick_model_delivery_rejection_does_not_open_picker() {
         .expect("control request pending");
     app.apply_control_request_outcome(
         request_id,
-        cockpit_core::engine::ControlRequestOutcome::Rejected("busy".to_string()),
+        cockpit_client::presentation::ControlRequestOutcome::Rejected("busy".to_string()),
     );
 
     assert!(app.pending_model_selection.is_none());
@@ -1122,7 +1123,7 @@ fn picker_transport_failure_does_not_report_success_or_submit_queued_payload() {
 }
 
 fn assert_control_failure_retains_complete_submission(
-    outcome: cockpit_core::engine::ControlRequestOutcome,
+    outcome: cockpit_client::presentation::ControlRequestOutcome,
 ) {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
@@ -1171,15 +1172,15 @@ fn assert_control_failure_retains_complete_submission(
 #[test]
 fn rejected_ack_retains_complete_queued_submission() {
     assert_control_failure_retains_complete_submission(
-        cockpit_core::engine::ControlRequestOutcome::Rejected("busy".to_string()),
+        cockpit_client::presentation::ControlRequestOutcome::Rejected("busy".to_string()),
     );
 }
 
 #[test]
 fn not_delivered_ack_retains_complete_queued_submission() {
     assert_control_failure_retains_complete_submission(
-        cockpit_core::engine::ControlRequestOutcome::NotDelivered(
-            cockpit_core::engine::ControlRequestNotDelivered::RunnerTeardown,
+        cockpit_client::presentation::ControlRequestOutcome::NotDelivered(
+            cockpit_client::presentation::ControlRequestNotDelivered::RunnerTeardown,
         ),
     );
 }
@@ -1275,7 +1276,7 @@ fn first_send_waits_for_confirmed_model_then_releases_exact_draft() {
     );
 
     let confirmed = selection("p", "a");
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id,
         provider: confirmed.provider.clone(),
         model: confirmed.model.clone(),
@@ -1338,7 +1339,7 @@ fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
         queued,
     );
 
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id,
         provider: requested.provider.clone(),
         model: requested.model.clone(),
@@ -1526,7 +1527,7 @@ fn chrome_renders_session_derived_active_model() {
 
     let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
-    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ActiveModelState {
         selection: selection("p", "a"),
         default_selection: Some(selection("other", "old")),
         diverged: true,
@@ -1539,7 +1540,7 @@ fn chrome_renders_session_derived_active_model() {
     );
     assert!(app.launch.active_model_diverged);
 
-    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ActiveModelState {
         selection: selection("stale", "stale"),
         default_selection: None,
         diverged: false,
@@ -1563,7 +1564,7 @@ fn config_drift_state_retains_config_model_fields() {
 
     let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
-    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ActiveModelState {
         selection: selection("session-p", "session-m"),
         default_selection: Some(selection("config-p", "config-m")),
         diverged: true,
@@ -1585,13 +1586,13 @@ fn config_drift_stale_generation_ignored() {
 
     let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
-    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ActiveModelState {
         selection: selection("p", "a"),
         default_selection: Some(selection("p", "a")),
         diverged: false,
         generation: 3,
     });
-    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ActiveModelState {
         selection: selection("stale-p", "stale-m"),
         default_selection: Some(selection("config-p", "config-m")),
         diverged: true,
@@ -1686,7 +1687,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         queued,
     );
     app.pending_control_requests.insert(
-        cockpit_core::engine::ControlRequestId(77),
+        cockpit_client::presentation::ControlRequestId(77),
         super::PendingControlRequest {
             label: "/quick".to_string(),
             applied: super::ControlApplied::ModelSelection {
@@ -1704,12 +1705,12 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
             app.adopt_runner(Ok(attached_runner.take().unwrap()));
         }
         ModelEpochPath::SameRunnerReconnect => {
-            app.apply_event(cockpit_core::engine::TurnEvent::DaemonLinkReconnected {
+            app.apply_event(cockpit_client::presentation::TurnEvent::DaemonLinkReconnected {
                 active_model_state: Some(attached_state.clone()),
             });
         }
         ModelEpochPath::EventStreamLagResync => {
-            app.apply_event(cockpit_core::engine::TurnEvent::DaemonLinkResynced {
+            app.apply_event(cockpit_client::presentation::TurnEvent::DaemonLinkResynced {
                 active_model_state: Some(attached_state.clone()),
             });
         }
@@ -1849,7 +1850,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
     );
     control_rx.try_recv().expect("follow-up control delivered");
 
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id,
         provider: requested.provider.clone(),
         model: requested.model.clone(),
@@ -1948,7 +1949,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         queued,
     );
     app.pending_control_requests.insert(
-        cockpit_core::engine::ControlRequestId(88),
+        cockpit_client::presentation::ControlRequestId(88),
         super::PendingControlRequest {
             label: "/quick".to_string(),
             applied: super::ControlApplied::ModelSelection {
@@ -1961,7 +1962,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         .unwrap()
         .push(crate::tui::agent_runner::QueuedTurnEvent {
             attachment_epoch: 0,
-            event: cockpit_core::engine::TurnEvent::ActiveModelState {
+            event: cockpit_client::presentation::TurnEvent::ActiveModelState {
                 selection: selection("stale-provider", "stale-model"),
                 default_selection: Some(selection("stale-provider", "stale-model")),
                 diverged: false,
@@ -2032,7 +2033,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         .try_recv()
         .expect("generation-one selection request delivered");
     let selection_id = app.pending_model_selection.as_ref().unwrap().selection_id;
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id,
         provider: requested.provider.clone(),
         model: requested.model.clone(),
@@ -2116,7 +2117,7 @@ fn picker_unchanged_verified_default_reports_already_set_without_claiming_a_writ
         .map(|pending| pending.minimum_generation)
         .unwrap_or(1)
         .max(1);
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id,
         provider: "p".into(),
         model: "a".into(),
@@ -2165,7 +2166,7 @@ fn picker_rejected_default_retains_intent_and_states_the_default_did_not_change(
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let (mut app, _control_rx, selection_id) = picker_app_awaiting_default_terminal(&tmp);
 
-    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
         selection_id,
         provider: "p".into(),
         model: "a".into(),
@@ -2209,7 +2210,7 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
     app.pending_default_model_update_id = Some(mine);
 
     // A late result for a different operation is ignored entirely.
-    app.apply_event(cockpit_core::engine::TurnEvent::DefaultModelUpdateResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::DefaultModelUpdateResult {
         default_update_id: uuid::Uuid::new_v4(),
         outcome: cockpit_proto::DefaultModelStandaloneOutcome::Applied {
             selection: Some(selection("other", "model")),
@@ -2231,7 +2232,7 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
     );
     assert!(app.pending_model_selection.is_none());
 
-    app.apply_event(cockpit_core::engine::TurnEvent::DefaultModelUpdateResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::DefaultModelUpdateResult {
         default_update_id: mine,
         outcome: cockpit_proto::DefaultModelStandaloneOutcome::Applied {
             selection: Some(selection("p", "a")),
@@ -2262,7 +2263,7 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
     // A rejection claims no change and names only a scope.
     let second = uuid::Uuid::new_v4();
     app.pending_default_model_update_id = Some(second);
-    app.apply_event(cockpit_core::engine::TurnEvent::DefaultModelUpdateResult {
+    app.apply_event(cockpit_client::presentation::TurnEvent::DefaultModelUpdateResult {
         default_update_id: second,
         outcome: cockpit_proto::DefaultModelStandaloneOutcome::Rejected {
             user_message: "the highest-precedence config layer (project) is not writable".into(),

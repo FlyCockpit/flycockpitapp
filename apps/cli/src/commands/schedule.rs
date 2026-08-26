@@ -22,7 +22,7 @@ pub async fn run(cmd: ScheduleCommand) -> Result<()> {
 async fn list(args: ScheduleListArgs) -> Result<()> {
     let response =
         crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
-            Box::pin(client.request_ok(Request::ListScheduledJobs { owner: args.owner }))
+            Box::pin(async move { client.request_ok(Request::ListScheduledJobs { owner: args.owner }).await })
         })
         .await?;
     let Response::ScheduledJobs { jobs } = response else {
@@ -42,7 +42,7 @@ async fn create(args: ScheduleCreateArgs) -> Result<()> {
     let job = build_create(args)?;
     let response =
         crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
-            Box::pin(client.request_ok(Request::CreateScheduledJob { job }))
+            Box::pin(async move { client.request_ok(Request::CreateScheduledJob { job }).await })
         })
         .await?;
     let Response::ScheduledJob { job } = response else {
@@ -76,10 +76,12 @@ fn parse_missed_run_policy(raw: &str) -> Result<MissedRunPolicy> {
 async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
     let response =
         crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
-            Box::pin(client.request_ok(Request::SetScheduledJobEnabled {
-                id: id.to_string(),
-                enabled,
-            }))
+            let id = id.to_string();
+            Box::pin(async move {
+                client
+                    .request_ok(Request::SetScheduledJobEnabled { id, enabled })
+                    .await
+            })
         })
         .await?;
     let Response::ScheduledJob { job } = response else {
@@ -92,7 +94,8 @@ async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
 async fn run_now(id: &str) -> Result<()> {
     let response =
         crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
-            Box::pin(client.request_ok(Request::RunScheduledJob { id: id.to_string() }))
+            let id = id.to_string();
+            Box::pin(async move { client.request_ok(Request::RunScheduledJob { id }).await })
         })
         .await?;
     let Response::ScheduledJobRunQueued { id } = response else {

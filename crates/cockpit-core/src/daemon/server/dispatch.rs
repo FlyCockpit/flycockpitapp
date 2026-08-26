@@ -238,7 +238,7 @@ fn retained_receipt_proof_matches_ledger(
         && proof.matches_canonical_outcome_json(&canonical_outcome_json)
 }
 
-async fn validate_retained_receipt_proof_against_ledger(
+pub(super) async fn validate_retained_receipt_proof_against_ledger(
     ctx: &DaemonContext,
     proof: &cockpit_config::config::effective_default::RetainedDefaultReceiptProof,
 ) -> anyhow::Result<()> {
@@ -9659,7 +9659,7 @@ async fn handle_serialized_request_impl(
                     )
                 {
                     Ok(projected) => {
-                        let inherited = projected.active_model;
+                        let inherited = projected.active_model.clone();
                         match cockpit_config::config::effective_default::validate_projected_inherited_default(
                             inherited.as_ref(),
                             &projected,

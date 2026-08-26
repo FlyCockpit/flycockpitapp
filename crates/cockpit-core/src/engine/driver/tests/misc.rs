@@ -149,7 +149,9 @@ async fn stale_child_watermark_does_not_suppress_sibling_auto_prune() {
         .get(&2)
         .copied()
         .expect("child A depth-2 watermark");
-    let _ = driver.pop_child_with_envelope(None, &tx).await;
+    let _ = driver
+        .pop_child_with_envelope(None, None, &[], &tx)
+        .await;
 
     let sibling_history = dup_read_history_big();
     assert_eq!(
@@ -430,7 +432,9 @@ async fn subagent_stop_gate_fires_once_at_interactive_child_completion_not_at_po
         "the child stop gate fires exactly one subagentStop at completion"
     );
     // The pop that publishes the child envelope must NOT fire a second stop.
-    let _ = driver.pop_child_with_envelope(None, &tx).await;
+    let _ = driver
+        .pop_child_with_envelope(None, None, &[], &tx)
+        .await;
     assert_eq!(
         observe_hook_events(&driver, "subagentStop").await,
         vec!["failed".to_string()],

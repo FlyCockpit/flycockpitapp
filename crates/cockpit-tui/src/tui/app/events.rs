@@ -3980,7 +3980,7 @@ pub(super) fn amend_subagent_routing_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_core::engine::model::InferenceErrorClass;
+    use cockpit_proto::InferenceErrorClass;
     use serde_json::json;
 
     #[test]
@@ -4238,7 +4238,7 @@ mod tests {
         });
 
         app.apply_event(TurnEvent::ToolProgress(
-            cockpit_core::engine::ToolProgress {
+            cockpit_client::presentation::ToolProgress {
                 call_id: "missing".to_string(),
                 done: 1,
                 total: 2,
@@ -4246,7 +4246,7 @@ mod tests {
             },
         ));
         app.apply_event(TurnEvent::ToolProgress(
-            cockpit_core::engine::ToolProgress {
+            cockpit_client::presentation::ToolProgress {
                 call_id: "call-1".to_string(),
                 done: 3,
                 total: 10,
@@ -4254,7 +4254,7 @@ mod tests {
             },
         ));
         app.apply_event(TurnEvent::ToolProgress(
-            cockpit_core::engine::ToolProgress {
+            cockpit_client::presentation::ToolProgress {
                 call_id: "call-1".to_string(),
                 done: 2,
                 total: 8,
@@ -4285,7 +4285,7 @@ mod tests {
             hint: None,
         });
         app.apply_event(TurnEvent::ToolProgress(
-            cockpit_core::engine::ToolProgress {
+            cockpit_client::presentation::ToolProgress {
                 call_id: "call-1".to_string(),
                 done: 8,
                 total: 10,

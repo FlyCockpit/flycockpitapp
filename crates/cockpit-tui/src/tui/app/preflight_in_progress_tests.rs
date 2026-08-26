@@ -1,6 +1,6 @@
 use super::App;
 use crate::tui::history::HistoryEntry;
-use cockpit_core::engine::TurnEvent;
+use cockpit_client::presentation::TurnEvent;
 
 /// Push the optimistic user row exactly as `submit_input` does on a fresh
 /// send: original text, no cleaned form, no indicator, unstamped `seq`.

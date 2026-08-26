@@ -575,7 +575,7 @@ pub struct TrustStatusArgs {
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 #[command(
     after_help = "Exit codes:\n  0  no failing checks\n  1  one or more doctor checks failed\n\nNetwork provider checks run by default; use --offline to skip DNS and HTTP."
 )]

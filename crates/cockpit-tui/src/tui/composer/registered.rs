@@ -8,9 +8,10 @@
 use std::ops::Deref;
 
 use super::paste::{
-    EditorPasteRebuild, EditorPasteSnapshot, ImageIngressDraftAuthority, PasteBlock, PasteKind,
-    PasteRegistry,
+    EditorPasteRebuild, EditorPasteSnapshot, ImageIngressDraftAuthority, PasteRegistry,
 };
+#[cfg(test)]
+use super::paste::PasteKind;
 use super::{Composer, EditOutcome, FindSpec, Operator, Register, VimMode};
 
 /// A closed inventory of cursor motions accepted by [`RegisteredComposer`].
@@ -973,6 +974,7 @@ mod tests {
 
     use super::super::paste::{ImageIngressDraftAuthority, PasteRegistry, RetainedImage};
     use super::{ComposerMotion, RegisteredComposer};
+    use super::super::paste::PasteKind;
     use crate::tui::composer::Operator;
 
     fn image_authority() -> (

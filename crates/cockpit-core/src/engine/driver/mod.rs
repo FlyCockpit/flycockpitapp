@@ -15,6 +15,11 @@ mod context_reduction;
 mod delegation_helpers;
 mod inbound;
 mod noninteractive;
+#[cfg(test)]
+pub(in crate::engine::driver) use noninteractive::{
+    parse_noninteractive_recovery_snapshot, ready_noninteractive_recovery_snapshot_with_late_steer,
+    retain_noninteractive_late_steer_checkpoint,
+};
 mod queue;
 mod reports;
 mod schedule_dispatch;
@@ -3263,7 +3268,7 @@ impl Driver {
                 .is_none(),
             "root already has a recovered accepted late-steer checkpoint"
         );
-        {
+        let endpoint_generation = {
             let root = self
                 .stack
                 .first_mut()
@@ -3273,7 +3278,15 @@ impl Driver {
                 "recovered root late-steer snapshot does not match the live root identity"
             );
             root.history = history;
-        }
+            match root.endpoint_generation {
+                Some(generation) => generation,
+                None => {
+                    let generation = crate::engine::agent::next_agent_tree_endpoint_generation();
+                    root.endpoint_generation = Some(generation);
+                    generation
+                }
+            }
+        };
         self.recovered_interactive_late_steer_continuations.insert(
             agent_instance_id,
             RecoveredInteractiveLateSteerContinuation {
@@ -3289,7 +3302,7 @@ impl Driver {
                 pending_response: None,
             },
         );
-        Ok(())
+        Ok(endpoint_generation)
     }
 
     async fn reattach_interactive_task_child(
@@ -3297,7 +3310,7 @@ impl Driver {
         recovery: RecoveredInteractiveTaskChild,
         input_queue: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::engine::agent::AgentTreeEndpointGeneration> {
         anyhow::ensure!(
             self.stack
                 .last()
@@ -3457,7 +3470,7 @@ impl Driver {
                     )
             });
         let child_recursion = self
-            .resolve_task_recursion(&recovery.child_agent, remaining_depth, &model)
+            .resolve_task_recursion(&recovery.child_agent, Some(remaining_depth), &model)
             .map_err(anyhow::Error::msg)?;
         let mut admission = self
             .admit_current_vnext_children(1)

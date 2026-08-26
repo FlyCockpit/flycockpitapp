@@ -282,6 +282,8 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
     let session_id = Uuid::parse_str(&args.session).context("parsing --session")?;
     let interrupt_id = Uuid::parse_str(&args.interrupt).context("parsing --interrupt")?;
     let response = response_from_args(args)?;
+    let json = args.json;
+    let follow = args.follow;
 
     crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
         Box::pin(async move {
@@ -315,7 +317,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
                 .await
                 .context("resolving interrupt")?;
 
-            if args.json {
+            if json {
                 emit_json(&json!({
                     "event": "interrupt_resolved",
                     "session_id": session_id,
@@ -326,17 +328,17 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
                 println!("interrupt {interrupt_id} resolved");
             }
 
-            if args.follow {
-                let format = if args.json {
+            if follow {
+                let format = if json {
                     OutputFormat::Json
                 } else {
                     OutputFormat::Default
                 };
                 crate::commands::run::pump_events(
-                    client,
+                    &client,
                     session_id,
                     format,
-                    args.json,
+                    json,
                     &[],
                     false,
                     None,

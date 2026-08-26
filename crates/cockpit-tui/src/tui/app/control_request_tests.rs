@@ -8,7 +8,7 @@ use crate::tui::agent_runner::{
 };
 use crate::tui::history::HistoryEntry;
 use cockpit_core::config::extended::ApprovalMode;
-use cockpit_core::engine::{
+use cockpit_client::presentation::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
 use cockpit_proto::{Request, Response};

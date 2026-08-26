@@ -708,7 +708,9 @@ async fn apply_model_wizard_via_daemon(
         deletes: Vec::new(),
         metadata: default_changed.then(|| cockpit_proto::ProviderLayerMetadataPatch {
             category_defaults: config.category_defaults.clone(),
-            on_unlisted_models_fetch: config.on_unlisted_models_fetch.unwrap_or_default(),
+            on_unlisted_models_fetch: config
+                .on_unlisted_models_fetch
+                .unwrap_or(crate::config::providers::OnUnlistedModelsFetch::Keep),
             active_model: active_model.clone(),
         }),
     };

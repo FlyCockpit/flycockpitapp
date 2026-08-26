@@ -1820,6 +1820,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | HistoryReplay { session_id, .. }
         | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }
+        | AgentTreeChanged { session_id, .. }
         | GoalSupervisionProgress { session_id, .. }
         | PrimarySwapped { session_id, .. }
         | LlmModeChanged { session_id, .. }

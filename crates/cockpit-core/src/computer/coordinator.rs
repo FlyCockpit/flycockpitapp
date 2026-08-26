@@ -278,7 +278,11 @@ fn canonical_computer_action_payload_digest(actions: &[ComputerAction]) -> Strin
             }
         }
     }
-    format!("{:x}", digest.finalize())
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The target identifiers themselves are host secrets.  The approval only
@@ -294,7 +298,11 @@ fn host_lease_binding_digest(lease: &HostLeaseToken) -> String {
     digest.update(lease.generation.as_u64().to_le_bytes());
     digest.update(lease.owner_instance.0.to_le_bytes());
     digest.update(lease.delegation.0.as_bytes());
-    format!("{:x}", digest.finalize())
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// A secret-free witness for the target evidence that the backend will act
@@ -339,7 +347,11 @@ fn target_evidence_binding_digest(
             digest.update(virtual_display_uuid);
         }
     }
-    format!("{:x}", digest.finalize())
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Trait for OS-level advisory lock operations. Tests inject an in-memory

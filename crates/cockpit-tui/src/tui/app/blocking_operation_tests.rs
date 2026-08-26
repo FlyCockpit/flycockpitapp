@@ -833,7 +833,7 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
         },
     ));
     app.handle_terminal_event(crossterm::event::Event::Resize(100, 40));
-    app.apply_event(cockpit_core::engine::TurnEvent::Notice {
+    app.apply_event(cockpit_client::presentation::TurnEvent::Notice {
         text: "daemon reduced".to_string(),
     });
 

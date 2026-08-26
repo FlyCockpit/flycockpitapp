@@ -6145,7 +6145,7 @@ mod render_history_spacing_tests {
         app.history_render_fingerprints.clear();
 
         assert!(app.open_subagent_view_for_history_index(0));
-        app.apply_event(cockpit_core::engine::agent::TurnEvent::SubagentReport {
+        app.apply_event(cockpit_client::presentation::TurnEvent::SubagentReport {
             agent: "explore".to_string(),
             task_call_id: "call-1".to_string(),
             label: "default".to_string(),

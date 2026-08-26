@@ -5754,7 +5754,7 @@ fn response_envelope_for_shared(
                 ),
             }
         }
-        Err(err) => bounded_error_envelope(Some(id), err),
+        Err(err) => bounded_error_envelope(Some(id), normalize_database_storage_error(err)),
     }
 }
 
@@ -6018,6 +6018,26 @@ fn bad_request(message: impl Into<String>) -> ErrorPayload {
         code: ErrorCode::BadRequest,
         message: message.into(),
     }
+}
+
+fn normalize_database_storage_error(mut error: ErrorPayload) -> ErrorPayload {
+    if error.code != ErrorCode::Internal {
+        return error;
+    }
+    error.code = if error.message.contains("FCDB_STORAGE_FULL") {
+        ErrorCode::StorageFull
+    } else if error.message.contains("FCDB_STORAGE_MEMORY") {
+        ErrorCode::StorageMemory
+    } else if error.message.contains("FCDB_STORAGE_READ_ONLY") {
+        ErrorCode::StorageReadOnly
+    } else if error.message.contains("FCDB_STORAGE_IO") {
+        ErrorCode::StorageIo
+    } else if error.message.contains("FCDB_STORAGE_CORRUPT") {
+        ErrorCode::StorageCorrupt
+    } else {
+        return error;
+    };
+    error
 }
 
 fn authorization_error(message: impl Into<String>) -> ErrorPayload {

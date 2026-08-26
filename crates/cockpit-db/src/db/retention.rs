@@ -85,7 +85,45 @@ pub struct RetentionOutcome {
     pub vacuumed: bool,
 }
 
+/// Read-only accounting for session rows protected from whole-session expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetentionProtectionReport {
+    pub total_session_rows: u64,
+    pub directly_pinned_sessions: u64,
+    pub pin_protected_root_sessions: u64,
+}
+
 impl Db {
+    /// Report how pins affect whole-session retention without mutating state.
+    pub async fn retention_protection_report(&self) -> Result<RetentionProtectionReport> {
+        self.read(|conn| {
+            conn.query_row(
+                "WITH RECURSIVE ancestry(session_id, root_session_id) AS (
+                     SELECT session_id, session_id FROM sessions WHERE parent_session_id IS NULL
+                     UNION ALL
+                     SELECT child.session_id, ancestry.root_session_id
+                       FROM sessions child
+                       JOIN ancestry ON child.parent_session_id=ancestry.session_id
+                 )
+                 SELECT
+                     (SELECT COUNT(*) FROM sessions),
+                     (SELECT COUNT(DISTINCT session_id) FROM pins),
+                     (SELECT COUNT(DISTINCT ancestry.root_session_id)
+                        FROM ancestry JOIN pins USING (session_id))",
+                [],
+                |row| {
+                    Ok(RetentionProtectionReport {
+                        total_session_rows: row.get(0)?,
+                        directly_pinned_sessions: row.get(1)?,
+                        pin_protected_root_sessions: row.get(2)?,
+                    })
+                },
+            )
+            .context("reading retention pin protection accounting")
+        })
+        .await
+    }
+
     /// Bound secret-free local authority receipts while retaining a generous
     /// replay/reconciliation window. Executing operations and completing
     /// editor leases are deliberately excluded: ambiguous side effects remain
@@ -677,6 +715,35 @@ mod tests {
         assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
         assert!(db.get_session(root.session_id).await.unwrap().is_some());
         assert!(db.get_session(child.session_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn retention_report_counts_descendant_pin_as_root_protection() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let child = db.create_fork(root.session_id, None).await.unwrap();
+        let child_id = child.session_id;
+        let seq = db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO session_events (session_id, ts_ms, type, data_json)
+                     VALUES (?1, 1, 'user_message', '{}')",
+                    params![child_id.to_string()],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+        assert!(db.pin_message(child.session_id, seq).await.unwrap());
+
+        assert_eq!(
+            db.retention_protection_report().await.unwrap(),
+            RetentionProtectionReport {
+                total_session_rows: 2,
+                directly_pinned_sessions: 1,
+                pin_protected_root_sessions: 1,
+            }
+        );
     }
 
     #[tokio::test]

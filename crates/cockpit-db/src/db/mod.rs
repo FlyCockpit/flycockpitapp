@@ -240,7 +240,8 @@ impl Writer {
                 while let Ok(request) = rx.recv() {
                     let result = catch_unwind(AssertUnwindSafe(|| (request.job)(&conn)))
                         .map_err(|_| anyhow::anyhow!("db writer job panicked"))
-                        .and_then(|result| result);
+                        .and_then(|result| result)
+                        .map_err(annotate_database_storage_failure);
                     let poison = result.as_ref().err().is_some_and(|error| {
                         error
                             .chain()
@@ -393,8 +394,8 @@ impl ReadPool {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
-        let conn = self.checkout()?;
-        let result = f(&conn);
+        let conn = self.checkout().map_err(annotate_database_storage_failure)?;
+        let result = f(&conn).map_err(annotate_database_storage_failure);
         let checkin = self.checkin(conn);
         match (result, checkin) {
             (Ok(value), Ok(())) => Ok(value),
@@ -449,6 +450,7 @@ pub struct DatabaseStorageReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseStorageFailure {
     Capacity,
+    Memory,
     ReadOnly,
     Io,
     Corrupt,
@@ -458,6 +460,7 @@ impl DatabaseStorageFailure {
     pub const fn diagnostic_code(self) -> &'static str {
         match self {
             Self::Capacity => "FCDB_STORAGE_FULL",
+            Self::Memory => "FCDB_STORAGE_MEMORY",
             Self::ReadOnly => "FCDB_STORAGE_READ_ONLY",
             Self::Io => "FCDB_STORAGE_IO",
             Self::Corrupt => "FCDB_STORAGE_CORRUPT",
@@ -475,9 +478,8 @@ pub fn classify_database_storage_failure(
             cause.downcast_ref::<rusqlite::Error>()
         {
             return match info.code {
-                rusqlite::ErrorCode::DiskFull | rusqlite::ErrorCode::OutOfMemory => {
-                    Some(DatabaseStorageFailure::Capacity)
-                }
+                rusqlite::ErrorCode::DiskFull => Some(DatabaseStorageFailure::Capacity),
+                rusqlite::ErrorCode::OutOfMemory => Some(DatabaseStorageFailure::Memory),
                 rusqlite::ErrorCode::ReadOnly
                 | rusqlite::ErrorCode::PermissionDenied
                 | rusqlite::ErrorCode::AuthorizationForStatementDenied => {
@@ -497,6 +499,33 @@ pub fn classify_database_storage_failure(
         current = cause.source();
     }
     None
+}
+
+fn annotate_database_storage_failure(error: anyhow::Error) -> anyhow::Error {
+    let Some(failure) = classify_database_storage_failure(error.as_ref()) else {
+        return error;
+    };
+    let guidance = match failure {
+        DatabaseStorageFailure::Capacity => {
+            "free disk space, then restart the daemon and reconcile the operation before retrying"
+        }
+        DatabaseStorageFailure::Memory => {
+            "free memory or reduce the operation size, then restart the daemon before retrying"
+        }
+        DatabaseStorageFailure::ReadOnly => {
+            "restore write permission to the Cockpit data directory, then restart the daemon"
+        }
+        DatabaseStorageFailure::Io => {
+            "check the storage device and filesystem, then restart the daemon and reconcile the operation before retrying"
+        }
+        DatabaseStorageFailure::Corrupt => {
+            "stop the daemon and restore a validated database backup; do not retry the mutation"
+        }
+    };
+    error.context(format!(
+        "{}: database durability failure; {guidance}",
+        failure.diagnostic_code()
+    ))
 }
 
 impl std::fmt::Debug for Db {
@@ -708,6 +737,23 @@ impl Db {
         let path = self.path.clone();
         self.read(move |conn| database_storage_report(conn, path.as_deref()))
             .await
+    }
+
+    /// Run SQLite's physical and relational integrity checks through the
+    /// daemon-owned/read-only database handle used by diagnostics.
+    pub async fn diagnostic_integrity_check(&self) -> Result<()> {
+        self.read(|conn| {
+            foreign_key_check(conn).context("running diagnostic foreign_key_check")?;
+            let quick_check: String = conn
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .context("running diagnostic SQLite quick_check")?;
+            anyhow::ensure!(
+                quick_check == "ok",
+                "SQLite quick_check failed: {quick_check}"
+            );
+            Ok(())
+        })
+        .await
     }
 
     pub async fn read<F, T>(&self, f: F) -> Result<T>
@@ -1171,8 +1217,11 @@ fn create_migration_backup(
             )
         })?;
     files::repair_private_file(&backup, "database backup")?;
-    validate_migration_backup(&backup)?;
+    // Preserve the physical recovery artifact before performing logical
+    // validation. A drifted source can legitimately fail the latter check;
+    // its online backup must still reach the filesystem durability boundary.
     fsync_file_and_parent(&backup)?;
+    validate_migration_backup(&backup, schema_version)?;
     prune_migration_backups(path)?;
     Ok(())
 }
@@ -1243,7 +1292,7 @@ fn prerelease_backup_reason(
     Ok(None)
 }
 
-fn validate_migration_backup(path: &Path) -> Result<()> {
+fn validate_migration_backup(path: &Path, expected_schema_version: i64) -> Result<()> {
     let backup = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening migration backup {}", path.display()))?;
     let result: String = backup
@@ -1254,6 +1303,45 @@ fn validate_migration_backup(path: &Path) -> Result<()> {
             "migration backup {} failed SQLite quick_check: {result}",
             path.display()
         );
+    }
+    foreign_key_check(&backup).with_context(|| {
+        format!(
+            "validating migration backup {} foreign keys",
+            path.display()
+        )
+    })?;
+
+    if table_exists(&backup, "schema_version")? {
+        let columns = table_columns(&backup, "schema_version")?;
+        if columns.iter().any(|column| column == "schema_fingerprint") {
+            verify_supported_ledger_shape(&backup)?;
+            let ledger_version = current_schema_version(&backup)?;
+            if expected_schema_version > 0 {
+                anyhow::ensure!(
+                    ledger_version == expected_schema_version,
+                    "migration backup {} ledger version {ledger_version} differs from recorded backup version {expected_schema_version}",
+                    path.display()
+                );
+            }
+            verify_user_version(&backup, ledger_version)?;
+            let (profile, fingerprint): (String, String) = backup
+                .query_row(
+                    "SELECT schema_profile, schema_fingerprint FROM schema_version WHERE version=?1",
+                    [ledger_version],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .context("reading migration backup schema metadata")?;
+            anyhow::ensure!(
+                !profile.trim().is_empty(),
+                "migration backup {} has an empty schema profile",
+                path.display()
+            );
+            anyhow::ensure!(
+                fingerprint == exact_ddl_fingerprint(&backup)?,
+                "migration backup {} schema fingerprint does not match its recorded {profile} profile",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1820,6 +1908,11 @@ mod tests {
                 rusqlite::ErrorCode::ReadOnly,
                 DatabaseStorageFailure::ReadOnly,
                 "FCDB_STORAGE_READ_ONLY",
+            ),
+            (
+                rusqlite::ErrorCode::OutOfMemory,
+                DatabaseStorageFailure::Memory,
+                "FCDB_STORAGE_MEMORY",
             ),
             (
                 rusqlite::ErrorCode::SystemIoFailure,

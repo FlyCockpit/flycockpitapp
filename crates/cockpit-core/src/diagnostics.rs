@@ -466,16 +466,24 @@ async fn database_lines(
 ) -> (Vec<String>, bool) {
     // `default_path` only resolves the on-disk location; it does NOT open,
     // create, or migrate anything, so the real path is always safe to report.
-    let path = match crate::db::Db::default_path() {
-        Ok(path) => path,
-        Err(error) => {
-            return (
-                vec![format!(
-                    "path: unavailable ({})",
-                    one_line(&format!("{error:#}"))
-                )],
-                true,
-            );
+    let resolved_path = match db {
+        DiagnosticDb::Open(db) => db.path().map(ToOwned::to_owned),
+        DiagnosticDb::OpenFailed(_) | DiagnosticDb::Unavailable => None,
+    };
+    let path = if let Some(path) = resolved_path {
+        path
+    } else {
+        match crate::db::Db::default_path() {
+            Ok(path) => path,
+            Err(error) => {
+                return (
+                    vec![format!(
+                        "path: unavailable ({})",
+                        one_line(&format!("{error:#}"))
+                    )],
+                    true,
+                );
+            }
         }
     };
     let mut lines = vec![format!("path: {}", path.display())];
@@ -497,6 +505,7 @@ async fn database_lines(
                     "schema: unavailable because the database could not be opened".to_string(),
                 );
             }
+            lines.push("integrity: unavailable because the database did not open".to_string());
             lines.push(retention_line(&extended.retention));
             return (lines, true);
         }
@@ -505,6 +514,8 @@ async fn database_lines(
         DiagnosticDb::Unavailable => {
             lines.push("openability: unavailable (daemon not running)".to_string());
             lines.push("schema: unavailable".to_string());
+            lines.push("integrity: unavailable (daemon not running)".to_string());
+            lines.push(retention_line(&extended.retention));
             return (lines, true);
         }
     };
@@ -528,6 +539,7 @@ async fn database_lines(
                 .or(migration.err())
                 .expect("one database read failed");
             lines.push(format!("schema: FAILED ({})", one_line(&error.to_string())));
+            lines.push("integrity: unavailable because schema reads failed".to_string());
             return (lines, true);
         }
     }
@@ -554,7 +566,34 @@ async fn database_lines(
             return (lines, true);
         }
     }
-    lines.push("integrity: ok (quick_check and foreign_key_check passed at open)".to_string());
+    match db.diagnostic_integrity_check().await {
+        Ok(()) => lines.push(
+            "integrity: ok (quick_check and foreign_key_check passed for this snapshot)"
+                .to_string(),
+        ),
+        Err(error) => {
+            lines.push(format!(
+                "integrity: FAILED ({})",
+                one_line(&format!("{error:#}"))
+            ));
+            return (lines, true);
+        }
+    }
+    match db.retention_protection_report().await {
+        Ok(report) => lines.push(format!(
+            "retention protection: {} session rows; {} directly pinned sessions protecting {} root subtrees",
+            report.total_session_rows,
+            report.directly_pinned_sessions,
+            report.pin_protected_root_sessions
+        )),
+        Err(error) => {
+            lines.push(format!(
+                "retention protection: FAILED ({})",
+                one_line(&format!("{error:#}"))
+            ));
+            return (lines, true);
+        }
+    }
     lines.push(
         "export: use `cockpit export <session>`; exports are assembled by the daemon and redacted by default"
             .to_string(),

@@ -1926,6 +1926,16 @@ pub enum ErrorCode {
     TerminalGenerationGone,
     /// `SetSandbox` asked for a mode the host capability snapshot cannot honor.
     SandboxCapabilityMissing,
+    /// SQLite could not extend durable storage. Commit outcome may be unknown.
+    StorageFull,
+    /// SQLite could not allocate memory for durable work. Outcome may be unknown.
+    StorageMemory,
+    /// The database or its directory is not writable.
+    StorageReadOnly,
+    /// SQLite reported a storage-device/filesystem I/O failure. Outcome may be unknown.
+    StorageIo,
+    /// SQLite reported database corruption or a non-database file.
+    StorageCorrupt,
     /// Anything else.
     Internal,
     /// Error code from a future peer that this binary does not know yet.
@@ -1981,6 +1991,11 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "ingress_path_unavailable" => Self::IngressPathUnavailable,
             "terminal_generation_gone" => Self::TerminalGenerationGone,
             "sandbox_capability_missing" => Self::SandboxCapabilityMissing,
+            "storage_full" => Self::StorageFull,
+            "storage_memory" => Self::StorageMemory,
+            "storage_read_only" => Self::StorageReadOnly,
+            "storage_io" => Self::StorageIo,
+            "storage_corrupt" => Self::StorageCorrupt,
             "internal" => Self::Internal,
             _ => Self::Other(raw),
         })
@@ -2023,6 +2038,11 @@ impl std::fmt::Display for ErrorCode {
             Self::IngressPathUnavailable => "ingress_path_unavailable",
             Self::TerminalGenerationGone => "terminal_generation_gone",
             Self::SandboxCapabilityMissing => "sandbox_capability_missing",
+            Self::StorageFull => "storage_full",
+            Self::StorageMemory => "storage_memory",
+            Self::StorageReadOnly => "storage_read_only",
+            Self::StorageIo => "storage_io",
+            Self::StorageCorrupt => "storage_corrupt",
             Self::Internal => "internal",
             Self::Other(raw) => raw,
         };

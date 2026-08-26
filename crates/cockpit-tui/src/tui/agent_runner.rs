@@ -238,7 +238,13 @@ fn classify_user_message_response(
             proto::ErrorCode::ModelGenerationStale => {
                 Err(UserSubmissionSendError::Rejected(error.message))
             }
-            proto::ErrorCode::Internal | proto::ErrorCode::Shutdown => {
+            proto::ErrorCode::Internal
+            | proto::ErrorCode::Shutdown
+            | proto::ErrorCode::StorageFull
+            | proto::ErrorCode::StorageMemory
+            | proto::ErrorCode::StorageReadOnly
+            | proto::ErrorCode::StorageIo
+            | proto::ErrorCode::StorageCorrupt => {
                 Err(UserSubmissionSendError::Ambiguous(error.message))
             }
             _ => Err(UserSubmissionSendError::Rejected(error.message)),
@@ -5620,6 +5626,25 @@ mod tests {
             assert!(matches!(
                 classify_image_upload_error(error),
                 UserSubmissionSendError::Ambiguous(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn storage_failures_leave_user_message_commit_ambiguous() {
+        for code in [
+            proto::ErrorCode::StorageFull,
+            proto::ErrorCode::StorageMemory,
+            proto::ErrorCode::StorageReadOnly,
+            proto::ErrorCode::StorageIo,
+            proto::ErrorCode::StorageCorrupt,
+        ] {
+            assert!(matches!(
+                classify_user_message_response(Err(proto::ErrorPayload {
+                    code,
+                    message: "database durability boundary was not confirmed".to_string(),
+                })),
+                Err(UserSubmissionSendError::Ambiguous(_))
             ));
         }
     }

@@ -118,7 +118,7 @@ use crate::tui::async_action::{
     AsyncActionCancellation, AsyncActionId, AsyncActionKey, AsyncActionKind, AsyncActionPayload,
     AsyncActionPolicy, AsyncActionResult, AsyncActionRunner, AsyncActionStart,
 };
-use crate::tui::composer::{Composer, VimMode, input_prefix_width};
+use crate::tui::composer::{RegisteredComposer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
 use crate::tui::history::{
     HistoryEntry, MarkdownOpts, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCall,
@@ -620,24 +620,13 @@ impl App {
     /// tied to byte ranges in the previous document. Whole-buffer callers
     /// must use this seam so placeholders can never outlive their registry.
     pub(super) fn replace_composer_buffer(&mut self, text: impl Into<String>) {
-        self.composer
-            .replace_registered(&mut self.paste_registry, text);
+        self.composer.replace_buffer(text);
     }
 
     /// Clear the composer document and all byte-range paste authority as one
     /// app-level operation.
     pub(super) fn clear_composer_buffer(&mut self) {
-        self.composer.clear_registered(&mut self.paste_registry);
-    }
-
-    /// Install a buffer reconstructed together with its authoritative paste
-    /// registry (for example after an external-editor round trip).
-    pub(super) fn rebuild_composer_buffer(
-        &mut self,
-        rebuilt: crate::tui::paste::EditorPasteRebuild,
-    ) {
-        self.composer
-            .rebuild_registered(&mut self.paste_registry, rebuilt);
+        self.composer.clear_buffer();
     }
 
     pub(super) fn attached_daemon_endpoint(&self) -> Option<cockpit_client::ClientEndpoint> {
@@ -1934,7 +1923,7 @@ pub struct App {
     /// value and never reconstruct session state from the config default.
     pub(super) active_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
 
-    pub(super) composer: Composer,
+    pub(super) composer: RegisteredComposer,
     /// Ownership epoch for asynchronous paste results. Edits keep the same
     /// epoch; detaching a submitted draft advances it.
     pub(super) draft_generation: u64,
@@ -2301,12 +2290,6 @@ pub struct App {
     /// editing elsewhere in the buffer can't desync it; cleared on
     /// submit and on `/new`.
     pub(super) accepted_tags: Vec<String>,
-    /// Registry of condensed-text / image paste blocks currently in the
-    /// composer buffer (composer-paste-handling). Kept byte-range-synced
-    /// with [`Self::composer`] across every edit; consumed at submit to
-    /// inline text + emit real image parts (vision) or text notes
-    /// (non-vision). Cleared on submit and `/new`.
-    pub(super) paste_registry: crate::tui::paste::PasteRegistry,
     /// Admitted image drafts still owned by this frontend. Entries survive
     /// composer/view removal until the daemon returns a terminal discard
     /// receipt, or are explicitly transferred to a possibly-sent message.
@@ -3549,7 +3532,7 @@ impl App {
             agent: tui_cfg.render_agent_markdown,
             user: tui_cfg.render_user_markdown,
         };
-        let mut composer = Composer::new(vim_setting.vim_enabled());
+        let mut composer = RegisteredComposer::new(vim_setting.vim_enabled());
         // We start in Insert mode regardless — landing in Normal on
         // first keystroke is jarring for users new to the TUI. The
         // hint (when enabled) tells them how to switch back if they
@@ -3726,7 +3709,6 @@ impl App {
             at_suggestions_loaded_query: None,
             at_suggestions_error: None,
             accepted_tags: Vec::new(),
-            paste_registry: crate::tui::paste::PasteRegistry::new(),
             image_ingress_draft_discards: Default::default(),
             terminal_paste_classifier:
                 crate::tui::structured_paste::TerminalPasteClassifier::default(),

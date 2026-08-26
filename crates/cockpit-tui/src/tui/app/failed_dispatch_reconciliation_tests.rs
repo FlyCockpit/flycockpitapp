@@ -1633,9 +1633,9 @@ fn busy_submit_queue_full_retries_consumed_wire_payload_exactly() {
     image
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
-    let placeholder = app.paste_registry.register_image(0, png.clone());
-    let display = format!("{placeholder} inspect the staged changes");
-    app.composer.set(display.clone());
+    app.composer.insert_registered_image(png.clone());
+    app.composer.insert_str(" inspect the staged changes");
+    let display = app.composer.text().to_string();
     app.pending_git_blocks
         .push("git diff --binary\nexact-busy-marker".to_string());
 

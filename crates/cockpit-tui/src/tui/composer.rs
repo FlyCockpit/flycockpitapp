@@ -25,6 +25,10 @@
 
 pub use cockpit_core::welcome::INPUT_PREFIX;
 
+mod registered;
+
+pub(crate) use registered::{ComposerMotion, RegisteredComposer};
+
 /// Display width of [`INPUT_PREFIX`] in terminal columns. Computed via
 /// `unicode-width` so wider glyphs (CJK, emoji) would size correctly if
 /// the prefix is ever changed.
@@ -556,6 +560,10 @@ impl Composer {
         self.pending_find
     }
 
+    pub fn last_find(&self) -> Option<FindSpec> {
+        self.last_find
+    }
+
     pub fn set_pending_find(&mut self, spec: Option<FindSpec>) {
         self.pending_find = spec;
     }
@@ -822,29 +830,6 @@ impl Composer {
         self.buffer = text.into();
         self.cursor = self.buffer.len();
         self.debug_assert_semantic_cursor();
-    }
-
-    pub(crate) fn replace_registered(
-        &mut self,
-        registry: &mut crate::tui::paste::PasteRegistry,
-        text: impl Into<String>,
-    ) {
-        registry.clear();
-        self.set_unregistered(text);
-    }
-
-    pub(crate) fn clear_registered(&mut self, registry: &mut crate::tui::paste::PasteRegistry) {
-        registry.clear();
-        self.clear_unregistered();
-    }
-
-    pub(crate) fn rebuild_registered(
-        &mut self,
-        registry: &mut crate::tui::paste::PasteRegistry,
-        rebuilt: crate::tui::paste::EditorPasteRebuild,
-    ) {
-        self.set_unregistered(rebuilt.buffer);
-        *registry = rebuilt.registry;
     }
 
     #[cfg(test)]

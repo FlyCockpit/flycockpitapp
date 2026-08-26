@@ -13,10 +13,10 @@
 //! blocks keyed to byte ranges in the composer buffer and shift those
 //! ranges whenever an edit before/after a block moves its offsets.
 //!
-//! The registry never owns the buffer; the [`super::composer::Composer`]
-//! does. Every composer mutation that the app makes routes its byte
-//! offset + delta through [`PasteRegistry::shift_for_edit`] so the two
-//! stay in lockstep.
+//! The registry never owns the buffer. Instead,
+//! [`super::composer::RegisteredComposer`] privately owns it beside the
+//! [`super::composer::Composer`] and routes every application edit through
+//! [`PasteRegistry::shift_for_edit`] so the two stay in lockstep.
 
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
@@ -120,8 +120,8 @@ impl RetainedImage {
 }
 
 /// One registered paste block. The byte range `[start, end)` indexes into
-/// the composer buffer and is the placeholder's exact extent; the app
-/// keeps it in sync via [`PasteRegistry::shift_for_edit`].
+/// the composer buffer and is the placeholder's exact extent; the registered
+/// composer owner keeps it in sync via [`PasteRegistry::shift_for_edit`].
 #[derive(Debug, Clone)]
 pub struct PasteBlock {
     pub id: u64,
@@ -654,8 +654,8 @@ impl PasteRegistry {
     ///
     /// - Insertion at `at`: every block whose `start >= at` shifts right
     ///   by `delta`. A block straddling `at` cannot happen because
-    ///   insertion points always resolve to a boundary (the app enforces
-    ///   this via [`Self::resolve_insertion`]).
+    ///   insertion points always resolve to a boundary (the registered
+    ///   composer owner enforces this via [`Self::resolve_insertion`]).
     /// - Deletion of `[at, at-delta)`: handled by the caller's
     ///   whole-block delete path for block-spanning deletes; for ordinary
     ///   edits outside any block, blocks entirely after the deleted range

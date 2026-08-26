@@ -640,7 +640,7 @@ impl App {
 
     fn start_pending_image_ingress_discards(&mut self) {
         let mut retained = self
-            .paste_registry
+            .composer
             .image_ingress_drafts()
             .into_iter()
             .map(|draft| draft.admission_id)

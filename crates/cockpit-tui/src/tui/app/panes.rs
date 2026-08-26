@@ -67,8 +67,8 @@ impl App {
                 return Ok(true);
             }
         };
-        let editor_text = self.paste_registry.expand_editor(self.composer.text());
-        let paste_snapshot = self.paste_registry.editor_snapshot();
+        let editor_text = self.composer.editor_text();
+        let paste_snapshot = self.composer.editor_snapshot();
         if let Err(e) = temp.write_all(editor_text.as_bytes()) {
             self.history.push(HistoryEntry::CommandError {
                 line: format!("editor: failed to write temp file: {e}"),
@@ -102,12 +102,7 @@ impl App {
                     // Drop a single trailing newline — most editors
                     // write one even when the user didn't add one.
                     let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
-                    let rebuilt = crate::tui::paste::PasteRegistry::rebuild_from_editor_snapshot(
-                        &text,
-                        &paste_snapshot,
-                        cockpit_core::tokens::count,
-                    );
-                    self.rebuild_composer_buffer(rebuilt);
+                    self.composer.rebuild_from_editor(&text, &paste_snapshot);
                     if let Err(restore) = &outcome.restore {
                         self.history.push(HistoryEntry::CommandError {
                             line: format!("editor: terminal restore: {restore}"),

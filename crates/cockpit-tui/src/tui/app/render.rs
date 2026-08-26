@@ -3309,10 +3309,10 @@ impl App {
                 Style::default().fg(Color::White),
             )]
         };
-        if self.paste_registry.is_empty() {
+        if self.composer.paste_is_empty() {
             return plain();
         }
-        let blocks = self.paste_registry.blocks();
+        let blocks = self.composer.paste_blocks();
         let chunk_end = chunk_byte_start + text.len();
         // Quick reject: no block overlaps this chunk.
         if !blocks

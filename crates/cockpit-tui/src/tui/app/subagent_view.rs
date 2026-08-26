@@ -2,10 +2,9 @@ use super::history_window::{HISTORY_WINDOW_TARGET_ENTRIES, HistoryWindow};
 use super::*;
 
 fn subagent_steer_message(
-    buffer: &str,
-    registry: &crate::tui::paste::PasteRegistry,
+    composer: &crate::tui::composer::RegisteredComposer,
 ) -> Result<Option<String>, &'static str> {
-    let Some(message) = registry.expand_plain_payload(buffer) else {
+    let Some(message) = composer.plain_payload() else {
         return Err(
             "Subagent steering does not accept image attachments; remove them before sending.",
         );
@@ -17,13 +16,13 @@ fn subagent_steer_message(
 #[cfg(test)]
 mod tests {
     use super::subagent_steer_message;
-    use crate::tui::paste::PasteRegistry;
+    use crate::tui::composer::RegisteredComposer;
 
     #[test]
     fn condensed_text_steer_expands_payload_instead_of_sending_placeholder() {
-        let mut registry = PasteRegistry::new();
-        let placeholder = registry.register_text(0, "actual steering text".to_string(), 3);
-        let message = subagent_steer_message(&placeholder, &registry)
+        let mut composer = RegisteredComposer::new(false);
+        composer.insert_registered_text("actual steering text".to_string(), 3);
+        let message = subagent_steer_message(&composer)
             .expect("text paste is supported")
             .expect("message is non-empty");
         assert_eq!(message, "actual steering text");
@@ -32,12 +31,11 @@ mod tests {
 
     #[test]
     fn image_steer_fails_closed_without_losing_registry_authority() {
-        let mut registry = PasteRegistry::new();
-        let placeholder = registry.register_image(0, vec![1, 2, 3]);
-        let error =
-            subagent_steer_message(&placeholder, &registry).expect_err("images unsupported");
+        let mut composer = RegisteredComposer::new(false);
+        composer.insert_registered_image(vec![1, 2, 3]);
+        let error = subagent_steer_message(&composer).expect_err("images unsupported");
         assert!(error.contains("does not accept image attachments"));
-        assert_eq!(registry.blocks().len(), 1);
+        assert_eq!(composer.paste_blocks().len(), 1);
     }
 }
 
@@ -378,7 +376,7 @@ impl App {
         let Some(view) = self.active_subagent_view().cloned() else {
             return false;
         };
-        let message = match subagent_steer_message(self.composer.text(), &self.paste_registry) {
+        let message = match subagent_steer_message(&self.composer) {
             Ok(Some(message)) => message,
             Ok(None) => return true,
             Err(error) => {

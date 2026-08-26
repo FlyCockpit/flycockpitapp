@@ -22370,12 +22370,47 @@ fn canonical_project_note_identity(
     requested_root: &str,
 ) -> std::result::Result<CanonicalProjectNoteIdentity, ErrorPayload> {
     let canonical = crate::daemon::fs_api::canonical_project_root(requested_root)?;
-    let worktree = crate::git::find_worktree_root(&canonical).unwrap_or(canonical);
+    canonical_project_note_identity_with_metadata(canonical, std::fs::symlink_metadata)
+}
+
+fn canonical_project_note_identity_with_metadata(
+    canonical: std::path::PathBuf,
+    mut metadata: impl FnMut(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
+) -> std::result::Result<CanonicalProjectNoteIdentity, ErrorPayload> {
+    let mut worktree = None;
+    for ancestor in canonical.ancestors() {
+        let marker = ancestor.join(".git");
+        match metadata(&marker) {
+            Ok(metadata) if metadata.is_dir() || metadata.is_file() => {
+                worktree = Some(ancestor.to_path_buf());
+                break;
+            }
+            Ok(_) => {
+                return Err(bad_request(format!(
+                    "project identity marker `{}` is neither a file nor a directory",
+                    marker.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(bad_request(format!(
+                    "project identity marker `{}` could not be inspected: {error}",
+                    marker.display()
+                )));
+            }
+        }
+    }
+    let worktree = worktree.unwrap_or(canonical.clone());
     let canonical_worktree = crate::daemon::fs_api::canonical_project_root(
         worktree
             .to_str()
             .ok_or_else(|| bad_request("project identity is not valid UTF-8".to_string()))?,
     )?;
+    if !canonical.starts_with(&canonical_worktree) {
+        return Err(bad_request(
+            "resolved project-note worktree does not contain the requested project root",
+        ));
+    }
     let canonical_bytes = canonical_worktree
         .to_str()
         .ok_or_else(|| bad_request("project identity is not valid UTF-8".to_string()))?

@@ -856,6 +856,86 @@ async fn project_note_rpc_uses_one_daemon_canonical_identity_for_symlink_aliases
     assert_eq!(notes[0].project_root, canonical);
 }
 
+#[test]
+fn project_note_identity_groups_nested_git_worktree_paths_without_shelling_out() {
+    let parent = tempfile::tempdir().unwrap();
+    let worktree = parent.path().join("worktree");
+    let nested = worktree.join("packages/app");
+    std::fs::create_dir_all(worktree.join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+
+    assert_eq!(
+        canonical_project_note_identity(worktree.to_str().unwrap())
+            .unwrap()
+            .0,
+        canonical_project_note_identity(nested.to_str().unwrap())
+            .unwrap()
+            .0
+    );
+}
+
+#[test]
+fn project_note_identity_accepts_linked_worktree_git_file() {
+    let parent = tempfile::tempdir().unwrap();
+    let worktree = parent.path().join("linked-worktree");
+    let nested = worktree.join("src");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: ../repository/.git/worktrees/linked-worktree\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        canonical_project_note_identity(worktree.to_str().unwrap())
+            .unwrap()
+            .0,
+        canonical_project_note_identity(nested.to_str().unwrap())
+            .unwrap()
+            .0
+    );
+}
+
+#[test]
+fn project_note_identity_uses_exact_canonical_launch_path_outside_a_repo() {
+    let parent = tempfile::tempdir().unwrap();
+    let one = parent.path().join("one");
+    let two = parent.path().join("two");
+    std::fs::create_dir(&one).unwrap();
+    std::fs::create_dir(&two).unwrap();
+
+    assert_ne!(
+        canonical_project_note_identity(one.to_str().unwrap())
+            .unwrap()
+            .0,
+        canonical_project_note_identity(two.to_str().unwrap())
+            .unwrap()
+            .0
+    );
+}
+
+#[test]
+fn project_note_identity_fails_closed_when_git_marker_metadata_is_indeterminate() {
+    let project = tempfile::tempdir().unwrap();
+    let canonical = std::fs::canonicalize(project.path()).unwrap();
+    let failing_marker = canonical.join(".git");
+    let error = canonical_project_note_identity_with_metadata(canonical, |path| {
+        if path == failing_marker {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected metadata denial",
+            ))
+        } else {
+            std::fs::symlink_metadata(path)
+        }
+    })
+    .err()
+    .expect("indeterminate metadata must fail closed");
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(error.message.contains("could not be inspected"));
+}
+
 #[tokio::test]
 async fn project_note_rejects_id_from_another_project_root() {
     let ctx = test_ctx();

@@ -1249,7 +1249,9 @@ fn notes_project_identity_resolution_is_daemon_owned() {
     }
     let dispatch = read("crates/cockpit-core/src/daemon/server/dispatch.rs");
     assert!(dispatch.contains("canonical_project_note_identity"));
-    assert!(dispatch.contains("find_worktree_root(&canonical)"));
+    assert!(dispatch.contains("canonical.ancestors()"));
+    assert!(dispatch.contains("std::fs::symlink_metadata"));
+    assert!(!dispatch.contains("find_worktree_root(&canonical)"));
     assert!(dispatch.contains("flycockpit-project-notes-v1\\0"));
 }
 

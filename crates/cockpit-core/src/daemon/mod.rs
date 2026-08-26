@@ -1104,48 +1104,143 @@ pub async fn run_foreground_with_resume(
 }
 
 pub struct InProcessDaemonGuard {
-    ctx: Option<std::sync::Arc<server::DaemonContext>>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    completion: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
 }
 
 impl InProcessDaemonGuard {
-    pub async fn shutdown(mut self) {
-        let Some(ctx) = self.ctx.take() else {
-            return;
-        };
-        server::request_shutdown(&ctx);
-        let grace = ctx
-            .take_shutdown_grace_override()
-            .unwrap_or(shutdown::SHUTDOWN_DRAIN_GRACE);
-        let _ = ctx.registry.drain_all(grace).await;
-        if let Some(containment) = ctx.process_containment.as_ref() {
-            let _ = containment.begin_shutdown().await;
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.begin_shutdown();
+        self.completion
+            .take()
+            .context("in-process daemon shutdown completion missing")?
+            .await
+            .context("in-process daemon shutdown supervisor stopped")?
+    }
+
+    fn begin_shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
         }
-        if let Some(write_scope) = ctx.write_scope.as_ref() {
-            let _ = write_scope.begin_shutdown().await;
-        }
-        if let Some(containment) = ctx.process_containment.as_ref() {
-            let _ = containment.await_all_empty(Some(grace)).await;
-        }
-        if let Some(write_scope) = ctx.write_scope.as_ref() {
-            let _ = write_scope.assert_shutdown_clean().await;
-        }
-        for task in self.tasks.drain(..) {
-            task.abort();
-            let _ = task.await;
-        }
-        drop(ctx);
     }
 }
 
 impl Drop for InProcessDaemonGuard {
     fn drop(&mut self) {
-        if let Some(ctx) = self.ctx.take() {
-            server::request_shutdown(&ctx);
+        self.begin_shutdown();
+    }
+}
+
+async fn drain_daemon_context(
+    ctx: &std::sync::Arc<server::DaemonContext>,
+    grace: Duration,
+) -> Result<()> {
+    let drain = ctx.registry.drain_all(grace).await;
+    let mut failures = Vec::new();
+    if !drain.park_commit.is_clean() {
+        failures.push(format!("interrupt park commit: {:?}", drain.park_commit));
+    }
+    if !drain.is_clean() {
+        failures.push("session worker drain was forced or incomplete".to_string());
+    }
+
+    if ctx.process_containment.is_some() || ctx.write_scope.is_some() {
+        let containment = ctx.process_containment.clone();
+        let write_scope = ctx.write_scope.clone();
+        let wall_cap = grace
+            .checked_add(Duration::from_millis(500))
+            .unwrap_or(grace)
+            .min(Duration::from_secs(2));
+        let barrier = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building shutdown containment runtime")?;
+            runtime.block_on(async move {
+                tokio::time::timeout(wall_cap, async move {
+                    let mut errors = Vec::new();
+                    if let Some(containment) = containment.as_ref()
+                        && let Err(error) = containment.begin_shutdown().await
+                    {
+                        errors.push(format!("containment begin-shutdown: {error}"));
+                    }
+                    if let Some(write_scope) = write_scope.as_ref()
+                        && let Err(error) = write_scope.begin_shutdown().await
+                    {
+                        errors.push(format!("write-scope begin-shutdown: {error}"));
+                    }
+                    if let Some(containment) = containment.as_ref()
+                        && let Err(error) = containment.await_all_empty(Some(grace)).await
+                    {
+                        errors.push(format!("containment not empty: {error}"));
+                    }
+                    if let Some(write_scope) = write_scope.as_ref()
+                        && let Err(error) = write_scope.assert_shutdown_clean().await
+                    {
+                        errors.push(format!("write-scope not clean: {error}"));
+                    }
+                    if errors.is_empty() {
+                        Ok::<(), anyhow::Error>(())
+                    } else {
+                        anyhow::bail!(errors.join("; "))
+                    }
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("containment barrier exceeded {wall_cap:?}"))?
+            })
+        });
+        match barrier.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("containment barrier: {error}")),
+            Err(error) => failures.push(format!("containment barrier task: {error}")),
         }
-        for task in self.tasks.drain(..) {
-            task.abort();
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        if !ctx.shutdown_signal().is_forced() {
+            ctx.shutdown_signal().force();
+            ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
         }
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+async fn shutdown_in_process_context(
+    ctx: std::sync::Arc<server::DaemonContext>,
+    mut tasks: Vec<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
+    server::request_shutdown(&ctx);
+    let grace = ctx
+        .take_shutdown_grace_override()
+        .unwrap_or(shutdown::SHUTDOWN_DRAIN_GRACE);
+    let result = drain_daemon_context(&ctx, grace).await;
+    for task in tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Err(error) = &result {
+        tracing::warn!(%error, "in-process daemon shutdown was not clean");
+    }
+    drop(ctx);
+    result
+}
+
+fn spawn_in_process_shutdown_supervisor(
+    ctx: std::sync::Arc<server::DaemonContext>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+) -> InProcessDaemonGuard {
+    let (shutdown, shutdown_request) = tokio::sync::oneshot::channel();
+    let (completion, completed) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = shutdown_request.await;
+        let result = shutdown_in_process_context(ctx, tasks).await;
+        let _ = completion.send(result);
+    });
+    InProcessDaemonGuard {
+        shutdown: Some(shutdown),
+        completion: Some(completed),
     }
 }
 
@@ -1180,10 +1275,7 @@ pub(crate) async fn boot_in_process(
     server::register_in_process_context(ctx.clone());
     Ok((
         ctx.clone(),
-        Some(InProcessDaemonGuard {
-            ctx: Some(ctx),
-            tasks,
-        }),
+        Some(spawn_in_process_shutdown_supervisor(ctx, tasks)),
     ))
 }
 
@@ -1558,101 +1650,8 @@ async fn run_foreground_inner_with_boot_db(
     // a registered interrupt waiter's park is still un-committed. A restart then
     // never reports success (or lets the successor bind) with an interrupt row
     // left `Open`.
-    let drain_outcome = ctx.registry.drain_all(drain_grace).await;
-    if !drain_outcome.park_commit.is_clean() {
-        tracing::warn!(
-            park_commit = ?drain_outcome.park_commit,
-            "daemon shutdown: interrupt park did not commit cleanly; not a clean park success"
-        );
-    }
-    let drained_clean = drain_outcome.is_clean();
-    // Generation-bound containment barrier: clean shutdown only when every
-    // containment is ProvenEmpty. Deadline/failure leaves Uncertain/Stopping
-    // rows durable for restart reconciliation.
-    // Bound the containment barrier with a wall-clock cap so paused-time
-    // tests and wedged adapters cannot prevent daemon exit. Clean status
-    // still requires ProvenEmpty within that bound.
-    let containment_clean = if let Some(pc) = ctx.process_containment.as_ref() {
-        let pc = pc.clone();
-        // The write-scope coordinator drains in the same barrier: shutdown may
-        // not report clean while a lease still holds authority or a permit is
-        // still held, exactly as it may not while a containment is nonempty.
-        let ws = ctx.write_scope.clone();
-        let grace = drain_grace;
-        // Prefer a real-time upper bound slightly above grace so a paused
-        // Tokio clock cannot leave this future pending forever.
-        let wall_cap = grace
-            .checked_add(Duration::from_millis(500))
-            .unwrap_or(grace)
-            .min(Duration::from_secs(2));
-        match tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("containment barrier runtime");
-            rt.block_on(async move {
-                let barrier = async move {
-                    if let Err(error) = pc.begin_shutdown().await {
-                        tracing::warn!(error = %error, "process containment begin_shutdown failed");
-                    }
-                    // Close write-scope intake before draining, so no transfer
-                    // can begin while the barrier is running.
-                    if let Some(ws) = ws.as_ref()
-                        && let Err(error) = ws.begin_shutdown().await
-                    {
-                        tracing::warn!(error = %error, "write scope begin_shutdown failed");
-                    }
-                    pc.await_all_empty(Some(grace)).await?;
-                    if let Some(ws) = ws.as_ref() {
-                        ws.assert_shutdown_clean().await.map_err(|error| {
-                            crate::process_containment::ContainmentError::Internal(format!(
-                                "write scope not drained at shutdown: {error}"
-                            ))
-                        })?;
-                    }
-                    Ok::<(), crate::process_containment::ContainmentError>(())
-                };
-                match tokio::time::timeout(wall_cap, barrier).await {
-                    Ok(Ok(())) => true,
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            error = %error,
-                            "process containment not proven empty at shutdown"
-                        );
-                        false
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "process containment barrier timed out at shutdown; leaving durable rows"
-                        );
-                        false
-                    }
-                }
-            })
-        })
-        .await
-        {
-            Ok(clean) => clean,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "process containment barrier task failed at shutdown"
-                );
-                false
-            }
-        }
-    } else {
-        true
-    };
-    let drained_clean = drained_clean && containment_clean;
-    if !drained_clean {
-        // Make sure the forced state + notice are set even if the timer
-        // hadn't fired yet (e.g. all workers wedged right at the deadline).
-        if !ctx.shutdown_signal().is_forced() {
-            ctx.shutdown_signal().force();
-            ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
-        }
-        tracing::warn!("daemon: forced shutdown — in-flight work aborted at grace deadline");
+    if let Err(error) = drain_daemon_context(&ctx, drain_grace).await {
+        tracing::warn!(%error, "daemon shutdown was not clean");
     }
 
     // Cleanup on every path, but only while the pid file still names this
@@ -2928,13 +2927,35 @@ mod tests {
             .await
             .expect("in-process daemon context");
         let shutdown = ctx.shutdown_signal().clone();
-        let guard = InProcessDaemonGuard {
-            ctx: Some(ctx),
-            tasks: Vec::new(),
-        };
+        let guard = spawn_in_process_shutdown_supervisor(ctx, Vec::new());
         drop(guard);
-        assert!(shutdown.is_draining());
-        assert!(server::in_process_context(&paths.socket).is_none());
+        wait_until(|| shutdown.is_draining(), Duration::from_secs(1)).await;
+        wait_until(
+            || server::in_process_context(&paths.socket).is_none(),
+            Duration::from_secs(1),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_in_process_shutdown_waiter_does_not_cancel_cleanup() {
+        let root = tempfile::tempdir().expect("daemon owner tempdir");
+        let paths = temp_ephemeral_paths(root.path(), "in-process-owner-cancel");
+        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
+        let ctx = boot_in_process_with_db(paths.clone(), db)
+            .await
+            .expect("in-process daemon context");
+        let shutdown = ctx.shutdown_signal().clone();
+        let guard = spawn_in_process_shutdown_supervisor(ctx, Vec::new());
+        let waiter = tokio::spawn(guard.shutdown());
+        wait_until(|| shutdown.is_draining(), Duration::from_secs(1)).await;
+        waiter.abort();
+        let _ = waiter.await;
+        wait_until(
+            || server::in_process_context(&paths.socket).is_none(),
+            Duration::from_secs(1),
+        )
+        .await;
     }
 
     async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {

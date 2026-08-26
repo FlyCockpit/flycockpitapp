@@ -92,9 +92,12 @@ pub enum OwnedDaemonGuard {
 }
 
 impl OwnedDaemonGuard {
-    async fn shutdown(self) {
+    async fn shutdown(self) -> Result<()> {
         match self {
-            Self::Process(guard) => drop(guard),
+            Self::Process(guard) => {
+                drop(guard);
+                Ok(())
+            }
             Self::InProcess(guard) => guard.shutdown().await,
         }
     }
@@ -138,7 +141,7 @@ pub async fn ensure_persistent_daemon() -> Result<ConnectedDaemon> {
 /// restart, or retain daemon process guards itself.
 pub async fn serve_lifecycle_requests(
     mut requests: tokio::sync::mpsc::Receiver<cockpit_client::LifecycleRequest>,
-) {
+) -> Result<()> {
     let mut owned_daemons = Vec::new();
     while let Some(request) = requests.recv().await {
         // A queued request may be cancelled before the lifecycle actor sees
@@ -180,8 +183,16 @@ pub async fn serve_lifecycle_requests(
             }
         }
     }
+    let mut failures = Vec::new();
     for guard in owned_daemons {
-        guard.shutdown().await;
+        if let Err(error) = guard.shutdown().await {
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
     }
 }
 
@@ -190,7 +201,9 @@ pub async fn serve_lifecycle_requests(
 #[cfg(feature = "test-support")]
 pub fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
     let (client, requests) = cockpit_client::LifecycleClient::channel(8);
-    tokio::spawn(serve_lifecycle_requests(requests));
+    tokio::spawn(async move {
+        let _ = serve_lifecycle_requests(requests).await;
+    });
     client
 }
 

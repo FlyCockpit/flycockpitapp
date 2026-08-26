@@ -8,7 +8,10 @@ use uuid::Uuid;
 use crate::welcome;
 use cockpit_tui::tui::app::{App, StartupWorkspaceTrust};
 
-fn lifecycle_composition() -> (cockpit_client::LifecycleClient, tokio::task::JoinHandle<()>) {
+fn lifecycle_composition() -> (
+    cockpit_client::LifecycleClient,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let (client, requests) = cockpit_client::LifecycleClient::channel(16);
     let task = tokio::spawn(cockpit_core::daemon::client::serve_lifecycle_requests(
         requests,
@@ -16,13 +19,15 @@ fn lifecycle_composition() -> (cockpit_client::LifecycleClient, tokio::task::Joi
     (client, task)
 }
 
-async fn finish_lifecycle(mut task: tokio::task::JoinHandle<()>) {
-    if tokio::time::timeout(std::time::Duration::from_secs(35), &mut task)
-        .await
-        .is_err()
-    {
-        task.abort();
-        let _ = task.await;
+async fn finish_lifecycle(mut task: tokio::task::JoinHandle<anyhow::Result<()>>) -> Result<()> {
+    match tokio::time::timeout(std::time::Duration::from_secs(35), &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(error).context("daemon lifecycle task failed"),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            anyhow::bail!("daemon lifecycle teardown exceeded 35s; forced shutdown was requested")
+        }
     }
 }
 
@@ -42,8 +47,8 @@ pub async fn run(
     let mut app = App::new_composed(project, no_sandbox, trust, launch_start, lifecycle);
     let result = app.run().await;
     drop(app);
-    finish_lifecycle(lifecycle_task).await;
-    result
+    let lifecycle_result = finish_lifecycle(lifecycle_task).await;
+    result.and(lifecycle_result)
 }
 
 pub async fn run_with_session(
@@ -76,8 +81,8 @@ pub async fn run_with_session(
     );
     let result = app.run().await;
     drop(app);
-    finish_lifecycle(lifecycle_task).await;
-    result
+    let lifecycle_result = finish_lifecycle(lifecycle_task).await;
+    result.and(lifecycle_result)
 }
 
 fn prepare_tui_workspace_trust(project: Option<&Path>) -> Result<StartupWorkspaceTrust> {

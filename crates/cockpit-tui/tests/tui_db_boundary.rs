@@ -658,7 +658,7 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
                 parts.insert(0, ty);
             }
             let resolved = resolve(&parts, self.aliases);
-            let last = parts.last().map(String::as_str).unwrap_or_default();
+            let last = resolved.rsplit("::").next().unwrap_or_default();
             let forbidden_named = matches!(
                 last,
                 "probe_or_spawn"
@@ -717,6 +717,44 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
                 ));
             }
             syn::visit::visit_type_path(self, path);
+        }
+
+        fn visit_macro(&mut self, value: &'ast syn::Macro) {
+            let tokens: String = value
+                .tokens
+                .to_string()
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            let mut spellings = vec![
+                "DaemonClient::connect".to_string(),
+                "UnixStream::connect".to_string(),
+                "LifecycleClient::channel".to_string(),
+                "probe_or_spawn".to_string(),
+                "serve_lifecycle_requests".to_string(),
+                "request_on_socket".to_string(),
+            ];
+            for (alias, target) in self.aliases {
+                if target.ends_with("DaemonClient") || target.ends_with("UnixStream") {
+                    spellings.push(format!("{alias}::connect"));
+                }
+                if target.ends_with("LifecycleClient") {
+                    spellings.push(format!("{alias}::channel"));
+                }
+                if target.ends_with("probe_or_spawn")
+                    || target.ends_with("serve_lifecycle_requests")
+                    || target.ends_with("request_on_socket")
+                {
+                    spellings.push(alias.clone());
+                }
+            }
+            if let Some(spelling) = spellings.iter().find(|spelling| tokens.contains(*spelling)) {
+                self.findings.push(format!(
+                    "line {}: macro retains lifecycle authority `{spelling}`",
+                    value.span().start().line
+                ));
+            }
+            syn::visit::visit_macro(self, value);
         }
     }
 
@@ -2078,6 +2116,15 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         lifecycle_reassigned: bool,
     }
     impl<'ast> Visit<'ast> for CompositionCalls {
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+        fn visit_expr_if(&mut self, _: &'ast syn::ExprIf) {}
+        fn visit_expr_match(&mut self, _: &'ast syn::ExprMatch) {}
+        fn visit_expr_loop(&mut self, _: &'ast syn::ExprLoop) {}
+        fn visit_expr_while(&mut self, _: &'ast syn::ExprWhile) {}
+        fn visit_expr_for_loop(&mut self, _: &'ast syn::ExprForLoop) {}
+        fn visit_expr_block(&mut self, _: &'ast syn::ExprBlock) {}
+
         fn visit_local(&mut self, local: &'ast syn::Local) {
             let initializes_lifecycle = local.init.as_ref().is_some_and(|init| {
                 matches!(init.expr.as_ref(), syn::Expr::Call(call)
@@ -2158,6 +2205,15 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
             finish_lifecycle: bool,
         }
         impl<'ast> Visit<'ast> for StatementCalls {
+            fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+            fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+            fn visit_expr_if(&mut self, _: &'ast syn::ExprIf) {}
+            fn visit_expr_match(&mut self, _: &'ast syn::ExprMatch) {}
+            fn visit_expr_loop(&mut self, _: &'ast syn::ExprLoop) {}
+            fn visit_expr_while(&mut self, _: &'ast syn::ExprWhile) {}
+            fn visit_expr_for_loop(&mut self, _: &'ast syn::ExprForLoop) {}
+            fn visit_expr_block(&mut self, _: &'ast syn::ExprBlock) {}
+
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
                 match call_name(call).as_deref() {
                     Some("drop")
@@ -2185,6 +2241,24 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
             matches!((drop_index, finish_index), (Some(drop), Some(finish)) if drop < finish),
             "{entrypoint} must drop every lifecycle client before awaiting actor teardown"
         );
+    }
+    for source in [
+        "fn run() { let witness = || { let (lifecycle, task) = lifecycle_composition(); App::new_composed(a,b,c,d,lifecycle); }; let _ = witness; }",
+        "fn run() { let witness = async { let (lifecycle, task) = lifecycle_composition(); App::new_composed(a,b,c,d,lifecycle); }; let _ = witness; }",
+        "fn run() { if false { let (lifecycle, task) = lifecycle_composition(); App::new_composed(a,b,c,d,lifecycle); } }",
+    ] {
+        let dead_witness =
+            syn::parse_str::<syn::ItemFn>(source).expect("dead composition fixture parses");
+        let mut dead_calls = CompositionCalls {
+            lifecycle: false,
+            constructor: false,
+            channel: false,
+            responder: false,
+            lifecycle_binding: None,
+            lifecycle_reassigned: false,
+        };
+        dead_calls.visit_block(&dead_witness.block);
+        assert!(!dead_calls.lifecycle && !dead_calls.constructor);
     }
     let composition = app
         .items
@@ -2219,6 +2293,9 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         abort: bool,
     }
     impl<'ast> Visit<'ast> for FinishCalls {
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
             self.timeout |= call_name(call).as_deref() == Some("timeout");
             syn::visit::visit_expr_call(self, call);
@@ -2279,6 +2356,10 @@ fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
         "type S = std::os::unix::net::UnixStream; type T = S; fn f() { let _ = T::connect; }",
         "extern crate cockpit_client as cc; fn f() { let _ = cc::DaemonClient::connect; }",
         "use cockpit_core::daemon::*; fn f() { let _ = discover; }",
+        "use cockpit_core::daemon::probe_or_spawn as p; fn f() { p(); }",
+        "use cockpit_core::daemon::client::serve_lifecycle_requests as serve; fn f() { serve(rx); }",
+        "macro_rules! hidden { () => { cockpit_client::DaemonClient::connect(path) } }",
+        "use cockpit_core::daemon::probe_or_spawn as p; macro_rules! hidden { () => { p() } }",
     ] {
         assert!(
             !lifecycle_authority_findings(source).is_empty(),

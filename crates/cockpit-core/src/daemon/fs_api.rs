@@ -21,6 +21,7 @@ use crate::daemon::server::DaemonContext;
 const FS_LIST_ENTRY_CAP: usize = 1_000;
 const FS_TEXT_READ_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
 const FS_BINARY_READ_BYTE_CAP: usize = 256 * 1024;
+const GIT_REVIEW_PR_REFERENCE_BYTE_CAP: usize = 256;
 const REMOTE_FILE_AGENT: &str = "remote-project-files";
 const SETTINGS_CAPABILITY_TTL: Duration = Duration::from_secs(30 * 60);
 const SETTINGS_CAPABILITY_GLOBAL_CAP: usize = 256;
@@ -1827,7 +1828,6 @@ pub(crate) fn git_review_sources_blocking(
     sources: Vec<GitReadSource>,
 ) -> Result<Response, ErrorPayload> {
     const MAX_REVIEW_SOURCES: usize = 4;
-    const MAX_PR_REFERENCE_BYTES: usize = 256;
 
     if sources.is_empty() || sources.len() > MAX_REVIEW_SOURCES {
         return Err(bad_request(
@@ -1841,11 +1841,7 @@ pub(crate) fn git_review_sources_blocking(
             GitReadSource::Worktree => crate::git::review_source_uncommitted(&root),
             GitReadSource::Unstaged => crate::git::review_source_unstaged(&root),
             GitReadSource::Unpushed => crate::git::review_source_unpushed(&root),
-            GitReadSource::PullRequest(pr)
-                if !pr.trim().is_empty()
-                    && pr.len() <= MAX_PR_REFERENCE_BYTES
-                    && pr.chars().all(|ch| !ch.is_control() && ch != '`') =>
-            {
+            GitReadSource::PullRequest(pr) if valid_pr_reference(pr) => {
                 crate::git::review_source_pr(&root, pr)
             }
             GitReadSource::PullRequest(_) => Err(anyhow::anyhow!(
@@ -1881,8 +1877,17 @@ fn review_source_label(source: &GitReadSource) -> String {
         GitReadSource::Staged => "Staged changes".into(),
         GitReadSource::Unstaged => "Unstaged changes".into(),
         GitReadSource::Unpushed => "Unpushed changes".into(),
-        GitReadSource::PullRequest(pr) => format!("PR {}", pr.trim()),
+        GitReadSource::PullRequest(pr) if valid_pr_reference(pr) => {
+            format!("PR {}", pr.trim())
+        }
+        GitReadSource::PullRequest(_) => "PR".into(),
     }
+}
+
+fn valid_pr_reference(pr: &str) -> bool {
+    !pr.trim().is_empty()
+        && pr.len() <= GIT_REVIEW_PR_REFERENCE_BYTE_CAP
+        && pr.chars().all(|ch| !ch.is_control() && ch != '`')
 }
 
 async fn join_fs_handler(

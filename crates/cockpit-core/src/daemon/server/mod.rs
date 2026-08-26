@@ -528,6 +528,9 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         } => scrub_string(diff, redact),
         proto::Response::GitReviewSources { sources } => {
             for source in sources {
+                if let proto::GitReadSource::PullRequest(pr) = &mut source.source {
+                    scrub_string(pr, redact);
+                }
                 scrub_string(&mut source.label, redact);
                 if let Some(command) = &mut source.command {
                     scrub_string(command, redact);

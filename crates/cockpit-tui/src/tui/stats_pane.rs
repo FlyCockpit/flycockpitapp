@@ -87,6 +87,7 @@ pub struct StatsPane {
     /// Cursor over recovery rows plus vertical body scroll.
     list: ListState,
     selected_model: Option<String>,
+    follow_selection: bool,
     /// Rendered body height at the last draw — drives scroll clamping.
     last_body_height: usize,
     /// Total rendered body rows at the last draw — drives scroll clamp.
@@ -138,6 +139,7 @@ impl StatsPane {
             expanded: Vec::new(),
             list: ListState::default(),
             selected_model: None,
+            follow_selection: false,
             last_body_height: 0,
             last_content_rows: 0,
         }
@@ -152,6 +154,7 @@ impl StatsPane {
         self.expanded = init_expanded(&self.rollup);
         self.list = ListState::default();
         self.selected_model = None;
+        self.follow_selection = false;
     }
 
     pub(crate) fn take_pending_fetch_key(&mut self) -> Option<StatsPaneFetchKey> {
@@ -262,6 +265,7 @@ impl StatsPane {
                 self.requery();
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                self.follow_selection = true;
                 let n = self.recovery_rows();
                 let prev = self.selected_recovery_index();
                 self.move_selection(-1, n);
@@ -275,6 +279,7 @@ impl StatsPane {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                self.follow_selection = true;
                 let n = self.recovery_rows();
                 let prev = self.selected_recovery_index();
                 self.move_selection(1, n);
@@ -286,22 +291,29 @@ impl StatsPane {
                 }
             }
             KeyCode::PageUp => {
+                self.follow_selection = false;
                 *self.list.offset_mut() = self
                     .list
                     .offset()
                     .saturating_sub(self.last_body_height.max(1));
             }
             KeyCode::PageDown => {
+                self.follow_selection = false;
                 let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
                 *self.list.offset_mut() =
                     (self.list.offset() + self.last_body_height.max(1)).min(max_scroll);
             }
-            KeyCode::Char('g') => *self.list.offset_mut() = 0,
+            KeyCode::Char('g') => {
+                self.follow_selection = false;
+                *self.list.offset_mut() = 0;
+            }
             KeyCode::Char('G') => {
+                self.follow_selection = false;
                 *self.list.offset_mut() =
                     self.last_content_rows.saturating_sub(self.last_body_height);
             }
             KeyCode::Enter | KeyCode::Char('e') => {
+                self.follow_selection = true;
                 // Expand/collapse the recovery row under the cursor.
                 let selected = self.selected_recovery_index();
                 if let Some(flag) = self.expanded.get_mut(selected) {
@@ -315,12 +327,14 @@ impl StatsPane {
 
     /// Scroll the body up by one row (mouse wheel).
     pub fn scroll_up(&mut self) {
+        self.follow_selection = false;
         *self.list.offset_mut() = self.list.offset().saturating_sub(1);
     }
 
     /// Scroll the body down by one row (mouse wheel), clamped so the
     /// last row can't scroll above the body floor.
     pub fn scroll_down(&mut self) {
+        self.follow_selection = false;
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
         *self.list.offset_mut() = (self.list.offset() + 1).min(max_scroll);
     }
@@ -377,6 +391,9 @@ impl StatsPane {
             *self.list.offset_mut() = max_scroll;
         }
         self.list.select(self.cursor_body_line());
+        if self.follow_selection {
+            self.ensure_cursor_visible();
+        }
         let mut viewport = self.list.clone();
         viewport.select(None);
         frame.render_stateful_widget(
@@ -949,6 +966,7 @@ mod tests {
             expanded,
             list: ListState::default(),
             selected_model: None,
+            follow_selection: false,
             last_body_height: 100,
             last_content_rows: 0,
         }
@@ -1404,6 +1422,41 @@ mod tests {
 
         let mut empty = pane_with(empty_rollup());
         assert!(rendered_buffer(&mut empty, 80, 12).contains("no data"));
+    }
+
+    #[test]
+    fn follow_mode_handles_resize_and_row_growth_without_overriding_manual_scroll() {
+        let mut rollup = empty_rollup();
+        rollup.recovery.by_model = (0..12)
+            .map(|index| recovery_row(format!("model-{index:02}")))
+            .collect();
+        rollup.recovery.by_tool = vec![RecoveryToolRow {
+            model: "model-00".into(),
+            tool: "edit".into(),
+            calls: 1,
+            recovered: 0,
+            hard_fail: 0,
+        }];
+        let mut pane = pane_with(rollup);
+        let _ = rendered_buffer(&mut pane, 80, 12);
+        for _ in 0..11 {
+            pane.handle_key(press(KeyCode::Down));
+        }
+        let _ = rendered_buffer(&mut pane, 80, 6);
+        let selected = pane.cursor_body_line().unwrap();
+        assert!(selected >= pane.list.offset());
+        assert!(selected < pane.list.offset() + pane.last_body_height);
+
+        pane.expanded[0] = true;
+        let _ = rendered_buffer(&mut pane, 80, 6);
+        let shifted = pane.cursor_body_line().unwrap();
+        assert!(shifted >= pane.list.offset());
+        assert!(shifted < pane.list.offset() + pane.last_body_height);
+
+        pane.scroll_up();
+        let manual = pane.list.offset();
+        let _ = rendered_buffer(&mut pane, 80, 7);
+        assert_eq!(pane.list.offset(), manual);
     }
 
     #[test]

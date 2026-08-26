@@ -87,6 +87,7 @@ pub struct PermissionsPane {
     /// Cursor into the flat deletable-row list plus rendered-row scroll.
     list: ListState,
     selected: Option<DeletableRow>,
+    follow_selection: bool,
     /// A transient status line (e.g. "removed `gh pr`"), shown until the
     /// next key. Cleared on the next navigation.
     status: Option<String>,
@@ -113,6 +114,7 @@ impl PermissionsPane {
             scopes,
             list: ListState::default(),
             selected: None,
+            follow_selection: false,
             status: None,
             last_body_height: 0,
             last_content_rows: 0,
@@ -162,6 +164,7 @@ impl PermissionsPane {
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => self.delete_focused(),
             KeyCode::PageUp => {
                 self.status = None;
+                self.follow_selection = false;
                 *self.list.offset_mut() = self
                     .list
                     .offset()
@@ -169,6 +172,7 @@ impl PermissionsPane {
             }
             KeyCode::PageDown => {
                 self.status = None;
+                self.follow_selection = false;
                 let max = self.last_content_rows.saturating_sub(self.last_body_height);
                 *self.list.offset_mut() =
                     (self.list.offset() + self.last_body_height.max(1)).min(max);
@@ -179,10 +183,12 @@ impl PermissionsPane {
     }
 
     pub fn scroll_up(&mut self) {
+        self.follow_selection = false;
         *self.list.offset_mut() = self.list.offset().saturating_sub(1);
     }
 
     pub fn scroll_down(&mut self) {
+        self.follow_selection = false;
         let max = self.last_content_rows.saturating_sub(self.last_body_height);
         *self.list.offset_mut() = (self.list.offset() + 1).min(max);
     }
@@ -263,6 +269,7 @@ impl PermissionsPane {
             (current + 1).min(rows.len() - 1)
         };
         self.selected = rows.get(next).cloned();
+        self.follow_selection = true;
         self.sync_scroll_to_focus();
     }
 
@@ -283,6 +290,7 @@ impl PermissionsPane {
                 self.reload();
                 let rows = self.deletable_rows();
                 self.selected = rows.get(index.min(rows.len().saturating_sub(1))).cloned();
+                self.follow_selection = true;
             }
             Err(e) => self.status = Some(format!("Remove failed: {e}")),
         }
@@ -323,6 +331,9 @@ impl PermissionsPane {
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
         *self.list.offset_mut() = self.list.offset().min(max_scroll);
         self.list.select(self.selected_line_index());
+        if self.follow_selection {
+            self.sync_scroll_to_focus();
+        }
         let mut viewport = self.list.clone();
         viewport.select(None);
         frame.render_stateful_widget(
@@ -649,6 +660,7 @@ mod tests {
             ],
             list: ListState::default(),
             selected: None,
+            follow_selection: false,
             status: None,
             last_body_height: 100,
             last_content_rows: 0,
@@ -923,6 +935,36 @@ mod tests {
             let _ = rendered_buffer(&mut pane, width, 8);
             assert_eq!(pane.list.offset(), manual);
         }
+    }
+
+    #[test]
+    fn follow_mode_handles_shrink_and_delete_while_manual_scroll_stays_put() {
+        let proj = tempfile::tempdir().unwrap();
+        let names = (0..16)
+            .map(|index| format!("cmd-{index:02}"))
+            .collect::<Vec<_>>();
+        let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        write_grants(proj.path(), &grants(&refs, &[]));
+        let mut pane = pane_over(Some(proj.path().to_path_buf()), None);
+        let _ = rendered_buffer(&mut pane, 80, 12);
+        for _ in 0..15 {
+            pane.handle_key(press(KeyCode::Down));
+        }
+        let _ = rendered_buffer(&mut pane, 80, 6);
+        let focused = pane.selected_line_index().unwrap();
+        assert!(focused >= pane.list.offset());
+        assert!(focused < pane.list.offset() + pane.last_body_height);
+
+        pane.handle_key(press(KeyCode::Char('d')));
+        let _ = rendered_buffer(&mut pane, 80, 6);
+        let focused = pane.selected_line_index().unwrap();
+        assert!(focused >= pane.list.offset());
+        assert!(focused < pane.list.offset() + pane.last_body_height);
+
+        pane.scroll_up();
+        let manual = pane.list.offset();
+        let _ = rendered_buffer(&mut pane, 80, 7);
+        assert_eq!(pane.list.offset(), manual);
     }
 
     #[test]

@@ -1,12 +1,11 @@
 //! Workspace trust decisions (migration 0045).
 
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use rusqlite::{Connection, OptionalExtension, params};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::db::Db;
 
@@ -50,8 +49,10 @@ impl FromStr for WorkspaceTrustMode {
 pub struct WorkspaceTrustDecision {
     pub root_path: String,
     pub mode: WorkspaceTrustMode,
-    pub created_at: i64,
-    pub updated_at: i64,
+    /// Daemon-observed creation time as signed Unix milliseconds.
+    pub created_at_unix_ms: i64,
+    /// Daemon-observed last-update time as signed Unix milliseconds.
+    pub updated_at_unix_ms: i64,
 }
 
 impl Db {
@@ -61,8 +62,8 @@ impl Db {
         mode: WorkspaceTrustMode,
     ) -> Result<WorkspaceTrustDecision> {
         let root = normalize_trust_root(root_path)?;
-        let now = now_epoch_seconds();
-        self.write(move |conn| Self::set_workspace_trust_conn(conn, &root, mode, now))
+        let now_unix_ms = Utc::now().timestamp_millis();
+        self.write(move |conn| Self::set_workspace_trust_conn(conn, &root, mode, now_unix_ms))
             .await
     }
 
@@ -70,15 +71,18 @@ impl Db {
         conn: &Connection,
         normalized_root: &str,
         mode: WorkspaceTrustMode,
-        now: i64,
+        now_unix_ms: i64,
     ) -> Result<WorkspaceTrustDecision> {
+        if normalized_root.is_empty() || normalized_root.len() > 32_768 {
+            bail!("workspace trust root must contain between 1 and 32768 bytes");
+        }
         conn.execute(
-            "INSERT INTO workspace_trust (root_path, mode, created_at, updated_at)
+            "INSERT INTO workspace_trust (root_path, mode, created_at_unix_ms, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?3)
              ON CONFLICT(root_path) DO UPDATE SET
                 mode = excluded.mode,
-                updated_at = excluded.updated_at",
-            params![normalized_root, mode.as_str(), now],
+                updated_at_unix_ms = excluded.updated_at_unix_ms",
+            params![normalized_root, mode.as_str(), now_unix_ms],
         )
         .context("upserting workspace_trust decision")?;
 
@@ -126,7 +130,7 @@ fn canonical_dir_path(path: &Path) -> Result<PathBuf> {
 
 fn query_decision_by_root(conn: &Connection, root: &str) -> Result<Option<WorkspaceTrustDecision>> {
     conn.query_row(
-        "SELECT root_path, mode, created_at, updated_at
+        "SELECT root_path, mode, created_at_unix_ms, updated_at_unix_ms
            FROM workspace_trust
           WHERE root_path = ?1",
         [root],
@@ -147,16 +151,9 @@ fn decode_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceTrustDe
                 Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
             )
         })?,
-        created_at: row.get("created_at")?,
-        updated_at: row.get("updated_at")?,
+        created_at_unix_ms: row.get("created_at_unix_ms")?,
+        updated_at_unix_ms: row.get("updated_at_unix_ms")?,
     })
-}
-
-fn now_epoch_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 #[cfg(test)]
@@ -178,7 +175,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.mode, WorkspaceTrustMode::Trust);
         assert_eq!(first.root_path, canonical_root);
-        assert_eq!(first.created_at, first.updated_at);
+        assert_eq!(first.created_at_unix_ms, first.updated_at_unix_ms);
 
         let second = db
             .set_workspace_trust(root, WorkspaceTrustMode::IgnoreConfig)
@@ -186,8 +183,8 @@ mod tests {
             .unwrap();
         assert_eq!(second.mode, WorkspaceTrustMode::IgnoreConfig);
         assert_eq!(second.root_path, first.root_path);
-        assert_eq!(second.created_at, first.created_at);
-        assert!(second.updated_at >= first.updated_at);
+        assert_eq!(second.created_at_unix_ms, first.created_at_unix_ms);
+        assert!(second.updated_at_unix_ms >= first.updated_at_unix_ms);
 
         let loaded = db
             .workspace_trust_by_root(root)

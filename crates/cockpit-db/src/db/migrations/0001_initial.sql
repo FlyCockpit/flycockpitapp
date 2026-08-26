@@ -3230,14 +3230,15 @@ CREATE INDEX idx_text_artifact_reservations_expiry
 -- Per-root workspace trust decisions.
 
 CREATE TABLE workspace_trust (
-    root_path TEXT PRIMARY KEY,
+    root_path TEXT PRIMARY KEY CHECK (length(root_path) BETWEEN 1 AND 32768),
     mode TEXT NOT NULL CHECK (mode IN ('trust', 'ignore-config', 'untrusted')),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    -- Daemon-observed wall-clock times, signed Unix milliseconds.
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms)
 );
 
 CREATE INDEX idx_workspace_trust_updated_at
-    ON workspace_trust(updated_at DESC);
+    ON workspace_trust(updated_at_unix_ms DESC);
 
 -- ---- task delegations -----------------------------------------------------------------------
 -- Durable state for delegated `task` runs: one job per task call, one

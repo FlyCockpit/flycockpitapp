@@ -9,7 +9,7 @@ use cockpit_core::host_capabilities::{
     FEATURE_MEDIA_DECODE, FEATURE_SANDBOX_CONTAINER, FEATURE_SANDBOX_HOST,
     FEATURE_SECRET_STORE_KEYRING,
 };
-use cockpit_core::tools::sandbox_mode::SandboxMode;
+use cockpit_proto::SandboxMode;
 #[cfg(test)]
 use cockpit_proto::SecretStoreSnapshot;
 use cockpit_proto::{

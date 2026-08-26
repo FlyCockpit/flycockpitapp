@@ -61,7 +61,7 @@ fn switch_outcome_with_epoch(session_id: uuid::Uuid, attachment_epoch: u64) -> A
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],
         last_applied_seq: None,
-        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        foreground_target: Some(cockpit_proto::QueueTarget::root("Build")),
         active_model_state: None,
         project_id: "project".to_string(),
         history: Vec::new(),
@@ -329,7 +329,7 @@ fn transition_failure_removes_identical_queue_rows_by_uuid_not_text() {
         app.queue.push(item.clone());
         let mut submission = UserSubmission::text(format!("wire-{marker}"));
         submission.display_text = Some("same text".to_string());
-        submission.images = vec![cockpit_core::engine::message::SubmissionImage::png(
+        submission.images = vec![cockpit_client::image_upload::SubmissionImage::png(
             marker.as_bytes().to_vec(),
         )];
         submission.forced_skill = Some(marker.to_string());
@@ -375,13 +375,13 @@ fn async_dispatch_failure_reconciles_exact_row_before_next_record_succeeds() {
     )));
     let mut first = UserSubmission::text("wire-a".to_string());
     first.display_text = Some("same visible text".to_string());
-    first.images = vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+    first.images = vec![cockpit_client::image_upload::SubmissionImage::png(vec![
         1, 2, 3,
     ])];
     first.forced_skill = Some("review".to_string());
     let mut second = UserSubmission::text("wire-b".to_string());
     second.display_text = Some("same visible text".to_string());
-    second.images = vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+    second.images = vec![cockpit_client::image_upload::SubmissionImage::png(vec![
         4, 5, 6,
     ])];
     second.forced_skill = Some("build".to_string());
@@ -492,7 +492,7 @@ fn fresh_a_failure_then_busy_b_fold_reconciles_history_queue_and_duplicate_recor
         display_text: second.submission.display_text.clone(),
         tag_expansions: second.submission.tag_expansions.clone(),
         queue_item_ids: vec![queued_b_id],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(92),
         preflight_cleaned: None,
     });
@@ -1040,7 +1040,7 @@ async fn successful_side_return_commits_snapshot_restore_and_discard_after_resul
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],
         last_applied_seq: Some(0),
-        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        foreground_target: Some(cockpit_proto::QueueTarget::root("Build")),
         active_model_state: None,
         project_id: "project-main".to_string(),
         history: Vec::new(),
@@ -1128,7 +1128,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
             detail: "expanded".to_string(),
             ok: true,
         }],
-        images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+        images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
             1, 2, 3, 4,
         ])],
         forced_skill: Some("review".to_string()),
@@ -1139,7 +1139,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
         client_submissions: Vec::new(),
         pending_terminal_disposition: None,
         run_invocation_id: None,
-        queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        queue_target: Some(cockpit_proto::QueueTarget::root("Build")),
     };
     let expected_submission = serde_json::to_value(&exact_submission).unwrap();
     app.async_actions.start(
@@ -1238,8 +1238,8 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
             ok: true,
         }],
         images: vec![
-            cockpit_core::engine::message::SubmissionImage::png(marker.as_bytes().to_vec()),
-            cockpit_core::engine::message::SubmissionImage::png(vec![0x89, b'P', b'N', b'G']),
+            cockpit_client::image_upload::SubmissionImage::png(marker.as_bytes().to_vec()),
+            cockpit_client::image_upload::SubmissionImage::png(vec![0x89, b'P', b'N', b'G']),
         ],
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
@@ -1252,7 +1252,7 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
             wire_fingerprint: format!("wire-fingerprint-{marker}"),
             origin_principal: Some("flycockpit:test-owner".to_string()),
         }],
-        queue_target: Some(cockpit_core::engine::message::QueueTarget::child(
+        queue_target: Some(cockpit_proto::QueueTarget::child(
             "Build",
             1,
             "task-call",
@@ -1650,7 +1650,7 @@ fn busy_submit_queue_full_retries_consumed_wire_payload_exactly() {
     assert_eq!(retained.display_text.as_deref(), Some(display.as_str()));
     assert_eq!(
         retained.images,
-        vec![cockpit_core::engine::message::SubmissionImage::png(png)]
+        vec![cockpit_client::image_upload::SubmissionImage::png(png)]
     );
     assert!(
         retained
@@ -2037,7 +2037,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
             detail: "expanded before switch".to_string(),
             ok: true,
         }],
-        images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+        images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
             0x89, b'P', b'N', b'G',
         ])],
         forced_skill: Some("review".to_string()),
@@ -2048,7 +2048,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
         client_submissions: Vec::new(),
         pending_terminal_disposition: None,
         run_invocation_id: None,
-        queue_target: Some(cockpit_core::engine::message::QueueTarget::child(
+        queue_target: Some(cockpit_proto::QueueTarget::child(
             "Build",
             1,
             "task-call",

@@ -1051,7 +1051,7 @@ mod tests {
 
         let submission = cockpit_client::submission::ClientUserSubmission {
             text: "exact wire".into(),
-            images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+            images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
                 1, 2, 3,
             ])],
             ..Default::default()

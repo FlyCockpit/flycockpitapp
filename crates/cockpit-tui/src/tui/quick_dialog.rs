@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use cockpit_config::extended::{ApprovalMode, LlmMode};
 use cockpit_config::providers::{CapabilityStatus, ModelTrust, PromptCacheRetention};
-use cockpit_core::tools::sandbox_mode::SandboxMode;
+use cockpit_proto::SandboxMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuickModelChoice {

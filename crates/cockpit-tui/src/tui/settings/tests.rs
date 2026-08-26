@@ -5018,8 +5018,8 @@ fn behavior_jobs_max_concurrent_rejects_zero() {
 #[test]
 fn privacy_sandbox_rows_cycle_edit_and_persist() {
     use cockpit_config::extended::ExtendedConfigDoc;
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
     use cockpit_proto::FeatureCapabilityState;
+    use cockpit_proto::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -5105,7 +5105,7 @@ fn inject_secret_store(
 #[test]
 fn privacy_sandbox_on_blocked_when_host_cap_missing() {
     use cockpit_config::extended::ExtendedConfigDoc;
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -5133,7 +5133,7 @@ fn privacy_sandbox_on_blocked_when_host_cap_missing() {
 #[test]
 fn sandbox_on_recheck_then_instruct() {
     use cockpit_config::extended::ExtendedConfigDoc;
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);

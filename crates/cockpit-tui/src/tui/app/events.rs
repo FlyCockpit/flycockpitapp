@@ -226,7 +226,7 @@ impl App {
 
     pub(super) fn apply_sandbox_state(
         &mut self,
-        mode: cockpit_core::tools::sandbox_mode::SandboxMode,
+        mode: cockpit_proto::SandboxMode,
         container_network_enabled: bool,
         container_availability: cockpit_proto::ContainerAvailability,
         sandbox_supported: bool,
@@ -237,7 +237,7 @@ impl App {
         self.container_network_enabled = container_network_enabled;
         self.container_availability = container_availability;
         let toast = match mode {
-            cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox => "sandbox on".to_string(),
+            cockpit_proto::SandboxMode::Sandbox => "sandbox on".to_string(),
             other => format!("sandbox {}", sandbox_mode_label(other)),
         };
         self.show_toast(&toast, ToastKind::Info);

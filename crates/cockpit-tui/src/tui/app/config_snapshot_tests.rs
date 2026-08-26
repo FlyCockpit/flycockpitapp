@@ -266,7 +266,7 @@ fn tui_config_count_stable_across_interactions() {
     );
     // turn-event application: a foreground-target event re-runs skill discovery.
     app.apply_event(cockpit_core::engine::TurnEvent::ForegroundInputTarget {
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
     });
     // /settings close and /new both funnel through `resync`; attached, it must
     // not read disk.

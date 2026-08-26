@@ -3082,7 +3082,7 @@ pub(super) fn parse_pane_side(arg: &str) -> PaneSide {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SandboxCommand {
     Cycle,
-    Set(cockpit_core::tools::sandbox_mode::SandboxMode),
+    Set(cockpit_proto::SandboxMode),
     Network(bool),
 }
 
@@ -3091,17 +3091,11 @@ pub(super) fn parse_sandbox_arg(args: &str) -> Result<SandboxCommand, String> {
     let normalized = normalized.to_ascii_lowercase();
     match normalized.as_str() {
         "" => Ok(SandboxCommand::Cycle),
-        "on" => Ok(SandboxCommand::Set(
-            cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox,
-        )),
-        "off" => Ok(SandboxCommand::Set(
-            cockpit_core::tools::sandbox_mode::SandboxMode::Off,
-        )),
-        "container" => Ok(SandboxCommand::Set(
-            cockpit_core::tools::sandbox_mode::SandboxMode::Container,
-        )),
+        "on" => Ok(SandboxCommand::Set(cockpit_proto::SandboxMode::Sandbox)),
+        "off" => Ok(SandboxCommand::Set(cockpit_proto::SandboxMode::Off)),
+        "container" => Ok(SandboxCommand::Set(cockpit_proto::SandboxMode::Container)),
         "container-readonly" | "container-ro" | "readonly" => Ok(SandboxCommand::Set(
-            cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly,
+            cockpit_proto::SandboxMode::ContainerReadonly,
         )),
         "network on" => Ok(SandboxCommand::Network(true)),
         "network off" => Ok(SandboxCommand::Network(false)),
@@ -3126,32 +3120,27 @@ pub(super) fn parse_sandbox_escalation_arg(args: &str) -> Result<SandboxEscalati
     }
 }
 
-pub(super) fn sandbox_mode_label(
-    mode: cockpit_core::tools::sandbox_mode::SandboxMode,
-) -> &'static str {
+pub(super) fn sandbox_mode_label(mode: cockpit_proto::SandboxMode) -> &'static str {
     match mode {
-        cockpit_core::tools::sandbox_mode::SandboxMode::Off => "off",
-        cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox => "on",
-        cockpit_core::tools::sandbox_mode::SandboxMode::Container => "container",
-        cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
+        cockpit_proto::SandboxMode::Off => "off",
+        cockpit_proto::SandboxMode::Sandbox => "on",
+        cockpit_proto::SandboxMode::Container => "container",
+        cockpit_proto::SandboxMode::ContainerReadonly => "container-readonly",
     }
 }
 
 pub(super) fn next_sandbox_mode(
-    current: cockpit_core::tools::sandbox_mode::SandboxMode,
+    current: cockpit_proto::SandboxMode,
     caps: &cockpit_proto::HostCapabilitySnapshot,
-) -> cockpit_core::tools::sandbox_mode::SandboxMode {
+) -> cockpit_proto::SandboxMode {
     crate::tui::capability_gate::next_available_sandbox_mode(current, caps)
 }
 
 pub fn decide_sandbox_set(
-    mode: cockpit_core::tools::sandbox_mode::SandboxMode,
+    mode: cockpit_proto::SandboxMode,
     caps: &cockpit_proto::HostCapabilitySnapshot,
     refresh: impl FnOnce() -> cockpit_proto::HostCapabilitySnapshot,
-) -> Result<
-    cockpit_core::tools::sandbox_mode::SandboxMode,
-    crate::tui::capability_gate::CapabilityInstruct,
-> {
+) -> Result<cockpit_proto::SandboxMode, crate::tui::capability_gate::CapabilityInstruct> {
     match crate::tui::capability_gate::apply_sandbox_choice(mode, caps, refresh) {
         crate::tui::capability_gate::RecheckApply::Applied(mode) => Ok(mode),
         crate::tui::capability_gate::RecheckApply::Instruct(instruct) => Err(instruct),

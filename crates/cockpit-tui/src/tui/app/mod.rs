@@ -1653,16 +1653,12 @@ pub(super) fn sandbox_down_notice_text_with_intent(
     remedy: &str,
     fix_command: Option<&str>,
     copy_chip: bool,
-    intent: Option<cockpit_core::tools::sandbox_mode::SandboxMode>,
+    intent: Option<cockpit_proto::SandboxMode>,
 ) -> String {
     let selected = match intent {
-        Some(cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox) => {
-            "Sandbox is selected but effective Off"
-        }
-        Some(cockpit_core::tools::sandbox_mode::SandboxMode::Container) => {
-            "Container is selected but effective Off"
-        }
-        Some(cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly) => {
+        Some(cockpit_proto::SandboxMode::Sandbox) => "Sandbox is selected but effective Off",
+        Some(cockpit_proto::SandboxMode::Container) => "Container is selected but effective Off",
+        Some(cockpit_proto::SandboxMode::ContainerReadonly) => {
             "Container-readonly is selected but effective Off"
         }
         _ => "shell sandbox can't start",
@@ -2643,8 +2639,8 @@ pub struct App {
     /// filesystem sandboxing OFF (unless the daemon itself was launched
     /// `--no-sandbox`, which wins). A `/sandbox` flip still overrides.
     pub(super) no_sandbox: bool,
-    pub(super) sandbox_mode: cockpit_core::tools::sandbox_mode::SandboxMode,
-    pub(super) sandbox_intent: cockpit_core::tools::sandbox_mode::SandboxMode,
+    pub(super) sandbox_mode: cockpit_proto::SandboxMode,
+    pub(super) sandbox_intent: cockpit_proto::SandboxMode,
     pub(super) container_network_enabled: bool,
     pub(super) container_availability: cockpit_proto::ContainerAvailability,
     pub(super) host_capabilities: cockpit_proto::HostCapabilitySnapshot,
@@ -3828,10 +3824,8 @@ impl App {
             active_schedules: std::collections::BTreeMap::new(),
             ctrl_c_armed_at: None,
             no_sandbox,
-            sandbox_mode: cockpit_core::tools::sandbox_mode::SandboxMode::from_enabled(!no_sandbox),
-            sandbox_intent: cockpit_core::tools::sandbox_mode::SandboxMode::from_enabled(
-                !no_sandbox,
-            ),
+            sandbox_mode: cockpit_proto::SandboxMode::from_enabled(!no_sandbox),
+            sandbox_intent: cockpit_proto::SandboxMode::from_enabled(!no_sandbox),
             container_network_enabled: false,
             container_availability: cockpit_proto::ContainerAvailability::unpublished(),
             host_capabilities: crate::tui::capability_gate::empty_capability_snapshot(),

@@ -4349,7 +4349,7 @@ mod image_submit_validation_tests {
 
     #[test]
     fn accepts_valid_png_under_limits() {
-        validate_pasted_images_for_submit(&[cockpit_core::engine::message::SubmissionImage::png(
+        validate_pasted_images_for_submit(&[cockpit_client::image_upload::SubmissionImage::png(
             sample_png(),
         )])
         .unwrap();
@@ -4359,7 +4359,7 @@ mod image_submit_validation_tests {
     fn rejects_too_many_images_before_dispatch() {
         let png = sample_png();
         let images = vec![
-            cockpit_core::engine::message::SubmissionImage::png(png);
+            cockpit_client::image_upload::SubmissionImage::png(png);
             cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE + 1
         ];
         let err = validate_pasted_images_for_submit(&images).expect_err("too many");
@@ -4368,7 +4368,7 @@ mod image_submit_validation_tests {
 
     #[test]
     fn rejects_oversized_single_image_before_dispatch() {
-        let images = vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+        let images = vec![cockpit_client::image_upload::SubmissionImage::png(vec![
             0u8;
             cockpit_proto::MAX_SINGLE_IMAGE_BYTES + 1
         ])];
@@ -4384,7 +4384,7 @@ mod image_submit_validation_tests {
         let total = cockpit_proto::MAX_TOTAL_IMAGE_BYTES;
         assert!(
             validate_pasted_image_sizes(&vec![
-                cockpit_core::engine::message::SubmissionImage::png(
+                cockpit_client::image_upload::SubmissionImage::png(
                     vec![1]
                 );
                 count
@@ -4393,7 +4393,7 @@ mod image_submit_validation_tests {
         );
         assert!(
             validate_pasted_image_sizes(&vec![
-                cockpit_core::engine::message::SubmissionImage::png(
+                cockpit_client::image_upload::SubmissionImage::png(
                     vec![1]
                 );
                 count + 1
@@ -4401,13 +4401,13 @@ mod image_submit_validation_tests {
             .is_err()
         );
         assert!(
-            validate_pasted_image_sizes(&[cockpit_core::engine::message::SubmissionImage::png(
+            validate_pasted_image_sizes(&[cockpit_client::image_upload::SubmissionImage::png(
                 vec![1; single]
             )])
             .is_ok()
         );
         assert!(
-            validate_pasted_image_sizes(&[cockpit_core::engine::message::SubmissionImage::png(
+            validate_pasted_image_sizes(&[cockpit_client::image_upload::SubmissionImage::png(
                 vec![1; single + 1]
             )])
             .is_err()
@@ -4415,15 +4415,15 @@ mod image_submit_validation_tests {
         let first = single.min(total);
         assert!(
             validate_pasted_image_sizes(&[
-                cockpit_core::engine::message::SubmissionImage::png(vec![1; first]),
-                cockpit_core::engine::message::SubmissionImage::png(vec![1; total - first]),
+                cockpit_client::image_upload::SubmissionImage::png(vec![1; first]),
+                cockpit_client::image_upload::SubmissionImage::png(vec![1; total - first]),
             ])
             .is_ok()
         );
         assert!(
             validate_pasted_image_sizes(&[
-                cockpit_core::engine::message::SubmissionImage::png(vec![1; first]),
-                cockpit_core::engine::message::SubmissionImage::png(vec![1; total - first + 1]),
+                cockpit_client::image_upload::SubmissionImage::png(vec![1; first]),
+                cockpit_client::image_upload::SubmissionImage::png(vec![1; total - first + 1]),
             ])
             .is_err()
         );
@@ -4431,7 +4431,7 @@ mod image_submit_validation_tests {
 
     #[test]
     fn rejects_malformed_png_before_dispatch() {
-        let images = vec![cockpit_core::engine::message::SubmissionImage::png(
+        let images = vec![cockpit_client::image_upload::SubmissionImage::png(
             b"not png".to_vec(),
         )];
         let err = validate_pasted_images_for_submit(&images).expect_err("invalid png");

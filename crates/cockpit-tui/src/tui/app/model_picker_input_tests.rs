@@ -189,7 +189,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
             text: "review expanded source\n\n<image>".to_string(),
             display_text: Some("review @src/model.rs with image".to_string()),
             tag_expansions: vec![tag.clone()],
-            images: vec![cockpit_core::engine::message::SubmissionImage::png(
+            images: vec![cockpit_client::image_upload::SubmissionImage::png(
                 png.into_inner(),
             )],
             forced_skill: Some("review".to_string()),
@@ -200,7 +200,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
             client_submissions: Vec::new(),
             pending_terminal_disposition: None,
             run_invocation_id: None,
-            queue_target: Some(cockpit_core::engine::message::QueueTarget {
+            queue_target: Some(cockpit_proto::QueueTarget {
                 id: "target-1".to_string(),
                 agent: "Build".to_string(),
                 depth: 1,
@@ -1728,7 +1728,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
                 active_agent: "Build".to_string(),
                 active_agent_path: vec!["Build".to_string()],
                 last_applied_seq: None,
-                foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+                foreground_target: Some(cockpit_proto::QueueTarget::root("Build")),
                 active_model_state: Some(attached_state.clone()),
                 project_id: "project".to_string(),
                 history: Vec::new(),
@@ -1972,7 +1972,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],
         last_applied_seq: None,
-        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        foreground_target: Some(cockpit_proto::QueueTarget::root("Build")),
         active_model_state: Some(cockpit_proto::ActiveModelState {
             selection: attached_selection.clone(),
             default_selection: Some(attached_selection.clone()),

@@ -1365,7 +1365,7 @@ mod tests {
         pane.apply_event(
             TurnEvent::AgentIdle {
                 turn_id: Some("side".to_string()),
-                reason: cockpit_core::engine::IdleReason::Completed,
+                reason: cockpit_proto::IdleReason::Completed,
             },
             true,
         );

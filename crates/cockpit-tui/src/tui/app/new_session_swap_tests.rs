@@ -207,7 +207,7 @@ fn complete_submission(index: usize) -> UserSubmission {
             detail: "complete".to_string(),
             ok: true,
         }],
-        images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+        images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
             index as u8,
             2,
             3,
@@ -221,7 +221,7 @@ fn complete_submission(index: usize) -> UserSubmission {
         client_submissions: Vec::new(),
         pending_terminal_disposition: None,
         run_invocation_id: None,
-        queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        queue_target: Some(cockpit_proto::QueueTarget::root("Build")),
     }
 }
 
@@ -297,7 +297,7 @@ async fn new_session_swap_failure_preserves_old_state_and_exact_staged_submissio
     app.side_conversation = Some(side_conversation(tmp.path()));
     app.launch.session_id = Some(old_session_id);
     app.launch.session_short_id = Some("old001".to_string());
-    app.foreground_input_target = Some(cockpit_core::engine::message::QueueTarget::root("Build"));
+    app.foreground_input_target = Some(cockpit_proto::QueueTarget::root("Build"));
 
     app.pending_new_session = true;
     let cleared = Arc::new(AtomicBool::new(false));
@@ -894,7 +894,7 @@ async fn new_session_swap_discards_old_epoch_events_while_provisional() {
             },
             TurnEvent::AgentIdle {
                 turn_id: None,
-                reason: cockpit_core::engine::IdleReason::Completed,
+                reason: cockpit_proto::IdleReason::Completed,
             },
             TurnEvent::InferenceFailed {
                 agent: "Build".into(),
@@ -1342,7 +1342,7 @@ async fn new_session_switch_outcome_adopts_identity_after_immediate_reset() {
             .attachment_epoch
             .store(2, std::sync::atomic::Ordering::Release);
     }
-    let foreground = cockpit_core::engine::message::QueueTarget::root("Build");
+    let foreground = cockpit_proto::QueueTarget::root("Build");
     let selection = cockpit_config::providers::ActiveModelRef {
         provider: "openai".into(),
         model: "gpt-test".into(),

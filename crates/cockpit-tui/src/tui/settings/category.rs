@@ -165,7 +165,7 @@ fn approval_mode_label(m: ApprovalMode) -> &'static str {
 }
 
 fn sandbox_mode_setting_value(
-    mode: cockpit_core::tools::sandbox_mode::SandboxMode,
+    mode: cockpit_proto::SandboxMode,
     caps: &cockpit_proto::HostCapabilitySnapshot,
 ) -> String {
     crate::tui::capability_gate::sandbox_mode_display(mode, caps)

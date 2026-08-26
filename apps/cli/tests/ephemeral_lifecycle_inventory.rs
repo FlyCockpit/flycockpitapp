@@ -441,6 +441,16 @@ fn path_ends(path: &syn::Path, name: &str) -> bool {
         .is_some_and(|segment| segment.ident == name)
 }
 
+fn path_is(path: &syn::Path, expected: &[&str]) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == expected.len()
+        && path
+            .segments
+            .iter()
+            .zip(expected)
+            .all(|(segment, expected)| segment.ident == *expected)
+}
+
 fn scoped_client_type(ty: &syn::Type, lifetime: &str) -> bool {
     let syn::Type::Path(path) = ty else {
         return false;
@@ -451,28 +461,51 @@ fn scoped_client_type(ty: &syn::Type, lifetime: &str) -> bool {
     let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
         return false;
     };
-    segment.ident == "ScopedDaemonClient"
+    path.path.segments.len() == 1
+        && segment.ident == "ScopedDaemonClient"
         && arguments.args.len() == 1
         && matches!(arguments.args.first(), Some(syn::GenericArgument::Lifetime(value)) if value.ident == lifetime)
 }
 
 fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
+    if runner.sig.asyncness.is_none()
+        || runner.sig.constness.is_some()
+        || runner.sig.unsafety.is_some()
+        || runner.sig.abi.is_some()
+        || runner.sig.inputs.len() != 2
+    {
+        return false;
+    }
+    let mut inputs = runner.sig.inputs.iter();
+    let exact_input = |input: Option<&syn::FnArg>, name: &str, ty: &str| {
+        matches!(input, Some(syn::FnArg::Typed(input))
+            if matches!(&*input.pat, syn::Pat::Ident(pattern)
+                if pattern.by_ref.is_none() && pattern.mutability.is_none()
+                    && pattern.subpat.is_none() && pattern.ident == name)
+                && matches!(&*input.ty, syn::Type::Path(path) if path.path.is_ident(ty)))
+    };
+    if !exact_input(inputs.next(), "mode", "OwnedSessionMode")
+        || !exact_input(inputs.next(), "operation", "F")
+    {
+        return false;
+    }
     let syn::ReturnType::Type(_, return_type) = &runner.sig.output else {
         return false;
     };
     let syn::Type::Path(return_path) = &**return_type else {
         return false;
     };
-    let Some(return_segment) = return_path.path.segments.last() else {
+    if !path_is(&return_path.path, &["std", "result", "Result"]) {
         return false;
-    };
+    }
+    let return_segment = return_path.path.segments.last().unwrap();
     let syn::PathArguments::AngleBracketed(return_arguments) = &return_segment.arguments else {
         return false;
     };
     if return_segment.ident != "Result"
         || return_arguments.args.len() != 2
         || !matches!(return_arguments.args.first(), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if value.path.is_ident("T"))
-        || !matches!(return_arguments.args.iter().nth(1), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if path_ends(&value.path, "OwnedDaemonRunError"))
+        || !matches!(return_arguments.args.iter().nth(1), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if value.path.is_ident("OwnedDaemonRunError"))
     {
         return false;
     }
@@ -512,6 +545,9 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
     let Some(syn::TypeParamBound::Trait(bound)) = predicate.bounds.first() else {
         return false;
     };
+    if !matches!(bound.modifier, syn::TraitBoundModifier::None) {
+        return false;
+    }
     let Some(lifetimes) = &bound.lifetimes else {
         return false;
     };
@@ -520,9 +556,10 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
     {
         return false;
     }
-    let Some(fn_once) = bound.path.segments.last() else {
+    if !path_is(&bound.path, &["std", "ops", "FnOnce"]) {
         return false;
-    };
+    }
+    let fn_once = bound.path.segments.last().unwrap();
     let syn::PathArguments::Parenthesized(arguments) = &fn_once.arguments else {
         return false;
     };
@@ -541,9 +578,10 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
     let syn::Type::Path(pin) = &**output else {
         return false;
     };
-    let Some(pin_segment) = pin.path.segments.last() else {
+    if !path_is(&pin.path, &["std", "pin", "Pin"]) {
         return false;
-    };
+    }
+    let pin_segment = pin.path.segments.last().unwrap();
     let syn::PathArguments::AngleBracketed(pin_arguments) = &pin_segment.arguments else {
         return false;
     };
@@ -554,9 +592,10 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
     if pin_segment.ident != "Pin" || pin_arguments.args.len() != 1 {
         return false;
     }
-    let Some(box_segment) = boxed.path.segments.last() else {
+    if !path_is(&boxed.path, &["std", "boxed", "Box"]) {
         return false;
-    };
+    }
+    let box_segment = boxed.path.segments.last().unwrap();
     let syn::PathArguments::AngleBracketed(box_arguments) = &box_segment.arguments else {
         return false;
     };
@@ -568,13 +607,21 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
     if box_segment.ident != "Box" || box_arguments.args.len() != 1 {
         return false;
     }
-    let has_client_lifetime = future.bounds.iter().any(
-        |bound| matches!(bound, syn::TypeParamBound::Lifetime(value) if value.ident == "client"),
-    );
-    let future_bound = future.bounds.iter().find_map(|bound| match bound {
-        syn::TypeParamBound::Trait(bound) if path_ends(&bound.path, "Future") => Some(bound),
+    if future.bounds.len() != 2 {
+        return false;
+    }
+    let has_client_lifetime = matches!(future.bounds.iter().nth(1),
+        Some(syn::TypeParamBound::Lifetime(value)) if value.ident == "client");
+    let future_bound = match future.bounds.first() {
+        Some(syn::TypeParamBound::Trait(bound))
+            if matches!(bound.modifier, syn::TraitBoundModifier::None)
+                && bound.lifetimes.is_none()
+                && path_is(&bound.path, &["std", "future", "Future"]) =>
+        {
+            Some(bound)
+        }
         _ => None,
-    });
+    };
     let output_is_result_t = future_bound.is_some_and(|bound| {
         let Some(segment) = bound.path.segments.last() else {
             return false;
@@ -582,15 +629,14 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
         let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
             return false;
         };
-        arguments.args.iter().any(|argument| match argument {
+        arguments.args.len() == 1 && arguments.args.iter().any(|argument| match argument {
             syn::GenericArgument::AssocType(output) if output.ident == "Output" => {
                 matches!(&output.ty, syn::Type::Path(result)
-                    if result.path.segments.last().is_some_and(|segment| {
-                        segment.ident == "Result"
-                            && matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments)
+                    if path_is(&result.path, &["anyhow", "Result"])
+                        && result.path.segments.last().is_some_and(|segment|
+                            matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments)
                                 if arguments.args.len() == 1
-                                    && matches!(arguments.args.first(), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if value.path.is_ident("T")))
-                    }))
+                                    && matches!(arguments.args.first(), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if value.path.is_ident("T")))))
             }
             _ => false,
         })
@@ -611,6 +657,34 @@ fn core_contract_violations(source: &str) -> Vec<String> {
     }
     let file = syn::parse_file(source).unwrap();
     let mut violations = Vec::new();
+    for item in &file.items {
+        let shadow = match item {
+            syn::Item::Mod(item) => Some(item.ident.to_string()),
+            syn::Item::Type(item) => Some(item.ident.to_string()),
+            syn::Item::ExternCrate(item) => item.rename.as_ref().map_or_else(
+                || Some(item.ident.to_string()),
+                |(_, name)| Some(name.to_string()),
+            ),
+            syn::Item::Use(item) => {
+                let mut inspection = UseInspection::default();
+                inspect_use(&item.tree, &mut inspection);
+                inspection
+                    .renamed
+                    .then(|| inspection.names.last().cloned())
+                    .flatten()
+            }
+            _ => None,
+        };
+        if shadow
+            .as_deref()
+            .is_some_and(|name| matches!(name, "std" | "anyhow"))
+        {
+            violations.push(format!(
+                "canonical lifecycle type root `{}` is shadowed",
+                shadow.unwrap()
+            ));
+        }
+    }
     let scoped = file.items.iter().find_map(|item| match item {
         syn::Item::Struct(item) if item.ident == "ScopedDaemonClient" => Some(item),
         _ => None,
@@ -694,6 +768,28 @@ fn core_contract_violations(source: &str) -> Vec<String> {
         if raw.0 {
             violations.push(format!(
                 "{} exposes raw daemon client authority in its signature",
+                method.sig.ident
+            ));
+        }
+        let expected = match method.sig.ident.to_string().as_str() {
+            "request" => {
+                r#"pub async fn request(&self, request: proto::Request) -> anyhow::Result<std::result::Result<proto::Response, proto::ErrorPayload>> { self.client.request(request).await }"#
+            }
+            "request_ok" => {
+                r#"pub async fn request_ok(&self, request: proto::Request) -> anyhow::Result<proto::Response> { self.client.request_ok(request).await }"#
+            }
+            "next_event" => {
+                r#"pub async fn next_event(&self) -> Option<proto::Event> { self.client.next_event().await }"#
+            }
+            "negotiated" => {
+                r#"pub fn negotiated(&self) -> &proto::NegotiatedProtocol { self.client.negotiated() }"#
+            }
+            _ => continue,
+        };
+        let expected = syn::parse_str::<syn::ImplItemFn>(expected).unwrap();
+        if compact_tokens(method) != compact_tokens(expected) {
+            violations.push(format!(
+                "{} signature or private-client delegation changed",
                 method.sig.ident
             ));
         }
@@ -1195,7 +1291,7 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
             "pub fn negotiated(&self) -> &proto::NegotiatedProtocol",
             "pub fn negotiated(&self) -> &DaemonClient",
         ),
-        ("for<'client> FnOnce(", "FnOnce("),
+        ("for<'client> std::ops::FnOnce(", "std::ops::FnOnce("),
         ("+ 'client>", "+ 'static>"),
         ("std::pin::Pin<", "crate::EvilPin<"),
         (
@@ -1206,12 +1302,40 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
             "std::result::Result<T, OwnedDaemonRunError>",
             "std::result::Result<T, OwnedDaemonRunError, anyhow::Error>",
         ),
+        (
+            "pub fn negotiated(&self) -> &proto::NegotiatedProtocol {\n        self.client.negotiated()\n    }",
+            "pub fn negotiated(&self) -> impl std::any::Any + Clone {\n        self.client.clone()\n    }",
+        ),
+        ("std::pin::Pin<", "evil::Pin<"),
+        ("std::boxed::Box<", "evil::Box<"),
+        ("std::future::Future", "evil::Future"),
+        ("std::ops::FnOnce", "evil::FnOnce"),
+        ("anyhow::Result<T>", "evil::Result<T>"),
+        (
+            "std::result::Result<T, OwnedDaemonRunError>",
+            "evil::Result<T, OwnedDaemonRunError>",
+        ),
     ] {
         let adversarial = source.replacen(before, after, 1);
         assert_ne!(adversarial, source, "fixture seam exists: {before}");
         assert!(
             !core_contract_violations(&adversarial).is_empty(),
             "accepted weakened scoped capability contract: {after}"
+        );
+    }
+
+    for addition in [
+        "mod std {}",
+        "mod anyhow {}",
+        "use evil as std;",
+        "use evil as anyhow;",
+        "type std = evil::Std;",
+        "type anyhow = evil::Anyhow;",
+    ] {
+        let adversarial = format!("{source}\n{addition}");
+        assert!(
+            !core_contract_violations(&adversarial).is_empty(),
+            "accepted canonical lifecycle path shadow: {addition}"
         );
     }
 

@@ -242,11 +242,11 @@ impl ScopedDaemonClient<'_> {
     pub async fn request(
         &self,
         request: proto::Request,
-    ) -> Result<std::result::Result<proto::Response, proto::ErrorPayload>> {
+    ) -> anyhow::Result<std::result::Result<proto::Response, proto::ErrorPayload>> {
         self.client.request(request).await
     }
 
-    pub async fn request_ok(&self, request: proto::Request) -> Result<proto::Response> {
+    pub async fn request_ok(&self, request: proto::Request) -> anyhow::Result<proto::Response> {
         self.client.request_ok(request).await
     }
 
@@ -272,11 +272,11 @@ pub async fn run_owned_daemon<T, F>(
     operation: F,
 ) -> std::result::Result<T, OwnedDaemonRunError>
 where
-    F: for<'client> FnOnce(
-        ScopedDaemonClient<'client>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<T>> + 'client>,
-    >,
+    F: for<'client> std::ops::FnOnce(
+            ScopedDaemonClient<'client>,
+        ) -> std::pin::Pin<
+            std::boxed::Box<dyn std::future::Future<Output = anyhow::Result<T>> + 'client>,
+        >,
 {
     let session = OwnedDaemonSession::connect(mode)
         .await

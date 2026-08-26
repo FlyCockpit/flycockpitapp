@@ -131,10 +131,10 @@ use cockpit_client::presentation::{
 };
 use cockpit_client::submission::ClientUserSubmission;
 use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
-use cockpit_core::git::{self, RepoStatus};
-use cockpit_core::welcome::{self, LaunchBundle, LaunchInfo};
+use cockpit_core::git;
+use cockpit_core::welcome;
 use cockpit_proto::QueueItem as QueuedUserMessage;
-use cockpit_proto::QueueTarget;
+use cockpit_proto::{LaunchBundle, LaunchInfo, QueueTarget, RepoStatus};
 pub(super) use history_log::{DirtyScan, HistoryEntryId, HistoryLog};
 pub(super) use history_window::HistoryWindow;
 #[cfg(test)]

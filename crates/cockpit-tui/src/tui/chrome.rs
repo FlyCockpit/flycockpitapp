@@ -19,7 +19,7 @@ use crate::tui::theme::{
 };
 use cockpit_config::{extended::LlmMode, sandbox_mode::SandboxMode};
 use cockpit_core::git::repo_counts;
-use cockpit_core::welcome::LaunchInfo;
+use cockpit_proto::LaunchInfo;
 #[cfg(feature = "remote")]
 use cockpit_proto::{ConnectorDisclosure, OrgSyncDisclosure};
 
@@ -359,7 +359,7 @@ mod tests {
 
     fn launch_info(agent: &str) -> LaunchInfo {
         LaunchInfo {
-            version: "test",
+            version: "test".to_string(),
             session_id: None,
             session_short_id: None,
             provider_line: String::new(),

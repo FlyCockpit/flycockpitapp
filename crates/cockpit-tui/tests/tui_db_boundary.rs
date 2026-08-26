@@ -495,6 +495,9 @@ fn production_uses_cockpit_proto_directly() {
                 "cockpit_core::engine::TurnEvent",
                 "cockpit_core::jitter::JitterSource",
                 "cockpit_core::jitter::SystemJitter",
+                "cockpit_core::git::RepoStatus",
+                "cockpit_core::welcome::LaunchBundle",
+                "cockpit_core::welcome::LaunchInfo",
                 "cockpit_core::tokens::TokenUsage",
                 "cockpit_core::engine::model::InferenceErrorClass",
                 "cockpit_core::engine::message::QueueItemStatus",
@@ -611,6 +614,9 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::engine::TurnEvent"
                     || imported == "cockpit_core::jitter::JitterSource"
                     || imported == "cockpit_core::jitter::SystemJitter"
+                    || imported == "cockpit_core::git::RepoStatus"
+                    || imported == "cockpit_core::welcome::LaunchBundle"
+                    || imported == "cockpit_core::welcome::LaunchInfo"
                     || imported == "cockpit_core::tokens::TokenUsage"
                     || imported == "cockpit_core::engine::model::InferenceErrorClass"
                     || imported == "cockpit_core::engine::message::QueueItemStatus"

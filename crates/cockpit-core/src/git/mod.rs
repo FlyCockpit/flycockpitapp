@@ -9,13 +9,7 @@ use std::process::{Command, Output};
 
 use anyhow::{Context, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoStatus {
-    pub branch: String,
-    pub staged: u32,
-    pub unstaged: u32,
-    pub unpushed: u32,
-}
+pub use cockpit_proto::RepoStatus;
 
 /// Compact staged/unstaged/unpushed counts for branch chrome and startup
 /// welcome text.

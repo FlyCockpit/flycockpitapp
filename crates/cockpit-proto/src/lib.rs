@@ -59,12 +59,14 @@ pub use config_management::{
 pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
+pub mod launch;
 pub mod provider_management;
 pub use host_capabilities::{
     CatalogDependencyImportance, CatalogDependencyRow, CatalogDependencyState,
     CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,
     SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
 };
+pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
     ProviderMutationUpsert, ProviderSecretValue,

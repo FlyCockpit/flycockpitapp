@@ -907,15 +907,6 @@ impl App {
     }
 
     pub(super) fn apply_async_action_result(&mut self, result: AsyncActionResult) {
-        if matches!(
-            result.kind,
-            AsyncActionKind::DaemonRpc("resources.snapshot" | "resources.promote")
-        ) {
-            if self.pending_resource_action != Some(result.id) {
-                return;
-            }
-            self.pending_resource_action = None;
-        }
         if result.presentation_stale && !stale_completion_requires_reducer(&result.kind) {
             // The runner has consumed the terminal completion and released its
             // process authority. Nothing in these handlers owns additional
@@ -2906,7 +2897,7 @@ impl App {
 
     pub(super) fn start_resources_snapshot_action(&mut self) {
         let lifecycle = self.lifecycle.clone();
-        let start = self.async_actions.start_serialized(
+        self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.snapshot"),
             AsyncActionKey::new("resources.projection"),
             async {
@@ -2922,14 +2913,13 @@ impl App {
                 .map_err(|error| format!("resources.snapshot worker failed: {error}"))?
             },
         );
-        self.pending_resource_action = Some(start.id());
     }
 
     pub(super) fn start_resource_promote_action(&mut self, request_id: String) {
         let session_id = self.current_session_id();
         let request = crate::tui::agent_runner::promote_resource_request(request_id, session_id);
         let lifecycle = self.lifecycle.clone();
-        let start = self.async_actions.start_serialized(
+        self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.promote"),
             AsyncActionKey::new("resources.projection"),
             async move {
@@ -2951,7 +2941,6 @@ impl App {
                 .map_err(|error| format!("resources.promote worker failed: {error}"))?
             },
         );
-        self.pending_resource_action = Some(start.id());
     }
 
     pub(super) fn start_resources_outcome(

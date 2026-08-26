@@ -2807,7 +2807,7 @@ mod resource_button_dispatch_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn stale_resource_completion_cannot_regress_newer_projection() {
+    async fn earlier_fifo_success_survives_later_resource_failure() {
         let mut pane = ResourcesPane::open();
         pane.apply_snapshot_result(Ok(scheduler_snapshot(&["rs-first", "rs-clicked"])));
         let mut app = App::new(None, false);
@@ -2831,29 +2831,66 @@ mod resource_button_dispatch_tests {
             presentation_stale: false,
             payload: Ok(AsyncActionPayload::PromoteResource {
                 status: cockpit_proto::ResourcePromoteStatus::Promoted,
-                message: "stale".to_string(),
-                snapshot: scheduler_snapshot(&["stale"]),
+                message: "first applied".to_string(),
+                snapshot: scheduler_snapshot(&["first-applied"]),
             }),
         });
         let Overlay::Resources(pane) = &app.overlay else {
             panic!("resources overlay")
         };
-        assert_eq!(pane.queued_display_ids(), ["rs-first", "rs-clicked"]);
+        assert_eq!(pane.queued_display_ids(), ["first-applied"]);
 
         app.apply_async_action_result(AsyncActionResult {
             id: ids[1],
             kind: AsyncActionKind::DaemonRpc("resources.promote"),
             presentation_stale: false,
-            payload: Ok(AsyncActionPayload::PromoteResource {
-                status: cockpit_proto::ResourcePromoteStatus::Promoted,
-                message: "fresh".to_string(),
-                snapshot: scheduler_snapshot(&["fresh"]),
-            }),
+            payload: Err("later mutation failed".to_string()),
         });
         let Overlay::Resources(pane) = &app.overlay else {
             panic!("resources overlay")
         };
-        assert_eq!(pane.queued_display_ids(), ["fresh"]);
+        assert_eq!(pane.queued_display_ids(), ["first-applied"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serialized_read_success_survives_following_mutation_failure() {
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Resources(ResourcesPane::open());
+        app.start_resources_snapshot_action();
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: "not-yet-rendered".to_string(),
+        });
+        // A button for an absent stable id is rejected before RPC enqueue.
+        assert_eq!(app.async_actions.pending_ids().len(), 1);
+
+        let Overlay::Resources(pane) = &mut app.overlay else {
+            panic!("resources overlay")
+        };
+        pane.apply_snapshot_result(Ok(scheduler_snapshot(&["rs-clicked"])));
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: "rs-clicked".to_string(),
+        });
+        let ids = app.async_actions.pending_ids();
+        assert_eq!(ids.len(), 2, "read and mutation must share the FIFO lane");
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: ids[0],
+            kind: AsyncActionKind::DaemonRpc("resources.snapshot"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ResourceSnapshot(scheduler_snapshot(&[
+                "read-applied",
+            ]))),
+        });
+        app.apply_async_action_result(AsyncActionResult {
+            id: ids[1],
+            kind: AsyncActionKind::DaemonRpc("resources.promote"),
+            presentation_stale: false,
+            payload: Err("mutation failed".to_string()),
+        });
+        let Overlay::Resources(pane) = &app.overlay else {
+            panic!("resources overlay")
+        };
+        assert_eq!(pane.queued_display_ids(), ["read-applied"]);
     }
 }
 

@@ -94,13 +94,14 @@ use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
 use cockpit_host::daemon_lifecycle::write_pid_file;
 #[cfg(any(unix, test))]
 use cockpit_host::daemon_lifecycle::{
-    DaemonPidReceipt, ForegroundMetadataGuard, PidIdentity, remove_metadata_if_receipt_matches,
+    DaemonPidReceipt, ForegroundMetadataGuard, PidIdentity, retire_metadata_if_receipt_matches,
+    with_lifecycle_lock,
 };
 use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record, read_pid_file};
 #[cfg(target_os = "linux")]
 use cockpit_host::daemon_lifecycle::{VerifiedProcessOutcome, acquire_verified_daemon_process};
 #[cfg(unix)]
-use cockpit_host::daemon_lifecycle::{legacy_pid_identity, verify_cockpit_daemon_pid_identity};
+use cockpit_host::daemon_lifecycle::{legacy_pid_identity, verify_cockpit_daemon_receipt_identity};
 #[cfg(all(test, unix))]
 use cockpit_host::daemon_lifecycle::{parse_macos_procargs2, split_proc_cmdline};
 use cockpit_host::private_fs::ensure_private_dir;
@@ -177,9 +178,8 @@ pub struct DaemonPaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonEndpointRecord {
     version: u8,
-    pid: u32,
     socket: PathBuf,
-    executable: PathBuf,
+    receipt: DaemonPidReceipt,
     kind: DaemonEndpointKind,
 }
 
@@ -259,7 +259,7 @@ fn read_bound_endpoint_record_from(
     let DaemonPidRecord::Receipt(receipt) = read_daemon_pid_record(&canonical.pid_file)? else {
         return None;
     };
-    (record.pid == receipt.pid && record.executable == receipt.executable).then_some(record)
+    (record.receipt == receipt).then_some(record)
 }
 
 #[cfg(any(unix, test))]
@@ -288,13 +288,6 @@ fn write_endpoint_record_with_receipt_and_canonical(
             paths.socket.display()
         );
     }
-    let record = DaemonEndpointRecord {
-        version: 1,
-        pid: receipt.pid,
-        socket: paths.socket.clone(),
-        executable: receipt.executable.clone(),
-        kind: DaemonEndpointKind::Persistent,
-    };
     let Some(state) = paths.pid_file.parent() else {
         anyhow::bail!(
             "daemon pid file has no parent: {}",
@@ -302,8 +295,22 @@ fn write_endpoint_record_with_receipt_and_canonical(
         );
     };
     let path = endpoint_file_for_state(state);
-    let data = serde_json::to_vec_pretty(&record).context("serializing daemon endpoint")?;
-    std::fs::write(&path, data).with_context(|| format!("writing {}", path.display()))
+    with_lifecycle_lock(&paths.pid_file, || {
+        if read_daemon_pid_record(&paths.pid_file)
+            != Some(DaemonPidRecord::Receipt(receipt.clone()))
+        {
+            anyhow::bail!("daemon PID receipt changed before endpoint publication");
+        }
+        let record = DaemonEndpointRecord {
+            version: 1,
+            socket: paths.socket.clone(),
+            receipt: receipt.clone(),
+            kind: DaemonEndpointKind::Persistent,
+        };
+        let data = serde_json::to_vec_pretty(&record).context("serializing daemon endpoint")?;
+        cockpit_host::private_fs::write_private_file(&path, &data)
+            .with_context(|| format!("writing {}", path.display()))
+    })
 }
 
 impl DaemonPaths {
@@ -686,9 +693,7 @@ fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
         return DaemonStatus::Stale;
     };
     let identity = match record {
-        DaemonPidRecord::Receipt(receipt) => {
-            verify_cockpit_daemon_pid_identity(receipt.pid, &receipt.executable)
-        }
+        DaemonPidRecord::Receipt(receipt) => verify_cockpit_daemon_receipt_identity(&receipt),
         DaemonPidRecord::LegacyNumeric(pid) => legacy_pid_identity(pid),
     };
     status_for_pid_identity(identity)
@@ -1580,7 +1585,7 @@ async fn run_foreground_inner_with_boot_db(
     // Cleanup on every path, but only while the pid file still names this
     // process. A restart replacement may have taken ownership of the shared
     // canonical paths before the old daemon finishes draining.
-    metadata_guard.cleanup();
+    metadata_guard.cleanup()?;
 
     signal_task.abort();
     if let Some(watchdog) = watchdog_task {
@@ -1721,7 +1726,7 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
     let process = match acquire_verified_daemon_process(&receipt) {
         VerifiedProcessOutcome::Verified(process) => process,
         VerifiedProcessOutcome::Identity(PidIdentity::Missing | PidIdentity::NotDaemon) => {
-            cleanup_receipt_metadata(paths, &receipt);
+            cleanup_receipt_metadata(paths, &receipt)?;
             return Ok(false);
         }
         VerifiedProcessOutcome::Identity(PidIdentity::Unverified) => {
@@ -1729,12 +1734,18 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
         }
         VerifiedProcessOutcome::Identity(PidIdentity::VerifiedDaemon) => unreachable!(),
     };
-    process.send_sigterm().with_context(|| {
-        format!(
-            "signaling daemon PID {} through its stable pidfd",
-            receipt.pid
-        )
-    })?;
+    if let Err(error) = process.send_sigterm() {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            cleanup_receipt_metadata(paths, &receipt)?;
+            return Ok(true);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "signaling daemon PID {} through its stable pidfd",
+                receipt.pid
+            )
+        });
+    }
     let deadline = std::time::Instant::now() + restart_release_timeout(None);
     loop {
         if read_daemon_pid_record(&paths.pid_file)
@@ -1761,7 +1772,7 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
             receipt.pid
         ),
     }
-    cleanup_receipt_metadata(paths, &receipt);
+    cleanup_receipt_metadata(paths, &receipt)?;
     Ok(true)
 }
 
@@ -1770,9 +1781,9 @@ fn stop_unix_without_stable_handle(paths: &DaemonPaths, record: DaemonPidRecord)
     match record {
         DaemonPidRecord::LegacyNumeric(pid) => settle_legacy_stop(paths, pid),
         DaemonPidRecord::Receipt(receipt) => {
-            match verify_cockpit_daemon_pid_identity(receipt.pid, &receipt.executable) {
+            match verify_cockpit_daemon_receipt_identity(&receipt) {
                 PidIdentity::Missing | PidIdentity::NotDaemon => {
-                    cleanup_receipt_metadata(paths, &receipt);
+                    cleanup_receipt_metadata(paths, &receipt)?;
                     Ok(false)
                 }
                 PidIdentity::VerifiedDaemon | PidIdentity::Unverified => anyhow::bail!(
@@ -1788,7 +1799,7 @@ fn stop_unix_without_stable_handle(paths: &DaemonPaths, record: DaemonPidRecord)
 fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
     match legacy_pid_identity(pid) {
         PidIdentity::Missing => {
-            remove_dead_legacy_metadata(&paths.pid_file, &paths.socket, pid);
+            remove_dead_legacy_metadata(&paths.pid_file, &paths.socket, pid)?;
             Ok(false)
         }
         PidIdentity::VerifiedDaemon | PidIdentity::NotDaemon | PidIdentity::Unverified => {
@@ -1800,26 +1811,15 @@ fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn cleanup_receipt_metadata(paths: &DaemonPaths, receipt: &DaemonPidReceipt) {
-    if !remove_metadata_if_receipt_matches(&paths.pid_file, &paths.socket, receipt) {
-        return;
-    }
-    if paths.ephemeral {
-        return;
-    }
-    let Some(state) = paths.pid_file.parent() else {
-        return;
+fn cleanup_receipt_metadata(paths: &DaemonPaths, receipt: &DaemonPidReceipt) -> Result<bool> {
+    let endpoint = if paths.ephemeral {
+        None
+    } else {
+        Some(endpoint_file_for_state(
+            paths.pid_file.parent().context("PID file has no parent")?,
+        ))
     };
-    let endpoint = endpoint_file_for_state(state);
-    let Some(record) = read_endpoint_record_from(&endpoint) else {
-        return;
-    };
-    if record.pid == receipt.pid
-        && record.socket == paths.socket
-        && record.executable == receipt.executable
-    {
-        let _ = std::fs::remove_file(endpoint);
-    }
+    retire_metadata_if_receipt_matches(&paths.pid_file, &paths.socket, endpoint.as_deref(), receipt)
 }
 
 #[cfg(all(test, unix))]
@@ -2053,9 +2053,8 @@ mod tests {
         std::fs::write(&paths.pid_file, "999999999").expect("pid file");
         let record = DaemonEndpointRecord {
             version: 1,
-            pid: 999999999,
             socket: runtime_dir.join("other/cockpit.sock"),
-            executable: test_pid_receipt(999999999).executable,
+            receipt: test_pid_receipt(999999999),
             kind: DaemonEndpointKind::Persistent,
         };
         let endpoint = endpoint_file_for_state(paths.pid_file.parent().unwrap());
@@ -2084,9 +2083,11 @@ mod tests {
         let endpoint = endpoint_file_for_state(paths.pid_file.parent().unwrap());
         let record = DaemonEndpointRecord {
             version: 1,
-            pid: receipt.pid,
             socket: paths.socket.clone(),
-            executable: paths.pid_file.clone(),
+            receipt: DaemonPidReceipt {
+                executable: paths.pid_file.clone(),
+                ..receipt
+            },
             kind: DaemonEndpointKind::Persistent,
         };
         std::fs::write(&endpoint, serde_json::to_vec(&record).unwrap()).expect("endpoint");
@@ -2161,7 +2162,7 @@ mod tests {
         .expect("noncanonical pid file");
         let mut guard =
             ForegroundMetadataGuard::new(noncanonical.pid_file, noncanonical.socket, None, receipt);
-        guard.cleanup();
+        guard.cleanup().expect("guard cleanup");
 
         assert!(
             endpoint.exists(),
@@ -2642,6 +2643,11 @@ mod tests {
         DaemonPidReceipt {
             pid,
             executable: std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+            process_start: cockpit_host::daemon_lifecycle::ProcessStartIdentity {
+                primary: 0,
+                secondary: 0,
+            },
+            publication_nonce: [0; 32],
         }
     }
 
@@ -2668,11 +2674,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         let executable = std::env::current_exe().unwrap();
-        let old = write_pid_file(&paths.pid_file, 123, &executable).unwrap();
-        let replacement = write_pid_file(&paths.pid_file, 456, &executable).unwrap();
+        let old = write_pid_file(&paths.pid_file, std::process::id(), &executable).unwrap();
+        let replacement = write_pid_file(&paths.pid_file, std::process::id(), &executable).unwrap();
         std::fs::write(&paths.socket, "replacement socket").unwrap();
 
-        cleanup_receipt_metadata(&paths, &old);
+        cleanup_receipt_metadata(&paths, &old).unwrap();
 
         assert_eq!(
             read_daemon_pid_record(&paths.pid_file),

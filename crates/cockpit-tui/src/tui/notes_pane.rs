@@ -1136,7 +1136,7 @@ impl Pane for NotesPane {
     }
 }
 
-fn cursor_follow_hscroll(line: &str, cursor_col: usize, current: usize, width: usize) -> usize {
+fn cursor_follow_hscroll(line: &str, cursor_col: usize, _current: usize, width: usize) -> usize {
     let width = width.max(1);
     let graphemes = markdown::semantic_graphemes(line);
     let mut column = 0usize;
@@ -1153,13 +1153,10 @@ fn cursor_follow_hscroll(line: &str, cursor_col: usize, current: usize, width: u
     let required = cursor_col
         .saturating_add(cursor_width)
         .saturating_sub(width);
-    let desired = if cursor_col < current {
-        cursor_col
-    } else if required > current {
-        required
-    } else {
-        current
-    };
+    // There is no manual horizontal mode: choose the smallest aligned origin
+    // that exposes the full cursor grapheme, revealing more left context as
+    // soon as a resize or edit makes it possible.
+    let desired = required;
     boundaries
         .into_iter()
         .find(|boundary| *boundary >= desired)

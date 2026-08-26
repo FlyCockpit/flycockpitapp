@@ -53,6 +53,46 @@ pub fn display_width_char(ch: char) -> usize {
     ch.width().unwrap_or(0)
 }
 
+fn semantic_boundaries(text: &str) -> Vec<usize> {
+    let mut offset = 0usize;
+    let mut boundaries = vec![0];
+    for grapheme in crate::tui::markdown::semantic_graphemes(text) {
+        offset += grapheme.len();
+        boundaries.push(offset);
+    }
+    boundaries
+}
+
+fn semantic_boundary_at_or_before(text: &str, byte: usize) -> usize {
+    semantic_boundaries(text)
+        .into_iter()
+        .take_while(|boundary| *boundary <= byte)
+        .last()
+        .unwrap_or(0)
+}
+
+fn semantic_boundary_at_or_after(text: &str, byte: usize) -> usize {
+    semantic_boundaries(text)
+        .into_iter()
+        .find(|boundary| *boundary >= byte)
+        .unwrap_or(text.len())
+}
+
+fn semantic_boundary_before(text: &str, byte: usize) -> usize {
+    semantic_boundaries(text)
+        .into_iter()
+        .take_while(|boundary| *boundary < byte)
+        .last()
+        .unwrap_or(0)
+}
+
+fn semantic_boundary_after(text: &str, byte: usize) -> usize {
+    semantic_boundaries(text)
+        .into_iter()
+        .find(|boundary| *boundary > byte)
+        .unwrap_or(text.len())
+}
+
 pub fn truncate_display_width(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -657,7 +697,7 @@ impl Composer {
         while p > 0 && !self.buffer.is_char_boundary(p) {
             p -= 1;
         }
-        self.cursor = p;
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, p);
     }
 
     /// Insert a whole string at the cursor and advance past it. Used by
@@ -690,7 +730,10 @@ impl Composer {
         prefix: usize,
         inner_width: usize,
     ) {
-        self.cursor = byte_for_visual_position(&self.buffer, row, col, prefix, inner_width);
+        self.cursor = semantic_boundary_at_or_before(
+            &self.buffer,
+            byte_for_visual_position(&self.buffer, row, col, prefix, inner_width),
+        );
     }
 
     pub fn is_empty(&self) -> bool {
@@ -731,11 +774,7 @@ impl Composer {
         if self.cursor == 0 {
             return;
         }
-        let previous = self.buffer[..self.cursor]
-            .char_indices()
-            .last()
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        let previous = semantic_boundary_before(&self.buffer, self.cursor);
         self.buffer.drain(previous..self.cursor);
         self.cursor = previous;
     }
@@ -744,7 +783,9 @@ impl Composer {
     /// `start`. Used by the whole-`@`-tag delete (the range comes from a
     /// tag-boundary scan, so it is always on char boundaries).
     pub fn delete_range(&mut self, start: usize, end: usize) {
-        if start >= end || end > self.buffer.len() {
+        let start = semantic_boundary_at_or_before(&self.buffer, start.min(self.buffer.len()));
+        let end = semantic_boundary_at_or_after(&self.buffer, end.min(self.buffer.len()));
+        if start >= end {
             return;
         }
         self.buffer.drain(start..end);
@@ -755,32 +796,22 @@ impl Composer {
         if self.cursor >= self.buffer.len() {
             return;
         }
-        let next_len = self.buffer[self.cursor..]
-            .chars()
-            .next()
-            .map(char::len_utf8)
-            .unwrap_or(0);
-        self.buffer.drain(self.cursor..self.cursor + next_len);
+        let next = semantic_boundary_after(&self.buffer, self.cursor);
+        self.buffer.drain(self.cursor..next);
     }
 
     pub fn move_left(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        self.cursor = self.buffer[..self.cursor]
-            .char_indices()
-            .last()
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        self.cursor = semantic_boundary_before(&self.buffer, self.cursor);
     }
 
     pub fn move_right(&mut self) {
         if self.cursor >= self.buffer.len() {
             return;
         }
-        if let Some(next) = self.buffer[self.cursor..].chars().next() {
-            self.cursor += next.len_utf8();
-        }
+        self.cursor = semantic_boundary_after(&self.buffer, self.cursor);
     }
 
     pub fn move_up(&mut self) {
@@ -797,7 +828,10 @@ impl Composer {
             .unwrap_or(0);
         let prev_line = &self.buffer[prev_line_start..prev_line_end];
         let target_byte = byte_for_display_col(prev_line, col);
-        self.cursor = prev_line_start + target_byte;
+        self.cursor = semantic_boundary_at_or_before(
+            &self.buffer,
+            prev_line_start.saturating_add(target_byte),
+        );
     }
 
     pub fn move_down(&mut self) {
@@ -815,7 +849,10 @@ impl Composer {
             .unwrap_or(buf.len());
         let next_line = &buf[next_line_start..next_line_end];
         let target_byte = byte_for_display_col(next_line, col);
-        self.cursor = next_line_start + target_byte;
+        self.cursor = semantic_boundary_at_or_before(
+            &self.buffer,
+            next_line_start.saturating_add(target_byte),
+        );
     }
 
     pub fn move_line_start(&mut self) {
@@ -856,6 +893,11 @@ impl Composer {
     /// whitespace boundaries only; `big_word=false` for `w` — also
     /// stops at punctuation transitions.
     pub fn move_word_forward(&mut self, big_word: bool) {
+        self.move_word_forward_scalar(big_word);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+    }
+
+    fn move_word_forward_scalar(&mut self, big_word: bool) {
         let bytes = self.buffer.as_bytes();
         let n = bytes.len();
         if self.cursor >= n {
@@ -994,6 +1036,11 @@ impl Composer {
 
     /// Vim word-backward (`b`/`B`).
     pub fn move_word_backward(&mut self, big_word: bool) {
+        self.move_word_backward_scalar(big_word);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+    }
+
+    fn move_word_backward_scalar(&mut self, big_word: bool) {
         if self.cursor == 0 {
             return;
         }
@@ -1042,6 +1089,11 @@ impl Composer {
     /// the last char of the word (inclusive), so an operator over `e`
     /// includes that char.
     pub fn move_word_end(&mut self, big_word: bool) {
+        self.move_word_end_scalar(big_word);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+    }
+
+    fn move_word_end_scalar(&mut self, big_word: bool) {
         let chars: Vec<(usize, char)> = self.buffer.char_indices().collect();
         // Index of the char the cursor sits on.
         let Some(mut i) = chars.iter().position(|(b, _)| *b >= self.cursor) else {
@@ -1075,6 +1127,11 @@ impl Composer {
     /// Vim `ge`/`gE` — move backward to the end of the previous word.
     /// Lands on the last char of that word.
     pub fn move_word_end_backward(&mut self, big_word: bool) {
+        self.move_word_end_backward_scalar(big_word);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+    }
+
+    fn move_word_end_backward_scalar(&mut self, big_word: bool) {
         if self.cursor == 0 {
             return;
         }
@@ -1274,7 +1331,9 @@ impl Composer {
     /// path also populates the register, per vim). Leaves the cursor at
     /// `start` clamped to a char boundary. `linewise` records the kind.
     pub fn cut_range(&mut self, start: usize, end: usize, linewise: bool) {
-        if start >= end || end > self.buffer.len() {
+        let start = semantic_boundary_at_or_before(&self.buffer, start.min(self.buffer.len()));
+        let end = semantic_boundary_at_or_after(&self.buffer, end.min(self.buffer.len()));
+        if start >= end {
             return;
         }
         let mut text = self.buffer[start..end].to_string();
@@ -1607,6 +1666,12 @@ impl Composer {
     /// is **not** consumed (returns `false`) so an embedding dialog can use it
     /// to leave edit mode.
     pub fn handle_vim_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        let handled = self.handle_vim_key_inner(key);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+        handled
+    }
+
+    fn handle_vim_key_inner(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
         if !self.vim_enabled {
             return self.handle_insert_key(key);
@@ -2235,6 +2300,57 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
+    }
+
+    #[test]
+    fn semantic_grapheme_motion_and_deletion_are_atomic() {
+        let family = "👨‍👩‍👧‍👦";
+        let combining = "e\u{301}";
+        let text = format!("a{family}{combining}z");
+        let family_start = 1;
+        let family_end = family_start + family.len();
+        let combining_end = family_end + combining.len();
+        let mut composer = Composer::new(false);
+        composer.set(text.clone());
+        composer.set_cursor(family_start);
+
+        composer.move_right();
+        assert_eq!(composer.cursor(), family_end);
+        composer.move_right();
+        assert_eq!(composer.cursor(), combining_end);
+        composer.move_left();
+        assert_eq!(composer.cursor(), family_end);
+        composer.move_left();
+        assert_eq!(composer.cursor(), family_start);
+
+        composer.delete_right();
+        assert_eq!(composer.text(), format!("a{combining}z"));
+        assert_eq!(composer.cursor(), family_start);
+        composer.move_right();
+        composer.delete_left();
+        assert_eq!(composer.text(), "az");
+        assert_eq!(composer.cursor(), family_start);
+    }
+
+    #[test]
+    fn semantic_grapheme_insert_mode_keys_never_expose_interior_bytes() {
+        let family = "👩‍💻";
+        let combining = "e\u{301}";
+        let mut composer = Composer::new(false);
+        composer.set(format!("{family}{combining}"));
+        composer.set_cursor(1);
+        assert_eq!(composer.cursor(), 0, "explicit cursor snaps before family");
+
+        assert!(composer.handle_vim_key(key(KeyCode::Right)));
+        assert_eq!(composer.cursor(), family.len());
+        assert!(composer.handle_vim_key(key(KeyCode::Char('X'))));
+        assert_eq!(composer.text(), format!("{family}X{combining}"));
+        assert_eq!(composer.cursor(), family.len() + 1);
+        assert!(composer.handle_vim_key(key(KeyCode::Delete)));
+        assert_eq!(composer.text(), format!("{family}X"));
+        assert!(composer.handle_vim_key(key(KeyCode::Backspace)));
+        assert_eq!(composer.text(), family);
+        assert_eq!(composer.cursor(), family.len());
     }
 
     #[test]

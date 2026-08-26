@@ -3289,12 +3289,22 @@ pub(crate) fn register_in_process_context(ctx: Arc<DaemonContext>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     contexts.insert(ctx.paths.socket.clone(), Arc::downgrade(&ctx));
-    let endpoint = ctx.paths.socket.clone();
-    let weak = Arc::downgrade(&ctx);
-    cockpit_client::register_in_process_connector(
-        endpoint,
-        Arc::new(move || weak.upgrade().map(spawn_in_process_client)),
-    );
+}
+
+pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::InProcessEndpoint {
+    let (connections, mut requests) = mpsc::channel(16);
+    let weak = Arc::downgrade(ctx);
+    tokio::spawn(async move {
+        while let Some(reply) = requests.recv().await {
+            let connection = weak.upgrade().map(spawn_in_process_client);
+            let retired = connection.is_none();
+            let _ = reply.send(connection);
+            if retired {
+                break;
+            }
+        }
+    });
+    cockpit_client::InProcessEndpoint::new(connections)
 }
 
 pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {

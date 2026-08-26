@@ -49,6 +49,7 @@ pub enum LifecycleMode {
 /// means "you spawned this daemon, so stop it on your way out."
 pub struct ConnectedDaemon {
     pub client: DaemonClient,
+    pub endpoint: cockpit_client::ClientEndpoint,
     pub owns_daemon: bool,
     pub socket: PathBuf,
     pub startup_notice: Option<String>,
@@ -81,6 +82,49 @@ pub async fn ensure_persistent_daemon() -> Result<ConnectedDaemon> {
     Ok(connected)
 }
 
+/// Run the lifecycle half of the two-phase TUI composition. The CLI owns this
+/// task; the TUI can request typed lifecycle policy but cannot probe, spawn,
+/// restart, or retain daemon process guards itself.
+pub async fn serve_lifecycle_requests(
+    mut requests: tokio::sync::mpsc::Receiver<cockpit_client::LifecycleRequest>,
+) {
+    let mut owned_daemons = Vec::new();
+    while let Some(request) = requests.recv().await {
+        let mode = match request.intent {
+            cockpit_client::LifecycleIntent::AttachOrAutoPromote
+            | cockpit_client::LifecycleIntent::EnsurePersistent => {
+                LifecycleMode::AttachOrAutoPromote
+            }
+            cockpit_client::LifecycleIntent::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
+            cockpit_client::LifecycleIntent::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
+            cockpit_client::LifecycleIntent::AttachOwnEphemeral => {
+                LifecycleMode::AttachOwnEphemeral
+            }
+        };
+        let result = probe_or_spawn(mode).await.and_then(|mut connected| {
+            if matches!(
+                request.intent,
+                cockpit_client::LifecycleIntent::EnsurePersistent
+            ) && connected.owns_daemon
+            {
+                anyhow::bail!("persistent lifecycle request resolved to an ephemeral daemon");
+            }
+            if let Some(guard) = connected.take_owned_daemon_guard() {
+                owned_daemons.push(guard);
+            }
+            Ok(cockpit_client::LifecycleResolution {
+                endpoint: connected.endpoint,
+                owns_daemon: connected.owns_daemon,
+                socket: connected.socket,
+                startup_notice: connected.startup_notice,
+            })
+        });
+        let _ = request
+            .reply
+            .send(result.map_err(|error| error.to_string()));
+    }
+}
+
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
@@ -105,6 +149,9 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                             tracing::info!(pid, "daemon version skew auto-restart completed");
                             let client = wait_for_daemon(&discovered.paths.socket).await?;
                             return Ok(ConnectedDaemon {
+                                endpoint: cockpit_client::ClientEndpoint::Wire(
+                                    discovered.paths.socket.clone(),
+                                ),
                                 client,
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
@@ -132,6 +179,9 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                             );
                             let client = DaemonClient::connect(&discovered.paths.socket).await?;
                             return Ok(ConnectedDaemon {
+                                endpoint: cockpit_client::ClientEndpoint::Wire(
+                                    discovered.paths.socket.clone(),
+                                ),
                                 client,
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
@@ -145,6 +195,9 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                             tracing::info!("daemon version skew surfaced without auto-restart");
                             let client = DaemonClient::connect(&discovered.paths.socket).await?;
                             return Ok(ConnectedDaemon {
+                                endpoint: cockpit_client::ClientEndpoint::Wire(
+                                    discovered.paths.socket.clone(),
+                                ),
                                 client,
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
@@ -164,6 +217,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                 }
                 let client = DaemonClient::connect(&discovered.paths.socket).await?;
                 return Ok(ConnectedDaemon {
+                    endpoint: cockpit_client::ClientEndpoint::Wire(discovered.paths.socket.clone()),
                     client,
                     owns_daemon: false,
                     socket: discovered.paths.socket,
@@ -201,10 +255,12 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                 crate::daemon::terminal::default_host_factory(),
             )
             .await?;
+            let endpoint = cockpit_client::ClientEndpoint::InProcess(
+                crate::daemon::server::in_process_endpoint(&ctx),
+            );
             return Ok(ConnectedDaemon {
-                client: DaemonClient::from_in_process(
-                    crate::daemon::server::spawn_in_process_client(ctx),
-                ),
+                client: DaemonClient::connect_endpoint(&endpoint).await?,
+                endpoint,
                 owns_daemon: false,
                 socket: own.socket,
                 startup_notice: None,
@@ -269,6 +325,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
     let client = wait_for_daemon(&paths.socket).await?;
 
     Ok(ConnectedDaemon {
+        endpoint: cockpit_client::ClientEndpoint::Wire(paths.socket.clone()),
         client,
         owns_daemon: ephemeral,
         socket: paths.socket,

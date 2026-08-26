@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -29,10 +29,84 @@ use cockpit_proto::{self as proto, ErrorPayload, Request, Response};
 #[cfg(unix)]
 use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame};
 
-pub type InProcessConnector = Arc<dyn Fn() -> Option<InProcessConnection> + Send + Sync>;
+/// A cloneable, capability-bearing endpoint for opening fresh in-process
+/// client connections. Unlike the former pathname registry, possession of
+/// this value is the authority to connect.
+#[derive(Clone)]
+pub struct InProcessEndpoint {
+    connections: mpsc::Sender<oneshot::Sender<Option<InProcessConnection>>>,
+}
 
-static IN_PROCESS_CONNECTORS: OnceLock<Mutex<HashMap<PathBuf, InProcessConnector>>> =
-    OnceLock::new();
+impl InProcessEndpoint {
+    pub fn new(connections: mpsc::Sender<oneshot::Sender<Option<InProcessConnection>>>) -> Self {
+        Self { connections }
+    }
+
+    async fn connect(&self) -> Result<InProcessConnection> {
+        let (reply, receive) = oneshot::channel();
+        self.connections
+            .send(reply)
+            .await
+            .map_err(|_| anyhow!("in-process daemon endpoint has retired"))?;
+        receive
+            .await
+            .map_err(|_| anyhow!("in-process daemon endpoint dropped its reply"))?
+            .ok_or_else(|| anyhow!("in-process daemon endpoint has retired"))
+    }
+}
+
+/// Transport capability returned by lifecycle composition.
+#[derive(Clone)]
+pub enum ClientEndpoint {
+    Wire(PathBuf),
+    InProcess(InProcessEndpoint),
+}
+
+/// Presentation-owned lifecycle request. Resolution remains in the host
+/// composition layer; the TUI never probes or spawns a daemon itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleIntent {
+    AttachOrAutoPromote,
+    AttachOrEphemeral,
+    AlwaysEphemeral,
+    AttachOwnEphemeral,
+    EnsurePersistent,
+}
+
+pub struct LifecycleResolution {
+    pub endpoint: ClientEndpoint,
+    pub owns_daemon: bool,
+    pub socket: PathBuf,
+    pub startup_notice: Option<String>,
+}
+
+pub struct LifecycleRequest {
+    pub intent: LifecycleIntent,
+    pub reply: oneshot::Sender<Result<LifecycleResolution, String>>,
+}
+
+#[derive(Clone)]
+pub struct LifecycleClient {
+    requests: mpsc::Sender<LifecycleRequest>,
+}
+
+impl LifecycleClient {
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<LifecycleRequest>) {
+        let (requests, receive) = mpsc::channel(capacity);
+        (Self { requests }, receive)
+    }
+
+    pub async fn resolve(&self, intent: LifecycleIntent) -> Result<LifecycleResolution, String> {
+        let (reply, receive) = oneshot::channel();
+        self.requests
+            .send(LifecycleRequest { intent, reply })
+            .await
+            .map_err(|_| "daemon lifecycle resolver has stopped".to_string())?;
+        receive
+            .await
+            .map_err(|_| "daemon lifecycle resolver dropped its reply".to_string())?
+    }
+}
 
 /// One request submitted to an in-process daemon transport.
 pub struct InProcessRequest {
@@ -44,29 +118,6 @@ pub struct InProcessRequest {
 pub struct InProcessConnection {
     pub requests: mpsc::Sender<InProcessRequest>,
     pub events: mpsc::Receiver<proto::Event>,
-}
-
-/// Register a connector under the opaque endpoint path used by discovery.
-///
-/// The connector must not retain daemon authority. Core registers a closure
-/// over a weak daemon context and returns `None` after that context retires.
-pub fn register_in_process_connector(endpoint: PathBuf, connector: InProcessConnector) {
-    let connectors = IN_PROCESS_CONNECTORS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut connectors = connectors
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    connectors.insert(endpoint, connector);
-}
-
-fn connect_in_process(endpoint: &Path) -> Option<InProcessConnection> {
-    let connectors = IN_PROCESS_CONNECTORS.get()?;
-    let connector = {
-        let connectors = connectors
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        connectors.get(endpoint).cloned()
-    }?;
-    connector()
 }
 
 #[cfg(unix)]
@@ -153,9 +204,6 @@ impl DaemonClient {
     pub async fn connect(socket: &Path) -> Result<Self> {
         #[cfg(feature = "test-support")]
         CONNECT_CALLS.with(|calls| calls.set(calls.get() + 1));
-        if let Some(connection) = connect_in_process(socket) {
-            return Ok(Self::from_in_process(connection));
-        }
         #[cfg(unix)]
         {
             let stream = UnixStream::connect(socket)
@@ -171,6 +219,15 @@ impl DaemonClient {
             Err(anyhow!(
                 "daemon socket transport is not supported on this platform"
             ))
+        }
+    }
+
+    pub async fn connect_endpoint(endpoint: &ClientEndpoint) -> Result<Self> {
+        match endpoint {
+            ClientEndpoint::Wire(socket) => Self::connect(socket).await,
+            ClientEndpoint::InProcess(endpoint) => {
+                Ok(Self::from_in_process(endpoint.connect().await?))
+            }
         }
     }
 

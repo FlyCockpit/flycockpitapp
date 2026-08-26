@@ -32,6 +32,7 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use crate::tui::composer::Composer;
@@ -91,6 +92,9 @@ pub struct NotesPane {
     view_scroll: usize,
     /// Raw editor vertical scroll offset while editing a note.
     edit_scroll: usize,
+    /// Raw editor viewport origin in terminal display columns. It is always
+    /// aligned to a semantic grapheme boundary on the cursor line.
+    edit_hscroll: usize,
     /// Mouse-wheel scrolling temporarily owns the editor viewport. Any
     /// subsequent keyboard edit/motion returns ownership to cursor follow.
     edit_scroll_manual: bool,
@@ -373,6 +377,7 @@ impl NotesPane {
             vim_enabled,
             view_scroll: 0,
             edit_scroll: 0,
+            edit_hscroll: 0,
             edit_scroll_manual: false,
             last_view_width: 0,
             last_view_height: 0,
@@ -587,6 +592,7 @@ impl NotesPane {
         // Park the cursor at the start so a fresh edit begins at the top.
         self.editor.set_cursor(0);
         self.edit_scroll = 0;
+        self.edit_hscroll = 0;
         self.edit_scroll_manual = false;
         self.invalidate_pending_operations();
         self.pending_save = None;
@@ -856,6 +862,7 @@ impl NotesPane {
             vim_enabled,
             view_scroll: 0,
             edit_scroll: 0,
+            edit_hscroll: 0,
             edit_scroll_manual: false,
             last_view_width: 80,
             last_view_height: 24,
@@ -1011,15 +1018,13 @@ impl NotesPane {
                 // Raw editable markdown source (never rendered while editing).
                 let height = area.height.max(1) as usize;
                 let text = self.editor.text().to_string();
-                let lines: Vec<Line<'static>> = if text.is_empty() {
-                    vec![Line::default()]
+                let source_lines = if text.is_empty() {
+                    vec![""]
                 } else {
-                    text.split('\n')
-                        .map(|l| Line::from(l.to_string()))
-                        .collect()
+                    text.split('\n').collect::<Vec<_>>()
                 };
-                self.last_edit_rows = lines.len();
-                let max_scroll = lines.len().saturating_sub(height);
+                self.last_edit_rows = source_lines.len();
+                let max_scroll = source_lines.len().saturating_sub(height);
                 let (content_area, scrollbar_area) = scrollbar_areas(area, max_scroll > 0);
                 let width = content_area.width.max(1) as usize;
                 self.last_view_width = width;
@@ -1033,6 +1038,13 @@ impl NotesPane {
                     }
                 }
                 self.edit_scroll = self.edit_scroll.min(max_scroll);
+                let cursor_source = source_lines.get(cursor_line).copied().unwrap_or_default();
+                self.edit_hscroll =
+                    cursor_follow_hscroll(cursor_source, cursor_col, self.edit_hscroll, width);
+                let lines = source_lines
+                    .into_iter()
+                    .map(|line| Line::from(display_column_slice(line, self.edit_hscroll, width)))
+                    .collect::<Vec<_>>();
                 frame.render_widget(
                     Paragraph::new(lines).scroll((self.edit_scroll as u16, 0)),
                     content_area,
@@ -1050,9 +1062,11 @@ impl NotesPane {
                     );
                 }
                 let cursor_y = content_area.y + cursor_line.saturating_sub(self.edit_scroll) as u16;
-                let cursor_x = content_area.x + (cursor_col.min(width.saturating_sub(1)) as u16);
+                let cursor_view_col = cursor_col.saturating_sub(self.edit_hscroll);
+                let cursor_x = content_area.x + cursor_view_col as u16;
                 if cursor_y < content_area.y + content_area.height
                     && cursor_line >= self.edit_scroll
+                    && cursor_view_col < width
                 {
                     frame.set_cursor_position((cursor_x, cursor_y));
                 }
@@ -1122,6 +1136,62 @@ impl Pane for NotesPane {
     }
 }
 
+fn cursor_follow_hscroll(line: &str, cursor_col: usize, current: usize, width: usize) -> usize {
+    let width = width.max(1);
+    let graphemes = markdown::semantic_graphemes(line);
+    let mut column = 0usize;
+    let mut boundaries = vec![0usize];
+    let mut cursor_width = 1usize;
+    for grapheme in graphemes {
+        let grapheme_width = UnicodeWidthStr::width(grapheme.as_str());
+        if column == cursor_col {
+            cursor_width = grapheme_width.max(1);
+        }
+        column += grapheme_width;
+        boundaries.push(column);
+    }
+    let required = cursor_col
+        .saturating_add(cursor_width)
+        .saturating_sub(width);
+    let desired = if cursor_col < current {
+        cursor_col
+    } else if required > current {
+        required
+    } else {
+        current
+    };
+    boundaries
+        .into_iter()
+        .find(|boundary| *boundary >= desired)
+        .unwrap_or(column)
+        .min(cursor_col)
+}
+
+fn display_column_slice(line: &str, start: usize, width: usize) -> String {
+    let end = start.saturating_add(width.max(1));
+    let mut column = 0usize;
+    let mut output = String::new();
+    for grapheme in markdown::semantic_graphemes(line) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme.as_str());
+        let grapheme_end = column.saturating_add(grapheme_width);
+        if grapheme_end <= start {
+            column = grapheme_end;
+            continue;
+        }
+        if column < start {
+            output.push_str(&" ".repeat(grapheme_end.saturating_sub(start)));
+            column = grapheme_end;
+            continue;
+        }
+        if grapheme_end > end {
+            break;
+        }
+        output.push_str(&grapheme);
+        column = grapheme_end;
+    }
+    output
+}
+
 fn initial_sidebar_state() -> ListState {
     let mut state = ListState::default();
     state.select(Some(0));
@@ -1140,7 +1210,7 @@ fn scrollbar_areas(area: Rect, overflow: bool) -> (Rect, Option<Rect>) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::Backend, backend::TestBackend};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -1174,6 +1244,7 @@ mod tests {
             vim_enabled: false,
             view_scroll: 0,
             edit_scroll: 0,
+            edit_hscroll: 0,
             edit_scroll_manual: false,
             last_view_width: 80,
             last_view_height: 24,
@@ -1214,6 +1285,25 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn rendered_editor(pane: &mut NotesPane, width: u16, height: u16) -> (String, (u16, u16)) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, width, height)))
+            .expect("draw notes editor");
+        let cursor = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor position");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        (content, (cursor.x, cursor.y))
     }
 
     #[test]
@@ -2059,6 +2149,80 @@ mod tests {
             pane.edit_scroll,
             pane.last_edit_rows.saturating_sub(pane.last_view_height)
         );
+    }
+
+    #[test]
+    fn raw_editor_horizontal_view_follows_ascii_cursor_and_resize() {
+        let text = "0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut pane = NotesPane::editing_for_test(text, false);
+        pane.editor.set_cursor(text.len());
+        let (narrow, cursor) = rendered_editor(&mut pane, 40, 8);
+        assert!(pane.edit_hscroll > 0);
+        assert!(narrow.contains("rstuvwxyz"));
+        assert_eq!(cursor.0 as usize, 29 + text.len() - pane.edit_hscroll);
+
+        pane.handle_key(press(KeyCode::Home));
+        let (_, home_cursor) = rendered_editor(&mut pane, 40, 8);
+        assert_eq!(pane.edit_hscroll, 0);
+        assert_eq!(home_cursor.0, 29);
+
+        pane.handle_key(press(KeyCode::End));
+        let _ = rendered_editor(&mut pane, 40, 8);
+        let previous_scroll = pane.edit_hscroll;
+        let (_, wide_cursor) = rendered_editor(&mut pane, 60, 8);
+        assert!(pane.edit_hscroll < previous_scroll);
+        assert_eq!(wide_cursor.0 as usize, 29 + text.len() - pane.edit_hscroll);
+
+        pane.handle_key(press(KeyCode::Backspace));
+        pane.handle_key(press(KeyCode::Char('界')));
+        let (_, edited_cursor) = rendered_editor(&mut pane, 40, 8);
+        assert!(edited_cursor.0 < 39);
+        assert_eq!(
+            edited_cursor.0 as usize,
+            29 + pane.editor.cursor_line_col().1 - pane.edit_hscroll
+        );
+        pane.handle_key(press(KeyCode::Left));
+        let (_, left_cursor) = rendered_editor(&mut pane, 40, 8);
+        assert_eq!(
+            left_cursor.0 as usize,
+            29 + pane.editor.cursor_line_col().1 - pane.edit_hscroll
+        );
+        pane.handle_key(press(KeyCode::Right));
+        let (_, right_cursor) = rendered_editor(&mut pane, 40, 8);
+        assert_eq!(
+            right_cursor.0 as usize,
+            29 + pane.editor.cursor_line_col().1 - pane.edit_hscroll
+        );
+    }
+
+    #[test]
+    fn raw_editor_slice_never_splits_semantic_graphemes() {
+        let family = "👨‍👩‍👧‍👦";
+        let combining = "e\u{301}";
+        let line = format!("ab中{family}{combining}tail");
+        let family_col = UnicodeWidthStr::width("ab中");
+        let family_width = UnicodeWidthStr::width(family);
+        let combining_col = family_col + family_width;
+
+        assert_eq!(
+            display_column_slice(&line, family_col, family_width),
+            family
+        );
+        assert_eq!(display_column_slice(&line, combining_col, 1), combining);
+        let inside_wide = display_column_slice(&line, family_col.saturating_sub(1), 3);
+        assert!(!inside_wide.contains('\u{200d}') || inside_wide.contains(family));
+
+        let hscroll = cursor_follow_hscroll(&line, family_col, 0, family_width);
+        assert_eq!(hscroll, family_col);
+        let combining_scroll = cursor_follow_hscroll(&line, combining_col, hscroll, 1);
+        assert_eq!(combining_scroll, combining_col);
+
+        let mut pane = NotesPane::editing_for_test(&line, false);
+        let family_byte = line.find(family).unwrap();
+        pane.editor.set_cursor(family_byte);
+        let (rendered, cursor) = rendered_editor(&mut pane, 34, 8);
+        assert!(rendered.contains(family));
+        assert_eq!(cursor.0 as usize, 29 + family_col - pane.edit_hscroll);
     }
 
     #[test]

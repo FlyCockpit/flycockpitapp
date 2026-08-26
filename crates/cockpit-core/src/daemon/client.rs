@@ -31,6 +31,16 @@ async fn retain_guard_after_acceptance<G>(
     }
 }
 
+fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
+    match intent {
+        cockpit_client::LifecycleIntent::AttachOrAutoPromote
+        | cockpit_client::LifecycleIntent::EnsurePersistent => LifecycleMode::AttachOrAutoPromote,
+        cockpit_client::LifecycleIntent::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
+        cockpit_client::LifecycleIntent::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
+        cockpit_client::LifecycleIntent::AttachOwnEphemeral => LifecycleMode::AttachOwnEphemeral,
+    }
+}
+
 // ---- lifecycle helpers ----------------------------------------------------
 
 /// Strategy for getting a daemon to talk to.
@@ -110,17 +120,7 @@ pub async fn serve_lifecycle_requests(
         if request.reply.is_closed() {
             continue;
         }
-        let mode = match request.intent {
-            cockpit_client::LifecycleIntent::AttachOrAutoPromote
-            | cockpit_client::LifecycleIntent::EnsurePersistent => {
-                LifecycleMode::AttachOrAutoPromote
-            }
-            cockpit_client::LifecycleIntent::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
-            cockpit_client::LifecycleIntent::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
-            cockpit_client::LifecycleIntent::AttachOwnEphemeral => {
-                LifecycleMode::AttachOwnEphemeral
-            }
-        };
+        let mode = mode_for_intent(request.intent);
         let resolved = probe_or_spawn(mode).await.and_then(|mut connected| {
             if matches!(
                 request.intent,
@@ -636,5 +636,25 @@ mod tests {
         .await;
         assert!(retained.is_empty());
         assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::EnsurePersistent),
+            LifecycleMode::AttachOrAutoPromote
+        );
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
+            LifecycleMode::AttachOrEphemeral
+        );
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::AlwaysEphemeral),
+            LifecycleMode::AlwaysEphemeral
+        );
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::AttachOwnEphemeral),
+            LifecycleMode::AttachOwnEphemeral
+        );
     }
 }

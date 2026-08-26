@@ -108,13 +108,19 @@ impl OwnedDaemonGuard {
     async fn shutdown(self) -> Result<()> {
         match self {
             Self::Process(guard) => {
-                tokio::task::spawn_blocking(move || {
-                    guard.shutdown();
-                    drop(guard);
-                })
-                .await
-                .context("joining ephemeral daemon stop request")?;
-                Ok(())
+                let (completed, completion) = tokio::sync::oneshot::channel();
+                let owner = std::thread::Builder::new()
+                    .name("cockpit-ephemeral-daemon-owner".to_string())
+                    .spawn(move || {
+                        let result = guard.shutdown();
+                        drop(guard);
+                        let _ = completed.send(result);
+                    })
+                    .context("spawning ephemeral daemon owner teardown")?;
+                crate::daemon::reap_daemon_owner_thread(owner);
+                completion
+                    .await
+                    .context("ephemeral daemon owner teardown stopped")?
             }
             Self::InProcess(guard) => guard.shutdown().await,
         }
@@ -213,33 +219,40 @@ pub async fn serve_lifecycle_requests(
     let mut shutdowns = std::pin::pin!(futures::future::join_all(
         owned_daemons.into_iter().map(OwnedDaemonGuard::shutdown)
     ));
-    let outcomes = match tokio::time::timeout(
-        crate::daemon::shutdown::SHUTDOWN_DRAIN_GRACE + std::time::Duration::from_secs(5),
-        &mut shutdowns,
-    )
-    .await
-    {
-        Ok(outcomes) => outcomes,
+    let graceful_deadline =
+        crate::daemon::shutdown::SHUTDOWN_DRAIN_GRACE + std::time::Duration::from_secs(5);
+    let (outcomes, forced) = match tokio::time::timeout(graceful_deadline, &mut shutdowns).await {
+        Ok(outcomes) => (outcomes, false),
         Err(_) => {
             // Each in-process supervisor owns its context on an independent
             // OS thread. Promote every still-running context to Forced, then
             // join all supervisors instead of abandoning them with the CLI
-            // runtime. Process guards have already synchronously delivered
-            // their idempotent StopDaemon requests concurrently through the
-            // same join set.
+            // runtime. Process stop requests run concurrently in the same
+            // join set and remain bounded independently.
             for force in &force_handles {
                 force.force();
             }
-            // Awaiting here is intentional: runtime exit is forbidden while
-            // an owned supervisor is alive, even after its forced deadline.
-            shutdowns.await
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut shutdowns).await {
+                Ok(outcomes) => (outcomes, true),
+                Err(_) => {
+                    // Dropping the join set transfers every in-process
+                    // supervisor to the runtime-independent reaper through
+                    // its guard's Drop. Never wait forever or claim clean.
+                    anyhow::bail!(
+                        "owned daemon cleanup remained incomplete after the forced terminal deadline"
+                    )
+                }
+            }
         }
     };
-    let failures = outcomes
+    let mut failures = outcomes
         .into_iter()
         .filter_map(Result::err)
         .map(|error| error.to_string())
         .collect::<Vec<_>>();
+    if forced {
+        failures.push("owned daemon cleanup exceeded its graceful deadline and was forced".into());
+    }
     if failures.is_empty() {
         Ok(())
     } else {
@@ -387,14 +400,12 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             // key, but `DaemonClient::connect` resolves it to the registered
             // in-process context instead of opening a Unix socket.
             let own = own_ephemeral_paths()?;
-            let (ctx, guard) = crate::daemon::boot_in_process(
+            let (in_process_endpoint, guard) = crate::daemon::boot_in_process(
                 own.clone(),
                 crate::daemon::terminal::default_host_factory(),
             )
             .await?;
-            let endpoint = cockpit_client::ClientEndpoint::InProcess(
-                crate::daemon::server::in_process_endpoint(&ctx),
-            );
+            let endpoint = cockpit_client::ClientEndpoint::InProcess(in_process_endpoint);
             return Ok(ConnectedDaemon {
                 client: DaemonClient::connect_endpoint(&endpoint).await?,
                 endpoint,
@@ -439,7 +450,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         // Arm ownership before any await or other cancellation point. From
         // here onward every early return owns a guard whose Drop stops exactly
         // this pid+nonce daemon.
-        let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.socket.clone());
+        let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.clone(), pid);
         (paths, pid, Some(guard))
     } else {
         // Auto-promoted persistent daemon: never `--no-sandbox` from a

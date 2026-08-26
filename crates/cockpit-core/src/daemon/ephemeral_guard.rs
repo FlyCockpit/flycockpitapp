@@ -36,25 +36,56 @@ use crate::daemon::proto::{Envelope, Request};
 /// graceful drain (see `server::handle_request` / `server::request_shutdown`).
 pub struct EphemeralDaemonGuard {
     socket: PathBuf,
+    paths: Option<crate::daemon::DaemonPaths>,
+    expected_pid: Option<u32>,
     /// Cleared once shutdown has been requested (happy path) so the drop
     /// doesn't fire a redundant second request.
     armed: Arc<AtomicBool>,
 }
 
 impl EphemeralDaemonGuard {
-    pub fn new(socket: PathBuf) -> Self {
+    pub fn new(paths: crate::daemon::DaemonPaths, expected_pid: u32) -> Self {
+        Self {
+            socket: paths.socket.clone(),
+            paths: Some(paths),
+            expected_pid: Some(expected_pid),
+            armed: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_socket(socket: PathBuf) -> Self {
         Self {
             socket,
+            paths: None,
+            expected_pid: None,
             armed: Arc::new(AtomicBool::new(true)),
         }
     }
 
     /// Disarm and synchronously request shutdown. Idempotent: the first
     /// caller wins, later calls (including the drop) are no-ops.
-    pub fn shutdown(&self) {
+    pub fn shutdown(&self) -> anyhow::Result<()> {
         if self.armed.swap(false, Ordering::SeqCst) {
-            stop_daemon_blocking(&self.socket);
+            if let (Some(paths), Some(expected_pid)) = (&self.paths, self.expected_pid) {
+                if let Some(recorded_pid) = crate::daemon::daemon_pid(paths)
+                    && recorded_pid != expected_pid
+                {
+                    anyhow::bail!(
+                        "owned daemon incarnation changed from PID {expected_pid} to {recorded_pid}; refusing teardown"
+                    );
+                }
+                let stopped = crate::daemon::stop(paths)?;
+                if !stopped && (paths.pid_file.exists() || paths.socket.exists()) {
+                    anyhow::bail!(
+                        "owned daemon PID {expected_pid} did not publish verifiable exit evidence"
+                    );
+                }
+            } else {
+                stop_daemon_blocking(&self.socket);
+            }
         }
+        Ok(())
     }
 
     /// Transfer ownership away from this guard without stopping the daemon.
@@ -67,7 +98,27 @@ impl EphemeralDaemonGuard {
 
 impl Drop for EphemeralDaemonGuard {
     fn drop(&mut self) {
-        self.shutdown();
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let (Some(paths), Some(expected_pid)) = (self.paths.clone(), self.expected_pid) {
+            let _ = std::thread::Builder::new()
+                .name("cockpit-ephemeral-daemon-reaper".to_string())
+                .spawn(move || {
+                    if crate::daemon::daemon_pid(&paths).is_some_and(|pid| pid != expected_pid) {
+                        tracing::error!(
+                            expected_pid,
+                            "refusing to reap changed daemon incarnation"
+                        );
+                        return;
+                    }
+                    if let Err(error) = crate::daemon::stop(&paths) {
+                        tracing::error!(%error, expected_pid, "ephemeral daemon reaper failed");
+                    }
+                });
+        } else {
+            stop_daemon_blocking(&self.socket);
+        }
     }
 }
 
@@ -126,6 +177,8 @@ pub fn spawn_signal_shutdown(
     let guard = guard?;
     let armed = guard.armed.clone();
     let socket = guard.socket.clone();
+    let paths = guard.paths.clone();
+    let expected_pid = guard.expected_pid;
     Some(tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -142,7 +195,20 @@ pub fn spawn_signal_shutdown(
             tokio::signal::ctrl_c().await.ok();
         }
         if armed.swap(false, Ordering::SeqCst) {
-            stop_daemon_blocking(&socket);
+            if let (Some(paths), Some(expected_pid)) = (paths, expected_pid) {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if crate::daemon::daemon_pid(&paths).is_some_and(|pid| pid != expected_pid) {
+                        tracing::error!(expected_pid, "refusing to stop changed daemon incarnation");
+                        return;
+                    }
+                    if let Err(error) = crate::daemon::stop(&paths) {
+                        tracing::error!(%error, expected_pid, "signal-triggered daemon stop failed");
+                    }
+                })
+                .await;
+            } else {
+                stop_daemon_blocking(&socket);
+            }
         }
         if exit_on_signal {
             // After reaping, exit the foreground promptly — the user asked
@@ -194,7 +260,7 @@ mod tests {
         // (the real drop fires from sync `Drop`).
         let socket_for_guard = socket.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = EphemeralDaemonGuard::new(socket_for_guard);
+            let guard = EphemeralDaemonGuard::new_for_socket(socket_for_guard);
             drop(guard);
         })
         .await
@@ -223,12 +289,12 @@ mod tests {
 
         let socket_for_guard = socket.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = EphemeralDaemonGuard::new(socket_for_guard);
+            let guard = EphemeralDaemonGuard::new_for_socket(socket_for_guard);
             assert!(guard.armed.load(Ordering::SeqCst));
-            guard.shutdown();
+            guard.shutdown().unwrap();
             // Disarmed: the second call and the drop must both be no-ops.
             assert!(!guard.armed.load(Ordering::SeqCst));
-            guard.shutdown();
+            guard.shutdown().unwrap();
             drop(guard);
         })
         .await

@@ -95,6 +95,59 @@ pub enum ClientEndpoint {
     InProcess(InProcessEndpoint),
 }
 
+impl ClientEndpoint {
+    /// Exchange one opaque, zeroizing payload over the endpoint's dedicated
+    /// sensitive channel. The wire pathname and framing transport remain
+    /// private to this client layer; presentation code cannot select or
+    /// construct a raw sensitive socket path.
+    pub async fn sensitive_request(
+        &self,
+        payload: Zeroizing<Vec<u8>>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        match self {
+            Self::InProcess(endpoint) => endpoint.sensitive_request(payload).await,
+            Self::Wire(control_socket) => {
+                #[cfg(unix)]
+                {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let stem = control_socket
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("cockpit");
+                    let socket = control_socket
+                        .parent()
+                        .map_or_else(PathBuf::new, Path::to_path_buf)
+                        .join(format!("{stem}-leak-reveal.sock"));
+                    let exchange = async move {
+                        let mut stream = UnixStream::connect(socket).await?;
+                        stream.write_all(&payload).await?;
+                        stream.flush().await?;
+                        stream.shutdown().await?;
+                        const MAX_SENSITIVE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+                        let mut response = Zeroizing::new(Vec::new());
+                        stream
+                            .take(MAX_SENSITIVE_RESPONSE_BYTES + 1)
+                            .read_to_end(&mut response)
+                            .await?;
+                        if response.len() as u64 > MAX_SENSITIVE_RESPONSE_BYTES {
+                            anyhow::bail!("sensitive endpoint response exceeded its byte limit");
+                        }
+                        Ok(response)
+                    };
+                    tokio::time::timeout(REQUEST_TIMEOUT, exchange)
+                        .await
+                        .map_err(|_| anyhow!("sensitive endpoint exchange timed out"))?
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (control_socket, payload);
+                    anyhow::bail!("wire sensitive transport is unavailable on this platform")
+                }
+            }
+        }
+    }
+}
+
 /// Presentation-owned lifecycle request. Resolution remains in the host
 /// composition layer; the TUI never probes or spawns a daemon itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -62,7 +62,7 @@ const IN_PROCESS_EVENT_QUEUE: usize = 1024;
 const CLIENT_IO_CHANNEL_CAPACITY: usize = 64;
 const MAX_CONCURRENT_CLIENT_REQUESTS: usize = 16;
 
-static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, Weak<DaemonContext>>>> =
+static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, RegisteredInProcessContext>>> =
     OnceLock::new();
 
 fn daemon_process_env() -> HashMap<String, String> {
@@ -2467,6 +2467,7 @@ impl DaemonContext {
             .lsp_manager()
             .set_notice_bus(global_events.clone(), global_redaction.clone());
         registry.set_global_bus(global_events.clone());
+        #[cfg(feature = "extended")]
         let scheduler = (!paths.ephemeral).then(|| {
             let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
                 db.clone(),
@@ -2480,6 +2481,8 @@ impl DaemonContext {
             ))
             .start_with_callbacks(shutdown.clone(), callbacks)
         });
+        #[cfg(not(feature = "extended"))]
+        let scheduler = None;
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
@@ -2517,6 +2520,7 @@ impl DaemonContext {
         // resolved destinations; concrete provider adapters + the destination map
         // install with the wire-adapters / real-dispatch prompts, so a queued job
         // records a typed `adapter_missing` skip rather than dispatching.
+        #[cfg(feature = "extended")]
         let image_generation_worker = (!paths.ephemeral)
             .then(|| {
                 match crate::daemon::image_runtime::install_standard_image_runtime_registry(
@@ -2553,6 +2557,8 @@ impl DaemonContext {
                 }
             })
             .flatten();
+        #[cfg(not(feature = "extended"))]
+        let image_generation_worker = None;
         Self {
             db,
             media_ledger,
@@ -3283,12 +3289,30 @@ impl Drop for ClientGuard {
     }
 }
 
-pub(crate) fn register_in_process_context(ctx: Arc<DaemonContext>) {
+struct RegisteredInProcessContext {
+    ctx: std::sync::Weak<DaemonContext>,
+    endpoint: cockpit_client::InProcessEndpoint,
+}
+
+pub(crate) fn register_in_process_context(
+    ctx: Arc<DaemonContext>,
+) -> cockpit_client::InProcessEndpoint {
+    // Endpoint service tasks are created on the daemon owner runtime. Callers
+    // receive only the cloneable transport capability; reconnects never spawn
+    // daemon work on a frontend runtime.
+    let endpoint = in_process_endpoint(&ctx);
     let contexts = IN_PROCESS_CONTEXTS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut contexts = contexts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    contexts.insert(ctx.paths.socket.clone(), Arc::downgrade(&ctx));
+    contexts.insert(
+        ctx.paths.socket.clone(),
+        RegisteredInProcessContext {
+            ctx: Arc::downgrade(&ctx),
+            endpoint: endpoint.clone(),
+        },
+    );
+    endpoint
 }
 
 pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::InProcessEndpoint {
@@ -3364,13 +3388,29 @@ pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {
     let mut contexts = contexts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let weak = contexts.get(socket)?;
-    match weak.upgrade() {
+    let registered = contexts.get(socket)?;
+    match registered.ctx.upgrade() {
         Some(ctx) => Some(ctx),
         None => {
             contexts.remove(socket);
             None
         }
+    }
+}
+
+pub(crate) fn registered_in_process_endpoint(
+    socket: &Path,
+) -> Option<cockpit_client::InProcessEndpoint> {
+    let contexts = IN_PROCESS_CONTEXTS.get()?;
+    let mut contexts = contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let registered = contexts.get(socket)?;
+    if registered.ctx.upgrade().is_some() {
+        Some(registered.endpoint.clone())
+    } else {
+        contexts.remove(socket);
+        None
     }
 }
 

@@ -551,6 +551,7 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
 
     const FORBIDDEN_AUTHORITY_NAMES: &[&str] = &[
         "DaemonClient",
+        "DaemonPaths",
         "EphemeralDaemonGuard",
         "LifecycleClient",
         "OwnedDaemonGuard",
@@ -559,10 +560,15 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
         "ensure_persistent_daemon",
         "probe",
         "probe_or_spawn",
+        "registered_in_process_endpoint",
         "request_on_socket",
+        "reveal_leak_secret_in_process",
+        "reveal_leak_secret_over_socket",
         "serve_lifecycle_requests",
+        "spawn_signal_shutdown",
         "spawn_detached",
         "spawn_detached_ephemeral",
+        "stop_daemon_blocking",
     ];
 
     fn collect_use(
@@ -698,22 +704,6 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
                 ));
             }
             syn::visit::visit_expr_path(self, expression);
-        }
-
-        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            if call_name(call).as_deref() == Some("daemon_reveal_leak_blocking")
-                && call.args.first().is_some_and(|argument| {
-                    matches!(argument, syn::Expr::Reference(reference)
-                        if matches!(reference.expr.as_ref(), syn::Expr::Path(path)
-                            if path.path.is_ident("socket")))
-                })
-            {
-                self.findings.push(format!(
-                    "line {}: leak reveal is bound to a raw socket",
-                    call.span().start().line
-                ));
-            }
-            syn::visit::visit_expr_call(self, call);
         }
 
         fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
@@ -2407,6 +2397,10 @@ fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
         "ensure_persistent_daemon",
         "serve_lifecycle_requests",
         "request_on_socket",
+        "reveal_leak_secret_in_process",
+        "reveal_leak_secret_over_socket",
+        "registered_in_process_endpoint",
+        "stop_daemon_blocking",
     ] {
         let source = format!("macro_rules! hidden {{ () => {{ {name}() }} }}");
         assert!(

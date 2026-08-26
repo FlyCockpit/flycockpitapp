@@ -152,37 +152,6 @@ async fn reveal_after_reservation(
     })
 }
 
-/// The unified production reveal client the TUI calls with the **control**
-/// socket path. Chooses the attach-appropriate path off the single derivation:
-/// an in-process context (TUI hosts the daemon; only path on Windows) is used
-/// directly; otherwise on Unix it derives the dedicated reveal socket path via
-/// [`crate::daemon::DaemonPaths::leak_reveal_socket_path`] (never a divergent
-/// basename) and connects to the peer-authenticated reveal socket. A non-Unix
-/// build with no in-process context truly cannot provide a reveal path →
-/// [`LeakRevealDenied::UnavailablePlatform`].
-pub async fn reveal_leak_secret(
-    control_socket: &Path,
-    capability: &crate::daemon::proto::LeakRevealToken,
-) -> Result<RevealedLeakSecret, LeakRevealDenied> {
-    if crate::daemon::server::in_process_context(control_socket).is_some() {
-        return reveal_leak_secret_in_process(control_socket, capability).await;
-    }
-    #[cfg(unix)]
-    {
-        let reveal_socket = crate::daemon::DaemonPaths::leak_reveal_socket_path(control_socket);
-        crate::daemon::leak_reveal_socket::reveal_leak_secret_over_socket(
-            &reveal_socket,
-            capability,
-        )
-        .await
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = capability;
-        Err(LeakRevealDenied::UnavailablePlatform)
-    }
-}
-
 /// Reveal through the exact transport capability returned by lifecycle
 /// composition. In-process attachments use a private capability-bearing
 /// channel; wire attachments use the peer-authenticated reveal socket.
@@ -190,38 +159,29 @@ pub async fn reveal_leak_secret_at_endpoint(
     endpoint: &cockpit_client::ClientEndpoint,
     capability: &crate::daemon::proto::LeakRevealToken,
 ) -> Result<RevealedLeakSecret, LeakRevealDenied> {
-    match endpoint {
-        cockpit_client::ClientEndpoint::Wire(control_socket) => {
-            reveal_leak_secret(control_socket, capability).await
-        }
-        cockpit_client::ClientEndpoint::InProcess(endpoint) => {
-            let request = crate::daemon::leak_reveal_frame::encode_request(
-                &crate::daemon::leak_reveal_frame::LeakRevealSocketRequest {
-                    capability_hex: capability.clone(),
-                },
-            )
-            .map_err(|_| LeakRevealDenied::Internal)?;
-            let response = endpoint
-                .sensitive_request(request)
-                .await
-                .map_err(|_| LeakRevealDenied::UnavailablePlatform)?;
-            match crate::daemon::leak_reveal_frame::decode_response(&response)
-                .map_err(|_| LeakRevealDenied::Internal)?
-            {
-                crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Ok {
-                    report_id,
-                    generation,
-                    plaintext,
-                } => Ok(RevealedLeakSecret {
-                    report_id,
-                    generation,
-                    plaintext,
-                }),
-                crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(denied) => {
-                    Err(denied)
-                }
-            }
-        }
+    let request = crate::daemon::leak_reveal_frame::encode_request(
+        &crate::daemon::leak_reveal_frame::LeakRevealSocketRequest {
+            capability_hex: capability.clone(),
+        },
+    )
+    .map_err(|_| LeakRevealDenied::Internal)?;
+    let response = endpoint
+        .sensitive_request(request)
+        .await
+        .map_err(|_| LeakRevealDenied::UnavailablePlatform)?;
+    match crate::daemon::leak_reveal_frame::decode_response(&response)
+        .map_err(|_| LeakRevealDenied::Internal)?
+    {
+        crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Ok {
+            report_id,
+            generation,
+            plaintext,
+        } => Ok(RevealedLeakSecret {
+            report_id,
+            generation,
+            plaintext,
+        }),
+        crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(denied) => Err(denied),
     }
 }
 

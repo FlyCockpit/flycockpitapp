@@ -40,6 +40,7 @@ struct ProcessCleanup {
 struct ProcessReap {
     cleanup: ProcessCleanup,
     completed: Option<std::sync::mpsc::Sender<anyhow::Result<()>>>,
+    attempts: u8,
 }
 
 static PROCESS_REAPER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<ProcessReap>>> =
@@ -48,6 +49,8 @@ static PROCESS_REAPER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Proces
 #[cfg(test)]
 thread_local! {
     static INJECT_PROCESS_CLEANUP_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INJECT_CHILD_KILL_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INJECT_CHILD_WAIT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn initialize_process_reaper() -> anyhow::Result<()> {
@@ -57,8 +60,26 @@ pub(crate) fn initialize_process_reaper() -> anyhow::Result<()> {
             std::thread::Builder::new()
                 .name("cockpit-ephemeral-process-reaper".to_string())
                 .spawn(move || {
-                    while let Ok(reap) = receive.recv() {
+                    let mut pending = std::collections::VecDeque::new();
+                    loop {
+                        if pending.is_empty() {
+                            let Ok(reap) = receive.recv() else { break };
+                            pending.push_back(reap);
+                        }
+                        while let Ok(reap) = receive.try_recv() {
+                            pending.push_back(reap);
+                        }
+                        let Some(mut reap) = pending.pop_front() else {
+                            continue;
+                        };
                         let result = run_process_cleanup_recovering(&reap.cleanup);
+                        if process_child_retained(&reap.cleanup) {
+                            reap.attempts = reap.attempts.saturating_add(1);
+                            let backoff_ms = 25_u64.saturating_mul(1_u64 << reap.attempts.min(5));
+                            pending.push_back(reap);
+                            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                            continue;
+                        }
                         if let Some(completed) = reap.completed {
                             let _ = completed.send(result);
                         } else if let Err(error) = result {
@@ -74,18 +95,50 @@ pub(crate) fn initialize_process_reaper() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("starting ephemeral process reaper"))
 }
 
+fn process_child_retained(cleanup: &ProcessCleanup) -> bool {
+    match cleanup.child.lock() {
+        Ok(child) => child.is_some(),
+        Err(poisoned) => poisoned.into_inner().is_some(),
+    }
+}
+
+fn run_cleanup_fallback_until_released(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
+    let mut last_error = None;
+    let mut attempt = 0_u8;
+    while process_child_retained(cleanup) {
+        if let Err(error) = run_process_cleanup_recovering(cleanup) {
+            last_error = Some(error);
+        }
+        if process_child_retained(cleanup) {
+            attempt = attempt.saturating_add(1);
+            let backoff_ms = 25_u64.saturating_mul(1_u64 << attempt.min(5));
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 fn run_process_cleanup_recovering(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         cleanup_exact_process(cleanup)
     }));
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            emergency_kill_wait_and_retire(cleanup);
-            Err(error)
-        }
+        Ok(Err(error)) => match emergency_kill_wait_and_retire(cleanup) {
+            Ok(()) => Err(error),
+            Err(emergency) => Err(anyhow::anyhow!(
+                "{error}; emergency exact-child reap failed: {emergency}"
+            )),
+        },
         Err(_) => {
-            emergency_kill_wait_and_retire(cleanup);
+            emergency_kill_wait_and_retire(cleanup).map_err(|emergency| {
+                anyhow::anyhow!(
+                    "process cleanup panicked and emergency exact-child reap failed: {emergency}"
+                )
+            })?;
             Err(anyhow::anyhow!(
                 "process cleanup panicked; exact child emergency-reaped"
             ))
@@ -93,7 +146,7 @@ fn run_process_cleanup_recovering(cleanup: &ProcessCleanup) -> anyhow::Result<()
     }
 }
 
-fn emergency_kill_wait_and_retire(cleanup: &ProcessCleanup) {
+fn emergency_kill_wait_and_retire(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
     let mut child_slot = match cleanup.child.lock() {
         Ok(child) => child,
         Err(poisoned) => poisoned.into_inner(),
@@ -109,8 +162,7 @@ fn emergency_kill_wait_and_retire(cleanup: &ProcessCleanup) {
             receipt.as_ref().map(|receipt| receipt.pid)
         });
     if let Some(child) = child_slot.as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_and_wait_exact_child(child)?;
     }
     *child_slot = None;
     drop(child_slot);
@@ -119,8 +171,46 @@ fn emergency_kill_wait_and_retire(cleanup: &ProcessCleanup) {
             Ok(receipt) => receipt.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        let _ = retire_late_exact_metadata(cleanup, expected_pid, bound.as_ref());
+        retire_late_exact_metadata(cleanup, expected_pid, bound.as_ref())?;
     }
+    Ok(())
+}
+
+fn kill_and_wait_exact_child(child: &mut std::process::Child) -> anyhow::Result<()> {
+    if child_try_wait(child)?.is_some() {
+        return Ok(());
+    }
+    if let Err(kill_error) = child_kill(child) {
+        if child_try_wait(child)?.is_none() {
+            return Err(kill_error).context("terminating exact ephemeral child");
+        }
+        return Ok(());
+    }
+    child_wait(child)
+        .context("reaping exact ephemeral child")
+        .map(|_| ())
+}
+
+fn child_try_wait(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    child.try_wait()
+}
+
+fn child_kill(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(test)]
+    if INJECT_CHILD_KILL_FAILURE.with(|inject| inject.replace(false)) {
+        return Err(std::io::Error::other("injected child kill failure"));
+    }
+    child.kill()
+}
+
+fn child_wait(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(test)]
+    if INJECT_CHILD_WAIT_FAILURE.with(|inject| inject.replace(false)) {
+        return Err(std::io::Error::other("injected child wait failure"));
+    }
+    child.wait()
 }
 
 fn process_reaper() -> anyhow::Result<&'static std::sync::mpsc::Sender<ProcessReap>> {
@@ -151,7 +241,11 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("ephemeral receipt lock poisoned"))?
         .clone();
     while expected.is_none() && std::time::Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
+        if child_try_wait(child)?.is_some() {
+            let bound = expected.clone();
+            *child_slot = None;
+            drop(child_slot);
+            retire_late_exact_metadata(cleanup, expected_pid, bound.as_ref())?;
             return Ok(());
         }
         if let Some(DaemonPidRecord::Receipt(receipt)) =
@@ -173,8 +267,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
         if read_daemon_pid_record(&cleanup.paths.pid_file)
             != Some(DaemonPidRecord::Receipt(expected.clone()))
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_wait_exact_child(child)?;
             anyhow::bail!(
                 "ephemeral daemon receipt changed before teardown; exact child was terminated without touching replacement metadata"
             );
@@ -182,8 +275,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
         match crate::daemon::stop_exact(&cleanup.paths, &expected) {
             Ok(true) => Ok(()),
             Ok(false) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_wait_exact_child(child)?;
                 anyhow::bail!(
                     "exact receipt no longer named a verified live daemon; exact child was reaped"
                 )
@@ -191,41 +283,56 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
             Err(error) => Err(error),
         }
     } else {
-        child
-            .kill()
-            .context("terminating unpublished ephemeral child")?;
-        child
-            .wait()
-            .context("reaping unpublished ephemeral child")?;
+        kill_and_wait_exact_child(child)?;
         retire_late_exact_metadata(cleanup, expected_pid, None)?;
         anyhow::bail!(
             "ephemeral child never published an exact v2 PID receipt; terminated exact child"
         )
     };
     if result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = retire_late_exact_metadata(cleanup, expected_pid, bound_expected.as_ref());
+        if let Err(reap_error) = kill_and_wait_exact_child(child) {
+            let original = result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unknown cleanup failure".to_string());
+            return Err(anyhow::anyhow!(
+                "{original}; exact child ownership retained after reap failure: {reap_error}"
+            ));
+        }
         *child_slot = None;
+        drop(child_slot);
+        if let Err(retire_error) =
+            retire_late_exact_metadata(cleanup, expected_pid, bound_expected.as_ref())
+        {
+            return Err(anyhow::anyhow!(
+                "{}; exact child exited but metadata retirement failed: {retire_error}",
+                result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown cleanup failure".to_string())
+            ));
+        }
         return result;
     }
     let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut forced_exit = false;
     loop {
-        if child.try_wait()?.is_some() {
+        if child_try_wait(child)?.is_some() {
             break;
         }
         if std::time::Instant::now() >= exit_deadline {
-            child.kill().context("forcing exact ephemeral child exit")?;
-            child.wait().context("reaping forced ephemeral child")?;
+            kill_and_wait_exact_child(child)?;
             forced_exit = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     *child_slot = None;
+    drop(child_slot);
+    retire_late_exact_metadata(cleanup, expected_pid, bound_expected.as_ref())?;
     if forced_exit && result.is_ok() {
-        retire_late_exact_metadata(cleanup, expected_pid, bound_expected.as_ref())?;
         anyhow::bail!("ephemeral daemon did not exit after verified stop; exact child was forced")
     }
     result
@@ -311,13 +418,14 @@ impl EphemeralDaemonGuard {
                 let reap = ProcessReap {
                     cleanup,
                     completed: Some(completed),
+                    attempts: 0,
                 };
                 if let Err(error) = process_reaper()?.send(reap) {
                     // Explicit shutdown runs on the lifecycle-owned OS thread.
                     // If the process-lifetime reaper unexpectedly retired,
                     // retain exact ownership and perform the same bounded
                     // cleanup synchronously while surfacing its result.
-                    return run_process_cleanup_recovering(&error.0.cleanup);
+                    return run_cleanup_fallback_until_released(&error.0.cleanup);
                 }
                 completion
                     .recv()
@@ -372,11 +480,13 @@ impl Drop for EphemeralDaemonGuard {
             let reap = ProcessReap {
                 cleanup,
                 completed: None,
+                attempts: 0,
             };
             match process_reaper() {
                 Ok(reaper) => {
                     if let Err(error) = reaper.send(reap) {
-                        if let Err(cleanup_error) = run_process_cleanup_recovering(&error.0.cleanup)
+                        if let Err(cleanup_error) =
+                            run_cleanup_fallback_until_released(&error.0.cleanup)
                         {
                             tracing::error!(%cleanup_error, "emergency ephemeral cleanup failed");
                         }
@@ -384,7 +494,7 @@ impl Drop for EphemeralDaemonGuard {
                 }
                 Err(error) => {
                     tracing::error!(%error, "ephemeral process reaper unavailable during drop");
-                    if let Err(cleanup_error) = run_process_cleanup_recovering(&reap.cleanup) {
+                    if let Err(cleanup_error) = run_cleanup_fallback_until_released(&reap.cleanup) {
                         tracing::error!(%cleanup_error, "emergency ephemeral cleanup failed");
                     }
                 }
@@ -472,27 +582,57 @@ pub fn spawn_signal_shutdown(
                 let reap = ProcessReap {
                     cleanup,
                     completed: Some(completed),
+                    attempts: 0,
                 };
                 match process_reaper() {
                     Ok(reaper) => match reaper.send(reap) {
                         Ok(()) => {
-                            let _ = tokio::task::spawn_blocking(move || completion.recv()).await;
+                            match tokio::task::spawn_blocking(move || completion.recv()).await {
+                                Ok(Ok(Ok(()))) => {}
+                                Ok(Ok(Err(error))) => {
+                                    tracing::error!(%error, "signal-triggered ephemeral cleanup failed");
+                                }
+                                Ok(Err(error)) => {
+                                    tracing::error!(%error, "signal-triggered cleanup completion channel closed");
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "signal-triggered cleanup waiter failed");
+                                }
+                            }
                         }
                         Err(error) => {
                             let cleanup = error.0.cleanup;
-                            let _ = tokio::task::spawn_blocking(move || {
-                                run_process_cleanup_recovering(&cleanup)
+                            match tokio::task::spawn_blocking(move || {
+                                run_cleanup_fallback_until_released(&cleanup)
                             })
-                            .await;
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    tracing::error!(%error, "signal-triggered emergency cleanup failed");
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "signal-triggered emergency cleanup worker failed");
+                                }
+                            }
                         }
                     },
                     Err(error) => {
                         tracing::error!(%error, "signal-triggered daemon reaper unavailable");
                         let cleanup = reap.cleanup;
-                        let _ = tokio::task::spawn_blocking(move || {
-                            run_process_cleanup_recovering(&cleanup)
+                        match tokio::task::spawn_blocking(move || {
+                            run_cleanup_fallback_until_released(&cleanup)
                         })
-                        .await;
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::error!(%error, "signal-triggered emergency cleanup failed");
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "signal-triggered emergency cleanup worker failed");
+                            }
+                        }
                     }
                 }
             } else {
@@ -743,5 +883,55 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn injected_kill_failure_retains_child_for_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, _pid) = child_guard(root.path(), "kill-failure");
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        guard.armed.store(false, Ordering::SeqCst);
+        std::fs::write(&paths.socket, b"owned artifact").unwrap();
+        INJECT_CHILD_KILL_FAILURE.with(|inject| inject.set(true));
+        assert!(emergency_kill_wait_and_retire(&cleanup).is_err());
+        assert!(process_child_retained(&cleanup));
+        assert!(paths.socket.exists(), "metadata retired before proven exit");
+        emergency_kill_wait_and_retire(&cleanup).expect("retry reaps exact child");
+        assert!(!process_child_retained(&cleanup));
+    }
+
+    #[test]
+    fn injected_wait_failure_retains_killed_child_until_reaped() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, _paths, _pid) = child_guard(root.path(), "wait-failure");
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        guard.armed.store(false, Ordering::SeqCst);
+        INJECT_CHILD_WAIT_FAILURE.with(|inject| inject.set(true));
+        assert!(emergency_kill_wait_and_retire(&cleanup).is_err());
+        assert!(process_child_retained(&cleanup));
+        assert!(
+            run_cleanup_fallback_until_released(&cleanup).is_err(),
+            "the injected ownership-critical wait failure must remain visible"
+        );
+        assert!(!process_child_retained(&cleanup));
+    }
+
+    #[test]
+    fn already_exited_child_clears_owner_and_exact_late_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "already-exited");
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        guard.armed.store(false, Ordering::SeqCst);
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable).unwrap();
+        std::fs::write(&paths.socket, b"stale socket").unwrap();
+        {
+            let mut child = cleanup.child.lock().unwrap();
+            kill_and_wait_exact_child(child.as_mut().unwrap()).unwrap();
+        }
+        cleanup_exact_process(&cleanup).expect("already-exited cleanup");
+        assert!(!process_child_retained(&cleanup));
+        assert!(!paths.pid_file.exists());
+        assert!(!paths.socket.exists());
     }
 }

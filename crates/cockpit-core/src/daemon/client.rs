@@ -15,6 +15,21 @@ use crate::daemon::proto::{self, Request};
 static OWN_EPHEMERAL_PATHS: OnceLock<Mutex<Option<crate::daemon::DaemonPaths>>> = OnceLock::new();
 
 const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
+const LIFECYCLE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn retain_guard_after_acceptance<G>(
+    guard: Option<G>,
+    accepted: tokio::sync::oneshot::Receiver<()>,
+    retained: &mut Vec<G>,
+) {
+    if tokio::time::timeout(LIFECYCLE_ACCEPT_TIMEOUT, accepted)
+        .await
+        .is_ok_and(|accepted| accepted.is_ok())
+        && let Some(guard) = guard
+    {
+        retained.push(guard);
+    }
+}
 
 // ---- lifecycle helpers ----------------------------------------------------
 
@@ -90,6 +105,11 @@ pub async fn serve_lifecycle_requests(
 ) {
     let mut owned_daemons = Vec::new();
     while let Some(request) = requests.recv().await {
+        // A queued request may be cancelled before the lifecycle actor sees
+        // it. Never spawn a daemon for a receiver that is already gone.
+        if request.reply.is_closed() {
+            continue;
+        }
         let mode = match request.intent {
             cockpit_client::LifecycleIntent::AttachOrAutoPromote
             | cockpit_client::LifecycleIntent::EnsurePersistent => {
@@ -101,7 +121,7 @@ pub async fn serve_lifecycle_requests(
                 LifecycleMode::AttachOwnEphemeral
             }
         };
-        let result = probe_or_spawn(mode).await.and_then(|mut connected| {
+        let resolved = probe_or_spawn(mode).await.and_then(|mut connected| {
             if matches!(
                 request.intent,
                 cockpit_client::LifecycleIntent::EnsurePersistent
@@ -109,19 +129,30 @@ pub async fn serve_lifecycle_requests(
             {
                 anyhow::bail!("persistent lifecycle request resolved to an ephemeral daemon");
             }
-            if let Some(guard) = connected.take_owned_daemon_guard() {
-                owned_daemons.push(guard);
-            }
-            Ok(cockpit_client::LifecycleResolution {
-                endpoint: connected.endpoint,
-                owns_daemon: connected.owns_daemon,
-                socket: connected.socket,
-                startup_notice: connected.startup_notice,
-            })
+            let guard = connected.take_owned_daemon_guard();
+            Ok((
+                cockpit_client::LifecycleResolution {
+                    endpoint: connected.endpoint,
+                    owns_daemon: connected.owns_daemon,
+                    socket: connected.socket,
+                    startup_notice: connected.startup_notice,
+                },
+                guard,
+            ))
         });
-        let _ = request
-            .reply
-            .send(result.map_err(|error| error.to_string()));
+        match resolved {
+            Ok((resolution, guard)) => {
+                if request.reply.send(Ok(resolution)).is_err() {
+                    // `guard` drops here and reaps an unaccepted ephemeral.
+                    continue;
+                }
+                retain_guard_after_acceptance(guard, request.accepted, &mut owned_daemons).await;
+                // A cancelled/missing acceptance drops the guard here.
+            }
+            Err(error) => {
+                let _ = request.reply.send(Err(error.to_string()));
+            }
+        }
     }
 }
 
@@ -557,5 +588,53 @@ mod tests {
 
         assert_ne!(first.socket, second.socket);
         assert_ne!(first.pid_file, second.pid_file);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_guard_is_retained_only_after_endpoint_acceptance() {
+        struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut retained = Vec::new();
+        let (accepted, acceptance) = tokio::sync::oneshot::channel();
+        accepted.send(()).unwrap();
+        retain_guard_after_acceptance(
+            Some(DropSpy(std::sync::Arc::clone(&drops))),
+            acceptance,
+            &mut retained,
+        )
+        .await;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(retained);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_lifecycle_acceptance_reaps_unclaimed_guard() {
+        struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut retained = Vec::new();
+        let (accepted, acceptance) = tokio::sync::oneshot::channel::<()>();
+        drop(accepted);
+        retain_guard_after_acceptance(
+            Some(DropSpy(std::sync::Arc::clone(&drops))),
+            acceptance,
+            &mut retained,
+        )
+        .await;
+        assert!(retained.is_empty());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

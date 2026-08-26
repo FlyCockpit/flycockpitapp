@@ -60,23 +60,29 @@ impl InProcessEndpoint {
         payload: Zeroizing<Vec<u8>>,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let (reply, receive) = oneshot::channel();
-        self.sensitive
-            .send(InProcessSensitiveRequest { payload, reply })
+        tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.sensitive
+                .send(InProcessSensitiveRequest { payload, reply }),
+        )
+        .await
+        .map_err(|_| anyhow!("in-process sensitive request enqueue timed out"))?
+        .map_err(|_| anyhow!("in-process sensitive endpoint has retired"))?;
+        tokio::time::timeout(REQUEST_TIMEOUT, receive)
             .await
-            .map_err(|_| anyhow!("in-process sensitive endpoint has retired"))?;
-        receive
-            .await
+            .map_err(|_| anyhow!("in-process sensitive request timed out"))?
             .map_err(|_| anyhow!("in-process sensitive endpoint dropped its reply"))
     }
 
     async fn connect(&self) -> Result<InProcessConnection> {
         let (reply, receive) = oneshot::channel();
-        self.connections
-            .send(reply)
+        tokio::time::timeout(REQUEST_TIMEOUT, self.connections.send(reply))
             .await
+            .map_err(|_| anyhow!("in-process daemon connection enqueue timed out"))?
             .map_err(|_| anyhow!("in-process daemon endpoint has retired"))?;
-        receive
+        tokio::time::timeout(REQUEST_TIMEOUT, receive)
             .await
+            .map_err(|_| anyhow!("in-process daemon connection timed out"))?
             .map_err(|_| anyhow!("in-process daemon endpoint dropped its reply"))?
             .ok_or_else(|| anyhow!("in-process daemon endpoint has retired"))
     }
@@ -110,6 +116,9 @@ pub struct LifecycleResolution {
 pub struct LifecycleRequest {
     pub intent: LifecycleIntent,
     pub reply: oneshot::Sender<Result<LifecycleResolution, String>>,
+    /// The resolver retains any owned-daemon guard only after the requester
+    /// acknowledges that it received the endpoint capability.
+    pub accepted: oneshot::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -133,13 +142,26 @@ impl LifecycleClient {
 
     pub async fn resolve(&self, intent: LifecycleIntent) -> Result<LifecycleResolution, String> {
         let (reply, receive) = oneshot::channel();
-        self.requests
-            .send(LifecycleRequest { intent, reply })
+        let (accepted, acceptance) = oneshot::channel();
+        tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.requests.send(LifecycleRequest {
+                intent,
+                reply,
+                accepted: acceptance,
+            }),
+        )
+        .await
+        .map_err(|_| "daemon lifecycle request enqueue timed out".to_string())?
+        .map_err(|_| "daemon lifecycle resolver has stopped".to_string())?;
+        let resolution = tokio::time::timeout(REQUEST_TIMEOUT, receive)
             .await
-            .map_err(|_| "daemon lifecycle resolver has stopped".to_string())?;
-        receive
-            .await
-            .map_err(|_| "daemon lifecycle resolver dropped its reply".to_string())?
+            .map_err(|_| "daemon lifecycle resolution timed out".to_string())?
+            .map_err(|_| "daemon lifecycle resolver dropped its reply".to_string())??;
+        accepted
+            .send(())
+            .map_err(|_| "daemon lifecycle resolver retired before acceptance".to_string())?;
+        Ok(resolution)
     }
 }
 
@@ -1393,5 +1415,80 @@ mod tests {
             .unwrap()
             .expect("unknown event must not close client IO loop");
         assert!(matches!(response, Response::DaemonStatus { .. }));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_resolution_requires_requester_acceptance() {
+        let (client, mut requests) = LifecycleClient::channel(1);
+        let resolve = tokio::spawn(async move {
+            client
+                .resolve(LifecycleIntent::AlwaysEphemeral)
+                .await
+                .expect("resolution")
+        });
+        let request = requests.recv().await.expect("lifecycle request");
+        let (connections, _connection_requests) = mpsc::channel(1);
+        let (sensitive, _sensitive_requests) = mpsc::channel(1);
+        assert!(
+            request
+                .reply
+                .send(Ok(LifecycleResolution {
+                    endpoint: ClientEndpoint::InProcess(InProcessEndpoint::new(
+                        connections,
+                        sensitive,
+                    )),
+                    owns_daemon: true,
+                    socket: PathBuf::from("in-process"),
+                    startup_notice: None,
+                }))
+                .is_ok()
+        );
+        let _resolution = resolve.await.expect("resolve task");
+        request.accepted.await.expect("endpoint acceptance");
+    }
+
+    #[tokio::test]
+    async fn cancelled_lifecycle_resolution_closes_reply_and_acceptance() {
+        let (client, mut requests) = LifecycleClient::channel(1);
+        let resolve = tokio::spawn(async move {
+            let _ = client.resolve(LifecycleIntent::AlwaysEphemeral).await;
+        });
+        let request = requests.recv().await.expect("lifecycle request");
+        resolve.abort();
+        let _ = resolve.await;
+        assert!(request.reply.is_closed());
+        assert!(request.accepted.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn in_process_endpoint_opens_reusable_fresh_connections() {
+        let (connections, mut connection_requests) = mpsc::channel(2);
+        let (sensitive, _sensitive_requests) = mpsc::channel(1);
+        let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+        let broker = tokio::spawn(async move {
+            for _ in 0..2 {
+                let reply = connection_requests
+                    .recv()
+                    .await
+                    .expect("connection request");
+                let (requests, _request_receiver) = mpsc::channel(1);
+                let (_events, event_receiver) = mpsc::channel(1);
+                assert!(
+                    reply
+                        .send(Some(InProcessConnection {
+                            requests,
+                            events: event_receiver,
+                        }))
+                        .is_ok()
+                );
+            }
+        });
+        let _first = DaemonClient::connect_endpoint(&endpoint)
+            .await
+            .expect("first connection");
+        let _second = DaemonClient::connect_endpoint(&endpoint)
+            .await
+            .expect("second connection");
+        broker.await.expect("connection broker");
     }
 }

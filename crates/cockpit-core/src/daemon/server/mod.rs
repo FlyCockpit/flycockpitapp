@@ -3298,6 +3298,9 @@ pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::I
     let weak = Arc::downgrade(ctx);
     tokio::spawn(async move {
         while let Some(reply) = requests.recv().await {
+            if reply.is_closed() {
+                continue;
+            }
             let connection = weak.upgrade().map(spawn_in_process_client);
             let retired = connection.is_none();
             let _ = reply.send(connection);
@@ -3308,30 +3311,41 @@ pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::I
     });
     let weak = Arc::downgrade(ctx);
     tokio::spawn(async move {
-        while let Some(request) = sensitive_requests.recv().await {
+        while let Some(mut request) = sensitive_requests.recv().await {
+            if request.reply.is_closed() {
+                continue;
+            }
             let Some(ctx) = weak.upgrade() else {
                 break;
             };
             let response = match crate::daemon::leak_reveal_frame::decode_request(&request.payload)
             {
-                Ok(decoded) => match crate::daemon::leak_reveal::consume_leak_reveal(
-                    &ctx,
-                    decoded.capability_hex.as_str(),
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .await
-                {
-                    Ok(revealed) => {
-                        crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Ok {
-                            report_id: revealed.report_id,
-                            generation: revealed.generation,
-                            plaintext: revealed.plaintext,
+                Ok(decoded) => {
+                    let consume = crate::daemon::leak_reveal::consume_leak_reveal(
+                        &ctx,
+                        decoded.capability_hex.as_str(),
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                    let consumed = tokio::select! {
+                        biased;
+                        _ = request.reply.closed() => continue,
+                        consumed = consume => consumed,
+                    };
+                    match consumed {
+                        Ok(revealed) => {
+                            crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Ok {
+                                report_id: revealed.report_id,
+                                generation: revealed.generation,
+                                plaintext: revealed.plaintext,
+                            }
+                        }
+                        Err(denied) => {
+                            crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(
+                                denied,
+                            )
                         }
                     }
-                    Err(denied) => {
-                        crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(denied)
-                    }
-                },
+                }
                 Err(_) => crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(
                     crate::daemon::leak_reveal::LeakRevealDenied::Unauthorized,
                 ),

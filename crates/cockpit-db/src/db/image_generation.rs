@@ -468,6 +468,97 @@ fn execute_image_job_transition_conn(
     Ok(next_version)
 }
 
+fn execute_basic_image_slot_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    from: ImageGenerationSlotState,
+    expected_version: u64,
+    to: ImageGenerationSlotState,
+) -> Result<u64> {
+    ensure!(
+        slot_transition_allowed(from, to),
+        "forbidden image generation slot transition"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("image generation slot version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4 AND state=?5 AND version=?6",params![to.as_str(),i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),from.as_str(),i64::try_from(expected_version)?])?==1,"image generation slot transition lost compare-and-set");
+    Ok(next)
+}
+
+fn execute_basic_image_attempt_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    from: ImageGenerationAttemptState,
+    expected_version: u64,
+    to: ImageGenerationAttemptState,
+) -> Result<u64> {
+    ensure!(
+        attempt_transition_allowed(from, to),
+        "forbidden image generation attempt transition"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("image generation attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state=?6 AND version=?7",params![to.as_str(),i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),from.as_str(),i64::try_from(expected_version)?])?==1,"image generation attempt transition lost compare-and-set");
+    Ok(next)
+}
+
+fn execute_queue_all_image_slots_conn(conn: &Connection, job_id: Uuid) -> Result<usize> {
+    ensure!(
+        slot_transition_allowed(
+            ImageGenerationSlotState::Planned,
+            ImageGenerationSlotState::Queued
+        ),
+        "queue slot transition is not canonical"
+    );
+    conn.execute("UPDATE image_generation_slots SET state='queued',version=version+1 WHERE job_id=?1 AND state='planned' AND version=1",[job_id.to_string()]).map_err(Into::into)
+}
+
+fn execute_image_publication_attempt_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    expected_version: u64,
+) -> Result<u64> {
+    ensure!(
+        attempt_transition_allowed(
+            ImageGenerationAttemptState::ResponseAdopted,
+            ImageGenerationAttemptState::Succeeded
+        ),
+        "publication attempt transition is not canonical"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("publication attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='succeeded',version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state='response_adopted' AND version=?5 AND applied_cancellation_version IS NULL",params![i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),i64::try_from(expected_version)?])?==1,"publication attempt lost compare-and-set");
+    Ok(next)
+}
+
+fn execute_image_publication_slot_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    expected_version: u64,
+) -> Result<u64> {
+    ensure!(
+        slot_transition_allowed(
+            ImageGenerationSlotState::ReadyToPublish,
+            ImageGenerationSlotState::Published
+        ),
+        "publication slot transition is not canonical"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("publication slot version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET state='published',version=?1,published_disposition='ordinary',published_disposition_generation=?1 WHERE job_id=?2 AND slot_id=?3 AND state='ready_to_publish' AND version=?4 AND applied_cancellation_version IS NULL AND result_after_cancel=0",params![i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),i64::try_from(expected_version)?])?==1,"publication slot lost compare-and-set");
+    Ok(next)
+}
+
 pub const fn slot_is_job_settled(state: ImageGenerationSlotState) -> bool {
     use ImageGenerationSlotState as S;
     matches!(
@@ -1625,7 +1716,7 @@ impl Db {
                 at_unix_ms,
                 ImageJobTransitionContext::Ordinary,
             )?;
-            let changed=conn.execute("UPDATE image_generation_slots SET state='queued',version=version+1 WHERE job_id=?1 AND state='planned' AND version=1",[authority.job_id.to_string()])?;
+            let changed = execute_queue_all_image_slots_conn(conn, authority.job_id)?;
             let expected: i64 = conn.query_row(
                 "SELECT slot_count FROM image_generation_plans WHERE job_id=?1",
                 [authority.job_id.to_string()],
@@ -1759,7 +1850,14 @@ impl Db {
             )?;
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1,dispatch_proof_endpoint_id=?5,dispatch_proof_config_generation=?6,dispatch_proof_refresh_epoch=?7,dispatch_proof_connected_ip=?8,dispatch_proof_location_class=?9,dispatch_proof_hops_digest=?10 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?,input.dispatch_proof.endpoint_id,i64::try_from(input.dispatch_proof.config_generation)?,i64::try_from(input.dispatch_proof.refresh_epoch)?,input.dispatch_proof.connected_ip,input.dispatch_proof.location_class,input.dispatch_proof.hops_digest])?==1,"image generation attempt preparation lost compare-and-set");
-            ensure!(conn.execute("UPDATE image_generation_slots SET state='dispatching',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='queued' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot dispatch lost compare-and-set");
+            execute_basic_image_slot_transition_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                ImageGenerationSlotState::Queued,
+                input.expected_slot_version,
+                ImageGenerationSlotState::Dispatching,
+            )?;
             execute_image_job_transition_conn(
                 conn,
                 input.job_id,
@@ -2592,8 +2690,23 @@ impl Db {
             "image generation download job transition is not canonical"
         );
         atomic_conn(conn, "image_generation_begin_download", || {
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='accepted' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt download compare-and-set lost");
-            ensure!(conn.execute("UPDATE image_generation_slots SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='running' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot download compare-and-set lost");
+            execute_basic_image_attempt_transition_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                input.attempt_number,
+                ImageGenerationAttemptState::Accepted,
+                input.expected_attempt_version,
+                ImageGenerationAttemptState::Downloading,
+            )?;
+            execute_basic_image_slot_transition_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                ImageGenerationSlotState::Running,
+                input.expected_slot_version,
+                ImageGenerationSlotState::Downloading,
+            )?;
             execute_image_job_transition_conn(
                 conn,
                 input.job_id,
@@ -2715,7 +2828,14 @@ impl Db {
                 slot_transition_allowed(ImageGenerationSlotState::Validating, next),
                 "image generation validation transition is not canonical"
             );
-            ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1 WHERE job_id=?2 AND slot_id=?3 AND state='validating' AND version=?4",params![next.as_str(),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation validation compare-and-set lost");
+            execute_basic_image_slot_transition_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                ImageGenerationSlotState::Validating,
+                input.expected_slot_version,
+                next,
+            )?;
             if after_cancel {
                 commit_terminal_job_projection_conn(conn, input.job_id, input.at_unix_ms)?;
             }
@@ -2863,22 +2983,19 @@ impl Db {
             "INSERT INTO image_generation_publication_right_facts(job_id,slot_id,attempt_number,slot_version,artifact_generation,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",
             params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_slot_version)?,i64::try_from(input.artifact_generation)?,input.now_unix_ms],
         )?;
-        let attempt_changed = conn.execute(
-            "UPDATE image_generation_attempts SET state='succeeded',version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state='response_adopted' AND version=?5 AND applied_cancellation_version IS NULL",
-            params![i64::try_from(input.expected_attempt_version+1)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?],
+        execute_image_publication_attempt_transition_conn(
+            conn,
+            input.job_id,
+            input.slot_id,
+            input.attempt_number,
+            input.expected_attempt_version,
         )?;
-        ensure!(
-            attempt_changed == 1,
-            "publication attempt lost its compare-and-set"
-        );
-        let slot_changed = conn.execute(
-            "UPDATE image_generation_slots SET state='published',version=?1,published_disposition='ordinary',published_disposition_generation=?1 WHERE job_id=?2 AND slot_id=?3 AND state='ready_to_publish' AND version=?4 AND applied_cancellation_version IS NULL AND result_after_cancel=0",
-            params![i64::try_from(input.expected_slot_version+1)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?],
+        execute_image_publication_slot_transition_conn(
+            conn,
+            input.job_id,
+            input.slot_id,
+            input.expected_slot_version,
         )?;
-        ensure!(
-            slot_changed == 1,
-            "publication slot lost its compare-and-set"
-        );
         commit_terminal_job_projection_conn(conn, input.job_id, input.now_unix_ms)?;
         Ok(ImageGenerationCasOutcome::Applied {
             version: input.expected_slot_version + 1,

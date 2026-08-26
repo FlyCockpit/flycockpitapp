@@ -28,6 +28,7 @@ pub const LEASE_STATES: &[&str] = &[
     "returning",
     "released",
 ];
+pub const LEASE_TERMINAL_STATES: &[&str] = &["released"];
 
 /// Valid durable transfer phases, in advance order.
 pub const TRANSFER_PHASES: &[&str] = &[

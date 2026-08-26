@@ -2,6 +2,7 @@
 
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 fn schema_inventory(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
@@ -501,6 +502,42 @@ fn declared_owner_sources(owner: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+fn csv_set(value: &str) -> BTreeSet<String> {
+    value
+        .split(',')
+        .map(|item| item.trim().to_owned())
+        .collect()
+}
+
+fn quoted_literals(value: &str) -> Vec<String> {
+    value
+        .split('\'')
+        .enumerate()
+        .filter_map(|(index, value)| (index % 2 == 1).then(|| value.to_owned()))
+        .collect()
+}
+
+fn rust_constant(source: &str, symbol: &str) -> &str {
+    source
+        .split(&format!(" {symbol}:"))
+        .nth(1)
+        .and_then(|tail| tail.split("]; ").next().or_else(|| tail.split("];").next()))
+        .unwrap_or_else(|| panic!("Rust contract constant {symbol} is absent"))
+}
+
+fn sql_trigger<'a>(sql: &'a str, name: &str, table: &str) -> &'a str {
+    let trigger = sql
+        .split(&format!("CREATE TRIGGER {name}"))
+        .nth(1)
+        .and_then(|tail| tail.split("END;").next())
+        .unwrap_or_else(|| panic!("SQL trigger {name} is absent"));
+    assert!(
+        trigger.contains(&format!(" ON {table}")),
+        "SQL trigger {name} is not bound to {table}"
+    );
+    trigger
+}
+
 fn ownership() -> BTreeMap<String, Ownership> {
     let parsed: toml::Value = toml::from_str(include_str!("../schema-ownership.toml"))
         .expect("schema-ownership.toml must be valid TOML");
@@ -519,9 +556,12 @@ fn ownership() -> BTreeMap<String, Ownership> {
         for field in [
             "table",
             "rust_source",
-            "rust_symbol",
-            "sql_trigger",
+            "states_symbol",
+            "edges_symbol",
+            "terminals_symbol",
+            "sql_triggers",
             "allowed_states",
+            "edges",
             "recovery_entrypoint",
             "terminal_states",
             "retention_rule",
@@ -529,14 +569,9 @@ fn ownership() -> BTreeMap<String, Ownership> {
         ] {
             required_text(name, family, field);
         }
-        let allowed = required_text(name, family, "allowed_states")
-            .split(',')
-            .map(str::trim)
-            .collect::<BTreeSet<_>>();
-        let terminal = required_text(name, family, "terminal_states")
-            .split(',')
-            .map(str::trim)
-            .collect::<BTreeSet<_>>();
+        let allowed = csv_set(required_text(name, family, "allowed_states"));
+        let edges = csv_set(required_text(name, family, "edges"));
+        let terminal = csv_set(required_text(name, family, "terminal_states"));
         assert!(
             !terminal.is_empty(),
             "state-machine family {name} needs terminal states"
@@ -551,22 +586,42 @@ fn ownership() -> BTreeMap<String, Ownership> {
             include_str!("../src/db/migrations/0001_remote_profile.sql"),
         ]
         .join("\n");
-        assert!(
-            sql.contains(required_text(name, family, "sql_trigger")),
-            "family {name} SQL trigger is absent"
-        );
         let table = required_text(name, family, "table");
         let declaration = sql
             .split(&format!("CREATE TABLE {table}"))
             .nth(1)
             .and_then(|tail| tail.split(";").next())
             .unwrap_or_else(|| panic!("family {name} table declaration is absent"));
-        for state in &allowed {
-            assert!(
-                declaration.contains(&format!("'{state}'")),
-                "family {name} state {state} is absent from SQL CHECK"
-            );
+        let state_check = declaration
+            .split("CHECK (state IN (")
+            .nth(1)
+            .and_then(|tail| tail.split("))").next())
+            .unwrap_or_else(|| panic!("family {name} has no closed SQL state CHECK"));
+        let sql_states = quoted_literals(state_check)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(allowed, sql_states, "family {name} SQL state set drifted");
+        let mut sql_edges = BTreeSet::new();
+        for trigger_name in required_text(name, family, "sql_triggers")
+            .split(',')
+            .map(str::trim)
+        {
+            for literal in quoted_literals(sql_trigger(&sql, trigger_name, table)) {
+                if literal.contains('>') {
+                    sql_edges.insert(literal);
+                }
+            }
         }
+        assert_eq!(edges, sql_edges, "family {name} SQL edge set drifted");
+        let sql_sources = sql_edges
+            .iter()
+            .filter_map(|edge| edge.split_once('>').map(|(from, _)| from.to_owned()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            terminal,
+            allowed.difference(&sql_sources).cloned().collect(),
+            "family {name} SQL terminal set drifted"
+        );
         let rust_source = repository_root().join(required_text(name, family, "rust_source"));
         let rust = std::fs::read_to_string(&rust_source).unwrap_or_else(|error| {
             panic!(
@@ -574,16 +629,37 @@ fn ownership() -> BTreeMap<String, Ownership> {
                 rust_source.display()
             )
         });
-        assert!(
-            rust.contains(required_text(name, family, "rust_symbol")),
-            "family {name} Rust transition symbol is absent"
+        let rust_states = quoted_literals(rust_constant(
+            &rust,
+            required_text(name, family, "states_symbol"),
+        ))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let rust_edge_values = quoted_literals(rust_constant(
+            &rust,
+            required_text(name, family, "edges_symbol"),
+        ));
+        assert_eq!(
+            rust_edge_values.len() % 2,
+            0,
+            "family {name} Rust edge constant is malformed"
         );
-        for state in &allowed {
-            assert!(
-                rust.contains(&format!("\"{state}\"")),
-                "family {name} state {state} is absent from Rust"
-            );
-        }
+        let rust_edges = rust_edge_values
+            .chunks_exact(2)
+            .map(|edge| format!("{}>{}", edge[0], edge[1]))
+            .collect::<BTreeSet<_>>();
+        let rust_terminals = quoted_literals(rust_constant(
+            &rust,
+            required_text(name, family, "terminals_symbol"),
+        ))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(allowed, rust_states, "family {name} Rust state set drifted");
+        assert_eq!(edges, rust_edges, "family {name} Rust edge set drifted");
+        assert_eq!(
+            terminal, rust_terminals,
+            "family {name} Rust terminal set drifted"
+        );
     }
     let table = parsed
         .get("table")
@@ -785,6 +861,30 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
     let local_sql = include_str!("../src/db/migrations/0001_initial.sql");
     let extended_sql = include_str!("../src/db/migrations/0001_extended_profile.sql");
     let remote_sql = include_str!("../src/db/migrations/0001_remote_profile.sql");
+    let profile_sql = [
+        local_sql.to_owned(),
+        [local_sql, extended_sql].concat(),
+        [local_sql, remote_sql].concat(),
+        [local_sql, extended_sql, remote_sql].concat(),
+    ];
+    let fingerprints = profile_sql
+        .iter()
+        .map(|sql| {
+            let mut hasher = DefaultHasher::new();
+            sql.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fingerprints.len(),
+        profile_sql.len(),
+        "profiles with different inventories must have distinct ordered SQL fingerprints"
+    );
+    assert!(
+        profile_sql[3].starts_with(&profile_sql[1])
+            && &profile_sql[3][profile_sql[1].len()..] == remote_sql,
+        "full profile composition must be local then extended then remote"
+    );
     let ownership = ownership();
     // Keep this source-level gate before either migration is handed to SQLite:
     // malformed or unavailable extensions must not hide ownership drift.

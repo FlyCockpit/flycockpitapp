@@ -78,6 +78,56 @@ pub enum ReservationState {
     AccountingCorrupt,
 }
 
+pub const RESERVATION_STATES: &[&str] = &[
+    "reserved_queued",
+    "executing_local",
+    "dispatching_external",
+    "external_pending",
+    "reconciling_external",
+    "cancellation_requested",
+    "overage_quarantined",
+    "settling",
+    "released",
+    "accounting_corrupt",
+];
+pub const RESERVATION_TERMINAL_STATES: &[&str] = &["released", "accounting_corrupt"];
+pub const RESERVATION_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("reserved_queued", "executing_local"),
+    ("reserved_queued", "dispatching_external"),
+    ("reserved_queued", "cancellation_requested"),
+    ("reserved_queued", "settling"),
+    ("executing_local", "dispatching_external"),
+    ("executing_local", "cancellation_requested"),
+    ("executing_local", "settling"),
+    ("executing_local", "overage_quarantined"),
+    ("executing_local", "accounting_corrupt"),
+    ("dispatching_external", "external_pending"),
+    ("dispatching_external", "cancellation_requested"),
+    ("dispatching_external", "settling"),
+    ("dispatching_external", "overage_quarantined"),
+    ("dispatching_external", "accounting_corrupt"),
+    ("external_pending", "reconciling_external"),
+    ("external_pending", "cancellation_requested"),
+    ("external_pending", "settling"),
+    ("external_pending", "overage_quarantined"),
+    ("external_pending", "accounting_corrupt"),
+    ("reconciling_external", "external_pending"),
+    ("reconciling_external", "cancellation_requested"),
+    ("reconciling_external", "settling"),
+    ("reconciling_external", "overage_quarantined"),
+    ("reconciling_external", "accounting_corrupt"),
+    ("cancellation_requested", "external_pending"),
+    ("cancellation_requested", "reconciling_external"),
+    ("cancellation_requested", "settling"),
+    ("cancellation_requested", "overage_quarantined"),
+    ("cancellation_requested", "accounting_corrupt"),
+    ("overage_quarantined", "settling"),
+    ("overage_quarantined", "accounting_corrupt"),
+    ("settling", "released"),
+    ("settling", "overage_quarantined"),
+    ("settling", "accounting_corrupt"),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaExternalHandoffOutcome {
     Accepted,
@@ -117,54 +167,8 @@ impl ReservationState {
         })
     }
 
-    pub const fn allows(self, next: Self) -> bool {
-        use ReservationState as S;
-        matches!(
-            (self, next),
-            (
-                S::ReservedQueued,
-                S::ExecutingLocal | S::DispatchingExternal | S::CancellationRequested | S::Settling
-            ) | (
-                S::ExecutingLocal,
-                S::DispatchingExternal
-                    | S::CancellationRequested
-                    | S::Settling
-                    | S::OverageQuarantined
-                    | S::AccountingCorrupt
-            ) | (
-                S::DispatchingExternal,
-                S::ExternalPending
-                    | S::CancellationRequested
-                    | S::Settling
-                    | S::OverageQuarantined
-                    | S::AccountingCorrupt
-            ) | (
-                S::ExternalPending,
-                S::ReconcilingExternal
-                    | S::CancellationRequested
-                    | S::Settling
-                    | S::OverageQuarantined
-                    | S::AccountingCorrupt
-            ) | (
-                S::ReconcilingExternal,
-                S::ExternalPending
-                    | S::CancellationRequested
-                    | S::Settling
-                    | S::OverageQuarantined
-                    | S::AccountingCorrupt
-            ) | (
-                S::CancellationRequested,
-                S::ExternalPending
-                    | S::ReconcilingExternal
-                    | S::Settling
-                    | S::OverageQuarantined
-                    | S::AccountingCorrupt
-            ) | (S::OverageQuarantined, S::Settling | S::AccountingCorrupt)
-                | (
-                    S::Settling,
-                    S::Released | S::OverageQuarantined | S::AccountingCorrupt
-                )
-        )
+    pub fn allows(self, next: Self) -> bool {
+        RESERVATION_LEGAL_EDGES.contains(&(self.as_str(), next.as_str()))
     }
 }
 

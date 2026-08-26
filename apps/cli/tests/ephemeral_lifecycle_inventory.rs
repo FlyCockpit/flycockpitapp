@@ -666,6 +666,17 @@ fn canonical_runner_body() -> syn::Block {
 
 fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
     let source = match name {
+        "lifecycle" => {
+            r#"
+            fn lifecycle(self) -> LifecycleMode {
+                match self {
+                    Self::AttachOrAutoPromote => LifecycleMode::AttachOrAutoPromote,
+                    Self::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
+                    Self::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
+                }
+            }
+        "#
+        }
         "connect" => {
             r#"
             async fn connect(mode: OwnedSessionMode) -> Result<Self> {
@@ -704,6 +715,13 @@ fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
                     let _ = task.await;
                 }
                 crate::daemon::ephemeral_guard::aggregate_shutdown_result(result, shutdown)
+            }
+        "#
+        }
+        "client" => {
+            r#"
+            fn client(&self) -> &DaemonClient {
+                &self.client
             }
         "#
         }
@@ -892,6 +910,28 @@ fn core_contract_violations(source: &str) -> Vec<String> {
         violations.push("run_owned_daemon ordered canonical body changed".into());
     }
 
+    let mode_impl = file.items.iter().find_map(|item| match item {
+        syn::Item::Impl(item)
+            if item.trait_.is_none()
+                && matches!(&*item.self_ty, syn::Type::Path(path)
+                    if path.path.is_ident("OwnedSessionMode")) =>
+        {
+            Some(item)
+        }
+        _ => None,
+    });
+    let lifecycle = mode_impl.and_then(|implementation| {
+        implementation.items.iter().find_map(|item| match item {
+            syn::ImplItem::Fn(method) if method.sig.ident == "lifecycle" => Some(method),
+            _ => None,
+        })
+    });
+    if lifecycle.is_none_or(|method| {
+        compact_tokens(method) != compact_tokens(canonical_owned_method("lifecycle"))
+    }) {
+        violations.push("OwnedSessionMode::lifecycle canonical mapping changed".into());
+    }
+
     let owned_impl = file.items.iter().find_map(|item| match item {
         syn::Item::Impl(item)
             if item.trait_.is_none()
@@ -902,7 +942,7 @@ fn core_contract_violations(source: &str) -> Vec<String> {
         }
         _ => None,
     });
-    for name in ["connect", "finish"] {
+    for name in ["connect", "client", "finish"] {
         let method = owned_impl.and_then(|implementation| {
             implementation.items.iter().find_map(|item| match item {
                 syn::ImplItem::Fn(method) if method.sig.ident == name => Some(method),
@@ -1484,6 +1524,18 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
     }
 
     for (before, after) in [
+        (
+            "Self::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral",
+            "Self::AlwaysEphemeral => LifecycleMode::AttachOrAutoPromote",
+        ),
+        (
+            "fn client(&self) -> &DaemonClient {\n        &self.client\n    }",
+            "fn client(&self) -> &DaemonClient {\n        global_daemon_client()\n    }",
+        ),
+        (
+            "fn client(&self) -> &DaemonClient {\n        &self.client\n    }",
+            "fn client(&self) -> &DaemonClient {\n        detached_daemon_client(&self.client)\n    }",
+        ),
         (
             "let result = operation(ScopedDaemonClient",
             "if false { return Err(OwnedDaemonRunError::OperationOrCleanup(anyhow::anyhow!(\"early\"))); }\n    let result = operation(ScopedDaemonClient",

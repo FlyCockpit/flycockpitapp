@@ -279,24 +279,26 @@ fn normalized_tokens(tokens: &[Token]) -> String {
 }
 
 fn reject_unsupported_schema_forms(tokens: &[Token]) {
-    fn comma_introduces_from_relation(tokens: &[Token], dot: usize) -> bool {
-        if dot < 3 || tokens.get(dot - 2) != Some(&Token::Mark(',')) {
+    fn source_context_before(tokens: &[Token], boundary: usize) -> bool {
+        if boundary == 0 {
             return false;
         }
-        // Walk backward at the schema qualifier's parenthesis depth. Commas
-        // inside SELECT lists, function arguments, subqueries, and VALUES
-        // therefore resolve to their own scope instead of the outer FROM.
+        // Walk backward at this table-or-subquery group's depth. An opening
+        // parenthesis can itself be a FROM/JOIN source group, so recurse into
+        // its surrounding scope. Function/scalar-expression parentheses reach
+        // a clause/SELECT boundary instead and fail closed as non-sources.
         let mut nested = 0_u32;
-        for token in tokens[..dot - 2].iter().rev() {
+        for (index, token) in tokens[..boundary].iter().enumerate().rev() {
             match token {
                 Token::Mark(')') => nested = nested.checked_add(1).expect("SQL nesting overflow"),
                 Token::Mark('(') if nested > 0 => nested -= 1,
-                Token::Mark('(') => return false,
+                Token::Mark('(') => return source_context_before(tokens, index),
                 Token::Mark(';') if nested == 0 => return false,
                 Token::Word(keyword) if nested == 0 => match keyword.as_str() {
                     "from" | "join" => return true,
                     "select" | "where" | "group" | "having" | "order" | "limit" | "union"
-                    | "intersect" | "except" | "values" | "returning" => {
+                    | "intersect" | "except" | "values" | "returning" | "on" | "using" | "set"
+                    | "when" => {
                         return false;
                     }
                     _ => {}
@@ -305,6 +307,15 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
             }
         }
         false
+    }
+
+    fn grouped_or_comma_from_relation(tokens: &[Token], dot: usize) -> bool {
+        dot >= 3
+            && matches!(
+                tokens.get(dot - 2),
+                Some(Token::Mark('(')) | Some(Token::Mark(','))
+            )
+            && source_context_before(tokens, dot - 2)
     }
 
     for (index, token) in tokens.iter().enumerate() {
@@ -373,7 +384,7 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
             assert!(
                 !direct_schema_context
                     && !update_conflict_schema_context
-                    && !comma_introduces_from_relation(tokens, index),
+                    && !grouped_or_comma_from_relation(tokens, index),
                 "schema-qualified object names are unsupported"
             );
         }
@@ -1175,6 +1186,10 @@ mod tests {
             "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT child.id FROM child JOIN main.other ON other.id=child.id; END;",
             "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT child.id FROM child, main.other; END;",
             "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT child.id FROM child, (SELECT other.id FROM other, main.child); END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT * FROM (main.child); END;",
+            "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT * FROM (child, main.other) AS grouped; END;",
+            "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT * FROM child JOIN (other, main.child) AS grouped; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT * FROM ((main.child)) AS grouped; END;",
         ] {
             assert!(
                 std::panic::catch_unwind(|| parse(&[sql])).is_err(),
@@ -1193,6 +1208,10 @@ mod tests {
                  WHERE coalesce(child.id, other.id) IN (
                     SELECT coalesce(child.id, other.id) FROM child, other
                  );
+                SELECT (child.id), coalesce(child.id, other.id)
+                  FROM (child, other) AS grouped;
+                SELECT child.id FROM child JOIN other
+                  ON coalesce(child.id, other.id) = coalesce(other.id, child.id);
                 INSERT INTO child(id) VALUES (coalesce(NEW.id, OLD.id));
             END;
         "#]);

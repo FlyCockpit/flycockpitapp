@@ -72,12 +72,12 @@ pub enum LifecycleMode {
 /// Connect-or-spawn result: a ready-to-use client plus a flag the
 /// caller honors when it's time to shut down — `owns_daemon = true`
 /// means "you spawned this daemon, so stop it on your way out."
-pub struct ConnectedDaemon {
-    pub client: DaemonClient,
-    pub endpoint: cockpit_client::ClientEndpoint,
-    pub owns_daemon: bool,
-    pub socket: PathBuf,
-    pub startup_notice: Option<String>,
+pub(crate) struct ConnectedDaemon {
+    client: DaemonClient,
+    endpoint: cockpit_client::ClientEndpoint,
+    owns_daemon: bool,
+    socket: PathBuf,
+    startup_notice: Option<String>,
     /// Provisional ownership begins in `probe_or_spawn` immediately after an
     /// ephemeral child is created. Callers must explicitly take this guard
     /// when publishing a longer-lived owner; every abandoned/error path drops
@@ -86,7 +86,7 @@ pub struct ConnectedDaemon {
     owned_in_process_guard: Option<crate::daemon::InProcessDaemonGuard>,
 }
 
-pub enum OwnedDaemonGuard {
+enum OwnedDaemonGuard {
     Process(crate::daemon::ephemeral_guard::EphemeralDaemonGuard),
     InProcess(crate::daemon::InProcessDaemonGuard),
 }
@@ -197,18 +197,36 @@ impl OwnedDaemonSession {
     }
 }
 
+impl Drop for OwnedDaemonSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.signal_task.take() {
+            task.abort();
+        }
+        // `guard` deliberately remains armed. Its Drop joins the same exact
+        // cleanup used by explicit finish and signal-driven teardown.
+    }
+}
+
+/// Persistent-only daemon connection. It contains no process-ownership guard,
+/// so exposing the client cannot detach an ephemeral child.
+pub struct PersistentDaemonSession {
+    pub client: DaemonClient,
+}
+
 /// Attach to the canonical persistent daemon, spawning one if needed.
 ///
 /// Product CLI commands that need installation state must go through this
 /// helper. Spawn failure is fail-closed: callers must not open SQLite.
-pub async fn ensure_persistent_daemon() -> Result<ConnectedDaemon> {
+pub async fn ensure_persistent_daemon() -> Result<PersistentDaemonSession> {
     let connected = probe_or_spawn(LifecycleMode::AttachOrAutoPromote).await?;
     if connected.owns_daemon {
         anyhow::bail!(
             "persistent daemon attach produced an ephemeral instance; refusing secret or workspace writes"
         );
     }
-    Ok(connected)
+    Ok(PersistentDaemonSession {
+        client: connected.client,
+    })
 }
 
 /// Run the lifecycle half of the two-phase TUI composition. The CLI owns this
@@ -324,7 +342,7 @@ pub fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
 
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
-pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
+pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
     use crate::daemon::{
         DaemonPaths, DaemonStatus, discover, spawn_detached, spawn_detached_ephemeral,
     };
@@ -616,6 +634,63 @@ mod tests {
     use super::*;
     use crate::daemon::DaemonPaths;
     use crate::daemon::proto::Response;
+
+    #[tokio::test]
+    async fn dropping_owned_session_aborts_watcher_and_runs_guard_cleanup() {
+        use tokio::io::AsyncBufReadExt as _;
+
+        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                if let Some(notify) = self.0.take() {
+                    let _ = notify.send(());
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("owned-session.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let stop = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            line
+        });
+        let (requests, _request_rx) = tokio::sync::mpsc::channel(1);
+        let (_events, event_rx) = tokio::sync::mpsc::channel(1);
+        let client = DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+            requests,
+            events: event_rx,
+        });
+        let (watcher_dropped, watcher_drop) = tokio::sync::oneshot::channel();
+        let signal_task = tokio::spawn(async move {
+            let _notify = NotifyDrop(Some(watcher_dropped));
+            std::future::pending::<()>().await;
+        });
+        let session = OwnedDaemonSession {
+            client,
+            guard: Some(
+                crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new_for_socket(socket),
+            ),
+            signal_task: Some(signal_task),
+        };
+
+        tokio::task::spawn_blocking(move || drop(session))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), watcher_drop)
+            .await
+            .expect("signal watcher was detached")
+            .unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(2), stop)
+            .await
+            .expect("guard cleanup did not contact daemon")
+            .unwrap();
+        assert!(line.contains("stop_daemon"));
+    }
 
     #[test]
     fn ephemeral_spawn_arms_raii_before_the_first_wait() {

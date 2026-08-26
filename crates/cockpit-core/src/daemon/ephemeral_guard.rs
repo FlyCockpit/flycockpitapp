@@ -549,7 +549,7 @@ impl EphemeralDaemonGuard {
     }
 
     #[cfg(test)]
-    fn new_for_socket(socket: PathBuf) -> Self {
+    pub(crate) fn new_for_socket(socket: PathBuf) -> Self {
         Self {
             socket,
             process: None,

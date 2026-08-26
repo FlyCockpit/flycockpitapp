@@ -24,13 +24,21 @@ pub mod test_env {
         TestEnvGuard::lock().await
     }
 }
+pub(crate) use cockpit_core::daemon;
 pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
-    daemon, diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
+    diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
     knowledge, locks, mcp, media_reservation, model_system_prompt, packages, private_fs, process,
     providers, redact, secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools,
     user_agent, welcome, wizard,
 };
+
+/// Narrow process-boundary fixtures used by the CLI's integration tests.
+/// Production consumers must not gain access to the daemon lifecycle module.
+#[doc(hidden)]
+pub mod integration_test_api {
+    pub use cockpit_core::daemon::agent_installation;
+}
 pub use cockpit_db as db;
 mod terminal_host;
 

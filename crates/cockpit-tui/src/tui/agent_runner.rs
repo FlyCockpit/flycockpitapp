@@ -3814,7 +3814,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayTextDelta {
             agent,
-            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
             delta,
         },
         AssistantDisplayReasoningDelta {
@@ -3824,7 +3824,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayReasoningDelta {
             agent,
-            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
             delta,
         },
         AssistantDisplayAttemptReset {
@@ -3835,8 +3835,10 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayAttemptReset {
             agent,
-            failed_attempt_id: cockpit_core::engine::AssistantAttemptId::new(failed_attempt_id),
-            replacement_attempt_id: cockpit_core::engine::AssistantAttemptId::new(
+            failed_attempt_id: cockpit_client::presentation::AssistantAttemptId::new(
+                failed_attempt_id,
+            ),
+            replacement_attempt_id: cockpit_client::presentation::AssistantAttemptId::new(
                 replacement_attempt_id,
             ),
             reason,
@@ -3852,7 +3854,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayComplete {
             agent,
-            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
             assistant: cockpit_core::engine::AssistantTextPayload {
                 text,
                 presentation_text,
@@ -3872,7 +3874,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayError {
             agent,
-            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
             kind: match kind.as_str() {
                 "cancelled" => cockpit_core::engine::DisplayErrorKind::Cancelled,
                 _ => cockpit_core::engine::DisplayErrorKind::Failed,

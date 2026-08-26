@@ -76,7 +76,7 @@ pub(super) struct BtwPane {
     pub history: Vec<HistoryEntry>,
     pub pending: Option<PendingMsg>,
     /// Live typed-display attempt owning BTW provisional UI (mirrors main TUI).
-    active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
+    active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     pub queue: Vec<QueuedUserMessage>,
     fresh_queue_ack: FreshQueueAck,
     folded_queue_item_ids: std::collections::HashSet<Uuid>,
@@ -1346,7 +1346,7 @@ mod tests {
     #[test]
     fn btw_pane_concurrent_with_main_turn() {
         let mut pane = BtwPane::new(info(false), false);
-        let attempt = cockpit_core::engine::AssistantAttemptId::new(1);
+        let attempt = cockpit_client::presentation::AssistantAttemptId::new(1);
         pane.apply_event(
             TurnEvent::ThinkingStarted {
                 agent: "Btw".to_string(),
@@ -1377,8 +1377,8 @@ mod tests {
     #[test]
     fn btw_typed_display_attempt_correlation_rejects_stale_and_raw_deltas() {
         let mut pane = BtwPane::new(info(false), false);
-        let failed = cockpit_core::engine::AssistantAttemptId::new(7);
-        let replacement = cockpit_core::engine::AssistantAttemptId::new(8);
+        let failed = cockpit_client::presentation::AssistantAttemptId::new(7);
+        let replacement = cockpit_client::presentation::AssistantAttemptId::new(8);
         pane.apply_event(
             TurnEvent::ThinkingStarted {
                 agent: "Btw".to_string(),

@@ -1463,7 +1463,7 @@ pub(super) struct SideConversation {
     saved_history_render_cache_rows: usize,
     saved_queue: Vec<QueuedUserMessage>,
     saved_pending: Option<PendingMsg>,
-    saved_active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
+    saved_active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     saved_prunable_tokens: u64,
     saved_cache_cold: bool,
     saved_elided_event_ids: std::collections::HashSet<String>,
@@ -2018,7 +2018,7 @@ pub struct App {
     /// Live typed-display attempt that owns provisional UI / chip state.
     /// Advanced to the replacement on `AssistantDisplayAttemptReset` so late
     /// deltas for the failed attempt cannot recreate a provisional row.
-    pub(super) active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
+    pub(super) active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     /// Currently rendered transcript view. `Main` is the normal session transcript;
     /// `Subagent` means `history`/`pending` have been swapped to the selected child.
     pub(super) transcript_view: TranscriptViewMeta,
@@ -3290,7 +3290,7 @@ pub(super) struct StoredTranscriptView {
     pub(super) meta: TranscriptViewMeta,
     pub(super) history: HistoryWindow,
     pub(super) pending: Option<PendingMsg>,
-    pub(super) active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
+    pub(super) active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     pub(super) history_render_versions: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_fingerprints: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,

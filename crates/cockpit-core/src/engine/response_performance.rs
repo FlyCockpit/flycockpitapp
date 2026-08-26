@@ -29,40 +29,7 @@ use cockpit_tokenizer::TiktokenEncoding;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Opaque, monotonically unique identifier for one inference attempt's
-/// user-visible display stream.
-///
-/// Assigned at successful attempt dispatch. The live/wire event envelope
-/// types (`AssistantDisplayTextDelta`, `AssistantDisplayReasoningDelta`,
-/// `AssistantDisplayAttemptReset`, `AssistantDisplayComplete`, and
-/// `AssistantDisplayError`) each carry an `attempt_id` for correlation.
-/// Consumers key provisional display strictly by this ID — no `seq`,
-/// ordering assumption, or content comparison may substitute.
-///
-/// This is explicitly **absent** from the persisted `AssistantMessage`
-/// schema, its `AssistantText` payload, replay, and export. Attempt IDs
-/// are live-only and never durable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AssistantAttemptId(u64);
-
-impl AssistantAttemptId {
-    /// Create a new attempt id from a raw counter value. The caller owns
-    /// monotonicity (typically a global `AtomicU64`).
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// The raw counter value (for debug/logging only — never persisted).
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for AssistantAttemptId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "attempt-{}", self.0)
-    }
-}
+pub use cockpit_client::presentation::AssistantAttemptId;
 
 /// Durable per-assistant-message response performance snapshot.
 ///

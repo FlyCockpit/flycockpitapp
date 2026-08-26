@@ -1,5 +1,5 @@
 use super::{App, new_pending};
-use cockpit_core::engine::AssistantAttemptId;
+use cockpit_client::presentation::AssistantAttemptId;
 use cockpit_core::engine::TurnEvent;
 use std::cell::Cell;
 use std::fs;

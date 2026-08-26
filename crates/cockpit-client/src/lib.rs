@@ -32,6 +32,7 @@ use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame};
 
 pub mod bulk_upload;
 pub mod image_upload;
+pub mod presentation;
 pub mod submission;
 
 /// A cloneable, capability-bearing endpoint for opening fresh in-process

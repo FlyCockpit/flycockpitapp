@@ -473,6 +473,12 @@ fn production_uses_cockpit_proto_directly() {
                 ));
             }
             for migrated_wire_type in [
+                "cockpit_core::daemon::caffeinate::CaffeinateMode",
+                "cockpit_core::env_snapshot::EnvDiffSummary",
+                "cockpit_core::env_snapshot::EnvDriftPolicy",
+                "cockpit_core::env_snapshot::EnvSnapshotMeta",
+                "cockpit_core::env_snapshot::EnvSnapshotSource",
+                "cockpit_core::env_snapshot::EnvSnapshotWire",
                 "cockpit_core::engine::IdleReason",
                 "cockpit_core::engine::model::InferenceErrorClass",
                 "cockpit_core::engine::tool::ToolFailKind",
@@ -500,6 +506,12 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::daemon::self"
                     || imported == "cockpit_core::daemon::proto"
                     || imported.starts_with("cockpit_core::daemon::proto::")
+                    || imported == "cockpit_core::daemon::caffeinate::CaffeinateMode"
+                    || imported == "cockpit_core::env_snapshot::EnvDiffSummary"
+                    || imported == "cockpit_core::env_snapshot::EnvDriftPolicy"
+                    || imported == "cockpit_core::env_snapshot::EnvSnapshotMeta"
+                    || imported == "cockpit_core::env_snapshot::EnvSnapshotSource"
+                    || imported == "cockpit_core::env_snapshot::EnvSnapshotWire"
                     || imported == "cockpit_core::engine::IdleReason"
                     || imported == "cockpit_core::engine::model::InferenceErrorClass"
                     || imported == "cockpit_core::engine::tool::ToolFailKind"

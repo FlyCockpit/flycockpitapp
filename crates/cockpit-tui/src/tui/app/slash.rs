@@ -2122,7 +2122,7 @@ impl App {
     /// assertion and broadcasts a `CaffeinateState` event back (→ toast +
     /// ☕ glyph). Bare command toggles.
     pub(super) fn handle_caffeinate_command(&mut self, args: &str) {
-        let mode = match cockpit_core::daemon::caffeinate::CaffeinateMode::parse(args) {
+        let mode = match cockpit_proto::CaffeinateMode::parse(args) {
             Ok(m) => m,
             Err(other) => {
                 self.push_plain(format!(

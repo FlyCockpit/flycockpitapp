@@ -1459,7 +1459,7 @@ fn advance_attachment_epoch(context: &AttachRequestContext) -> u64 {
 pub(crate) struct AttachRequestContext {
     project_root: String,
     no_sandbox: bool,
-    env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire,
+    env_snapshot: cockpit_proto::EnvSnapshotWire,
     transition_gate: Arc<AsyncMutex<()>>,
     client_epoch_tx: watch::Sender<u64>,
     attachment_epoch: Arc<AtomicU64>,
@@ -1959,7 +1959,7 @@ where
         model_override: None,
         client_protocol_version,
         env_snapshot: Some(ctx.env_snapshot.clone()),
-        env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+        env_policy: cockpit_proto::EnvDriftPolicy::Client,
     })
     .await
     .map_err(|e| format!("attach: {e}"))?;
@@ -2194,7 +2194,7 @@ async fn try_spawn_inner(
                 model_override: None,
                 client_protocol_version: client.negotiated().version,
                 env_snapshot: Some(env_snapshot.to_wire()),
-                env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+                env_policy: cockpit_proto::EnvDriftPolicy::Client,
             })
             .await
         {
@@ -3584,7 +3584,7 @@ where
         model_override: None,
         client_protocol_version,
         env_snapshot: Some(attach_context.env_snapshot.clone()),
-        env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+        env_policy: cockpit_proto::EnvDriftPolicy::Client,
     })
     .await
     .map_err(ReconnectAttachError::Retriable)?;
@@ -4703,8 +4703,8 @@ mod tests {
         Arc::new(RwLock::new(AttachRequestContext {
             project_root: project_root.to_string(),
             no_sandbox: true,
-            env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire {
-                source: cockpit_core::env_snapshot::EnvSnapshotSource::TuiShell,
+            env_snapshot: cockpit_proto::EnvSnapshotWire {
+                source: cockpit_proto::EnvSnapshotSource::TuiShell,
                 digest: String::new(),
                 vars: std::collections::HashMap::new(),
             },
@@ -4742,7 +4742,7 @@ mod tests {
             env_baseline: None,
             env_session: None,
             env_drift: None,
-            env_policy_applied: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+            env_policy_applied: cockpit_proto::EnvDriftPolicy::Client,
             btw_fork: None,
         }
     }
@@ -6087,8 +6087,8 @@ mod tests {
         let attach_context = AttachRequestContext {
             project_root: "/tmp/project".to_string(),
             no_sandbox: false,
-            env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire {
-                source: cockpit_core::env_snapshot::EnvSnapshotSource::TuiShell,
+            env_snapshot: cockpit_proto::EnvSnapshotWire {
+                source: cockpit_proto::EnvSnapshotSource::TuiShell,
                 digest: String::new(),
                 vars: std::collections::HashMap::new(),
             },
@@ -6324,8 +6324,8 @@ mod tests {
         let attach_context = Arc::new(RwLock::new(AttachRequestContext {
             project_root: "/tmp/project".to_string(),
             no_sandbox: true,
-            env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire {
-                source: cockpit_core::env_snapshot::EnvSnapshotSource::TuiShell,
+            env_snapshot: cockpit_proto::EnvSnapshotWire {
+                source: cockpit_proto::EnvSnapshotSource::TuiShell,
                 digest: String::new(),
                 vars: std::collections::HashMap::new(),
             },
@@ -6365,7 +6365,7 @@ mod tests {
                         env_baseline: None,
                         env_session: None,
                         env_drift: None,
-                        env_policy_applied: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+                        env_policy_applied: cockpit_proto::EnvDriftPolicy::Client,
                         btw_fork: None,
                     }))
                 }
@@ -6659,13 +6659,13 @@ mod tests {
             "image-control config changes are not chat-history events"
         );
 
-        let meta = cockpit_core::env_snapshot::EnvSnapshotMeta {
-            source: cockpit_core::env_snapshot::EnvSnapshotSource::DaemonStart,
+        let meta = cockpit_proto::EnvSnapshotMeta {
+            source: cockpit_proto::EnvSnapshotSource::DaemonStart,
             digest: "digest".into(),
             key_count: 3,
             path_entry_count: 1,
         };
-        let drift = cockpit_core::env_snapshot::EnvDiffSummary {
+        let drift = cockpit_proto::EnvDiffSummary {
             baseline_digest: "base".into(),
             candidate_digest: "candidate".into(),
             added_keys: 1,
@@ -6679,7 +6679,7 @@ mod tests {
             baseline: meta.clone(),
             candidate: meta,
             diff: drift,
-            policy: cockpit_core::env_snapshot::EnvDriftPolicy::Daemon,
+            policy: cockpit_proto::EnvDriftPolicy::Daemon,
         };
         assert!(event_session(&warning).is_none());
         assert!(is_global_event(&warning));
@@ -6918,13 +6918,13 @@ mod tests {
             awaiting_durable: &awaiting_durable,
         };
         apply_incoming_event(proto::Event::LspNotice { text: "lsp".into() }, &ctx);
-        let meta = cockpit_core::env_snapshot::EnvSnapshotMeta {
-            source: cockpit_core::env_snapshot::EnvSnapshotSource::DaemonStart,
+        let meta = cockpit_proto::EnvSnapshotMeta {
+            source: cockpit_proto::EnvSnapshotSource::DaemonStart,
             digest: "digest".into(),
             key_count: 3,
             path_entry_count: 1,
         };
-        let drift = cockpit_core::env_snapshot::EnvDiffSummary {
+        let drift = cockpit_proto::EnvDiffSummary {
             baseline_digest: "base".into(),
             candidate_digest: "candidate".into(),
             added_keys: 1,
@@ -6939,7 +6939,7 @@ mod tests {
                 baseline: meta.clone(),
                 candidate: meta,
                 diff: drift,
-                policy: cockpit_core::env_snapshot::EnvDriftPolicy::Daemon,
+                policy: cockpit_proto::EnvDriftPolicy::Daemon,
             },
             &ctx,
         );

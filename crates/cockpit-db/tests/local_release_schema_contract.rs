@@ -2,6 +2,7 @@
 
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 fn schema_inventory(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
     let mut inventory = BTreeMap::<String, BTreeSet<String>>::new();
@@ -467,6 +468,39 @@ fn required_text<'a>(name: &str, entry: &'a toml::value::Table, field: &str) -> 
     value
 }
 
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("cockpit-db must live under crates/")
+        .to_owned()
+}
+
+fn declared_owner_sources(owner: &str) -> Vec<PathBuf> {
+    owner
+        .split(" + ")
+        .flat_map(|part| {
+            let module = part.trim_end_matches(" table accessors");
+            let relative = module
+                .strip_prefix("cockpit_db::db::")
+                .map(|module| ("crates/cockpit-db/src/db", module))
+                .or_else(|| {
+                    module
+                        .strip_prefix("cockpit_core::")
+                        .map(|module| ("crates/cockpit-core/src", module))
+                });
+            let Some((base, module)) = relative else {
+                return Vec::new();
+            };
+            let module = module.replace("::", "/");
+            vec![
+                repository_root().join(format!("{base}/{module}.rs")),
+                repository_root().join(format!("{base}/{module}/mod.rs")),
+            ]
+        })
+        .collect()
+}
+
 fn ownership() -> BTreeMap<String, Ownership> {
     let parsed: toml::Value = toml::from_str(include_str!("../schema-ownership.toml"))
         .expect("schema-ownership.toml must be valid TOML");
@@ -483,7 +517,11 @@ fn ownership() -> BTreeMap<String, Ownership> {
             .as_table()
             .unwrap_or_else(|| panic!("state-machine family {name} must be a rich record"));
         for field in [
-            "rust_owner",
+            "table",
+            "rust_source",
+            "rust_symbol",
+            "sql_trigger",
+            "allowed_states",
             "recovery_entrypoint",
             "terminal_states",
             "retention_rule",
@@ -491,12 +529,61 @@ fn ownership() -> BTreeMap<String, Ownership> {
         ] {
             required_text(name, family, field);
         }
+        let allowed = required_text(name, family, "allowed_states")
+            .split(',')
+            .map(str::trim)
+            .collect::<BTreeSet<_>>();
+        let terminal = required_text(name, family, "terminal_states")
+            .split(',')
+            .map(str::trim)
+            .collect::<BTreeSet<_>>();
         assert!(
-            required_text(name, family, "terminal_states")
-                .split(',')
-                .all(|state| !state.trim().is_empty()),
-            "state-machine family {name} has an empty terminal state"
+            !terminal.is_empty(),
+            "state-machine family {name} needs terminal states"
         );
+        assert!(
+            terminal.is_subset(&allowed),
+            "family {name} terminal states must be allowed"
+        );
+        let sql = [
+            include_str!("../src/db/migrations/0001_initial.sql"),
+            include_str!("../src/db/migrations/0001_extended_profile.sql"),
+            include_str!("../src/db/migrations/0001_remote_profile.sql"),
+        ]
+        .join("\n");
+        assert!(
+            sql.contains(required_text(name, family, "sql_trigger")),
+            "family {name} SQL trigger is absent"
+        );
+        let table = required_text(name, family, "table");
+        let declaration = sql
+            .split(&format!("CREATE TABLE {table}"))
+            .nth(1)
+            .and_then(|tail| tail.split(";").next())
+            .unwrap_or_else(|| panic!("family {name} table declaration is absent"));
+        for state in &allowed {
+            assert!(
+                declaration.contains(&format!("'{state}'")),
+                "family {name} state {state} is absent from SQL CHECK"
+            );
+        }
+        let rust_source = repository_root().join(required_text(name, family, "rust_source"));
+        let rust = std::fs::read_to_string(&rust_source).unwrap_or_else(|error| {
+            panic!(
+                "family {name} Rust source {} is unreadable: {error}",
+                rust_source.display()
+            )
+        });
+        assert!(
+            rust.contains(required_text(name, family, "rust_symbol")),
+            "family {name} Rust transition symbol is absent"
+        );
+        for state in &allowed {
+            assert!(
+                rust.contains(&format!("\"{state}\"")),
+                "family {name} state {state} is absent from Rust"
+            );
+        }
     }
     let table = parsed
         .get("table")
@@ -546,6 +633,21 @@ fn ownership() -> BTreeMap<String, Ownership> {
                 rust_owner, "cockpit-db::db",
                 "table {name} has a generic Rust owner"
             );
+            assert_ne!(
+                rust_owner, "cockpit_db::db",
+                "table {name} has a generic Rust owner"
+            );
+            let owner_sources = declared_owner_sources(rust_owner);
+            assert!(
+                !owner_sources.is_empty(),
+                "table {name} must declare a resolvable Rust owner module"
+            );
+            assert!(
+                owner_sources.iter().any(|source| {
+                    std::fs::read_to_string(source).is_ok_and(|contents| contents.contains(name))
+                }),
+                "table {name} is absent from every declared Rust owner source: {owner_sources:?}"
+            );
             for placeholder in [
                 "cockpit-db remote domain module",
                 "cockpit-db::db:: methods",
@@ -565,7 +667,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
             );
             let state_machine = required_text(name, entry, "state_machine");
             assert!(
-                matches!(state_machine, "rust" | "rust-and-sql" | "none"),
+                matches!(state_machine, "rust" | "sql" | "rust-and-sql" | "none"),
                 "table {name} has unsupported state-machine ownership {state_machine}"
             );
             if state_machine == "rust-and-sql" {

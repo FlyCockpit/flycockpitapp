@@ -3,6 +3,9 @@
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use syn::parse::Parser;
+use syn::spanned::Spanned;
+use syn::visit::{self, Visit};
 
 fn schema_inventory(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
     let mut inventory = BTreeMap::<String, BTreeSet<String>>::new();
@@ -579,44 +582,252 @@ fn semantic_transition_guard_tables(sql: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn assert_production_image_mutations_use_validator(source: &str, table: &str, validator: &str) {
-    fn mutates_state(function: &str, table: &str) -> bool {
-        let normalized = function.split_whitespace().collect::<Vec<_>>().join(" ");
-        let marker = format!("UPDATE {table} SET ");
-        normalized.split(&marker).skip(1).any(|tail| {
-            tail.split(" WHERE ").next().is_some_and(|assignments| {
-                assignments.contains("state=") || assignments.contains("state =")
-            })
+#[derive(Clone)]
+struct TransitionEvidence {
+    line: usize,
+    family: &'static str,
+    edge: Option<(String, String)>,
+}
+#[derive(Clone)]
+struct StateMutation {
+    line: usize,
+    family: &'static str,
+    edge: Option<(String, String)>,
+}
+#[derive(Default)]
+struct TransitionAstAudit {
+    validators: Vec<TransitionEvidence>,
+    mutations: Vec<StateMutation>,
+}
+
+fn image_family(value: &str) -> Option<&'static str> {
+    match value {
+        "job_transition_allowed" | "IMAGE_JOB_CONDITIONAL_EDGES" | "image_generation_jobs" => {
+            Some("job")
+        }
+        "slot_transition_allowed" | "IMAGE_SLOT_CONDITIONAL_EDGES" | "image_generation_slots" => {
+            Some("slot")
+        }
+        "attempt_transition_allowed" | "image_generation_attempts" => Some("attempt"),
+        "artifact_transition_allowed" | "image_generation_artifacts" => Some("artifact"),
+        "artifact_component_transition_allowed" | "image_generation_artifact_components" => {
+            Some("component")
+        }
+        _ => None,
+    }
+}
+
+fn path_tail(expr: &syn::Expr) -> Option<String> {
+    let syn::Expr::Path(path) = expr else {
+        return None;
+    };
+    path.path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+}
+
+fn sql_literal_edge(sql: &str) -> Option<(String, String)> {
+    fn state_literal(value: &str) -> Option<String> {
+        let tail = value.split("state").nth(1)?;
+        let quote = tail.find('\'')?;
+        let remainder = &tail[quote + 1..];
+        Some(remainder.split('\'').next()?.to_owned())
+    }
+    let (assignments, predicate) = sql.split_once(" WHERE ")?;
+    Some((state_literal(predicate)?, state_literal(assignments)?))
+}
+
+impl<'ast> Visit<'ast> for TransitionAstAudit {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if let Ok(arguments) =
+            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+                .parse2(mac.tokens.clone())
+        {
+            for argument in arguments {
+                let mut nested = TransitionAstAudit::default();
+                nested.visit_expr(&argument);
+                self.validators.extend(nested.validators);
+                self.mutations.extend(nested.mutations);
+            }
+        }
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let Some(name) = path_tail(&call.func)
+            && let Some(family) = image_family(&name)
+        {
+            let edge = call
+                .args
+                .first()
+                .and_then(path_tail)
+                .zip(call.args.iter().nth(1).and_then(path_tail));
+            self.validators.push(TransitionEvidence {
+                line: call.span().start().line,
+                family,
+                edge,
+            });
+        }
+        visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "contains"
+            && let Some(name) = path_tail(&call.receiver)
+            && let Some(family) = image_family(&name)
+        {
+            self.validators.push(TransitionEvidence {
+                line: call.span().start().line,
+                family,
+                edge: None,
+            });
+        }
+        if call.method == "execute"
+            && let Some(syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(sql),
+                ..
+            })) = call.args.first()
+        {
+            let normalized = sql.value().split_whitespace().collect::<Vec<_>>().join(" ");
+            for table in [
+                "image_generation_jobs",
+                "image_generation_slots",
+                "image_generation_attempts",
+                "image_generation_artifacts",
+                "image_generation_artifact_components",
+            ] {
+                let marker = format!("UPDATE {table} SET ");
+                if let Some(tail) = normalized.split(&marker).nth(1)
+                    && tail
+                        .split(" WHERE ")
+                        .next()
+                        .is_some_and(|set| set.contains("state=") || set.contains("state ="))
+                {
+                    self.mutations.push(StateMutation {
+                        line: call.span().start().line,
+                        family: image_family(table).unwrap(),
+                        edge: sql_literal_edge(&normalized),
+                    });
+                }
+            }
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+}
+
+fn audit_transition_block(block: &syn::Block) -> Result<(), String> {
+    let mut audit = TransitionAstAudit::default();
+    audit.visit_block(block);
+    audit.validators.sort_by_key(|item| item.line);
+    audit.mutations.sort_by_key(|item| item.line);
+    let mut used = BTreeSet::new();
+    for mutation in audit.mutations {
+        let candidate = audit
+            .validators
+            .iter()
+            .enumerate()
+            .find(|(index, validator)| {
+                !used.contains(index)
+                    && validator.family == mutation.family
+                    && validator.line <= mutation.line
+                    && match (&mutation.edge, &validator.edge) {
+                        (Some((from, to)), Some((validated_from, validated_to))) => {
+                            let expected = |state: &str| {
+                                state
+                                    .split('_')
+                                    .map(|part| {
+                                        let mut chars = part.chars();
+                                        chars
+                                            .next()
+                                            .into_iter()
+                                            .flat_map(char::to_uppercase)
+                                            .chain(chars)
+                                            .collect::<String>()
+                                    })
+                                    .collect::<String>()
+                            };
+                            *validated_from == expected(from) && *validated_to == expected(to)
+                        }
+                        _ => true,
+                    }
+            });
+        let Some((index, _)) = candidate else {
+            return Err(format!(
+                "{} state mutation at line {} has no preceding exact validator",
+                mutation.family, mutation.line
+            ));
+        };
+        used.insert(index);
+    }
+    Ok(())
+}
+
+fn transition_source_errors(source: &str) -> Vec<String> {
+    fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && matches!(&attr.meta, syn::Meta::List(list) if list.tokens.to_string() == "test")
         })
     }
-    let production = source
-        .split("\n#[cfg(test)]\nmod tests")
-        .next()
-        .expect("image-generation production source is present");
-    let mut starts = ["\nfn ", "\n    fn ", "\n    pub fn "]
-        .into_iter()
-        .flat_map(|marker| production.match_indices(marker).map(|(index, _)| index))
-        .collect::<Vec<_>>();
-    starts.sort_unstable();
-    starts.dedup();
-    starts.push(production.len());
-    for bounds in starts.windows(2) {
-        let prefix = &production[..bounds[0]];
-        if prefix
-            .lines()
-            .next_back()
-            .is_some_and(|line| line.trim() == "#[cfg(test)]")
-        {
-            continue;
-        }
-        let function = &production[bounds[0]..bounds[1]];
-        if mutates_state(function, table) {
-            assert!(
-                function.contains(validator),
-                "production state mutation for {table} bypasses {validator}"
-            );
+    let file = syn::parse_file(source).expect("image-generation source parses");
+    let mut errors = Vec::new();
+    for item in file.items {
+        match item {
+            syn::Item::Fn(function) if !is_test_only(&function.attrs) => {
+                if let Err(error) = audit_transition_block(&function.block) {
+                    errors.push(format!("{}: {error}", function.sig.ident));
+                }
+            }
+            syn::Item::Impl(item_impl) => {
+                for item in item_impl.items {
+                    if let syn::ImplItem::Fn(function) = item
+                        && !is_test_only(&function.attrs)
+                        && let Err(error) = audit_transition_block(&function.block)
+                    {
+                        errors.push(format!("{}: {error}", function.sig.ident));
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    errors
+}
+
+fn assert_production_image_mutations_use_ast(source: &str) {
+    let errors = transition_source_errors(source);
+    assert!(
+        errors.is_empty(),
+        "image transition AST audit failed: {errors:#?}"
+    );
+}
+
+#[test]
+fn image_transition_ast_audit_rejects_decoys_and_unvalidated_occurrences() {
+    let decoy = r#"
+        fn bad(conn: &Connection) {
+            ensure!(job_transition_allowed(ImageGenerationJobState::Created, ImageGenerationJobState::Validating));
+            conn.execute("UPDATE image_generation_jobs SET state='dispatching' WHERE state='queued'", []);
+        }
+    "#;
+    assert!(!transition_source_errors(decoy).is_empty());
+
+    let missing_second = r#"
+        fn bad(conn: &Connection) {
+            ensure!(slot_transition_allowed(ImageGenerationSlotState::Planned, ImageGenerationSlotState::Queued));
+            conn.execute("UPDATE image_generation_slots SET state='queued' WHERE state='planned'", []);
+            conn.execute("UPDATE image_generation_slots SET state='dispatching' WHERE state='queued'", []);
+        }
+    "#;
+    assert!(!transition_source_errors(missing_second).is_empty());
+
+    let async_restricted_visibility = r#"
+        pub(crate) async fn good(conn: &Connection) {
+            ensure!(attempt_transition_allowed(ImageGenerationAttemptState::Planned, ImageGenerationAttemptState::Preparing));
+            conn.execute("UPDATE image_generation_attempts SET state='preparing' WHERE state='planned'", []);
+        }
+    "#;
+    assert!(transition_source_errors(async_restricted_visibility).is_empty());
 }
 
 fn sql_registry_edges(sql: &str, registry: &str) -> BTreeSet<String> {
@@ -813,31 +1024,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
     let parsed: toml::Value = toml::from_str(include_str!("../schema-ownership.toml"))
         .expect("schema-ownership.toml must be valid TOML");
     let image_source = include_str!("../src/db/image_generation.rs");
-    assert_production_image_mutations_use_validator(
-        image_source,
-        "image_generation_artifacts",
-        "artifact_transition_allowed",
-    );
-    assert_production_image_mutations_use_validator(
-        image_source,
-        "image_generation_artifact_components",
-        "artifact_component_transition_allowed",
-    );
-    assert_production_image_mutations_use_validator(
-        image_source,
-        "image_generation_jobs",
-        "job_transition_allowed",
-    );
-    assert_production_image_mutations_use_validator(
-        image_source,
-        "image_generation_slots",
-        "slot_transition_allowed",
-    );
-    assert_production_image_mutations_use_validator(
-        image_source,
-        "image_generation_attempts",
-        "attempt_transition_allowed",
-    );
+    assert_production_image_mutations_use_ast(image_source);
     let reconciliation = image_source
         .split("fn reconcile_image_generation_attempt_inner")
         .nth(1)

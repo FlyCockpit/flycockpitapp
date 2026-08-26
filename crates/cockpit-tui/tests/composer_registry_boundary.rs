@@ -324,6 +324,19 @@ impl ProductionInventory<'_> {
     fn is_authority_owner(&self) -> bool {
         matches!(self.relative, "tui/composer/registered.rs" | "tui/paste.rs")
     }
+
+    fn authority_storage(&mut self, owner: &str, tokens: impl ToTokens) {
+        if self.test_depth != 0 {
+            return;
+        }
+        let ty = compact(tokens);
+        if ["RegisteredComposer", "PasteRegistry"]
+            .iter()
+            .any(|name| ty.contains(name))
+        {
+            self.violation(format!("{owner} owns or aliases composer authority"));
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for ProductionInventory<'_> {
@@ -417,32 +430,70 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
     }
 
     fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-        if self.test_depth == 0 {
-            let ty = compact(&item.ty);
-            if ["RegisteredComposer", "PasteRegistry"]
-                .iter()
-                .any(|name| ty.contains(name))
-            {
-                self.violation("composer authority type alias");
-            }
-        }
+        self.authority_storage("type alias", &item.ty);
         visit::visit_item_type(self, item);
+    }
+
+    fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
+        self.authority_storage("associated type alias", &item.ty);
+        visit::visit_impl_item_type(self, item);
+    }
+
+    fn visit_trait_item_type(&mut self, item: &'ast syn::TraitItemType) {
+        if let Some((_, ty)) = &item.default {
+            self.authority_storage("trait associated type default", ty);
+        }
+        visit::visit_trait_item_type(self, item);
     }
 
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
         if self.test_depth == 0
-            && !self.is_authority_owner()
-            && item.ident != "App"
-            && item.ident != "RegisteredComposer"
+            && !matches!(
+                item.ident.to_string().as_str(),
+                "App" | "RegisteredComposer" | "EditorPasteRebuild"
+            )
         {
             for field in &item.fields {
-                let ty = compact(&field.ty);
-                if ty.contains("RegisteredComposer") || ty.contains("PasteRegistry") {
-                    self.violation(format!("wrapper `{}` owns composer authority", item.ident));
-                }
+                self.authority_storage(&format!("wrapper `{}`", item.ident), &field.ty);
             }
+            self.authority_storage(&format!("generic wrapper `{}`", item.ident), &item.generics);
         }
         visit::visit_item_struct(self, item);
+    }
+
+    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        if self.test_depth == 0 {
+            for variant in &item.variants {
+                for field in &variant.fields {
+                    self.authority_storage(
+                        &format!("enum `{}::{}`", item.ident, variant.ident),
+                        &field.ty,
+                    );
+                }
+            }
+            self.authority_storage(&format!("generic enum `{}`", item.ident), &item.generics);
+        }
+        visit::visit_item_enum(self, item);
+    }
+
+    fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+        if self.test_depth == 0 {
+            for field in &item.fields.named {
+                self.authority_storage(&format!("union `{}`", item.ident), &field.ty);
+            }
+            self.authority_storage(&format!("generic union `{}`", item.ident), &item.generics);
+        }
+        visit::visit_item_union(self, item);
+    }
+
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        self.authority_storage("static", &item.ty);
+        visit::visit_item_static(self, item);
+    }
+
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        self.authority_storage("const", &item.ty);
+        visit::visit_item_const(self, item);
     }
 
     fn visit_signature(&mut self, signature: &'ast syn::Signature) {
@@ -454,6 +505,18 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
                     "{} returns mutable composer authority",
                     signature.ident
                 ));
+            }
+            if !self.is_authority_owner() {
+                let output = compact(&signature.output);
+                if ["RegisteredComposer", "PasteRegistry"]
+                    .iter()
+                    .any(|name| output.contains(name))
+                {
+                    self.violation(format!(
+                        "{} returns owned composer authority",
+                        signature.ident
+                    ));
+                }
             }
         }
         visit::visit_signature(self, signature);
@@ -596,7 +659,15 @@ fn ratchet_detectors_reject_adversarial_aliases_and_extra_authorities() {
         "use crate::tui::composer as editing; fn f() { editing::RegisteredComposer::new(false); }",
         "type Owner = RegisteredComposer;",
         "struct Wrapper { owner: RegisteredComposer }",
+        "struct Generic<T = RegisteredComposer>(std::marker::PhantomData<T>);",
+        "enum Wrapper { Owner(RegisteredComposer) }",
+        "union Wrapper { owner: std::mem::ManuallyDrop<RegisteredComposer> }",
+        "trait Authority { type Owner; } impl Authority for () { type Owner = RegisteredComposer; }",
+        "trait Authority { type Owner = RegisteredComposer; }",
+        "static OWNER: Option<RegisteredComposer> = None;",
+        "const OWNER: Option<RegisteredComposer> = None;",
         "fn leak(owner: &mut RegisteredComposer) -> &mut RegisteredComposer { owner }",
+        "fn move_out(owner: RegisteredComposer) -> RegisteredComposer { owner }",
         "pub(super) use crate::tui::composer::RegisteredComposer;",
         "fn f() { let constructor = RegisteredComposer::new; let _ = constructor(false); }",
         "macro_rules! owner { () => { RegisteredComposer::new(false) } }",

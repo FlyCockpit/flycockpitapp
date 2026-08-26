@@ -18,8 +18,8 @@
 //! [`super::composer::Composer`] and routes every application edit through
 //! [`PasteRegistry::shift_for_edit`] so the two stay in lockstep.
 
-use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 const USER_PASTE_TAG: &str = "user_paste";
@@ -211,11 +211,10 @@ impl PasteRegistry {
                     .get(block.start..block.end)
                     .is_some_and(|text| text == Self::expected_placeholder(block))
         });
-        debug_assert!(
-            self.blocks
-                .windows(2)
-                .all(|pair| pair[0].end <= pair[1].start)
-        );
+        debug_assert!(self
+            .blocks
+            .windows(2)
+            .all(|pair| pair[0].end <= pair[1].start));
     }
     pub fn new() -> Self {
         Self::default()
@@ -227,6 +226,23 @@ impl PasteRegistry {
 
     pub fn blocks(&self) -> &[PasteBlock] {
         &self.blocks
+    }
+
+    pub(crate) fn contains_image_bytes(&self, png: &[u8]) -> bool {
+        self.contains_image_hash(hash_bytes(png))
+    }
+
+    pub(crate) fn contains_image_sha256(&self, sha256: &str) -> bool {
+        self.contains_image_hash(hash_bytes(sha256.as_bytes()))
+    }
+
+    fn contains_image_hash(&self, hash: u64) -> bool {
+        self.blocks.iter().any(|block| match &block.kind {
+            PasteKind::Image { hash: other, .. } | PasteKind::ImageHandle { hash: other, .. } => {
+                *other == hash
+            }
+            PasteKind::Text { .. } => false,
+        })
     }
 
     /// Clear all blocks (after submit / composer clear).
@@ -1151,9 +1167,9 @@ mod tests {
         // Under both thresholds → raw.
         assert!(!should_condense("one line"));
         assert!(!should_condense("line1\nline2")); // exactly 2 lines
-        // Over the line threshold.
+                                                   // Over the line threshold.
         assert!(should_condense("a\nb\nc")); // 3 lines
-        // Over the char threshold (one line, 321 chars).
+                                             // Over the char threshold (one line, 321 chars).
         let long = "x".repeat(321);
         assert!(should_condense(&long));
         // Exactly at the char threshold is not over.
@@ -1855,12 +1871,10 @@ gamma",
         assert_eq!(rebuilt.buffer, raw);
         assert!(rebuilt.registry.is_empty());
         assert_eq!(rebuilt.registry.next_image_number, u64::from(u32::MAX) + 1);
-        assert!(
-            rebuilt
-                .registry
-                .register_image(raw.len(), vec![1])
-                .is_none()
-        );
+        assert!(rebuilt
+            .registry
+            .register_image(raw.len(), vec![1])
+            .is_none());
     }
 
     #[test]
@@ -1871,12 +1885,10 @@ gamma",
 
         assert_eq!(rebuilt.buffer, raw);
         assert_eq!(rebuilt.registry.blocks()[0].number, u32::MAX);
-        assert!(
-            rebuilt
-                .registry
-                .register_image(raw.len(), vec![1])
-                .is_none()
-        );
+        assert!(rebuilt
+            .registry
+            .register_image(raw.len(), vec![1])
+            .is_none());
         assert_eq!(
             rebuilt
                 .registry

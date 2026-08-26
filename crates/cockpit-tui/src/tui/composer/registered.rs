@@ -524,7 +524,11 @@ impl RegisteredComposer {
         true
     }
 
-    fn can_insert_image(&self, byte_length: u64) -> bool {
+    fn can_insert_image(&self, png: &[u8]) -> bool {
+        let byte_length = png.len() as u64;
+        if self.paste_registry.contains_image_bytes(png) {
+            return true;
+        }
         let retained = self.paste_registry.image_payloads_by_number();
         let total = retained.values().try_fold(byte_length, |sum, image| {
             sum.checked_add(image.normalized_byte_length())
@@ -534,43 +538,35 @@ impl RegisteredComposer {
             && retained.len() < cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
     }
 
-    fn can_insert_image_handle(&self, normalized_byte_length: u64) -> bool {
+    fn can_insert_image_handle(&self, normalized_byte_length: u64, sha256: &str) -> bool {
+        if self.paste_registry.contains_image_sha256(sha256) {
+            return true;
+        }
         let retained = self.paste_registry.image_payloads_by_number();
         let retained_bytes = retained
             .values()
             .try_fold(normalized_byte_length, |sum, image| {
                 sum.checked_add(image.normalized_byte_length())
             });
-        let image_count = self
-            .paste_registry
-            .blocks()
-            .iter()
-            .filter(|block| {
-                matches!(
-                    block.kind,
-                    PasteKind::Image { .. } | PasteKind::ImageHandle { .. }
-                )
-            })
-            .count();
         normalized_byte_length > 0
             && normalized_byte_length <= cockpit_proto::MAX_SINGLE_IMAGE_BYTES as u64
             && retained_bytes
                 .is_some_and(|total| total <= cockpit_proto::MAX_TOTAL_IMAGE_BYTES as u64)
-            && image_count < cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
+            && retained.len() < cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
     }
 
     pub(crate) fn try_insert_image(&mut self, png: Vec<u8>) -> bool {
-        if !self.can_insert_image(png.len() as u64) {
+        if !self.can_insert_image(&png) {
             return false;
         }
         let at = self
             .paste_registry
             .resolve_insertion(self.composer.cursor());
-        self.composer.set_cursor(at);
         let Some((block_id, placeholder)) = self.paste_registry.register_image_with_id(at, png)
         else {
             return false;
         };
+        self.composer.set_cursor(at);
         self.composer.insert_str(&placeholder);
         self.paste_registry
             .shift_other_blocks_after_insert(block_id, at, placeholder.len());
@@ -585,13 +581,12 @@ impl RegisteredComposer {
         normalized_byte_length: u64,
         sha256: String,
     ) -> bool {
-        if !self.can_insert_image_handle(normalized_byte_length) {
+        if !self.can_insert_image_handle(normalized_byte_length, &sha256) {
             return false;
         }
         let at = self
             .paste_registry
             .resolve_insertion(self.composer.cursor());
-        self.composer.set_cursor(at);
         let Some((block_id, placeholder)) = self.paste_registry.register_image_handle_with_id(
             at,
             draft,
@@ -601,6 +596,7 @@ impl RegisteredComposer {
         ) else {
             return false;
         };
+        self.composer.set_cursor(at);
         self.composer.insert_str(&placeholder);
         self.paste_registry
             .shift_other_blocks_after_insert(block_id, at, placeholder.len());
@@ -821,9 +817,29 @@ impl RegisteredComposer {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{ComposerMotion, RegisteredComposer};
     use crate::tui::composer::Operator;
-    use crate::tui::paste::PasteRegistry;
+    use crate::tui::paste::{ImageIngressDraftAuthority, PasteRegistry, RetainedImage};
+
+    fn image_authority() -> (
+        ImageIngressDraftAuthority,
+        cockpit_proto::ImageAttachmentRef,
+    ) {
+        let session_id = uuid::Uuid::new_v4();
+        let admission_id = uuid::Uuid::new_v4();
+        let attachment_id = uuid::Uuid::new_v4();
+        (
+            ImageIngressDraftAuthority {
+                session_id,
+                admission_id,
+                attachment_id,
+                local_operation_id: uuid::Uuid::new_v4(),
+            },
+            cockpit_proto::ImageAttachmentRef { id: attachment_id },
+        )
+    }
 
     #[test]
     fn adversarial_cursor_and_insert_cannot_split_registered_placeholder() {
@@ -852,15 +868,13 @@ mod tests {
         owner.insert_char('!');
 
         assert!(owner.text().contains("👨‍👩‍👧‍👦"));
-        assert!(
-            crate::tui::markdown::semantic_graphemes(owner.text())
-                .iter()
-                .scan(0usize, |offset, grapheme| {
-                    *offset += grapheme.len();
-                    Some(*offset)
-                })
-                .any(|boundary| boundary == owner.cursor())
-        );
+        assert!(crate::tui::markdown::semantic_graphemes(owner.text())
+            .iter()
+            .scan(0usize, |offset, grapheme| {
+                *offset += grapheme.len();
+                Some(*offset)
+            })
+            .any(|boundary| boundary == owner.cursor()));
     }
 
     #[test]
@@ -893,6 +907,90 @@ mod tests {
             assert_eq!(owner.cursor(), 0);
             assert_eq!(owner.text(), "tail");
         }
+    }
+
+    #[test]
+    fn exhausted_image_numbering_rejects_bytes_and_handles_without_any_state_change() {
+        let retained = BTreeMap::from([(u32::MAX, RetainedImage::Bytes(vec![9]))]);
+        let rebuilt =
+            PasteRegistry::rebuild_from_editor("[Pasted image #4294967295]", &retained, |_| 0);
+        let mut owner = RegisteredComposer::new(false);
+        owner.rebuild_buffer(rebuilt);
+        owner.composer.set_cursor(2);
+
+        let text = owner.text().to_owned();
+        let cursor = owner.cursor();
+        let registry = format!("{:?}", owner.paste_registry);
+        assert!(!owner.try_insert_image(vec![1]));
+        assert_eq!(owner.text(), text);
+        assert_eq!(owner.cursor(), cursor);
+        assert_eq!(format!("{:?}", owner.paste_registry), registry);
+
+        let (draft, image_ref) = image_authority();
+        assert!(!owner.try_insert_image_handle(draft, image_ref, 1, "distinct".into()));
+        assert_eq!(owner.text(), text);
+        assert_eq!(owner.cursor(), cursor);
+        assert_eq!(format!("{:?}", owner.paste_registry), registry);
+    }
+
+    #[test]
+    fn duplicate_byte_images_remain_admissible_at_the_distinct_image_limit() {
+        let mut owner = RegisteredComposer::new(false);
+        let first = 0_u64.to_le_bytes().to_vec();
+        for index in 0..cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
+            assert!(owner.try_insert_image((index as u64).to_le_bytes().to_vec()));
+        }
+        assert!(!owner.try_insert_image(b"one-more-distinct".to_vec()));
+        assert!(owner.try_insert_image(first));
+    }
+
+    #[test]
+    fn duplicate_byte_images_remain_admissible_at_the_total_byte_limit() {
+        let mut owner = RegisteredComposer::new(false);
+        let first = vec![1; cockpit_proto::MAX_SINGLE_IMAGE_BYTES];
+        let second = vec![2; cockpit_proto::MAX_TOTAL_IMAGE_BYTES - first.len()];
+        assert!(owner.try_insert_image(first.clone()));
+        assert!(owner.try_insert_image(second));
+        assert!(!owner.try_insert_image(vec![3]));
+        assert!(owner.try_insert_image(first));
+    }
+
+    #[test]
+    fn duplicate_handle_images_remain_admissible_at_the_distinct_image_limit() {
+        let mut owner = RegisteredComposer::new(false);
+        for index in 0..cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
+            let (draft, image_ref) = image_authority();
+            assert!(owner.try_insert_image_handle(draft, image_ref, 1, format!("sha-{index}"),));
+        }
+        let (draft, image_ref) = image_authority();
+        assert!(!owner.try_insert_image_handle(draft, image_ref, 1, "one-more-distinct".into(),));
+        let (draft, image_ref) = image_authority();
+        assert!(owner.try_insert_image_handle(draft, image_ref, 1, "sha-0".into()));
+    }
+
+    #[test]
+    fn duplicate_handle_images_remain_admissible_at_the_total_byte_limit() {
+        let mut owner = RegisteredComposer::new(false);
+        for (sha256, bytes) in [
+            ("sha-first", cockpit_proto::MAX_SINGLE_IMAGE_BYTES as u64),
+            (
+                "sha-second",
+                (cockpit_proto::MAX_TOTAL_IMAGE_BYTES - cockpit_proto::MAX_SINGLE_IMAGE_BYTES)
+                    as u64,
+            ),
+        ] {
+            let (draft, image_ref) = image_authority();
+            assert!(owner.try_insert_image_handle(draft, image_ref, bytes, sha256.into()));
+        }
+        let (draft, image_ref) = image_authority();
+        assert!(!owner.try_insert_image_handle(draft, image_ref, 1, "sha-third".into()));
+        let (draft, image_ref) = image_authority();
+        assert!(owner.try_insert_image_handle(
+            draft,
+            image_ref,
+            cockpit_proto::MAX_SINGLE_IMAGE_BYTES as u64,
+            "sha-first".into(),
+        ));
     }
 
     #[test]

@@ -515,6 +515,12 @@ fn production_uses_cockpit_proto_directly() {
                     path.display()
                 ));
             }
+            if compact.contains("cockpit_core::tokens::count") {
+                findings.push(format!(
+                    "{}: token counting is owned by cockpit-tokenizer",
+                    path.display()
+                ));
+            }
             if compact.contains("externcratecockpit_core") {
                 findings.push(format!(
                     "{}: whole-crate cockpit_core extern aliases obscure protocol ownership",
@@ -535,6 +541,7 @@ fn production_uses_cockpit_proto_directly() {
                     || imported.starts_with("cockpit_core::daemon::image_upload::")
                     || imported == "cockpit_core::daemon::bulk_upload"
                     || imported.starts_with("cockpit_core::daemon::bulk_upload::")
+                    || imported == "cockpit_core::tokens::count"
                     || imported == "cockpit_core::container::ContainerAvailability"
                     || imported == "cockpit_core::container::ContainerRuntimeKind"
                     || imported == "cockpit_core::container::ContainerUnavailableReason"

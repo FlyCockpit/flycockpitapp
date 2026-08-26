@@ -3777,13 +3777,13 @@ pub(super) fn cap_display_lines(s: &str) -> String {
 
 /// Cap text to roughly `max_tokens` (cl100k estimate) with a marker.
 pub(super) fn cap_tokens(s: &str, max_tokens: usize) -> String {
-    if cockpit_core::tokens::count(s) <= max_tokens {
+    if cockpit_tokenizer::count(s) <= max_tokens {
         return s.to_string();
     }
     let mut budget = max_tokens.saturating_mul(4).max(64);
     loop {
         let truncated: String = s.chars().take(budget).collect();
-        if budget < 64 || cockpit_core::tokens::count(&truncated) <= max_tokens {
+        if budget < 64 || cockpit_tokenizer::count(&truncated) <= max_tokens {
             return format!("{truncated}\n… [truncated to ~{max_tokens} tokens]");
         }
         budget = budget * 3 / 4;

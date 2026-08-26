@@ -438,7 +438,7 @@ fn cap_tokens_truncates_large_input() {
     let big = "word ".repeat(5000);
     let capped = cap_tokens(&big, 100);
     assert!(capped.contains("truncated"));
-    assert!(cockpit_core::tokens::count(&capped) <= 200);
+    assert!(cockpit_tokenizer::count(&capped) <= 200);
 }
 
 #[test]

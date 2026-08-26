@@ -3762,7 +3762,7 @@ impl App {
             crate::tui::async_action::AsyncActionKind::Internal("paste.token_count"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             move || {
-                let tokens = std::panic::catch_unwind(|| cockpit_core::tokens::count(&full))
+                let tokens = std::panic::catch_unwind(|| cockpit_tokenizer::count(&full))
                     .map_err(|_| "paste token count panicked".to_string())?;
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::PasteTokenCount {
@@ -5095,7 +5095,7 @@ mod paste_routing_tests {
         drain_async_actions_until_idle(&mut app).await;
 
         let expected =
-            RegisteredComposer::test_text_placeholder(1, cockpit_core::tokens::count(&pasted));
+            RegisteredComposer::test_text_placeholder(1, cockpit_tokenizer::count(&pasted));
         assert_eq!(app.composer.text(), expected);
         let block = &app.composer.test_paste_blocks()[0];
         assert_eq!((block.start, block.end), (0, expected.len()));
@@ -5124,7 +5124,7 @@ mod paste_routing_tests {
         app.agent_runner = Some(Ok(runner_with_input_tx(input_tx)));
         let pasted = long_paste("wire display");
         app.composer
-            .insert_registered_text(pasted.clone(), cockpit_core::tokens::count(&pasted));
+            .insert_registered_text(pasted.clone(), cockpit_tokenizer::count(&pasted));
 
         let keep_running = app.submit_input();
 

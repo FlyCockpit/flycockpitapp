@@ -6,6 +6,27 @@ use tiktoken_rs::{
     r50k_base_singleton,
 };
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub fn count(text: &str) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    COUNT_CALLS.with(|calls| calls.set(calls.get() + 1));
+    TiktokenEncoding::Cl100k.count(text)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_count_call_count() {
+    COUNT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn count_call_count() -> usize {
+    COUNT_CALLS.with(std::cell::Cell::get)
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TiktokenEncoding {

@@ -2971,7 +2971,7 @@ async fn daemon_guidance_estimate_at_endpoint(
 }
 
 /// Daemonless fallback: size the guidance file body and the full composed
-/// system prompt in-process with raw cl100k (`cockpit_core::tokens::count`).
+/// system prompt in-process with the shared raw cl100k tokenizer.
 /// Cheap and synchronous — `load_agent_guidance` only stats/reads one
 /// small file along the cwd→git-root walk — so it never blocks launch.
 fn local_guidance_estimate(
@@ -2985,18 +2985,18 @@ fn local_guidance_estimate(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        (name, cockpit_core::tokens::count(&body) as u64)
+        (name, cockpit_tokenizer::count(&body) as u64)
     });
     // No session exists yet at the fresh-chat indicator, so the system
     // prompt omits the `Session:` line — matching what the engine sends.
     let system_prompt = cockpit_core::engine::builtin::default_chat_system_prompt(cwd, "");
-    let system_tokens = cockpit_core::tokens::count(&system_prompt) as u64;
+    let system_tokens = cockpit_tokenizer::count(&system_prompt) as u64;
     let model_instruction_tokens = provider
         .zip(model)
         .and_then(|(provider, model)| {
             providers
                 .resolve_model_system_prompt(provider, model)
-                .map(|prompt| cockpit_core::tokens::count(prompt) as u64)
+                .map(|prompt| cockpit_tokenizer::count(prompt) as u64)
         })
         .unwrap_or(0);
     match file {

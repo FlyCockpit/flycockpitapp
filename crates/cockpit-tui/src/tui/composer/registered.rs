@@ -126,7 +126,7 @@ impl RegisteredComposer {
         let rebuilt = PasteRegistry::rebuild_from_editor_snapshot(
             editor_text,
             snapshot,
-            cockpit_core::tokens::count,
+            cockpit_tokenizer::count,
         );
         self.rebuild_buffer(rebuilt);
     }

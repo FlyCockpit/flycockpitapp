@@ -108,6 +108,72 @@ impl<'ast> Visit<'ast> for Inventory<'_> {
         self.function = previous;
     }
 
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if self.test_depth == 0 && item.sig.ident == "run_owned_daemon" {
+            self.violation("runner name may not be defined by an impl method");
+        }
+        let previous = self.function.replace(item.sig.ident.to_string());
+        let test_only = usize::from(is_test_only(&item.attrs));
+        self.test_depth += test_only;
+        visit::visit_impl_item_fn(self, item);
+        self.test_depth -= test_only;
+        self.function = previous;
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        if self.test_depth == 0 && item.sig.ident == "run_owned_daemon" {
+            self.violation("runner name may not be defined by a trait method");
+        }
+        visit::visit_trait_item_fn(self, item);
+    }
+
+    fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
+        if self.test_depth == 0 && item.ident == "run_owned_daemon" {
+            self.violation("runner name may not be used by an associated type");
+        }
+        visit::visit_impl_item_type(self, item);
+    }
+
+    fn visit_trait_item_type(&mut self, item: &'ast syn::TraitItemType) {
+        if self.test_depth == 0 && item.ident == "run_owned_daemon" {
+            self.violation("runner name may not be used by a trait associated type");
+        }
+        visit::visit_trait_item_type(self, item);
+    }
+
+    fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
+        if self.test_depth == 0 && item.ident == "run_owned_daemon" {
+            self.violation("runner name may not be shadowed by an associated const");
+        }
+        visit::visit_impl_item_const(self, item);
+    }
+
+    fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
+        if self.test_depth == 0 && item.ident == "run_owned_daemon" {
+            self.violation("runner name may not be shadowed by a trait associated const");
+        }
+        visit::visit_trait_item_const(self, item);
+    }
+
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if self.test_depth == 0 && variant.ident == "run_owned_daemon" {
+            self.violation("runner name may not be shadowed by an enum variant");
+        }
+        visit::visit_variant(self, variant);
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if self.test_depth == 0
+            && field
+                .ident
+                .as_ref()
+                .is_some_and(|ident| ident == "run_owned_daemon")
+        {
+            self.violation("runner name may not be shadowed by a field");
+        }
+        visit::visit_field(self, field);
+    }
+
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         if self.test_depth == 0 && item.ident == "run_owned_daemon" {
             self.violation("runner name may not be used by a local module");
@@ -276,6 +342,422 @@ fn inspect<'a>(source: &str, relative: &'a str) -> Inventory<'a> {
     inventory
 }
 
+fn path_ends(path: &syn::Path, name: &str) -> bool {
+    path.segments
+        .last()
+        .is_some_and(|segment| segment.ident == name)
+}
+
+fn scoped_client_type(ty: &syn::Type, lifetime: &str) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    segment.ident == "ScopedDaemonClient"
+        && arguments.args.len() == 1
+        && matches!(arguments.args.first(), Some(syn::GenericArgument::Lifetime(value)) if value.ident == lifetime)
+}
+
+fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
+    let syn::ReturnType::Type(_, return_type) = &runner.sig.output else {
+        return false;
+    };
+    let syn::Type::Path(return_path) = &**return_type else {
+        return false;
+    };
+    let Some(return_segment) = return_path.path.segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(return_arguments) = &return_segment.arguments else {
+        return false;
+    };
+    if return_segment.ident != "Result"
+        || !matches!(return_arguments.args.first(), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if value.path.is_ident("T"))
+    {
+        return false;
+    }
+    let type_parameters = runner
+        .sig
+        .generics
+        .params
+        .iter()
+        .filter_map(|parameter| match parameter {
+            syn::GenericParam::Type(parameter) => Some(parameter),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if type_parameters.len() != 2
+        || type_parameters[0].ident != "T"
+        || type_parameters[1].ident != "F"
+        || !type_parameters
+            .iter()
+            .all(|parameter| parameter.bounds.is_empty())
+    {
+        return false;
+    }
+    let Some(where_clause) = &runner.sig.generics.where_clause else {
+        return false;
+    };
+    if where_clause.predicates.len() != 1 {
+        return false;
+    }
+    let Some(syn::WherePredicate::Type(predicate)) = where_clause.predicates.first() else {
+        return false;
+    };
+    if !matches!(&predicate.bounded_ty, syn::Type::Path(path) if path.path.is_ident("F"))
+        || predicate.bounds.len() != 1
+    {
+        return false;
+    }
+    let Some(syn::TypeParamBound::Trait(bound)) = predicate.bounds.first() else {
+        return false;
+    };
+    let Some(lifetimes) = &bound.lifetimes else {
+        return false;
+    };
+    if lifetimes.lifetimes.len() != 1
+        || !matches!(lifetimes.lifetimes.first(), Some(syn::GenericParam::Lifetime(value)) if value.lifetime.ident == "client")
+    {
+        return false;
+    }
+    let Some(fn_once) = bound.path.segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::Parenthesized(arguments) = &fn_once.arguments else {
+        return false;
+    };
+    if fn_once.ident != "FnOnce"
+        || arguments.inputs.len() != 1
+        || !arguments
+            .inputs
+            .first()
+            .is_some_and(|input| scoped_client_type(input, "client"))
+    {
+        return false;
+    }
+    let syn::ReturnType::Type(_, output) = &arguments.output else {
+        return false;
+    };
+    let syn::Type::Path(pin) = &**output else {
+        return false;
+    };
+    let Some(pin_segment) = pin.path.segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(pin_arguments) = &pin_segment.arguments else {
+        return false;
+    };
+    let Some(syn::GenericArgument::Type(syn::Type::Path(boxed))) = pin_arguments.args.first()
+    else {
+        return false;
+    };
+    let Some(box_segment) = boxed.path.segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(box_arguments) = &box_segment.arguments else {
+        return false;
+    };
+    let Some(syn::GenericArgument::Type(syn::Type::TraitObject(future))) =
+        box_arguments.args.first()
+    else {
+        return false;
+    };
+    let has_client_lifetime = future.bounds.iter().any(
+        |bound| matches!(bound, syn::TypeParamBound::Lifetime(value) if value.ident == "client"),
+    );
+    let future_bound = future.bounds.iter().find_map(|bound| match bound {
+        syn::TypeParamBound::Trait(bound) if path_ends(&bound.path, "Future") => Some(bound),
+        _ => None,
+    });
+    let output_is_result_t = future_bound.is_some_and(|bound| {
+        let Some(segment) = bound.path.segments.last() else {
+            return false;
+        };
+        let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+            return false;
+        };
+        arguments.args.iter().any(|argument| match argument {
+            syn::GenericArgument::AssocType(output) if output.ident == "Output" => {
+                matches!(&output.ty, syn::Type::Path(result)
+                    if result.path.segments.last().is_some_and(|segment| {
+                        segment.ident == "Result"
+                            && matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments)
+                                if matches!(arguments.args.first(), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if value.path.is_ident("T")))
+                    }))
+            }
+            _ => false,
+        })
+    });
+    has_client_lifetime && output_is_result_t
+}
+
+fn core_contract_violations(source: &str) -> Vec<String> {
+    #[derive(Default)]
+    struct RawReturn(bool);
+    impl<'ast> Visit<'ast> for RawReturn {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            if path_ends(&path.path, "DaemonClient") || path_ends(&path.path, "ScopedDaemonClient")
+            {
+                self.0 = true;
+            }
+            visit::visit_type_path(self, path);
+        }
+    }
+    let file = syn::parse_file(source).unwrap();
+    let mut violations = Vec::new();
+    let scoped = file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(item) if item.ident == "ScopedDaemonClient" => Some(item),
+        _ => None,
+    });
+    let Some(scoped) = scoped else {
+        return vec!["ScopedDaemonClient missing".into()];
+    };
+    if !matches!(scoped.vis, syn::Visibility::Public(_)) {
+        violations.push("ScopedDaemonClient visibility changed".into());
+    }
+    let derives_clone_or_copy = scoped.attrs.iter().any(|attribute| {
+        attribute.path().is_ident("derive")
+            && attribute
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                )
+                .is_ok_and(|derives| {
+                    derives
+                        .iter()
+                        .any(|derive| path_ends(derive, "Clone") || path_ends(derive, "Copy"))
+                })
+    });
+    if derives_clone_or_copy {
+        violations.push("ScopedDaemonClient may not derive Clone/Copy".into());
+    }
+    let syn::Fields::Named(fields) = &scoped.fields else {
+        violations.push("ScopedDaemonClient must have named fields".into());
+        return violations;
+    };
+    if fields.named.len() != 1 {
+        violations.push("ScopedDaemonClient must have exactly one field".into());
+    } else {
+        let field = fields.named.first().unwrap();
+        let exact = field.ident.as_ref().is_some_and(|name| name == "client")
+            && matches!(field.vis, syn::Visibility::Inherited)
+            && matches!(&field.ty, syn::Type::Reference(reference)
+                if reference.mutability.is_none()
+                    && reference.lifetime.as_ref().is_some_and(|lifetime| lifetime.ident == "session")
+                    && matches!(&*reference.elem, syn::Type::Path(path) if path.path.is_ident("DaemonClient")));
+        if !exact {
+            violations
+                .push("ScopedDaemonClient field must be private &'session DaemonClient".into());
+        }
+    }
+
+    let implementation = file.items.iter().find_map(|item| match item {
+        syn::Item::Impl(item)
+            if item.trait_.is_none()
+                && matches!(&*item.self_ty, syn::Type::Path(path) if path_ends(&path.path, "ScopedDaemonClient")) => Some(item),
+        _ => None,
+    });
+    let Some(implementation) = implementation else {
+        violations.push("ScopedDaemonClient inherent impl missing".into());
+        return violations;
+    };
+    let method_items = implementation
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::ImplItem::Fn(method) => Some(method),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let methods = method_items
+        .iter()
+        .map(|method| method.sig.ident.to_string())
+        .collect::<Vec<_>>();
+    if methods != ["request", "request_ok", "next_event", "negotiated"] {
+        violations.push(format!("ScopedDaemonClient API changed: {methods:?}"));
+    }
+    for method in method_items {
+        if !matches!(method.vis, syn::Visibility::Public(_)) {
+            violations.push(format!("{} is not public", method.sig.ident));
+        }
+        let mut raw = RawReturn::default();
+        raw.visit_return_type(&method.sig.output);
+        if raw.0 {
+            violations.push(format!(
+                "{} returns raw daemon client authority",
+                method.sig.ident
+            ));
+        }
+    }
+    for item in &file.items {
+        let syn::Item::Impl(item) = item else {
+            continue;
+        };
+        if !matches!(&*item.self_ty, syn::Type::Path(path) if path_ends(&path.path, "ScopedDaemonClient"))
+        {
+            continue;
+        }
+        if let Some((_, path, _)) = &item.trait_
+            && [
+                "Clone",
+                "Copy",
+                "Deref",
+                "DerefMut",
+                "AsRef",
+                "AsMut",
+                "Borrow",
+                "BorrowMut",
+            ]
+            .iter()
+            .any(|name| path_ends(path, name))
+        {
+            violations.push(format!(
+                "ScopedDaemonClient escape trait: {}",
+                path.segments.last().unwrap().ident
+            ));
+        }
+        for implementation_item in &item.items {
+            let syn::ImplItem::Fn(method) = implementation_item else {
+                continue;
+            };
+            let mut authority = RawReturn::default();
+            authority.visit_return_type(&method.sig.output);
+            if authority.0 {
+                violations.push(format!(
+                    "trait method {} returns daemon client authority",
+                    method.sig.ident
+                ));
+            }
+        }
+    }
+    let runner = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(item) if item.sig.ident == "run_owned_daemon" => Some(item),
+        _ => None,
+    });
+    if !runner.is_some_and(runner_hrtb_is_exact) {
+        violations.push("run_owned_daemon HRTB/result lifetime contract changed".into());
+    }
+    violations
+}
+
+fn raw_owner_acquisitions(source: &str) -> Vec<String> {
+    struct RawOwnerVisitor {
+        function: Option<String>,
+        test_depth: usize,
+        acquisitions: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for RawOwnerVisitor {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_item_mod(self, item);
+            self.test_depth -= test;
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let previous = self.function.replace(item.sig.ident.to_string());
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_item_fn(self, item);
+            self.test_depth -= test;
+            self.function = previous;
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            let previous = self.function.replace(item.sig.ident.to_string());
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_impl_item_fn(self, item);
+            self.test_depth -= test;
+            self.function = previous;
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if self.test_depth == 0
+                && matches!(&*call.func, syn::Expr::Path(path)
+                    if path.path.segments.iter().rev().take(2).map(|segment| segment.ident.to_string()).eq(["connect", "OwnedDaemonSession"]))
+            {
+                self.acquisitions
+                    .push(self.function.clone().unwrap_or_else(|| "<none>".into()));
+            }
+            visit::visit_expr_call(self, call);
+        }
+    }
+
+    let file = syn::parse_file(source).unwrap();
+    let mut visitor = RawOwnerVisitor {
+        function: None,
+        test_depth: 0,
+        acquisitions: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.acquisitions
+}
+
+fn raw_owner_struct_literals(source: &str) -> Vec<String> {
+    struct StructLiteralVisitor {
+        function: Option<String>,
+        test_depth: usize,
+        owned_impl_depth: usize,
+        owners: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for StructLiteralVisitor {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_item_mod(self, item);
+            self.test_depth -= test;
+        }
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let previous = self.function.replace(item.sig.ident.to_string());
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_item_fn(self, item);
+            self.test_depth -= test;
+            self.function = previous;
+        }
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            let previous = self.function.replace(item.sig.ident.to_string());
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_impl_item_fn(self, item);
+            self.test_depth -= test;
+            self.function = previous;
+        }
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let owned = usize::from(
+                matches!(&*item.self_ty, syn::Type::Path(path) if path_ends(&path.path, "OwnedDaemonSession")),
+            );
+            self.owned_impl_depth += owned;
+            visit::visit_item_impl(self, item);
+            self.owned_impl_depth -= owned;
+        }
+        fn visit_expr_struct(&mut self, value: &'ast syn::ExprStruct) {
+            if self.test_depth == 0
+                && (path_ends(&value.path, "OwnedDaemonSession")
+                    || (self.owned_impl_depth > 0 && value.path.is_ident("Self")))
+            {
+                self.owners
+                    .push(self.function.clone().unwrap_or_else(|| "<none>".into()));
+            }
+            visit::visit_expr_struct(self, value);
+        }
+    }
+    let file = syn::parse_file(source).unwrap();
+    let mut visitor = StructLiteralVisitor {
+        function: None,
+        test_depth: 0,
+        owned_impl_depth: 0,
+        owners: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.owners
+}
+
 #[test]
 fn production_cli_has_one_structural_lifecycle_runner_inventory() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -306,6 +788,13 @@ fn core_runner_is_the_only_raw_owner() {
     )
     .unwrap();
     let file = syn::parse_file(&source).unwrap();
+    assert!(
+        core_contract_violations(&source).is_empty(),
+        "{}",
+        core_contract_violations(&source).join("\n")
+    );
+    assert_eq!(raw_owner_acquisitions(&source), ["run_owned_daemon"]);
+    assert_eq!(raw_owner_struct_literals(&source), ["connect"]);
     let session = file
         .items
         .iter()
@@ -358,6 +847,50 @@ fn core_runner_is_the_only_raw_owner() {
 }
 
 #[test]
+fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() {
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/cockpit-core/src/daemon/client.rs"),
+    )
+    .unwrap();
+    for (before, after) in [
+        (
+            "pub struct ScopedDaemonClient<'session>",
+            "#[derive(Clone)] pub struct ScopedDaemonClient<'session>",
+        ),
+        (
+            "pub fn negotiated(&self) -> &proto::NegotiatedProtocol",
+            "pub fn negotiated(&self) -> &DaemonClient",
+        ),
+        ("for<'client> FnOnce(", "FnOnce("),
+        ("+ 'client>", "+ 'static>"),
+    ] {
+        let adversarial = source.replacen(before, after, 1);
+        assert_ne!(adversarial, source, "fixture seam exists: {before}");
+        assert!(
+            !core_contract_violations(&adversarial).is_empty(),
+            "accepted weakened scoped capability contract: {after}"
+        );
+    }
+
+    let bypass = source.replacen(
+        "let session = OwnedDaemonSession::connect(mode)",
+        "let extra = OwnedDaemonSession::connect(mode).await?; drop(extra);\n    let session = OwnedDaemonSession::connect(mode)",
+        1,
+    );
+    assert_eq!(raw_owner_acquisitions(&bypass).len(), 2);
+    let literal = source.replacen(
+        "let session = OwnedDaemonSession::connect(mode)",
+        "let leaked = OwnedDaemonSession { client: todo!(), guard: None, signal_task: None }; drop(leaked);\n    let session = OwnedDaemonSession::connect(mode)",
+        1,
+    );
+    assert_eq!(
+        raw_owner_struct_literals(&literal),
+        ["connect", "run_owned_daemon"]
+    );
+}
+
+#[test]
 fn inventory_rejects_unlisted_alias_function_item_and_macro() {
     for source in [
         "use crate::daemon::client::run_owned_daemon as run; async fn extra() { run(mode, op).await; }",
@@ -372,6 +905,13 @@ fn inventory_rejects_unlisted_alias_function_item_and_macro() {
         "const run_owned_daemon: usize = 0;",
         "static run_owned_daemon: usize = 0;",
         "macro_rules! run_owned_daemon { () => {} }",
+        "struct Shadow { run_owned_daemon: usize }",
+        "enum Shadow { run_owned_daemon }",
+        "struct Shadow; impl Shadow { fn run_owned_daemon() {} }",
+        "trait Shadow { fn run_owned_daemon(); }",
+        "trait Shadow { type run_owned_daemon; }",
+        "trait Shadow { const run_owned_daemon: usize; }",
+        "struct Shadow; impl Trait for Shadow { type run_owned_daemon = usize; const run_owned_daemon: usize = 0; }",
     ] {
         let inventory = inspect(source, "fixture.rs");
         assert!(

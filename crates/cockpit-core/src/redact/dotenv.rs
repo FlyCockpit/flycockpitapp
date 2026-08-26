@@ -220,11 +220,20 @@ pub(super) fn parse_dotenv(
         if is_allowlisted(name, user_allowlist) {
             continue;
         }
-        out.push(Candidate::prunable(
+        let mut candidate = Candidate::prunable(
             value,
             format!("$dotenv:{display}:{name}"),
             credential_shaped_key(name),
-        ));
+        );
+        // SEC-F3 consistency: register case-transformed variants for the whole
+        // secret-shaped key family (`*_KEY`/`*_TOKEN`/`*_PAT`/…), mirroring the
+        // env-scan collector in `mod.rs`. Decoupled from `length_exempt` (kept
+        // narrow via `credential_shaped_key`) on purpose: the `min_secret_length`
+        // prune still keeps short values out of the table, so their case echoes
+        // never register. `is_secret_shaped_key` is a superset of
+        // `credential_shaped_key`, so this only ever ADDS coverage.
+        candidate.register_case_variants = is_secret_shaped_key(name);
+        out.push(candidate);
     }
     (matched > 0).then_some(out)
 }
@@ -380,4 +389,69 @@ fn unquoted_comment_start_in_line(line: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod case_variant_tests {
+    use crate::config::extended::{RedactConfig, default_dotenv_patterns};
+    use crate::redact::RedactionTable;
+
+    fn cfg() -> RedactConfig {
+        RedactConfig {
+            enabled: true,
+            scan_environment: false,
+            scan_dotenv: true,
+            scan_ssh_keys: false,
+            ssh_key_dir: None,
+            dotenv_patterns: default_dotenv_patterns(),
+            extra_dotenv_paths: vec![],
+            secret_path_patterns: vec![],
+            min_secret_length: 8,
+            placeholder: "***REDACT***".into(),
+            denylist: vec![],
+            allowlist: vec![],
+        }
+    }
+
+    // A `*_TOKEN`-family secret defined via a dotenv line is NOT
+    // `credential_shaped_key` (which only covers `_PIN`/`_PASSWORD`/`_PASSWD`/
+    // `_SECRET`), so before SEC-F3 its uppercased/capitalized echoes were left
+    // unscrubbed. It IS `is_secret_shaped_key`, so the collector now registers
+    // its case variants. Fails pre-change, passes after.
+    #[test]
+    fn secret_shaped_dotenv_key_scrubs_uppercase_and_capitalized_echoes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Long value (>= min_secret_length) under a `*_TOKEN` key.
+        std::fs::write(
+            dir.path().join(".env"),
+            "SERVICE_TOKEN=CaseTokenValue123\n",
+        )
+        .unwrap();
+        let cfg = cfg();
+        let table = RedactionTable::build(&cfg, dir.path()).unwrap();
+
+        // Raw value scrubs before and after the change (base entry).
+        assert_eq!(table.scrub("CaseTokenValue123"), cfg.placeholder);
+        // Uppercased echo — only registered once the collector gates case
+        // variants on `is_secret_shaped_key`.
+        assert_eq!(table.scrub("CASETOKENVALUE123"), cfg.placeholder);
+        // Capitalized (Title-case first letter of the lowercased form) echo.
+        assert_eq!(table.scrub("Casetokenvalue123"), cfg.placeholder);
+    }
+
+    // The narrow `length_exempt` floor is untouched: a short value under a
+    // secret-shaped key is pruned by `min_secret_length`, so neither it nor its
+    // case echoes ever register. Guards against over-redaction.
+    #[test]
+    fn short_dotenv_value_does_not_register_case_variants() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".env"), "SHORT_TOKEN=abc\n").unwrap();
+        let cfg = cfg();
+        let table = RedactionTable::build(&cfg, dir.path()).unwrap();
+
+        // Below the 8-char floor: not redacted at all, so its uppercase echo
+        // is not over-redacted either.
+        assert_eq!(table.scrub("abc"), "abc");
+        assert_eq!(table.scrub("ABC"), "ABC");
+    }
 }

@@ -185,16 +185,23 @@ pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option
         return crate::config::providers::provider_file_path_for_config(&path, provider_id).ok();
     }
 
+    // Most-specific first: `target` is the nearest applicable layer (the
+    // nearest project, never an outer sibling-shared one), and `defining` is
+    // the nearest layer that already holds the provider file — the one load
+    // precedence actually reads. Prefer an existing definition, else fall
+    // back to the nearest writable layer.
     let mut target = None;
     let mut defining = None;
-    for dir in discover_config_dirs(cwd) {
+    for dir in config_dirs_most_specific_first(cwd) {
         let path =
             match crate::config::providers::provider_file_path_for_dir(&dir.path, provider_id) {
                 Ok(path) => path,
                 Err(_) => return None,
             };
-        target = Some(path.clone());
-        if path.exists() {
+        if target.is_none() {
+            target = Some(path.clone());
+        }
+        if defining.is_none() && path.exists() {
             defining = Some(path);
         }
     }
@@ -214,10 +221,14 @@ pub fn most_specific_config_write_target(cwd: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    discover_config_dirs(cwd)
-        .into_iter()
+    // Nearest project layer wins (consistent with load precedence and the
+    // gitignore write path); when no project layer applies, fall back to the
+    // most-specific non-project layer — unchanged from the prior behavior.
+    let dirs = discover_config_dirs(cwd);
+    dirs.iter()
+        .find(|d| d.kind == ConfigDirKind::Project)
+        .or_else(|| dirs.last())
         .map(|d| d.path.join(CONFIG_FILE))
-        .next_back()
 }
 
 /// Effective `mcp.json` files for runtime loading, ordered from least
@@ -242,6 +253,33 @@ fn file_paths_for_load(cwd: &Path, filename: &str) -> Vec<PathBuf> {
     project.reverse();
     home_and_local.extend(project);
     home_and_local
+}
+
+/// [`discover_config_dirs`] reordered most-specific first: the nearest
+/// project layer, then any outer project layers, then machine-local and home.
+/// This is load precedence reversed, so `first()` is the layer a runtime
+/// mutation must target to actually take effect (and the layer whose
+/// "approve for this project" must not leak to sibling projects). Mirrors the
+/// nearest-project selection used by the gitignore write path
+/// (`nearest_project_config_path`): the deepest ancestor that already holds a
+/// `.cockpit/` project layer wins.
+fn config_dirs_most_specific_first(cwd: &Path) -> Vec<ConfigDir> {
+    let mut project = Vec::new();
+    let mut home_and_local = Vec::new();
+    for dir in discover_config_dirs(cwd) {
+        match dir.kind {
+            ConfigDirKind::Project => project.push(dir),
+            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot | ConfigDirKind::MachineLocal => {
+                home_and_local.push(dir);
+            }
+        }
+    }
+    // `project` is already nearest-first; `home_and_local` is
+    // home-XDG → home-dot → machine-local, so reverse it to
+    // machine-local → home (most specific first) before appending.
+    home_and_local.reverse();
+    project.extend(home_and_local);
+    project
 }
 
 /// Default places `/settings` will offer when no config exists yet.
@@ -631,6 +669,183 @@ mod tests {
 
         assert!(config_file_paths_for_load(&repo).is_empty());
         assert!(most_specific_config_write_target(&repo).is_none());
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// Trust a nested project (`/repo` + `/repo/app`, both with `.cockpit/`)
+    /// so both project layers are discovered. Returns `(home, root, app)`.
+    fn nested_project_layers(tmp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("repo");
+        let app = root.join("app");
+        std::fs::create_dir_all(home.join(".config/cockpit")).unwrap();
+        std::fs::create_dir_all(root.join(".cockpit")).unwrap();
+        std::fs::create_dir_all(app.join(".cockpit")).unwrap();
+        (home, root, app)
+    }
+
+    /// CFG-8 regression: a non-entity config mutation writes to the NEAREST
+    /// project layer, not the outermost. With `/repo/.cockpit` and
+    /// `/repo/app/.cockpit`, writing from `/repo/app` must land on
+    /// `/repo/app/.cockpit/config.json` — otherwise the write is silently
+    /// masked on load by the nearer layer. Fails against the pre-fix
+    /// `next_back()` (outermost) logic.
+    #[test]
+    fn most_specific_write_target_prefers_nearest_project_not_outermost() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        let (_home, root, app) = nested_project_layers(&tmp);
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+        );
+
+        assert_eq!(
+            most_specific_config_write_target(&app),
+            Some(app.join(".cockpit").join(CONFIG_FILE)),
+            "write target must be the nearest project layer"
+        );
+        assert_ne!(
+            most_specific_config_write_target(&app),
+            Some(root.join(".cockpit").join(CONFIG_FILE)),
+            "must not resolve to the masked outermost project layer"
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// CFG-8 regression for provider files: with no existing provider file,
+    /// the write target is the nearest project's `providers/<id>.json`, not
+    /// the outermost. The outermost target is the "approve for this project
+    /// leaks to sibling projects" bug. Fails against the pre-fix last-wins loop.
+    #[test]
+    fn provider_write_target_prefers_nearest_project_not_outermost() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        let (_home, root, app) = nested_project_layers(&tmp);
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+        );
+
+        let nearest = crate::config::providers::provider_file_path_for_dir(
+            &app.join(".cockpit"),
+            "default",
+        )
+        .ok();
+        let outer = crate::config::providers::provider_file_path_for_dir(
+            &root.join(".cockpit"),
+            "default",
+        )
+        .ok();
+        assert_eq!(config_write_target_for_provider(&app, "default"), nearest);
+        assert_ne!(config_write_target_for_provider(&app, "default"), outer);
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// An existing provider definition is preferred, but resolved at the
+    /// most-specific (nearest) layer that holds it — the file load precedence
+    /// reads. Outer-only definition stays outer (unchanged); once the nearest
+    /// layer also defines it, the mutation moves inward. The second assertion
+    /// fails against the pre-fix last-wins `defining` (which stayed outer).
+    #[test]
+    fn provider_write_target_prefers_nearest_existing_definition() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        let (_home, root, app) = nested_project_layers(&tmp);
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+        );
+
+        let outer = crate::config::providers::provider_file_path_for_dir(
+            &root.join(".cockpit"),
+            "default",
+        )
+        .unwrap();
+        let inner = crate::config::providers::provider_file_path_for_dir(
+            &app.join(".cockpit"),
+            "default",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(outer.parent().unwrap()).unwrap();
+        std::fs::write(&outer, "{}").unwrap();
+        assert_eq!(
+            config_write_target_for_provider(&app, "default"),
+            Some(outer.clone()),
+            "only the outer layer defines it, so that is the definition"
+        );
+
+        std::fs::create_dir_all(inner.parent().unwrap()).unwrap();
+        std::fs::write(&inner, "{}").unwrap();
+        assert_eq!(
+            config_write_target_for_provider(&app, "default"),
+            Some(inner),
+            "nearest layer now defines it, so the mutation must target it"
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// The `COCKPIT_CONFIG` single-layer override still wins over discovered
+    /// project layers for both write-target functions.
+    #[test]
+    fn cockpit_config_override_wins_for_write_targets() {
+        let tmp = TempDir::new().unwrap();
+        let env = test_support::IsolatedCockpitHome::new(tmp.path());
+        let (_home, _root, app) = nested_project_layers(&tmp);
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+        );
+
+        // A non-`.cockpit` parent is always write-allowed, isolating the
+        // override branch from workspace-trust concerns.
+        let override_cfg = tmp.path().join("explicit-config.json");
+        std::fs::write(&override_cfg, "{}").unwrap();
+        let _ovr = env.override_cockpit_config(&override_cfg);
+
+        assert_eq!(
+            most_specific_config_write_target(&app),
+            Some(override_cfg.clone()),
+            "override wins over the nearest project layer"
+        );
+        assert_eq!(
+            config_write_target_for_provider(&app, "default"),
+            crate::config::providers::provider_file_path_for_config(&override_cfg, "default").ok(),
+            "provider file lives beside the exact override config"
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// Guard against a behavior change in the no-project case: when no project
+    /// layer applies, the fallback stays the most-specific non-project layer
+    /// (here home-dot), exactly as the pre-fix `next_back()` resolved. Passes
+    /// both before and after the fix — it locks the fallback in place.
+    #[test]
+    fn no_project_fallback_targets_most_specific_home_layer_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".config/cockpit")).unwrap();
+        std::fs::create_dir_all(home.join(".cockpit")).unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        assert_eq!(
+            most_specific_config_write_target(&work),
+            Some(home.join(".cockpit").join(CONFIG_FILE)),
+            "no project layer → most-specific non-project layer (home-dot)"
+        );
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 }

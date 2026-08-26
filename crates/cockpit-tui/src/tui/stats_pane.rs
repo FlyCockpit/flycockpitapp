@@ -357,17 +357,21 @@ impl StatsPane {
     }
 
     fn ensure_cursor_visible(&mut self) {
-        let Some(row) = self.cursor_body_line() else {
+        let Some((start, end)) = self.cursor_body_span() else {
             return;
         };
-        let height = self.last_body_height.max(1);
-        if row < self.list.offset() {
-            *self.list.offset_mut() = row;
-        } else if row >= self.list.offset() + height {
-            *self.list.offset_mut() = row + 1 - height;
-        }
-        let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        *self.list.offset_mut() = self.list.offset().min(max_scroll);
+        // Keep the selected row's *full* rendered span visible, not just its
+        // top line: an expanded recovery row spans several body lines, so a
+        // uniform-height clamp would leave its drilldown below the fold. Reuse
+        // the shared span clamp (mirrors `sessions_pane`) so the math matches
+        // the per-row heights the renderer actually drew.
+        *self.list.offset_mut() = crate::tui::pane_shared::clamp_scroll_to_visible_span(
+            self.list.offset(),
+            self.last_body_height,
+            self.last_content_rows,
+            start,
+            end,
+        );
     }
 
     fn cursor_body_line(&self) -> Option<usize> {
@@ -386,6 +390,24 @@ impl StatsPane {
             }
         }
         Some(row)
+    }
+
+    /// The selected recovery row's rendered span `[start, end)` in body-line
+    /// units. `end` accounts for the extra lines an expanded drilldown adds to
+    /// the *selected* row itself, so scroll-follow can keep the whole variable
+    /// height span visible rather than just its summary line. `None` when
+    /// there's no selectable recovery row.
+    fn cursor_body_span(&self) -> Option<(usize, usize)> {
+        let start = self.cursor_body_line()?;
+        let rollup = self.rollup.ready()?;
+        let selected = self.selected_recovery_index();
+        let mut height = 1;
+        if self.expanded.get(selected).copied().unwrap_or(false)
+            && let Some(row) = rollup.recovery.by_model.get(selected)
+        {
+            height += recovery_drilldown(&rollup.recovery, &row.model).len();
+        }
+        Some((start, start + height))
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -1476,6 +1498,52 @@ mod tests {
         let manual = pane.list.offset();
         let _ = rendered_buffer(&mut pane, 80, 7);
         assert_eq!(pane.list.offset(), manual);
+    }
+
+    #[test]
+    fn cursor_follow_keeps_expanded_selected_row_fully_visible() {
+        // The *selected* recovery row is expanded, so it spans several body
+        // lines (its summary plus a multi-line drilldown). A uniform-height
+        // follow keeps only the summary line on screen and pushes the
+        // drilldown below the fold; the span clamp keeps the whole row
+        // visible.
+        let mut rollup = empty_rollup();
+        rollup.recovery.by_model = vec![recovery_row("a"), recovery_row("b"), recovery_row("c")];
+        rollup.recovery.by_tool = vec![RecoveryToolRow {
+            model: "a".into(),
+            tool: "edit".into(),
+            calls: 1,
+            recovered: 0,
+            hard_fail: 0,
+        }];
+        rollup.recovery.by_stage = vec![RecoveryStageRow {
+            model: "a".into(),
+            recovery_kind: "shape".into(),
+            recovery_stage: "wrap".into(),
+            count: 1,
+        }];
+        let mut pane = pane_with(rollup);
+        // Expand the selected (index 0) row — the variable-height row.
+        assert!(!pane.handle_key(press(KeyCode::Enter)));
+        assert!(pane.expanded[0]);
+
+        // Body height 6 (area 9 − border 2 − help 1) is shorter than the
+        // expanded row's span, so a summary-line-only follow would leave the
+        // drilldown off-screen.
+        let rendered = rendered_buffer(&mut pane, 60, 9);
+        assert_eq!(pane.last_body_height, 6);
+
+        let (start, end) = pane.cursor_body_span().expect("selected span");
+        let offset = pane.list.offset();
+        assert!(start >= offset, "start={start} offset={offset}");
+        assert!(
+            end <= offset + pane.last_body_height,
+            "end={end} offset={offset} height={}",
+            pane.last_body_height
+        );
+        // The selected row's full drilldown is drawn, not just its summary.
+        assert!(rendered.contains("by tool"), "{rendered}");
+        assert!(rendered.contains("shape / wrap"), "{rendered}");
     }
 
     #[test]

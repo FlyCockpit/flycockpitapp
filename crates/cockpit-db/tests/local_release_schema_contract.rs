@@ -762,28 +762,122 @@ fn audit_transition_block(block: &syn::Block) -> Result<(), String> {
     Ok(())
 }
 
+const IMAGE_STATE_EXECUTORS: &[&str] = &[
+    "execute_image_job_transition_conn",
+    "transition_image_generation_artifact_conn",
+    "transition_image_generation_artifact_component_conn",
+    "execute_late_publication_artifact_transition_conn",
+    "execute_artifact_cleanup_transition_conn",
+    "execute_component_tombstone_transition_conn",
+    "execute_artifact_tombstone_transition_conn",
+    "execute_basic_image_slot_transition_conn",
+    "execute_basic_image_attempt_transition_conn",
+    "execute_queue_all_image_slots_conn",
+    "execute_image_publication_attempt_transition_conn",
+    "execute_image_publication_slot_transition_conn",
+    "execute_image_dispatch_preparation_transitions_conn",
+    "execute_image_attempt_handoff_transition_conn",
+    "execute_image_handoff_outcome_transitions_conn",
+    "execute_reconciliation_claim_attempt_transition_conn",
+    "execute_reconciliation_state_transitions_conn",
+    "execute_accepted_response_failure_transitions_conn",
+    "execute_response_adoption_transitions_conn",
+    "execute_deadline_attempt_journal_binding_conn",
+    "execute_cancellation_attempt_transition_conn",
+    "execute_cancellation_slot_transition_conn",
+    "execute_validating_slot_cancellation_marker_conn",
+    "execute_late_publication_slot_transition_conn",
+];
+
 fn raw_transition_boundary_error(name: &str, block: &syn::Block) -> Option<String> {
     let mut audit = TransitionAstAudit::default();
     audit.visit_block(block);
-    let allowed = [
-        "execute_image_job_transition_conn",
-        "transition_image_generation_artifact_conn",
-        "transition_image_generation_artifact_component_conn",
-        "execute_late_publication_artifact_transition_conn",
-        "execute_artifact_cleanup_transition_conn",
-        "execute_component_tombstone_transition_conn",
-        "execute_artifact_tombstone_transition_conn",
-    ];
     audit.mutations.into_iter().find_map(|mutation| {
-        matches!(mutation.family, "job" | "artifact" | "component")
-            .then(|| ())
-            .filter(|_| !allowed.contains(&name))
+        (!IMAGE_STATE_EXECUTORS.contains(&name))
+            .then_some(())
             .map(|_| {
                 format!(
                     "{name} contains raw {} state SQL outside a typed executor",
                     mutation.family
                 )
             })
+    })
+}
+
+#[derive(Default)]
+struct RawImageSqlLiteralAudit {
+    literals: Vec<(usize, String)>,
+}
+
+impl<'ast> Visit<'ast> for RawImageSqlLiteralAudit {
+    fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+        let normalized = literal
+            .value()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_uppercase();
+        self.literals
+            .push((literal.span().start().line, normalized));
+        visit::visit_lit_str(self, literal);
+    }
+
+    fn visit_macro(&mut self, item_macro: &'ast syn::Macro) {
+        self.literals.push((
+            item_macro.span().start().line,
+            item_macro.tokens.to_string().to_ascii_uppercase(),
+        ));
+    }
+}
+
+impl RawImageSqlLiteralAudit {
+    fn state_mutation_line(&self) -> Option<usize> {
+        let combined = self
+            .literals
+            .iter()
+            .map(|(_, literal)| literal.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let targets = [
+            "IMAGE_GENERATION_JOBS",
+            "IMAGE_GENERATION_SLOTS",
+            "IMAGE_GENERATION_ATTEMPTS",
+            "IMAGE_GENERATION_ARTIFACTS",
+            "IMAGE_GENERATION_ARTIFACT_COMPONENTS",
+        ];
+        let is_state_update = targets.iter().any(|table| {
+            let marker = format!("UPDATE {table}");
+            combined.split(&marker).skip(1).any(|tail| {
+                tail.split_once(" SET ").is_some_and(|(_, after_set)| {
+                    let assignments = after_set.split(" WHERE ").next().unwrap_or(after_set);
+                    assignments.contains("STATE=") || assignments.contains("STATE =")
+                })
+            })
+        });
+        is_state_update.then(|| {
+            self.literals
+                .iter()
+                .find(|(_, literal)| literal.contains("UPDATE IMAGE_GENERATION_"))
+                .map_or(0, |(line, _)| *line)
+        })
+    }
+}
+
+fn raw_sql_literal_boundary_error(name: &str, block: &syn::Block) -> Option<String> {
+    let mut audit = RawImageSqlLiteralAudit::default();
+    audit.visit_block(block);
+    let line = audit.state_mutation_line()?;
+    if !IMAGE_STATE_EXECUTORS.contains(&name) {
+        return Some(format!(
+            "{name} contains image state-table UPDATE SQL at line {line} outside an executor"
+        ));
+    }
+    let mut direct = TransitionAstAudit::default();
+    direct.visit_block(block);
+    direct.mutations.is_empty().then(|| {
+        format!(
+            "{name} hides image state-table UPDATE SQL at line {line} behind an indirect executor"
+        )
     })
 }
 
@@ -794,40 +888,85 @@ fn transition_source_errors(source: &str) -> Vec<String> {
                 && matches!(&attr.meta, syn::Meta::List(list) if list.tokens.to_string() == "test")
         })
     }
-    let file = syn::parse_file(source).expect("image-generation source parses");
     let mut errors = Vec::new();
-    for item in file.items {
-        match item {
-            syn::Item::Fn(function) if !is_test_only(&function.attrs) => {
-                if let Some(error) =
-                    raw_transition_boundary_error(&function.sig.ident.to_string(), &function.block)
-                {
-                    errors.push(error);
+    fn audit_block(name: &str, block: &syn::Block, errors: &mut Vec<String>) {
+        if let Some(error) = raw_transition_boundary_error(name, block) {
+            errors.push(error);
+        }
+        if let Some(error) = raw_sql_literal_boundary_error(name, block) {
+            errors.push(error);
+        }
+        if let Err(error) = audit_transition_block(block) {
+            errors.push(format!("{name}: {error}"));
+        }
+    }
+    fn audit_items(items: Vec<syn::Item>, errors: &mut Vec<String>) {
+        for item in items {
+            match item {
+                syn::Item::Fn(function) if !is_test_only(&function.attrs) => {
+                    audit_block(&function.sig.ident.to_string(), &function.block, errors);
                 }
-                if let Err(error) = audit_transition_block(&function.block) {
-                    errors.push(format!("{}: {error}", function.sig.ident));
-                }
-            }
-            syn::Item::Impl(item_impl) => {
-                for item in item_impl.items {
-                    if let syn::ImplItem::Fn(function) = item
-                        && !is_test_only(&function.attrs)
-                    {
-                        if let Some(error) = raw_transition_boundary_error(
-                            &function.sig.ident.to_string(),
-                            &function.block,
-                        ) {
-                            errors.push(error);
-                        }
-                        if let Err(error) = audit_transition_block(&function.block) {
-                            errors.push(format!("{}: {error}", function.sig.ident));
+                syn::Item::Impl(item_impl) if !is_test_only(&item_impl.attrs) => {
+                    for item in item_impl.items {
+                        if let syn::ImplItem::Fn(function) = item
+                            && !is_test_only(&function.attrs)
+                        {
+                            audit_block(&function.sig.ident.to_string(), &function.block, errors);
                         }
                     }
                 }
+                syn::Item::Trait(item_trait) if !is_test_only(&item_trait.attrs) => {
+                    for item in item_trait.items {
+                        if let syn::TraitItem::Fn(function) = item
+                            && !is_test_only(&function.attrs)
+                            && let Some(block) = function.default
+                        {
+                            audit_block(&function.sig.ident.to_string(), &block, errors);
+                        }
+                    }
+                }
+                syn::Item::Mod(module) if !is_test_only(&module.attrs) => {
+                    if let Some((_, items)) = module.content {
+                        audit_items(items, errors);
+                    }
+                }
+                syn::Item::Const(item_const) if !is_test_only(&item_const.attrs) => {
+                    let mut audit = RawImageSqlLiteralAudit::default();
+                    audit.visit_expr(&item_const.expr);
+                    if let Some(line) = audit.state_mutation_line() {
+                        errors.push(format!(
+                            "const {} contains image state-table UPDATE SQL at line {line}",
+                            item_const.ident
+                        ));
+                    }
+                }
+                syn::Item::Static(item_static) if !is_test_only(&item_static.attrs) => {
+                    let mut audit = RawImageSqlLiteralAudit::default();
+                    audit.visit_expr(&item_static.expr);
+                    if let Some(line) = audit.state_mutation_line() {
+                        errors.push(format!(
+                            "static {} contains image state-table UPDATE SQL at line {line}",
+                            item_static.ident
+                        ));
+                    }
+                }
+                syn::Item::Macro(item_macro) if !is_test_only(&item_macro.attrs) => {
+                    let tokens = item_macro.mac.tokens.to_string().to_ascii_uppercase();
+                    if (tokens.contains("UPDATE IMAGE_GENERATION_")
+                        || (tokens.contains("UPDATE") && tokens.contains("IMAGE_GENERATION_")))
+                        && (tokens.contains("SET STATE") || tokens.contains("STATE ="))
+                    {
+                        errors.push(
+                            "production macro contains image state-table UPDATE SQL".to_owned(),
+                        );
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
+    let file = syn::parse_file(source).expect("image-generation source parses");
+    audit_items(file.items, &mut errors);
     errors
 }
 
@@ -865,6 +1004,56 @@ fn image_transition_ast_audit_rejects_decoys_and_unvalidated_occurrences() {
         }
     "#;
     assert!(transition_source_errors(async_restricted_visibility).is_empty());
+
+    let nested = r#"
+        mod hidden { fn mutate(conn: &Connection) {
+            let sql = "UPDATE image_generation_slots SET state='queued' WHERE state='planned'";
+            conn.prepare(sql).unwrap();
+        }}
+    "#;
+    assert!(!transition_source_errors(nested).is_empty());
+
+    let trait_default = r#"
+        trait Hidden { fn mutate(conn: &Connection) {
+            conn.execute("UPDATE image_generation_attempts SET state='accepted' WHERE state='dispatching'", []);
+        }}
+    "#;
+    assert!(!transition_source_errors(trait_default).is_empty());
+
+    let constant_wrapper = r#"
+        const SQL: &str = "UPDATE image_generation_jobs SET state='failed' WHERE state='running'";
+        fn wrapper(conn: &Connection) { conn.prepare(SQL).unwrap(); }
+    "#;
+    assert!(!transition_source_errors(constant_wrapper).is_empty());
+
+    let macro_sql = r#"
+        macro_rules! hidden { () => { "UPDATE image_generation_artifacts SET state='ready'" } }
+    "#;
+    assert!(!transition_source_errors(macro_sql).is_empty());
+
+    let dynamic = r#"
+        fn wrapper(conn: &Connection) {
+            let prefix = "UPDATE image_generation_slots";
+            let sql = format!("{prefix} SET state='queued'");
+            conn.execute(&sql, []);
+        }
+    "#;
+    assert!(!transition_source_errors(dynamic).is_empty());
+
+    let disguised_executor = r#"
+        fn execute_basic_image_slot_transition_conn(conn: &Connection) {
+            let prefix = "UPDATE image_generation_slots";
+            conn.prepare(&format!("{prefix} SET state='queued'")).unwrap();
+        }
+    "#;
+    assert!(!transition_source_errors(disguised_executor).is_empty());
+
+    let invocation_macro = r#"
+        fn wrapper(conn: &Connection) {
+            conn.execute(sql!("UPDATE image_generation_attempts SET state='accepted'"), []);
+        }
+    "#;
+    assert!(!transition_source_errors(invocation_macro).is_empty());
 }
 
 fn sql_registry_edges(sql: &str, registry: &str) -> BTreeSet<String> {

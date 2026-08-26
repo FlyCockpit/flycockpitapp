@@ -15,6 +15,7 @@ workspace = true
 [features]
 default = []
 remote = ["cockpit-proto/remote"]
+test-support = []
 
 [dependencies]
 anyhow = { workspace = true }

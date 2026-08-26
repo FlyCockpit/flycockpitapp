@@ -33,6 +33,66 @@ fn client_manifest_stays_below_application_and_storage_layers() {
 }
 
 #[test]
+fn connection_counter_instrumentation_is_feature_gated() {
+    let root = workspace_root();
+    let manifest = fs::read_to_string(root.join("crates/cockpit-client/Cargo.toml"))
+        .expect("read cockpit-client manifest");
+    assert!(
+        manifest.contains("default = []"),
+        "production client defaults must remain feature-free"
+    );
+    assert!(
+        manifest.contains("test-support = []"),
+        "test instrumentation must have an explicit feature"
+    );
+
+    let source = fs::read_to_string(root.join("crates/cockpit-client/src/lib.rs"))
+        .expect("read cockpit-client source");
+    for symbol in [
+        "static CONNECT_CALLS",
+        "pub fn reset_connect_call_count",
+        "pub fn connect_call_count",
+    ] {
+        let offset = source.find(symbol).expect("connection counter symbol");
+        let prefix = &source[..offset];
+        let cfg = prefix
+            .rfind("#[cfg(feature = \"test-support\")]")
+            .expect("test-support cfg before instrumentation symbol");
+        let intervening = &prefix[cfg..];
+        assert!(
+            intervening.lines().count() <= 3,
+            "{symbol} must be directly guarded by test-support"
+        );
+    }
+
+    let connect = source
+        .find("CONNECT_CALLS.with(|calls| calls.set(calls.get() + 1))")
+        .expect("connect counter increment");
+    let prefix = &source[..connect];
+    let cfg = prefix
+        .rfind("#[cfg(feature = \"test-support\")]")
+        .expect("test-support cfg before increment");
+    assert!(
+        prefix[cfg..].lines().count() <= 3,
+        "the production connect hot path must not include test instrumentation"
+    );
+
+    let tui_manifest = fs::read_to_string(root.join("crates/cockpit-tui/Cargo.toml"))
+        .expect("read cockpit-tui manifest");
+    let production = tui_manifest
+        .split_once("[dev-dependencies]")
+        .expect("TUI dev-dependencies section")
+        .0;
+    assert!(
+        !production.contains("cockpit-client/test-support")
+            && !production.lines().any(|line| {
+                line.starts_with("cockpit-client") && line.contains("test-support")
+            }),
+        "TUI production dependency must not enable client test instrumentation"
+    );
+}
+
+#[test]
 fn core_does_not_reimplement_or_reexport_daemon_transport() {
     let root = workspace_root();
     let lifecycle = fs::read_to_string(root.join("crates/cockpit-core/src/daemon/client.rs"))

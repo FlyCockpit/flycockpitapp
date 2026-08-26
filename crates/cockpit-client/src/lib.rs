@@ -87,14 +87,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const MAX_BIASED_INBOUND_FRAMES: usize = 32;
 
+#[cfg(feature = "test-support")]
 thread_local! {
     static CONNECT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(feature = "test-support")]
 pub fn reset_connect_call_count() {
     CONNECT_CALLS.with(|calls| calls.set(0));
 }
 
+#[cfg(feature = "test-support")]
 pub fn connect_call_count() -> usize {
     CONNECT_CALLS.with(std::cell::Cell::get)
 }
@@ -148,6 +151,7 @@ impl DaemonClient {
     /// Connect to the daemon at `socket`. Spawns the background task
     /// before returning.
     pub async fn connect(socket: &Path) -> Result<Self> {
+        #[cfg(feature = "test-support")]
         CONNECT_CALLS.with(|calls| calls.set(calls.get() + 1));
         if let Some(connection) = connect_in_process(socket) {
             return Ok(Self::from_in_process(connection));

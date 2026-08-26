@@ -16,10 +16,10 @@
 -- ---- assistants ------------------------------------------------------------
 
 CREATE TABLE assistants (
-    name         TEXT    PRIMARY KEY CHECK (length(name) BETWEEN 1 AND 255),
+    name         TEXT    PRIMARY KEY CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 255),
     -- Daemon-observed wall-clock time, signed Unix milliseconds.
     created_at_unix_ms INTEGER NOT NULL,
-    home_dir     TEXT    NOT NULL CHECK (length(home_dir) BETWEEN 1 AND 32768),
+    home_dir     TEXT    NOT NULL CHECK (length(CAST(home_dir AS BLOB)) BETWEEN 1 AND 32768),
     config_json  TEXT    NOT NULL DEFAULT '{}' CHECK (
         json_valid(config_json) AND json_type(config_json) = 'object'
         AND length(CAST(config_json AS BLOB)) <= 1048576
@@ -37,12 +37,19 @@ CREATE TABLE assistants (
 -- ---- sessions --------------------------------------------------------------
 
 CREATE TABLE sessions (
-    session_id      TEXT    PRIMARY KEY CHECK (length(session_id) = 36),
-    project_id      TEXT    NOT NULL CHECK (length(project_id) BETWEEN 1 AND 1024),
-    project_root    TEXT    NOT NULL CHECK (length(project_root) BETWEEN 1 AND 32768),
-    started_at      INTEGER NOT NULL,            -- epoch seconds
-    last_active_at  INTEGER NOT NULL CHECK (last_active_at >= started_at),
-    ended_at        INTEGER CHECK (ended_at IS NULL OR ended_at >= started_at),
+    session_id      TEXT    PRIMARY KEY CHECK (
+        length(session_id) = 36 AND session_id = lower(session_id)
+        AND substr(session_id, 9, 1) = '-' AND substr(session_id, 14, 1) = '-'
+        AND substr(session_id, 19, 1) = '-' AND substr(session_id, 24, 1) = '-'
+        AND length(replace(session_id, '-', '')) = 32
+        AND replace(session_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    project_id      TEXT    NOT NULL CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 1024),
+    project_root    TEXT    NOT NULL CHECK (length(CAST(project_root AS BLOB)) BETWEEN 1 AND 32768),
+    -- Daemon-observed wall-clock times, signed Unix milliseconds.
+    started_at_unix_ms      INTEGER NOT NULL,
+    last_active_at_unix_ms  INTEGER NOT NULL CHECK (last_active_at_unix_ms >= started_at_unix_ms),
+    ended_at_unix_ms        INTEGER CHECK (ended_at_unix_ms IS NULL OR ended_at_unix_ms >= started_at_unix_ms),
     provider        TEXT,
     model           TEXT,
     model_selection_json TEXT CHECK (
@@ -88,11 +95,11 @@ CREATE TABLE sessions (
 
     -- read/unread + archive state for the session browser (GOALS §17f).
     -- A session is UNREAD when the latest agent-produced event is newer
-    -- than last_viewed_at (NULL = never viewed). archived_at is a
+    -- than last_viewed_at_unix_ms (NULL = never viewed). archived_at_unix_ms is a
     -- recoverable soft-delete; NULL = live. Archive cascades the fork
     -- subtree app-side (src/db/sessions.rs).
-    last_viewed_at INTEGER,
-    archived_at    INTEGER,
+    last_viewed_at_unix_ms INTEGER,
+    archived_at_unix_ms    INTEGER,
 
     -- live guidance-file diff injection: hash + path of the resolved
     -- agent-guidance body baked into this session's frozen system block,
@@ -107,7 +114,7 @@ CREATE TABLE sessions (
         )
     ),
     guidance_baseline_path TEXT CHECK (
-        guidance_baseline_path IS NULL OR length(guidance_baseline_path) BETWEEN 1 AND 32768
+        guidance_baseline_path IS NULL OR length(CAST(guidance_baseline_path AS BLOB)) BETWEEN 1 AND 32768
     ),
 
     -- Accumulated session egress redaction table. Stores literal redaction
@@ -168,8 +175,8 @@ CREATE TABLE sessions (
     CHECK (parent_session_id IS NULL OR parent_session_id <> session_id),
     CHECK (btw_parent_session_id IS NULL OR btw_parent_session_id <> session_id),
     CHECK ((guidance_baseline_path IS NULL) = (guidance_baseline_hash IS NULL)),
-    CHECK (last_viewed_at IS NULL OR last_viewed_at >= started_at),
-    CHECK (archived_at IS NULL OR archived_at >= started_at),
+    CHECK (last_viewed_at_unix_ms IS NULL OR last_viewed_at_unix_ms >= started_at_unix_ms),
+    CHECK (archived_at_unix_ms IS NULL OR archived_at_unix_ms >= started_at_unix_ms),
     FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
     FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
@@ -225,8 +232,14 @@ END;
 -- INTEGER is signed i64. Application codecs reject zero, leading zeroes and
 -- values outside u64 before any mutation.
 CREATE TABLE media_attachments (
-    attachment_id                  TEXT PRIMARY KEY CHECK (length(attachment_id) BETWEEN 1 AND 255),
-    session_id                     TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    attachment_id                  TEXT PRIMARY KEY CHECK (
+        length(attachment_id) = 36 AND attachment_id = lower(attachment_id)
+        AND substr(attachment_id, 9, 1) = '-' AND substr(attachment_id, 14, 1) = '-'
+        AND substr(attachment_id, 19, 1) = '-' AND substr(attachment_id, 24, 1) = '-'
+        AND length(replace(attachment_id, '-', '')) = 32
+        AND replace(attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    session_id                     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     canonical_project_digest       TEXT NOT NULL,
     media_kind                     TEXT NOT NULL CHECK (media_kind IN ('image', 'audio', 'video')),
     source_kind                    TEXT NOT NULL CHECK (source_kind IN ('local_path', 'retained_https', 'authenticated_session_upload')),
@@ -248,11 +261,21 @@ CREATE TABLE media_attachments (
     selected_video_stream_json     TEXT CHECK (selected_video_stream_json IS NULL OR (
         json_valid(selected_video_stream_json)
         AND json_type(selected_video_stream_json) = 'array'
+        AND json_array_length(selected_video_stream_json) = 2
+        AND json_type(selected_video_stream_json, '$[0]') = 'integer'
+        AND json_extract(selected_video_stream_json, '$[0]') BETWEEN 0 AND 4294967295
+        AND json_type(selected_video_stream_json, '$[1]') = 'text'
+        AND length(CAST(json_extract(selected_video_stream_json, '$[1]') AS BLOB)) BETWEEN 1 AND 255
         AND length(CAST(selected_video_stream_json AS BLOB)) <= 65536
     )),
     selected_audio_stream_json     TEXT CHECK (selected_audio_stream_json IS NULL OR (
         json_valid(selected_audio_stream_json)
         AND json_type(selected_audio_stream_json) = 'array'
+        AND json_array_length(selected_audio_stream_json) = 2
+        AND json_type(selected_audio_stream_json, '$[0]') = 'integer'
+        AND json_extract(selected_audio_stream_json, '$[0]') BETWEEN 0 AND 4294967295
+        AND json_type(selected_audio_stream_json, '$[1]') = 'text'
+        AND length(CAST(json_extract(selected_audio_stream_json, '$[1]') AS BLOB)) BETWEEN 1 AND 255
         AND length(CAST(selected_audio_stream_json AS BLOB)) <= 65536
     )),
     -- Daemon-observed wall-clock times, signed Unix milliseconds.
@@ -307,7 +330,13 @@ BEGIN
 END;
 
 CREATE TABLE media_attachment_components (
-    component_id          TEXT PRIMARY KEY CHECK (length(component_id) BETWEEN 1 AND 255),
+    component_id          TEXT PRIMARY KEY CHECK (
+        length(component_id) = 36 AND component_id = lower(component_id)
+        AND substr(component_id, 9, 1) = '-' AND substr(component_id, 14, 1) = '-'
+        AND substr(component_id, 19, 1) = '-' AND substr(component_id, 24, 1) = '-'
+        AND length(replace(component_id, '-', '')) = 32
+        AND replace(component_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
     attachment_id         TEXT NOT NULL,
     attachment_version    TEXT NOT NULL,
     component_kind        TEXT NOT NULL CHECK (component_kind IN ('quarantined_original', 'image_model', 'browser_thumbnail', 'audio_model', 'video_model', 'upload_temporary')),
@@ -373,10 +402,39 @@ CREATE TABLE media_storage_publication_intents (
     derivative_storage_ids_json TEXT NOT NULL CHECK (
         json_valid(derivative_storage_ids_json)
         AND json_type(derivative_storage_ids_json) = 'array'
+        AND json(derivative_storage_ids_json) = derivative_storage_ids_json
         AND length(CAST(derivative_storage_ids_json AS BLOB)) <= 1048576
     ),
     created_at_unix_ms INTEGER NOT NULL
 );
+
+CREATE TRIGGER media_storage_publication_derivative_ids_insert
+BEFORE INSERT ON media_storage_publication_intents
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.derivative_storage_ids_json)
+    WHERE type <> 'text' OR length(value) <> 36 OR value <> lower(value)
+       OR substr(value, 9, 1) <> '-' OR substr(value, 14, 1) <> '-'
+       OR substr(value, 19, 1) <> '-' OR substr(value, 24, 1) <> '-'
+       OR length(replace(value, '-', '')) <> 32
+       OR replace(value, '-', '') GLOB '*[^0-9a-f]*'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'media derivative storage ids must be canonical UUIDs');
+END;
+
+CREATE TRIGGER media_storage_publication_derivative_ids_update
+BEFORE UPDATE OF derivative_storage_ids_json ON media_storage_publication_intents
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.derivative_storage_ids_json)
+    WHERE type <> 'text' OR length(value) <> 36 OR value <> lower(value)
+       OR substr(value, 9, 1) <> '-' OR substr(value, 14, 1) <> '-'
+       OR substr(value, 19, 1) <> '-' OR substr(value, 24, 1) <> '-'
+       OR length(replace(value, '-', '')) <> 32
+       OR replace(value, '-', '') GLOB '*[^0-9a-f]*'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'media derivative storage ids must be canonical UUIDs');
+END;
 
 -- Crash fence for daemon-owned clipboard/private-terminal ingress. The
 -- opaque admission id is the client idempotency identity; the retained
@@ -922,16 +980,16 @@ CREATE TABLE media_downstream_ownership (
 );
 CREATE INDEX idx_media_downstream_invocation ON media_downstream_ownership(invocation_id);
 
-CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at DESC);
-CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at DESC);
-CREATE INDEX idx_sessions_open            ON sessions (ended_at) WHERE ended_at IS NULL;
+CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at_unix_ms DESC);
+CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at_unix_ms DESC);
+CREATE INDEX idx_sessions_open            ON sessions (ended_at_unix_ms) WHERE ended_at_unix_ms IS NULL;
 CREATE INDEX idx_sessions_parent          ON sessions (parent_session_id);
 -- Partial so rows whose short_id is still NULL (lazily backfilled on next
 -- touch by src/db/sessions.rs) don't trip the uniqueness constraint.
 CREATE UNIQUE INDEX idx_sessions_short_id_project
     ON sessions (project_id, short_id)
     WHERE short_id IS NOT NULL;
-CREATE INDEX idx_sessions_archived  ON sessions (archived_at);
+CREATE INDEX idx_sessions_archived  ON sessions (archived_at_unix_ms);
 CREATE INDEX idx_sessions_ephemeral ON sessions (ephemeral);
 CREATE INDEX idx_sessions_btw_parent ON sessions (btw_parent_session_id);
 CREATE UNIQUE INDEX idx_sessions_one_live_btw
@@ -940,7 +998,7 @@ CREATE UNIQUE INDEX idx_sessions_one_live_btw
 CREATE INDEX idx_sessions_created_by_principal ON sessions (created_by_principal);
 CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_collaborators)
   WHERE shared_with_collaborators = 1;
-CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at DESC)
+CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at_unix_ms DESC)
   WHERE assistant_name IS NOT NULL;
 
 -- ---- sealed_values ---------------------------------------------------------
@@ -3230,7 +3288,7 @@ CREATE INDEX idx_text_artifact_reservations_expiry
 -- Per-root workspace trust decisions.
 
 CREATE TABLE workspace_trust (
-    root_path TEXT PRIMARY KEY CHECK (length(root_path) BETWEEN 1 AND 32768),
+    root_path TEXT PRIMARY KEY CHECK (length(CAST(root_path AS BLOB)) BETWEEN 1 AND 32768),
     mode TEXT NOT NULL CHECK (mode IN ('trust', 'ignore-config', 'untrusted')),
     -- Daemon-observed wall-clock times, signed Unix milliseconds.
     created_at_unix_ms INTEGER NOT NULL,

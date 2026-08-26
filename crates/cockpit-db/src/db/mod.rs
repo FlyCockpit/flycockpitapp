@@ -3006,7 +3006,7 @@ mod tests {
         db.write(move |conn| {
             conn.execute(
                 "INSERT INTO sessions \
-                 (session_id, project_id, project_root, started_at, last_active_at) \
+                 (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms) \
                  VALUES (?1, 'project', '/tmp/project', 1, 1)",
                 [&session_id],
             )?;
@@ -3305,7 +3305,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let id = session_id.to_string();
         db.write(move |conn| {
-            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
+            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
             conn.execute("INSERT INTO remote_principal_audit (ts_ms, principal, request_kind, session_id, verdict) VALUES (1, 'p', 'request', ?1, 'allowed')", [&id])?;
             Ok(())
         }).await.unwrap();
@@ -3391,7 +3391,7 @@ mod tests {
         std::fs::write(&sidecar, "payload").unwrap();
         let relative_for_db = relative.clone();
         db.write(move |conn| {
-            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
+            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
             conn.execute("INSERT INTO task_delegation_jobs (task_call_id, parent_session_id, parent_agent, status, created_at, updated_at) VALUES ('task', ?1, 'agent', 'completed', 1, 1)", [&id])?;
             conn.execute("INSERT INTO task_delegation_payloads (task_call_id, label, payload_hash, parent_session_id, parent_agent, child_agent, prompt_byte_len, sidecar_path, created_at) VALUES ('task', 'default', 'hash', ?1, 'agent', 'child', 7, ?2, 1)", rusqlite::params![id, relative_for_db])?;
             Ok(())
@@ -3414,7 +3414,7 @@ mod tests {
             let id = id.clone();
             let relative = relative.clone();
             move |conn| {
-                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/p',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
                 Db::enqueue_delegation_sidecar_cleanup_conn(conn, session_id, 2)?;
@@ -3457,7 +3457,7 @@ mod tests {
             let id = id.clone();
             let relative = relative.clone();
             move |conn| {
-                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/p',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
                 conn.execute("INSERT INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms) VALUES(?1,?2,2)",rusqlite::params![relative,id])?;

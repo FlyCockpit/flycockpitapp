@@ -3744,7 +3744,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .await
             .unwrap()
             .unwrap()
-            .archived_at
+            .archived_at_unix_ms
             .is_some()
     );
     assert!(
@@ -3753,7 +3753,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .await
             .unwrap()
             .unwrap()
-            .archived_at
+            .archived_at_unix_ms
             .is_none()
     );
     let unarchive_operation = proto::RemoteOperationIdentityV1::new(
@@ -3813,7 +3813,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .await
             .unwrap()
             .unwrap()
-            .archived_at
+            .archived_at_unix_ms
             .is_none()
     );
     // The second session's paused work was cancelled earlier; the
@@ -10358,7 +10358,7 @@ async fn remote_archive_stops_worker_before_committing_archive() {
             .await
             .unwrap()
             .unwrap()
-            .archived_at
+            .archived_at_unix_ms
             .is_none(),
         "archive transaction must not commit when worker stop fails"
     );
@@ -14103,7 +14103,7 @@ async fn retention_tick_runs_one_pass_without_sleep() {
     let session = db.create_session("p", "/x", "Build").await.unwrap();
     db.write(move |conn| {
         conn.execute(
-            "UPDATE sessions SET started_at = 5, ended_at = 10, last_active_at = 10 WHERE session_id = ?1",
+            "UPDATE sessions SET started_at_unix_ms = 5, ended_at_unix_ms = 10, last_active_at_unix_ms = 10 WHERE session_id = ?1",
             [session.session_id.to_string()],
         )?;
         conn.execute(
@@ -22649,7 +22649,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
                     .await
                     .unwrap()
                     .unwrap()
-                    .archived_at
+                    .archived_at_unix_ms
                     .is_some()
             );
         }
@@ -22673,7 +22673,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
                     .await
                     .unwrap()
                     .unwrap()
-                    .archived_at
+                    .archived_at_unix_ms
                     .is_none()
             );
         }
@@ -25754,7 +25754,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SaveExtendedConfig,
         ExportPolicy,
         ImportPolicy,
+        #[cfg(feature = "extended")]
         GetImageSpendPolicy,
+        #[cfg(feature = "extended")]
         SaveImageSpendPolicy,
         ImageEndpointList,
         ImageEndpointGet,
@@ -29942,7 +29944,7 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
         .await
         .unwrap()
         .expect("row remains");
-    assert!(row.archived_at.is_none());
+    assert!(row.archived_at_unix_ms.is_none());
 }
 
 #[tokio::test]

@@ -116,25 +116,6 @@ impl Db {
         .await
     }
 
-    pub async fn update_assistant_config(&self, name: &str, config_json: &str) -> Result<()> {
-        validate_config_json(config_json)?;
-        let name = name.to_string();
-        let config_json = config_json.to_string();
-        self.write(move |conn| {
-            let changed = conn
-                .execute(
-                    "UPDATE assistants SET config_json = ?2 WHERE name = ?1",
-                    params![name, config_json],
-                )
-                .context("updating assistant config")?;
-            if changed == 0 {
-                anyhow::bail!("assistant `{name}` does not exist");
-            }
-            Ok(())
-        })
-        .await
-    }
-
     /// Update only the identity-file digests when every authority-bearing row
     /// field still matches the snapshot used to read those files.
     pub async fn update_assistant_identity_hashes_cas(

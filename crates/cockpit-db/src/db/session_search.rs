@@ -2,7 +2,7 @@
 //! `session_read`, prompt `search-old-sessions.md`).
 //!
 //! Backed by the `session_fts` FTS5 virtual table (migration 0013). The
-//! engine is BM25 ranking with a `last_active_at` recency tiebreaker; no
+//! engine is BM25 ranking with a `last_active_at_unix_ms` recency tiebreaker; no
 //! embeddings in v1. The candidate-pool seam ([`search_candidates`]
 //! returns more rows than the caller's display budget) is where a future
 //! embedding ranker would re-rank without changing either tool's schema.
@@ -34,9 +34,9 @@ pub struct SearchHit {
     pub session_id: Uuid,
     pub short_id: Option<String>,
     pub title: Option<String>,
-    /// `last_active_at`, epoch seconds — the human-date source + recency
+    /// `last_active_at_unix_ms` — the human-date source + recency
     /// tiebreaker.
-    pub last_active_at: i64,
+    pub last_active_at_unix_ms: i64,
     /// Best snippet for this thread (matched terms highlighted).
     pub snippet: String,
     /// BM25 relevance (lower = more relevant, FTS5 convention). Kept on
@@ -91,7 +91,7 @@ impl Db {
 
     /// Rank FTS5 candidates for `query`, one row per matching thread
     /// (the best-ranking snippet per session). Ordered by BM25 relevance
-    /// then `last_active_at` recency. This is the candidate pool: callers
+    /// then `last_active_at_unix_ms` recency. This is the candidate pool: callers
     /// pass a `pool` larger than their display budget so a later ranking
     /// pass (today identity; a future embedding re-ranker tomorrow) has
     /// room to reorder.
@@ -100,7 +100,7 @@ impl Db {
     ///   * `project_id = Some(p)` confines to that project; `None` is
     ///     global recall across every project.
     ///   * `exclude_session` drops the current live thread.
-    ///   * archived threads (`archived_at IS NOT NULL`) are always
+    ///   * archived threads (`archived_at_unix_ms IS NOT NULL`) are always
     ///     excluded — search never surfaces a soft-deleted thread.
     ///   * `since` (epoch seconds) keeps only threads active at/after it.
     pub async fn search_candidates(
@@ -331,7 +331,7 @@ fn search_candidates_inner(
             "SELECT f.session_id AS session_id,
                     s.short_id    AS short_id,
                     s.title       AS title,
-                    s.last_active_at AS last_active_at,
+                    s.last_active_at_unix_ms AS last_active_at_unix_ms,
                     CASE f.row_kind
                       WHEN 'title' THEN s.title
                       WHEN 'compaction' THEN COALESCE(
@@ -351,12 +351,12 @@ fn search_candidates_inner(
                  ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
                 AND h.session_id = e.session_id
               WHERE session_fts MATCH ?1
-                AND s.archived_at IS NULL
+                AND s.archived_at_unix_ms IS NULL
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
-                AND (?4 IS NULL OR s.last_active_at >= ?4)
+                AND (?4 IS NULL OR s.last_active_at_unix_ms >= ?4)
                 AND (?5 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
-              ORDER BY rank ASC, s.last_active_at DESC",
+              ORDER BY rank ASC, s.last_active_at_unix_ms DESC",
         )
         .context("preparing search_candidates")?;
 
@@ -376,7 +376,7 @@ fn search_candidates_inner(
                     sid,
                     row.get::<_, Option<String>>("short_id")?,
                     row.get::<_, Option<String>>("title")?,
-                    row.get::<_, i64>("last_active_at")?,
+                    row.get::<_, i64>("last_active_at_unix_ms")?,
                     row.get::<_, Option<String>>("body")?,
                     row.get::<_, f64>("rank")?,
                 ))
@@ -391,7 +391,7 @@ fn search_candidates_inner(
     let mut by_session: std::collections::HashMap<Uuid, SearchHit> =
         std::collections::HashMap::new();
     for r in rows {
-        let (sid, short_id, title, last_active_at, body, bm25) =
+        let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
             r.context("decoding search hit")?;
         let session_id = Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
         if by_session.contains_key(&session_id) {
@@ -407,7 +407,7 @@ fn search_candidates_inner(
                 session_id,
                 short_id,
                 title,
-                last_active_at,
+                last_active_at_unix_ms,
                 snippet: canonical_snippet(&body, &terms),
                 bm25,
             },
@@ -444,7 +444,7 @@ fn search_candidates_in_sessions_inner(
                 "SELECT f.session_id AS session_id,
                         s.short_id AS short_id,
                         s.title AS title,
-                        s.last_active_at AS last_active_at,
+                        s.last_active_at_unix_ms AS last_active_at_unix_ms,
                         CASE f.row_kind
                           WHEN 'title' THEN s.title
                           WHEN 'compaction' THEN COALESCE(
@@ -482,7 +482,7 @@ fn search_candidates_in_sessions_inner(
                         sid,
                         row.get::<_, Option<String>>("short_id")?,
                         row.get::<_, Option<String>>("title")?,
-                        row.get::<_, i64>("last_active_at")?,
+                        row.get::<_, i64>("last_active_at_unix_ms")?,
                         row.get::<_, Option<String>>("body")?,
                         row.get::<_, f64>("rank")?,
                     ))
@@ -490,7 +490,7 @@ fn search_candidates_in_sessions_inner(
             )
             .context("querying lineage search")?;
         for row in rows {
-            let (sid, short_id, title, last_active_at, body, bm25) =
+            let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
                 row.context("decoding lineage search hit")?;
             let hit_session_id =
                 Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
@@ -504,7 +504,7 @@ fn search_candidates_in_sessions_inner(
                 session_id: hit_session_id,
                 short_id,
                 title,
-                last_active_at,
+                last_active_at_unix_ms,
                 snippet: canonical_snippet(&body, &terms),
                 bm25,
             });
@@ -790,7 +790,7 @@ fn literal_fts_match_query(query: &str) -> Option<String> {
 /// the raw FTS5 BM25 relevance (`hit.bm25`, lower = better), so this is
 /// the SQL order made explicit; a re-ranker swaps the key for a blended
 /// semantic score without touching either tool's schema or the DB query
-/// surface. The sort is stable, so the SQL `last_active_at` recency
+/// surface. The sort is stable, so the SQL `last_active_at_unix_ms` recency
 /// tiebreaker survives ties.
 fn rank_candidates(mut candidates: Vec<SearchHit>) -> Vec<SearchHit> {
     candidates.sort_by(|a, b| {
@@ -1221,7 +1221,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
-            .last_active_at;
+            .last_active_at_unix_ms;
         // since in the future → filtered out.
         let later = db
             .search_candidates("banana", Some("p"), None, Some(active + 10_000), 10)

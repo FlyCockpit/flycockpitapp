@@ -420,7 +420,8 @@ pub(super) async fn delete_session(
         return Ok(cached);
     }
     let session = require_session(ctx, session_id).await?;
-    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at.is_none() {
+    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at_unix_ms.is_none()
+    {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: format!("session {session_id} is active; end it before deleting"),

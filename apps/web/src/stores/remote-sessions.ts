@@ -715,7 +715,7 @@ export function toWebSessionSummary(session: WireSessionSummary): WebSessionSumm
     forkCount: numberField(raw, "fork_count") ?? 0,
     turnCount: session.turns,
     attention: null,
-    updatedAt: session.last_active_at,
+    updatedAt: session.last_active_at_unix_ms,
     createdBy: createdByPrincipal ? { userId: createdByPrincipal, origin: "daemon" } : null,
     agent: session.active_agent,
     model: stringField(raw, "model"),

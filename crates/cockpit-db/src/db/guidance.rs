@@ -16,6 +16,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -29,6 +30,13 @@ fn validate_guidance_hash(hash: &str) -> Result<()> {
         anyhow::bail!("guidance content hash must be 64 lowercase hexadecimal characters");
     }
     Ok(())
+}
+
+fn guidance_hash(contents: &str) -> String {
+    Sha256::digest(contents.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The per-session guidance baseline: the `(path, hash)` of the guidance
@@ -86,13 +94,34 @@ impl Db {
             None => (None, None),
         };
         self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions
+            let tx = conn
+                .transaction()
+                .context("starting guidance baseline transaction")?;
+            if let Some(ref content_hash) = hash {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM guidance_contents WHERE hash = ?1)",
+                        [content_hash],
+                        |row| row.get(0),
+                    )
+                    .context("checking guidance baseline contents")?;
+                if !exists {
+                    anyhow::bail!("guidance baseline content is not stored");
+                }
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE sessions
                  SET guidance_baseline_path = ?1, guidance_baseline_hash = ?2
                  WHERE session_id = ?3",
-                params![path, hash, session_id.to_string()],
-            )
-            .context("setting guidance baseline")?;
+                    params![path, hash, session_id.to_string()],
+                )
+                .context("setting guidance baseline")?;
+            if changed != 1 {
+                anyhow::bail!("guidance baseline session does not exist");
+            }
+            tx.commit()
+                .context("committing guidance baseline transaction")?;
             Ok(())
         })
         .await
@@ -106,6 +135,10 @@ impl Db {
         validate_guidance_hash(hash)?;
         if contents.len() > 8 * 1024 * 1024 {
             anyhow::bail!("guidance contents exceed the 8 MiB durable limit");
+        }
+        let computed_hash = guidance_hash(contents);
+        if computed_hash != hash {
+            anyhow::bail!("guidance content hash does not match the exact content bytes");
         }
         let now_unix_ms = Utc::now().timestamp_millis();
         let hash = hash.to_owned();
@@ -155,8 +188,14 @@ mod tests {
     async fn baseline_round_trips_and_defaults_null() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
-        let first_hash = "de".repeat(32);
-        let second_hash = "ca".repeat(32);
+        let first_hash = guidance_hash("first baseline");
+        let second_hash = guidance_hash("second baseline");
+        db.put_guidance_contents(&first_hash, "first baseline")
+            .await
+            .unwrap();
+        db.put_guidance_contents(&second_hash, "second baseline")
+            .await
+            .unwrap();
         // Fresh session: no baseline yet.
         assert_eq!(db.guidance_baseline(s.session_id).await.unwrap(), None);
         db.set_guidance_baseline(s.session_id, Some(&baseline("/x/AGENTS.md", &first_hash)))
@@ -180,18 +219,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn baseline_requires_stored_contents_and_existing_session() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let missing_hash = guidance_hash("not stored");
+        let missing_contents = db
+            .set_guidance_baseline(
+                session.session_id,
+                Some(&baseline("/x/AGENTS.md", &missing_hash)),
+            )
+            .await
+            .unwrap_err();
+        assert!(missing_contents.to_string().contains("not stored"));
+
+        let stored_hash = guidance_hash("stored");
+        db.put_guidance_contents(&stored_hash, "stored")
+            .await
+            .unwrap();
+        let missing_session = db
+            .set_guidance_baseline(
+                Uuid::now_v7(),
+                Some(&baseline("/x/AGENTS.md", &stored_hash)),
+            )
+            .await
+            .unwrap_err();
+        assert!(missing_session.to_string().contains("does not exist"));
+    }
+
+    #[tokio::test]
     async fn guidance_contents_insert_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
-        let first_hash = "11".repeat(32);
-        let second_hash = "22".repeat(32);
+        let first_hash = guidance_hash("first body");
+        let second_hash = guidance_hash("second body");
         db.put_guidance_contents(&first_hash, "first body")
             .await
             .unwrap();
         // Re-inserting the same hash with different contents must NOT
         // overwrite (content-addressed: the hash IS the identity).
-        db.put_guidance_contents(&first_hash, "tampered body")
+        let mismatch = db
+            .put_guidance_contents(&first_hash, "tampered body")
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("does not match"));
         assert_eq!(
             db.guidance_contents(&first_hash).await.unwrap().as_deref(),
             Some("first body")

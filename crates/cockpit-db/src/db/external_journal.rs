@@ -3719,7 +3719,7 @@ mod tests {
         for id in [old_root.session_id, old_child.session_id] {
             db.write(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET ended_at = 1, last_active_at = 1
+                    "UPDATE sessions SET ended_at_unix_ms = 1, last_active_at_unix_ms = 1
                       WHERE session_id = ?1",
                     params![id.to_string()],
                 )?;

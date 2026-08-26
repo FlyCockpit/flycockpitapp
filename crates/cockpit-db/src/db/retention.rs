@@ -280,7 +280,8 @@ fn prune_session_payloads_conn(conn: &Connection, cutoff_secs: i64) -> Result<u6
         .unchecked_transaction()
         .context("begin prune_session_payloads tx")?;
     let cutoff_ms = cutoff_secs * 1000;
-    let closed = "session_id IN (SELECT session_id FROM sessions WHERE ended_at IS NOT NULL)";
+    let closed =
+        "session_id IN (SELECT session_id FROM sessions WHERE ended_at_unix_ms IS NOT NULL)";
     let mut total = 0_u64;
     for (sql, cutoff) in [
         (
@@ -309,28 +310,29 @@ fn prune_session_payloads_conn(conn: &Connection, cutoff_secs: i64) -> Result<u6
 }
 
 fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
+    let cutoff_unix_ms = cutoff_secs.saturating_mul(1000);
     let mut stmt = conn
         .prepare(
             "SELECT root.session_id
                FROM sessions root
               WHERE root.parent_session_id IS NULL
-                AND root.ended_at IS NOT NULL
+                AND root.ended_at_unix_ms IS NOT NULL
                 AND root.ephemeral = 0
-                AND root.last_active_at < ?1
+                AND root.last_active_at_unix_ms < ?1
                 AND NOT EXISTS (
-                    WITH RECURSIVE subtree(session_id, ended_at) AS (
-                        SELECT session_id, ended_at FROM sessions WHERE session_id = root.session_id
+                    WITH RECURSIVE subtree(session_id, ended_at_unix_ms) AS (
+                        SELECT session_id, ended_at_unix_ms FROM sessions WHERE session_id = root.session_id
                         UNION ALL
-                        SELECT child.session_id, child.ended_at
+                        SELECT child.session_id, child.ended_at_unix_ms
                           FROM sessions child
                           JOIN subtree parent ON child.parent_session_id = parent.session_id
                     )
-                    SELECT 1 FROM subtree WHERE ended_at IS NULL
+                    SELECT 1 FROM subtree WHERE ended_at_unix_ms IS NULL
                 )",
         )
         .context("preparing old session roots")?;
     let rows = stmt
-        .query_map(params![cutoff_secs], |row| {
+        .query_map(params![cutoff_unix_ms], |row| {
             let raw: String = row.get(0)?;
             parse_uuid_sql(raw)
         })
@@ -365,7 +367,7 @@ mod tests {
     async fn close_session(db: &Db, id: Uuid, ts: i64) {
         db.write(move |conn| {
             conn.execute(
-                "UPDATE sessions SET ended_at = ?2, last_active_at = ?2 WHERE session_id = ?1",
+                "UPDATE sessions SET ended_at_unix_ms = ?2, last_active_at_unix_ms = ?2 WHERE session_id = ?1",
                 params![id.to_string(), ts],
             )?;
             Ok(())

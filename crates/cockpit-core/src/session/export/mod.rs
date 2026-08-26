@@ -1680,24 +1680,24 @@ fn build_manifest_conn(
                 "fork_point_turn_id": session.fork_point_turn_id,
                 "active_model": active_model,
                 "active_agent": session.active_agent,
-                "started_at": session.started_at,
-                "ended_at": session.ended_at,
+                "started_at_unix_ms": session.started_at_unix_ms,
+                "ended_at_unix_ms": session.ended_at_unix_ms,
                 "title": session.title,
             }))
         })
         .collect::<Result<Vec<Value>>>()?;
 
     let mut manifest = json!({
-        "schema": "cockpit-session-export/3",
+        "schema": "cockpit-session-export/4",
         // The version of the cockpit binary producing THIS export — not
         // persisted per session, so a CLI export of an old session reflects
         // the exporting binary, not the one that created the session.
         "cockpit_version": env!("CARGO_PKG_VERSION"),
         "exporter_cockpit_version": env!("CARGO_PKG_VERSION"),
-        // The target/root session date, derived from started_at (epoch
-        // seconds), as both ISO-8601 and the raw epoch for convenience.
-        "session_date": iso8601_from_epoch(target.started_at),
-        "session_started_at": target.started_at,
+        // The target/root session date, derived from its signed Unix-millisecond
+        // timestamp, as both ISO-8601 and the raw durable value.
+        "session_date": iso8601_from_unix_ms(target.started_at_unix_ms),
+        "session_started_at_unix_ms": target.started_at_unix_ms,
         "target": {
             "session_id": target.session_id.to_string(),
             "short_id": target.short_id,
@@ -1707,8 +1707,8 @@ fn build_manifest_conn(
             "config_active_model": config_active_model,
             "active_model_diverged": active_model_diverged,
             "title": target.title,
-            "started_at": target.started_at,
-            "ended_at": target.ended_at,
+            "started_at_unix_ms": target.started_at_unix_ms,
+            "ended_at_unix_ms": target.ended_at_unix_ms,
         },
         "session_count": bundle.len(),
         "excluded_generated_artifacts": !options.include_generated_artifacts,
@@ -2276,11 +2276,11 @@ fn write_prescrubbed_text_member<W: Write + Seek>(
     Ok(())
 }
 
-/// Format an epoch-seconds timestamp as an ISO-8601 / RFC 3339 UTC string.
+/// Format a signed Unix-millisecond timestamp as ISO-8601 / RFC 3339 UTC.
 /// Returns `None` (serialized as JSON `null`) for an out-of-range value
 /// rather than failing the export.
-fn iso8601_from_epoch(epoch_secs: i64) -> Option<String> {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(epoch_secs, 0).map(|dt| dt.to_rfc3339())
+fn iso8601_from_unix_ms(unix_ms: i64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(unix_ms).map(|dt| dt.to_rfc3339())
 }
 
 /// A short, stable, filename-safe label for a config layer, used as the

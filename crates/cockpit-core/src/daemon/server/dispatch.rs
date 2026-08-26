@@ -6221,7 +6221,7 @@ async fn handle_serialized_request_impl(
                 .db
                 .read(move |conn| {
                     let mut statement = conn.prepare(
-                        "SELECT session_id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
+                        "SELECT session_id FROM sessions WHERE ended_at_unix_ms IS NOT NULL AND ended_at_unix_ms < ?1",
                     )?;
                     statement
                         .query_map([before], |row| row.get::<_, String>(0))?

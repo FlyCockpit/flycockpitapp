@@ -160,9 +160,9 @@ pub fn classify(summary: &SessionSummary, live: Option<(bool, bool)>) -> Tier {
 /// last-viewed marker. A never-viewed session with any agent activity is
 /// unread; a session with no agent activity is never unread.
 fn is_unread(summary: &SessionSummary) -> bool {
-    match summary.latest_activity_at {
+    match summary.latest_activity_at_unix_ms {
         None => false,
-        Some(activity) => match summary.last_viewed_at {
+        Some(activity) => match summary.last_viewed_at_unix_ms {
             None => true,
             Some(viewed) => activity > viewed,
         },
@@ -184,7 +184,7 @@ pub fn tier_sort(
         .collect();
     classified.sort_by(|a, b| {
         a.1.cmp(&b.1)
-            .then(b.0.last_active_at.cmp(&a.0.last_active_at))
+            .then(b.0.last_active_at_unix_ms.cmp(&a.0.last_active_at_unix_ms))
     });
     classified
 }
@@ -610,7 +610,7 @@ impl SessionsPane {
                 let selected_id = self.selected_id();
                 self.error = None;
                 if !self.show_archived {
-                    sessions.retain(|s| s.archived_at.is_none());
+                    sessions.retain(|s| s.archived_at_unix_ms.is_none());
                 }
                 let ids: Vec<_> = sessions.iter().map(|s| s.session_id).collect();
                 let cards = tier_sort(sessions.into_iter().map(|s| (s, None)).collect());
@@ -1110,7 +1110,7 @@ impl SessionsPane {
             return None;
         }
         let s = self.selected().cloned()?;
-        s.archived_at?;
+        s.archived_at_unix_ms?;
         self.error = None;
         Some(SessionsOutcome::Mutate(self.begin_mutation(
             s.session_id,
@@ -1940,7 +1940,7 @@ pub fn card_lines(
     // Row 2: relative + absolute most-recent-event time + (optional) project
     // label.
     let mut meta: Vec<Span<'static>> = vec![Span::styled(
-        fmt_time_with_relative(s.last_active_at),
+        fmt_time_with_relative(s.last_active_at_unix_ms),
         muted,
     )];
     if show_project {
@@ -1950,7 +1950,7 @@ pub fn card_lines(
             muted,
         ));
     }
-    if s.archived_at.is_some() {
+    if s.archived_at_unix_ms.is_some() {
         meta.push(Span::raw("  "));
         meta.push(Span::styled(
             "archived".to_string(),
@@ -2222,19 +2222,19 @@ mod tests {
             short_id: Some("abc123".into()),
             project_root: "/proj/alpha".into(),
             project_id: "pid".into(),
-            started_at: 0,
-            last_active_at: last_active,
+            started_at_unix_ms: 0,
+            last_active_at_unix_ms: last_active,
             turns: 0,
             active_agent: "builder".into(),
             title: None,
             parent_session_id: None,
             fork_count: 0,
             descendant_count: 0,
-            last_viewed_at: None,
-            latest_activity_at: None,
+            last_viewed_at_unix_ms: None,
+            latest_activity_at_unix_ms: None,
             open_interrupts: 0,
             activity_state: None,
-            archived_at: None,
+            archived_at_unix_ms: None,
             created_by_principal: None,
             shared_with_collaborators: false,
             pin_count: 0,
@@ -2245,7 +2245,7 @@ mod tests {
     fn classify_respects_tier_precedence() {
         let mut s = summary(Uuid::new_v4(), 100);
         // Live jobs win over everything.
-        s.latest_activity_at = Some(200);
+        s.latest_activity_at_unix_ms = Some(200);
         s.open_interrupts = 3;
         assert_eq!(classify(&s, Some((true, true))), Tier::ActiveSchedules);
         // Processing (no jobs) is tier 2.
@@ -2261,13 +2261,13 @@ mod tests {
         // No agent activity → never unread.
         assert!(!is_unread(&s));
         // Activity but never viewed → unread.
-        s.latest_activity_at = Some(50);
+        s.latest_activity_at_unix_ms = Some(50);
         assert!(is_unread(&s));
         // Viewed after the activity → read.
-        s.last_viewed_at = Some(60);
+        s.last_viewed_at_unix_ms = Some(60);
         assert!(!is_unread(&s));
         // New activity after the view → unread again.
-        s.latest_activity_at = Some(70);
+        s.latest_activity_at_unix_ms = Some(70);
         assert!(is_unread(&s));
     }
 
@@ -2275,8 +2275,8 @@ mod tests {
     fn read_with_pending_question_is_tier_4() {
         let mut s = summary(Uuid::new_v4(), 100);
         // Read (activity <= viewed), but an open interrupt.
-        s.latest_activity_at = Some(50);
-        s.last_viewed_at = Some(60);
+        s.latest_activity_at_unix_ms = Some(50);
+        s.last_viewed_at_unix_ms = Some(60);
         s.open_interrupts = 1;
         assert_eq!(classify(&s, None), Tier::PendingQuestion);
         // Read, no question → idle.
@@ -2289,8 +2289,8 @@ mod tests {
         // `None` live status (daemon unreachable) → the session still
         // classifies into a DB tier, never panics.
         let mut s = summary(Uuid::new_v4(), 100);
-        s.latest_activity_at = Some(10);
-        s.last_viewed_at = Some(20);
+        s.latest_activity_at_unix_ms = Some(10);
+        s.last_viewed_at_unix_ms = Some(20);
         assert_eq!(classify(&s, None), Tier::Idle);
     }
 
@@ -2299,7 +2299,7 @@ mod tests {
         let idle_old = summary(Uuid::new_v4(), 10);
         let idle_new = summary(Uuid::new_v4(), 90);
         let mut unread = summary(Uuid::new_v4(), 50);
-        unread.latest_activity_at = Some(55); // never viewed → unread
+        unread.latest_activity_at_unix_ms = Some(55); // never viewed → unread
 
         let sorted = tier_sort(vec![
             (idle_old.clone(), None),
@@ -3346,7 +3346,7 @@ mod tests {
         assert_eq!(pane.loading, Some("Loading sessions..."));
 
         let mut archived = summary(Uuid::new_v4(), 200);
-        archived.archived_at = Some(300);
+        archived.archived_at_unix_ms = Some(300);
         let mut pane = test_pane(vec![(archived, Tier::Idle)]);
         pane.show_archived = true;
         assert!(matches!(

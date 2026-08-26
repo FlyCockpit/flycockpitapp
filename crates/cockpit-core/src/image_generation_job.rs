@@ -2464,7 +2464,7 @@ impl ImageGenerationOwnerContextAuthority {
         let session = cockpit_db::Db::get_session_conn(conn, self.session_id)?
             .context("image generation owner session is unavailable")?;
         ensure!(
-            session.ended_at.is_none()
+            session.ended_at_unix_ms.is_none()
                 && session.project_id == self.project_id
                 && crate::intel::hex_lower(&Sha256::digest(session.project_root.as_bytes()))
                     == self.project_identity_digest,
@@ -2483,7 +2483,7 @@ impl ImageGenerationOwnerContextAuthority {
         ensure!(config_generation > 0, unavailable());
         let session =
             cockpit_db::Db::get_session_conn(conn, session_id)?.ok_or_else(unavailable)?;
-        ensure!(session.ended_at.is_none(), unavailable());
+        ensure!(session.ended_at_unix_ms.is_none(), unavailable());
         ensure!(
             principal.can_agent_write_project(&session.project_root),
             unavailable()

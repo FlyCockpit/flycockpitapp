@@ -879,7 +879,7 @@ mod tests {
     async fn seed_session(db: &Db) {
         db.write(|conn| {
             conn.execute(
-                "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) \
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) \
                  VALUES(?1,'p','/redacted',1,1)",
                 [session_id()],
             )?;

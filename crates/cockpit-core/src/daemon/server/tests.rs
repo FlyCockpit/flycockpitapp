@@ -732,10 +732,11 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     let ctx = test_ctx();
     // Project-note RPCs run through the uniform `project_root` FCOR
     // authorization, which canonicalizes the root and requires it to exist on
-    // disk. Use a real temp dir and key the direct db calls by the same string
-    // so the parity assertions hold.
+    // disk. Use a real temp dir and key direct DB assertions by the exact
+    // daemon-derived opaque identity so the parity assertions hold.
     let project = tempfile::tempdir().unwrap();
     let root = project.path().to_str().unwrap().to_string();
+    let identity = canonical_project_note_identity(&root).unwrap().0;
     let mut state = owner_state();
     let response = handle_request(
         Request::CreateProjectNote {
@@ -763,7 +764,7 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     .await
     .unwrap();
     assert_eq!(
-        ctx.db.list_project_notes(&root).await.unwrap()[0].content,
+        ctx.db.list_project_notes(&identity).await.unwrap()[0].content,
         "body"
     );
     let response = handle_request(
@@ -790,7 +791,7 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     let Response::ProjectNotes { notes } = response else {
         panic!("expected project notes")
     };
-    let direct = ctx.db.list_project_notes(&root).await.unwrap();
+    let direct = ctx.db.list_project_notes(&identity).await.unwrap();
     assert_eq!(notes.len(), direct.len());
     assert_eq!(notes[0].id, direct[0].id);
     assert_eq!(notes[0].name, direct[0].name);
@@ -805,7 +806,54 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     .await
     .unwrap();
     assert!(matches!(response, Response::Ack));
-    assert!(ctx.db.list_project_notes(&root).await.unwrap().is_empty());
+    assert!(
+        ctx.db
+            .list_project_notes(&identity)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn project_note_rpc_uses_one_daemon_canonical_identity_for_symlink_aliases() {
+    let ctx = test_ctx();
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("project");
+    let alias = parent.path().join("project-alias");
+    std::fs::create_dir(&project).unwrap();
+    std::os::unix::fs::symlink(&project, &alias).unwrap();
+    let canonical = canonical_project_note_identity(project.to_str().unwrap())
+        .unwrap()
+        .0;
+    let mut state = owner_state();
+
+    handle_request(
+        Request::CreateProjectNote {
+            project_root: alias.to_string_lossy().into_owned(),
+            name: "shared".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    let response = handle_request(
+        Request::ListProjectNotes {
+            project_root: project.to_string_lossy().into_owned(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::ProjectNotes { notes } = response else {
+        panic!("project notes");
+    };
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].project_root, canonical);
 }
 
 #[tokio::test]
@@ -879,7 +927,8 @@ async fn project_note_create_returns_resolved_name() {
     let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();
     let root = project.path().to_str().unwrap().to_string();
-    ctx.db.create_project_note(&root, "todo").await.unwrap();
+    let identity = canonical_project_note_identity(&root).unwrap().0;
+    ctx.db.create_project_note(&identity, "todo").await.unwrap();
     let mut state = owner_state();
     let response = handle_request(
         Request::CreateProjectNote {
@@ -902,12 +951,13 @@ async fn project_note_list_preserves_sidebar_order() {
     let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();
     let root = project.path().to_str().unwrap().to_string();
+    let identity = canonical_project_note_identity(&root).unwrap().0;
     for name in ["first", "second", "third"] {
-        ctx.db.create_project_note(&root, name).await.unwrap();
+        ctx.db.create_project_note(&identity, name).await.unwrap();
     }
     let expected: Vec<_> = ctx
         .db
-        .list_project_notes(&root)
+        .list_project_notes(&identity)
         .await
         .unwrap()
         .into_iter()

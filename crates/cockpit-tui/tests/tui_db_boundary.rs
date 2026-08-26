@@ -1235,6 +1235,25 @@ fn tui_db_surface_behavior_matrix() {
 }
 
 #[test]
+fn notes_project_identity_resolution_is_daemon_owned() {
+    let notes = production_source(&read("crates/cockpit-tui/src/tui/notes_pane.rs"));
+    for forbidden in [
+        "find_worktree_root",
+        "std::fs::canonicalize",
+        "dunce::canonicalize",
+    ] {
+        assert!(
+            !notes.contains(forbidden),
+            "notes TUI resolves durable project identity locally: {forbidden}"
+        );
+    }
+    let dispatch = read("crates/cockpit-core/src/daemon/server/dispatch.rs");
+    assert!(dispatch.contains("canonical_project_note_identity"));
+    assert!(dispatch.contains("find_worktree_root(&canonical)"));
+    assert!(dispatch.contains("flycockpit-project-notes-v1\\0"));
+}
+
+#[test]
 fn tui_agent_authority_is_daemon_owned() {
     let agents = production_source(&read("crates/cockpit-tui/src/tui/settings/agents_page.rs"));
     let goals = production_source(&read("crates/cockpit-tui/src/tui/goal_settings_pane.rs"));

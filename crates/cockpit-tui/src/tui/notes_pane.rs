@@ -69,7 +69,8 @@ pub enum Mode {
 /// `App` alongside the other panes.
 pub struct NotesPane {
     instance_id: u64,
-    /// Project-root scoping key (git/worktree root, or launch cwd).
+    /// Untrusted launch locator. The daemon resolves this to the canonical
+    /// worktree identity used for every durable note operation.
     project_root: String,
     /// Loaded notes for this project, in sidebar order.
     notes: Vec<ProjectNote>,
@@ -352,15 +353,12 @@ impl NotesPane {
         }
     }
 
-    /// Open the dialog for `cwd`, resolving the project root (git/worktree
-    /// root, falling back to `cwd`). Loading happens through
+    /// Open the dialog for `cwd`. The TUI retains only this launch locator;
+    /// canonical project/worktree identity is daemon-owned. Loading happens through
     /// [`Self::initial_load_action`] so the TUI does not block the async
     /// runtime while opening the pane.
     pub fn open(cwd: &std::path::Path, vim_enabled: bool) -> Self {
-        let project_root = cockpit_core::git::find_worktree_root(cwd)
-            .unwrap_or_else(|| cwd.to_path_buf())
-            .to_string_lossy()
-            .into_owned();
+        let project_root = cwd.to_string_lossy().into_owned();
         Self {
             instance_id: next_notes_pane_instance(),
             project_root,

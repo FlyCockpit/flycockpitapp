@@ -5497,28 +5497,33 @@ async fn handle_serialized_request_impl(
             Ok(Response::SealedActionRetired { action_id, retired })
         }
 
-        Request::ListProjectNotes { project_root } => ctx
-            .db
-            .list_project_notes(&project_root)
-            .await
-            .map(|notes| Response::ProjectNotes {
-                notes: notes.into_iter().map(project_note_to_proto).collect(),
-            })
-            .map_err(internal),
-        Request::CreateProjectNote { project_root, name } => ctx
-            .db
-            .create_project_note(&project_root, &name)
-            .await
-            .map(|note| Response::ProjectNoteCreated {
-                note: project_note_to_proto(note),
-            })
-            .map_err(|error| bad_request(error.to_string())),
+        Request::ListProjectNotes { project_root } => {
+            let identity = canonical_project_note_identity(&project_root)?;
+            ctx.db
+                .list_project_notes(&identity.0)
+                .await
+                .map(|notes| Response::ProjectNotes {
+                    notes: notes.into_iter().map(project_note_to_proto).collect(),
+                })
+                .map_err(internal)
+        }
+        Request::CreateProjectNote { project_root, name } => {
+            let identity = canonical_project_note_identity(&project_root)?;
+            ctx.db
+                .create_project_note(&identity.0, &name)
+                .await
+                .map(|note| Response::ProjectNoteCreated {
+                    note: project_note_to_proto(note),
+                })
+                .map_err(|error| bad_request(error.to_string()))
+        }
         Request::SetProjectNoteContent {
             project_root,
             id,
             content,
         } => {
-            ensure_project_note_member(&ctx.db, &project_root, id).await?;
+            let identity = canonical_project_note_identity(&project_root)?;
+            ensure_project_note_member(&ctx.db, &identity.0, id).await?;
             ctx.db
                 .set_project_note_content(id, &content)
                 .await
@@ -5530,7 +5535,8 @@ async fn handle_serialized_request_impl(
             id,
             name,
         } => {
-            ensure_project_note_member(&ctx.db, &project_root, id).await?;
+            let identity = canonical_project_note_identity(&project_root)?;
+            ensure_project_note_member(&ctx.db, &identity.0, id).await?;
             ctx.db
                 .rename_project_note(id, &name)
                 .await
@@ -5538,7 +5544,8 @@ async fn handle_serialized_request_impl(
                 .map_err(|error| bad_request(error.to_string()))
         }
         Request::DeleteProjectNote { project_root, id } => {
-            ensure_project_note_member(&ctx.db, &project_root, id).await?;
+            let identity = canonical_project_note_identity(&project_root)?;
+            ensure_project_note_member(&ctx.db, &identity.0, id).await?;
             ctx.db.delete_project_note(id).await.map_err(internal)?;
             Ok(Response::Ack)
         }
@@ -22352,6 +22359,33 @@ async fn ensure_project_note_member(
             "project note `{id}` does not belong to project root `{project_root}`"
         )))
     }
+}
+
+/// Daemon-owned durable identity for project notes. Request paths are only
+/// locators: canonicalization and Git worktree grouping happen here, after
+/// request authorization, so spelling/symlink aliases cannot fork storage.
+struct CanonicalProjectNoteIdentity(String);
+
+fn canonical_project_note_identity(
+    requested_root: &str,
+) -> std::result::Result<CanonicalProjectNoteIdentity, ErrorPayload> {
+    let canonical = crate::daemon::fs_api::canonical_project_root(requested_root)?;
+    let worktree = crate::git::find_worktree_root(&canonical).unwrap_or(canonical);
+    let canonical_worktree = crate::daemon::fs_api::canonical_project_root(
+        worktree
+            .to_str()
+            .ok_or_else(|| bad_request("project identity is not valid UTF-8".to_string()))?,
+    )?;
+    let canonical_bytes = canonical_worktree
+        .to_str()
+        .ok_or_else(|| bad_request("project identity is not valid UTF-8".to_string()))?
+        .as_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"flycockpit-project-notes-v1\0");
+    digest.update(canonical_bytes);
+    Ok(CanonicalProjectNoteIdentity(crate::intel::hex_lower(
+        &digest.finalize(),
+    )))
 }
 
 pub(super) fn stats_range_from_proto(range: proto::StatsRange) -> crate::db::stats::StatsRange {

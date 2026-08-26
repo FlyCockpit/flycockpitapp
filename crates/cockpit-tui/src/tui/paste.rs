@@ -1057,6 +1057,7 @@ impl PasteRegistry {
             .expect("external-editor image numbering exhausted");
         registry.next_text_number = snapshot.next_text_number;
         registry.next_image_number = snapshot.next_image_number.max(unknown_image_floor);
+        let mut retained_text_numbers = snapshot.text_numbers_by_nonce.clone();
         let mut pos = 0usize;
 
         while pos < editor_text.len() {
@@ -1089,12 +1090,11 @@ impl PasteRegistry {
                 let full = editor_text[content_start..close_start].to_string();
                 let at = buffer.len();
                 let tokens = count_text(&full);
-                let nonce = nonce.to_string();
-                let number = snapshot
-                    .text_numbers_by_nonce
-                    .get(&nonce)
-                    .copied()
-                    .unwrap_or_else(|| registry.next_text_number());
+                let original_nonce = nonce.to_string();
+                let (nonce, number) = match retained_text_numbers.remove(&original_nonce) {
+                    Some(number) => (original_nonce, number),
+                    None => (Self::text_nonce(&full), registry.next_text_number()),
+                };
                 let (_id, placeholder) = registry.register_text_with_number_and_nonce(
                     at,
                     full,
@@ -1727,6 +1727,38 @@ text"
                 .register_image(rebuilt.buffer.len(), vec![61]),
             "[Pasted image #61]"
         );
+    }
+
+    #[test]
+    fn editor_rebuild_consumes_known_text_nonce_only_once() {
+        let mut registry = PasteRegistry::new();
+        registry.next_text_number = 10;
+        let placeholder = registry.register_text(0, "known".into(), 1);
+        registry.next_text_number = 20;
+        let snapshot = registry.editor_snapshot();
+        let known = registry.expand_editor(&placeholder);
+        let unknown_nonce = "editor-supplied";
+        let editor = format!(
+            "{known} {known} <user_paste id=\"{unknown_nonce}\">unknown</user_paste id=\"{unknown_nonce}\">"
+        );
+
+        let rebuilt = PasteRegistry::rebuild_from_editor_snapshot(&editor, &snapshot, |_| 1);
+        let blocks = rebuilt.registry.blocks();
+        assert_eq!(
+            blocks.iter().map(|block| block.number).collect::<Vec<_>>(),
+            [10, 20, 21]
+        );
+        let nonces = blocks
+            .iter()
+            .map(|block| match &block.kind {
+                PasteKind::Text { nonce, .. } => nonce.as_str(),
+                _ => panic!("expected text block"),
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(nonces[0], nonces[1]);
+        assert_ne!(nonces[1], unknown_nonce);
+        assert_ne!(nonces[2], unknown_nonce);
+        assert_ne!(nonces[1], nonces[2]);
     }
 
     #[test]

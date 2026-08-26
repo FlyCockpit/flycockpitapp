@@ -77,14 +77,12 @@ async fn fetch_attached_skills(
                 generation,
                 source: SkillsPaneSource::Session,
                 skills,
-                bundle: Some(response),
             }
         }
         Err(error) => SkillsPaneFetchResult {
             generation,
             source: SkillsPaneSource::Session,
             skills: Err(error),
-            bundle: None,
         },
     }
 }

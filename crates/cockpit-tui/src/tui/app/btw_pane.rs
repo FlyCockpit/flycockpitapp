@@ -643,7 +643,7 @@ impl BtwPane {
                 }
                 match self.send_text(text) {
                     Ok(()) => {
-                        self.composer.clear();
+                        self.composer = Composer::new(self.composer.vim_enabled());
                         BtwFocusedKeyOutcome::Consumed
                     }
                     Err(error) => BtwFocusedKeyOutcome::Error(error),

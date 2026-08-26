@@ -57,8 +57,6 @@ pub struct SkillsPaneFetchResult {
     pub generation: u64,
     pub source: SkillsPaneSource,
     pub skills: Result<Vec<SkillSummary>, String>,
-    /// Full bundle when the fetch came from GetInventoryBundle (for inventory state).
-    pub bundle: Option<cockpit_proto::Response>,
 }
 
 impl SkillsPane {
@@ -510,7 +508,6 @@ mod tests {
             generation: 1,
             source: SkillsPaneSource::Session,
             skills: Ok(vec![summary("stale", "d", "/s")]),
-            bundle: None,
         });
 
         assert!(!applied);

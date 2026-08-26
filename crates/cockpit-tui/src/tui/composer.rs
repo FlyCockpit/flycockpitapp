@@ -801,19 +801,49 @@ impl Composer {
         self.vim_enabled
     }
 
-    /// Reset to empty + cursor at start. Used after submit and on `Esc`
-    /// while a slash command is being composed.
-    pub fn clear(&mut self) {
+    fn clear_unregistered(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
         self.debug_assert_semantic_cursor();
     }
 
-    /// Replace the entire buffer content, resetting cursor to end.
-    pub fn set(&mut self, text: impl Into<String>) {
+    fn set_unregistered(&mut self, text: impl Into<String>) {
         self.buffer = text.into();
         self.cursor = self.buffer.len();
         self.debug_assert_semantic_cursor();
+    }
+
+    pub(crate) fn replace_registered(
+        &mut self,
+        registry: &mut crate::tui::paste::PasteRegistry,
+        text: impl Into<String>,
+    ) {
+        registry.clear();
+        self.set_unregistered(text);
+    }
+
+    pub(crate) fn clear_registered(&mut self, registry: &mut crate::tui::paste::PasteRegistry) {
+        registry.clear();
+        self.clear_unregistered();
+    }
+
+    pub(crate) fn rebuild_registered(
+        &mut self,
+        registry: &mut crate::tui::paste::PasteRegistry,
+        rebuilt: crate::tui::paste::EditorPasteRebuild,
+    ) {
+        self.set_unregistered(rebuilt.buffer);
+        *registry = rebuilt.registry;
+    }
+
+    #[cfg(test)]
+    pub fn clear(&mut self) {
+        self.clear_unregistered();
+    }
+
+    #[cfg(test)]
+    pub fn set(&mut self, text: impl Into<String>) {
+        self.set_unregistered(text);
     }
 
     pub fn insert_char(&mut self, ch: char) {

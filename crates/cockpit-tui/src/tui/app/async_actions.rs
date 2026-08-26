@@ -1121,9 +1121,6 @@ impl App {
                     if !owns_result {
                         return;
                     }
-                    if let Some(bundle) = result.bundle.clone() {
-                        self.apply_inventory_bundle_response(bundle);
-                    }
                     if let Overlay::Skills(pane) = &mut self.overlay {
                         pane.apply_fetch_result(result);
                     }

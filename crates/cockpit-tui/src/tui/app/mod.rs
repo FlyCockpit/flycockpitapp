@@ -620,15 +620,14 @@ impl App {
     /// tied to byte ranges in the previous document. Whole-buffer callers
     /// must use this seam so placeholders can never outlive their registry.
     pub(super) fn replace_composer_buffer(&mut self, text: impl Into<String>) {
-        self.paste_registry.clear();
-        self.composer.set(text.into());
+        self.composer
+            .replace_registered(&mut self.paste_registry, text);
     }
 
     /// Clear the composer document and all byte-range paste authority as one
     /// app-level operation.
     pub(super) fn clear_composer_buffer(&mut self) {
-        self.paste_registry.clear();
-        self.composer.clear();
+        self.composer.clear_registered(&mut self.paste_registry);
     }
 
     /// Install a buffer reconstructed together with its authoritative paste
@@ -637,8 +636,8 @@ impl App {
         &mut self,
         rebuilt: crate::tui::paste::EditorPasteRebuild,
     ) {
-        self.paste_registry = rebuilt.registry;
-        self.composer.set(rebuilt.buffer);
+        self.composer
+            .rebuild_registered(&mut self.paste_registry, rebuilt);
     }
 
     pub(super) fn attached_daemon_endpoint(&self) -> Option<cockpit_client::ClientEndpoint> {

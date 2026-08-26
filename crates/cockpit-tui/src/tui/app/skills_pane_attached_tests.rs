@@ -190,6 +190,17 @@ async fn skills_pane_stale_result_dropped() {
     let stale_generation = skills_generation(&app);
     app.agent_runner = None;
     open_skills_pane_trusted(&mut app, &tmp);
+    app.inventory.begin_attach(
+        uuid::Uuid::new_v4(),
+        7,
+        uuid::Uuid::new_v4(),
+        "unrelated-agent".into(),
+        3,
+    );
+    let unrelated_ticket = app
+        .inventory
+        .start_refresh("unrelated-agent".into(), true)
+        .expect("unrelated inventory ticket");
 
     app.apply_async_action_result(AsyncActionResult {
         id: stale_id,
@@ -199,15 +210,6 @@ async fn skills_pane_stale_result_dropped() {
             generation: stale_generation,
             source: SkillsPaneSource::Session,
             skills: Ok(vec![summary("stale-session", "old result", "/session")]),
-            bundle: Some(Response::InventoryBundle {
-                selected_agent: "stale-agent".into(),
-                agents: Vec::new(),
-                models: Vec::new(),
-                skills: vec![summary("stale-global", "must remain inert", "/stale")],
-                session_generation: 99,
-                config_generation: 99,
-                inventory_generation: 99,
-            }),
         })),
     });
 
@@ -215,9 +217,5 @@ async fn skills_pane_stale_result_dropped() {
     // Detached reopen shows unavailable; stale attached generation is dropped.
     assert!(text.contains("inventory unavailable until attached") || text.contains("unavailable"));
     assert!(!text.contains("stale-session"));
-    assert!(
-        !app.skill_commands
-            .iter()
-            .any(|command| command.name == "stale-global")
-    );
+    assert_eq!(app.inventory.in_flight, Some(unrelated_ticket));
 }

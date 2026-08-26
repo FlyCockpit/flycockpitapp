@@ -30,6 +30,7 @@ use cockpit_proto::{self as proto, ErrorPayload, Request, Response};
 #[cfg(unix)]
 use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame};
 
+pub mod bulk_upload;
 pub mod image_upload;
 
 /// A cloneable, capability-bearing endpoint for opening fresh in-process

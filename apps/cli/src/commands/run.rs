@@ -543,7 +543,7 @@ pub(crate) async fn attach_send_pump(
     // Sole invocation identity: allocated once before first SendUserMessage.
     let client_submission_id = Uuid::new_v4();
     if submitted_message {
-        let use_bulk = cockpit_core::daemon::bulk_upload::user_message_needs_bulk(&prompt, None);
+        let use_bulk = cockpit_client::bulk_upload::user_message_needs_bulk(&prompt, None);
         if use_bulk && !options.image_data.is_empty() {
             return Err(RunUsageError(
                 "media/file submissions cannot carry text over the 64 KiB artifact threshold"
@@ -558,10 +558,9 @@ pub(crate) async fn attach_send_pump(
         // includes the run marker; init/learn omit options and create no
         // RunInvocationState.
         let send_result = if use_bulk {
-            let transfer =
-                cockpit_core::daemon::bulk_upload::stage_opaque_user_text(client, &prompt)
-                    .await
-                    .map_err(|error| RunUsageError(error.to_string()))?;
+            let transfer = cockpit_client::bulk_upload::stage_opaque_user_text(client, &prompt)
+                .await
+                .map_err(|error| RunUsageError(error.to_string()))?;
             client
                 .request(Request::SendUserMessageBulk {
                     expected_model_state_generation: None,

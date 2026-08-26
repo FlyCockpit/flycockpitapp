@@ -20,12 +20,12 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, mpsc, on
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
-use cockpit_client::image_upload::{ImageUploadError, upload_submission_images};
-use cockpit_client::{ClientEndpoint, DaemonClient, LifecycleClient, LifecycleIntent};
-use cockpit_core::daemon::bulk_upload::{
+use cockpit_client::bulk_upload::{
     BulkUserMessageUploadError, INLINE_USER_MESSAGE_TEXT_BYTES, stage_opaque_user_text,
     user_message_needs_bulk,
 };
+use cockpit_client::image_upload::{ImageUploadError, upload_submission_images};
+use cockpit_client::{ClientEndpoint, DaemonClient, LifecycleClient, LifecycleIntent};
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };

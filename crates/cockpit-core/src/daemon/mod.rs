@@ -26,6 +26,7 @@ pub mod agent_installation;
 pub mod agent_management;
 pub(crate) mod authority_token;
 pub mod bulk_staging;
+#[cfg(test)]
 pub mod bulk_upload;
 pub mod caffeinate;
 pub mod client;

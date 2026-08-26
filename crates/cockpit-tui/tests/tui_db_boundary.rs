@@ -509,6 +509,12 @@ fn production_uses_cockpit_proto_directly() {
                     path.display()
                 ));
             }
+            if compact.contains("cockpit_core::daemon::bulk_upload") {
+                findings.push(format!(
+                    "{}: bulk upload transport is owned by cockpit-client",
+                    path.display()
+                ));
+            }
             if compact.contains("externcratecockpit_core") {
                 findings.push(format!(
                     "{}: whole-crate cockpit_core extern aliases obscure protocol ownership",
@@ -527,6 +533,8 @@ fn production_uses_cockpit_proto_directly() {
                     || imported.starts_with("cockpit_core::daemon::proto::")
                     || imported == "cockpit_core::daemon::image_upload"
                     || imported.starts_with("cockpit_core::daemon::image_upload::")
+                    || imported == "cockpit_core::daemon::bulk_upload"
+                    || imported.starts_with("cockpit_core::daemon::bulk_upload::")
                     || imported == "cockpit_core::container::ContainerAvailability"
                     || imported == "cockpit_core::container::ContainerRuntimeKind"
                     || imported == "cockpit_core::container::ContainerUnavailableReason"

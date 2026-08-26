@@ -254,6 +254,40 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
         syn::visit::Visit::visit_expr(&mut visitor, expression);
         visitor.found
     }
+    fn exact_literal_value(expression: &syn::Expr, line: usize) -> bool {
+        match expression {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(literal),
+                ..
+            }) => literal.span().start().line == line,
+            syn::Expr::Group(group) => exact_literal_value(&group.expr, line),
+            syn::Expr::Paren(paren) => exact_literal_value(&paren.expr, line),
+            _ => false,
+        }
+    }
+    fn exact_block_value(block: &syn::Block, line: usize) -> bool {
+        matches!(block.stmts.as_slice(), [syn::Stmt::Expr(expression, None)] if exact_literal_value(expression, line))
+    }
+    fn reviewed_branch_value(expression: &syn::Expr, line: usize) -> bool {
+        match expression {
+            expression if exact_literal_value(expression, line) => true,
+            syn::Expr::If(branch) => {
+                exact_block_value(&branch.then_branch, line)
+                    || branch
+                        .else_branch
+                        .as_ref()
+                        .is_some_and(|(_, expression)| reviewed_branch_value(expression, line))
+            }
+            syn::Expr::Match(branch) => branch
+                .arms
+                .iter()
+                .any(|arm| reviewed_branch_value(&arm.body, line)),
+            syn::Expr::Block(block) => exact_block_value(&block.block, line),
+            syn::Expr::Group(group) => reviewed_branch_value(&group.expr, line),
+            syn::Expr::Paren(paren) => reviewed_branch_value(&paren.expr, line),
+            _ => false,
+        }
+    }
     fn block_contains_literal(block: &syn::Block, line: usize) -> bool {
         let mut visitor = ContainsLiteral { line, found: false };
         syn::visit::Visit::visit_block(&mut visitor, block);
@@ -299,23 +333,61 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
                 syn::UseTree::Name(_) | syn::UseTree::Rename(_) | syn::UseTree::Glob(_) => {}
             }
         }
+        fn binds_name(tree: &syn::UseTree, target: &str, prefix: &mut Vec<String>) -> bool {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    prefix.push(path.ident.to_string());
+                    let found = binds_name(&path.tree, target, prefix);
+                    prefix.pop();
+                    found
+                }
+                syn::UseTree::Name(name) => {
+                    name.ident == target
+                        || name.ident == "self" && prefix.last().is_some_and(|name| name == target)
+                }
+                syn::UseTree::Rename(rename) => rename.rename == target,
+                syn::UseTree::Group(group) => group
+                    .items
+                    .iter()
+                    .any(|item| binds_name(item, target, prefix)),
+                syn::UseTree::Glob(_) => false,
+            }
+        }
         let mut output = std::collections::BTreeSet::new();
         for item in &syntax.items {
             if let syn::Item::Use(item) = item {
                 inspect(&item.tree, &mut Vec::new(), &mut output);
             }
         }
+        let reserved = output
+            .iter()
+            .cloned()
+            .chain(std::iter::once("rusqlite".to_owned()))
+            .collect::<std::collections::BTreeSet<_>>();
         for item in &syntax.items {
+            if let syn::Item::Use(item) = item {
+                assert!(
+                    !binds_name(&item.tree, "rusqlite", &mut Vec::new()),
+                    "external rusqlite path is shadowed by a use binding"
+                );
+            }
             let shadow = match item {
                 syn::Item::Type(item) => Some(item.ident.to_string()),
                 syn::Item::Struct(item) => Some(item.ident.to_string()),
                 syn::Item::Enum(item) => Some(item.ident.to_string()),
                 syn::Item::Union(item) => Some(item.ident.to_string()),
                 syn::Item::Mod(item) => Some(item.ident.to_string()),
+                syn::Item::Trait(item) => Some(item.ident.to_string()),
+                syn::Item::TraitAlias(item) => Some(item.ident.to_string()),
+                syn::Item::ExternCrate(item) => Some(
+                    item.rename
+                        .as_ref()
+                        .map_or_else(|| item.ident.to_string(), |(_, name)| name.to_string()),
+                ),
                 _ => None,
             };
             assert!(
-                !shadow.as_ref().is_some_and(|name| output.contains(name)),
+                !shadow.as_ref().is_some_and(|name| reserved.contains(name)),
                 "canonical rusqlite::Connection import is shadowed by a local item"
             );
         }
@@ -366,7 +438,7 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
                 .is_some_and(|identifier| self.connections.contains(&identifier))
                 && let Some(sql) = call.args.first()
             {
-                let exact_argument = contains_literal(sql, self.line)
+                let exact_argument = exact_literal_value(sql, self.line)
                     || self
                         .variable
                         .is_some_and(|variable| path_identifier(sql).as_deref() == Some(variable));
@@ -402,6 +474,13 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
 
         fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
             if !block_contains_literal(block, self.line) {
+                return;
+            }
+            if signature.generics.params.iter().any(|parameter| {
+                matches!(parameter, syn::GenericParam::Type(parameter)
+                    if parameter.ident == "rusqlite"
+                        || self.imported_connections.contains(&parameter.ident.to_string()))
+            }) {
                 return;
             }
             let connections = signature
@@ -455,7 +534,7 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
                         if local
                             .init
                             .as_ref()
-                            .is_some_and(|init| contains_literal(&init.expr, self.line)) =>
+                            .is_some_and(|init| reviewed_branch_value(&init.expr, self.line)) =>
                     {
                         Some((index, local))
                     }
@@ -534,6 +613,11 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
 
         fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
             self.inspect(&function.sig, &function.block);
+        }
+
+        fn visit_item_mod(&mut self, _module: &'ast syn::ItemMod) {
+            // An unqualified import at the file root cannot prove the type
+            // binding inside an independently scoped inline module.
         }
     }
     let mut sql_binding = BindingScope {
@@ -645,6 +729,88 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
                 let sql = "SELECT exact FROM owned WHERE id=?1";
                 let sql = "SELECT drifted FROM owned";
                 conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = ("SELECT exact FROM owned WHERE id=?1", "SELECT drifted FROM owned").1;
+                conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                conn.prepare(
+                    // schema-hot-query: reviewed.shape
+                    ("SELECT exact FROM owned WHERE id=?1", "SELECT drifted FROM owned").1
+                );
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = choose("SELECT exact FROM owned WHERE id=?1", "SELECT drifted FROM owned");
+                conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = { let ignored = "SELECT exact FROM owned WHERE id=?1"; "SELECT drifted FROM owned" };
+                conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = format!("SELECT exact FROM owned WHERE id={}", 1);
+                conn.prepare(&sql);
+            }
+        "#,
+        r#"
+            mod rusqlite {
+                pub struct Connection;
+            }
+            fn owner(conn: &rusqlite::Connection) {
+                conn.prepare(
+                    // schema-hot-query: reviewed.shape
+                    "SELECT exact FROM owned WHERE id=?1"
+                );
+            }
+        "#,
+        r#"
+            use fake_database as rusqlite;
+            fn owner(conn: &rusqlite::Connection) {
+                conn.prepare(
+                    // schema-hot-query: reviewed.shape
+                    "SELECT exact FROM owned WHERE id=?1"
+                );
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner<Connection>(conn: &Connection) {
+                conn.prepare(
+                    // schema-hot-query: reviewed.shape
+                    "SELECT exact FROM owned WHERE id=?1"
+                );
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            mod nested {
+                struct Connection;
+                fn owner(conn: &Connection) {
+                    conn.prepare(
+                        // schema-hot-query: reviewed.shape
+                        "SELECT exact FROM owned WHERE id=?1"
+                    );
+                }
             }
         "#,
         r#"

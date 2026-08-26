@@ -321,7 +321,7 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
         }
         if matches!(token, Token::Mark('.')) {
             let schema_context = index >= 2
-                && ["table", "index", "references", "on"]
+                && ["table", "index", "view", "trigger", "references", "on"]
                     .iter()
                     .any(|keyword| is(tokens.get(index - 2), keyword));
             assert!(
@@ -760,6 +760,10 @@ fn apply_script(schema: &mut Schema, sql: &str) {
         } else if is(tokens.get(cursor), "view") {
             let end = statement_end(&tokens, at, "view");
             let view_name = name(tokens.get(cursor + 1)).expect("CREATE VIEW name");
+            assert!(
+                is(tokens.get(cursor + 2), "as"),
+                "CREATE VIEW name must be one unqualified identifier followed by AS"
+            );
             assert_unique_object(schema, &view_name);
             let (columns, owner) = view_columns(schema, &tokens[at..end]);
             assert!(
@@ -778,6 +782,10 @@ fn apply_script(schema: &mut Schema, sql: &str) {
             let end = statement_end(&tokens, at, "virtual");
             assert!(is(tokens.get(cursor + 1), "table"));
             let table_name = name(tokens.get(cursor + 2)).expect("CREATE VIRTUAL TABLE name");
+            assert!(
+                is(tokens.get(cursor + 3), "using"),
+                "CREATE VIRTUAL TABLE name must be one unqualified identifier followed by USING"
+            );
             assert_unique_object(schema, &table_name);
             let columns = virtual_table_columns(&tokens[at..end]);
             schema.objects.push(Object {
@@ -791,6 +799,11 @@ fn apply_script(schema: &mut Schema, sql: &str) {
         } else if is(tokens.get(cursor), "trigger") {
             let end = statement_end(&tokens, at, "trigger");
             let trigger_name = name(tokens.get(cursor + 1)).expect("CREATE TRIGGER name");
+            assert_ne!(
+                tokens.get(cursor + 2),
+                Some(&Token::Mark('.')),
+                "CREATE TRIGGER name must be one unqualified identifier"
+            );
             let begin = top_level_position(&tokens[at..end], "begin")
                 .map(|offset| at + offset)
                 .expect("CREATE TRIGGER BEGIN");
@@ -1082,6 +1095,9 @@ mod tests {
             "DROP TABLE child;",
             "CREATE TEMP TABLE child(id TEXT);",
             "CREATE TABLE main.child(id TEXT);",
+            "CREATE TABLE child(id TEXT); CREATE VIEW main.child_view AS SELECT * FROM child;",
+            "CREATE VIRTUAL TABLE main.child_search USING fts5(body);",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER main.child_guard BEFORE UPDATE ON child BEGIN SELECT 1; END;",
         ] {
             assert!(
                 std::panic::catch_unwind(|| parse(&[sql])).is_err(),

@@ -29,6 +29,7 @@ pub struct ResourcesPane {
     loading: bool,
     list: ListState,
     selected_request_id: Option<String>,
+    follow_selection: bool,
     last_body_height: usize,
     last_content_rows: usize,
 }
@@ -70,6 +71,7 @@ impl ResourcesPane {
             loading: true,
             list: ListState::default(),
             selected_request_id: None,
+            follow_selection: false,
             last_body_height: 0,
             last_content_rows: 0,
         }
@@ -107,6 +109,7 @@ impl ResourcesPane {
             .display_id
             .clone();
         self.selected_request_id = Some(request_id.clone());
+        self.follow_selection = true;
         Some(ResourcesOutcome::Promote(request_id))
     }
 
@@ -157,10 +160,18 @@ impl ResourcesPane {
         self.last_content_rows = lines.len();
         self.last_body_height = body.height as usize;
         self.list.select(selected_row);
-        *self.list.offset_mut() = self
-            .list
-            .offset()
-            .min(self.last_content_rows.saturating_sub(self.last_body_height));
+        let max_offset = self.last_content_rows.saturating_sub(self.last_body_height);
+        let mut offset = self.list.offset().min(max_offset);
+        if self.follow_selection
+            && let Some(row) = selected_row
+        {
+            if row < offset {
+                offset = row;
+            } else if row >= offset.saturating_add(self.last_body_height) {
+                offset = row.saturating_add(1).saturating_sub(self.last_body_height);
+            }
+        }
+        *self.list.offset_mut() = offset.min(max_offset);
         let mut viewport = self.list.clone();
         viewport.select(None);
         frame.render_stateful_widget(
@@ -349,13 +360,16 @@ impl ResourcesPane {
             crate::tui::nav::wrap_next(current, total)
         };
         self.select_index(next);
+        self.follow_selection = true;
     }
 
     pub fn scroll_up(&mut self) {
+        self.follow_selection = false;
         *self.list.offset_mut() = self.list.offset().saturating_sub(1);
     }
 
     pub fn scroll_down(&mut self) {
+        self.follow_selection = false;
         let max = self.last_content_rows.saturating_sub(self.last_body_height);
         *self.list.offset_mut() = (self.list.offset() + 1).min(max);
     }
@@ -764,5 +778,54 @@ mod tests {
             pane.list.offset(),
             pane.last_content_rows.saturating_sub(pane.last_body_height)
         );
+    }
+
+    #[test]
+    fn keyboard_navigation_keeps_selection_visible_through_reorder_and_resize() {
+        let mut value = snapshot();
+        for index in 0..6 {
+            let mut pool = value.pools[0].clone();
+            pool.name = format!("pool-{index}");
+            value.pools.push(pool);
+            let mut running = value.running[0].clone();
+            running.id = Uuid::new_v4();
+            running.display_id = format!("running-{index}");
+            value.running.push(running);
+            let mut queued = value.queued[0].clone();
+            queued.id = Uuid::new_v4();
+            queued.display_id = format!("queued-{index}");
+            value.queued.push(queued);
+        }
+        let mut pane = ResourcesPane::open();
+        pane.apply_snapshot_result(Ok(value.clone()));
+        let _ = rendered_buffer(&mut pane, 80, 10);
+        assert_eq!(
+            pane.list.offset(),
+            0,
+            "initial render keeps leading sections visible"
+        );
+
+        pane.handle_key(press(KeyCode::Down));
+        let selected_id = pane.selected_request_id.clone().expect("selection");
+        let _ = rendered_buffer(&mut pane, 80, 10);
+        let selected_row = pane.body_lines_with_selected_row(true).1.unwrap();
+        assert!(selected_row >= pane.list.offset());
+        assert!(selected_row < pane.list.offset() + pane.last_body_height);
+
+        value.queued.reverse();
+        pane.apply_snapshot_result(Ok(value));
+        let _ = rendered_buffer(&mut pane, 80, 10);
+        assert_eq!(
+            pane.selected_request_id.as_deref(),
+            Some(selected_id.as_str())
+        );
+        let reordered_row = pane.body_lines_with_selected_row(true).1.unwrap();
+        assert!(reordered_row >= pane.list.offset());
+        assert!(reordered_row < pane.list.offset() + pane.last_body_height);
+
+        let _ = rendered_buffer(&mut pane, 80, 6);
+        let resized_row = pane.body_lines_with_selected_row(true).1.unwrap();
+        assert!(resized_row >= pane.list.offset());
+        assert!(resized_row < pane.list.offset() + pane.last_body_height);
     }
 }

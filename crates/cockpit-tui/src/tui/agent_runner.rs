@@ -3345,18 +3345,36 @@ pub(crate) fn resource_snapshot_blocking(
     }
 }
 
-pub fn promote_resource_blocking(
-    lifecycle: cockpit_client::LifecycleClient,
+pub(crate) fn promote_resource_request(
     request_id: String,
     session_id: Option<uuid::Uuid>,
+) -> Request {
+    let request = Request::PromoteResource {
+        request_id,
+        session_id,
+    };
+    #[cfg(test)]
+    TEST_RESOURCE_PROMOTE_REQUESTS.with(|requests| requests.borrow_mut().push(request.clone()));
+    request
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RESOURCE_PROMOTE_REQUESTS: std::cell::RefCell<Vec<Request>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_resource_promote_requests() -> Vec<Request> {
+    TEST_RESOURCE_PROMOTE_REQUESTS.with(|requests| std::mem::take(&mut *requests.borrow_mut()))
+}
+
+pub fn promote_resource_blocking(
+    lifecycle: cockpit_client::LifecycleClient,
+    request: Request,
 ) -> Result<proto::Response, String> {
-    match daemon_request_blocking(
-        lifecycle,
-        Request::PromoteResource {
-            request_id,
-            session_id,
-        },
-    )? {
+    match daemon_request_blocking(lifecycle, request)? {
         response @ Response::PromoteResourceResult { .. } => Ok(response),
         other => Err(format!("unexpected promote_resource response: {other:?}")),
     }

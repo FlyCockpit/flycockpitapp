@@ -2784,6 +2784,7 @@ mod resource_button_dispatch_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn promote_button_enqueues_daemon_mutation_for_clicked_request() {
+        let _ = crate::tui::agent_runner::take_test_resource_promote_requests();
         let mut pane = ResourcesPane::open();
         pane.apply_snapshot_result(Ok(scheduler_snapshot(&["rs-first", "rs-clicked"])));
         let mut app = App::new(None, false);
@@ -2797,6 +2798,11 @@ mod resource_button_dispatch_tests {
             app.async_actions.pending_kinds(),
             vec![AsyncActionKind::DaemonRpc("resources.promote")]
         );
+        assert!(matches!(
+            crate::tui::agent_runner::take_test_resource_promote_requests().as_slice(),
+            [cockpit_proto::Request::PromoteResource { request_id, .. }]
+                if request_id == "rs-clicked"
+        ));
         assert!(matches!(app.overlay, Overlay::Resources(_)));
     }
 

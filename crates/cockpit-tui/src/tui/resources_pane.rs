@@ -29,6 +29,7 @@ pub struct ResourcesPane {
     loading: bool,
     list: ListState,
     selected_request_id: Option<uuid::Uuid>,
+    selection_initialized: bool,
     follow_selection: bool,
     last_body_height: usize,
     last_content_rows: usize,
@@ -71,6 +72,7 @@ impl ResourcesPane {
             loading: true,
             list: ListState::default(),
             selected_request_id: None,
+            selection_initialized: false,
             follow_selection: false,
             last_body_height: 0,
             last_content_rows: 0,
@@ -82,14 +84,18 @@ impl ResourcesPane {
         match result {
             Ok(snapshot) => {
                 self.error = None;
-                self.selected_request_id = match self.selected_request_id.take() {
-                    Some(id) => snapshot
-                        .queued
-                        .iter()
-                        .any(|entry| entry.id == id)
-                        .then_some(id),
-                    None => snapshot.queued.first().map(|entry| entry.id),
-                };
+                if self.selection_initialized {
+                    self.selected_request_id = self.selected_request_id.take().and_then(|id| {
+                        snapshot
+                            .queued
+                            .iter()
+                            .any(|entry| entry.id == id)
+                            .then_some(id)
+                    });
+                } else {
+                    self.selected_request_id = snapshot.queued.first().map(|entry| entry.id);
+                    self.selection_initialized = true;
+                }
                 self.snapshot = Some(snapshot);
             }
             Err(e) => self.error = Some(e),
@@ -105,6 +111,7 @@ impl ResourcesPane {
             .find(|entry| entry.id == request_id)?
             .id;
         self.selected_request_id = Some(request_id);
+        self.selection_initialized = true;
         self.follow_selection = true;
         Some(ResourcesOutcome::Promote(request_id))
     }
@@ -335,6 +342,7 @@ impl ResourcesPane {
     fn move_selection(&mut self, delta: isize, total: usize) {
         if total == 0 {
             self.selected_request_id = None;
+            self.selection_initialized = true;
             self.list.select(None);
             *self.list.offset_mut() = 0;
             return;
@@ -350,6 +358,7 @@ impl ResourcesPane {
             }
         };
         self.select_index(next);
+        self.selection_initialized = true;
         self.follow_selection = true;
     }
 
@@ -749,11 +758,32 @@ mod tests {
         value.queued.retain(|entry| entry.id != removed_id);
         let first_remaining = value.queued[0].id;
 
+        pane.apply_snapshot_result(Ok(value.clone()));
+        assert_eq!(pane.selected_request_id, None);
+        assert!(pane.handle_key(press(KeyCode::Enter)).is_none());
         pane.apply_snapshot_result(Ok(value));
+        assert_eq!(pane.selected_request_id, None);
+        assert!(pane.handle_key(press(KeyCode::Char(' '))).is_none());
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.selected_request_id, Some(first_remaining));
+    }
+
+    #[test]
+    fn initially_empty_snapshot_requires_navigation_when_rows_arrive() {
+        let mut empty = snapshot();
+        let later = empty.clone();
+        empty.queued.clear();
+        let later_first = later.queued[0].id;
+        let mut pane = ResourcesPane::open();
+
+        pane.apply_snapshot_result(Ok(empty));
+        assert!(pane.selection_initialized);
+        assert_eq!(pane.selected_request_id, None);
+        pane.apply_snapshot_result(Ok(later));
         assert_eq!(pane.selected_request_id, None);
         assert!(pane.handle_key(press(KeyCode::Enter)).is_none());
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.selected_request_id, Some(first_remaining));
+        assert_eq!(pane.selected_request_id, Some(later_first));
     }
 
     #[test]

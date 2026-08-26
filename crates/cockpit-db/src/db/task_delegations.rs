@@ -1090,19 +1090,37 @@ fn immediate_transaction<T>(
     commit_context: &str,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     conn.execute_batch("BEGIN IMMEDIATE")
         .with_context(|| begin_context.to_string())?;
-    let result = f();
-    match result {
-        Ok(value) => {
-            conn.execute_batch("COMMIT")
-                .with_context(|| commit_context.to_string())?;
-            Ok(value)
+    // Mirror `super::run_transaction`: a failed COMMIT — or a panic inside `f` —
+    // must roll back. Otherwise the shared single writer connection is left
+    // inside an open `BEGIN IMMEDIATE`, poisoning every subsequent delegation
+    // write for the life of the daemon (this previously only rolled back on a
+    // clean `Err`, leaking the transaction on a COMMIT failure or panic).
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(Ok(value)) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                let primary = anyhow::Error::new(error).context(commit_context.to_string());
+                finish_immediate_rollback(conn, primary)
+            }
+        },
+        Ok(Err(error)) => finish_immediate_rollback(conn, error),
+        Err(_) => {
+            finish_immediate_rollback(conn, anyhow::anyhow!("db transaction job panicked"))
         }
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        }
+    }
+}
+
+/// Roll back the current transaction and surface `primary`, chaining a rollback
+/// failure the way `super::run_transaction` does so a wedged connection is not
+/// silently masked.
+fn finish_immediate_rollback<T>(conn: &rusqlite::Connection, primary: anyhow::Error) -> Result<T> {
+    match super::rollback_transaction(conn) {
+        Ok(()) => Err(primary),
+        Err(rollback) => Err(super::TransactionRollbackFailed { primary, rollback }.into()),
     }
 }
 
@@ -1204,6 +1222,48 @@ fn decode_child_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationCh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immediate_transaction_commits_on_success() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        let out = immediate_transaction(&conn, "begin", "commit", || -> Result<i64> {
+            conn.execute("INSERT INTO t (x) VALUES (1)", [])?;
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(out, 42);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn immediate_transaction_rolls_back_on_error_and_leaves_connection_usable() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let result = immediate_transaction(&conn, "begin", "commit", || -> Result<()> {
+            Err(anyhow::anyhow!("body failed"))
+        });
+        assert!(result.is_err());
+        // The connection must not be wedged inside an open `BEGIN IMMEDIATE`.
+        conn.execute_batch("BEGIN IMMEDIATE; COMMIT;")
+            .expect("connection left inside an open transaction");
+    }
+
+    #[test]
+    fn immediate_transaction_rolls_back_on_panic_and_leaves_connection_usable() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // A panic inside the body is caught, rolled back, and surfaced as an
+        // error — the connection is not left inside an open transaction (which
+        // would poison every later write on the shared writer connection).
+        let result = immediate_transaction(&conn, "begin", "commit", || -> Result<()> {
+            panic!("body panicked");
+        });
+        assert!(result.is_err());
+        conn.execute_batch("BEGIN IMMEDIATE; COMMIT;")
+            .expect("connection left inside an open transaction after a panic");
+    }
 
     async fn seed_job(db: &Db, task_call_id: &str, children: &[&str]) -> Uuid {
         let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();

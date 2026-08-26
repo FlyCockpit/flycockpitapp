@@ -135,27 +135,32 @@ pub fn wrap_display_chunks(line: &str, budget: usize) -> Vec<(usize, usize, usiz
         let mut end = start;
         let mut last_space: Option<(usize, usize)> = None;
         let mut overflow_at: Option<usize> = None;
-        for (rel, ch) in line[start..].char_indices() {
+        let mut rel = 0usize;
+        for grapheme in crate::tui::markdown::semantic_graphemes(&line[start..]) {
             let abs = start + rel;
-            let ch_end = abs + ch.len_utf8();
-            let w = display_width_char(ch);
+            let ch_end = abs + grapheme.len();
+            let w = display_width(&grapheme);
             if col > 0 && col.saturating_add(w) > budget {
                 overflow_at = Some(abs);
                 break;
             }
             end = ch_end;
             col = col.saturating_add(w);
-            if ch == ' ' {
+            if grapheme == " " {
                 last_space = Some((ch_end, col));
             }
             if col >= budget {
                 break;
             }
+            rel += grapheme.len();
         }
         if end == start {
-            if let Some((_, ch)) = line[start..].char_indices().next() {
-                end = start + ch.len_utf8();
-                col = display_width_char(ch);
+            if let Some(grapheme) = crate::tui::markdown::semantic_graphemes(&line[start..])
+                .into_iter()
+                .next()
+            {
+                end = start + grapheme.len();
+                col = display_width(&grapheme);
             }
         } else if (overflow_at.is_some() || end < line.len())
             && let Some((space_end, space_col)) = last_space
@@ -257,9 +262,12 @@ pub fn byte_for_visual_position(
         return chunk.start_byte;
     }
     let mut used = chunk.start_col;
-    for (rel, ch) in text[chunk.start_byte..chunk.end_byte].char_indices() {
+    let mut rel = 0usize;
+    for grapheme in
+        crate::tui::markdown::semantic_graphemes(&text[chunk.start_byte..chunk.end_byte])
+    {
         let abs = chunk.start_byte + rel;
-        let w = display_width_char(ch);
+        let w = display_width(&grapheme);
         if target <= used {
             return abs;
         }
@@ -267,14 +275,16 @@ pub fn byte_for_visual_position(
             return abs;
         }
         used = used.saturating_add(w);
+        rel += grapheme.len();
     }
     chunk.end_byte
 }
 
 fn byte_for_display_col(line: &str, col: usize) -> usize {
     let mut used = 0usize;
-    for (byte, ch) in line.char_indices() {
-        let w = display_width_char(ch);
+    let mut byte = 0usize;
+    for grapheme in crate::tui::markdown::semantic_graphemes(line) {
+        let w = display_width(&grapheme);
         if col <= used {
             return byte;
         }
@@ -282,6 +292,7 @@ fn byte_for_display_col(line: &str, col: usize) -> usize {
             return byte;
         }
         used = used.saturating_add(w);
+        byte += grapheme.len();
     }
     line.len()
 }
@@ -2519,6 +2530,28 @@ mod tests {
             chunks,
             vec![(0, "中中".len(), 0, 4), ("中中".len(), "中中a".len(), 0, 1)]
         );
+    }
+
+    #[test]
+    fn display_chunks_and_cell_mapping_keep_zwj_clusters_whole() {
+        let family = "👨‍👩‍👧‍👦";
+        let text = format!("a{family}b");
+        let family_start = 1;
+        let family_end = family_start + family.len();
+
+        assert_eq!(
+            wrap_display_chunks(&text, 2),
+            vec![
+                (0, 1, 0, 1),
+                (family_start, family_end, 0, 2),
+                (family_end, text.len(), 0, 1)
+            ]
+        );
+        assert_eq!(byte_for_visual_position(&text, 1, 0, 0, 2), family_start);
+        assert_eq!(byte_for_visual_position(&text, 1, 1, 0, 2), family_start);
+        assert_eq!(byte_for_visual_position(&text, 1, 2, 0, 2), family_end);
+        assert_eq!(byte_for_display_col(&text, 2), family_start);
+        assert_eq!(byte_for_display_col(&text, 3), family_end);
     }
 
     #[test]

@@ -141,6 +141,8 @@ pub struct PasteBlock {
 pub struct PasteRegistry {
     blocks: Vec<PasteBlock>,
     next_block_id: u64,
+    next_text_number: u32,
+    next_image_number: u32,
 }
 
 #[derive(Debug)]
@@ -154,6 +156,8 @@ impl Default for PasteRegistry {
         Self {
             blocks: Vec::new(),
             next_block_id: 1,
+            next_text_number: 1,
+            next_image_number: 1,
         }
     }
 }
@@ -215,32 +219,26 @@ impl PasteRegistry {
         &self.blocks
     }
 
-    /// Mutable access to the block list, for the app's post-insert offset
-    /// fix-up (the only caller that adjusts ranges outside
-    /// [`Self::shift_for_edit`]).
-    pub fn blocks_mut(&mut self) -> &mut [PasteBlock] {
-        &mut self.blocks
-    }
-
     /// Clear all blocks (after submit / composer clear).
     pub fn clear(&mut self) {
         self.blocks.clear();
     }
 
     /// Next 1-based number for a fresh condensed text block.
-    fn next_text_number(&self) -> u32 {
-        self.blocks
-            .iter()
-            .filter(|b| matches!(b.kind, PasteKind::Text { .. }))
-            .count() as u32
-            + 1
+    fn next_text_number(&mut self) -> u32 {
+        let number = self.next_text_number;
+        self.next_text_number = self
+            .next_text_number
+            .checked_add(1)
+            .expect("paste text numbering exhausted");
+        number
     }
 
     /// The display number to use for an image with this content hash. A
     /// prior occurrence of the same image reuses its number (and the new
     /// block becomes a `reference`); otherwise it's the next distinct
     /// image index. Returns `(number, is_duplicate)`.
-    fn image_number_for(&self, hash: u64) -> (u32, bool) {
+    fn image_number_for(&mut self, hash: u64) -> (u32, bool) {
         if let Some(existing) = self.blocks.iter().find_map(|b| match &b.kind {
             PasteKind::Image { hash: h, .. } | PasteKind::ImageHandle { hash: h, .. }
                 if *h == hash =>
@@ -251,16 +249,12 @@ impl PasteRegistry {
         }) {
             return (existing, true);
         }
-        let distinct = self
-            .blocks
-            .iter()
-            .filter_map(|b| match &b.kind {
-                PasteKind::Image { hash, .. } | PasteKind::ImageHandle { hash, .. } => Some(*hash),
-                _ => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .len() as u32;
-        (distinct + 1, false)
+        let number = self.next_image_number;
+        self.next_image_number = self
+            .next_image_number
+            .checked_add(1)
+            .expect("paste image numbering exhausted");
+        (number, false)
     }
 
     fn next_block_id(&mut self) -> u64 {
@@ -344,6 +338,10 @@ impl PasteRegistry {
     /// flagged a `reference` (sent as text at send time). Returns the
     /// placeholder string the caller must insert into the buffer.
     pub fn register_image(&mut self, at: usize, png: Vec<u8>) -> String {
+        self.register_image_with_id(at, png).1
+    }
+
+    pub fn register_image_with_id(&mut self, at: usize, png: Vec<u8>) -> (u64, String) {
         let hash = hash_bytes(&png);
         let (number, reference) = self.image_number_for(hash);
         let placeholder = Self::image_placeholder(number);
@@ -360,7 +358,7 @@ impl PasteRegistry {
                 reference,
             },
         });
-        placeholder
+        (id, placeholder)
     }
 
     pub fn register_image_handle(
@@ -371,6 +369,18 @@ impl PasteRegistry {
         normalized_byte_length: u64,
         sha256: String,
     ) -> String {
+        self.register_image_handle_with_id(at, draft, image_ref, normalized_byte_length, sha256)
+            .1
+    }
+
+    pub fn register_image_handle_with_id(
+        &mut self,
+        at: usize,
+        draft: ImageIngressDraftAuthority,
+        image_ref: cockpit_proto::ImageAttachmentRef,
+        normalized_byte_length: u64,
+        sha256: String,
+    ) -> (u64, String) {
         let hash = hash_bytes(sha256.as_bytes());
         let (number, reference) = self.image_number_for(hash);
         let placeholder = Self::image_placeholder(number);
@@ -390,7 +400,7 @@ impl PasteRegistry {
                 reference,
             },
         });
-        placeholder
+        (id, placeholder)
     }
 
     pub fn apply_text_token_count(
@@ -517,6 +527,18 @@ impl PasteRegistry {
         self.blocks.insert(pos, block);
     }
 
+    /// Shift every pre-existing block at or after an insertion point while
+    /// preserving the just-registered block's exact range and identity.
+    pub fn shift_other_blocks_after_insert(&mut self, inserted_id: u64, at: usize, len: usize) {
+        for block in &mut self.blocks {
+            if block.id != inserted_id && block.start >= at {
+                block.start += len;
+                block.end += len;
+            }
+        }
+        self.blocks.sort_by_key(|block| block.start);
+    }
+
     /// Keep block byte-ranges in sync after an edit of magnitude `delta`
     /// (positive = insertion, negative = deletion) applied at byte `at`.
     ///
@@ -625,11 +647,22 @@ impl PasteRegistry {
     /// should remove the whole block. Returns the block's full span so the
     /// caller can widen the delete range to a block boundary.
     pub fn block_crossed_by(&self, from: usize, to: usize) -> Option<(usize, usize)> {
-        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
-        self.blocks
-            .iter()
-            .find(|b| b.start < hi && b.end > lo)
-            .map(|b| (b.start, b.end))
+        let (mut lo, mut hi) = if from <= to { (from, to) } else { (to, from) };
+        let mut intersected = false;
+        loop {
+            let before = (lo, hi);
+            for block in &self.blocks {
+                if block.start < hi && block.end > lo {
+                    intersected = true;
+                    lo = lo.min(block.start);
+                    hi = hi.max(block.end);
+                }
+            }
+            if (lo, hi) == before {
+                break;
+            }
+        }
+        intersected.then_some((lo, hi))
     }
 
     /// If `cursor` is at the right edge (`end`) of a condensed *text*
@@ -867,6 +900,15 @@ impl PasteRegistry {
     ) -> EditorPasteRebuild {
         let mut buffer = String::with_capacity(editor_text.len());
         let mut registry = PasteRegistry::new();
+        registry.next_image_number = editor_text
+            .match_indices(PASTED_IMAGE_PREFIX)
+            .filter_map(|(start, _)| Self::parse_image_placeholder_at(&editor_text[start..]))
+            .map(|(number, _)| number)
+            .filter(|number| !retained_images.contains_key(number))
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("external-editor image numbering exhausted");
         let mut pos = 0usize;
 
         while pos < editor_text.len() {
@@ -977,6 +1019,27 @@ mod tests {
         let at = p1.len();
         let p2 = r.register_text(at, "full two".into(), 9);
         assert_eq!(p2, "[Pasted text #2, 9 tokens]");
+    }
+
+    #[test]
+    fn deletion_does_not_reuse_text_or_image_numbers() {
+        let mut registry = PasteRegistry::new();
+        let first_text = registry.register_text(0, "one".into(), 1);
+        let second_text = registry.register_text(first_text.len(), "two".into(), 2);
+        registry.remove_range(0, first_text.len());
+        assert_eq!(
+            registry.register_text(second_text.len(), "three".into(), 3),
+            "[Pasted text #3, 3 tokens]"
+        );
+
+        let mut registry = PasteRegistry::new();
+        let first_image = registry.register_image(0, vec![1]);
+        let second_image = registry.register_image(first_image.len(), vec![2]);
+        registry.remove_range(first_image.len(), first_image.len() + second_image.len());
+        assert_eq!(
+            registry.register_image(first_image.len(), vec![3]),
+            "[Pasted image #3]"
+        );
     }
 
     #[test]
@@ -1138,6 +1201,19 @@ mod tests {
     }
 
     #[test]
+    fn atomic_range_widens_through_every_intersected_block() {
+        let mut registry = PasteRegistry::new();
+        let first = registry.register_text(2, "first".into(), 1);
+        let second_start = 2 + first.len() + 2;
+        let second = registry.register_text(second_start, "second".into(), 1);
+
+        assert_eq!(
+            registry.block_crossed_by(3, second_start + 1),
+            Some((2, second_start + second.len()))
+        );
+    }
+
+    #[test]
     fn re_paste_to_expand_matches_only_at_right_edge_and_identical() {
         let mut r = PasteRegistry::new();
         let full = "the original pasted body";
@@ -1286,14 +1362,10 @@ VERY LONG TEXT
     fn insert_text_block(c: &mut Composer, r: &mut PasteRegistry, full: &str, tokens: usize) {
         let at = r.resolve_insertion(c.cursor());
         c.set_cursor(at);
-        let placeholder = r.register_text(at, full.to_string(), tokens);
+        let (block_id, placeholder) =
+            r.register_text_with_state(at, full.to_string(), Some(tokens));
         c.insert_str(&placeholder);
-        for b in r.blocks_mut() {
-            if b.start > at {
-                b.start += placeholder.len();
-                b.end += placeholder.len();
-            }
-        }
+        r.shift_other_blocks_after_insert(block_id, at, placeholder.len());
     }
 
     /// Mirror a raw insertion through the app's registry shift path.
@@ -1309,15 +1381,52 @@ VERY LONG TEXT
     fn insert_image_block(c: &mut Composer, r: &mut PasteRegistry, png: Vec<u8>) -> String {
         let at = r.resolve_insertion(c.cursor());
         c.set_cursor(at);
-        let placeholder = r.register_image(at, png);
+        let (block_id, placeholder) = r.register_image_with_id(at, png);
         c.insert_str(&placeholder);
-        for b in r.blocks_mut() {
-            if b.start > at {
-                b.start += placeholder.len();
-                b.end += placeholder.len();
-            }
-        }
+        r.shift_other_blocks_after_insert(block_id, at, placeholder.len());
         placeholder
+    }
+
+    #[test]
+    fn inserting_text_at_an_existing_block_start_preserves_both_identities() {
+        let mut composer = Composer::new(false);
+        let mut registry = PasteRegistry::new();
+        insert_text_block(&mut composer, &mut registry, "old", 1);
+        let old_id = registry.blocks()[0].id;
+
+        composer.set_cursor(0);
+        insert_text_block(&mut composer, &mut registry, "new", 1);
+
+        assert_eq!(registry.blocks().len(), 2);
+        assert_ne!(registry.blocks()[0].id, old_id);
+        assert_eq!(registry.blocks()[1].id, old_id);
+        for block in registry.blocks() {
+            assert_eq!(
+                &composer.text()[block.start..block.end],
+                PasteRegistry::expected_placeholder(block)
+            );
+        }
+    }
+
+    #[test]
+    fn inserting_image_at_an_existing_block_start_preserves_both_identities() {
+        let mut composer = Composer::new(false);
+        let mut registry = PasteRegistry::new();
+        insert_image_block(&mut composer, &mut registry, vec![1]);
+        let old_id = registry.blocks()[0].id;
+
+        composer.set_cursor(0);
+        insert_image_block(&mut composer, &mut registry, vec![2]);
+
+        assert_eq!(registry.blocks().len(), 2);
+        assert_ne!(registry.blocks()[0].id, old_id);
+        assert_eq!(registry.blocks()[1].id, old_id);
+        for block in registry.blocks() {
+            assert_eq!(
+                &composer.text()[block.start..block.end],
+                PasteRegistry::expected_placeholder(block)
+            );
+        }
     }
 
     #[test]
@@ -1470,6 +1579,42 @@ gamma",
         let (wire, images) = rebuilt.registry.build_wire(&rebuilt.buffer, true);
         assert_eq!(images, vec![second]);
         assert!(wire.contains(IMAGE_PART_SENTINEL));
+    }
+
+    #[test]
+    fn editor_rebuild_keeps_unknown_references_disjoint_from_retained_images() {
+        let retained = BTreeMap::from([(2, RetainedImage::Bytes(vec![2, 2, 2]))]);
+        let mut rebuilt = PasteRegistry::rebuild_from_editor(
+            "unknown [Pasted image #1] [Pasted image #2] [Pasted image #2]",
+            &retained,
+            |_| 0,
+        );
+
+        assert_eq!(
+            rebuilt.buffer,
+            "unknown [Pasted image #1] [Pasted image #2] [Pasted image #2]"
+        );
+        assert_eq!(rebuilt.registry.blocks()[0].number, 2);
+        assert!(matches!(
+            rebuilt.registry.blocks()[0].kind,
+            PasteKind::Image {
+                reference: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rebuilt.registry.blocks()[1].kind,
+            PasteKind::Image {
+                reference: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            rebuilt
+                .registry
+                .register_image(rebuilt.buffer.len(), vec![4]),
+            "[Pasted image #3]"
+        );
     }
 
     #[test]

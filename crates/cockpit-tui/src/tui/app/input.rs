@@ -3849,9 +3849,8 @@ impl App {
         self.composer.set_cursor(at);
         let (block_id, placeholder) = self.paste_registry.register_text_pending(at, full.clone());
         self.composer.insert_str(&placeholder);
-        // `register_text_pending` already recorded the block at `[at, at+len)`;
-        // shift only the blocks that were *after* the insertion point.
-        self.shift_other_blocks_after_insert(at, placeholder.len());
+        self.paste_registry
+            .shift_other_blocks_after_insert(block_id, at, placeholder.len());
         self.reconcile_paste_blocks();
         self.start_paste_token_count(block_id, full);
     }
@@ -3946,9 +3945,10 @@ impl App {
             .paste_registry
             .resolve_insertion(self.composer.cursor());
         self.composer.set_cursor(at);
-        let placeholder = self.paste_registry.register_image(at, png);
+        let (block_id, placeholder) = self.paste_registry.register_image_with_id(at, png);
         self.composer.insert_str(&placeholder);
-        self.shift_other_blocks_after_insert(at, placeholder.len());
+        self.paste_registry
+            .shift_other_blocks_after_insert(block_id, at, placeholder.len());
         self.reconcile_paste_blocks();
         self.refresh_at_dismiss();
         self.reset_at_window();
@@ -4005,7 +4005,7 @@ impl App {
             .paste_registry
             .resolve_insertion(self.composer.cursor());
         self.composer.set_cursor(at);
-        let placeholder = self.paste_registry.register_image_handle(
+        let (block_id, placeholder) = self.paste_registry.register_image_handle_with_id(
             at,
             draft,
             admission.image_ref,
@@ -4013,7 +4013,8 @@ impl App {
             admission.sha256,
         );
         self.composer.insert_str(&placeholder);
-        self.shift_other_blocks_after_insert(at, placeholder.len());
+        self.paste_registry
+            .shift_other_blocks_after_insert(block_id, at, placeholder.len());
         self.reconcile_paste_blocks();
         self.refresh_at_dismiss();
         self.reset_at_window();
@@ -4023,20 +4024,6 @@ impl App {
                 "Current model has no image support — this image will be sent as a text note.",
                 super::ToastKind::Info,
             );
-        }
-    }
-
-    /// After [`crate::tui::paste::PasteRegistry::register_text`] /
-    /// `register_image` recorded a new block at `[at, at+len)`, shift the
-    /// *other* blocks that started at/after `at` (the new one is exact).
-    /// `register_*` inserts the new block sorted, so we shift every block
-    /// whose start is `> at` (i.e. excluding the one we just added).
-    fn shift_other_blocks_after_insert(&mut self, at: usize, len: usize) {
-        for b in self.paste_registry.blocks_mut() {
-            if b.start > at {
-                b.start += len;
-                b.end += len;
-            }
         }
     }
 

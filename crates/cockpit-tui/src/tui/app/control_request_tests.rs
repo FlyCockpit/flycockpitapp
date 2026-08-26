@@ -8,10 +8,10 @@ use crate::tui::agent_runner::{
 };
 use crate::tui::history::HistoryEntry;
 use cockpit_core::config::extended::ApprovalMode;
-use cockpit_core::daemon::proto::{Request, Response};
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
+use cockpit_proto::{Request, Response};
 
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();

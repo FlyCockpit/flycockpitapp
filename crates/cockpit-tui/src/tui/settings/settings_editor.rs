@@ -3799,7 +3799,7 @@ mod tests {
         use crate::tui::quick_dialog::{QuickCurrent, QuickDialog, QuickModelChoice, QuickOutcome};
         use cockpit_config::extended::{ApprovalMode, LlmMode};
         use cockpit_core::container::{ContainerAvailability, ContainerRuntimeKind};
-        use cockpit_core::tools::sandbox_mode::SandboxMode;
+        use cockpit_proto::SandboxMode;
 
         let entry = provider_with_model();
         let mut settings = SettingsEditor::for_model("p", &entry, "m1")

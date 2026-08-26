@@ -219,8 +219,17 @@ fn verify_test_daemon(pid: u32, owner: &str) -> Result<()> {
             "refusing to signal pid {pid}: missing matching {TEST_OWNER_ENV} marker"
         ));
     }
-    let args = super::read_process_cmdline(pid)?;
-    if !super::cmdline_is_cockpit_daemon(&args) {
+    let args = cockpit_host::daemon_lifecycle::read_process_cmdline(pid)?;
+    let observed_exe = args
+        .first()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let approved_exe = std::env::current_exe()?;
+    if !cockpit_host::daemon_lifecycle::cmdline_is_cockpit_daemon(
+        &args,
+        &observed_exe,
+        &approved_exe,
+    ) {
         return Err(anyhow!(
             "refusing to signal pid {pid}: process is not a cockpit daemon"
         ));

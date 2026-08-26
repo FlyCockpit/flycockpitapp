@@ -27,16 +27,18 @@ use cockpit_db::db::external_journal::{
 };
 use cockpit_db::db::image_generation::{
     AcquireImageGenerationArtifactLease, AcquiredImageGenerationArtifactLease,
-    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
+    AdvanceImageGenerationLatePublication, BeginImageGenerationArtifactComponentWrite,
+    BeginImageGenerationArtifactWrite, BlockVerifiedImageGenerationLatePublication,
+    CommitImageGenerationArtifactComponentReady, CommitImageGenerationArtifactRetention,
+    CommitImageGenerationSecurityCleanup, CommitImageGenerationSecurityPublication,
     CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
     DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
-    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
-    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
+    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
     ImageGenerationDispatchCandidate, ImageGenerationHandoffFinishDisposition,
     ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
-    PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
-    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
-    image_generation_attempt_media_reservation_id, image_generation_component_set_binding,
+    PreparedImageGenerationDispatch, RecoverImageGenerationArtifactComponent,
+    ReserveImageGenerationLatePublication, image_generation_attempt_media_reservation_id,
+    image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
@@ -47,10 +49,6 @@ use crate::media_reservation::{
     definitive_rejection_retry_conn, finish_external_handoff_conn, handoff_external_conn,
 };
 
-pub use crate::private_fs::held_directory::{
-    HeldArtifactEvidence, HeldDirectoryEffectEvidence, HeldDirectoryEffectOutcome,
-    HeldDirectoryRecovery, HeldSealOutcome, HeldSealedArtifact, HeldTemporaryArtifact,
-};
 pub use cockpit_db::image_generation_plan::{
     AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
     MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
@@ -59,11 +57,15 @@ pub use cockpit_db::image_generation_plan::{
     ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
     TypedParameterV1, VectorSanitizerProvenanceV1,
 };
+use cockpit_host::private_fs::held_directory::{
+    HeldArtifactEvidence, HeldDirectoryEffectOutcome, HeldDirectoryRecovery, HeldSealOutcome,
+    HeldSealedArtifact, HeldTemporaryArtifact,
+};
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
 const MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES: usize = 64 * 1024;
 const MAX_IMAGE_MEDIA_PLAN_SNAPSHOT_BYTES: usize = 64 * 1024;
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 static FORCE_ACCEPTED_RESPONSE_POST_RENAME_CUT: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
 > = std::sync::LazyLock::new(Default::default);
@@ -246,7 +248,7 @@ pub enum AcceptedImageResponseProgress {
     OutcomeUnknown,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 pub(crate) struct DeterministicImageGenerationAdapter {
     outcomes: std::sync::Mutex<std::collections::VecDeque<ImageGenerationHandoffResult>>,
     requests: std::sync::Mutex<Vec<ImageGenerationHandoffRequest>>,
@@ -258,7 +260,7 @@ pub(crate) struct DeterministicImageGenerationAdapter {
     cancellation_requests: std::sync::Mutex<Vec<ImageGenerationCancelRequest>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 impl DeterministicImageGenerationAdapter {
     pub(crate) fn new(outcomes: Vec<ImageGenerationHandoffResult>) -> Self {
         Self {
@@ -304,7 +306,7 @@ impl DeterministicImageGenerationAdapter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 struct ScriptedAcceptedResponseFetcher {
     fetches: std::sync::Mutex<std::collections::VecDeque<AcceptedImageResponseFetchOutcome>>,
     reconciliations:
@@ -313,10 +315,10 @@ struct ScriptedAcceptedResponseFetcher {
     reconcile_count: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 impl accepted_response_fetch_sealed::Sealed for ScriptedAcceptedResponseFetcher {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 #[async_trait::async_trait]
 impl AcceptedImageResponseFetcher for ScriptedAcceptedResponseFetcher {
     async fn fetch(
@@ -346,7 +348,7 @@ impl AcceptedImageResponseFetcher for ScriptedAcceptedResponseFetcher {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 impl ScriptedAcceptedResponseFetcher {
     fn new(
         fetches: Vec<AcceptedImageResponseFetchOutcome>,
@@ -361,10 +363,10 @@ impl ScriptedAcceptedResponseFetcher {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 impl image_generation_adapter_sealed::Sealed for DeterministicImageGenerationAdapter {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 #[async_trait::async_trait]
 impl ImageGenerationAdapter for DeterministicImageGenerationAdapter {
     async fn handoff(
@@ -1810,9 +1812,16 @@ impl OutputPathAuthorityId {
         &self.0
     }
 
+    /// Test-only raw constructor. `#[cfg(test)]`-gated so production code
+    /// cannot bypass the verified-output-directory constructor.
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     /// Test-only raw constructor. `#[cfg(test)]`-gated so production cannot
     /// bypass [`Self::from_verified_output_directory`].
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -2461,7 +2470,7 @@ impl ImageGenerationOwnerContextAuthority {
         let session = cockpit_db::Db::get_session_conn(conn, self.session_id)?
             .context("image generation owner session is unavailable")?;
         ensure!(
-            session.ended_at.is_none()
+            session.ended_at_unix_ms.is_none()
                 && session.project_id == self.project_id
                 && crate::intel::hex_lower(&Sha256::digest(session.project_root.as_bytes()))
                     == self.project_identity_digest,
@@ -2480,7 +2489,7 @@ impl ImageGenerationOwnerContextAuthority {
         ensure!(config_generation > 0, unavailable());
         let session =
             cockpit_db::Db::get_session_conn(conn, session_id)?.ok_or_else(unavailable)?;
-        ensure!(session.ended_at.is_none(), unavailable());
+        ensure!(session.ended_at_unix_ms.is_none(), unavailable());
         ensure!(
             principal.can_agent_write_project(&session.project_root),
             unavailable()
@@ -3251,20 +3260,31 @@ impl ImageGenerationOwnerContextAuthority {
             [],
             |row| row.get(0),
         )?;
-        let next_generation = recorded
-            .artifact_generation
-            .checked_add(1)
-            .context("security recovery generation overflow")?;
-        tx.execute("INSERT INTO image_generation_artifact_cleanup_intents(cleanup_operation_id,artifact_id,expected_artifact_generation,reason,state,version,created_at_unix_ms) VALUES(?1,?2,?3,'owner_recovery','pending',1,?4)",params![cleanup_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(next_generation)?,now])?;
-        ensure!(tx.execute("UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state='security_blocked' AND generation=?3 AND active_lease_count=0",params![now,recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?])?==1,"security recovery artifact compare-and-set lost");
-        for component in components {
-            ensure!(tx.execute("UPDATE image_generation_artifact_components SET state='cleanup_pending',generation=generation+1 WHERE artifact_id=?1 AND component_id=?2 AND state IN ('ready','security_blocked')",params![recorded.artifact_id.to_string(),component.component_id.to_string()])?==1,"security recovery component compare-and-set lost");
-        }
         let outcome = crate::intel::hex_lower(&Sha256::digest(format!(
             "cleanup:{}:{}",
             recorded.operation_id, recorded.component_set_digest
         )));
-        ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
+        let component_transitions = components
+            .iter()
+            .map(|component| RecoverImageGenerationArtifactComponent {
+                component_id: component.component_id,
+                expected_generation: component.generation,
+            })
+            .collect::<Vec<_>>();
+        cockpit_db::Db::commit_image_generation_security_cleanup_conn(
+            &tx,
+            &CommitImageGenerationSecurityCleanup {
+                recovery_operation_id: recorded.operation_id,
+                principal_digest: &self.principal_digest,
+                artifact_id: recorded.artifact_id,
+                expected_artifact_generation: recorded.artifact_generation,
+                component_set_digest: &recorded.component_set_digest,
+                cleanup_operation_id,
+                components: &component_transitions,
+                outcome_digest: &outcome,
+                now_unix_ms: now,
+            },
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -3506,14 +3526,27 @@ impl ImageGenerationOwnerContextAuthority {
             [],
             |row| row.get(0),
         )?;
-        tx.execute("INSERT INTO image_generation_user_published_outputs(publication_operation_id,artifact_id,artifact_generation,output_authority_digest,output_authority_generation,destination_name,output_evidence_json,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![publication_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,row.2,row.3,row.1,evidence,now])?;
-        ensure!(tx.execute("UPDATE image_generation_late_publication_leases SET state='published',version=version+1,output_evidence_json=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND state='security_blocked' AND version=?4",params![evidence,now,publication_operation_id.to_string(),row.0])?==1,"security publication lease compare-and-set lost");
         let outcome = crate::intel::hex_lower(&Sha256::digest(format!(
             "published:{publication_operation_id}:{evidence}"
         )));
-        ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
-        ensure!(tx.execute("UPDATE image_generation_artifacts SET state='retained',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state IN ('late_quarantined','security_blocked') AND generation=?3",params![now,recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?])?==1,"security publication artifact compare-and-set lost");
-        ensure!(tx.execute("UPDATE image_generation_slots SET state='published',version=version+1,published_disposition='late_authorized',published_disposition_generation=version+1 WHERE job_id=(SELECT job_id FROM image_generation_artifacts WHERE artifact_id=?1) AND slot_id=(SELECT slot_id FROM image_generation_artifacts WHERE artifact_id=?1) AND state='late_quarantined' AND version=?2 AND result_after_cancel=1",params![recorded.artifact_id.to_string(),row.4])?==1,"security publication slot compare-and-set lost");
+        cockpit_db::Db::commit_image_generation_security_publication_conn(
+            &tx,
+            &CommitImageGenerationSecurityPublication {
+                recovery_operation_id: recorded.operation_id,
+                principal_digest: &self.principal_digest,
+                publication_operation_id,
+                expected_lease_version,
+                artifact_id: recorded.artifact_id,
+                expected_artifact_generation: recorded.artifact_generation,
+                expected_slot_version: u64::try_from(row.4)?,
+                output_authority_digest: &row.2,
+                output_authority_generation: u64::try_from(row.3)?,
+                destination_name: &row.1,
+                output_evidence_json: &evidence,
+                outcome_digest: &outcome,
+                now_unix_ms: now,
+            },
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -3887,21 +3920,21 @@ impl VerifiedOutputDirectoryAuthority {
 
 #[derive(Debug)]
 pub struct HeldImageGenerationOutputDirectory {
-    guard: crate::private_fs::held_directory::HeldDirectoryAuthority,
+    guard: cockpit_host::private_fs::held_directory::HeldDirectoryAuthority,
     authority: VerifiedOutputDirectoryAuthority,
 }
 
 #[derive(Debug)]
 pub struct HeldImageGenerationArtifactRoot {
-    guard: crate::private_fs::held_directory::HeldDirectoryAuthority,
+    guard: cockpit_host::private_fs::held_directory::HeldDirectoryAuthority,
 }
 
 impl HeldImageGenerationArtifactRoot {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn force_next_directory_sync_failure(&self) {
         self.guard.force_next_directory_sync_failure();
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn force_accepted_response_post_rename_cut(&self, component_id: Uuid) {
         FORCE_ACCEPTED_RESPONSE_POST_RENAME_CUT
             .lock()
@@ -4195,7 +4228,9 @@ fn held_artifact_evidence_json(evidence: &HeldArtifactEvidence) -> Result<String
 
 pub fn open_image_generation_artifact_root(path: &Path) -> Result<HeldImageGenerationArtifactRoot> {
     Ok(HeldImageGenerationArtifactRoot {
-        guard: crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?,
+        guard: cockpit_host::private_fs::held_directory::HeldDirectoryAuthority::open_existing(
+            path,
+        )?,
     })
 }
 
@@ -4793,27 +4828,20 @@ pub fn retain_generated_image_artifact(
             now_unix_ms: input.now_unix_ms,
         },
     )?;
-    cockpit_db::Db::transition_image_generation_artifact_conn(
+    cockpit_db::Db::begin_image_generation_artifact_write_conn(
         conn,
-        &TransitionImageGenerationArtifact {
+        &BeginImageGenerationArtifactWrite {
             artifact_id: input.artifact_id,
             expected_generation: 1,
-            from: ImageGenerationArtifactState::Allocating,
-            to: ImageGenerationArtifactState::Writing,
             now_unix_ms: input.now_unix_ms,
-            terminal_reason: None,
         },
     )?;
-    cockpit_db::Db::transition_image_generation_artifact_component_conn(
+    cockpit_db::Db::begin_image_generation_artifact_component_write_conn(
         conn,
-        &TransitionImageGenerationArtifactComponent {
+        &BeginImageGenerationArtifactComponentWrite {
             artifact_id: input.artifact_id,
             component_id: input.component_id,
             expected_generation: 1,
-            from: ImageGenerationArtifactComponentState::Planned,
-            to: ImageGenerationArtifactComponentState::Writing,
-            stable_identity_json: None,
-            deletion_evidence_digest: None,
         },
     )?;
     let mut temporary = root.create_component_temporary(&temporary_name)?;
@@ -4882,7 +4910,7 @@ pub fn retain_generated_image_artifact(
     };
     let evidence = effect.artifact().clone();
     let evidence_json = held_artifact_evidence_json(&evidence)?;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     if FORCE_ACCEPTED_RESPONSE_POST_RENAME_CUT
         .lock()
         .unwrap()
@@ -4897,33 +4925,25 @@ pub fn retain_generated_image_artifact(
         }
         .into());
     }
-    cockpit_db::Db::transition_image_generation_artifact_component_conn(
+    cockpit_db::Db::commit_image_generation_artifact_component_ready_conn(
         conn,
-        &TransitionImageGenerationArtifactComponent {
+        &CommitImageGenerationArtifactComponentReady {
             artifact_id: input.artifact_id,
             component_id: input.component_id,
             expected_generation: 2,
-            from: ImageGenerationArtifactComponentState::Writing,
-            to: ImageGenerationArtifactComponentState::Ready,
-            stable_identity_json: Some(evidence_json),
-            deletion_evidence_digest: None,
+            stable_identity_json: &evidence_json,
         },
     )?;
-    cockpit_db::Db::transition_image_generation_artifact_conn(
-        conn,
-        &TransitionImageGenerationArtifact {
-            artifact_id: input.artifact_id,
-            expected_generation: 2,
-            from: ImageGenerationArtifactState::Writing,
-            to: if input.late_quarantined {
-                ImageGenerationArtifactState::LateQuarantined
-            } else {
-                ImageGenerationArtifactState::Retained
-            },
-            now_unix_ms: input.now_unix_ms,
-            terminal_reason: None,
-        },
-    )?;
+    let retention = CommitImageGenerationArtifactRetention {
+        artifact_id: input.artifact_id,
+        expected_generation: 2,
+        now_unix_ms: input.now_unix_ms,
+    };
+    if input.late_quarantined {
+        cockpit_db::Db::commit_image_generation_artifact_late_quarantined_conn(conn, &retention)?;
+    } else {
+        cockpit_db::Db::commit_image_generation_artifact_retained_conn(conn, &retention)?;
+    }
     Ok(evidence)
 }
 
@@ -5007,7 +5027,7 @@ impl HeldImageGenerationOutputDirectory {
     ) -> Result<HeldDirectoryEffectOutcome> {
         self.guard.delete_recovered_destination(recovery)
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn force_next_directory_sync_failure(&self) {
         self.guard.force_next_directory_sync_failure();
     }
@@ -5018,7 +5038,8 @@ pub fn open_image_generation_output_directory(
     filename_prefix: String,
     extension: String,
 ) -> Result<HeldImageGenerationOutputDirectory> {
-    let guard = crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?;
+    let guard =
+        cockpit_host::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?;
     let parent_identity_digest = guard.identity().stable_digest.clone();
     let canonical_destination_digest = digest_fields(&[
         guard.identity().platform,
@@ -5437,7 +5458,7 @@ fn valid_path_component(value: &str) -> bool {
     valid_string(value) && value != "." && value != ".." && !value.contains(['/', '\\'])
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -10225,7 +10246,7 @@ mod tests {
         let temporary = tempfile::TempDir::new().unwrap();
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
-        crate::goal_scratch::set_private(&output).unwrap();
+        cockpit_host::goal_scratch::set_private(&output).unwrap();
         assert!(
             open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
                 .is_ok()

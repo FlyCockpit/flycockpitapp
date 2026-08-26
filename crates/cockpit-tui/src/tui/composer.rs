@@ -25,6 +25,15 @@
 
 pub use cockpit_core::welcome::INPUT_PREFIX;
 
+#[path = "paste.rs"]
+mod paste;
+mod registered;
+
+pub(crate) use paste::ImageIngressDraftAuthority;
+#[cfg(test)]
+pub(crate) use registered::TestPasteKind;
+pub(crate) use registered::{ComposerMotion, RegisteredComposer};
+
 /// Display width of [`INPUT_PREFIX`] in terminal columns. Computed via
 /// `unicode-width` so wider glyphs (CJK, emoji) would size correctly if
 /// the prefix is ever changed.
@@ -51,6 +60,52 @@ pub fn display_width(s: &str) -> usize {
 pub fn display_width_char(ch: char) -> usize {
     use unicode_width::UnicodeWidthChar;
     ch.width().unwrap_or(0)
+}
+
+fn semantic_boundaries(text: &str) -> Vec<usize> {
+    let mut offset = 0usize;
+    let mut boundaries = vec![0];
+    for grapheme in crate::tui::markdown::semantic_graphemes(text) {
+        offset += grapheme.len();
+        boundaries.push(offset);
+    }
+    boundaries
+}
+
+fn semantic_boundary_at_or_before(text: &str, byte: usize) -> usize {
+    semantic_boundaries(text)
+        .into_iter()
+        .take_while(|boundary| *boundary <= byte)
+        .last()
+        .unwrap_or(0)
+}
+
+fn semantic_boundary_at_or_after(text: &str, byte: usize) -> usize {
+    semantic_boundaries(text)
+        .into_iter()
+        .find(|boundary| *boundary >= byte)
+        .unwrap_or(text.len())
+}
+
+fn semantic_boundary_before(text: &str, byte: usize) -> usize {
+    semantic_boundaries(text)
+        .into_iter()
+        .take_while(|boundary| *boundary < byte)
+        .last()
+        .unwrap_or(0)
+}
+
+fn semantic_boundary_after(text: &str, byte: usize) -> usize {
+    semantic_boundaries(text)
+        .into_iter()
+        .find(|boundary| *boundary > byte)
+        .unwrap_or(text.len())
+}
+
+#[derive(Clone, Copy)]
+enum EditIntent {
+    InsertionEnd(usize),
+    DeletionStart(usize),
 }
 
 pub fn truncate_display_width(s: &str, width: usize) -> String {
@@ -89,27 +144,32 @@ pub fn wrap_display_chunks(line: &str, budget: usize) -> Vec<(usize, usize, usiz
         let mut end = start;
         let mut last_space: Option<(usize, usize)> = None;
         let mut overflow_at: Option<usize> = None;
-        for (rel, ch) in line[start..].char_indices() {
+        let mut rel = 0usize;
+        for grapheme in crate::tui::markdown::semantic_graphemes(&line[start..]) {
             let abs = start + rel;
-            let ch_end = abs + ch.len_utf8();
-            let w = display_width_char(ch);
+            let ch_end = abs + grapheme.len();
+            let w = display_width(&grapheme);
             if col > 0 && col.saturating_add(w) > budget {
                 overflow_at = Some(abs);
                 break;
             }
             end = ch_end;
             col = col.saturating_add(w);
-            if ch == ' ' {
+            if grapheme == " " {
                 last_space = Some((ch_end, col));
             }
             if col >= budget {
                 break;
             }
+            rel += grapheme.len();
         }
         if end == start {
-            if let Some((_, ch)) = line[start..].char_indices().next() {
-                end = start + ch.len_utf8();
-                col = display_width_char(ch);
+            if let Some(grapheme) = crate::tui::markdown::semantic_graphemes(&line[start..])
+                .into_iter()
+                .next()
+            {
+                end = start + grapheme.len();
+                col = display_width(&grapheme);
             }
         } else if (overflow_at.is_some() || end < line.len())
             && let Some((space_end, space_col)) = last_space
@@ -211,9 +271,12 @@ pub fn byte_for_visual_position(
         return chunk.start_byte;
     }
     let mut used = chunk.start_col;
-    for (rel, ch) in text[chunk.start_byte..chunk.end_byte].char_indices() {
+    let mut rel = 0usize;
+    for grapheme in
+        crate::tui::markdown::semantic_graphemes(&text[chunk.start_byte..chunk.end_byte])
+    {
         let abs = chunk.start_byte + rel;
-        let w = display_width_char(ch);
+        let w = display_width(&grapheme);
         if target <= used {
             return abs;
         }
@@ -221,14 +284,16 @@ pub fn byte_for_visual_position(
             return abs;
         }
         used = used.saturating_add(w);
+        rel += grapheme.len();
     }
     chunk.end_byte
 }
 
 fn byte_for_display_col(line: &str, col: usize) -> usize {
     let mut used = 0usize;
-    for (byte, ch) in line.char_indices() {
-        let w = display_width_char(ch);
+    let mut byte = 0usize;
+    for grapheme in crate::tui::markdown::semantic_graphemes(line) {
+        let w = display_width(&grapheme);
         if col <= used {
             return byte;
         }
@@ -236,6 +301,7 @@ fn byte_for_display_col(line: &str, col: usize) -> usize {
             return byte;
         }
         used = used.saturating_add(w);
+        byte += grapheme.len();
     }
     line.len()
 }
@@ -388,6 +454,13 @@ pub enum Operator {
     Yank,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditOutcome {
+    pub removed_range: std::ops::Range<usize>,
+    pub inserted_range: std::ops::Range<usize>,
+    pub cursor: usize,
+}
+
 pub struct Composer {
     buffer: String,
     cursor: usize,
@@ -420,6 +493,26 @@ pub struct Composer {
 }
 
 impl Composer {
+    fn normalize_cursor_after_edit(&mut self, intent: EditIntent) {
+        self.cursor = match intent {
+            EditIntent::InsertionEnd(desired) => {
+                semantic_boundary_at_or_after(&self.buffer, desired.min(self.buffer.len()))
+            }
+            EditIntent::DeletionStart(desired) => {
+                semantic_boundary_at_or_before(&self.buffer, desired.min(self.buffer.len()))
+            }
+        };
+        self.debug_assert_semantic_cursor();
+    }
+
+    fn debug_assert_semantic_cursor(&self) {
+        debug_assert_eq!(
+            self.cursor,
+            semantic_boundary_at_or_before(&self.buffer, self.cursor),
+            "composer cursor must remain on a semantic grapheme boundary"
+        );
+    }
+
     pub fn new(vim_enabled: bool) -> Self {
         Self {
             buffer: String::new(),
@@ -437,6 +530,17 @@ impl Composer {
             pending_text_object: None,
             register: Register::default(),
         }
+    }
+
+    /// Construct a standalone plain-text editor with initial contents.
+    ///
+    /// This is intentionally a constructor rather than a general whole-buffer
+    /// mutator: registered application composers use [`RegisteredComposer`]
+    /// so their text and paste authority cannot be separated.
+    pub(crate) fn with_text(text: impl Into<String>, vim_enabled: bool) -> Self {
+        let mut composer = Self::new(vim_enabled);
+        composer.set_unregistered(text);
+        composer
     }
 
     pub fn set_vim_enabled(&mut self, enabled: bool) {
@@ -459,6 +563,10 @@ impl Composer {
 
     pub fn pending_find(&self) -> Option<FindSpec> {
         self.pending_find
+    }
+
+    pub fn last_find(&self) -> Option<FindSpec> {
+        self.last_find
     }
 
     pub fn set_pending_find(&mut self, spec: Option<FindSpec>) {
@@ -488,32 +596,30 @@ impl Composer {
     /// lands one char shy of the target. Stays within the current line
     /// (never crosses `\n`) and on char boundaries.
     pub fn find_target(&self, spec: FindSpec) -> Option<usize> {
+        let graphemes = crate::tui::markdown::semantic_graphemes(&self.buffer);
+        let mut offset = 0usize;
+        let clusters = graphemes
+            .into_iter()
+            .map(|grapheme| {
+                let start = offset;
+                offset += grapheme.len();
+                (start, offset, grapheme)
+            })
+            .collect::<Vec<_>>();
         if spec.forward {
             let line_end = self.buffer[self.cursor..]
                 .find('\n')
                 .map(|i| self.cursor + i)
                 .unwrap_or(self.buffer.len());
-            // Search from one char past the cursor so a repeat advances
-            // rather than re-landing on the same character.
-            let start = self.buffer[self.cursor..line_end]
-                .chars()
-                .next()
-                .map(|c| self.cursor + c.len_utf8())
-                .unwrap_or(self.cursor);
-            if start > line_end {
-                return None;
-            }
-            // `prev` tracks the char-start immediately before the char
-            // under inspection. It starts at the cursor's own char (the
-            // char right before `start`), so a `t` matching at `start`
-            // lands on the cursor cell, one shy of the target.
             let mut prev = self.cursor;
-            for (off, ch) in self.buffer[start..line_end].char_indices() {
-                let here = start + off;
-                if ch == spec.target {
-                    return Some(if spec.till { prev } else { here });
+            for (start, _end, grapheme) in clusters
+                .iter()
+                .filter(|(start, _, _)| *start > self.cursor && *start < line_end)
+            {
+                if grapheme.chars().any(|ch| ch == spec.target) {
+                    return Some(if spec.till { prev } else { *start });
                 }
-                prev = here;
+                prev = *start;
             }
             None
         } else {
@@ -521,17 +627,19 @@ impl Composer {
                 .rfind('\n')
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            let slice = &self.buffer[line_start..self.cursor];
             let mut prev_after = self.cursor;
-            for (off, ch) in slice.char_indices().rev() {
-                let here = line_start + off;
-                if ch == spec.target {
+            for (start, _end, grapheme) in clusters
+                .iter()
+                .filter(|(start, _, _)| *start >= line_start && *start < self.cursor)
+                .rev()
+            {
+                if grapheme.chars().any(|ch| ch == spec.target) {
                     // `T` lands one char *after* the target (toward the
                     // original cursor). For a repeated `T`, the cursor is
                     // already there, so `prev_after` skips it.
-                    return Some(if spec.till { prev_after } else { here });
+                    return Some(if spec.till { prev_after } else { *start });
                 }
-                prev_after = here;
+                prev_after = *start;
             }
             None
         }
@@ -589,17 +697,17 @@ impl Composer {
     fn step_over_for_till_repeat(&mut self, forward: bool) {
         if forward {
             if let Some(ch) = self.buffer[self.cursor..].chars().next() {
-                let next = self.cursor + ch.len_utf8();
+                let next = semantic_boundary_after(&self.buffer, self.cursor);
                 // Stay on the line.
                 if ch != '\n' && next <= self.buffer.len() {
                     self.cursor = next;
                 }
             }
         } else if self.cursor > 0
-            && let Some((idx, ch)) = self.buffer[..self.cursor].char_indices().next_back()
+            && let Some(ch) = self.buffer[..self.cursor].chars().next_back()
             && ch != '\n'
         {
-            self.cursor = idx;
+            self.cursor = semantic_boundary_before(&self.buffer, self.cursor);
         }
     }
 
@@ -639,6 +747,10 @@ impl Composer {
         self.cursor
     }
 
+    pub fn semantic_boundary_after_cursor(&self) -> usize {
+        semantic_boundary_after(&self.buffer, self.cursor)
+    }
+
     /// Buffer length in bytes. Used by the paste-block registry to
     /// compute the magnitude of an edit (`len_after - len_before`).
     pub fn len(&self) -> usize {
@@ -657,15 +769,16 @@ impl Composer {
         while p > 0 && !self.buffer.is_char_boundary(p) {
             p -= 1;
         }
-        self.cursor = p;
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, p);
     }
 
     /// Insert a whole string at the cursor and advance past it. Used by
     /// the paste path to drop a placeholder (or raw pasted text) in one
     /// step so the registry can record the exact byte span.
     pub fn insert_str(&mut self, s: &str) {
+        let desired = self.cursor.saturating_add(s.len());
         self.buffer.insert_str(self.cursor, s);
-        self.cursor += s.len();
+        self.normalize_cursor_after_edit(EditIntent::InsertionEnd(desired));
     }
 
     /// Run a cursor-moving motion closure without keeping its effect:
@@ -690,7 +803,10 @@ impl Composer {
         prefix: usize,
         inner_width: usize,
     ) {
-        self.cursor = byte_for_visual_position(&self.buffer, row, col, prefix, inner_width);
+        self.cursor = semantic_boundary_at_or_before(
+            &self.buffer,
+            byte_for_visual_position(&self.buffer, row, col, prefix, inner_width),
+        );
     }
 
     pub fn is_empty(&self) -> bool {
@@ -709,78 +825,81 @@ impl Composer {
         self.vim_enabled
     }
 
-    /// Reset to empty + cursor at start. Used after submit and on `Esc`
-    /// while a slash command is being composed.
-    pub fn clear(&mut self) {
+    fn clear_unregistered(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
+        self.debug_assert_semantic_cursor();
     }
 
-    /// Replace the entire buffer content, resetting cursor to end.
-    pub fn set(&mut self, text: impl Into<String>) {
+    fn set_unregistered(&mut self, text: impl Into<String>) {
         self.buffer = text.into();
         self.cursor = self.buffer.len();
+        self.debug_assert_semantic_cursor();
+    }
+
+    #[cfg(test)]
+    pub fn clear(&mut self) {
+        self.clear_unregistered();
+    }
+
+    #[cfg(test)]
+    pub fn set(&mut self, text: impl Into<String>) {
+        self.set_unregistered(text);
     }
 
     pub fn insert_char(&mut self, ch: char) {
+        let desired = self.cursor.saturating_add(ch.len_utf8());
         self.buffer.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+        self.normalize_cursor_after_edit(EditIntent::InsertionEnd(desired));
     }
 
-    pub fn delete_left(&mut self) {
+    pub fn delete_left(&mut self) -> Option<std::ops::Range<usize>> {
         if self.cursor == 0 {
-            return;
+            return None;
         }
-        let previous = self.buffer[..self.cursor]
-            .char_indices()
-            .last()
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        let old_cursor = self.cursor;
+        let previous = semantic_boundary_before(&self.buffer, self.cursor);
         self.buffer.drain(previous..self.cursor);
-        self.cursor = previous;
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(previous));
+        Some(previous..old_cursor)
     }
 
-    /// Drain the byte range `[start, end)` and place the cursor at
-    /// `start`. Used by the whole-`@`-tag delete (the range comes from a
-    /// tag-boundary scan, so it is always on char boundaries).
-    pub fn delete_range(&mut self, start: usize, end: usize) {
-        if start >= end || end > self.buffer.len() {
-            return;
+    /// Drain the semantic-grapheme-normalized range and return the actual
+    /// removed byte span for external offset registries.
+    pub fn delete_range(&mut self, start: usize, end: usize) -> Option<std::ops::Range<usize>> {
+        let start = semantic_boundary_at_or_before(&self.buffer, start.min(self.buffer.len()));
+        let end = semantic_boundary_at_or_after(&self.buffer, end.min(self.buffer.len()));
+        if start >= end {
+            return None;
         }
         self.buffer.drain(start..end);
-        self.cursor = start;
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
+        Some(start..end)
     }
 
-    pub fn delete_right(&mut self) {
+    pub fn delete_right(&mut self) -> Option<std::ops::Range<usize>> {
         if self.cursor >= self.buffer.len() {
-            return;
+            return None;
         }
-        let next_len = self.buffer[self.cursor..]
-            .chars()
-            .next()
-            .map(char::len_utf8)
-            .unwrap_or(0);
-        self.buffer.drain(self.cursor..self.cursor + next_len);
+        let start = self.cursor;
+        let next = semantic_boundary_after(&self.buffer, start);
+        self.buffer.drain(start..next);
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
+        Some(start..next)
     }
 
     pub fn move_left(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        self.cursor = self.buffer[..self.cursor]
-            .char_indices()
-            .last()
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        self.cursor = semantic_boundary_before(&self.buffer, self.cursor);
     }
 
     pub fn move_right(&mut self) {
         if self.cursor >= self.buffer.len() {
             return;
         }
-        if let Some(next) = self.buffer[self.cursor..].chars().next() {
-            self.cursor += next.len_utf8();
-        }
+        self.cursor = semantic_boundary_after(&self.buffer, self.cursor);
     }
 
     pub fn move_up(&mut self) {
@@ -797,7 +916,10 @@ impl Composer {
             .unwrap_or(0);
         let prev_line = &self.buffer[prev_line_start..prev_line_end];
         let target_byte = byte_for_display_col(prev_line, col);
-        self.cursor = prev_line_start + target_byte;
+        self.cursor = semantic_boundary_at_or_before(
+            &self.buffer,
+            prev_line_start.saturating_add(target_byte),
+        );
     }
 
     pub fn move_down(&mut self) {
@@ -815,7 +937,10 @@ impl Composer {
             .unwrap_or(buf.len());
         let next_line = &buf[next_line_start..next_line_end];
         let target_byte = byte_for_display_col(next_line, col);
-        self.cursor = next_line_start + target_byte;
+        self.cursor = semantic_boundary_at_or_before(
+            &self.buffer,
+            next_line_start.saturating_add(target_byte),
+        );
     }
 
     pub fn move_line_start(&mut self) {
@@ -823,7 +948,7 @@ impl Composer {
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        self.cursor = line_start;
+        self.set_cursor(line_start);
     }
 
     pub fn move_line_end(&mut self) {
@@ -856,6 +981,11 @@ impl Composer {
     /// whitespace boundaries only; `big_word=false` for `w` — also
     /// stops at punctuation transitions.
     pub fn move_word_forward(&mut self, big_word: bool) {
+        self.move_word_forward_scalar(big_word);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+    }
+
+    fn move_word_forward_scalar(&mut self, big_word: bool) {
         let bytes = self.buffer.as_bytes();
         let n = bytes.len();
         if self.cursor >= n {
@@ -903,7 +1033,7 @@ impl Composer {
         let end = self.cursor;
         if end > start {
             self.buffer.drain(start..end);
-            self.cursor = start;
+            self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         }
     }
 
@@ -915,6 +1045,7 @@ impl Composer {
         let start = self.cursor;
         if end > start {
             self.buffer.drain(start..end);
+            self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         }
     }
 
@@ -925,7 +1056,7 @@ impl Composer {
         let end = self.cursor;
         if end > start {
             self.buffer.drain(start..end);
-            self.cursor = start;
+            self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         }
     }
 
@@ -937,6 +1068,7 @@ impl Composer {
         let start = self.cursor;
         if end > start {
             self.buffer.drain(start..end);
+            self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         }
     }
 
@@ -965,13 +1097,13 @@ impl Composer {
             }
         };
         self.buffer.drain(start..end);
-        self.cursor = start.min(self.buffer.len());
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         // Snap to start of the (now-)current line for vim parity.
         let line_start = self.buffer[..self.cursor]
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        self.cursor = line_start;
+        self.set_cursor(line_start);
     }
 
     /// `o` — open a new empty line below the current one and land at
@@ -989,11 +1121,16 @@ impl Composer {
         // insert_char advanced the cursor past the new `\n`; step one
         // byte back so we land at the start of the empty line we just
         // opened. The `\n` is single-byte so byte-decrement is safe.
-        self.cursor = self.cursor.saturating_sub(1);
+        self.set_cursor(self.cursor.saturating_sub(1));
     }
 
     /// Vim word-backward (`b`/`B`).
     pub fn move_word_backward(&mut self, big_word: bool) {
+        self.move_word_backward_scalar(big_word);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+    }
+
+    fn move_word_backward_scalar(&mut self, big_word: bool) {
         if self.cursor == 0 {
             return;
         }
@@ -1042,6 +1179,11 @@ impl Composer {
     /// the last char of the word (inclusive), so an operator over `e`
     /// includes that char.
     pub fn move_word_end(&mut self, big_word: bool) {
+        self.move_word_end_scalar(big_word);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+    }
+
+    fn move_word_end_scalar(&mut self, big_word: bool) {
         let chars: Vec<(usize, char)> = self.buffer.char_indices().collect();
         // Index of the char the cursor sits on.
         let Some(mut i) = chars.iter().position(|(b, _)| *b >= self.cursor) else {
@@ -1075,6 +1217,11 @@ impl Composer {
     /// Vim `ge`/`gE` — move backward to the end of the previous word.
     /// Lands on the last char of that word.
     pub fn move_word_end_backward(&mut self, big_word: bool) {
+        self.move_word_end_backward_scalar(big_word);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+    }
+
+    fn move_word_end_backward_scalar(&mut self, big_word: bool) {
         if self.cursor == 0 {
             return;
         }
@@ -1220,12 +1367,10 @@ impl Composer {
                 let (lo, hi) = (anchor.min(self.cursor), anchor.max(self.cursor));
                 // Inclusive of the cell at `hi`: extend to the next char
                 // boundary (stops at buffer end).
-                let hi_inc = self.buffer[hi..]
-                    .chars()
-                    .next()
-                    .map(|c| hi + c.len_utf8())
-                    .unwrap_or(hi);
-                Some((lo, hi_inc))
+                Some((
+                    semantic_boundary_at_or_before(&self.buffer, lo),
+                    semantic_boundary_after(&self.buffer, hi),
+                ))
             }
             VimMode::VisualLine => {
                 let (lo_pos, hi_pos) = (anchor.min(self.cursor), anchor.max(self.cursor));
@@ -1247,7 +1392,9 @@ impl Composer {
     /// Yank the byte range `[start, end)` into the register without
     /// modifying the buffer. `linewise` records the register kind.
     pub fn yank_range(&mut self, start: usize, end: usize, linewise: bool) {
-        if start >= end || end > self.buffer.len() {
+        let start = semantic_boundary_at_or_before(&self.buffer, start.min(self.buffer.len()));
+        let end = semantic_boundary_at_or_after(&self.buffer, end.min(self.buffer.len()));
+        if start >= end {
             return;
         }
         let mut text = self.buffer[start..end].to_string();
@@ -1271,11 +1418,18 @@ impl Composer {
     }
 
     /// Delete the byte range `[start, end)` into the register (the `d`/`c`
-    /// path also populates the register, per vim). Leaves the cursor at
-    /// `start` clamped to a char boundary. `linewise` records the kind.
-    pub fn cut_range(&mut self, start: usize, end: usize, linewise: bool) {
-        if start >= end || end > self.buffer.len() {
-            return;
+    /// path also populates the register, per vim). Returns the actual
+    /// semantic-grapheme-normalized removed span for external registries.
+    pub fn cut_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        linewise: bool,
+    ) -> Option<std::ops::Range<usize>> {
+        let start = semantic_boundary_at_or_before(&self.buffer, start.min(self.buffer.len()));
+        let end = semantic_boundary_at_or_after(&self.buffer, end.min(self.buffer.len()));
+        if start >= end {
+            return None;
         }
         let mut text = self.buffer[start..end].to_string();
         if linewise && !text.ends_with('\n') {
@@ -1283,7 +1437,8 @@ impl Composer {
         }
         self.register = Register { text, linewise };
         self.buffer.drain(start..end);
-        self.set_cursor(start);
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
+        Some(start..end)
     }
 
     /// `p` — paste the register after the cursor (charwise) or on the line
@@ -1308,22 +1463,19 @@ impl Composer {
                 let body = text.strip_suffix('\n').unwrap_or(&text);
                 let insert = format!("\n{body}");
                 self.buffer.insert_str(line_end, &insert);
-                self.cursor = line_end + 1;
+                self.normalize_cursor_after_edit(EditIntent::InsertionEnd(line_end + 1));
             } else {
                 self.buffer.insert_str(line_end, &text);
-                self.cursor = line_end;
+                self.normalize_cursor_after_edit(EditIntent::InsertionEnd(line_end));
             }
         } else {
             // Charwise: insert after the cursor cell.
-            let at = self.buffer[self.cursor..]
-                .chars()
-                .next()
-                .map(|c| self.cursor + c.len_utf8())
-                .unwrap_or(self.cursor);
+            let at = semantic_boundary_after(&self.buffer, self.cursor);
             self.buffer.insert_str(at, &self.register.text);
             // Land on the last pasted char.
-            let end = at + self.register.text.len();
-            self.cursor = self.last_char_start_before(end);
+            let desired =
+                at + semantic_boundary_before(&self.register.text, self.register.text.len());
+            self.normalize_cursor_after_edit(EditIntent::InsertionEnd(desired));
         }
     }
 
@@ -1340,12 +1492,13 @@ impl Composer {
                 .unwrap_or(0);
             let text = self.linewise_payload();
             self.buffer.insert_str(line_start, &text);
-            self.cursor = line_start;
+            self.normalize_cursor_after_edit(EditIntent::InsertionEnd(line_start));
         } else {
             let at = self.cursor;
             self.buffer.insert_str(at, &self.register.text);
-            let end = at + self.register.text.len();
-            self.cursor = self.last_char_start_before(end);
+            let desired =
+                at + semantic_boundary_before(&self.register.text, self.register.text.len());
+            self.normalize_cursor_after_edit(EditIntent::InsertionEnd(desired));
         }
     }
 
@@ -1357,19 +1510,6 @@ impl Composer {
         } else {
             format!("{}\n", self.register.text)
         }
-    }
-
-    /// Byte offset of the *start* of the char immediately before `end`
-    /// (the last char of a `[start, end)` span). Used to land the cursor
-    /// on the last pasted char (vim `p`/`P` semantics). Returns the
-    /// nearest char boundary `< end`, or 0 when `end` is at the start.
-    fn last_char_start_before(&self, end: usize) -> usize {
-        let end = end.min(self.buffer.len());
-        self.buffer[..end]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0)
     }
 
     // ---- Text objects -----------------------------------------------
@@ -1561,15 +1701,15 @@ impl Composer {
 
     /// Replace the `@partial` immediately left of the cursor with
     /// `@{replacement}`. No-op if no `@` token is active.
-    pub fn replace_at_token(&mut self, replacement: &str) {
+    pub fn replace_at_token(&mut self, replacement: &str) -> Option<EditOutcome> {
         let Some(at_idx) = self.buffer[..self.cursor].rfind('@') else {
-            return;
+            return None;
         };
         // Confirm boundary — mirror at_query semantics.
         if at_idx > 0 {
             let prev = self.buffer[..at_idx].chars().next_back();
             if !matches!(prev, Some(c) if c.is_whitespace()) {
-                return;
+                return None;
             }
         }
         let body_end = self.cursor;
@@ -1580,7 +1720,12 @@ impl Composer {
         let new_cursor = new.len();
         new.push_str(&self.buffer[body_end..]);
         self.buffer = new;
-        self.cursor = new_cursor;
+        self.normalize_cursor_after_edit(EditIntent::InsertionEnd(new_cursor));
+        Some(EditOutcome {
+            removed_range: at_idx..body_end,
+            inserted_range: at_idx..new_cursor,
+            cursor: self.cursor,
+        })
     }
 
     /// Cursor's (line, column) measured in terminal display columns.
@@ -1607,6 +1752,13 @@ impl Composer {
     /// is **not** consumed (returns `false`) so an embedding dialog can use it
     /// to leave edit mode.
     pub fn handle_vim_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        let handled = self.handle_vim_key_inner(key);
+        self.cursor = semantic_boundary_at_or_before(&self.buffer, self.cursor);
+        self.debug_assert_semantic_cursor();
+        handled
+    }
+
+    fn handle_vim_key_inner(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
         if !self.vim_enabled {
             return self.handle_insert_key(key);
@@ -2033,11 +2185,7 @@ impl Composer {
         }
         let (lo, hi) = if from <= to {
             let hi = if inclusive {
-                self.buffer[to..]
-                    .chars()
-                    .next()
-                    .map(|c| to + c.len_utf8())
-                    .unwrap_or(to)
+                semantic_boundary_after(&self.buffer, to)
             } else {
                 to
             };
@@ -2238,12 +2386,203 @@ mod tests {
     }
 
     #[test]
+    fn semantic_grapheme_motion_and_deletion_are_atomic() {
+        let family = "👨‍👩‍👧‍👦";
+        let combining = "e\u{301}";
+        let text = format!("a{family}{combining}z");
+        let family_start = 1;
+        let family_end = family_start + family.len();
+        let combining_end = family_end + combining.len();
+        let mut composer = Composer::new(false);
+        composer.set(text.clone());
+        composer.set_cursor(family_start);
+
+        composer.move_right();
+        assert_eq!(composer.cursor(), family_end);
+        composer.move_right();
+        assert_eq!(composer.cursor(), combining_end);
+        composer.move_left();
+        assert_eq!(composer.cursor(), family_end);
+        composer.move_left();
+        assert_eq!(composer.cursor(), family_start);
+
+        composer.delete_right();
+        assert_eq!(composer.text(), format!("a{combining}z"));
+        assert_eq!(composer.cursor(), family_start);
+        composer.move_right();
+        composer.delete_left();
+        assert_eq!(composer.text(), "az");
+        assert_eq!(composer.cursor(), family_start);
+    }
+
+    #[test]
+    fn semantic_grapheme_insert_mode_keys_never_expose_interior_bytes() {
+        let family = "👩‍💻";
+        let combining = "e\u{301}";
+        let mut composer = Composer::new(false);
+        composer.set(format!("{family}{combining}"));
+        composer.set_cursor(1);
+        assert_eq!(composer.cursor(), 0, "explicit cursor snaps before family");
+
+        assert!(composer.handle_vim_key(key(KeyCode::Right)));
+        assert_eq!(composer.cursor(), family.len());
+        assert!(composer.handle_vim_key(key(KeyCode::Char('X'))));
+        assert_eq!(composer.text(), format!("{family}X{combining}"));
+        assert_eq!(composer.cursor(), family.len() + 1);
+        assert!(composer.handle_vim_key(key(KeyCode::Delete)));
+        assert_eq!(composer.text(), format!("{family}X"));
+        assert!(composer.handle_vim_key(key(KeyCode::Backspace)));
+        assert_eq!(composer.text(), family);
+        assert_eq!(composer.cursor(), family.len());
+    }
+
+    #[test]
+    fn semantic_ranges_find_and_paste_preserve_cluster_bytes() {
+        let family = "👩‍💻";
+        let combining = "e\u{301}";
+        let mut composer = Composer::new(true);
+        composer.set(format!("a{family}{combining}b"));
+        let family_start = 1;
+        let family_end = family_start + family.len();
+
+        composer.yank_range(family_start + 1, family_end - 1, false);
+        assert_eq!(composer.register().text, family);
+        composer.set_cursor(composer.len());
+        composer.paste_after();
+        assert_eq!(composer.cursor(), composer.len() - family.len());
+        assert!(composer.text().ends_with(family));
+
+        composer.set_cursor(0);
+        assert_eq!(
+            composer.find_target(FindSpec {
+                target: '\u{200d}',
+                till: true,
+                forward: true,
+            }),
+            Some(0),
+            "till lands before the whole family cluster"
+        );
+        assert!(composer.apply_find(
+            FindSpec {
+                target: '\u{200d}',
+                till: false,
+                forward: true,
+            },
+            true,
+        ));
+        assert_eq!(composer.cursor(), family_start);
+        assert!(composer.repeat_find(false));
+        assert_eq!(composer.cursor(), composer.len() - family.len());
+        assert!(composer.repeat_find(true));
+        assert_eq!(composer.cursor(), family_start);
+        composer.set_cursor(composer.len());
+        let combining_start_before_cut = composer.text().find(combining).unwrap();
+        assert_eq!(
+            composer.find_target(FindSpec {
+                target: '\u{301}',
+                till: true,
+                forward: false,
+            }),
+            Some(combining_start_before_cut + combining.len()),
+            "backward till lands after the whole combining cluster"
+        );
+
+        composer.set_cursor(family_end);
+        let removed = composer
+            .cut_range(family_start + 1, family_end - 1, false)
+            .expect("normalized cluster range");
+        assert_eq!(removed, family_start..family_end);
+        assert_eq!(composer.register().text, family);
+        assert!(!composer.text().contains("\u{200d}"));
+
+        let combining_start = composer.text().find(combining).unwrap();
+        composer.set_visual_selection(combining_start + 1, combining_start + 1);
+        let visual = composer.visual_range().expect("visual range");
+        assert_eq!(visual, combining_start..combining_start + combining.len());
+        composer.yank_range(visual.0, visual.1, false);
+        assert_eq!(composer.register().text, combining);
+    }
+
+    #[test]
+    fn edit_seams_resegment_before_the_next_mutation() {
+        let mut composer = Composer::new(false);
+
+        composer.set("👩💻");
+        composer.set_cursor("👩".len());
+        composer.insert_str("\u{200d}");
+        assert_eq!(composer.cursor(), composer.len());
+        composer.delete_left();
+        assert!(
+            composer.text().is_empty(),
+            "joined emoji deletes atomically"
+        );
+
+        composer.set("🇺X🇸");
+        let separator = "🇺".len();
+        let removed = composer
+            .delete_range(separator, separator + 1)
+            .expect("separator removed");
+        assert_eq!(removed, separator..separator + 1);
+        assert_eq!(composer.cursor(), 0, "new regional pair snaps backward");
+        composer.delete_right();
+        assert!(composer.text().is_empty());
+
+        composer.set("ᄀᆨ");
+        composer.set_cursor("ᄀ".len());
+        composer.insert_str("ᅡ");
+        assert_eq!(composer.cursor(), composer.len());
+        composer.delete_left();
+        assert!(
+            composer.text().is_empty(),
+            "Hangul Jamo cluster stays atomic"
+        );
+
+        composer.set("कष");
+        composer.set_cursor("क".len());
+        composer.insert_str("्\u{200d}");
+        assert_eq!(composer.cursor(), composer.len());
+        composer.delete_left();
+        assert!(composer.text().is_empty(), "Indic conjunct stays atomic");
+
+        composer.set("ex");
+        composer.set_cursor(1);
+        composer.insert_char('\u{301}');
+        assert_eq!(composer.cursor(), "e\u{301}".len());
+        composer.delete_left();
+        assert_eq!(composer.text(), "x");
+        composer.insert_char('a');
+        assert_eq!(composer.text(), "ax");
+    }
+
+    #[test]
     fn display_chunks_wrap_wide_glyphs_by_terminal_columns() {
         let chunks = wrap_display_chunks("中中a", 4);
         assert_eq!(
             chunks,
             vec![(0, "中中".len(), 0, 4), ("中中".len(), "中中a".len(), 0, 1)]
         );
+    }
+
+    #[test]
+    fn display_chunks_and_cell_mapping_keep_zwj_clusters_whole() {
+        let family = "👨‍👩‍👧‍👦";
+        let text = format!("a{family}b");
+        let family_start = 1;
+        let family_end = family_start + family.len();
+
+        assert_eq!(
+            wrap_display_chunks(&text, 2),
+            vec![
+                (0, 1, 0, 1),
+                (family_start, family_end, 0, 2),
+                (family_end, text.len(), 0, 1)
+            ]
+        );
+        assert_eq!(byte_for_visual_position(&text, 1, 0, 0, 2), family_start);
+        assert_eq!(byte_for_visual_position(&text, 1, 1, 0, 2), family_start);
+        assert_eq!(byte_for_visual_position(&text, 1, 2, 0, 2), family_end);
+        assert_eq!(byte_for_display_col(&text, 2), family_start);
+        assert_eq!(byte_for_display_col(&text, 3), family_end);
     }
 
     #[test]

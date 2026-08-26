@@ -72,12 +72,7 @@ impl std::error::Error for SetSandboxError {}
 /// still usable (Refuse remains the backstop). Wizard treats missing rows as
 /// unselectable.
 pub fn unpublished_host_capability_snapshot() -> HostCapabilitySnapshot {
-    HostCapabilitySnapshot {
-        generation: 0,
-        features: Vec::new(),
-        dependencies: Vec::new(),
-        secret_store: SecretStoreSnapshot::unconfigured_placeholder(),
-    }
+    HostCapabilitySnapshot::unpublished()
 }
 
 /// Test/production helper: build a snapshot with explicit sandbox feature rows.

@@ -4,10 +4,16 @@ use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
 use crate::tui::skills_pane::{SkillsPane, SkillsPaneFetchResult, SkillsPaneSource};
-use cockpit_core::daemon::proto::{Request, Response};
+use cockpit_proto::{Request, Response};
 use std::path::PathBuf;
 
 const SKILLS_LIST_ACTION: &str = "skills.list";
+
+fn next_skills_fetch_generation(current: u64) -> u64 {
+    current
+        .checked_add(1)
+        .expect("skills pane fetch generation exhausted")
+}
 
 impl App {
     pub(super) fn open_skills_pane(&mut self) {
@@ -38,7 +44,7 @@ impl App {
     }
 
     fn next_skills_pane_generation(&mut self) -> u64 {
-        self.skills_pane_generation = self.skills_pane_generation.saturating_add(1);
+        self.skills_pane_generation = next_skills_fetch_generation(self.skills_pane_generation);
         self.skills_pane_generation
     }
 
@@ -61,6 +67,21 @@ impl App {
     }
 }
 
+#[cfg(test)]
+mod generation_tests {
+    use super::next_skills_fetch_generation;
+
+    #[test]
+    fn skills_fetch_generation_never_saturates_or_reuses_maximum() {
+        assert_eq!(next_skills_fetch_generation(0), 1);
+        assert_eq!(next_skills_fetch_generation(u64::MAX - 1), u64::MAX);
+        assert!(
+            std::panic::catch_unwind(|| next_skills_fetch_generation(u64::MAX)).is_err(),
+            "exhaustion must fail closed before a stale generation can be reused"
+        );
+    }
+}
+
 async fn fetch_attached_skills(
     generation: u64,
     attached_request: AttachedRequestBinding,
@@ -77,14 +98,12 @@ async fn fetch_attached_skills(
                 generation,
                 source: SkillsPaneSource::Session,
                 skills,
-                bundle: Some(response),
             }
         }
         Err(error) => SkillsPaneFetchResult {
             generation,
             source: SkillsPaneSource::Session,
             skills: Err(error),
-            bundle: None,
         },
     }
 }

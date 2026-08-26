@@ -67,6 +67,32 @@ pub(crate) struct IngestMessageImageInput<'a> {
     pub now_monotonic_ms: u64,
 }
 
+pub(crate) struct PublishIngressImageInput {
+    pub admission_id: Uuid,
+    pub session_id: Uuid,
+    pub project_digest: String,
+    pub reservation_id: String,
+    pub request_source_digest: String,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    pub now_unix_ms: i64,
+}
+
+pub(crate) struct PublishedIngressImage {
+    pub admission_id: Uuid,
+    pub session_id: Uuid,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub availability_generation: u64,
+    pub reservation_id: String,
+    pub normalized_sha256: String,
+    pub normalized_byte_length: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub(crate) struct AcquireComponentLeaseInput {
     pub lease_id: Uuid,
     pub attachment_id: Uuid,
@@ -184,6 +210,180 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn image_ingress_draft_discard_receipt(
+        &self,
+        admission_id: Uuid,
+        session_id: Uuid,
+        local_operation_id: Uuid,
+        actor_principal_digest: String,
+        canonical_project_digest: String,
+    ) -> Result<Option<cockpit_db::media_attachments::LocalMediaMutationReceiptV1>> {
+        self.db
+            .read(move |conn| {
+                let stored = conn
+                    .query_row(
+                        "SELECT o.receipt_json FROM local_media_operations o JOIN media_ingress_admission_receipts r ON r.attachment_id=json_extract(o.receipt_json,'$.subjectId') JOIN media_attachments a ON a.attachment_id=r.attachment_id WHERE o.local_operation_id=?1 AND o.action='discard' AND r.admission_id=?2 AND r.session_id=?3 AND a.session_id=?3 AND a.canonical_project_digest=?4",
+                        params![
+                            local_operation_id.to_string(),
+                            admission_id.to_string(),
+                            session_id.to_string(),
+                            canonical_project_digest,
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let Some(json) = stored else { return Ok(None) };
+                let receipt: cockpit_db::media_attachments::LocalMediaMutationReceiptV1 =
+                    serde_json::from_str(&json)?;
+                ensure!(
+                    receipt.local_operation_id == local_operation_id
+                        && receipt.actor_principal_digest == actor_principal_digest
+                        && receipt.action == "discard",
+                    "image ingress discard replay conflict"
+                );
+                Ok(Some(receipt))
+            })
+            .await
+    }
+
+    async fn discard_ingress_publication(
+        &self,
+        admission_id: Uuid,
+        reservation_id: &str,
+        storage_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        let mut proof = Sha256::new();
+        proof.update(b"media-ingress-orphan-cleanup-v1\0");
+        proof.update(admission_id.as_bytes());
+        proof.update([0]);
+        proof.update(storage_id.as_bytes());
+        if let Some(file) = open_optional_verified(&self.owned_root, storage_id)? {
+            let identity = stable_identity_digest(&file)?;
+            self.owned_root
+                .remove_file(storage_id)
+                .map_err(anyhow::Error::new)?;
+            proof.update(identity.as_bytes());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                ensure!(
+                    file.metadata()?.nlink() == 0,
+                    "ingress orphan was not deleted"
+                );
+            }
+        }
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let cleanup = crate::intel::hex_lower(&proof.finalize());
+        let admission = admission_id.to_string();
+        let reservation = reservation_id.to_owned();
+        self.db
+            .transaction(move |conn| {
+                crate::media_reservation::destroy_verified_media_artifacts_conn(
+                    conn,
+                    &reservation,
+                    &cleanup,
+                    u64::try_from(now_unix_ms)?,
+                )?;
+                ensure!(
+                    conn.execute(
+                        "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1 AND reservation_id=?2",
+                        params![admission, reservation],
+                    )? == 1,
+                    "ingress publication intent lost"
+                );
+                Ok(())
+            })
+            .await
+    }
+
+    pub(crate) async fn ingress_image_receipt(
+        &self,
+        admission_id: Uuid,
+        session_id: Uuid,
+        request_source_digest: String,
+    ) -> Result<Option<PublishedIngressImage>> {
+        self.db.read(move |conn| {
+            conn.query_row(
+                "SELECT attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,normalized_byte_length,width,height,request_source_digest,session_id FROM media_ingress_admission_receipts WHERE admission_id=?1",
+                params![admission_id.to_string()],
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,u32>(6)?,row.get::<_,u32>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?)),
+            )
+            .optional()?
+            .map(|row| {
+                ensure!(row.8 == request_source_digest, "image ingress admission id was reused with a different source");
+                ensure!(row.9 == session_id.to_string(), "image ingress admission id belongs to a different session");
+                Ok(PublishedIngressImage {
+                admission_id,
+                session_id,
+                attachment_id: Uuid::parse_str(&row.0)?,
+                attachment_version: row.1.parse()?,
+                availability_generation: row.2.parse()?,
+                reservation_id: row.3,
+                normalized_sha256: row.4,
+                normalized_byte_length: row.5.parse()?,
+                width: row.6,
+                height: row.7,
+                })
+            })
+            .transpose()
+        }).await
+    }
+
+    /// Resolve the exact current CAS identity for an ingress-created draft.
+    /// This is intentionally daemon-only: clients retain the admission
+    /// capability, never mutable attachment generations or project authority.
+    pub(crate) async fn image_ingress_draft_discard_mutation(
+        &self,
+        admission_id: Uuid,
+        session_id: Uuid,
+        local_operation_id: Uuid,
+        actor_principal_digest: String,
+        actor_role: cockpit_db::media_attachments::LocalMediaActorRoleV1,
+        canonical_project_digest: String,
+    ) -> Result<cockpit_db::media_attachments::LocalMediaMutationV1> {
+        self.db
+            .read(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT r.attachment_id,a.attachment_version,a.availability_generation,a.reference_generation FROM media_ingress_admission_receipts r JOIN media_attachments a ON a.attachment_id=r.attachment_id WHERE r.admission_id=?1 AND r.session_id=?2 AND a.session_id=?2 AND a.canonical_project_digest=?3",
+                        params![
+                            admission_id.to_string(),
+                            session_id.to_string(),
+                            canonical_project_digest,
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    .context("media_attachment_unavailable")?;
+                Ok(cockpit_db::media_attachments::LocalMediaMutationV1 {
+                    schema_version: 1,
+                    kind: "localMediaMutation".into(),
+                    local_operation_id,
+                    actor_principal_digest,
+                    actor_role,
+                    payload: cockpit_db::media_attachments::LocalMediaMutationPayloadV1::Discard {
+                        session_id,
+                        canonical_project_digest,
+                        attachment_id: Uuid::parse_str(&row.0)?,
+                        attachment_version: row.1.parse()?,
+                        availability_generation: row.2.parse()?,
+                        reference_generation: row.3.parse()?,
+                        origin_admission_id: Some(admission_id),
+                        origin_upload: None,
+                    },
+                })
+            })
+            .await
+    }
+
     async fn finish_retained_https_orphan(
         &self,
         operation_id: Uuid,
@@ -743,6 +943,7 @@ impl MediaStorageRecovery {
             attachment_version,
             availability_generation,
             reference_generation,
+            origin_admission_id,
             origin_upload,
         } = &mutation.payload
         else {
@@ -755,10 +956,11 @@ impl MediaStorageRecovery {
             attachment_version: *attachment_version,
             availability_generation: *availability_generation,
             reference_generation: *reference_generation,
+            origin_admission_id: *origin_admission_id,
             origin_upload: origin_upload.clone(),
         };
         let domain = format!(
-            "discard:{session_id}:{canonical_project_digest}:{attachment_id}:{attachment_version}:{availability_generation}:{reference_generation}"
+            "discard:{session_id}:{canonical_project_digest}:{attachment_id}:{attachment_version}:{availability_generation}:{reference_generation}:{origin_admission_id:?}"
         );
         let (request_digest, semantic_digest) =
             cockpit_db::Db::local_media_mutation_digests(&mutation)?;
@@ -1045,6 +1247,179 @@ impl MediaStorageRecovery {
             Ok(())
         }).await
     }
+
+    /// Publish one already-normalized ingress image under the exact durable
+    /// reservation that paid for its decode and retained bytes. No upload or
+    /// second reservation is created. The publication intent makes a crash
+    /// between file creation and database visibility recoverable.
+    pub(crate) async fn publish_ingress_image(
+        &self,
+        input: PublishIngressImageInput,
+    ) -> Result<PublishedIngressImage> {
+        let PublishIngressImageInput {
+            admission_id,
+            session_id,
+            project_digest,
+            reservation_id,
+            request_source_digest,
+            bytes,
+            sha256,
+            width,
+            height,
+            now_unix_ms,
+        } = input;
+        ensure!(
+            !bytes.is_empty()
+                && crate::intel::hex_lower(&Sha256::digest(&bytes)) == sha256
+                && width > 0
+                && height > 0,
+            "media_attachment_unavailable"
+        );
+        let storage_id = Uuid::now_v7();
+        let storage_name = storage_id.to_string();
+        let intent_admission = admission_id.to_string();
+        let intent_session = session_id.to_string();
+        let intent_reservation = reservation_id.clone();
+        let intent_storage = storage_name.clone();
+        let intent_sha = sha256.clone();
+        let intent_request_digest = request_source_digest.clone();
+        self.db
+            .transaction(move |conn| {
+                conn.execute(
+                    "INSERT INTO media_ingress_publication_intents(admission_id,session_id,reservation_id,storage_id,source_sha256,request_source_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![intent_admission,intent_session,intent_reservation,intent_storage,intent_sha,intent_request_digest,now_unix_ms],
+                )?;
+                Ok(())
+            })
+            .await?;
+        let publication = (|| -> Result<(String, u64)> {
+            let mut file = self
+                .owned_root
+                .create_file_exclusive(&storage_name)
+                .map_err(anyhow::Error::new)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            let identity = stable_identity_digest(&file)?;
+            let (length, persisted_sha) = read_full_digest(&mut file)?;
+            ensure!(
+                length == bytes.len() as u64
+                    && persisted_sha == sha256
+                    && stable_identity_digest(&file)? == identity,
+                "ingress publication proof failed"
+            );
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            Ok((identity, length))
+        })();
+        let (identity, length) = match publication {
+            Ok(proof) => proof,
+            Err(error) => {
+                self.discard_ingress_publication(
+                    admission_id,
+                    &reservation_id,
+                    &storage_name,
+                    now_unix_ms,
+                )
+                .await
+                .context("failed to clean rejected ingress publication")?;
+                return Err(error);
+            }
+        };
+        let attachment_id = Uuid::now_v7();
+        let component_id = Uuid::now_v7();
+        let expires = now_unix_ms
+            .checked_add(86_400_000)
+            .context("draft expiry overflow")?;
+        let record = MediaAttachmentRecord {
+            attachment_id,
+            session_id,
+            canonical_project_digest: project_digest,
+            media_kind: MediaKind::Image,
+            source_kind: MediaSourceKind::AuthenticatedSessionUpload,
+            canonical_container: "image/png".into(),
+            canonical_mime: "image/png".into(),
+            availability: MediaAvailability::Ready,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: 1,
+            source_identity_digest: identity.clone(),
+            source_byte_length: length,
+            source_sha256: sha256.clone(),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            draft_expires_at_unix_ms: Some(expires),
+            first_referenced_at_unix_ms: None,
+        };
+        let component = cockpit_db::media_attachments::MediaAttachmentComponent {
+            component_id,
+            attachment_id,
+            attachment_version: 1,
+            component_kind: "image_model".into(),
+            storage_id,
+            lifecycle_state: "ready".into(),
+            component_generation: 1,
+            stable_identity_digest: identity,
+            byte_length: length,
+            sha256: sha256.clone(),
+            reservation_id: reservation_id.clone(),
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+        };
+        let receipt_reservation = reservation_id.clone();
+        let receipt_sha = sha256.clone();
+        let receipt_request_digest = request_source_digest;
+        let transaction_reservation = reservation_id.clone();
+        let commit = self
+            .db
+            .transaction(move |conn| {
+                cockpit_db::Db::insert_media_attachment_conn(conn, &record)?;
+                cockpit_db::Db::insert_media_attachment_component_conn(conn, &component)?;
+                conn.execute(
+                    "INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",
+                    params![component_id.to_string(),width,height],
+                )?;
+                crate::media_reservation::settle_and_publish_conn(conn, &transaction_reservation)?;
+                conn.execute(
+                    "INSERT INTO media_ingress_admission_receipts(admission_id,session_id,attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,request_source_digest,normalized_byte_length,width,height,committed_at_unix_ms) VALUES(?1,?2,?3,'1','1',?4,?5,?6,?7,?8,?9,?10)",
+                    params![admission_id.to_string(),session_id.to_string(),attachment_id.to_string(),receipt_reservation,receipt_sha,receipt_request_digest,length.to_string(),width,height,now_unix_ms],
+                )?;
+                ensure!(
+                    conn.execute(
+                        "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1 AND reservation_id=?2",
+                        params![admission_id.to_string(),transaction_reservation],
+                    )? == 1,
+                    "ingress publication intent lost"
+                );
+                Ok(())
+            })
+            .await;
+        if let Err(error) = commit {
+            self.discard_ingress_publication(
+                admission_id,
+                &reservation_id,
+                &storage_name,
+                now_unix_ms,
+            )
+            .await
+            .context("failed to roll back ingress publication")?;
+            return Err(error);
+        }
+        Ok(PublishedIngressImage {
+            admission_id,
+            session_id,
+            attachment_id,
+            attachment_version: 1,
+            availability_generation: 1,
+            reservation_id,
+            normalized_sha256: sha256,
+            normalized_byte_length: length,
+            width,
+            height,
+        })
+    }
+
     pub(crate) async fn ingest_message_image(
         &self,
         input: IngestMessageImageInput<'_>,
@@ -1157,7 +1532,7 @@ impl MediaStorageRecovery {
     pub(crate) async fn begin_due_retention(&self, now_unix_ms: i64) -> Result<usize> {
         const COMPLETED_SESSION_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
         self.db.transaction(move |conn| {
-            let candidates={let mut statement=conn.prepare("SELECT a.attachment_id,a.attachment_version,a.availability_generation,a.reference_generation,a.source_kind,a.availability,CASE WHEN a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1 THEN 'draft_expired' ELSE 'session_retention' END FROM media_attachments a JOIN sessions s ON s.session_id=a.session_id WHERE a.availability IN ('registered','quarantined','probing','decoding','normalizing','ready','model_derivative_unavailable','source_changed','failed') AND NOT EXISTS(SELECT 1 FROM media_attachment_cleanup_intents i WHERE i.attachment_id=a.attachment_id) AND NOT EXISTS(SELECT 1 FROM media_attachment_references r WHERE r.attachment_id=a.attachment_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM media_attachment_component_leases l WHERE l.attachment_id=a.attachment_id AND l.released_at_unix_ms IS NULL) AND ((a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1) OR (s.ended_at IS NOT NULL AND ?1>=s.ended_at*1000+?2)) ORDER BY a.attachment_id")?;statement.query_map(params![now_unix_ms,COMPLETED_SESSION_RETENTION_MS],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
+            let candidates={let mut statement=conn.prepare("SELECT a.attachment_id,a.attachment_version,a.availability_generation,a.reference_generation,a.source_kind,a.availability,CASE WHEN a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1 THEN 'draft_expired' ELSE 'session_retention' END FROM media_attachments a JOIN sessions s ON s.session_id=a.session_id WHERE a.availability IN ('registered','quarantined','probing','decoding','normalizing','ready','model_derivative_unavailable','source_changed','failed') AND NOT EXISTS(SELECT 1 FROM media_attachment_cleanup_intents i WHERE i.attachment_id=a.attachment_id) AND NOT EXISTS(SELECT 1 FROM media_attachment_references r WHERE r.attachment_id=a.attachment_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM media_attachment_component_leases l WHERE l.attachment_id=a.attachment_id AND l.released_at_unix_ms IS NULL) AND ((a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1) OR (s.ended_at_unix_ms IS NOT NULL AND ?1>=s.ended_at_unix_ms+?2)) ORDER BY a.attachment_id")?;statement.query_map(params![now_unix_ms,COMPLETED_SESSION_RETENTION_MS],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
             let mut started=0;
             for (attachment,version,generation,reference_generation,source_kind,from_state,reason) in candidates {
                 let components={let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?;statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
@@ -1425,6 +1800,50 @@ impl MediaStorageRecovery {
             MediaUploadLastTransitionV1, MediaUploadSystemActionV1, RemoteMediaOperationOutcomeV1,
         };
         let mut repaired = 0usize;
+        let ingress_intents = self.db.read(|conn| {
+            let mut statement = conn.prepare("SELECT admission_id,reservation_id,storage_id FROM media_ingress_publication_intents ORDER BY created_at_unix_ms,admission_id")?;
+            statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)
+        }).await?;
+        for (admission_id, reservation_id, storage_id) in ingress_intents {
+            let mut proof = Sha256::new();
+            proof.update(b"media-ingress-orphan-cleanup-v1\0");
+            proof.update(admission_id.as_bytes());
+            proof.update([0]);
+            proof.update(storage_id.as_bytes());
+            if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
+                let identity = stable_identity_digest(&file)?;
+                self.owned_root
+                    .remove_file(&storage_id)
+                    .map_err(anyhow::Error::new)?;
+                proof.update(identity.as_bytes());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    ensure!(
+                        file.metadata()?.nlink() == 0,
+                        "ingress orphan was not deleted"
+                    );
+                }
+            }
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            let cleanup = crate::intel::hex_lower(&proof.finalize());
+            self.db
+                .transaction(move |conn| {
+                    crate::media_reservation::destroy_verified_media_artifacts_conn(
+                        conn,
+                        &reservation_id,
+                        &cleanup,
+                        u64::try_from(now_unix_ms)?,
+                    )?;
+                    conn.execute(
+                        "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1",
+                        [admission_id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            repaired += 1;
+        }
         let processing_intents=self.db.read(|conn|{let mut statement=conn.prepare("SELECT job_id,output_ids_json FROM media_attachment_processing_publication_intents ORDER BY created_at_unix_ms,job_id")?;statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
         for (job, outputs_json) in processing_intents {
             let outputs: Vec<String> = serde_json::from_str(&outputs_json)?;
@@ -4878,7 +5297,7 @@ fn open_project_source(root: &Path, relative: &str) -> Result<File> {
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     let mut current = root.canonicalize()?;
     let mut held = Vec::new();
-    crate::goal_scratch::verify_private_dacl(&current)
+    cockpit_host::goal_scratch::verify_private_dacl(&current)
         .context("project root DACL is not protected")?;
     for component in Path::new(relative).components() {
         let Component::Normal(name) = component else {
@@ -4905,7 +5324,7 @@ fn open_project_source(root: &Path, relative: &str) -> Result<File> {
             meta.file_attributes() & 0x400 == 0,
             "media_attachment_unavailable"
         );
-        crate::goal_scratch::verify_private_dacl(&current)
+        cockpit_host::goal_scratch::verify_private_dacl(&current)
             .context("source component DACL is not protected")?;
         held.push(file);
     }
@@ -5905,7 +6324,7 @@ mod tests {
         std::fs::write(project.join("source.bin"), b"held borrowed source").unwrap();
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
-        db.transaction(move |conn| { conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?; Ok(()) }).await.unwrap();
+        db.transaction(move |conn| { conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?; Ok(()) }).await.unwrap();
         let recovery =
             MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
         let request = RegisterLocalPathMediaV1 {
@@ -5971,7 +6390,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
-        db.transaction(move |conn| { conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?; Ok(()) }).await.unwrap();
+        db.transaction(move |conn| { conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?; Ok(()) }).await.unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             2,
@@ -6151,7 +6570,7 @@ mod tests {
             let trigger = format!(
                 "CREATE TRIGGER fail_https_cut BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'injected retained HTTPS fault'); END;"
             );
-            db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;conn.execute_batch(&trigger)?;Ok(())}).await.unwrap();
+            db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;conn.execute_batch(&trigger)?;Ok(())}).await.unwrap();
             let recovery =
                 MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
                     .unwrap()
@@ -6247,7 +6666,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
         let fetcher = std::sync::Arc::new(RejectingHttpsFetcher(AtomicUsize::new(0)));
         let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
             .unwrap()
@@ -6312,7 +6731,7 @@ mod tests {
         let session_id = Uuid::now_v7();
         db.transaction(move |conn| {
             conn.execute(
-                "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",
                 [session_id.to_string()],
             )?;
             Ok(())
@@ -6369,7 +6788,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
         let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
             .unwrap()
             .with_https_fetcher(std::sync::Arc::new(ScriptedHttpsFetcher {
@@ -6472,7 +6891,7 @@ mod tests {
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
         db.transaction(move |conn| {
-            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
             Ok(())
         }).await.unwrap();
         let mut wav = b"RIFF".to_vec();
@@ -6559,7 +6978,7 @@ mod tests {
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
         db.transaction(move |conn| {
-            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
             Ok(())
         }).await.unwrap();
         let runtime = ApprovedAvRuntime {
@@ -6705,7 +7124,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             2,
@@ -6785,7 +7204,7 @@ mod tests {
         std::fs::write(project.join("source.bin"), b"source").unwrap();
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;conn.execute_batch("CREATE TRIGGER fail_local_evidence BEFORE INSERT ON media_local_path_registration_evidence BEGIN SELECT RAISE(ABORT,'injected registration fault'); END;")?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;conn.execute_batch("CREATE TRIGGER fail_local_evidence BEFORE INSERT ON media_local_path_registration_evidence BEGIN SELECT RAISE(ABORT,'injected registration fault'); END;")?;Ok(())}).await.unwrap();
         let recovery =
             MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
         let request = RegisterLocalPathMediaV1 {
@@ -6838,7 +7257,7 @@ mod tests {
         let database_path = temp.path().join("cockpit.db");
         let db = cockpit_db::Db::open(&database_path).unwrap();
         let session_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
         let recovery =
             MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
         let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
@@ -7491,7 +7910,7 @@ mod tests {
         let db = cockpit_db::Db::open(&database_path).unwrap();
         let session_id = Uuid::now_v7();
         db.transaction(move |conn| {
-            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;
             Ok(())
         }).await.unwrap();
         let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
@@ -7697,7 +8116,7 @@ mod tests {
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
             };
-            db.transaction(move|conn|{conn.execute("INSERT OR IGNORE INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms,published) VALUES(?1,1,'p',?2,'upload','image',?1,'settling',1,?3,100,1,1)",params![reservation,session.to_string(),index as i64+1])?;cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;for generation in 1..5{let next=[MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready][generation-1];cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,generation as u64,next,1)?;}Ok(())}).await.unwrap();
+            db.transaction(move|conn|{conn.execute("INSERT OR IGNORE INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms,published) VALUES(?1,1,'p',?2,'upload','image',?1,'settling',1,?3,100,1,1)",params![reservation,session.to_string(),index as i64+1])?;cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;for generation in 1..5{let next=[MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready][generation-1];cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,generation as u64,next,1)?;}Ok(())}).await.unwrap();
             fixtures.push((attachment, storage_id));
         }
         std::fs::write(root.join(fixtures[1].1.to_string()), b"tampered").unwrap();
@@ -7758,7 +8177,7 @@ mod tests {
             draft_expires_at_unix_ms: None,
             first_referenced_at_unix_ms: None,
         };
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;cockpit_db::Db::insert_media_attachment_conn(conn,&record(attachment))?;cockpit_db::Db::insert_media_attachment_conn(conn,&record(fault_attachment))?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;cockpit_db::Db::insert_media_attachment_conn(conn,&record(attachment))?;cockpit_db::Db::insert_media_attachment_conn(conn,&record(fault_attachment))?;Ok(())}).await.unwrap();
         let storage =
             MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
         let request = LocalMediaMutationV1 {
@@ -7774,6 +8193,7 @@ mod tests {
                 attachment_version: 1,
                 availability_generation: 1,
                 reference_generation: 1,
+                origin_admission_id: None,
                 origin_upload: None,
             },
         };
@@ -7824,6 +8244,7 @@ mod tests {
                 attachment_version: 1,
                 availability_generation: 1,
                 reference_generation: 1,
+                origin_admission_id: None,
                 origin_upload: None,
             },
         };
@@ -8002,7 +8423,7 @@ mod tests {
         let db = cockpit_db::Db::open(&database_path).unwrap();
         let session_id = Uuid::now_v7();
         db.transaction(move |conn| {
-            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;
             Ok(())
         }).await.unwrap();
         let root = temp.path().join("media");
@@ -8130,7 +8551,7 @@ mod tests {
         let session = Uuid::now_v7();
         let attachment = Uuid::now_v7();
         let component = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms) VALUES('cleanup-reservation',1,'p',?1,'cleanup','retention','cleanup-recovery','settling',1,1,1,1)",[session.to_string()])?;cockpit_db::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord{attachment_id:attachment,session_id:session,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::Quarantined,attachment_version:1,availability_generation:1,reference_generation:1,captured_capability_generation:1,source_identity_digest:"22".repeat(32),source_byte_length:length,source_sha256:checksum.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:Some(1)})?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,1,MediaAvailability::OwnedCleanupPending,1)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&MediaAttachmentComponent{component_id:component,attachment_id:attachment,attachment_version:1,component_kind:"image_model".into(),storage_id,lifecycle_state:"cleanup_pending".into(),component_generation:2,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:"cleanup-reservation".into(),created_at_unix_ms:1,updated_at_unix_ms:1})?;conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,'1','2','1',?3,'session_retention',1)",params![Uuid::now_v7().to_string(),attachment.to_string(),"33".repeat(32)])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms) VALUES('cleanup-reservation',1,'p',?1,'cleanup','retention','cleanup-recovery','settling',1,1,1,1)",[session.to_string()])?;cockpit_db::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord{attachment_id:attachment,session_id:session,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::Quarantined,attachment_version:1,availability_generation:1,reference_generation:1,captured_capability_generation:1,source_identity_digest:"22".repeat(32),source_byte_length:length,source_sha256:checksum.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:Some(1)})?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,1,MediaAvailability::OwnedCleanupPending,1)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&MediaAttachmentComponent{component_id:component,attachment_id:attachment,attachment_version:1,component_kind:"image_model".into(),storage_id,lifecycle_state:"cleanup_pending".into(),component_generation:2,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:"cleanup-reservation".into(),created_at_unix_ms:1,updated_at_unix_ms:1})?;conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,'1','2','1',?3,'session_retention',1)",params![Uuid::now_v7().to_string(),attachment.to_string(),"33".repeat(32)])?;Ok(())}).await.unwrap();
         let storage = MediaStorageRecovery::open(db.clone(), &root_path).unwrap();
         (temp, storage, db, attachment, component, storage_id)
     }
@@ -8182,7 +8603,7 @@ mod tests {
         let attachment_id = Uuid::now_v7();
         let component_id = Uuid::now_v7();
         db.transaction(move |conn| {
-            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
             cockpit_db::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord { attachment_id,session_id,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::Quarantined,attachment_version:1,availability_generation:1,reference_generation:1,captured_capability_generation:7,source_identity_digest:"22".repeat(32),source_byte_length:length,source_sha256:checksum.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:None})?;
             cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,1,1,MediaAvailability::Probing,1)?;
             cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,1,2,MediaAvailability::Decoding,1)?;
@@ -8346,7 +8767,7 @@ mod tests {
         let inserted_source_identity = source_identity.clone();
         let inserted_source_checksum = source_checksum.clone();
         db.transaction(move |conn| {
-            conn.execute("INSERT INTO sessions (session_id,project_id,project_root,started_at,last_active_at) VALUES (?1,'project','/redacted',1,1)", [session_id.to_string()])?;
+            conn.execute("INSERT INTO sessions (session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES (?1,'project','/redacted',1,1)", [session_id.to_string()])?;
             cockpit_db::Db::insert_media_attachment_conn(conn, &MediaAttachmentRecord {
                 attachment_id,
                 session_id,

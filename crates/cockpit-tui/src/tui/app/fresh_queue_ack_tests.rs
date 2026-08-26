@@ -9,7 +9,7 @@ fn item(id: u128, text: &str) -> QueuedUserMessage {
         status: QueueItemStatus::Queued,
         text: text.to_string(),
         display_text: None,
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
     }
 }
 
@@ -17,12 +17,10 @@ fn item(id: u128, text: &str) -> QueuedUserMessage {
 fn foreground_input_target_event_updates_tracked_target() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.foreground_input_target = Some(cockpit_core::engine::message::QueueTarget::root("Build"));
+    app.foreground_input_target = Some(cockpit_proto::QueueTarget::root("Build"));
 
     app.apply_event(TurnEvent::ForegroundInputTarget {
-        target: cockpit_core::engine::message::QueueTarget::child(
-            "explore", 1, "call-1", "default",
-        ),
+        target: cockpit_proto::QueueTarget::child("explore", 1, "call-1", "default"),
     });
     assert_eq!(
         app.foreground_input_target
@@ -38,7 +36,7 @@ fn foreground_input_target_event_updates_tracked_target() {
     );
 
     app.apply_event(TurnEvent::ForegroundInputTarget {
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
     });
     assert_eq!(
         app.foreground_input_target
@@ -93,14 +91,14 @@ fn fresh_queue_ack_does_not_duplicate_optimistic_user_row() {
     app.apply_event(TurnEvent::QueuedUserMessagesFolded {
         text: "fresh hello".to_string(),
         display_text: None,
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             detail: "1 line".to_string(),
             ok: true,
         }],
         queue_item_ids: vec![id],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(42),
         preflight_cleaned: None,
     });
@@ -152,7 +150,7 @@ fn queued_fold_record_pair_never_stamps_an_earlier_failed_row() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![queue_id],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(73),
         preflight_cleaned: None,
     });
@@ -194,7 +192,7 @@ fn fresh_fold_before_queue_ack_still_suppresses_optimistic_row() {
         display_text: Some("fresh race".to_string()),
         tag_expansions: Vec::new(),
         queue_item_ids: vec![id],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(49),
         preflight_cleaned: None,
     });
@@ -265,7 +263,7 @@ fn retained_retry_eventually_folds_into_the_same_optimistic_row() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![id],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(59),
         preflight_cleaned: None,
     });
@@ -322,7 +320,7 @@ fn retained_dispatch_wins_over_driver_failure_in_either_event_order() {
             display_text: None,
             tag_expansions: Vec::new(),
             queue_item_ids: vec![id],
-            target: cockpit_core::engine::message::QueueTarget::root("Build"),
+            target: cockpit_proto::QueueTarget::root("Build"),
             seq: Some(60),
             preflight_cleaned: None,
         });
@@ -347,7 +345,7 @@ fn unrelated_fold_preserves_fresh_uuid_correlation() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![other_id],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(50),
         preflight_cleaned: None,
     });
@@ -397,7 +395,7 @@ fn queued_fold_off_tail_preserves_scroll_position() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![uuid::Uuid::from_u128(10)],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(70),
         preflight_cleaned: None,
     });
@@ -417,7 +415,7 @@ fn queued_fold_at_tail_stays_live_tail() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![uuid::Uuid::from_u128(12)],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(72),
         preflight_cleaned: None,
     });
@@ -448,7 +446,7 @@ fn busy_queue_update_still_renders_and_folds_once() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![uuid::Uuid::from_u128(11)],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(77),
         preflight_cleaned: None,
     });
@@ -476,7 +474,7 @@ fn replacement_session_may_reuse_an_old_folded_uuid() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![id],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(99),
         preflight_cleaned: None,
     });
@@ -515,7 +513,7 @@ fn two_busy_queue_items_fold_once_in_order() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![uuid::Uuid::from_u128(21), uuid::Uuid::from_u128(22)],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(81),
         preflight_cleaned: None,
     });
@@ -542,7 +540,7 @@ fn one_multi_id_fold_replaces_every_optimistic_row_with_authoritative_display_te
         display_text: Some("canonical first\n\ncanonical second".to_string()),
         tag_expansions: Vec::new(),
         queue_item_ids: vec![first_id, second_id],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(82),
         preflight_cleaned: Some("cleaned fold".to_string()),
     });
@@ -580,14 +578,14 @@ fn queued_fold_event_renders_daemon_display_and_tag_metadata() {
     app.apply_event(TurnEvent::QueuedUserMessagesFolded {
         text: "<file path=\"src/lib.rs\">expanded</file>".to_string(),
         display_text: Some("queued @src/lib.rs".to_string()),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             ok: true,
             detail: "1 line".to_string(),
         }],
         queue_item_ids: vec![uuid::Uuid::from_u128(31)],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(91),
         preflight_cleaned: None,
     });

@@ -1,5 +1,15 @@
 use super::*;
 
+async fn resolve_notes_endpoint(
+    lifecycle: cockpit_client::LifecycleClient,
+) -> Result<cockpit_client::ClientEndpoint, String> {
+    lifecycle
+        .resolve(cockpit_client::LifecycleIntent::EnsurePersistent)
+        .await
+        .map(|resolution| resolution.endpoint)
+        .map_err(|error| format!("notes daemon lifecycle failed: {error}"))
+}
+
 pub(super) struct PendingLeakReveal {
     pub(super) operation_id: uuid::Uuid,
     pub(super) pane_instance_id: uuid::Uuid,
@@ -29,16 +39,16 @@ fn canonical_leak_capability(value: &str) -> bool {
 }
 
 fn cancel_leak_capability_blocking(
-    socket: &std::path::Path,
-    capability: cockpit_core::daemon::proto::LeakRevealToken,
+    endpoint: &cockpit_client::ClientEndpoint,
+    capability: cockpit_proto::LeakRevealToken,
     expected_report_id: &str,
 ) -> bool {
     matches!(
         crate::tui::agent_runner::daemon_request_at_blocking(
-            socket,
-            cockpit_core::daemon::proto::Request::CancelLeakReveal { capability },
+            endpoint,
+            cockpit_proto::Request::CancelLeakReveal { capability },
         ),
-        Ok(cockpit_core::daemon::proto::Response::LeakRevealCancelled { report_id })
+        Ok(cockpit_proto::Response::LeakRevealCancelled { report_id })
             if report_id == expected_report_id
     )
 }
@@ -48,32 +58,32 @@ impl App {
     /// slash command and the Ctrl+N keyboard shortcut. The editor mirrors the
     /// composer's vim setting so vim users get vim editing in their scratchpad.
     pub(super) fn open_scratchpad_pane(&mut self) {
-        let pane = crate::tui::notes_pane::NotesPane::open(
-            &self.launch.cwd,
-            self.composer.vim_enabled(),
-            self.startup_background.daemon_socket.clone(),
-        );
+        let mut pane =
+            crate::tui::notes_pane::NotesPane::open(&self.launch.cwd, self.composer.vim_enabled());
         let action = pane.initial_load_action();
         self.overlay = Overlay::Notes(pane);
-        if let Some(action) = action {
-            self.start_notes_rpc_action(action);
-        }
+        self.start_notes_rpc_action(action);
     }
 
     pub(super) fn start_notes_rpc_action(
         &mut self,
         action: crate::tui::notes_pane::NotesRpcAction,
     ) {
-        self.async_actions.start_blocking(
-            crate::tui::async_action::AsyncActionKind::Internal("notes.rpc"),
-            crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
-            move || {
-                action
-                    .run_blocking_rpc()
-                    .map(crate::tui::async_action::AsyncActionPayload::NotesRpc)
-                    .map_err(|e| e.to_string())
-            },
-        );
+        let lifecycle = self.lifecycle.clone();
+        let kind = crate::tui::async_action::AsyncActionKind::NotesProjection {
+            instance_id: action.instance_id(),
+            generation: action.generation(),
+        };
+        let key = crate::tui::async_action::AsyncActionKey::new(action.serialization_key());
+        self.async_actions.start_serialized(kind, key, async move {
+            let endpoint = resolve_notes_endpoint(lifecycle).await?;
+            let result = tokio::task::spawn_blocking(move || action.run_blocking_rpc(endpoint))
+                .await
+                .map_err(|error| format!("notes rpc worker failed: {error}"))?;
+            result
+                .map(crate::tui::async_action::AsyncActionPayload::NotesRpc)
+                .map_err(|error| error.to_string())
+        });
     }
 
     /// Open the `/leaks` pane (replacing the interim transcript list) and kick
@@ -93,12 +103,15 @@ impl App {
         &mut self,
         action: crate::tui::leaks_pane::LeaksRpcAction,
     ) {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            return;
+        };
         self.async_actions.start_blocking(
             crate::tui::async_action::AsyncActionKind::Internal("leaks.rpc"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             move || {
                 action
-                    .run_blocking_rpc()
+                    .run_blocking_rpc(endpoint)
                     .map(crate::tui::async_action::AsyncActionPayload::LeaksRpc)
             },
         );
@@ -121,7 +134,7 @@ impl App {
             }
             return;
         }
-        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
             if let Overlay::Leaks(pane) = &mut self.overlay {
                 pane.set_reveal_error("daemon detached — reveal unavailable");
             }
@@ -135,14 +148,12 @@ impl App {
         let _ = tokio::task::spawn_blocking(move || {
             let result = (|| {
                 let capability = match crate::tui::agent_runner::daemon_request_at_blocking(
-                    &socket,
-                    cockpit_core::daemon::proto::Request::BeginLeakReveal {
+                    &endpoint,
+                    cockpit_proto::Request::BeginLeakReveal {
                         report_id: worker_report_id.clone(),
                     },
                 ) {
-                    Ok(cockpit_core::daemon::proto::Response::LeakRevealCapability {
-                        capability,
-                    }) => capability,
+                    Ok(cockpit_proto::Response::LeakRevealCapability { capability }) => capability,
                     _ => {
                         return Err(
                             cockpit_core::daemon::leak_reveal::LeakRevealDenied::Unauthorized,
@@ -158,7 +169,7 @@ impl App {
                             .saturating_add(cockpit_core::leaks::LEAK_REVEAL_CAPABILITY_TTL_MS);
                 if !binding_valid || !worker_active.load(std::sync::atomic::Ordering::Acquire) {
                     let settled = cancel_leak_capability_blocking(
-                        &socket,
+                        &endpoint,
                         capability.capability,
                         &capability.report_id,
                     );
@@ -169,12 +180,13 @@ impl App {
                     });
                 }
                 let token = capability.capability;
-                let reveal = crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, &token);
+                let reveal =
+                    crate::tui::agent_runner::daemon_reveal_leak_blocking(&endpoint, &token);
                 if reveal.is_err() {
                     // `RateLimited` and unavailable-channel paths do not consume
                     // the slot. An authorization failure may already have spent
                     // it; exact cancel then harmlessly fails closed.
-                    let _ = cancel_leak_capability_blocking(&socket, token, &worker_report_id);
+                    let _ = cancel_leak_capability_blocking(&endpoint, token, &worker_report_id);
                 }
                 reveal
             })();
@@ -323,6 +335,61 @@ impl App {
                 self.keyboard_enhancement_active,
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod notes_lifecycle_tests {
+    use super::resolve_notes_endpoint;
+
+    #[tokio::test]
+    async fn endpoint_resolution_requests_persistent_attach_exactly_once() {
+        let (client, mut requests) = cockpit_client::LifecycleClient::channel(2);
+        let resolve = tokio::spawn(resolve_notes_endpoint(client));
+        let request = requests.recv().await.expect("one lifecycle request");
+        assert_eq!(
+            request.intent,
+            cockpit_client::LifecycleIntent::EnsurePersistent
+        );
+        let (connections, _connection_requests) = tokio::sync::mpsc::channel(1);
+        let (sensitive, _sensitive_requests) = tokio::sync::mpsc::channel(1);
+        assert!(
+            request
+                .reply
+                .send(Ok(cockpit_client::LifecycleResolution {
+                    endpoint: cockpit_client::ClientEndpoint::InProcess(
+                        cockpit_client::InProcessEndpoint::new(connections, sensitive),
+                    ),
+                    owns_daemon: false,
+                    socket: std::path::PathBuf::from("in-process"),
+                    startup_notice: None,
+                }))
+                .is_ok()
+        );
+        let endpoint = resolve.await.expect("resolver task").expect("endpoint");
+        assert!(matches!(
+            endpoint,
+            cockpit_client::ClientEndpoint::InProcess(_)
+        ));
+        request.accepted.await.expect("endpoint acceptance");
+        assert!(
+            requests.try_recv().is_err(),
+            "later attachment must not duplicate a settled intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_failure_is_a_correlated_worker_error() {
+        let (client, mut requests) = cockpit_client::LifecycleClient::channel(1);
+        let resolve = tokio::spawn(resolve_notes_endpoint(client));
+        let request = requests.recv().await.expect("lifecycle request");
+        assert!(request.reply.send(Err("attach unavailable".into())).is_ok());
+        let result = resolve.await.expect("resolver task");
+        let Err(error) = result else {
+            panic!("resolution must fail");
+        };
+        assert!(error.contains("attach unavailable"));
+        assert!(requests.try_recv().is_err());
     }
 }
 

@@ -26,8 +26,8 @@ pub struct SessionSummary {
     pub short_id: Option<String>,
     pub project_root: String,
     pub project_id: String,
-    pub started_at: i64,
-    pub last_active_at: i64,
+    pub started_at_unix_ms: i64,
+    pub last_active_at_unix_ms: i64,
     pub turns: u32,
     pub active_agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,15 +43,15 @@ pub struct SessionSummary {
     #[serde(default)]
     pub descendant_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_viewed_at: Option<i64>,
+    pub last_viewed_at_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_activity_at: Option<i64>,
+    pub latest_activity_at_unix_ms: Option<i64>,
     #[serde(default)]
     pub open_interrupts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_state: Option<SessionActivityState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archived_at: Option<i64>,
+    pub archived_at_unix_ms: Option<i64>,
     #[serde(default)]
     pub pin_count: u32,
 }

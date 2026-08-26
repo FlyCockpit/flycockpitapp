@@ -1,589 +1,44 @@
-//! Typed client over the daemon's NDJSON protocol.
+//! Daemon discovery and lifecycle composition.
 //!
-//! Spawns one background "reader/writer" task that owns the
-//! [`ProtoStream`]; callers interact through:
-//!
-//! - [`DaemonClient::request`] — send one [`proto::Request`], wait for
-//!   the matching [`proto::Response`] (or [`proto::ErrorPayload`]).
-//! - [`DaemonClient::event_stream`] — clone-able subscriber to
-//!   server-pushed events.
-//!
-//! The split lets the TUI driver fan multiple in-flight requests
-//! through one socket while also reading the event stream, without
-//! any locking ceremony in user code.
+//! Local wire framing and typed request/event transport live in
+//! `cockpit-client`; this module owns only process and daemon lifecycle.
 
-#[cfg(unix)]
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-#[cfg(unix)]
-use anyhow::Context;
-use anyhow::{Result, anyhow};
-#[cfg(unix)]
-use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
+use anyhow::{Context, Result, anyhow};
+use cockpit_client::DaemonClient;
 
-use crate::daemon::proto::{self, ErrorPayload, Request, Response};
-#[cfg(unix)]
-use crate::daemon::proto::{Body, Envelope, ProtoStream, RecvFrame};
+use crate::daemon::proto::{self, Request};
 
 static OWN_EPHEMERAL_PATHS: OnceLock<Mutex<Option<crate::daemon::DaemonPaths>>> = OnceLock::new();
 
-#[cfg(unix)]
-/// Outbound queue depth. Generous — request payloads are tiny.
-const REQUEST_QUEUE: usize = 64;
-
-#[cfg(unix)]
-/// Inbound event queue depth. Lagging consumers drop incoming events and get a
-/// typed lag marker once capacity returns. If the TUI cannot keep up, the
-/// right answer is "reattach" (the server re-sends the current session state
-/// on `Attach`).
-const EVENT_QUEUE: usize = 1024;
-
-/// Default request timeout. Most requests are < 50ms; we set a
-/// generous ceiling so a hung daemon causes a loud error rather than
-/// a stalled TUI.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Maximum wait for a freshly spawned daemon child to bind its socket and
-/// answer a status request.  A debug build paginating in a ~700MB binary
-/// under CI or test parallelism can take well past the previous 5s ceiling;
-/// 30s matches the restart-handshake budget and stays well below the
-/// interactive `DAEMON_RESTART_HANDSHAKE_TIMEOUT` (90s).
 const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(unix)]
-const MAX_BIASED_INBOUND_FRAMES: usize = 32;
+const LIFECYCLE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
-thread_local! {
-    static CONNECT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-pub fn reset_connect_call_count() {
-    CONNECT_CALLS.with(|calls| calls.set(0));
-}
-
-pub fn connect_call_count() -> usize {
-    CONNECT_CALLS.with(std::cell::Cell::get)
-}
-
-/// Whether a daemon connection failed because the peer's wire protocol is
-/// outside the supported range.
-///
-/// Keep this typed all the way through the `anyhow` boundary. Callers must not
-/// classify transport failures by matching human-readable error text.
-pub fn is_protocol_version_mismatch(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<proto::ErrorPayload>()
-        .is_some_and(|payload| payload.code == proto::ErrorCode::ProtocolVersion)
-}
-
-/// Public handle. Cheap to clone: every clone shares the same
-/// background reader/writer task; only the event-stream subscription
-/// differs.
-#[derive(Clone)]
-pub struct DaemonClient {
-    backend: ClientBackend,
-    negotiated: proto::NegotiatedProtocol,
-    /// One channel per `DaemonClient` clone, hydrated by the reader
-    /// task. We use `Arc<Mutex<_>>` because `mpsc::Receiver` isn't
-    /// `Clone` — clones of `DaemonClient` share access to the
-    /// receiver they were spawned with.
-    events: Arc<tokio::sync::Mutex<mpsc::Receiver<proto::Event>>>,
-}
-
-#[cfg(unix)]
-struct Pending {
-    id: Uuid,
-    request: Request,
-    reply: oneshot::Sender<std::result::Result<Response, ErrorPayload>>,
-}
-
-#[derive(Clone)]
-enum ClientBackend {
-    #[cfg(unix)]
-    Wire(mpsc::Sender<IoCommand>),
-    InProcess(mpsc::Sender<crate::daemon::server::InProcessRequest>),
-}
-
-#[cfg(unix)]
-enum IoCommand {
-    Request(Box<Pending>),
-    Cancel { id: Uuid },
-}
-
-impl DaemonClient {
-    /// Connect to the daemon at `socket`. Spawns the background task
-    /// before returning.
-    pub async fn connect(socket: &Path) -> Result<Self> {
-        CONNECT_CALLS.with(|calls| calls.set(calls.get() + 1));
-        if let Some(ctx) = crate::daemon::server::in_process_context(socket) {
-            return Ok(Self::from_in_process(ctx));
-        }
-        #[cfg(unix)]
-        {
-            let stream = UnixStream::connect(socket)
-                .await
-                .with_context(|| format!("connecting to {}", socket.display()))?;
-            let mut proto = ProtoStream::new(stream);
-            let negotiated = negotiate_hello(&mut proto).await?;
-            proto.set_negotiated_version(negotiated.version);
-            Ok(Self::from_proto_negotiated(proto, negotiated))
-        }
-        #[cfg(not(unix))]
-        {
-            Err(anyhow!(
-                "daemon socket transport is not supported on this platform"
-            ))
-        }
-    }
-
-    pub(crate) fn from_in_process(ctx: Arc<crate::daemon::server::DaemonContext>) -> Self {
-        let (request_tx, event_rx) = crate::daemon::server::spawn_in_process_client(ctx);
-        Self {
-            backend: ClientBackend::InProcess(request_tx),
-            negotiated: proto::NegotiatedProtocol::current(),
-            events: Arc::new(tokio::sync::Mutex::new(event_rx)),
-        }
-    }
-
-    #[cfg(unix)]
-    #[cfg(test)]
-    fn from_proto(proto: ProtoStream<UnixStream>) -> Self {
-        Self::from_proto_negotiated(proto, proto::NegotiatedProtocol::current())
-    }
-
-    #[cfg(unix)]
-    fn from_proto_negotiated(
-        proto: ProtoStream<UnixStream>,
-        negotiated: proto::NegotiatedProtocol,
-    ) -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<IoCommand>(REQUEST_QUEUE);
-        let (event_tx, event_rx) = mpsc::channel::<proto::Event>(EVENT_QUEUE);
-        tokio::spawn(run_io(proto, request_rx, event_tx));
-        Self {
-            backend: ClientBackend::Wire(request_tx),
-            negotiated,
-            events: Arc::new(tokio::sync::Mutex::new(event_rx)),
-        }
-    }
-
-    pub fn negotiated(&self) -> &proto::NegotiatedProtocol {
-        &self.negotiated
-    }
-
-    /// Send a request and wait for the matching response. Returns the
-    /// daemon's typed [`proto::ErrorPayload`] when the request was
-    /// rejected, distinct from transport / timeout errors which come
-    /// back as `Err(anyhow)`.
-    pub async fn request(
-        &self,
-        request: Request,
-    ) -> Result<std::result::Result<Response, ErrorPayload>> {
-        let (tx, rx) = oneshot::channel();
-        #[cfg(unix)]
-        let id = Uuid::new_v4();
-        match &self.backend {
-            #[cfg(unix)]
-            ClientBackend::Wire(request_tx) => {
-                request_tx
-                    .send(IoCommand::Request(Box::new(Pending {
-                        id,
-                        request,
-                        reply: tx,
-                    })))
-                    .await
-                    .map_err(|_| anyhow!("daemon client task has stopped"))?;
-                match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-                    Ok(Ok(result)) => Ok(result),
-                    Ok(Err(_)) => Err(anyhow!("daemon client dropped reply channel")),
-                    Err(_) => {
-                        let _ = request_tx.send(IoCommand::Cancel { id }).await;
-                        Err(anyhow!("request timed out after {:?}", REQUEST_TIMEOUT))
-                    }
-                }
-            }
-            ClientBackend::InProcess(request_tx) => {
-                request_tx
-                    .send(crate::daemon::server::InProcessRequest { request, reply: tx })
-                    .await
-                    .map_err(|_| anyhow!("in-process daemon client task has stopped"))?;
-                match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-                    Ok(Ok(result)) => Ok(result),
-                    Ok(Err(_)) => Err(anyhow!("in-process daemon client dropped reply channel")),
-                    Err(_) => Err(anyhow!("request timed out after {:?}", REQUEST_TIMEOUT)),
-                }
-            }
-        }
-    }
-
-    /// Convenience: send a request, unwrap typed errors as `Err`.
-    pub async fn request_ok(&self, request: Request) -> Result<Response> {
-        match self.request(request).await? {
-            Ok(r) => Ok(r),
-            Err(e) => Err(anyhow!("daemon error: {e}")),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub async fn steer_delegation(
-        &self,
-        session_id: Uuid,
-        task_call_id: impl Into<String>,
-        label: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Result<proto::DelegationSteerResult> {
-        match self
-            .request_ok(Request::SteerDelegation {
-                session_id,
-                task_call_id: task_call_id.into(),
-                label: label.into(),
-                message: message.into(),
-            })
-            .await?
-        {
-            Response::DelegationSteer { result } => Ok(result),
-            other => Err(anyhow!("unexpected steer delegation response: {other:?}")),
-        }
-    }
-
-    /// Pull the next server-pushed event. Returns `None` when the
-    /// connection has closed. Multi-call from multiple cloned
-    /// clients is fine; each event is delivered to exactly one
-    /// caller (we don't use broadcast on the client side because
-    /// the TUI is the single consumer; the broadcast lives on the
-    /// daemon side where multi-client is the design point).
-    pub async fn next_event(&self) -> Option<proto::Event> {
-        let mut events = self.events.lock().await;
-        events.recv().await
-    }
-
-    pub fn is_socket_backed(&self) -> bool {
-        #[cfg(unix)]
-        {
-            matches!(self.backend, ClientBackend::Wire(_))
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn negotiate_hello(
-    proto_stream: &mut ProtoStream<UnixStream>,
-) -> Result<proto::NegotiatedProtocol> {
-    let line = match tokio::time::timeout(Duration::from_millis(500), proto_stream.recv_raw_line())
+async fn retain_guard_after_acceptance<G>(
+    guard: Option<G>,
+    accepted: tokio::sync::oneshot::Receiver<()>,
+    retained: &mut Vec<G>,
+) {
+    if tokio::time::timeout(LIFECYCLE_ACCEPT_TIMEOUT, accepted)
         .await
+        .is_ok_and(|accepted| accepted.is_ok())
+        && let Some(guard) = guard
     {
-        Ok(Ok(Some(line))) => line,
-        Ok(Ok(None)) => {
-            return Err(protocol_handshake_error(
-                "daemon closed the connection before its hello",
-            ));
-        }
-        Ok(Err(error)) => {
-            tracing::debug!(error = %error, "daemon hello unreadable");
-            return Err(protocol_handshake_error("daemon hello could not be read"));
-        }
-        Err(_) => {
-            return Err(protocol_handshake_error("daemon hello timed out"));
-        }
-    };
-
-    let Some(hello) = (match proto::parse_daemon_hello_line(&line) {
-        Ok(hello) => hello,
-        Err(error) => {
-            tracing::debug!(error = %error, "daemon hello unparseable");
-            return Err(protocol_handshake_error("daemon hello was malformed"));
-        }
-    }) else {
-        return Err(protocol_handshake_error(
-            "first daemon frame was not a daemon-status hello",
-        ));
-    };
-
-    proto::NegotiatedProtocol::from_hello(&hello).map_err(anyhow::Error::new)
-}
-
-#[cfg(unix)]
-fn protocol_handshake_error(reason: &'static str) -> anyhow::Error {
-    anyhow::Error::new(proto::ErrorPayload {
-        code: proto::ErrorCode::ProtocolVersion,
-        message: format!(
-            "daemon protocol handshake failed: {reason}; run `cockpit daemon restart`"
-        ),
-    })
-}
-
-#[cfg(unix)]
-async fn run_io(
-    mut proto: ProtoStream<UnixStream>,
-    mut request_rx: mpsc::Receiver<IoCommand>,
-    event_tx: mpsc::Sender<proto::Event>,
-) {
-    let mut pending: HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>> =
-        HashMap::new();
-    let mut inbound_burst = InboundBurst::default();
-    let mut dropped_events: u64 = 0;
-    let mut attached_session: Option<Uuid> = None;
-
-    loop {
-        if inbound_burst.should_probe_outbound() {
-            match request_rx.try_recv() {
-                Ok(cmd) => {
-                    inbound_burst.reset();
-                    if !handle_io_command(cmd, &mut proto, &mut pending).await {
-                        break;
-                    }
-                    continue;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => inbound_burst.reset(),
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        tokio::select! {
-            biased;
-
-            permit = event_tx.reserve(), if dropped_events > 0 => {
-                match permit {
-                    Ok(permit) => {
-                        let dropped = dropped_events;
-                        permit.send(proto::Event::EventStreamLagged {
-                            session_id: None,
-                            dropped,
-                        });
-                        dropped_events = 0;
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
-            }
-
-            // Inbound envelope from the daemon.
-            recv = proto.recv() => {
-                inbound_burst.record_inbound();
-                match recv {
-                    Ok(None) => {
-                        tracing::debug!("daemon closed the connection");
-                        break;
-                    }
-                    Ok(Some(RecvFrame::Envelope(env))) => {
-                        match env.body {
-                            Body::Response { id, response } => {
-                                let response = *response;
-                                if let Some(tx) = pending.remove(&id) {
-                                    if let Response::Attached { session_id, .. } = &response {
-                                        attached_session = Some(*session_id);
-                                    }
-                                    let _ = tx.send(Ok(response));
-                                } else if is_nil_daemon_status_hello(id, &response) {
-                                    tracing::debug!("daemon hello status received");
-                                } else {
-                                    tracing::warn!(id = %id, "daemon responded with unknown id");
-                                }
-                            }
-                            Body::Error { id, error } => {
-                                match id {
-                                    Some(id) => {
-                                        if let Some(tx) = pending.remove(&id) {
-                                            let _ = tx.send(Err(error));
-                                        } else {
-                                            tracing::warn!(id = %id, ?error, "daemon error for unknown id");
-                                        }
-                                    }
-                                    None => {
-                                        tracing::warn!(?error, "out-of-band daemon error");
-                                        let text = format!("daemon error: {error}");
-                                        let event = match attached_session {
-                                            Some(session_id) => proto::Event::Notice {
-                                                session_id,
-                                                text,
-                                            },
-                                            None => proto::Event::LspNotice { text },
-                                        };
-                                        try_forward_event(&event_tx, event, &mut dropped_events);
-                                    }
-                                }
-                            }
-                            Body::Event { event } => {
-                                try_forward_event(&event_tx, event, &mut dropped_events);
-                            }
-                            Body::Request { id, request, .. } => {
-                                tracing::warn!(id = %id, ?request, "daemon sent a request to a client; ignoring");
-                            }
-                            #[cfg(feature = "remote")]
-                            Body::RemoteReplayRequest(_)
-                            | Body::RemoteReplayResponse(_)
-                            | Body::RemoteReplayAck(_)
-                            | Body::RemoteReplayAckResponse(_) => {
-                                tracing::debug!("ignoring remote replay control frame on local client transport");
-                            }
-                            Body::Unknown => {
-                                tracing::debug!("dropping unknown daemon protocol body");
-                            }
-                        }
-                    }
-                    Ok(Some(RecvFrame::VersionMismatch { v, id, .. })) => {
-                        if let Some(id) = id
-                            && let Some(tx) = pending.remove(&id)
-                        {
-                            let _ = tx.send(Err(ErrorPayload {
-                                code: proto::ErrorCode::ProtocolVersion,
-                                message: proto::version_mismatch_message(v),
-                            }));
-                        }
-                        break;
-                    }
-                    Ok(Some(RecvFrame::Unknown { v, kind, tag, id })) => {
-                        if matches!(kind.as_str(), "res" | "err")
-                            && let Some(id) = id
-                            && let Some(tx) = pending.remove(&id)
-                        {
-                            let _ = tx.send(Err(proto::unsupported_request_error(v, tag.as_deref())));
-                        } else {
-                            tracing::debug!(
-                                version = v,
-                                kind,
-                                ?tag,
-                                ?id,
-                                "dropping unknown daemon protocol frame"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = ?e, "daemon read failed; closing");
-                        break;
-                    }
-                }
-            }
-
-            // Outbound request from the user.
-            cmd = request_rx.recv() => {
-                inbound_burst.reset();
-                let Some(cmd) = cmd else {
-                    break;
-                };
-                if !handle_io_command(cmd, &mut proto, &mut pending).await {
-                    break;
-                }
-            }
-        }
-    }
-
-    // Drain any pending requests with an explicit "connection closed."
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(ErrorPayload {
-            code: proto::ErrorCode::Internal,
-            message: "daemon connection closed".into(),
-        }));
-    }
-
-    if dropped_events > 0 {
-        emit_lag_marker_on_close(&event_tx, dropped_events).await;
+        retained.push(guard);
     }
 }
 
-#[cfg(unix)]
-async fn emit_lag_marker_on_close(event_tx: &mpsc::Sender<proto::Event>, dropped: u64) {
-    if dropped == 0 {
-        return;
+fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
+    match intent {
+        cockpit_client::LifecycleIntent::AttachOrAutoPromote
+        | cockpit_client::LifecycleIntent::EnsurePersistent => LifecycleMode::AttachOrAutoPromote,
+        cockpit_client::LifecycleIntent::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
+        cockpit_client::LifecycleIntent::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
+        cockpit_client::LifecycleIntent::AttachOwnEphemeral => LifecycleMode::AttachOwnEphemeral,
     }
-    if let Ok(permit) = event_tx.reserve().await {
-        permit.send(proto::Event::EventStreamLagged {
-            session_id: None,
-            dropped,
-        });
-    }
-}
-
-#[cfg(unix)]
-fn try_forward_event(
-    event_tx: &mpsc::Sender<proto::Event>,
-    event: proto::Event,
-    dropped_events: &mut u64,
-) {
-    match event_tx.try_send(event) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            *dropped_events = dropped_events.saturating_add(1);
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            // The consumer dropped; keep reading the socket so OS buffers do
-            // not fill while request senders wind down through their channel.
-        }
-    }
-}
-
-#[cfg(unix)]
-#[derive(Default)]
-struct InboundBurst {
-    frames: usize,
-}
-
-#[cfg(unix)]
-impl InboundBurst {
-    fn record_inbound(&mut self) {
-        self.frames = self.frames.saturating_add(1);
-    }
-
-    fn reset(&mut self) {
-        self.frames = 0;
-    }
-
-    fn should_probe_outbound(&self) -> bool {
-        self.frames >= MAX_BIASED_INBOUND_FRAMES
-    }
-}
-
-#[cfg(unix)]
-async fn handle_io_command(
-    cmd: IoCommand,
-    proto: &mut ProtoStream<UnixStream>,
-    pending: &mut HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>>,
-) -> bool {
-    match cmd {
-        IoCommand::Cancel { id } => {
-            if remove_pending_request(pending, id).is_some() {
-                tracing::debug!(id = %id, "daemon request timed out; removed pending entry");
-            }
-            true
-        }
-        IoCommand::Request(p) => {
-            let id = p.id;
-            pending.insert(id, p.reply);
-            let envelope = Envelope::request(id, p.request);
-            if let Err(e) = proto.send(&envelope).await {
-                tracing::warn!(error = ?e, "daemon write failed");
-                if let Some(tx) = pending.remove(&id) {
-                    let _ = tx.send(Err(ErrorPayload {
-                        code: proto::ErrorCode::Internal,
-                        message: format!("write to daemon failed: {e}"),
-                    }));
-                }
-                false
-            } else {
-                true
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn remove_pending_request(
-    pending: &mut HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>>,
-    id: Uuid,
-) -> Option<oneshot::Sender<std::result::Result<Response, ErrorPayload>>> {
-    pending.remove(&id)
-}
-
-#[cfg(any(unix, test))]
-fn is_nil_daemon_status_hello(id: Uuid, response: &Response) -> bool {
-    id.is_nil() && matches!(response, Response::DaemonStatus { .. })
 }
 
 // ---- lifecycle helpers ----------------------------------------------------
@@ -617,43 +72,371 @@ pub enum LifecycleMode {
 /// Connect-or-spawn result: a ready-to-use client plus a flag the
 /// caller honors when it's time to shut down — `owns_daemon = true`
 /// means "you spawned this daemon, so stop it on your way out."
-pub struct ConnectedDaemon {
-    pub client: DaemonClient,
-    pub owns_daemon: bool,
-    pub socket: PathBuf,
-    pub startup_notice: Option<String>,
+pub(crate) struct ConnectedDaemon {
+    client: DaemonClient,
+    endpoint: cockpit_client::ClientEndpoint,
+    owns_daemon: bool,
+    socket: PathBuf,
+    startup_notice: Option<String>,
     /// Provisional ownership begins in `probe_or_spawn` immediately after an
     /// ephemeral child is created. Callers must explicitly take this guard
     /// when publishing a longer-lived owner; every abandoned/error path drops
     /// it and reaps the child.
     owned_daemon_guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    owned_in_process_guard: Option<crate::daemon::InProcessDaemonGuard>,
+}
+
+enum OwnedDaemonGuard {
+    Process(crate::daemon::ephemeral_guard::EphemeralDaemonGuard),
+    InProcess(crate::daemon::InProcessDaemonGuard),
+}
+
+impl OwnedDaemonGuard {
+    fn begin_shutdown(&mut self) {
+        if let Self::InProcess(guard) = self {
+            guard.begin_shutdown();
+        }
+    }
+
+    fn shutdown_force_handle(&self) -> Option<crate::daemon::shutdown::ShutdownSignal> {
+        match self {
+            Self::Process(_) => None,
+            Self::InProcess(guard) => Some(guard.shutdown_force_handle()),
+        }
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        match self {
+            Self::Process(guard) => {
+                let (completed, completion) = tokio::sync::oneshot::channel();
+                let owner = std::thread::Builder::new()
+                    .name("cockpit-ephemeral-daemon-owner".to_string())
+                    .spawn(move || {
+                        let result = guard.shutdown();
+                        drop(guard);
+                        let _ = completed.send(result);
+                    })
+                    .context("spawning ephemeral daemon owner teardown")?;
+                crate::daemon::reap_daemon_owner_thread(owner);
+                completion
+                    .await
+                    .context("ephemeral daemon owner teardown stopped")?
+            }
+            Self::InProcess(guard) => guard.shutdown().await,
+        }
+    }
 }
 
 impl ConnectedDaemon {
-    pub fn take_owned_daemon_guard(
+    pub(crate) fn take_owned_daemon_guard(
         &mut self,
     ) -> Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard> {
         self.owned_daemon_guard.take()
     }
+
+    fn take_lifecycle_guard(&mut self) -> Option<OwnedDaemonGuard> {
+        self.owned_daemon_guard
+            .take()
+            .map(OwnedDaemonGuard::Process)
+            .or_else(|| {
+                self.owned_in_process_guard
+                    .take()
+                    .map(OwnedDaemonGuard::InProcess)
+            })
+    }
+}
+
+/// Foreground CLI connection whose ephemeral process ownership cannot be
+/// separated from its client. Construction arms signal cleanup before the
+/// value is published; [`finish`](Self::finish) joins that cleanup and
+/// combines it with the command result.
+struct OwnedDaemonSession {
+    client: DaemonClient,
+    guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    signal_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Foreground command modes that can only resolve to an attached persistent
+/// daemon or an exactly owned child process. In-process TUI ownership is
+/// intentionally absent because it requires a different async guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedSessionMode {
+    AttachOrAutoPromote,
+    AttachOrEphemeral,
+    AlwaysEphemeral,
+}
+
+impl OwnedSessionMode {
+    fn lifecycle(self) -> LifecycleMode {
+        match self {
+            Self::AttachOrAutoPromote => LifecycleMode::AttachOrAutoPromote,
+            Self::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
+            Self::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
+        }
+    }
+}
+
+impl OwnedDaemonSession {
+    async fn connect(mode: OwnedSessionMode) -> Result<Self> {
+        let mut connected = probe_or_spawn(mode.lifecycle()).await?;
+        let guard = connected.take_owned_daemon_guard();
+        let signal_task =
+            match crate::daemon::ephemeral_guard::spawn_signal_shutdown(guard.as_ref(), true) {
+                Ok(task) => task,
+                Err(error) => {
+                    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
+                    drop(guard);
+                    return crate::daemon::ephemeral_guard::aggregate_shutdown_result(
+                        Err::<Self, _>(error.context("arming owned-daemon signal cleanup")),
+                        shutdown,
+                    );
+                }
+            };
+        Ok(Self {
+            client: connected.client,
+            guard,
+            signal_task,
+        })
+    }
+
+    fn client(&self) -> &DaemonClient {
+        &self.client
+    }
+
+    async fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        let signal_task = self.signal_task.take();
+        if let Some(task) = &signal_task {
+            task.abort();
+        }
+        let shutdown = self.guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
+        self.guard.take();
+        if let Some(task) = signal_task {
+            let _ = task.await;
+        }
+        crate::daemon::ephemeral_guard::aggregate_shutdown_result(result, shutdown)
+    }
+}
+
+/// Run one foreground operation while this module retains inseparable
+/// ownership of any ephemeral daemon it starts. The operation can only borrow
+/// the authority-free client; every return path joins signal cleanup and
+/// aggregates the operation and exact-child shutdown results.
+#[derive(Debug, thiserror::Error)]
+pub enum OwnedDaemonRunError {
+    #[error("connecting to owned daemon: {0:#}")]
+    Connect(#[source] anyhow::Error),
+    #[error(transparent)]
+    OperationOrCleanup(#[from] anyhow::Error),
+}
+
+/// A lifetime-bound view of a daemon client for one owned foreground run.
+///
+/// This capability deliberately cannot be cloned or converted back into a
+/// [`DaemonClient`]. Its lifetime is tied to the runner callback, so neither
+/// it nor a borrow derived from it can escape the operation.
+pub struct ScopedDaemonClient<'session> {
+    client: &'session DaemonClient,
+}
+
+impl ScopedDaemonClient<'_> {
+    pub async fn request(
+        &self,
+        request: proto::Request,
+    ) -> anyhow::Result<std::result::Result<proto::Response, proto::ErrorPayload>> {
+        self.client.request(request).await
+    }
+
+    pub async fn request_ok(&self, request: proto::Request) -> anyhow::Result<proto::Response> {
+        self.client.request_ok(request).await
+    }
+
+    pub async fn next_event(&self) -> Option<proto::Event> {
+        self.client.next_event().await
+    }
+
+    pub fn negotiated(&self) -> &proto::NegotiatedProtocol {
+        self.client.negotiated()
+    }
+}
+
+impl OwnedDaemonRunError {
+    pub fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Connect(error) | Self::OperationOrCleanup(error) => error,
+        }
+    }
+}
+
+pub async fn run_owned_daemon<T, F>(
+    mode: OwnedSessionMode,
+    operation: F,
+) -> std::result::Result<T, OwnedDaemonRunError>
+where
+    F: for<'client> std::ops::FnOnce(
+            ScopedDaemonClient<'client>,
+        ) -> std::pin::Pin<
+            std::boxed::Box<dyn std::future::Future<Output = anyhow::Result<T>> + 'client>,
+        >,
+{
+    let session = OwnedDaemonSession::connect(mode)
+        .await
+        .map_err(OwnedDaemonRunError::Connect)?;
+    let result = operation(ScopedDaemonClient {
+        client: session.client(),
+    })
+    .await;
+    session
+        .finish(result)
+        .await
+        .map_err(OwnedDaemonRunError::OperationOrCleanup)
+}
+
+impl Drop for OwnedDaemonSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.signal_task.take() {
+            task.abort();
+        }
+        // `guard` deliberately remains armed. Its Drop joins the same exact
+        // cleanup used by explicit finish and signal-driven teardown.
+    }
+}
+
+/// Persistent-only daemon connection. It contains no process-ownership guard,
+/// so exposing the client cannot detach an ephemeral child.
+pub struct PersistentDaemonSession {
+    pub client: DaemonClient,
 }
 
 /// Attach to the canonical persistent daemon, spawning one if needed.
 ///
 /// Product CLI commands that need installation state must go through this
 /// helper. Spawn failure is fail-closed: callers must not open SQLite.
-pub async fn ensure_persistent_daemon() -> Result<ConnectedDaemon> {
+pub async fn ensure_persistent_daemon() -> Result<PersistentDaemonSession> {
     let connected = probe_or_spawn(LifecycleMode::AttachOrAutoPromote).await?;
     if connected.owns_daemon {
         anyhow::bail!(
             "persistent daemon attach produced an ephemeral instance; refusing secret or workspace writes"
         );
     }
-    Ok(connected)
+    Ok(PersistentDaemonSession {
+        client: connected.client,
+    })
+}
+
+/// Run the lifecycle half of the two-phase TUI composition. The CLI owns this
+/// task; the TUI can request typed lifecycle policy but cannot probe, spawn,
+/// restart, or retain daemon process guards itself.
+pub async fn serve_lifecycle_requests(
+    mut requests: tokio::sync::mpsc::Receiver<cockpit_client::LifecycleRequest>,
+) -> Result<()> {
+    let mut owned_daemons = Vec::new();
+    while let Some(request) = requests.recv().await {
+        // A queued request may be cancelled before the lifecycle actor sees
+        // it. Never spawn a daemon for a receiver that is already gone.
+        if request.reply.is_closed() {
+            continue;
+        }
+        let mode = mode_for_intent(request.intent);
+        let resolved = probe_or_spawn(mode).await.and_then(|mut connected| {
+            if matches!(
+                request.intent,
+                cockpit_client::LifecycleIntent::EnsurePersistent
+            ) && connected.owns_daemon
+            {
+                anyhow::bail!("persistent lifecycle request resolved to an ephemeral daemon");
+            }
+            let guard = connected.take_lifecycle_guard();
+            Ok((
+                cockpit_client::LifecycleResolution {
+                    endpoint: connected.endpoint,
+                    owns_daemon: connected.owns_daemon,
+                    socket: connected.socket,
+                    startup_notice: connected.startup_notice,
+                },
+                guard,
+            ))
+        });
+        match resolved {
+            Ok((resolution, guard)) => {
+                if request.reply.send(Ok(resolution)).is_err() {
+                    // `guard` drops here and reaps an unaccepted ephemeral.
+                    continue;
+                }
+                retain_guard_after_acceptance(guard, request.accepted, &mut owned_daemons).await;
+                // A cancelled/missing acceptance drops the guard here.
+            }
+            Err(error) => {
+                let _ = request.reply.send(Err(error.to_string()));
+            }
+        }
+    }
+    // Start every owned daemon before waiting for any one of them. A single
+    // slow teardown must not consume the grace period of all later owners.
+    for guard in &mut owned_daemons {
+        guard.begin_shutdown();
+    }
+    let force_handles = owned_daemons
+        .iter()
+        .filter_map(OwnedDaemonGuard::shutdown_force_handle)
+        .collect::<Vec<_>>();
+    let mut shutdowns = std::pin::pin!(futures::future::join_all(
+        owned_daemons.into_iter().map(OwnedDaemonGuard::shutdown)
+    ));
+    let graceful_deadline =
+        crate::daemon::shutdown::SHUTDOWN_DRAIN_GRACE + std::time::Duration::from_secs(5);
+    let (outcomes, forced) = match tokio::time::timeout(graceful_deadline, &mut shutdowns).await {
+        Ok(outcomes) => (outcomes, false),
+        Err(_) => {
+            // Each in-process supervisor owns its context on an independent
+            // OS thread. Promote every still-running context to Forced, then
+            // join all supervisors instead of abandoning them with the CLI
+            // runtime. Process stop requests run concurrently in the same
+            // join set and remain bounded independently.
+            for force in &force_handles {
+                force.force();
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut shutdowns).await {
+                Ok(outcomes) => (outcomes, true),
+                Err(_) => {
+                    // Dropping the join set transfers every in-process
+                    // supervisor to the runtime-independent reaper through
+                    // its guard's Drop. Never wait forever or claim clean.
+                    anyhow::bail!(
+                        "owned daemon cleanup remained incomplete after the forced terminal deadline"
+                    )
+                }
+            }
+        }
+    };
+    let mut failures = outcomes
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if forced {
+        failures.push("owned daemon cleanup exceeded its graceful deadline and was forced".into());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// Test-support composition owned below frontends. TUI tests receive only the
+/// client capability and never construct or drive core lifecycle requests.
+#[cfg(feature = "test-support")]
+pub fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
+    let (client, requests) = cockpit_client::LifecycleClient::channel(8);
+    tokio::spawn(async move {
+        let _ = serve_lifecycle_requests(requests).await;
+    });
+    client
 }
 
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
-pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
+pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
     use crate::daemon::{
         DaemonPaths, DaemonStatus, discover, spawn_detached, spawn_detached_ephemeral,
     };
@@ -675,6 +458,9 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                             tracing::info!(pid, "daemon version skew auto-restart completed");
                             let client = wait_for_daemon(&discovered.paths.socket).await?;
                             return Ok(ConnectedDaemon {
+                                endpoint: cockpit_client::ClientEndpoint::Wire(
+                                    discovered.paths.socket.clone(),
+                                ),
                                 client,
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
@@ -686,6 +472,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                                         .to_string(),
                                 }),
                                 owned_daemon_guard: None,
+                                owned_in_process_guard: None,
                             });
                         }
                         Ok(crate::daemon::skew_restart::SkewRestartOutcome::Refused {
@@ -702,11 +489,15 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                             );
                             let client = DaemonClient::connect(&discovered.paths.socket).await?;
                             return Ok(ConnectedDaemon {
+                                endpoint: cockpit_client::ClientEndpoint::Wire(
+                                    discovered.paths.socket.clone(),
+                                ),
                                 client,
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
                                 startup_notice,
                                 owned_daemon_guard: None,
+                                owned_in_process_guard: None,
                             });
                         }
                         Ok(crate::daemon::skew_restart::SkewRestartOutcome::NoticeOnly {
@@ -715,12 +506,16 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                             tracing::info!("daemon version skew surfaced without auto-restart");
                             let client = DaemonClient::connect(&discovered.paths.socket).await?;
                             return Ok(ConnectedDaemon {
+                                endpoint: cockpit_client::ClientEndpoint::Wire(
+                                    discovered.paths.socket.clone(),
+                                ),
                                 client,
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
                                 startup_notice: reason
                                     .map(|reason| format!("daemon version skew: {reason}")),
                                 owned_daemon_guard: None,
+                                owned_in_process_guard: None,
                             });
                         }
                         Ok(
@@ -734,11 +529,13 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                 }
                 let client = DaemonClient::connect(&discovered.paths.socket).await?;
                 return Ok(ConnectedDaemon {
+                    endpoint: cockpit_client::ClientEndpoint::Wire(discovered.paths.socket.clone()),
                     client,
                     owns_daemon: false,
                     socket: discovered.paths.socket,
                     startup_notice: None,
                     owned_daemon_guard: None,
+                    owned_in_process_guard: None,
                 });
             }
             if matches!(
@@ -766,17 +563,20 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             // key, but `DaemonClient::connect` resolves it to the registered
             // in-process context instead of opening a Unix socket.
             let own = own_ephemeral_paths()?;
-            let ctx = crate::daemon::boot_in_process(
+            let (in_process_endpoint, guard) = crate::daemon::boot_in_process(
                 own.clone(),
                 crate::daemon::terminal::default_host_factory(),
             )
             .await?;
+            let endpoint = cockpit_client::ClientEndpoint::InProcess(in_process_endpoint);
             return Ok(ConnectedDaemon {
-                client: DaemonClient::from_in_process(ctx),
-                owns_daemon: false,
+                client: DaemonClient::connect_endpoint(&endpoint).await?,
+                endpoint,
+                owns_daemon: guard.is_some(),
                 socket: own.socket,
                 startup_notice: None,
                 owned_daemon_guard: None,
+                owned_in_process_guard: guard,
             });
         }
         LifecycleMode::AlwaysEphemeral => {
@@ -809,11 +609,12 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             LifecycleMode::AttachOwnEphemeral => own_ephemeral_paths()?,
             _ => DaemonPaths::allocate_ephemeral()?,
         };
-        let pid = spawn_detached_ephemeral(&paths)?;
+        let child = spawn_detached_ephemeral(&paths)?;
+        let pid = child.id();
         // Arm ownership before any await or other cancellation point. From
         // here onward every early return owns a guard whose Drop stops exactly
         // this pid+nonce daemon.
-        let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.socket.clone());
+        let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.clone(), child);
         (paths, pid, Some(guard))
     } else {
         // Auto-promoted persistent daemon: never `--no-sandbox` from a
@@ -835,13 +636,18 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
 
     // Wait for the socket + a successful handshake.
     let client = wait_for_daemon(&paths.socket).await?;
+    if let Some(guard) = owned_daemon_guard.as_ref() {
+        guard.bind_published_receipt()?;
+    }
 
     Ok(ConnectedDaemon {
+        endpoint: cockpit_client::ClientEndpoint::Wire(paths.socket.clone()),
         client,
         owns_daemon: ephemeral,
         socket: paths.socket,
         startup_notice: None,
         owned_daemon_guard,
+        owned_in_process_guard: None,
     })
 }
 
@@ -917,17 +723,82 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
 }
 
 #[cfg(test)]
+pub(super) fn temp_ephemeral_paths(root: &std::path::Path, stem: &str) -> super::DaemonPaths {
+    super::DaemonPaths {
+        socket: root.join(format!("{stem}.sock")),
+        pid_file: root.join(format!("{stem}.pid")),
+        ephemeral: true,
+    }
+}
+
+#[cfg(test)]
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::daemon::DaemonPaths;
-    use tokio::net::UnixListener;
+    use crate::daemon::proto::Response;
+
+    #[tokio::test]
+    async fn dropping_owned_session_aborts_watcher_and_runs_guard_cleanup() {
+        use tokio::io::AsyncBufReadExt as _;
+
+        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                if let Some(notify) = self.0.take() {
+                    let _ = notify.send(());
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("owned-session.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let stop = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            line
+        });
+        let (requests, _request_rx) = tokio::sync::mpsc::channel(1);
+        let (_events, event_rx) = tokio::sync::mpsc::channel(1);
+        let client = DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+            requests,
+            events: event_rx,
+        });
+        let (watcher_dropped, watcher_drop) = tokio::sync::oneshot::channel();
+        let signal_task = tokio::spawn(async move {
+            let _notify = NotifyDrop(Some(watcher_dropped));
+            std::future::pending::<()>().await;
+        });
+        let session = OwnedDaemonSession {
+            client,
+            guard: Some(
+                crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new_for_socket(socket),
+            ),
+            signal_task: Some(signal_task),
+        };
+
+        tokio::task::spawn_blocking(move || drop(session))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), watcher_drop)
+            .await
+            .expect("signal watcher was detached")
+            .unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(2), stop)
+            .await
+            .expect("guard cleanup did not contact daemon")
+            .unwrap();
+        assert!(line.contains("stop_daemon"));
+    }
 
     #[test]
     fn ephemeral_spawn_arms_raii_before_the_first_wait() {
         let source = include_str!("client.rs");
         let spawn = source
-            .find("let pid = spawn_detached_ephemeral(&paths)?;")
+            .find("let child = spawn_detached_ephemeral(&paths)?;")
             .expect("ephemeral spawn funnel");
         let arm = source[spawn..]
             .find("EphemeralDaemonGuard::new")
@@ -941,692 +812,6 @@ mod tests {
             spawn < arm && arm < wait,
             "no cancellation window before RAII"
         );
-    }
-
-    fn lsp_event(text: impl Into<String>) -> proto::Event {
-        proto::Event::LspNotice { text: text.into() }
-    }
-
-    fn daemon_status_response() -> Response {
-        daemon_status_response_with(proto::DAEMON_VERSION, proto::PROTOCOL_VERSION)
-    }
-
-    fn daemon_status_response_with(
-        daemon_version: impl Into<String>,
-        protocol_version: u32,
-    ) -> Response {
-        Response::DaemonStatus {
-            pid: 1,
-            uptime_secs: 2,
-            active_sessions: 0,
-            socket_path: "/tmp/cockpit.sock".to_string(),
-            daemon_version: daemon_version.into(),
-            protocol_version,
-            paused_sessions: 0,
-            database_path: ":memory:".to_string(),
-            schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
-        }
-    }
-
-    fn attach_request(session_id: Option<Uuid>) -> Request {
-        attach_request_with_client_protocol_version(session_id, proto::PROTOCOL_VERSION)
-    }
-
-    fn attach_request_with_client_protocol_version(
-        session_id: Option<Uuid>,
-        client_protocol_version: u32,
-    ) -> Request {
-        Request::Attach {
-            session_id,
-            since_seq: None,
-            project_root: Some("/tmp".into()),
-            initial_model: None,
-            no_sandbox: false,
-            interactive: true,
-            model_override: None,
-            client_protocol_version,
-            env_snapshot: None,
-            env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
-        }
-    }
-
-    fn attached_response(session_id: Uuid) -> Response {
-        Response::Attached {
-            session_id,
-            short_id: "abc123".to_string(),
-            project_root: "/tmp".to_string(),
-            project_id: "project".to_string(),
-            active_agent: "Build".to_string(),
-            active_agent_path: Vec::new(),
-            foreground_target: None,
-            active_subagent: None,
-            active_model_state: None,
-            history: Vec::new(),
-            paused_work: Vec::new(),
-            repair_required: None,
-            daemon_version: proto::DAEMON_VERSION.to_string(),
-            compatible: true,
-            env_baseline: None,
-            env_session: None,
-            env_drift: None,
-            env_policy_applied: crate::env_snapshot::EnvDriftPolicy::Daemon,
-            btw_fork: None,
-        }
-    }
-
-    async fn recv_request_id(daemon: &mut ProtoStream<UnixStream>) -> Uuid {
-        match daemon.recv().await.unwrap().unwrap() {
-            proto::RecvFrame::Envelope(env) => match env.body {
-                Body::Request { id, .. } => id,
-                other => panic!("expected request body, got {other:?}"),
-            },
-            other => panic!("expected request envelope, got {other:?}"),
-        }
-    }
-
-    fn temp_ephemeral_paths(root: &std::path::Path, stem: &str) -> DaemonPaths {
-        DaemonPaths {
-            socket: root.join(format!("{stem}.sock")),
-            pid_file: root.join(format!("{stem}.pid")),
-            ephemeral: true,
-        }
-    }
-
-    fn bind_test_socket() -> (tempfile::TempDir, PathBuf, UnixListener) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket).expect("bind daemon socket");
-        (dir, socket, listener)
-    }
-
-    async fn send_daemon_hello(
-        daemon: &mut ProtoStream<UnixStream>,
-        daemon_version: impl Into<String>,
-        protocol_version: u32,
-    ) {
-        daemon
-            .send(&Envelope::response(
-                Uuid::nil(),
-                daemon_status_response_with(daemon_version, protocol_version),
-            ))
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn nil_daemon_status_is_known_hello() {
-        assert!(is_nil_daemon_status_hello(
-            Uuid::nil(),
-            &Response::DaemonStatus {
-                pid: 1,
-                uptime_secs: 1,
-                active_sessions: 0,
-                socket_path: "/tmp/cockpit.sock".to_string(),
-                daemon_version: "0.1.test".to_string(),
-                protocol_version: proto::PROTOCOL_VERSION,
-                paused_sessions: 0,
-                database_path: "/tmp/cockpit.db".to_string(),
-                schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
-            },
-        ));
-    }
-
-    #[test]
-    fn non_nil_or_non_status_still_unknown() {
-        assert!(!is_nil_daemon_status_hello(
-            Uuid::new_v4(),
-            &Response::DaemonStatus {
-                pid: 1,
-                uptime_secs: 1,
-                active_sessions: 0,
-                socket_path: "/tmp/cockpit.sock".to_string(),
-                daemon_version: "0.1.test".to_string(),
-                protocol_version: proto::PROTOCOL_VERSION,
-                paused_sessions: 0,
-                database_path: "/tmp/cockpit.db".to_string(),
-                schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
-            },
-        ));
-        assert!(!is_nil_daemon_status_hello(Uuid::nil(), &Response::Ack));
-    }
-
-    #[tokio::test]
-    async fn negotiation_parses_daemon_hello_on_connect() {
-        let (_dir, socket, listener) = bind_test_socket();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
-        });
-
-        let client = DaemonClient::connect(&socket).await.unwrap();
-
-        assert_eq!(client.negotiated().daemon_version, "0.1.handshake");
-        assert_eq!(
-            client.negotiated().daemon_protocol_version,
-            proto::PROTOCOL_VERSION
-        );
-        assert_eq!(client.negotiated().version, proto::PROTOCOL_VERSION);
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn negotiation_preserves_typed_protocol_version_mismatch() {
-        let (_dir, socket, listener) = bind_test_socket();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(&mut daemon, "0.1.incompatible", proto::PROTOCOL_VERSION + 1).await;
-        });
-
-        let error = match DaemonClient::connect(&socket).await {
-            Ok(_) => panic!("an incompatible daemon hello must reject the connection"),
-            Err(error) => error,
-        };
-
-        assert!(is_protocol_version_mismatch(&error));
-        let payload = error
-            .downcast_ref::<proto::ErrorPayload>()
-            .expect("the typed protocol error must survive the anyhow boundary");
-        assert_eq!(payload.code, proto::ErrorCode::ProtocolVersion);
-        assert!(!is_protocol_version_mismatch(&anyhow!(
-            "wire protocol version mismatch in unrelated transport text"
-        )));
-        server.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn negotiation_rejects_a_daemon_that_does_not_send_a_hello() {
-        let (_dir, socket, listener) = bind_test_socket();
-        let server = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        });
-        let connect = tokio::spawn({
-            let socket = socket.clone();
-            async move { DaemonClient::connect(&socket).await }
-        });
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(500)).await;
-        let error = match connect.await.unwrap() {
-            Ok(_) => panic!("missing hello must fail closed"),
-            Err(error) => error,
-        };
-        assert!(is_protocol_version_mismatch(&error));
-        let payload = error
-            .downcast_ref::<proto::ErrorPayload>()
-            .expect("missing hello must preserve a typed protocol error");
-        assert_eq!(payload.code, proto::ErrorCode::ProtocolVersion);
-        assert!(payload.message.contains("hello timed out"));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
-        let (_dir, socket, listener) = bind_test_socket();
-        let session_id = Uuid::new_v4();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(
-                &mut daemon,
-                "0.1.handshake",
-                proto::MIN_SUPPORTED_PROTOCOL_VERSION,
-            )
-            .await;
-            daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
-            let request_id = match daemon.recv().await.unwrap().unwrap() {
-                proto::RecvFrame::Envelope(env) => match env.body {
-                    Body::Request { id, request, .. } => {
-                        match request {
-                            Request::Attach {
-                                client_protocol_version,
-                                ..
-                            } => assert_eq!(
-                                client_protocol_version,
-                                proto::MIN_SUPPORTED_PROTOCOL_VERSION
-                            ),
-                            other => panic!("expected attach request, got {other:?}"),
-                        }
-                        id
-                    }
-                    other => panic!("expected request body, got {other:?}"),
-                },
-                other => panic!("expected request envelope, got {other:?}"),
-            };
-            daemon
-                .send(&Envelope::response(
-                    request_id,
-                    attached_response(session_id),
-                ))
-                .await
-                .unwrap();
-        });
-
-        let client = DaemonClient::connect(&socket).await.unwrap();
-        client
-            .request(attach_request_with_client_protocol_version(
-                Some(session_id),
-                client.negotiated().version,
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-
-        server.await.unwrap();
-    }
-
-    #[test]
-    fn inbound_burst_probes_outbound_after_thirty_two_frames() {
-        let mut burst = InboundBurst::default();
-        for _ in 0..(MAX_BIASED_INBOUND_FRAMES - 1) {
-            burst.record_inbound();
-            assert!(!burst.should_probe_outbound());
-        }
-        burst.record_inbound();
-        assert!(burst.should_probe_outbound());
-        burst.reset();
-        assert!(!burst.should_probe_outbound());
-    }
-
-    #[test]
-    fn pending_cancel_removes_entry_and_late_repeat_is_ignored() {
-        let id = Uuid::new_v4();
-        let (tx, _rx) = oneshot::channel();
-        let mut pending = HashMap::new();
-        pending.insert(id, tx);
-
-        assert!(remove_pending_request(&mut pending, id).is_some());
-        assert!(pending.is_empty());
-        assert!(remove_pending_request(&mut pending, id).is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn full_event_queue_does_not_block_pending_requests() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
-        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
-        let mut daemon = ProtoStream::new(daemon_stream);
-
-        let daemon_task = tokio::spawn(async move {
-            for i in 0..(EVENT_QUEUE + 100) {
-                daemon
-                    .send(&Envelope::event(lsp_event(format!("event-{i}"))))
-                    .await
-                    .unwrap();
-            }
-            let id = recv_request_id(&mut daemon).await;
-            daemon
-                .send(&Envelope::response(id, daemon_status_response()))
-                .await
-                .unwrap();
-        });
-
-        let response = client
-            .request(Request::DaemonStatus)
-            .await
-            .unwrap()
-            .expect("full event queue must not block request handling");
-        assert!(matches!(response, Response::DaemonStatus { .. }));
-        daemon_task.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn dropped_events_emit_exactly_one_lag_marker() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
-        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
-        let mut daemon = ProtoStream::new(daemon_stream);
-        const DROPPED: usize = 7;
-
-        let daemon_task = tokio::spawn(async move {
-            for i in 0..EVENT_QUEUE {
-                daemon
-                    .send(&Envelope::event(lsp_event(format!("pre-{i}"))))
-                    .await
-                    .unwrap();
-            }
-            for i in 0..DROPPED {
-                daemon
-                    .send(&Envelope::event(lsp_event(format!("drop-{i}"))))
-                    .await
-                    .unwrap();
-            }
-
-            let id = recv_request_id(&mut daemon).await;
-            daemon
-                .send(&Envelope::response(id, daemon_status_response()))
-                .await
-                .unwrap();
-        });
-
-        client
-            .request(Request::DaemonStatus)
-            .await
-            .unwrap()
-            .expect("request proves all pre-lag frames were read before the response");
-
-        for expected in 0..2 {
-            assert!(matches!(
-                client.next_event().await,
-                Some(proto::Event::LspNotice { text }) if text == format!("pre-{expected}")
-            ));
-        }
-
-        for expected in 2..EVENT_QUEUE {
-            assert!(matches!(
-                client.next_event().await,
-                Some(proto::Event::LspNotice { text }) if text == format!("pre-{expected}")
-            ));
-        }
-
-        assert!(matches!(
-            client.next_event().await,
-            Some(proto::Event::EventStreamLagged {
-                session_id: None,
-                dropped
-            }) if dropped == DROPPED as u64
-        ));
-        match tokio::time::timeout(Duration::from_millis(1), client.next_event()).await {
-            Err(_) | Ok(None) => {}
-            Ok(Some(event)) => assert!(
-                !matches!(event, proto::Event::EventStreamLagged { .. }),
-                "one contiguous lag episode should produce exactly one marker"
-            ),
-        }
-        daemon_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn out_of_band_lag_error_is_surfaced_not_discarded() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
-        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
-        let mut daemon = ProtoStream::new(daemon_stream);
-        let session_id = Uuid::new_v4();
-
-        let request = client.request(attach_request(Some(session_id)));
-        let daemon_reply = async {
-            let attach_id = recv_request_id(&mut daemon).await;
-            daemon
-                .send(&Envelope::response(
-                    attach_id,
-                    attached_response(session_id),
-                ))
-                .await
-                .unwrap();
-            daemon
-                .send(&Envelope::error(
-                    None,
-                    ErrorPayload {
-                        code: proto::ErrorCode::Internal,
-                        message: format!("event stream {} by 9; re-attach", "lagged"),
-                    },
-                ))
-                .await
-                .unwrap();
-        };
-
-        let (result, _) = tokio::join!(request, daemon_reply);
-        result.unwrap().expect("attach succeeds");
-        assert!(matches!(
-            client.next_event().await,
-            Some(proto::Event::Notice {
-                session_id: observed,
-                text
-            }) if observed == session_id
-                && text.contains(&format!("event stream {} by 9; re-attach", "lagged"))
-        ));
-    }
-
-    #[tokio::test]
-    async fn pre_attach_out_of_band_error_is_surfaced_not_discarded() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
-        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
-        let mut daemon = ProtoStream::new(daemon_stream);
-
-        daemon
-            .send(&Envelope::error(
-                None,
-                ErrorPayload {
-                    code: proto::ErrorCode::Internal,
-                    message: "daemon boot warning".to_string(),
-                },
-            ))
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            client.next_event().await,
-            Some(proto::Event::LspNotice { text })
-                if text.contains("daemon boot warning")
-        ));
-    }
-
-    #[tokio::test]
-    async fn client_routes_protocol_version_error_to_pending_attach() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
-        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
-        let mut daemon = ProtoStream::new(daemon_stream);
-
-        let request = client.request(Request::Attach {
-            session_id: None,
-            since_seq: None,
-            project_root: Some("/tmp".into()),
-            initial_model: None,
-            no_sandbox: false,
-            interactive: true,
-            model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
-            env_snapshot: None,
-            env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
-        });
-        let daemon_reply = async {
-            let id = match daemon.recv().await.unwrap().unwrap() {
-                proto::RecvFrame::Envelope(env) => match env.body {
-                    Body::Request { id, .. } => id,
-                    other => panic!("expected request body, got {other:?}"),
-                },
-                other => panic!("expected request envelope, got {other:?}"),
-            };
-            daemon
-                .send_raw_line(
-                    serde_json::json!({
-                        "v": 999,
-                        "kind": "err",
-                        "id": id,
-                        "error": {
-                            "code": "protocol_version",
-                            "message": "too new"
-                        }
-                    })
-                    .to_string(),
-                )
-                .await
-                .unwrap();
-        };
-
-        let (result, _) = tokio::join!(request, daemon_reply);
-        let err = result
-            .unwrap()
-            .expect_err("attach should receive typed protocol error");
-        assert_eq!(err.code, proto::ErrorCode::ProtocolVersion);
-        assert!(err.message.contains("wire protocol version mismatch"));
-    }
-
-    #[tokio::test]
-    async fn unknown_frame_response_resolves_pending_request_with_error() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
-        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
-        let mut daemon = ProtoStream::new(daemon_stream);
-
-        let daemon_reply = tokio::spawn(async move {
-            let id = match daemon.recv().await.unwrap().unwrap() {
-                proto::RecvFrame::Envelope(env) => match env.body {
-                    Body::Request { id, .. } => id,
-                    other => panic!("expected request body, got {other:?}"),
-                },
-                other => panic!("expected request envelope, got {other:?}"),
-            };
-            daemon
-                .send_raw_line(
-                    serde_json::json!({
-                        "v": proto::PROTOCOL_VERSION,
-                        "kind": "res",
-                        "id": id,
-                        "response": "future_response",
-                        "data": { "future": true }
-                    })
-                    .to_string(),
-                )
-                .await
-                .unwrap();
-            let id = match daemon.recv().await.unwrap().unwrap() {
-                proto::RecvFrame::Envelope(env) => match env.body {
-                    Body::Request { id, .. } => id,
-                    other => panic!("expected request body, got {other:?}"),
-                },
-                other => panic!("expected request envelope, got {other:?}"),
-            };
-            daemon
-                .send(&Envelope::response(
-                    id,
-                    Response::DaemonStatus {
-                        pid: 1,
-                        uptime_secs: 2,
-                        active_sessions: 0,
-                        socket_path: "/tmp/cockpit.sock".to_string(),
-                        daemon_version: proto::DAEMON_VERSION.to_string(),
-                        protocol_version: proto::PROTOCOL_VERSION,
-                        paused_sessions: 0,
-                        database_path: ":memory:".to_string(),
-                        schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
-                    },
-                ))
-                .await
-                .unwrap();
-        });
-
-        let err = client
-            .request(Request::DaemonStatus)
-            .await
-            .unwrap()
-            .expect_err("unknown response should resolve pending request with error");
-        assert_eq!(err.code, proto::ErrorCode::UnsupportedRequest);
-        assert_eq!(
-            err.message,
-            format!(
-                "unsupported request \"future_response\" in protocol v{}; this daemon speaks v{}",
-                proto::PROTOCOL_VERSION,
-                proto::PROTOCOL_VERSION
-            )
-        );
-
-        let response = client
-            .request(Request::DaemonStatus)
-            .await
-            .unwrap()
-            .expect("unknown response must not close client IO loop");
-        assert!(matches!(response, Response::DaemonStatus { .. }));
-        daemon_reply.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn unknown_frame_error_resolves_pending_request_with_error() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
-        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
-        let mut daemon = ProtoStream::new(daemon_stream);
-
-        let request = client.request(Request::DaemonStatus);
-        let daemon_reply = async {
-            let id = match daemon.recv().await.unwrap().unwrap() {
-                proto::RecvFrame::Envelope(env) => match env.body {
-                    Body::Request { id, .. } => id,
-                    other => panic!("expected request body, got {other:?}"),
-                },
-                other => panic!("expected request envelope, got {other:?}"),
-            };
-            daemon
-                .send_raw_line(
-                    serde_json::json!({
-                        "v": proto::PROTOCOL_VERSION,
-                        "kind": "err",
-                        "id": id,
-                        "error": {
-                            "code": "future_error",
-                            "message": "future error shape"
-                        }
-                    })
-                    .to_string(),
-                )
-                .await
-                .unwrap();
-        };
-
-        let (result, _) = tokio::join!(request, daemon_reply);
-        let err = result
-            .unwrap()
-            .expect_err("unknown error should resolve pending request with error");
-        assert_eq!(err.code, proto::ErrorCode::UnsupportedRequest);
-        assert_eq!(
-            err.message,
-            format!(
-                "unsupported request \"future_error\" in protocol v{}; this daemon speaks v{}",
-                proto::PROTOCOL_VERSION,
-                proto::PROTOCOL_VERSION
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_frame_event_does_not_close_client_io_loop() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
-        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
-        let mut daemon = ProtoStream::new(daemon_stream);
-
-        let request = client.request(Request::DaemonStatus);
-        let daemon_reply = async {
-            let id = match daemon.recv().await.unwrap().unwrap() {
-                proto::RecvFrame::Envelope(env) => match env.body {
-                    Body::Request { id, .. } => id,
-                    other => panic!("expected request body, got {other:?}"),
-                },
-                other => panic!("expected request envelope, got {other:?}"),
-            };
-            daemon
-                .send_raw_line(
-                    serde_json::json!({
-                        "v": proto::PROTOCOL_VERSION,
-                        "kind": "evt",
-                        "event": "future_event",
-                        "data": { "future": true }
-                    })
-                    .to_string(),
-                )
-                .await
-                .unwrap();
-            daemon
-                .send(&Envelope::response(
-                    id,
-                    Response::DaemonStatus {
-                        pid: 1,
-                        uptime_secs: 2,
-                        active_sessions: 0,
-                        socket_path: "/tmp/cockpit.sock".to_string(),
-                        daemon_version: proto::DAEMON_VERSION.to_string(),
-                        protocol_version: proto::PROTOCOL_VERSION,
-                        paused_sessions: 0,
-                        database_path: ":memory:".to_string(),
-                        schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
-                    },
-                ))
-                .await
-                .unwrap();
-        };
-
-        let (result, _) = tokio::join!(request, daemon_reply);
-        let response = result
-            .unwrap()
-            .expect("unknown event must not close client IO loop");
-        assert!(matches!(response, Response::DaemonStatus { .. }));
     }
 
     /// Daemonless = own ephemeral daemon (`daemonless-tui-ephemeral-lifecycle.md`
@@ -1737,5 +922,77 @@ mod tests {
 
         assert_ne!(first.socket, second.socket);
         assert_ne!(first.pid_file, second.pid_file);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_guard_is_retained_only_after_endpoint_acceptance() {
+        struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut retained = Vec::new();
+        let (accepted, acceptance) = tokio::sync::oneshot::channel();
+        accepted.send(()).unwrap();
+        retain_guard_after_acceptance(
+            Some(DropSpy(std::sync::Arc::clone(&drops))),
+            acceptance,
+            &mut retained,
+        )
+        .await;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(retained);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_lifecycle_acceptance_reaps_unclaimed_guard() {
+        struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut retained = Vec::new();
+        let (accepted, acceptance) = tokio::sync::oneshot::channel::<()>();
+        drop(accepted);
+        retain_guard_after_acceptance(
+            Some(DropSpy(std::sync::Arc::clone(&drops))),
+            acceptance,
+            &mut retained,
+        )
+        .await;
+        assert!(retained.is_empty());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::AttachOrAutoPromote),
+            LifecycleMode::AttachOrAutoPromote
+        );
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::EnsurePersistent),
+            LifecycleMode::AttachOrAutoPromote
+        );
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
+            LifecycleMode::AttachOrEphemeral
+        );
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::AlwaysEphemeral),
+            LifecycleMode::AlwaysEphemeral
+        );
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::AttachOwnEphemeral),
+            LifecycleMode::AttachOwnEphemeral
+        );
     }
 }

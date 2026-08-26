@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::daemon::client::{DaemonClient, is_protocol_version_mismatch};
 use crate::daemon::proto::{self, Request, Response};
 use crate::daemon::{self, DaemonPaths};
+use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
 
 pub const DEFAULT_SKEW_RESTART_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 

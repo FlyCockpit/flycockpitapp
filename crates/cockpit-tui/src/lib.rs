@@ -13,8 +13,10 @@
 //! nothing here may be depended upon by `cockpit-core` or lower.
 //!
 //! Crate direction is one-way:
-//! `cockpit-cli -> cockpit-tui -> cockpit-core -> cockpit-config/cockpit-db/cockpit-proto`;
-//! the lower crates do not depend on `cockpit-tui` or `cockpit-cli`. A
+//! `cockpit-cli -> cockpit-tui -> cockpit-core -> cockpit-client -> cockpit-proto -> cockpit-config -> cockpit-db`.
+//! The TUI also depends directly on `cockpit-client` for authority-free daemon
+//! transport and on the lower host/protocol/config crates named in `AGENTS.md`;
+//! none of those lower crates depends on `cockpit-tui` or `cockpit-cli`. A
 //! discovered inversion is fixed by moving the symbol to its correct crate,
 //! never by a shim or a circular dev-dependency.
 //!

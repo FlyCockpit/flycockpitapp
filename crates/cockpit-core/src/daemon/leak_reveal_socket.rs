@@ -139,7 +139,7 @@ async fn read_request_frame(stream: &mut UnixStream) -> Option<LeakRevealSocketR
 /// attached TUI. A malformed capability (not 64 hex chars) fails closed as
 /// `Unauthorized` without contacting the daemon; connect failure (stale/missing
 /// socket after restart) is `UnavailablePlatform`.
-pub async fn reveal_leak_secret_over_socket(
+pub(crate) async fn reveal_leak_secret_over_socket(
     reveal_socket: &Path,
     capability: &crate::daemon::proto::LeakRevealToken,
 ) -> Result<RevealedLeakSecret, LeakRevealDenied> {

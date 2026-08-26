@@ -1,5 +1,4 @@
-//! "Daemon isn't running — what now?" dialog shown at TUI launch when
-//! [`cockpit_core::daemon::probe`] returns anything other than `Running`.
+//! Presentation-only daemon lifecycle choice shown at TUI launch.
 //!
 //! Choices:
 //!   - Start a shared daemon (spawns a detached persistent child at the
@@ -21,7 +20,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_core::daemon::{DaemonPaths, DaemonStatus};
 
 pub const DIALOG_HEIGHT: u16 = 14;
 
@@ -33,8 +31,6 @@ pub enum DaemonChoice {
 }
 
 pub struct DaemonPromptDialog {
-    status: DaemonStatus,
-    paths: DaemonPaths,
     cursor: usize,
     /// Set to `Some` once the user has picked. The caller drains it
     /// and acts on the choice; the dialog is then closed.
@@ -45,10 +41,8 @@ pub struct DaemonPromptDialog {
 }
 
 impl DaemonPromptDialog {
-    pub fn new(status: DaemonStatus, paths: DaemonPaths) -> Self {
+    pub fn new() -> Self {
         Self {
-            status,
-            paths,
             cursor: 0,
             chosen: None,
             error: None,
@@ -114,23 +108,7 @@ impl DaemonPromptDialog {
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(Span::styled(
-            match self.status {
-                DaemonStatus::NotRunning => "The cockpit daemon is not running.",
-                DaemonStatus::Stale => {
-                    "A stale daemon pid file was found, but the socket isn't responding."
-                }
-                DaemonStatus::LivePidSocketUnreachable => {
-                    "A cockpit daemon pid is live, but its recorded socket is unreachable."
-                }
-                DaemonStatus::UnverifiedPid => {
-                    "A live daemon pid file was found, but the process identity could not be verified."
-                }
-                DaemonStatus::IncompatibleProtocol => {
-                    "The cockpit daemon speaks an incompatible protocol."
-                }
-                DaemonStatus::Running => "Daemon is running.",
-            }
-            .to_string(),
+            "Choose how this window should connect to the cockpit daemon.".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::default());
@@ -167,14 +145,6 @@ impl DaemonPromptDialog {
         }
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            format!(
-                "  pid file: {}    socket: {}",
-                self.paths.pid_file.display(),
-                self.paths.socket.display()
-            ),
-            muted,
-        )));
-        lines.push(Line::from(Span::styled(
             "  stop later with: `cockpit daemon stop`".to_string(),
             muted,
         )));
@@ -197,7 +167,6 @@ impl DaemonPromptDialog {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
-    use std::path::PathBuf;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -209,14 +178,7 @@ mod tests {
     }
 
     fn fresh() -> DaemonPromptDialog {
-        DaemonPromptDialog::new(
-            DaemonStatus::NotRunning,
-            DaemonPaths {
-                pid_file: PathBuf::from("/tmp/cockpit.test.pid"),
-                socket: PathBuf::from("/tmp/cockpit.test.sock"),
-                ephemeral: false,
-            },
-        )
+        DaemonPromptDialog::new()
     }
 
     /// Pressing `j`/`k` must move the cursor and signal "don't close".

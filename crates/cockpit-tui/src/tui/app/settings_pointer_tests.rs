@@ -54,7 +54,7 @@ pub(crate) fn run_settings_pointer_z_order_matrix() {
     app.auth_failure_notice = Some(crate::tui::auth_failure::AuthFailureNotice {
         provider: "fixture".into(),
         model: "fixture".into(),
-        kind: cockpit_core::daemon::proto::AuthFailureKind::ProviderNotConfigured,
+        kind: cockpit_proto::AuthFailureKind::ProviderNotConfigured,
     });
     app.auth_notice_switch_rect = Some(target);
     app.auth_notice_fix_rect = Some(target);
@@ -268,7 +268,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         ),
         (
             OverlaySurface::Stats,
-            Overlay::Stats(crate::tui::stats_pane::StatsPane::open(tmp.path())),
+            Overlay::Stats(crate::tui::stats_pane::StatsPane::open(None, tmp.path())),
         ),
         (
             OverlaySurface::Usage,
@@ -277,6 +277,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         (
             OverlaySurface::Sessions,
             Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
+                None,
                 tmp.path(),
                 false,
                 None,
@@ -289,9 +290,9 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         ),
         (
             OverlaySurface::Permissions,
-            Overlay::Permissions(crate::tui::permissions_pane::PermissionsPane::open(
+            Overlay::Permissions(crate::tui::permissions_pane::PermissionsPane::open(Some(
                 tmp.path(),
-            )),
+            ))),
         ),
         (
             OverlaySurface::Resources,
@@ -324,11 +325,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         ),
         (
             OverlaySurface::Notes,
-            Overlay::Notes(crate::tui::notes_pane::NotesPane::open(
-                tmp.path(),
-                false,
-                None,
-            )),
+            Overlay::Notes(crate::tui::notes_pane::NotesPane::open(tmp.path(), false)),
         ),
         (
             OverlaySurface::Diff,

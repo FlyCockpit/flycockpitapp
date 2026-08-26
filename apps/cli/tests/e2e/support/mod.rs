@@ -268,7 +268,7 @@ impl SpawnedDaemon {
         )
         .expect("write non-secret agent-installation fixture");
         home.set_env(
-            cockpit_cli::daemon::agent_installation::DEBUG_AGENT_INSTALLATION_FIXTURE_ENV,
+            cockpit_cli::integration_test_api::agent_installation::DEBUG_AGENT_INSTALLATION_FIXTURE_ENV,
             path.display().to_string(),
         );
         Self::start_in(home).await

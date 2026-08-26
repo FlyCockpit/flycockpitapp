@@ -468,6 +468,60 @@ impl ConfigMutationLock {
         }
     }
 
+    pub(crate) fn acquire_until(
+        _target: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<Option<Self>> {
+        let lock_path = mutation_lock_path()?;
+        ensure_parent_dir_private(&lock_path)?;
+
+        let file = open_private_lock_file(&lock_path)?;
+        loop {
+            // A bounded recovery caller must never acquire fresh authority
+            // after its deadline, even when the lock happens to be free at
+            // the first polling attempt.
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self::enter_before_deadline(file, deadline)),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(now)
+                            .min(std::time::Duration::from_millis(5)),
+                    );
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| {
+                        format!("locking config mutation at {}", lock_path.display())
+                    });
+                }
+            }
+        }
+    }
+
+    /// Converts an acquired OS lock into mutation authority only while the
+    /// caller's deadline is still live.
+    ///
+    /// `try_lock` and this check are intentionally adjacent but cannot be
+    /// atomic. Rechecking here closes the window where a contender acquires
+    /// the lock just after its bounded recovery budget expires. Dropping the
+    /// file on the expired path releases the OS lock without ever incrementing
+    /// this thread's re-entrancy depth.
+    fn enter_before_deadline(file: std::fs::File, deadline: std::time::Instant) -> Option<Self> {
+        if std::time::Instant::now() >= deadline {
+            drop(file);
+            None
+        } else {
+            Some(Self::enter(file))
+        }
+    }
+
     fn enter(file: std::fs::File) -> Self {
         MUTATION_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
         Self {
@@ -485,6 +539,38 @@ impl ConfigMutationLock {
 impl Drop for ConfigMutationLock {
     fn drop(&mut self) {
         MUTATION_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+#[cfg(test)]
+mod mutation_lock_deadline_tests {
+    #[test]
+    fn expired_post_acquisition_deadline_releases_lock_without_entering_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("mutation.lock");
+        let acquired = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        acquired.try_lock().unwrap();
+
+        let guard =
+            super::ConfigMutationLock::enter_before_deadline(acquired, std::time::Instant::now());
+
+        assert!(guard.is_none());
+        assert!(!super::ConfigMutationLock::is_held_by_current_thread());
+
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        contender
+            .try_lock()
+            .expect("expired acquisition must release the OS lock");
     }
 }
 
@@ -666,11 +752,11 @@ pub(crate) fn read_file_nofollow_with_identity(
 pub(crate) fn open_directory_handle_nofollow(path: &Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
-        return open_directory_nofollow(path, false, false);
+        open_directory_nofollow(path, false, false)
     }
     #[cfg(windows)]
     {
-        return open_windows_directory_nofollow(path, false);
+        open_windows_directory_nofollow(path, false)
     }
     #[cfg(all(not(unix), not(windows)))]
     {
@@ -678,7 +764,7 @@ pub(crate) fn open_directory_handle_nofollow(path: &Path) -> Result<std::fs::Fil
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             anyhow::bail!("refusing non-directory or symlink {}", path.display());
         }
-        return std::fs::File::open(path).map_err(Into::into);
+        std::fs::File::open(path).map_err(Into::into)
     }
 }
 
@@ -740,6 +826,15 @@ pub(crate) fn read_leaf_from_directory_handle(
     }
 }
 
+/// Bounding limits for a nofollow knowledge-directory snapshot.
+struct KnowledgeSnapshotLimits {
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+}
+
 pub(crate) fn snapshot_markdown_tree_nofollow(
     root: &Path,
     max_files: usize,
@@ -752,6 +847,13 @@ pub(crate) fn snapshot_markdown_tree_nofollow(
     let mut output = Vec::new();
     let mut total = 0usize;
     let mut entries = 0usize;
+    let limits = KnowledgeSnapshotLimits {
+        max_files,
+        max_entries,
+        max_depth,
+        max_file_bytes,
+        max_total_bytes,
+    };
     snapshot_markdown_directory(
         &root_handle,
         Path::new(""),
@@ -759,11 +861,7 @@ pub(crate) fn snapshot_markdown_tree_nofollow(
         &mut total,
         &mut entries,
         0,
-        max_files,
-        max_entries,
-        max_depth,
-        max_file_bytes,
-        max_total_bytes,
+        &limits,
     )?;
     output.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(output)
@@ -819,17 +917,13 @@ fn snapshot_markdown_directory(
     total: &mut usize,
     entries: &mut usize,
     depth: usize,
-    max_files: usize,
-    max_entries: usize,
-    max_depth: usize,
-    max_file_bytes: usize,
-    max_total_bytes: usize,
+    limits: &KnowledgeSnapshotLimits,
 ) -> Result<()> {
     use std::ffi::{CStr, OsStr};
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::ffi::OsStrExt as _;
 
-    if depth > max_depth {
+    if depth > limits.max_depth {
         anyhow::bail!("knowledge snapshot exceeds its directory depth limit");
     }
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
@@ -874,7 +968,7 @@ fn snapshot_markdown_directory(
     for name in names {
         *entries = entries
             .checked_add(1)
-            .filter(|entries| *entries <= max_entries)
+            .filter(|entries| *entries <= limits.max_entries)
             .ok_or_else(|| anyhow::anyhow!("knowledge snapshot exceeds its entry limit"))?;
         let component = path_component_cstring(&name)?;
         let fd = unsafe {
@@ -899,11 +993,7 @@ fn snapshot_markdown_directory(
                 total,
                 entries,
                 depth + 1,
-                max_files,
-                max_entries,
-                max_depth,
-                max_file_bytes,
-                max_total_bytes,
+                limits,
             )?;
         } else if metadata.is_file() && child_relative.extension().is_some_and(|ext| ext == "md") {
             accept_markdown_document(
@@ -911,9 +1001,9 @@ fn snapshot_markdown_directory(
                 child,
                 output,
                 total,
-                max_files,
-                max_file_bytes,
-                max_total_bytes,
+                limits.max_files,
+                limits.max_file_bytes,
+                limits.max_total_bytes,
             )?;
         } else if metadata.file_type().is_symlink() {
             anyhow::bail!("knowledge snapshot refused a symbolic link");
@@ -930,11 +1020,7 @@ fn snapshot_markdown_directory(
     total: &mut usize,
     entries: &mut usize,
     depth: usize,
-    max_files: usize,
-    max_entries: usize,
-    max_depth: usize,
-    max_file_bytes: usize,
-    max_total_bytes: usize,
+    limits: &KnowledgeSnapshotLimits,
 ) -> Result<()> {
     use std::os::windows::ffi::OsStringExt as _;
     use std::os::windows::io::AsRawHandle as _;
@@ -946,7 +1032,7 @@ fn snapshot_markdown_directory(
         GetFileInformationByHandleEx, SYNCHRONIZE,
     };
 
-    if depth > max_depth {
+    if depth > limits.max_depth {
         anyhow::bail!("knowledge snapshot exceeds its directory depth limit");
     }
     let mut names = Vec::new();
@@ -997,7 +1083,7 @@ fn snapshot_markdown_directory(
     for (name, directory_hint) in names {
         *entries = entries
             .checked_add(1)
-            .filter(|entries| *entries <= max_entries)
+            .filter(|entries| *entries <= limits.max_entries)
             .ok_or_else(|| anyhow::anyhow!("knowledge snapshot exceeds its entry limit"))?;
         let child_relative = relative.join(&name);
         let child = open_windows_relative_nofollow(
@@ -1021,11 +1107,7 @@ fn snapshot_markdown_directory(
                 total,
                 entries,
                 depth + 1,
-                max_files,
-                max_entries,
-                max_depth,
-                max_file_bytes,
-                max_total_bytes,
+                limits,
             )?;
         } else if metadata.is_file() && child_relative.extension().is_some_and(|ext| ext == "md") {
             accept_markdown_document(
@@ -1033,9 +1115,9 @@ fn snapshot_markdown_directory(
                 child,
                 output,
                 total,
-                max_files,
-                max_file_bytes,
-                max_total_bytes,
+                limits.max_files,
+                limits.max_file_bytes,
+                limits.max_total_bytes,
             )?;
         }
     }
@@ -1050,11 +1132,7 @@ fn snapshot_markdown_directory(
     _: &mut usize,
     _: &mut usize,
     _: usize,
-    _: usize,
-    _: usize,
-    _: usize,
-    _: usize,
-    _: usize,
+    _: &KnowledgeSnapshotLimits,
 ) -> Result<()> {
     anyhow::bail!("retained knowledge snapshots are unsupported on this platform")
 }
@@ -2124,8 +2202,8 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
             );
         }
         let entry_identity = super::TerminalIngressFileIdentity {
-            volume: stat.st_dev as u64,
-            file: stat.st_ino as u64,
+            volume: stat.st_dev,
+            file: stat.st_ino,
             links: stat.st_nlink.try_into().unwrap_or(u32::MAX),
         };
         if entry_identity != expected_identity {
@@ -2221,7 +2299,7 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
         // before any namespace operation.
         drop(destination_file);
         drop(held_source);
-        return Ok(());
+        Ok(())
     }
     #[cfg(windows)]
     {
@@ -2237,7 +2315,7 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
             })?;
         source_parent.sync_all()?;
         destination_parent.sync_all()?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(all(not(unix), not(windows)))]
     {

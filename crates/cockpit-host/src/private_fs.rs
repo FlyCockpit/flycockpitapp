@@ -38,14 +38,23 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-pub(crate) mod held_directory;
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+pub mod held_directory;
 
 /// Canonical Unix held-fd syscalls (`openat`/`mkdirat`/`fchmod`/`unlinkat`/
 /// `linkat`/`renameat2`/`fstatat`) shared by this module, the external-journal
 /// spool `DirGuard`, and the held-directory authority, so the no-follow
 /// fd-anchored discipline is implemented in exactly one place.
 #[cfg(unix)]
-pub(crate) mod held_fd;
+pub mod held_fd;
 
 // ------------------------------------------------------------------------
 // Typed, matchable, fail-closed errors
@@ -1096,7 +1105,7 @@ fn create_temp_in(
     for _ in 0..32 {
         let mut raw = [0u8; 16];
         rand::rng().fill_bytes(&mut raw);
-        let name = format!(".tmp-{}", crate::intel::hex_lower(&raw));
+        let name = format!(".tmp-{}", hex_lower(&raw));
         let cname = std::ffi::CString::new(name).expect("hex temp name has no NUL");
         match openat_create_private_excl(dir, &cname) {
             Ok(file) => return Ok((file, cname)),

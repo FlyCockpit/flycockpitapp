@@ -29,7 +29,7 @@ pub(crate) enum ButtonId {
     SessionsConfirmDelete,
     SessionsConfirmCancel,
     ResourcePromote {
-        index: usize,
+        request_id: uuid::Uuid,
     },
     NoteNew,
     OverlayAction {

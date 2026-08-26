@@ -54,7 +54,7 @@ pub(crate) struct ToolsEffect {
     pub(crate) agent_name: String,
     pub(crate) project_root: String,
     pub(crate) expected_revision: Option<String>,
-    pub(crate) request: cockpit_core::daemon::proto::Request,
+    pub(crate) request: cockpit_proto::Request,
 }
 
 #[derive(Debug)]
@@ -71,7 +71,7 @@ enum ToolsPending {
         agent_name: String,
         project_root: String,
         expected_revision: String,
-        mutation: cockpit_core::daemon::proto::AgentMutation,
+        mutation: cockpit_proto::AgentMutation,
         def: AgentDef,
         selection: ToolSurfaceSelection,
         override_json: String,
@@ -97,14 +97,20 @@ pub(crate) struct ToolsCompletion {
     pub(crate) agent_name: String,
     pub(crate) project_root: String,
     pub(crate) expected_revision: Option<String>,
-    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
+    pub(crate) response: Result<cockpit_proto::Response, String>,
 }
 
 impl ToolsPane {
+    /// A save owns durable agent authority until its exact receipt is known.
+    /// The initial snapshot load is deliberately excluded: it is read-only.
+    pub(crate) fn has_unsettled_local_authority(&self) -> bool {
+        matches!(self.in_flight, Some(ToolsPending::SaveAgent { .. }))
+    }
+
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
         let operation_id = uuid::Uuid::new_v4();
         let project_root = cwd.to_string_lossy().into_owned();
-        let request = cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+        let request = cockpit_proto::Request::GetAgentEditSnapshot {
             project_root: project_root.clone(),
             name: agent_name.to_string(),
         };
@@ -157,7 +163,7 @@ impl ToolsPane {
         agent_name: String,
         project_root: String,
         expected_revision: String,
-        mutation: cockpit_core::daemon::proto::AgentMutation,
+        mutation: cockpit_proto::AgentMutation,
         def: AgentDef,
         selection: ToolSurfaceSelection,
         override_json: String,
@@ -177,7 +183,7 @@ impl ToolsPane {
                 agent_name: agent_name.clone(),
                 project_root: project_root.clone(),
                 expected_revision: Some(expected_revision.clone()),
-                request: cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                request: cockpit_proto::Request::GetLocalOperationSettlement {
                     client_operation_id: client_operation_id.clone(),
                 },
             });
@@ -225,7 +231,7 @@ impl ToolsPane {
             agent_name: agent_name.clone(),
             project_root: project_root.clone(),
             expected_revision: Some(expected_revision.clone()),
-            request: cockpit_core::daemon::proto::Request::MutateAgent {
+            request: cockpit_proto::Request::MutateAgent {
                 client_operation_id: client_operation_id.clone(),
                 mutation_intent_hash: mutation_intent_hash.clone(),
                 project_root: project_root.clone(),
@@ -303,9 +309,7 @@ impl ToolsPane {
                     return None;
                 }
                 let loaded = completion.response.and_then(|response| {
-                    let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) =
-                        response
-                    else {
+                    let cockpit_proto::Response::AgentEditSnapshot(snapshot) = response else {
                         return Err("daemon returned an unexpected agent snapshot".to_string());
                     };
                     crate::tui::settings::agents_page::validate_agent_snapshot(
@@ -314,9 +318,7 @@ impl ToolsPane {
                         &self.agent_name,
                         None,
                     )?;
-                    if snapshot.markdown.len()
-                        > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
-                    {
+                    if snapshot.markdown.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES {
                         return Err("daemon returned an oversized agent snapshot".to_string());
                     }
                     let def = cockpit_core::agents::parse_agent(
@@ -392,7 +394,9 @@ impl ToolsPane {
                     &client_operation_id,
                     &mutation_intent_hash,
                 ) {
-                    Ok(crate::tui::settings::agents_page::AgentMutationSettlement::Committed(result)) => (|| {
+                    Ok(crate::tui::settings::agents_page::AgentMutationSettlement::Committed(
+                        result,
+                    )) => (|| {
                         crate::tui::settings::agents_page::validate_agent_mutation_result(
                             &result,
                             &client_operation_id,
@@ -402,15 +406,18 @@ impl ToolsPane {
                             Some(&expected_revision),
                             None,
                         )?;
-                        if let cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } = result.outcome {
+                        if let cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                            warning,
+                        } = result.outcome
+                        {
                             return Ok(ToolsMutationResolution::Committed {
                                 revision: result.result_revision,
                                 warning: Some(warning),
                             });
                         }
-                        let snapshot = result.snapshot.ok_or_else(|| {
-                            "daemon omitted the saved snapshot".to_string()
-                        })?;
+                        let snapshot = result
+                            .snapshot
+                            .ok_or_else(|| "daemon omitted the saved snapshot".to_string())?;
                         Ok(ToolsMutationResolution::Committed {
                             revision: snapshot.revision,
                             warning: None,
@@ -420,9 +427,9 @@ impl ToolsPane {
                     Ok(crate::tui::settings::agents_page::AgentMutationSettlement::Pending) => {
                         ToolsMutationResolution::Pending
                     }
-                    Ok(crate::tui::settings::agents_page::AgentMutationSettlement::Rejected(error)) => {
-                        ToolsMutationResolution::Rejected(error)
-                    }
+                    Ok(crate::tui::settings::agents_page::AgentMutationSettlement::Rejected(
+                        error,
+                    )) => ToolsMutationResolution::Rejected(error),
                     Err(error) => ToolsMutationResolution::Invalid(error),
                 };
                 match saved {
@@ -664,7 +671,7 @@ impl ToolsPane {
             .revision
             .clone()
             .ok_or_else(|| anyhow::anyhow!("agent revision is unavailable"))?;
-        let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+        let mutation = cockpit_proto::AgentMutation::SaveDefinition {
             name: self.agent_name.clone(),
             markdown,
         };
@@ -683,7 +690,7 @@ impl ToolsPane {
             agent_name: self.agent_name.clone(),
             project_root: project_root.clone(),
             expected_revision: Some(prior_revision.clone()),
-            request: cockpit_core::daemon::proto::Request::MutateAgent {
+            request: cockpit_proto::Request::MutateAgent {
                 client_operation_id: client_operation_id.clone(),
                 mutation_intent_hash: mutation_intent_hash.clone(),
                 project_root: project_root.clone(),

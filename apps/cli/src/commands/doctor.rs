@@ -26,7 +26,7 @@ pub struct DoctorChecksFailed;
 pub struct DoctorCouldNotRun(#[source] pub anyhow::Error);
 
 use crate::cli::DoctorArgs;
-use crate::daemon::client::{LifecycleMode, probe_or_spawn};
+use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode};
 use crate::daemon::proto::{Request, Response};
 
 const DIAGNOSTIC_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -48,7 +48,7 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
         return dependencies_json(&args, no_sandbox).await;
     }
 
-    // `probe_or_spawn` attaches to a persistent daemon when one is available,
+    // The owned session attaches to a persistent daemon when one is available,
     // otherwise it starts an isolated ephemeral daemon. Only the latter can
     // need the one-shot worker: never replace a failure to contact a live
     // daemon with an unrelated local diagnostic.
@@ -73,32 +73,35 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
             })?;
         return finish_snapshot(worker.rendered, worker.has_failures);
     }
-    let mut daemon = match probe_or_spawn(LifecycleMode::AttachOrEphemeral).await {
-        Ok(daemon) => daemon,
-        Err(daemon_error) if ephemeral_boot_attempted => {
+    let response = match crate::daemon::client::run_owned_daemon(
+        OwnedSessionMode::AttachOrEphemeral,
+        |client| {
+            Box::pin(async {
+                client
+                    .request(build_doctor_request(&args, no_sandbox))
+                    .await
+                    .map_err(DoctorCouldNotRun)?
+                    .map_err(|error| {
+                        DoctorCouldNotRun(anyhow::anyhow!(
+                            "daemon rejected doctor snapshot: {error}"
+                        ))
+                    })
+                    .map_err(anyhow::Error::from)
+            })
+        },
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(OwnedDaemonRunError::Connect(daemon_error)) if ephemeral_boot_attempted => {
             return recover_ephemeral_database_boot_failure(&args, no_sandbox, daemon_error).await;
         }
-        Err(daemon_error) => return Err(DoctorCouldNotRun(daemon_error).into()),
+        Err(error) => return Err(DoctorCouldNotRun(error.into_inner()).into()),
     };
-    // A diagnostic-only invocation must never auto-promote a persistent
-    // daemon. The guard owns only a daemon this command spawned, and reaps it
-    // on every return path after the socket RPC has been attempted.
-    let guard = daemon.take_owned_daemon_guard();
-    let response = daemon
-        .client
-        .request(build_doctor_request(&args, no_sandbox))
-        .await
-        .map_err(DoctorCouldNotRun)?
-        .map_err(|error| {
-            DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
-        });
-    if let Some(guard) = &guard {
-        guard.shutdown();
-    }
     let Response::DoctorSnapshot {
         rendered,
         has_failures,
-    } = response?
+    } = response
     else {
         return Err(DoctorCouldNotRun(anyhow::anyhow!(
             "daemon returned unexpected response to doctor snapshot"

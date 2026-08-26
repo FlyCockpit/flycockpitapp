@@ -179,7 +179,7 @@ pub(super) async fn fork_session(
     }
     let created_by = principal.tag();
     let session_id = Uuid::new_v4();
-    let now = chrono::Utc::now().timestamp();
+    let now = chrono::Utc::now().timestamp_millis();
     let fork_point = fork_point_turn_id.clone();
     commit_session_remote_mutation(ctx, ledger, "fork_session", move |conn| {
         if crate::db::Db::get_session_conn(conn, parent_session_id)?.is_none() {
@@ -218,7 +218,7 @@ pub(super) async fn create_btw_fork(
     }
     let created_by = principal.tag();
     let session_id = Uuid::new_v4();
-    let now = chrono::Utc::now().timestamp();
+    let now = chrono::Utc::now().timestamp_millis();
     commit_session_remote_mutation(ctx, ledger, "btw_create", move |conn| {
         if crate::db::Db::get_session_conn(conn, parent_session_id)?.is_none() {
             return Err(UnknownRemoteSession(parent_session_id).into());
@@ -337,7 +337,7 @@ pub(super) async fn archive_session(
             conn,
             session_id,
             cascade,
-            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp_millis(),
         )?;
         require_mutated(existed, session_id)?;
         Ok(Response::Ack)
@@ -420,7 +420,8 @@ pub(super) async fn delete_session(
         return Ok(cached);
     }
     let session = require_session(ctx, session_id).await?;
-    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at.is_none() {
+    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at_unix_ms.is_none()
+    {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: format!("session {session_id} is active; end it before deleting"),

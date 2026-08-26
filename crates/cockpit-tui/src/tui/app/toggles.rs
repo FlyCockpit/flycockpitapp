@@ -12,7 +12,7 @@ impl App {
     ) {
         self.send_daemon_request(
             "/toggle-redaction",
-            cockpit_core::daemon::proto::Request::SetRedaction {
+            cockpit_proto::Request::SetRedaction {
                 scan_environment,
                 scan_dotenv,
                 scan_ssh_keys,
@@ -26,9 +26,7 @@ impl App {
     /// interrupt) like the `/init` existing-file prompt; the close handler
     /// matches the synthetic interrupt id and applies the selection.
     pub(super) fn open_redaction_toggle_dialog(&mut self) {
-        use cockpit_core::daemon::proto::{
-            InterruptOption, InterruptQuestion, InterruptQuestionSet,
-        };
+        use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
         let interrupt_id = uuid::Uuid::new_v4();
         let set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Multi {
@@ -105,9 +103,7 @@ impl App {
     /// interrupt) like the bare `/toggle-redaction` picker; the close handler
     /// matches the synthetic id and routes the selection to the daemon.
     pub(super) fn open_model_comparison_dialog(&mut self) {
-        use cockpit_core::daemon::proto::{
-            InterruptOption, InterruptQuestion, InterruptQuestionSet,
-        };
+        use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
 
         // Configured `(provider, model)` pairs come from the held daemon
         // snapshot (`tui-config-single-source`); tandem models must have
@@ -208,7 +204,7 @@ impl App {
             .collect();
         self.send_daemon_request(
             "/model-comparison",
-            cockpit_core::daemon::proto::Request::SetTandemModels { models },
+            cockpit_proto::Request::SetTandemModels { models },
             ControlApplied::None,
         );
     }

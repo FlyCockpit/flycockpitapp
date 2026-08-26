@@ -318,7 +318,9 @@ fn fully_populated_config_json_round_trips_byte_identically() {
         global_bytes: 8192,
     };
     cfg.retention = RetentionConfig {
-        payload_window_days: 14,
+        transcript_window_days: 90,
+        raw_wire_window_days: 14,
+        terminal_evidence_window_days: 90,
         session_window_days: 30,
         sweep_interval_hours: 12,
         vacuum_min_deletions: 10,

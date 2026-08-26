@@ -192,7 +192,7 @@ fn is_esrch(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
 }
 
-pub(crate) async fn terminate_group_async(
+pub async fn terminate_group_async(
     child: &mut tokio::process::Child,
     pid: Option<u32>,
     grace: Duration,
@@ -232,7 +232,7 @@ pub(crate) async fn terminate_group_async(
 /// process group. This is the non-async counterpart used from `Drop` paths;
 /// callers that can await should use [`terminate_group_async`] so a stubborn
 /// group also receives SIGKILL after its grace period.
-pub(crate) fn terminate_group_start(child: &mut tokio::process::Child) {
+pub fn terminate_group_start(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {

@@ -153,9 +153,9 @@ pub struct SessionRow {
     pub session_id: Uuid,
     pub project_id: String,
     pub project_root: String,
-    pub started_at: i64,
-    pub last_active_at: i64,
-    pub ended_at: Option<i64>,
+    pub started_at_unix_ms: i64,
+    pub last_active_at_unix_ms: i64,
+    pub ended_at_unix_ms: Option<i64>,
     pub provider: Option<String>,
     pub model: Option<String>,
     /// Full daemon-owned session model selection. Kept alongside the indexed
@@ -189,11 +189,11 @@ pub struct SessionRow {
     /// client (migration 0010). `None` = never viewed. The browser
     /// reads a session as unread when its latest agent-produced event is
     /// newer than this marker (or it has activity and was never viewed).
-    pub last_viewed_at: Option<i64>,
+    pub last_viewed_at_unix_ms: Option<i64>,
     /// Epoch seconds the session was archived (recoverable soft-delete,
     /// migration 0010). `None` = live. Archived sessions are hidden from
     /// the browser by default.
-    pub archived_at: Option<i64>,
+    pub archived_at_unix_ms: Option<i64>,
     /// `true` for a throwaway `/side` side-conversation fork (migration
     /// 0017) and for persistent `/btw` forks. Ephemeral sessions are
     /// excluded from every list query and never auto-titled. Legacy `/side`
@@ -236,7 +236,7 @@ pub struct BtwForkInfo {
     pub parent_session_id: Uuid,
     pub short_id: Option<String>,
     pub tangent: bool,
-    pub created_at: i64,
+    pub created_at_unix_ms: i64,
     pub message_count: u32,
 }
 
@@ -265,9 +265,9 @@ impl SessionRow {
             session_id,
             project_id: row.get("project_id")?,
             project_root: row.get("project_root")?,
-            started_at: row.get("started_at")?,
-            last_active_at: row.get("last_active_at")?,
-            ended_at: row.get("ended_at")?,
+            started_at_unix_ms: row.get("started_at_unix_ms")?,
+            last_active_at_unix_ms: row.get("last_active_at_unix_ms")?,
+            ended_at_unix_ms: row.get("ended_at_unix_ms")?,
             provider: row.get("provider")?,
             model: row.get("model")?,
             model_selection_json: row.get("model_selection_json")?,
@@ -282,8 +282,8 @@ impl SessionRow {
             fork_point_turn_id: row.get("fork_point_turn_id")?,
             title: row.get("title")?,
             user_renamed: user_renamed != 0,
-            last_viewed_at: row.get("last_viewed_at")?,
-            archived_at: row.get("archived_at")?,
+            last_viewed_at_unix_ms: row.get("last_viewed_at_unix_ms")?,
+            archived_at_unix_ms: row.get("archived_at_unix_ms")?,
             ephemeral: row.get::<_, i64>("ephemeral")? != 0,
             btw_parent_session_id,
             btw_tangent: row.get::<_, i64>("btw_tangent").unwrap_or(0) != 0,
@@ -434,7 +434,7 @@ fn is_short_id_collision(conn: &Connection, err: &rusqlite::Error, row: &Session
 fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO sessions
-         (session_id, project_id, project_root, started_at, last_active_at, active_agent,
+         (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, active_agent,
           short_id, provider, model, model_selection_json, active_model_revision,
           session_llm_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
@@ -445,8 +445,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.session_id.to_string(),
             row.project_id,
             row.project_root,
-            row.started_at,
-            row.last_active_at,
+            row.started_at_unix_ms,
+            row.last_active_at_unix_ms,
             row.active_agent,
             row.short_id,
             row.provider,
@@ -494,8 +494,8 @@ fn execute_fork_insert(
 ) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO sessions
-         (session_id, project_id, project_root, started_at,
-          last_active_at, active_agent, short_id,
+         (session_id, project_id, project_root, started_at_unix_ms,
+          last_active_at_unix_ms, active_agent, short_id,
           parent_session_id, fork_point_turn_id,
           provider, model, session_llm_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
@@ -508,8 +508,8 @@ fn execute_fork_insert(
             row.session_id.to_string(),
             row.project_id,
             row.project_root,
-            row.started_at,
-            row.last_active_at,
+            row.started_at_unix_ms,
+            row.last_active_at_unix_ms,
             row.active_agent,
             row.short_id,
             row.parent_session_id.map(|id| id.to_string()),
@@ -597,14 +597,14 @@ fn build_session_row(
     assistant_name: Option<String>,
 ) -> SessionRow {
     let session_id = Uuid::new_v4();
-    let now = Utc::now().timestamp();
+    let now_unix_ms = Utc::now().timestamp_millis();
     SessionRow {
         session_id,
         project_id: project_id.to_string(),
         project_root: project_root.to_string(),
-        started_at: now,
-        last_active_at: now,
-        ended_at: None,
+        started_at_unix_ms: now_unix_ms,
+        last_active_at_unix_ms: now_unix_ms,
+        ended_at_unix_ms: None,
         provider: None,
         model: None,
         model_selection_json: None,
@@ -619,8 +619,8 @@ fn build_session_row(
         fork_point_turn_id: None,
         title: None,
         user_renamed: false,
-        last_viewed_at: None,
-        archived_at: None,
+        last_viewed_at_unix_ms: None,
+        archived_at_unix_ms: None,
         ephemeral: false,
         btw_parent_session_id: None,
         btw_tangent: false,
@@ -844,7 +844,7 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
         parent_session_id,
         short_id: row.short_id.clone(),
         tangent: row.btw_tangent,
-        created_at: row.started_at,
+        created_at_unix_ms: row.started_at_unix_ms,
         message_count: message_count.max(0) as u32,
     })
 }
@@ -857,7 +857,11 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
 /// is what lets resolution after deletion emit owner-visible recovery status
 /// without recreating session content. It is written in the caller's
 /// transaction, so a session can never be removed without one.
-pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+/// Returns the exact number of rows changed by the final session cascade.
+/// Preparatory tombstones and cleanup intents are deliberately outside the
+/// measured interval; the count begins immediately before the root DELETE and
+/// covers the root, descendants, FK dependents, and delete projections.
+pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
     #[cfg(windows)]
     for member in collect_subtree(conn, session_id)? {
         let sidecars: i64 = conn.query_row(
@@ -912,12 +916,13 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
         )
         .context("recording external journal session tombstone")?;
     }
+    let changes_before = conn.total_changes();
     conn.execute(
         "DELETE FROM sessions WHERE session_id = ?1",
         [session_id.to_string()],
     )
     .context("deleting session")?;
-    Ok(())
+    Ok(conn.total_changes().saturating_sub(changes_before))
 }
 
 impl Db {
@@ -1145,13 +1150,18 @@ impl Db {
         tangent: bool,
     ) -> Result<BtwForkCreateResult> {
         let session_id = Uuid::new_v4();
-        let now = Utc::now().timestamp();
+        let now_unix_ms = Utc::now().timestamp_millis();
         self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin create_btw_fork tx")?;
-            let result =
-                Self::create_btw_fork_conn(&tx, parent_session_id, tangent, session_id, now)?;
+            let result = Self::create_btw_fork_conn(
+                &tx,
+                parent_session_id,
+                tangent,
+                session_id,
+                now_unix_ms,
+            )?;
             tx.commit().context("commit create_btw_fork tx")?;
             Ok(result)
         })
@@ -1168,7 +1178,7 @@ impl Db {
         parent_session_id: Uuid,
         tangent: bool,
         session_id: Uuid,
-        now: i64,
+        now_unix_ms: i64,
     ) -> Result<BtwForkCreateResult> {
         if let Some(info) = live_btw_fork_info_conn(conn, parent_session_id)? {
             return Ok(BtwForkCreateResult {
@@ -1191,9 +1201,9 @@ impl Db {
             session_id,
             project_id: parent.project_id,
             project_root: parent.project_root,
-            started_at: now,
-            last_active_at: now,
-            ended_at: None,
+            started_at_unix_ms: now_unix_ms,
+            last_active_at_unix_ms: now_unix_ms,
+            ended_at_unix_ms: None,
             provider: parent.provider,
             model: parent.model,
             model_selection_json: parent.model_selection_json,
@@ -1208,8 +1218,8 @@ impl Db {
             fork_point_turn_id: None,
             title: None,
             user_renamed: false,
-            last_viewed_at: None,
-            archived_at: None,
+            last_viewed_at_unix_ms: None,
+            archived_at_unix_ms: None,
             ephemeral: true,
             btw_parent_session_id: Some(parent_session_id),
             btw_tangent: tangent,
@@ -1282,7 +1292,7 @@ impl Db {
         ephemeral: bool,
     ) -> Result<SessionRow> {
         let session_id = Uuid::new_v4();
-        let now = Utc::now().timestamp();
+        let now_unix_ms = Utc::now().timestamp_millis();
         self.write(move |conn| {
             Self::create_fork_conn(
                 conn,
@@ -1290,7 +1300,7 @@ impl Db {
                 fork_point_turn_id,
                 ephemeral,
                 session_id,
-                now,
+                now_unix_ms,
             )
         })
         .await
@@ -1302,7 +1312,7 @@ impl Db {
         fork_point_turn_id: Option<String>,
         ephemeral: bool,
         session_id: Uuid,
-        now: i64,
+        now_unix_ms: i64,
     ) -> Result<SessionRow> {
         let tx = conn
             .unchecked_transaction()
@@ -1313,7 +1323,7 @@ impl Db {
             fork_point_turn_id,
             ephemeral,
             session_id,
-            now,
+            now_unix_ms,
         )?;
         tx.commit().context("commit create_fork tx")?;
         Ok(row)
@@ -1329,7 +1339,7 @@ impl Db {
         fork_point_turn_id: Option<String>,
         ephemeral: bool,
         session_id: Uuid,
-        now: i64,
+        now_unix_ms: i64,
     ) -> Result<SessionRow> {
         let parent = get_session_inner(conn, parent_session_id)?
             .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
@@ -1339,9 +1349,9 @@ impl Db {
             session_id,
             project_id: parent.project_id,
             project_root: parent.project_root,
-            started_at: now,
-            last_active_at: now,
-            ended_at: None,
+            started_at_unix_ms: now_unix_ms,
+            last_active_at_unix_ms: now_unix_ms,
+            ended_at_unix_ms: None,
             provider: parent.provider,
             model: parent.model,
             model_selection_json: parent.model_selection_json,
@@ -1356,8 +1366,8 @@ impl Db {
             fork_point_turn_id: fork_point_turn_id.clone(),
             title: None,
             user_renamed: false,
-            last_viewed_at: None,
-            archived_at: None,
+            last_viewed_at_unix_ms: None,
+            archived_at_unix_ms: None,
             ephemeral,
             btw_parent_session_id: None,
             btw_tangent: false,
@@ -1753,7 +1763,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT * FROM sessions WHERE parent_session_id = ?1 AND ephemeral = 0
-             ORDER BY last_active_at DESC",
+             ORDER BY last_active_at_unix_ms DESC",
             )
             .context("preparing list_forks")?;
         let rows = stmt
@@ -1808,7 +1818,7 @@ impl Db {
             .prepare(
                 "SELECT * FROM sessions
              WHERE project_id = ?1 AND parent_session_id IS NULL AND ephemeral = 0
-             ORDER BY last_active_at DESC LIMIT ?2",
+             ORDER BY last_active_at_unix_ms DESC LIMIT ?2",
             )
             .context("preparing list_root_sessions")?;
         let rows = stmt
@@ -1953,7 +1963,7 @@ impl Db {
     /// deletes the row + fork subtree. Intent reconciliation remains the
     /// caller's post-commit responsibility.
     pub fn delete_session_row_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
-        delete_session_conn(conn, session_id)
+        delete_session_conn(conn, session_id).map(|_| ())
     }
 
     /// Transaction-composable deletion which refuses to treat a concurrently
@@ -2047,11 +2057,11 @@ impl Db {
     /// up to this instant counts as seen; later agent output reads as
     /// unread.
     pub async fn mark_session_viewed(&self, session_id: Uuid) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now_unix_ms = Utc::now().timestamp_millis();
         self.write(move |conn| {
             conn.execute(
-                "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
-                params![now, session_id.to_string()],
+                "UPDATE sessions SET last_viewed_at_unix_ms = ?1 WHERE session_id = ?2",
+                params![now_unix_ms, session_id.to_string()],
             )
             .context("marking session viewed")?;
             Ok(())
@@ -2059,11 +2069,11 @@ impl Db {
         .await
     }
 
-    /// Timestamp (epoch seconds) of the most recent agent-produced event
+    /// Signed Unix-millisecond timestamp of the most recent agent-produced event
     /// for a session, or `None` when the session has no agent activity
     /// yet. The max across `tool_call_events` and `inference_calls` — the
     /// two tables that record agent output. Drives the unread tier: a
-    /// session is unread when this is newer than `last_viewed_at` (or it
+    /// session is unread when this is newer than `last_viewed_at_unix_ms` (or it
     /// has activity and was never viewed).
     #[allow(dead_code)]
     pub async fn latest_agent_activity_at(&self, session_id: Uuid) -> Result<Option<i64>> {
@@ -2090,14 +2100,14 @@ impl Db {
     /// `cascade = true`, archives every descendant fork (depth-unbounded)
     /// via the same recursive walk `delete_session` uses, so the whole
     /// fork subtree disappears from the browser together. Idempotent —
-    /// re-archiving an already-archived row just re-stamps `archived_at`.
+    /// re-archiving an already-archived row just re-stamps `archived_at_unix_ms`.
     pub async fn archive_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now_unix_ms = Utc::now().timestamp_millis();
         self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin archive_session tx")?;
-            Self::archive_session_conn(&tx, session_id, cascade, now)?;
+            Self::archive_session_conn(&tx, session_id, cascade, now_unix_ms)?;
             tx.commit().context("commit archive_session tx")
         })
         .await
@@ -2107,7 +2117,7 @@ impl Db {
         conn: &Connection,
         session_id: Uuid,
         cascade: bool,
-        now: i64,
+        now_unix_ms: i64,
     ) -> Result<()> {
         let targets = if cascade {
             collect_subtree(conn, session_id)?
@@ -2116,8 +2126,8 @@ impl Db {
         };
         for id in targets {
             conn.execute(
-                "UPDATE sessions SET archived_at = ?1 WHERE session_id = ?2",
-                params![now, id.to_string()],
+                "UPDATE sessions SET archived_at_unix_ms = ?1 WHERE session_id = ?2",
+                params![now_unix_ms, id.to_string()],
             )
             .context("archiving session")?;
         }
@@ -2130,7 +2140,7 @@ impl Db {
         conn: &Connection,
         session_id: Uuid,
         cascade: bool,
-        now: i64,
+        now_unix_ms: i64,
     ) -> Result<bool> {
         let targets = if cascade {
             collect_subtree(conn, session_id)?
@@ -2144,8 +2154,8 @@ impl Db {
         }
         for id in targets {
             conn.execute(
-                "UPDATE sessions SET archived_at = ?1 WHERE session_id = ?2",
-                params![now, id.to_string()],
+                "UPDATE sessions SET archived_at_unix_ms = ?1 WHERE session_id = ?2",
+                params![now_unix_ms, id.to_string()],
             )
             .context("archiving existing session")?;
         }
@@ -2161,7 +2171,7 @@ impl Db {
 
     pub fn unarchive_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
         conn.execute(
-            "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
+            "UPDATE sessions SET archived_at_unix_ms = NULL WHERE session_id = ?1",
             [session_id.to_string()],
         )
         .context("unarchiving session")?;
@@ -2172,7 +2182,7 @@ impl Db {
     pub fn unarchive_existing_session_conn(conn: &Connection, session_id: Uuid) -> Result<bool> {
         let affected = conn
             .execute(
-                "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
+                "UPDATE sessions SET archived_at_unix_ms = NULL WHERE session_id = ?1",
                 [session_id.to_string()],
             )
             .context("unarchiving existing session")?;
@@ -2204,14 +2214,14 @@ impl Db {
             .await
     }
 
-    /// Move `last_active_at` to now. Called by the daemon on every
+    /// Move `last_active_at_unix_ms` to now. Called by the daemon on every
     /// interaction so `cockpit -c` resumes the actually-recent one.
     pub async fn touch_session(&self, session_id: Uuid) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now_unix_ms = Utc::now().timestamp_millis();
         self.write(move |conn| {
             conn.execute(
-                "UPDATE sessions SET last_active_at = ?1 WHERE session_id = ?2",
-                params![now, session_id.to_string()],
+                "UPDATE sessions SET last_active_at_unix_ms = ?1 WHERE session_id = ?2",
+                params![now_unix_ms, session_id.to_string()],
             )
             .context("touching session")?;
             Ok(())
@@ -2320,11 +2330,11 @@ impl Db {
     }
 
     pub async fn end_session(&self, session_id: Uuid) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now_unix_ms = Utc::now().timestamp_millis();
         self.write(move |conn| {
             conn.execute(
-                "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2",
-                params![now, session_id.to_string()],
+                "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2",
+                params![now_unix_ms, session_id.to_string()],
             )
             .context("ending session")?;
             Ok(())
@@ -2344,22 +2354,27 @@ impl Db {
         only_open: bool,
         limit: u32,
     ) -> Result<Vec<SessionRow>> {
-        let sql = if only_open {
-            "SELECT * FROM sessions WHERE ended_at IS NULL AND ephemeral = 0
-             ORDER BY last_active_at DESC LIMIT ?1"
+        let rows = if only_open {
+            conn.prepare(
+                // schema-hot-query: local.sessions.open
+                "SELECT * FROM sessions WHERE ended_at_unix_ms IS NULL AND ephemeral = 0
+                 ORDER BY last_active_at_unix_ms DESC LIMIT ?1",
+            )
+            .context("preparing open session list")?
+            .query_map([limit], SessionRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("querying open sessions")?
         } else {
-            "SELECT * FROM sessions WHERE ephemeral = 0
-             ORDER BY last_active_at DESC LIMIT ?1"
+            conn.prepare(
+                "SELECT * FROM sessions WHERE ephemeral = 0
+                 ORDER BY last_active_at_unix_ms DESC LIMIT ?1",
+            )
+            .context("preparing session list")?
+            .query_map([limit], SessionRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("querying sessions")?
         };
-        let mut stmt = conn.prepare(sql).context("preparing list_sessions")?;
-        let rows = stmt
-            .query_map([limit], SessionRow::from_row)
-            .context("querying sessions")?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.context("decoding session row")?);
-        }
-        Ok(out)
+        Ok(rows)
     }
 
     pub async fn list_sessions_for_assistant(
@@ -2383,12 +2398,12 @@ impl Db {
     ) -> Result<Vec<SessionRow>> {
         let sql = if only_open {
             "SELECT * FROM sessions
-              WHERE assistant_name = ?1 AND ended_at IS NULL AND ephemeral = 0
-              ORDER BY last_active_at DESC LIMIT ?2"
+              WHERE assistant_name = ?1 AND ended_at_unix_ms IS NULL AND ephemeral = 0
+              ORDER BY last_active_at_unix_ms DESC LIMIT ?2"
         } else {
             "SELECT * FROM sessions
               WHERE assistant_name = ?1 AND ephemeral = 0
-              ORDER BY last_active_at DESC LIMIT ?2"
+              ORDER BY last_active_at_unix_ms DESC LIMIT ?2"
         };
         let mut stmt = conn
             .prepare(sql)
@@ -2419,7 +2434,7 @@ impl Db {
         conn.query_row(
             "SELECT * FROM sessions
               WHERE assistant_name = ?1 AND ephemeral = 0
-              ORDER BY last_active_at DESC, started_at DESC
+              ORDER BY last_active_at_unix_ms DESC, started_at_unix_ms DESC
               LIMIT 1",
             params![assistant_name],
             SessionRow::from_row,
@@ -2446,9 +2461,9 @@ impl Db {
                                   FROM session_events AS e
                                  WHERE e.session_id = s.session_id
                                    AND e.type IN ('user_message', 'assistant_message')),
-                               s.last_active_at * 1000
+                               s.last_active_at_unix_ms
                            ) DESC,
-                           s.last_active_at DESC,
+                           s.last_active_at_unix_ms DESC,
                            s.session_id DESC
                   LIMIT 1",
                 [&project_root],
@@ -2544,19 +2559,19 @@ impl Db {
                 short_id: row.short_id,
                 project_root: row.project_root,
                 project_id: row.project_id,
-                started_at: row.started_at,
-                last_active_at: row.last_active_at,
+                started_at_unix_ms: row.started_at_unix_ms,
+                last_active_at_unix_ms: row.last_active_at_unix_ms,
                 turns: 0, // wire up when we track turn count
                 active_agent: row.active_agent,
                 title: row.title,
                 parent_session_id: row.parent_session_id,
                 fork_count,
                 descendant_count,
-                last_viewed_at: row.last_viewed_at,
-                latest_activity_at,
+                last_viewed_at_unix_ms: row.last_viewed_at_unix_ms,
+                latest_activity_at_unix_ms: latest_activity_at,
                 open_interrupts,
                 activity_state,
-                archived_at: row.archived_at,
+                archived_at_unix_ms: row.archived_at_unix_ms,
                 created_by_principal: row.created_by_principal,
                 shared_with_collaborators: row.shared_with_collaborators,
                 pin_count,
@@ -2639,8 +2654,8 @@ impl Db {
         self.read(move |conn| {
             let result = conn.query_row(
                 "SELECT * FROM sessions
-                 WHERE project_id = ?1 AND ended_at IS NULL AND ephemeral = 0
-                 ORDER BY last_active_at DESC LIMIT 1",
+                 WHERE project_id = ?1 AND ended_at_unix_ms IS NULL AND ephemeral = 0
+                 ORDER BY last_active_at_unix_ms DESC LIMIT 1",
                 [&project_id],
                 SessionRow::from_row,
             );
@@ -2979,7 +2994,7 @@ mod tests {
         db.read(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT session_id FROM sessions WHERE parent_session_id = ?1 ORDER BY started_at",
+                    "SELECT session_id FROM sessions WHERE parent_session_id = ?1 ORDER BY started_at_unix_ms",
                 )
                 .unwrap();
             let rows = stmt
@@ -3013,7 +3028,7 @@ mod tests {
         assert_eq!(g.project_id, "p1");
         assert_eq!(g.project_root, "/x/y");
         assert_eq!(g.active_agent, "Build");
-        assert!(g.ended_at.is_none());
+        assert!(g.ended_at_unix_ms.is_none());
     }
 
     #[tokio::test]
@@ -3107,7 +3122,7 @@ mod tests {
         db.end_session(session.session_id).await.unwrap();
 
         let stored = db.get_session(session.session_id).await.unwrap().unwrap();
-        assert!(stored.ended_at.is_some());
+        assert!(stored.ended_at_unix_ms.is_some());
         assert!(
             db.list_sessions(true, 100)
                 .await
@@ -3262,7 +3277,7 @@ mod tests {
                 [other_seq],
             )?;
             conn.execute(
-                "UPDATE sessions SET last_active_at = 9999 WHERE session_id = ?1",
+                "UPDATE sessions SET last_active_at_unix_ms = 9999 WHERE session_id = ?1",
                 [second.session_id.to_string()],
             )?;
             Ok(())
@@ -3399,14 +3414,14 @@ mod tests {
         );
     }
 
-    /// Push a session's `last_active_at` into the past so recency ordering is
+    /// Push a session's `last_active_at_unix_ms` into the past so recency ordering is
     /// deterministic without sleeping across a whole-second timestamp boundary.
     async fn backdate_session(db: &Db, session_id: Uuid, seconds: i64) {
         db.write(move |conn| {
             conn.execute(
                 "UPDATE sessions
-                    SET started_at = started_at - ?1,
-                        last_active_at = last_active_at - ?1
+                    SET started_at_unix_ms = started_at_unix_ms - ?1,
+                        last_active_at_unix_ms = last_active_at_unix_ms - ?1
                   WHERE session_id = ?2",
                 params![seconds, session_id.to_string()],
             )
@@ -3423,7 +3438,7 @@ mod tests {
         let s = db.create_session("p", "/x", "a").await.unwrap();
         db.touch_session(s.session_id).await.unwrap();
         let g = db.get_session(s.session_id).await.unwrap().unwrap();
-        assert!(g.last_active_at >= s.last_active_at);
+        assert!(g.last_active_at_unix_ms >= s.last_active_at_unix_ms);
     }
 
     #[tokio::test]
@@ -4319,7 +4334,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .last_viewed_at
+                .last_viewed_at_unix_ms
                 .is_none()
         );
         db.mark_session_viewed(s.session_id).await.unwrap();
@@ -4328,7 +4343,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .last_viewed_at
+                .last_viewed_at_unix_ms
                 .is_some()
         );
     }
@@ -4349,7 +4364,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap()
-                    .archived_at
+                    .archived_at_unix_ms
                     .is_some(),
                 "archive should cascade the whole subtree"
             );
@@ -4362,7 +4377,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .archived_at
+                .archived_at_unix_ms
                 .is_none()
         );
         assert!(
@@ -4370,7 +4385,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .archived_at
+                .archived_at_unix_ms
                 .is_some()
         );
     }
@@ -4385,9 +4400,9 @@ mod tests {
             &db,
             &format!(
                 "CREATE TEMP TRIGGER fail_cascade_archive
-                 BEFORE UPDATE OF archived_at ON sessions
+                 BEFORE UPDATE OF archived_at_unix_ms ON sessions
                  WHEN OLD.session_id = '{}'
-                  AND NEW.archived_at IS NOT NULL
+                  AND NEW.archived_at_unix_ms IS NOT NULL
                  BEGIN
                      SELECT RAISE(FAIL, 'injected cascade archive failure');
                  END;",
@@ -4411,7 +4426,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap()
-                    .archived_at
+                    .archived_at_unix_ms
                     .is_none(),
                 "{id} should not be archived after rollback"
             );
@@ -4484,7 +4499,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .archived_at
+                .archived_at_unix_ms
                 .is_some()
         );
         assert!(
@@ -4492,7 +4507,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .archived_at
+                .archived_at_unix_ms
                 .is_none()
         );
     }

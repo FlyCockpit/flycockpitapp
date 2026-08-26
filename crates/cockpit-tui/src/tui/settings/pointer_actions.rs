@@ -103,6 +103,7 @@ pub(crate) enum RootNodeId {
     Interface,
     Behavior,
     Privacy,
+    #[cfg(feature = "extended")]
     ImageSpend,
     Generation,
     Translation,
@@ -114,7 +115,7 @@ pub(crate) enum RootNodeId {
     Lsp,
 }
 impl RootNodeId {
-    pub(super) const ALL: [Self; 16] = [
+    pub(super) const ALL: &'static [Self] = &[
         Self::DefaultModel,
         Self::Providers,
         Self::Dependencies,
@@ -122,6 +123,7 @@ impl RootNodeId {
         Self::Interface,
         Self::Behavior,
         Self::Privacy,
+        #[cfg(feature = "extended")]
         Self::ImageSpend,
         Self::Generation,
         Self::Translation,
@@ -141,6 +143,7 @@ impl RootNodeId {
             Self::Interface => "Interface",
             Self::Behavior => "Behavior",
             Self::Privacy => "Privacy & Safety",
+            #[cfg(feature = "extended")]
             Self::ImageSpend => "Image spend budgets",
             Self::Generation => "Generation",
             Self::Translation => "Translation",

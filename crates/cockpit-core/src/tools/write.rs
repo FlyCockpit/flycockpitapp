@@ -209,7 +209,7 @@ pub(crate) fn enforce_write_scope(ctx: &ToolCtx, path: &std::path::Path, tool: &
     let Some(scope) = ctx.write_scope.as_ref() else {
         return Ok(());
     };
-    if crate::path_containment::contained_under(scope, path) {
+    if cockpit_host::path_containment::contained_under(scope, path) {
         return Ok(());
     }
     Err(crate::engine::tool::invalid_input(format!(
@@ -227,7 +227,7 @@ pub(crate) fn enforce_requested_write_scope(
     if ctx.write_scope.is_none() {
         return Ok(());
     }
-    let effective = crate::path_containment::effective_path(requested_path)
+    let effective = cockpit_host::path_containment::effective_path(requested_path)
         .unwrap_or_else(|_| requested_path.to_path_buf());
     enforce_write_scope(ctx, &effective, tool)
 }
@@ -308,7 +308,9 @@ mod tests {
         .unwrap();
     }
 
-    async fn identity_refusal_ctx(home: &std::path::Path) -> (ToolCtx, crate::test_env::TestEnvGuard) {
+    async fn identity_refusal_ctx(
+        home: &std::path::Path,
+    ) -> (ToolCtx, crate::test_env::TestEnvGuard) {
         let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home).await;
         let canonical = crate::assistants::default_home_dir("helper").unwrap();
         std::fs::create_dir_all(&canonical).unwrap();

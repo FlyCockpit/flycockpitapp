@@ -102,7 +102,7 @@ async fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> Sessio
             None,
             false,
             Uuid::new_v4(),
-            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp_millis(),
         )
     })
     .await
@@ -3243,7 +3243,7 @@ async fn export_older_events_without_new_fields_still_parse() {
     // The pre-release export contract is the intentional breaking /3 shape.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/3");
+    assert_eq!(manifest["schema"], "cockpit-session-export/4");
 }
 
 #[tokio::test]
@@ -3325,7 +3325,7 @@ async fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     // Manifest round-trips and lists the session.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&bytes, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/3");
+    assert_eq!(manifest["schema"], "cockpit-session-export/4");
     assert_eq!(manifest["session_count"], 1);
     assert_eq!(
         manifest["target"]["short_id"],
@@ -4110,13 +4110,14 @@ async fn manifest_has_version_and_session_date() {
     // Epoch matches the session row; ISO string is the RFC-3339 rendering
     // of that same epoch.
     assert_eq!(
-        manifest["session_started_at"].as_i64().unwrap(),
-        target.started_at
+        manifest["session_started_at_unix_ms"].as_i64().unwrap(),
+        target.started_at_unix_ms
     );
     let iso = manifest["session_date"].as_str().unwrap();
-    let expected = chrono::DateTime::<chrono::Utc>::from_timestamp(target.started_at, 0)
-        .unwrap()
-        .to_rfc3339();
+    let expected =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(target.started_at_unix_ms)
+            .unwrap()
+            .to_rfc3339();
     assert_eq!(iso, expected);
 
     let zip = build_zip_with_options_and_env(

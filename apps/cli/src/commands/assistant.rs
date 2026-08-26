@@ -255,7 +255,7 @@ async fn show(name: &str) -> Result<()> {
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant show")?;
-    let assistant = fetch_assistant(&daemon, name)
+    let assistant = fetch_assistant(&daemon.client, name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
     let def = verified_assistant_definition(&assistant)?;
@@ -317,9 +317,10 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant delete")?;
-    let (assistant, expected_config_generation) = fetch_assistant_inventory(&daemon, &args.name)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("assistant `{}` not found", args.name))?;
+    let (assistant, expected_config_generation) =
+        fetch_assistant_inventory(&daemon.client, &args.name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("assistant `{}` not found", args.name))?;
     if !args.yes {
         print!(
             "Delete assistant `{}` from the registry? Its home directory will remain at {} [y/N]: ",
@@ -419,11 +420,10 @@ fn delete_assistant_request(
 }
 
 async fn fetch_assistant_inventory(
-    daemon: &crate::daemon::client::ConnectedDaemon,
+    client: &cockpit_client::DaemonClient,
     name: &str,
 ) -> Result<Option<(crate::daemon::proto::AssistantSummary, u64)>> {
-    let response = daemon
-        .client
+    let response = client
         .request(Request::ListAssistants)
         .await
         .context("requesting assistant inventory from daemon")?
@@ -444,11 +444,10 @@ async fn fetch_assistant_inventory(
 /// Resolve a single assistant registry row through the daemon's owner-remoted
 /// `GetAssistant` read. Returns `None` when the name is not registered.
 async fn fetch_assistant(
-    daemon: &crate::daemon::client::ConnectedDaemon,
+    client: &cockpit_client::DaemonClient,
     name: &str,
 ) -> Result<Option<crate::daemon::proto::AssistantSummary>> {
-    let response = daemon
-        .client
+    let response = client
         .request(get_assistant_request(name))
         .await
         .context("requesting assistant from daemon")?

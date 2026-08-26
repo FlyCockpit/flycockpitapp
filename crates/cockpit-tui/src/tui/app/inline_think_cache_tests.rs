@@ -1,5 +1,5 @@
 use super::{App, new_pending};
-use cockpit_core::engine::AssistantAttemptId;
+use cockpit_client::presentation::AssistantAttemptId;
 use cockpit_core::engine::TurnEvent;
 use std::cell::Cell;
 use std::fs;
@@ -131,7 +131,7 @@ fn typed_display_attempt_correlation_rejects_stale_after_reset() {
     app.apply_event(TurnEvent::AssistantDisplayComplete {
         agent: "agent".to_string(),
         attempt_id: failed,
-        assistant: cockpit_core::engine::AssistantTextPayload {
+        assistant: cockpit_client::presentation::AssistantTextPayload {
             text: "wrong".to_string(),
             presentation_text: None,
             reasoning: String::new(),

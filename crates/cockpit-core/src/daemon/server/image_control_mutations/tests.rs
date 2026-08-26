@@ -687,6 +687,10 @@ fn durability_source_ratchet_requires_exact_cas_journal_and_post_commit_publicat
         "exact_target_path",
         "registry_from_document(consumed.as_slice())",
         "image_config_mutation_journals",
+        "publication_phase",
+        "publication_authorized",
+        "settle_unpublished_image_mutation",
+        "settle_image_mutation_success_and_retire",
         "local_operation_receipts",
         "write_config_bytes_atomic",
         "publish_committed_config_generation",
@@ -716,14 +720,76 @@ fn durability_source_ratchet_requires_exact_cas_journal_and_post_commit_publicat
         .split("pub(crate) async fn recover_image_config_mutation_journals")
         .nth(1)
         .expect("image recovery exists");
-    let actual_read = recovery
-        .find("let actual_bytes = read_document")
-        .expect("recovery must re-read the exact target");
-    assert!(
-        !recovery[..actual_read].contains("receipt_state.starts_with"),
-        "terminal-looking receipts must not retire journals before file reconciliation"
-    );
+    assert!(recovery.contains("receipt.state"));
+    assert!(recovery.contains("receipt.terminal_outcome_json"));
+    assert!(recovery.contains("if receipt_state == \"terminal_success\""));
+    assert!(recovery.contains("if terminal != response_json"));
+    assert!(recovery.contains("does not exactly match its journaled response"));
+    assert!(recovery.contains("receipt.consumed_revision != consumed"));
+    assert!(recovery.contains("receipt.result_config_generation != expected_generation"));
+    assert!(recovery.contains("Every terminal receipt is final"));
+    assert!(recovery.contains("bounded terminal image recovery"));
     assert!(recovery.contains("if actual == intended"));
-    assert!(recovery.contains("else if actual == consumed"));
+    assert!(recovery.contains("publish_committed_config_generation_at_least"));
+    assert!(recovery.contains("must never rewrite the terminal receipt"));
+    assert!(recovery.contains("journal.consumed_generation"));
+    assert!(recovery.contains("committed.client_operation_id != operation"));
+    assert!(recovery.contains("committed.result_revision != intended"));
+    assert!(recovery.contains("committed.result_config_generation != expected_generation"));
+    assert!(!recovery.contains("state IN ('executing','terminal_error','terminal_cancelled')"));
+    assert!(recovery.contains("actual != intended"));
+    assert!(recovery.contains("if actual == intended"));
+    assert!(recovery.contains("publication_phase == \"prepared\""));
+    assert!(
+        recovery.contains("publication_phase == \"publication_authorized\" && actual == consumed")
+    );
     assert!(recovery.contains("diverged from both consumed and intended"));
+}
+
+#[test]
+fn durability_source_ratchet_distinguishes_prepublication_conflict_from_ambiguity() {
+    let source = include_str!("../image_control_mutations.rs");
+    let journal_insert = source
+        .find("'prepared'")
+        .expect("journal insert records prepared phase");
+    let live_cas = source
+        .find("let precommit = read_document")
+        .expect("live CAS re-reads target");
+    let authorize = source
+        .find("SET publication_phase='publication_authorized'")
+        .expect("publication authorization is durable");
+    let atomic_write = source
+        .find("write_config_bytes_atomic")
+        .expect("atomic publication exists");
+    assert!(journal_insert < authorize && authorize < live_cas && live_cas < atomic_write);
+    let live_handler = source
+        .split("async fn dispatch_mutation")
+        .nth(1)
+        .and_then(|tail| tail.split("fn bounded_prepublication_conflict").next())
+        .expect("image mutation live handler");
+    let lock = live_handler
+        .find("hold_config_mutation_lock")
+        .expect("live publication lock");
+    let drop_lock = live_handler[lock..]
+        .find("drop(publication_guard)")
+        .map(|offset| lock + offset)
+        .expect("publication lock is explicitly released");
+    assert!(
+        !live_handler[lock..drop_lock].contains(".await"),
+        "SQLite/network awaits must not occur while the synchronous config lock is held",
+    );
+
+    let recovery = source
+        .split("pub(crate) async fn recover_image_config_mutation_journals")
+        .nth(1)
+        .expect("image recovery exists");
+    let prepared = recovery
+        .find("publication_phase == \"prepared\"")
+        .expect("prepared recovery branch exists");
+    let authorized = recovery
+        .find("publication_phase == \"publication_authorized\"")
+        .expect("authorized recovery branch exists");
+    assert!(prepared < authorized);
+    assert!(recovery[prepared..authorized].contains("terminal_error"));
+    assert!(recovery[authorized..].contains("diverged from both consumed and intended"));
 }

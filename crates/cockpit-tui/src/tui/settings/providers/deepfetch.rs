@@ -28,7 +28,7 @@ struct DeepFetchProgress {
     lines: Vec<String>,
     result: Option<Result<String, String>>,
     /// Latest authoritative catalog returned with a successful daemon probe.
-    config: Option<cockpit_core::daemon::proto::ProviderConfigView>,
+    config: Option<cockpit_proto::ProviderConfigView>,
 }
 
 /// State is deliberately prepared from the config document, rather than from
@@ -88,7 +88,11 @@ impl DeepFetchState {
         })
     }
 
-    fn start(&mut self, project_root: std::path::PathBuf) {
+    fn start(
+        &mut self,
+        lifecycle: cockpit_client::LifecycleClient,
+        project_root: std::path::PathBuf,
+    ) {
         debug_assert_eq!(self.phase, DeepFetchPhase::Confirm);
         self.phase = DeepFetchPhase::Running;
         self.status = None;
@@ -98,6 +102,7 @@ impl DeepFetchState {
         let cancel = Arc::clone(&self.cancel);
         tokio::spawn(async move {
             let result = run_deep_fetch(
+                lifecycle,
                 project_root.display().to_string(),
                 provider_id,
                 targets,
@@ -157,6 +162,7 @@ impl DeepFetchState {
 }
 
 async fn run_deep_fetch(
+    lifecycle: cockpit_client::LifecycleClient,
     project_root: String,
     provider_id: String,
     targets: Vec<DeepfetchTarget>,
@@ -168,7 +174,7 @@ async fn run_deep_fetch(
     // A settings config path may be the global XDG layer rather than a
     // workspace `.cockpit/config.json`; it is not a project-root authority.
     // The caller supplies the active dialog/picker workspace explicitly.
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|error| format!("deep fetch failed: {error}"))?;
     // Use one daemon operation per model. This keeps probing and persistence
@@ -183,7 +189,7 @@ async fn run_deep_fetch(
             format!("→ {}:{}", target.provider_id, target.model_id),
         );
         let response = client
-            .request(cockpit_core::daemon::proto::Request::FetchProviderModels {
+            .request(cockpit_proto::Request::FetchProviderModels {
                 project_root: project_root.clone(),
                 provider_id: Some(provider_id.clone()),
                 model_id: Some(target.model_id.clone()),
@@ -194,9 +200,7 @@ async fn run_deep_fetch(
             .await
             .map_err(|error| format!("deep fetch failed: {error}"))?
             .map_err(|error| format!("deep fetch failed: {error}"))?;
-        let cockpit_core::daemon::proto::Response::ProviderModelsFetched { results, config } =
-            response
-        else {
+        let cockpit_proto::Response::ProviderModelsFetched { results, config } = response else {
             return Err("deep fetch failed: daemon returned unexpected response".into());
         };
         let result = results
@@ -204,25 +208,21 @@ async fn run_deep_fetch(
             .next()
             .ok_or_else(|| "deep fetch failed: daemon returned no provider result".to_string())?;
         match result.outcome {
-            cockpit_core::daemon::proto::ProviderModelFetchOutcome::Models { .. } => {
+            cockpit_proto::ProviderModelFetchOutcome::Models { .. } => {
                 append_line(progress, "  daemon deep fetch complete".to_string());
             }
-            cockpit_core::daemon::proto::ProviderModelFetchOutcome::Error { message } => {
+            cockpit_proto::ProviderModelFetchOutcome::Error { message } => {
                 return Err(format!("deep fetch failed: {message}"));
             }
-            cockpit_core::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
-                unlisted_count,
-            } => {
+            cockpit_proto::ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted_count } => {
                 return Err(format!(
                     "deep fetch needs a keep/remove decision for {unlisted_count} configured model(s)"
                 ));
             }
-            cockpit_core::daemon::proto::ProviderModelFetchOutcome::Unsupported => {
+            cockpit_proto::ProviderModelFetchOutcome::Unsupported => {
                 append_line(progress, "  provider does not publish /models".to_string());
             }
-            cockpit_core::daemon::proto::ProviderModelFetchOutcome::FallbackAvailable {
-                ..
-            } => {
+            cockpit_proto::ProviderModelFetchOutcome::FallbackAvailable { .. } => {
                 append_line(progress, "  daemon returned fallback catalog".to_string());
             }
         }
@@ -405,7 +405,7 @@ impl SettingsCx {
                             Some("deep fetch requires the active settings workspace".into());
                         return Nav::Stay;
                     };
-                    state.start(project_root);
+                    state.start(self.lifecycle.clone(), project_root);
                 }
                 KeyCode::Enter => return deep_fetch_back(parent, "deep fetch cancelled".into()),
                 _ => {}

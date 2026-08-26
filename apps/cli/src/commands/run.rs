@@ -13,12 +13,12 @@
 //!
 //! 1. Resolve project root (cwd or `--project`).
 //! 2. Build the prompt (argv + stdin).
-//! 3. probe_or_spawn the daemon, attach a new session.
+//! 3. acquire an owned daemon session, attach a new session.
 //! 4. Send the prompt and pump events until `TurnComplete`.
 //! 5. In `default` format we stream assistant text to stdout; in
 //!    `json` format we emit one envelope per line.
 //! 6. If we own the daemon (ephemeral path), shut it down. An
-//!    [`EphemeralDaemonGuard`] (Layer A) guarantees this fires on every
+//!    The owned-session RAII fallback (Layer A) guarantees this fires on every
 //!    exit — happy path, early `?` error, panic/unwind, or
 //!    SIGINT/SIGTERM — never on a run that attached to a pre-existing
 //!    persistent daemon.
@@ -32,8 +32,7 @@ use uuid::Uuid;
 
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
-use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::spawn_signal_shutdown;
+use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient};
 use crate::daemon::proto::{self, Request, Response};
 
 #[derive(Debug, thiserror::Error)]
@@ -48,10 +47,25 @@ struct RunUsageError(String);
 #[error("{0}")]
 struct RunTurnFailure(String);
 
-async fn emit_org_logging_indicator_via_daemon(
-    client: &crate::daemon::client::DaemonClient,
-    cwd: &Path,
-) {
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RunPreflightFailure {
+    exit_code: i32,
+    code: &'static str,
+    message: String,
+}
+
+impl RunPreflightFailure {
+    fn new(exit_code: i32, code: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            exit_code,
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
+async fn emit_org_logging_indicator_via_daemon(client: &ScopedDaemonClient<'_>, cwd: &Path) {
     let project_root = cwd.display().to_string();
     let response = client
         .request(crate::daemon::proto::Request::GetStartupDisclosures { project_root })
@@ -70,7 +84,7 @@ async fn emit_org_logging_indicator_via_daemon(
 }
 
 async fn enforce_noninteractive_workspace_trust_via_daemon(
-    client: &crate::daemon::client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     cwd: &Path,
 ) -> Result<()> {
     let trust_root = crate::config::trust::resolve_trust_root(cwd)?;
@@ -109,7 +123,7 @@ async fn enforce_noninteractive_workspace_trust_via_daemon(
 
 async fn resolve_requested_session_via_daemon(
     args: &RunArgs,
-    client: &crate::daemon::client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     root: &Path,
 ) -> Result<Option<Uuid>> {
     if let Some(session) = &args.session {
@@ -218,71 +232,67 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     }
 
     let mode = if args.ephemeral {
-        LifecycleMode::AlwaysEphemeral
+        OwnedSessionMode::AlwaysEphemeral
     } else {
-        LifecycleMode::AttachOrEphemeral
+        OwnedSessionMode::AttachOrEphemeral
     };
 
-    let mut daemon = match probe_or_spawn(mode).await {
-        Ok(daemon) => daemon,
-        Err(error) => exit_run_error(format, 4, "daemon_connection", &format!("{error:#}")),
-    };
-    let client = daemon.client.clone();
+    let result = crate::daemon::client::run_owned_daemon(mode, |client| {
+        Box::pin(async move {
+            // Preflight via daemon RPCs — the CLI never opens SQLite.
+            emit_org_logging_indicator_via_daemon(&client, &cwd).await;
+            enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd)
+                .await
+                .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
+            let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
+                .await
+                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+            let image_files = resolve_attachment_paths(&cwd, &args.file)
+                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+            let image_data = load_and_validate_images(&image_files).map_err(|error| {
+                RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
+            })?;
 
-    // Preflight via daemon RPCs — the CLI never opens SQLite.
-    emit_org_logging_indicator_via_daemon(&client, &cwd).await;
-    if let Err(error) = enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd).await {
-        exit_run_error(format, 3, "workspace_trust", &error.to_string());
-    }
-
-    let requested_session = match resolve_requested_session_via_daemon(&args, &client, &cwd).await {
-        Ok(session) => session,
-        Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
-    };
-    let image_files = match resolve_attachment_paths(&cwd, &args.file) {
-        Ok(paths) => paths,
-        Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
-    };
-    let image_data = match load_and_validate_images(&image_files) {
-        Ok(images) => images,
-        Err(error) => exit_run_error(format, 2, "invalid_attachment", &format!("{error:#}")),
-    };
-
-    // Layer A: arm the shutdown backstop *only* when we own the daemon.
-    // Held across every `?` below so an error return still reaps it.
-    let guard = daemon.take_owned_daemon_guard();
-
-    // A signal handler so Ctrl-C / SIGTERM during the run reaps the
-    // daemon instead of orphaning it. Shares the guard's armed flag and
-    // socket so it drives the identical synchronous shutdown.
-    let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
-
-    let result = run_turn(
-        &client,
-        &args,
-        prompt,
-        no_sandbox,
-        &cwd,
-        requested_session,
-        &image_data,
-    )
+            run_turn(
+                &client,
+                &args,
+                prompt,
+                no_sandbox,
+                &cwd,
+                requested_session,
+                &image_data,
+            )
+            .await
+        })
+    })
     .await;
 
-    // Stop the signal watcher and run the (now happy-path) shutdown
-    // before deciding the exit code, so the daemon is gone whether the
-    // turn succeeded or errored.
-    if let Some(task) = signal_task {
-        task.abort();
-    }
-    if let Some(guard) = &guard {
-        guard.shutdown();
-    }
-    // Drop the guard explicitly here so its (now-disarmed) drop is a
-    // no-op and we don't carry it past `process::exit`.
-    drop(guard);
+    let result = match result {
+        Err(OwnedDaemonRunError::Connect(error)) => {
+            exit_run_error(format, 4, "daemon_connection", &format!("{error:#}"))
+        }
+        Err(error) => Err(error.into_inner()),
+        Ok(value) => Ok(value),
+    };
 
     let exit_code = match result {
         Ok(code) => code,
+        Err(error) if error.downcast_ref::<RunPreflightFailure>().is_some() => {
+            let failure = error
+                .downcast_ref::<RunPreflightFailure>()
+                .expect("preflight failure checked above");
+            if json_mode {
+                emit_json(&json!({
+                    "event": "error",
+                    "code": failure.code,
+                    "message": failure.message
+                }))?;
+                emit_run_complete(false, failure.exit_code)?;
+            } else {
+                eprintln!("{}", failure.message);
+            }
+            failure.exit_code
+        }
         Err(error) if error.downcast_ref::<RunWorkspaceTrustError>().is_some() => {
             let message = error.to_string();
             if json_mode {
@@ -345,10 +355,25 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     Ok(())
 }
 
+#[cfg(test)]
+fn finish_owned_run<T>(
+    command: anyhow::Result<T>,
+    shutdown: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    match (command, shutdown()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(shutdown)) => Err(shutdown).context("shutting down owned daemon"),
+        (Err(command), Err(shutdown)) => Err(anyhow::anyhow!(
+            "command failed: {command:#}; owned daemon shutdown also failed: {shutdown:#}"
+        )),
+    }
+}
+
 /// Attach, send the prompt, pump events. Split out so the `?` operators
 /// unwind through [`run`]'s guard rather than skipping it.
 async fn run_turn(
-    client: &crate::daemon::client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     args: &RunArgs,
     prompt: String,
     no_sandbox: bool,
@@ -382,7 +407,7 @@ async fn run_turn(
 /// the daemon. The caller owns the daemon lifecycle (probe/spawn +
 /// ephemeral guard).
 pub(crate) async fn attach_send_pump(
-    client: &crate::daemon::client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     prompt: String,
     no_sandbox: bool,
     format: OutputFormat,
@@ -518,7 +543,7 @@ pub(crate) async fn attach_send_pump(
     // Sole invocation identity: allocated once before first SendUserMessage.
     let client_submission_id = Uuid::new_v4();
     if submitted_message {
-        let use_bulk = cockpit_core::daemon::bulk_upload::user_message_needs_bulk(&prompt, None);
+        let use_bulk = cockpit_client::bulk_upload::user_message_needs_bulk(&prompt, None);
         if use_bulk && !options.image_data.is_empty() {
             return Err(RunUsageError(
                 "media/file submissions cannot carry text over the 64 KiB artifact threshold"
@@ -533,10 +558,9 @@ pub(crate) async fn attach_send_pump(
         // includes the run marker; init/learn omit options and create no
         // RunInvocationState.
         let send_result = if use_bulk {
-            let transfer =
-                cockpit_core::daemon::bulk_upload::stage_opaque_user_text(client, &prompt)
-                    .await
-                    .map_err(|error| RunUsageError(error.to_string()))?;
+            let transfer = cockpit_client::bulk_upload::stage_opaque_user_text(client, &prompt)
+                .await
+                .map_err(|error| RunUsageError(error.to_string()))?;
             client
                 .request(Request::SendUserMessageBulk {
                     expected_model_state_generation: None,
@@ -726,18 +750,23 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
 }
 
 async fn load_and_upload_images(
-    client: &crate::daemon::client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     images: &[Vec<u8>],
 ) -> Result<Vec<proto::ImageAttachmentRef>> {
-    match crate::daemon::image_upload::upload_submission_images(client, images).await {
+    let typed = images
+        .iter()
+        .cloned()
+        .map(cockpit_client::image_upload::SubmissionImage::png)
+        .collect::<Vec<_>>();
+    match cockpit_client::image_upload::upload_submission_images(client, &typed).await {
         Ok(refs) => Ok(refs),
         Err(error) => Err(map_image_upload_error(error)),
     }
 }
 
-fn map_image_upload_error(error: crate::daemon::image_upload::ImageUploadError) -> anyhow::Error {
+fn map_image_upload_error(error: cockpit_client::image_upload::ImageUploadError) -> anyhow::Error {
     match error {
-        crate::daemon::image_upload::ImageUploadError::Usage(message) => {
+        cockpit_client::image_upload::ImageUploadError::Usage(message) => {
             RunUsageError(message).into()
         }
         error => error.into(),
@@ -843,7 +872,7 @@ fn validate_ephemeral_continuation(args: &RunArgs) -> Result<()> {
 }
 
 pub(crate) async fn pump_events(
-    client: &crate::daemon::client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     session_id: Uuid,
     format: OutputFormat,
     verbose_json: bool,
@@ -1022,7 +1051,7 @@ fn disconnect_status_guidance(id: Uuid) -> String {
 
 /// First-SIGINT reconciliation: cancel then status on the same identity.
 async fn reconcile_after_interrupt(
-    client: &crate::daemon::client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     id: Uuid,
     format: OutputFormat,
     stderr: &mut impl Write,
@@ -1412,10 +1441,7 @@ fn sanitize_terminal_text(input: &str) -> String {
     out
 }
 
-async fn is_processing(
-    client: &crate::daemon::client::DaemonClient,
-    session_id: Uuid,
-) -> Result<bool> {
+async fn is_processing(client: &ScopedDaemonClient<'_>, session_id: Uuid) -> Result<bool> {
     match client
         .request_ok(Request::SessionLiveStatus {
             session_ids: vec![session_id],
@@ -1851,6 +1877,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preflight_failure_still_finishes_owned_shutdown_before_render_or_exit() {
+        let shutdown_called = std::cell::Cell::new(false);
+        let result: anyhow::Result<()> = finish_owned_run(
+            Err(RunPreflightFailure::new(3, "workspace_trust", "denied").into()),
+            || {
+                shutdown_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(shutdown_called.get());
+        assert!(result.unwrap_err().is::<RunPreflightFailure>());
+    }
+
+    #[test]
+    fn injected_signal_cleanup_during_preflight_is_joined_before_exit_selection() {
+        let cleanup_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal_complete = cleanup_complete.clone();
+        let signal_cleanup = std::thread::spawn(move || {
+            signal_complete.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let result: anyhow::Result<()> = finish_owned_run(
+            Err(RunPreflightFailure::new(2, "invalid_arguments", "injected").into()),
+            || {
+                signal_cleanup.join().unwrap();
+                assert!(cleanup_complete.load(std::sync::atomic::Ordering::SeqCst));
+                Ok(())
+            },
+        );
+        assert!(cleanup_complete.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(result.unwrap_err().is::<RunPreflightFailure>());
+    }
+
+    #[test]
     fn image_control_config_changed_is_filtered_as_daemon_global() {
         let event = proto::Event::ImageControlConfigChanged {
             event: proto::image_control::ImageControlEventV1::config_changed(
@@ -2247,13 +2306,13 @@ mod tests {
         assert!(error.downcast_ref::<RunUsageError>().is_some());
         assert!(error.to_string().contains("too many images"));
 
-        let error = map_image_upload_error(crate::daemon::image_upload::ImageUploadError::Usage(
+        let error = map_image_upload_error(cockpit_client::image_upload::ImageUploadError::Usage(
             "configured upload limit rejected the image".into(),
         ));
         assert!(error.downcast_ref::<RunUsageError>().is_some());
 
         let error = map_image_upload_error(
-            crate::daemon::image_upload::ImageUploadError::Transport("socket closed".into()),
+            cockpit_client::image_upload::ImageUploadError::Transport("socket closed".into()),
         );
         assert!(error.downcast_ref::<RunUsageError>().is_none());
     }

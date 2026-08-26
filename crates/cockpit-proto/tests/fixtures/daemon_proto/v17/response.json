@@ -1760,6 +1760,25 @@
     },
     "response": "local_path_media_registration"
   },
+  "image_ingress_admitted": {
+    "data": {
+      "schemaVersion": 1,
+      "kind": "imageIngressAdmissionReceipt",
+      "admissionId": "01890f3e-7bcd-7abc-8abc-000000000021",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "imageRef": {
+        "id": "01890f3e-7bcd-7abc-8abc-000000000022"
+      },
+      "attachmentVersion": 1,
+      "availabilityGeneration": 1,
+      "reservationId": "image-ingress:01890f3e-7bcd-7abc-8abc-000000000021",
+      "normalizedSha256": "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",
+      "normalizedByteLength": 8,
+      "width": 1,
+      "height": 1
+    },
+    "response": "image_ingress_admitted"
+  },
   "retained_https_media": {
     "data": {
       "schemaVersion": 1,
@@ -2616,9 +2635,12 @@
     "data": {
       "client_operation_id": "33333333-3333-4333-8333-333333333333",
       "project_root": "/tmp/project",
+      "owner_scope": "project:/tmp/project",
       "agent_name": "build",
       "lease_id": "11111111-1111-4111-8111-111111111111",
       "consumed_revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
+      "consumed_config_generation": 7,
+      "result_config_generation": 8,
       "status": {
         "status": "saved",
         "result_revision": "2c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",

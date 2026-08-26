@@ -1,9 +1,7 @@
 use super::{App, HistoryEntry, Overlay, SLASH_COMMANDS, SideConversation, input};
 use crate::tui::async_action::AsyncActionKind;
 use crate::tui::keys_overlay::KeyContext;
-use cockpit_core::daemon::proto::{
-    InterruptOption, InterruptQuestion, InterruptQuestionSet, SessionSummary,
-};
+use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet, SessionSummary};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use std::fs;
@@ -65,8 +63,8 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
         short_id: Some("abcdef".to_string()),
         project_root,
         project_id: "pid".to_string(),
-        started_at: 1,
-        last_active_at: 2,
+        started_at_unix_ms: 1,
+        last_active_at_unix_ms: 2,
         turns: 1,
         active_agent: "Build".to_string(),
         title: Some("summary".to_string()),
@@ -75,17 +73,18 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
         shared_with_collaborators: false,
         fork_count: 0,
         descendant_count: 0,
-        last_viewed_at: None,
-        latest_activity_at: None,
+        last_viewed_at_unix_ms: None,
+        latest_activity_at_unix_ms: None,
         open_interrupts: 0,
         activity_state: None,
-        archived_at: None,
+        archived_at_unix_ms: None,
         pin_count: 0,
     }
 }
 
 fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
     SideConversation {
+        endpoint: cockpit_client::ClientEndpoint::Wire(tmp.join("daemon.sock")),
         side_session_id: Uuid::new_v4(),
         socket: tmp.join("missing-daemon.sock"),
         saved_runner: None,
@@ -168,6 +167,7 @@ fn app_with_sessions_preview_pane_body(tmp: &tempfile::TempDir, app: &mut App) {
     app.startup_background.daemon_socket = Some(dead_socket.clone());
     let session_id = Uuid::new_v4();
     let mut pane = crate::tui::sessions_pane::SessionsPane::open(
+        None,
         &app.launch.cwd,
         true,
         Some(dead_socket),
@@ -197,6 +197,7 @@ fn question_dialog_shadows_and_resumes_an_open_overlay() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
     app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
+        None,
         &app.launch.cwd,
         false,
         None,
@@ -296,6 +297,7 @@ fn leader_with_sessions_pane_open_shows_sessions_context() {
     let mut app = configured_app(&tmp);
 
     app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
+        None,
         &app.launch.cwd,
         false,
         None,

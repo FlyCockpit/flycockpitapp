@@ -7,8 +7,12 @@
 //! the writer connection and panics if called from any Tokio runtime; async
 //! code must use [`Db::read`], [`Db::write`], or [`Db::transaction`] instead.
 //! Four temporary sync UI/event/maintenance wrappers remain until
-//! `db-sync-wrapper-migration`; the cockpit-db-local AST/call-graph gate in
-//! `tests/db_blocking_boundary_gate.rs` freezes that exact allowlist.
+//! `db-sync-wrapper-migration`. Three typed agent-publication journal methods
+//! also bridge the writer while a caller owns a `!Send` cross-process
+//! filesystem lock; unlike the CLI escape hatch, they accept only journal
+//! fields and cannot run caller-provided SQL. The cockpit-db-local
+//! AST/call-graph gate in `tests/db_blocking_boundary_gate.rs` freezes that
+//! exact allowlist and its ownership rationale.
 //!
 //! Async migration rules:
 //!
@@ -110,6 +114,7 @@ pub mod workspace_trust;
 pub mod write_scope_leases;
 
 use std::any::Any;
+use std::io::Seek as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,6 +127,8 @@ use sha2::{Digest, Sha256};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATION_BACKUP_LIMIT: usize = 3;
+const UNTRUSTED_MIGRATION_BACKUP_LIMIT: usize = 2;
+const UNTRUSTED_MIGRATION_BACKUP_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -236,7 +243,8 @@ impl Writer {
                 while let Ok(request) = rx.recv() {
                     let result = catch_unwind(AssertUnwindSafe(|| (request.job)(&conn)))
                         .map_err(|_| anyhow::anyhow!("db writer job panicked"))
-                        .and_then(|result| result);
+                        .and_then(|result| result)
+                        .map_err(annotate_database_storage_failure);
                     let poison = result.as_ref().err().is_some_and(|error| {
                         error
                             .chain()
@@ -389,8 +397,8 @@ impl ReadPool {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
-        let conn = self.checkout()?;
-        let result = f(&conn);
+        let conn = self.checkout().map_err(annotate_database_storage_failure)?;
+        let result = f(&conn).map_err(annotate_database_storage_failure);
         let checkin = self.checkin(conn);
         match (result, checkin) {
             (Ok(value), Ok(())) => Ok(value),
@@ -415,6 +423,112 @@ pub struct Db {
     _owner_lock: Option<Arc<files::DatabaseOwnerLock>>,
     _diagnostic_lock: Option<Arc<files::DatabaseDiagnosticLock>>,
     read_only: bool,
+}
+
+/// Read-only physical storage accounting for diagnostics and retention UX.
+///
+/// `allocated_bytes` is SQLite's main-file page allocation, while
+/// `reclaimable_bytes` is the freelist portion of that allocation. The WAL and
+/// shared-memory sidecars are reported separately because they are bounded by
+/// the daemon's checkpoint policy rather than retention deletes alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseStorageReport {
+    pub page_size_bytes: u64,
+    pub page_count: u64,
+    pub freelist_page_count: u64,
+    pub allocated_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub live_bytes: u64,
+    pub main_file_bytes: u64,
+    pub wal_file_bytes: u64,
+    pub shared_memory_file_bytes: u64,
+}
+
+/// Stable recovery category for storage failures that require user action.
+///
+/// Callers must not retry these as ordinary contention. In particular,
+/// `Capacity` and `Io` leave the outcome of an interrupted commit unknown;
+/// recovery must reopen through the daemon and reconcile durable state before
+/// reporting success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseStorageFailure {
+    Capacity,
+    Memory,
+    ReadOnly,
+    Io,
+    Corrupt,
+}
+
+impl DatabaseStorageFailure {
+    pub const fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::Capacity => "FCDB_STORAGE_FULL",
+            Self::Memory => "FCDB_STORAGE_MEMORY",
+            Self::ReadOnly => "FCDB_STORAGE_READ_ONLY",
+            Self::Io => "FCDB_STORAGE_IO",
+            Self::Corrupt => "FCDB_STORAGE_CORRUPT",
+        }
+    }
+}
+
+/// Classify an SQLite storage failure through any `anyhow` context chain.
+pub fn classify_database_storage_failure(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<DatabaseStorageFailure> {
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        if let Some(rusqlite::Error::SqliteFailure(info, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            return match info.code {
+                rusqlite::ErrorCode::DiskFull => Some(DatabaseStorageFailure::Capacity),
+                rusqlite::ErrorCode::OutOfMemory => Some(DatabaseStorageFailure::Memory),
+                rusqlite::ErrorCode::ReadOnly
+                | rusqlite::ErrorCode::PermissionDenied
+                | rusqlite::ErrorCode::AuthorizationForStatementDenied => {
+                    Some(DatabaseStorageFailure::ReadOnly)
+                }
+                rusqlite::ErrorCode::SystemIoFailure
+                | rusqlite::ErrorCode::CannotOpen
+                | rusqlite::ErrorCode::FileLockingProtocolFailed => {
+                    Some(DatabaseStorageFailure::Io)
+                }
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+                    Some(DatabaseStorageFailure::Corrupt)
+                }
+                _ => None,
+            };
+        }
+        current = cause.source();
+    }
+    None
+}
+
+fn annotate_database_storage_failure(error: anyhow::Error) -> anyhow::Error {
+    let Some(failure) = classify_database_storage_failure(error.as_ref()) else {
+        return error;
+    };
+    let guidance = match failure {
+        DatabaseStorageFailure::Capacity => {
+            "free disk space, then restart the daemon and reconcile the operation before retrying"
+        }
+        DatabaseStorageFailure::Memory => {
+            "free memory or reduce the operation size, then restart the daemon before retrying"
+        }
+        DatabaseStorageFailure::ReadOnly => {
+            "restore write permission to the Cockpit data directory, then restart the daemon"
+        }
+        DatabaseStorageFailure::Io => {
+            "check the storage device and filesystem, then restart the daemon and reconcile the operation before retrying"
+        }
+        DatabaseStorageFailure::Corrupt => {
+            "stop the daemon and restore a validated database backup; do not retry the mutation"
+        }
+    };
+    error.context(format!(
+        "{}: database durability failure; {guidance}",
+        failure.diagnostic_code()
+    ))
 }
 
 impl std::fmt::Debug for Db {
@@ -614,6 +728,35 @@ impl Db {
     /// checksum-backed migration ledger replaces `schema_version`.
     pub async fn applied_migration_version(&self) -> Result<i64> {
         self.read(current_schema_version).await
+    }
+
+    /// Return physical database accounting without mutating or checkpointing.
+    ///
+    /// This is safe for both the live daemon handle and the hidden read-only
+    /// diagnostic opener. Missing WAL/SHM sidecars count as zero; all other
+    /// metadata failures are surfaced so `doctor` cannot claim a complete
+    /// report from partial evidence.
+    pub async fn storage_report(&self) -> Result<DatabaseStorageReport> {
+        let path = self.path.clone();
+        self.read(move |conn| database_storage_report(conn, path.as_deref()))
+            .await
+    }
+
+    /// Run SQLite's physical and relational integrity checks through the
+    /// daemon-owned/read-only database handle used by diagnostics.
+    pub async fn diagnostic_integrity_check(&self) -> Result<()> {
+        self.read(|conn| {
+            foreign_key_check(conn).context("running diagnostic foreign_key_check")?;
+            let quick_check: String = conn
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .context("running diagnostic SQLite quick_check")?;
+            anyhow::ensure!(
+                quick_check == "ok",
+                "SQLite quick_check failed: {quick_check}"
+            );
+            Ok(())
+        })
+        .await
     }
 
     pub async fn read<F, T>(&self, f: F) -> Result<T>
@@ -986,12 +1129,17 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 struct Migration {
     name: &'static str,
     sql: &'static str,
+    deferred_sql: &'static str,
     extension_sql: &'static str,
 }
 
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "extended"))]
+const SCHEMA_PROFILE: &str = "remote-extended-v0.1";
+#[cfg(all(feature = "remote", not(feature = "extended")))]
 const SCHEMA_PROFILE: &str = "remote-v0.1";
-#[cfg(not(feature = "remote"))]
+#[cfg(all(not(feature = "remote"), feature = "extended"))]
+const SCHEMA_PROFILE: &str = "extended-local-v0.1";
+#[cfg(all(not(feature = "remote"), not(feature = "extended")))]
 const SCHEMA_PROFILE: &str = "local-v0.1";
 
 /// Stable diagnostic identifier for attempting to open one prerelease build
@@ -999,6 +1147,10 @@ const SCHEMA_PROFILE: &str = "local-v0.1";
 /// in-place migration in v0.1: opt-in remote builds must use a separate data
 /// directory (or an explicit supported export/import flow).
 pub const SCHEMA_PROFILE_MISMATCH_CODE: &str = "FCDB_SCHEMA_PROFILE_MISMATCH";
+/// Stable diagnostic code for an existing SQLite database which opened, but
+/// whose pre-migration backup could not be promoted to a trusted restorable
+/// artifact because the schema/ledger was not an exact compiled state.
+pub const SCHEMA_REJECTION_AFTER_OPEN_CODE: &str = "FCDB_SCHEMA_REJECTED_AFTER_OPEN";
 
 fn schema_profile_mismatch(database_profile: &str) -> anyhow::Error {
     anyhow::anyhow!(
@@ -1011,6 +1163,10 @@ fn schema_profile_mismatch(database_profile: &str) -> anyhow::Error {
 const MIGRATIONS: &[Migration] = &[Migration {
     name: "0001_initial.sql",
     sql: include_str!("migrations/0001_initial.sql"),
+    #[cfg(not(feature = "extended"))]
+    deferred_sql: "",
+    #[cfg(feature = "extended")]
+    deferred_sql: include_str!("migrations/0001_extended_profile.sql"),
     #[cfg(not(feature = "remote"))]
     extension_sql: "",
     #[cfg(feature = "remote")]
@@ -1038,7 +1194,7 @@ fn backup_before_pending_migration(
                 "rejecting an unproven or malformed prerelease schema ledger",
             )?;
             return Err(assessment_error).context(
-                "database schema could not be proven compatible; a validated backup was created before rejection",
+                "database schema could not be proven compatible; a durable backup artifact was preserved before rejection",
             );
         }
     };
@@ -1054,24 +1210,1374 @@ fn create_migration_backup(
     schema_version: i64,
     reason: &str,
 ) -> Result<()> {
+    create_migration_backup_with_limit(
+        conn,
+        path,
+        schema_version,
+        reason,
+        UNTRUSTED_MIGRATION_BACKUP_TOTAL_BYTES,
+    )
+}
+
+fn create_migration_backup_with_limit(
+    conn: &Connection,
+    path: &Path,
+    schema_version: i64,
+    reason: &str,
+    quarantine_byte_limit: u64,
+) -> Result<()> {
+    // Serialize the complete artifact lifecycle across processes, including
+    // callers of the public non-daemon `Db::open`. While this lock is held,
+    // every owned candidate is crash residue: a live creator cannot coexist.
+    let _artifact_lock = BackupArtifactLock::acquire(path)?;
+    remove_stale_backup_candidates(path)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let backup = path.with_extension(format!("v{schema_version}.backup-{stamp}.sqlite"));
-    conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
-        .with_context(|| {
+    let estimated_bytes = sqlite_allocated_bytes(conn)?;
+    if estimated_bytes > quarantine_byte_limit {
+        anyhow::bail!(
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was created before {reason}; the estimated {estimated_bytes}-byte backup exceeds the hard {quarantine_byte_limit}-byte quarantine limit"
+        );
+    }
+    reserve_untrusted_migration_backup_capacity(path, estimated_bytes, quarantine_byte_limit)
+        .context("backing up database before migration: reserving quarantine capacity")?;
+    if let Some(available) = filesystem_available_bytes(path)
+        .context("backing up database before migration: checking filesystem free space")?
+        && available < estimated_bytes
+    {
+        anyhow::bail!(
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was created before {reason}; only {available} filesystem bytes are available for the estimated {estimated_bytes}-byte online backup"
+        );
+    }
+    let candidate = path.with_extension(format!(
+        "v{schema_version}.backup-candidate-{stamp}-{:016x}.sqlite.tmp",
+        rand::random::<u64>()
+    ));
+    // Arm cleanup before exposing the candidate pathname to SQLite. This also
+    // covers partial files left by an ordinary VACUUM error or later failure.
+    let mut candidate_guard = BackupCandidateGuard::new(candidate.clone());
+    if let Err(error) = conn.execute("VACUUM INTO ?1", [candidate.to_string_lossy().as_ref()]) {
+        if candidate.exists() {
+            remove_backup_candidate(&candidate)?;
+            candidate_guard.disarm();
+        }
+        return Err(error).with_context(|| {
             format!(
-                "creating SQLite online backup of {} at {} before {reason}",
-                path.display(),
-                backup.display()
+                "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was created; creating SQLite online backup of {} at {} before {reason} failed",
+                path.display(), candidate.display()
+            )
+        });
+    }
+    files::repair_private_file(&candidate, "database backup candidate")?;
+    let candidate_bytes = std::fs::metadata(&candidate)
+        .with_context(|| format!("reading backup candidate size {}", candidate.display()))?
+        .len();
+    if candidate_bytes > quarantine_byte_limit {
+        remove_backup_candidate(&candidate)?;
+        candidate_guard.disarm();
+        anyhow::bail!(
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was created before {reason}; the completed {candidate_bytes}-byte backup exceeds the hard {quarantine_byte_limit}-byte quarantine limit"
+        );
+    }
+    if let Err(error) =
+        reserve_untrusted_migration_backup_capacity(path, candidate_bytes, quarantine_byte_limit)
+    {
+        remove_backup_candidate(&candidate)?;
+        candidate_guard.disarm();
+        return Err(error).context("no recovery artifact was created after backup sizing");
+    }
+    // Preserve the physical recovery artifact before performing logical
+    // validation. A drifted source can legitimately fail the latter check;
+    // its online backup must still reach the filesystem durability boundary.
+    fsync_file_and_parent(&candidate)?;
+    let content_digest = file_sha256(&candidate)?;
+    let untrusted = path.with_extension(format!(
+        "v{schema_version}.backup-untrusted-{content_digest}.sqlite.quarantine"
+    ));
+    let validation = validate_migration_backup(&candidate, schema_version).with_context(|| {
+        format!(
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: migration backup artifact {} was durably preserved but remains untrusted before {reason}",
+            untrusted.display()
+        )
+    });
+    if let Err(error) = validation {
+        if existing_quarantine_matches(&untrusted, &content_digest)? {
+            remove_backup_candidate(&candidate)?;
+            candidate_guard.disarm();
+            return Err(error).context(format!(
+                "an exact content-identical backup is already durably quarantined at {}",
+                untrusted.display()
+            ));
+        }
+        // A mismatched, truncated, insecure, or symlink occupant must never make
+        // us discard the fresh candidate merely because it owns the digest-shaped
+        // pathname. Move it into the lock-owned candidate namespace; it remains
+        // recoverable until the replacement reaches its fsync boundary.
+        let displaced = handle_invalid_quarantine_occupant(path, &untrusted)?;
+        std::fs::rename(&candidate, &untrusted).with_context(|| {
+            format!(
+                "publishing quarantined database backup {} at {}",
+                candidate.display(),
+                untrusted.display()
             )
         })?;
-    files::repair_private_file(&backup, "database backup")?;
-    validate_migration_backup(&backup)?;
+        candidate_guard.disarm();
+        fsync_file_and_parent(&untrusted)?;
+        if let Some(displaced) = displaced {
+            remove_backup_candidate(&displaced)?;
+        }
+        prune_untrusted_migration_backups(path)?;
+        return Err(error);
+    }
+    let displaced = handle_invalid_quarantine_occupant(path, &untrusted)?;
+    std::fs::rename(&candidate, &backup).with_context(|| {
+        format!(
+            "promoting trusted migration backup {} to {}",
+            candidate.display(),
+            backup.display()
+        )
+    })?;
+    candidate_guard.disarm();
     fsync_file_and_parent(&backup)?;
+    if let Some(displaced) = displaced {
+        remove_backup_candidate(&displaced)?;
+    }
     prune_migration_backups(path)?;
     Ok(())
+}
+
+fn existing_quarantine_matches(path: &Path, expected_digest: &str) -> Result<bool> {
+    existing_quarantine_matches_after_open(path, expected_digest, || {}, || {})
+}
+
+fn existing_quarantine_matches_after_open(
+    path: &Path,
+    expected_digest: &str,
+    after_open: impl FnOnce(),
+    before_parent_sync: impl FnOnce(),
+) -> Result<bool> {
+    let mut file = match open_quarantine_nofollow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting quarantine artifact {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting quarantine handle {}", path.display()))?;
+    if !quarantine_handle_is_regular(&metadata) {
+        return Ok(false);
+    }
+    if !quarantine_metadata_is_owned(&metadata) {
+        return Ok(false);
+    }
+    repair_private_quarantine_handle(&file, &metadata, path)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("rechecking quarantine handle {}", path.display()))?;
+    if !quarantine_metadata_is_private_and_owned(&metadata) {
+        return Ok(false);
+    }
+    after_open();
+    file.rewind()
+        .with_context(|| format!("rewinding quarantine artifact {}", path.display()))?;
+    let digest_matches = reader_sha256(&mut file)? == expected_digest;
+    if !digest_matches {
+        return Ok(false);
+    }
+    file.sync_all()
+        .with_context(|| format!("fsyncing opened quarantine handle {}", path.display()))?;
+    if !path_still_names_open_quarantine(path, &metadata)? {
+        return Ok(false);
+    }
+    before_parent_sync();
+    if !path_still_names_open_quarantine(path, &metadata)? {
+        return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .context("quarantine artifact has no parent directory")?;
+    sync_backup_parent(parent)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn quarantine_metadata_is_owned(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    // SAFETY: `geteuid` has no preconditions and reads process identity only.
+    metadata.uid() == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn quarantine_metadata_is_owned(_metadata: &std::fs::Metadata) -> bool {
+    // The standard library cannot prove a private-owner ACL for this handle.
+    false
+}
+
+#[cfg(unix)]
+fn path_still_names_open_quarantine(path: &Path, opened: &std::fs::Metadata) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let current = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("rechecking quarantine pathname identity"),
+    };
+    Ok(current.file_type().is_file()
+        && !current.file_type().is_symlink()
+        && current.dev() == opened.dev()
+        && current.ino() == opened.ino())
+}
+
+#[cfg(not(unix))]
+fn path_still_names_open_quarantine(_path: &Path, _opened: &std::fs::Metadata) -> Result<bool> {
+    // Windows deduplication already fails closed because the standard library
+    // cannot prove a private-owner ACL for the opened handle.
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn open_quarantine_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_quarantine_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_quarantine_nofollow(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no-follow quarantine validation is unavailable on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn quarantine_handle_is_regular(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+#[cfg(not(windows))]
+fn quarantine_handle_is_regular(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+#[cfg(unix)]
+fn repair_private_quarantine_handle(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+    path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "repairing quarantined database backup handle permissions {}",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn repair_private_quarantine_handle(
+    _file: &std::fs::File,
+    _metadata: &std::fs::Metadata,
+    _path: &Path,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn quarantine_metadata_is_private_and_owned(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    // SAFETY: `geteuid` has no preconditions and reads process identity only.
+    let effective_uid = unsafe { libc::geteuid() };
+    metadata.permissions().mode() & 0o777 == 0o600 && metadata.uid() == effective_uid
+}
+
+#[cfg(windows)]
+fn quarantine_metadata_is_private_and_owned(_metadata: &std::fs::Metadata) -> bool {
+    // The standard library exposes the opened handle's reparse attributes but
+    // not a sufficiently strong private-owner ACL proof. Keep deduplication
+    // fail-closed rather than treating a regular file as privately owned.
+    false
+}
+
+#[cfg(not(any(unix, windows)))]
+fn quarantine_metadata_is_private_and_owned(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+fn displace_invalid_quarantine(database: &Path, quarantine: &Path) -> Result<Option<PathBuf>> {
+    displace_invalid_quarantine_after_open(database, quarantine, || {})
+}
+
+fn displace_invalid_quarantine_after_open(
+    database: &Path,
+    quarantine: &Path,
+    after_open: impl FnOnce(),
+) -> Result<Option<PathBuf>> {
+    let file = match open_quarantine_nofollow(quarantine) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            unlink_quarantine_symlink(quarantine, sync_backup_parent)?;
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "opening invalid quarantine without following it {}",
+                    quarantine.display()
+                )
+            });
+        }
+    };
+    let opened = file.metadata().with_context(|| {
+        format!(
+            "inspecting invalid quarantine handle {}",
+            quarantine.display()
+        )
+    })?;
+    anyhow::ensure!(
+        quarantine_handle_is_regular(&opened),
+        "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: quarantine path {} changed type before displacement; remove that exact path manually and retry",
+        quarantine.display()
+    );
+    after_open();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let displaced = database.with_extension(format!(
+        "backup-candidate-replaced-{stamp}-{:016x}.sqlite.tmp",
+        rand::random::<u64>()
+    ));
+    std::fs::rename(quarantine, &displaced).with_context(|| {
+        format!(
+            "moving invalid quarantine artifact {} aside at {}",
+            quarantine.display(),
+            displaced.display()
+        )
+    })?;
+    let current = std::fs::symlink_metadata(&displaced).with_context(|| {
+        format!(
+            "inspecting displaced quarantine without following it {}",
+            displaced.display()
+        )
+    })?;
+    if current.file_type().is_symlink() {
+        unlink_quarantine_symlink(&displaced, sync_backup_parent)?;
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        current.file_type().is_file() && same_quarantine_file_identity(&opened, &current),
+        "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: displaced quarantine {} changed identity or type; remove that exact path manually and retry",
+        displaced.display()
+    );
+    file.sync_all().with_context(|| {
+        format!(
+            "fsyncing retained invalid quarantine handle {}",
+            displaced.display()
+        )
+    })?;
+    let parent = displaced
+        .parent()
+        .context("displaced quarantine has no parent directory")?;
+    sync_backup_parent(parent)?;
+    Ok(Some(displaced))
+}
+
+#[cfg(unix)]
+fn same_quarantine_file_identity(opened: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    opened.dev() == current.dev() && opened.ino() == current.ino()
+}
+
+#[cfg(not(unix))]
+fn same_quarantine_file_identity(
+    _opened: &std::fs::Metadata,
+    _current: &std::fs::Metadata,
+) -> bool {
+    // No portable stable file identity is exposed; automatic displacement is
+    // therefore denied rather than trusting a path after rename.
+    false
+}
+
+fn handle_invalid_quarantine_occupant(
+    database: &Path,
+    quarantine: &Path,
+) -> Result<Option<PathBuf>> {
+    let metadata = match std::fs::symlink_metadata(quarantine) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting quarantine path {}", quarantine.display()));
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_file() && !file_type.is_symlink() {
+        return displace_invalid_quarantine(database, quarantine);
+    }
+    if file_type.is_symlink() {
+        unlink_quarantine_symlink(quarantine, sync_backup_parent)?;
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was published because the quarantine path {} is a directory or special file; remove that exact path manually and retry",
+        quarantine.display()
+    )
+}
+
+fn unlink_quarantine_symlink(
+    quarantine: &Path,
+    sync_parent: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    std::fs::remove_file(quarantine).with_context(|| {
+        format!(
+            "unlinking invalid quarantine symlink {} without following it",
+            quarantine.display()
+        )
+    })?;
+    let parent = quarantine
+        .parent()
+        .context("quarantine symlink has no parent directory")?;
+    sync_parent(parent)
+}
+
+fn sync_backup_parent(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)
+        .with_context(|| format!("opening backup directory {} for fsync", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("fsyncing backup directory {}", parent.display()))
+}
+
+/// Cross-process serialization for recovery-artifact admission.
+///
+/// The stable authority is a held, privately owned parent-directory handle;
+/// the persistent sibling file only carries the kernel lock. On Unix the
+/// ancestor walk proves that no different OS principal can replace the parent
+/// directory entry. On Windows the parent is reached by a handle-relative,
+/// per-component no-reparse walk from the volume root (each hop opened with
+/// `OBJ_DONT_REPARSE`, so an intermediate junction fails closed instead of
+/// redirecting resolution), giving the same retained-authority guarantee as the
+/// Unix ancestry walk; the retained final handle additionally denies
+/// delete/rename and both parent and lock carry a verified protected
+/// current-user+SYSTEM DACL. A process running as this same user (or
+/// root/SYSTEM) is inside Cockpit's local trust boundary and can always
+/// sabotage its own files; this protocol intentionally does not claim
+/// protection from that principal.
+#[derive(Debug)]
+struct BackupArtifactLock {
+    file: std::fs::File,
+    _parent: std::fs::File,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BACKUP_ARTIFACT_LOCK_AFTER_KERNEL_LOCK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_backup_artifact_lock_after_kernel_lock_hook() {
+    if let Some(hook) =
+        BACKUP_ARTIFACT_LOCK_AFTER_KERNEL_LOCK_HOOK.with(|slot| slot.borrow_mut().take())
+    {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_backup_artifact_lock_after_kernel_lock_hook() {}
+
+impl BackupArtifactLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let lock_path = path.with_extension("backup-artifacts.lock");
+        let parent_path = lock_path
+            .parent()
+            .context("backup artifact lock has no parent directory")?;
+        let parent = open_stable_backup_lock_parent(parent_path)?;
+        let (file, created) = open_backup_artifact_lock_in_parent(&parent, &lock_path)
+            .with_context(|| format!("opening backup artifact lock {}", lock_path.display()))?;
+        validate_and_repair_backup_artifact_lock_handle(&file, &lock_path, created)?;
+        file.lock()
+            .with_context(|| format!("locking backup artifacts for {}", path.display()))?;
+        run_backup_artifact_lock_after_kernel_lock_hook();
+        validate_and_repair_backup_artifact_lock_handle(&file, &lock_path, false)?;
+        validate_stable_backup_lock_parent(&parent, parent_path)?;
+        Ok(Self {
+            file,
+            _parent: parent,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn open_stable_backup_lock_parent(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    files::ensure_private_dir(path)?;
+    validate_unix_backup_lock_ancestry(path)?;
+    let parent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("opening stable backup lock parent {}", path.display()))?;
+    let metadata = parent.metadata()?;
+    let effective_uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.is_dir()
+            && metadata.uid() == effective_uid
+            && metadata.permissions().mode() & 0o777 == 0o700,
+        "backup lock parent {} is not a private current-user directory",
+        path.display()
+    );
+    Ok(parent)
+}
+
+#[cfg(unix)]
+fn validate_unix_backup_lock_ancestry(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let effective_uid = unsafe { libc::geteuid() };
+    let mut child = absolute.as_path();
+    loop {
+        let child_metadata = std::fs::symlink_metadata(child)
+            .with_context(|| format!("inspecting backup lock ancestor {}", child.display()))?;
+        anyhow::ensure!(
+            child_metadata.is_dir() && !child_metadata.file_type().is_symlink(),
+            "backup lock ancestry contains a symlink or non-directory at {}",
+            child.display()
+        );
+        let Some(ancestor) = child.parent() else {
+            break;
+        };
+        if ancestor == child {
+            break;
+        }
+        let ancestor_metadata = std::fs::symlink_metadata(ancestor)
+            .with_context(|| format!("inspecting backup lock ancestor {}", ancestor.display()))?;
+        anyhow::ensure!(
+            ancestor_metadata.is_dir() && !ancestor_metadata.file_type().is_symlink(),
+            "backup lock ancestry contains a symlink or non-directory at {}",
+            ancestor.display()
+        );
+        // Every ancestor `A` that directly contains child `C` must not let any
+        // principal outside the trust boundary (the current user or root)
+        // replace `C`'s directory entry. Such a replacement would split the
+        // lock namespace: two processes resolving the same path could lock
+        // different inodes, defeating cross-process mutual exclusion and
+        // corrupting a concurrent backup. Only the current user and root are
+        // inside Cockpit's local trust boundary.
+        let mode = ancestor_metadata.permissions().mode();
+        let owner_trusted =
+            ancestor_metadata.uid() == effective_uid || ancestor_metadata.uid() == 0;
+        let child_trusted = child_metadata.uid() == effective_uid || child_metadata.uid() == 0;
+        if mode & libc::S_ISVTX != 0 {
+            // Sticky ancestor: only `C`'s owner, `A`'s owner, and root may
+            // replace the entry `C`, so all three must be trusted. This is the
+            // sole justified sticky exception (e.g. a root-owned `1777 /tmp`
+            // holding our own current-user child directory).
+            anyhow::ensure!(
+                owner_trusted && child_trusted,
+                "backup lock parent identity is replaceable through sticky ancestor {} whose owner or child owner is outside the trust boundary",
+                ancestor.display()
+            );
+        } else {
+            // Non-sticky ancestor: `A`'s owner can replace `C` outright, and
+            // any group/other-writable ancestor lets an outsider replace `C`.
+            anyhow::ensure!(
+                owner_trusted && mode & 0o022 == 0,
+                "backup lock parent identity is replaceable through untrusted or group/other-writable ancestor {}",
+                ancestor.display()
+            );
+        }
+        child = ancestor;
+    }
+    Ok(())
+}
+
+/// Shared Windows FFI for the handle-relative, no-reparse authority pattern.
+///
+/// cockpit-db is the base of the crate graph and must not depend on
+/// cockpit-host, so the pattern proven in
+/// `cockpit-host/src/private_fs/held_directory.rs` (whose shapes/constants
+/// these mirror exactly) is duplicated here. Both the parent walk in
+/// `open_stable_backup_lock_parent` and the child open in
+/// `open_backup_artifact_lock_in_parent` resolve every component through
+/// [`backup_lock_win::open_relative`].
+#[cfg(windows)]
+mod backup_lock_win {
+    use std::ffi::c_void;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+
+    pub(super) type Handle = *mut c_void;
+    pub(super) const INVALID_HANDLE_VALUE: Handle = -1_isize as Handle;
+
+    // NTSTATUS sentinels.
+    pub(super) const STATUS_SUCCESS_MIN: i32 = 0;
+    pub(super) const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+    pub(super) const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
+
+    // Object-attribute flags.
+    pub(super) const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+    pub(super) const OBJ_DONT_REPARSE: u32 = 0x1000;
+
+    // Access rights.
+    pub(super) const GENERIC_READ: u32 = 0x8000_0000;
+    pub(super) const GENERIC_WRITE: u32 = 0x4000_0000;
+    pub(super) const READ_CONTROL: u32 = 0x0002_0000;
+    pub(super) const WRITE_DAC: u32 = 0x0004_0000;
+    pub(super) const SYNCHRONIZE: u32 = 0x0010_0000;
+    pub(super) const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    pub(super) const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+
+    // Share modes.
+    pub(super) const FILE_SHARE_READ: u32 = 0x0000_0001;
+    pub(super) const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    pub(super) const FILE_SHARE_ALL: u32 = 0x7;
+
+    // Dispositions.
+    pub(super) const FILE_OPEN: u32 = 1;
+    pub(super) const FILE_CREATE: u32 = 2;
+
+    // Create options.
+    pub(super) const FILE_DIRECTORY_FILE: u32 = 0x1;
+    pub(super) const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+    pub(super) const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+    pub(super) const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // File attributes.
+    pub(super) const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    pub(super) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    // Win32 CreateFileW parameters for the volume-root anchor open.
+    pub(super) const OPEN_EXISTING: u32 = 3;
+    pub(super) const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    pub(super) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: Handle,
+        object_name: *const UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut c_void,
+        security_quality_of_service: *mut c_void,
+    }
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: isize,
+        information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file: *mut Handle,
+            access: u32,
+            attributes: *const ObjectAttributes,
+            io: *mut IoStatusBlock,
+            allocation: *const i64,
+            file_attributes: u32,
+            share: u32,
+            disposition: u32,
+            options: u32,
+            ea: *const c_void,
+            ea_len: u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub(super) fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            creation: u32,
+            flags: u32,
+            template: Handle,
+        ) -> Handle;
+    }
+
+    /// Handle-relative, no-reparse open of a single leaf `name` beneath
+    /// `parent`. `OBJ_DONT_REPARSE` + `FILE_OPEN_REPARSE_POINT` make any reparse
+    /// point at the leaf fail closed rather than be followed, so no intermediate
+    /// junction can redirect resolution and no component can be swapped between
+    /// validation and use. `STATUS_OBJECT_NAME_COLLISION` and
+    /// `STATUS_OBJECT_NAME_NOT_FOUND` are surfaced as `AlreadyExists`/`NotFound`
+    /// so callers can drive create-then-open fallback without re-deriving the
+    /// raw NTSTATUS. Both the per-component parent walk and the child-lock open
+    /// share this routine.
+    pub(super) fn open_relative(
+        parent: &std::fs::File,
+        name: &[u16],
+        disposition: u32,
+        kind: u32,
+        access: u32,
+        share: u32,
+    ) -> std::io::Result<std::fs::File> {
+        if name.is_empty() || name.len() > (u16::MAX as usize / 2) || name.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid Windows relative name",
+            ));
+        }
+        let mut owned = name.to_vec();
+        let unicode = UnicodeString {
+            length: (owned.len() * 2) as u16,
+            maximum_length: (owned.len() * 2) as u16,
+            buffer: owned.as_mut_ptr(),
+        };
+        let attributes = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: parent.as_raw_handle(),
+            object_name: &unicode,
+            attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut io = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let mut raw: Handle = std::ptr::null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                access,
+                &attributes,
+                &mut io,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share,
+                disposition,
+                kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status >= STATUS_SUCCESS_MIN && !raw.is_null() {
+            return Ok(unsafe { std::fs::File::from_raw_handle(raw) });
+        }
+        let error_kind = match status {
+            STATUS_OBJECT_NAME_COLLISION => std::io::ErrorKind::AlreadyExists,
+            STATUS_OBJECT_NAME_NOT_FOUND => std::io::ErrorKind::NotFound,
+            _ => std::io::ErrorKind::Other,
+        };
+        Err(std::io::Error::new(
+            error_kind,
+            format!("Windows handle-relative open failed with NTSTATUS {status:#x}"),
+        ))
+    }
+}
+
+/// Open the stable backup-lock parent by a handle-relative, per-component
+/// no-reparse walk from the volume root.
+///
+/// The parent tree is created first, then re-derived hop by hop from `C:\` with
+/// [`backup_lock_win::open_relative`]: every ancestor is opened with
+/// `OBJ_DONT_REPARSE`, so an intermediate junction/reparse point fails the walk
+/// closed instead of redirecting the parent to a different (even current-user
+/// owned) inode. This is the retained-authority equivalent of the Unix ancestry
+/// walk; a final pathname check would not suffice. The retained final handle is
+/// opened shared READ|WRITE but never DELETE (its lifetime rename/delete lease)
+/// and carries a set-then-verified private current-user+SYSTEM DACL.
+#[cfg(windows)]
+fn open_stable_backup_lock_parent(path: &Path) -> Result<std::fs::File> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::MetadataExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use std::path::{Component, Prefix};
+
+    use backup_lock_win as win;
+
+    // Create the private directory tree first. The no-reparse walk below then
+    // re-derives the same tree handle-relative from the volume root: if any
+    // ancestor create was redirected through a junction/reparse point, the walk
+    // fails closed instead of yielding a locked inode.
+    files::ensure_private_dir(path)?;
+
+    // Resolve a relative parent against the current directory, mirroring the
+    // Unix ancestry walk, so the per-component descent always starts from a
+    // drive-rooted volume anchor.
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut components = absolute.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+            _ => anyhow::bail!(
+                "backup lock parent {} is not on a local drive volume",
+                path.display()
+            ),
+        },
+        _ => anyhow::bail!(
+            "backup lock parent {} requires an absolute drive path",
+            path.display()
+        ),
+    };
+    anyhow::ensure!(
+        matches!(components.next(), Some(Component::RootDir)),
+        "backup lock parent {} requires a rooted drive path",
+        path.display()
+    );
+
+    // Reject any non-`Normal` component (lexical `.`/`..` or a second prefix):
+    // the walk admits only concrete directory names.
+    let mut names = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => names.push(name.to_owned()),
+            _ => anyhow::bail!(
+                "backup lock parent {} is not a lexical path",
+                path.display()
+            ),
+        }
+    }
+    anyhow::ensure!(
+        !names.is_empty(),
+        "backup lock parent {} resolves to the volume root",
+        path.display()
+    );
+
+    // Open the volume root (`C:\`) with no-reparse backup semantics; this is the
+    // fixed anchor the per-component walk descends from.
+    let root = format!("{}:\\", char::from(drive));
+    let root_wide = OsStr::new(&root)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<u16>>();
+    let raw = unsafe {
+        win::CreateFileW(
+            root_wide.as_ptr(),
+            win::GENERIC_READ | win::FILE_READ_ATTRIBUTES | win::SYNCHRONIZE,
+            win::FILE_SHARE_ALL,
+            std::ptr::null_mut(),
+            win::OPEN_EXISTING,
+            win::FILE_FLAG_BACKUP_SEMANTICS | win::FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    anyhow::ensure!(
+        raw != win::INVALID_HANDLE_VALUE,
+        "opening backup lock volume root {} failed: {}",
+        root,
+        std::io::Error::last_os_error()
+    );
+    let mut dir = unsafe { std::fs::File::from_raw_handle(raw) };
+
+    // The FINAL parent needs READ_CONTROL|WRITE_DAC to set/verify its private
+    // DACL and shares READ|WRITE but never DELETE so the retained handle denies
+    // rename/delete of the parent for its lifetime. Intermediate ancestors are
+    // only traversed, so they take read access and may share ALL.
+    const DIRECTORY_SECURITY_ACCESS: u32 =
+        win::READ_CONTROL | win::WRITE_DAC | win::SYNCHRONIZE | win::FILE_READ_ATTRIBUTES;
+    let last = names.len() - 1;
+    for (index, name) in names.iter().enumerate() {
+        let is_final = index == last;
+        let wide = name.encode_wide().collect::<Vec<u16>>();
+        let access = if is_final {
+            DIRECTORY_SECURITY_ACCESS
+        } else {
+            win::GENERIC_READ | win::FILE_READ_ATTRIBUTES | win::SYNCHRONIZE
+        };
+        let share = if is_final {
+            win::FILE_SHARE_READ | win::FILE_SHARE_WRITE
+        } else {
+            win::FILE_SHARE_ALL
+        };
+        dir = win::open_relative(
+            &dir,
+            &wide,
+            win::FILE_OPEN,
+            win::FILE_DIRECTORY_FILE,
+            access,
+            share,
+        )
+        .with_context(|| {
+            format!(
+                "opening backup lock parent component {:?} of {}",
+                name,
+                path.display()
+            )
+        })?;
+        let metadata = dir.metadata()?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.file_attributes() & win::FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "backup lock parent component {:?} of {} is a reparse point or non-directory",
+            name,
+            path.display()
+        );
+    }
+
+    files::set_private_windows_dacl_handle(&dir)?;
+    files::verify_private_windows_dacl_handle(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_stable_backup_lock_parent(path: &Path) -> Result<std::fs::File> {
+    anyhow::bail!(
+        "stable backup artifact lock parents are unavailable on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn validate_stable_backup_lock_parent(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = file.metadata()?;
+    let effective_uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.is_dir()
+            && metadata.uid() == effective_uid
+            && metadata.permissions().mode() & 0o777 == 0o700,
+        "held backup lock parent {} lost its private-directory invariant",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_stable_backup_lock_parent(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "held backup lock parent {} became a reparse point or non-directory",
+        path.display()
+    );
+    files::verify_private_windows_dacl_handle(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_stable_backup_lock_parent(_file: &std::fs::File, path: &Path) -> Result<()> {
+    anyhow::bail!(
+        "stable backup artifact lock parent validation is unavailable on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn open_backup_artifact_lock_in_parent(
+    parent: &std::fs::File,
+    path: &Path,
+) -> std::io::Result<(std::fs::File, bool)> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock path has no filename",
+        )
+    })?;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock filename contains NUL",
+        )
+    })?;
+    let mut fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    let created = fd >= 0;
+    if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+        fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+    }
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((unsafe { std::fs::File::from_raw_fd(fd) }, created))
+}
+
+#[cfg(windows)]
+fn open_backup_artifact_lock_in_parent(
+    parent: &std::fs::File,
+    path: &Path,
+) -> std::io::Result<(std::fs::File, bool)> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use backup_lock_win as win;
+
+    // Bind the open to the already-validated, held parent inode: the child is
+    // named only by its leaf and resolved via `RootDirectory` = the held parent
+    // handle, so no ancestor is re-traversed and no component can be swapped
+    // between the parent walk and this open. `OBJ_DONT_REPARSE` +
+    // `FILE_OPEN_REPARSE_POINT` (inside `open_relative`) fail closed if the leaf
+    // itself is a reparse point, and `FILE_NON_DIRECTORY_FILE` rejects a
+    // directory occupying the name.
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock path has no filename",
+        )
+    })?;
+    // Defense in depth: the leaf must be exactly one path component with no
+    // separators, since NtCreateFile would otherwise treat separators as a
+    // relative traversal and defeat the held-handle binding.
+    if std::path::Path::new(name).components().count() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock filename is not a single path component",
+        ));
+    }
+    // Defense in depth: reject a `:` in the leaf. NTFS treats `name:stream` as
+    // an alternate data stream and `X:` as a drive-relative qualifier, either of
+    // which NtCreateFile would resolve specially instead of as our lock file.
+    // Unreachable for the fixed `.backup-artifacts.lock` leaf, but cheap
+    // insurance on a security-sensitive lock.
+    if name.encode_wide().any(|unit| unit == u16::from(b':')) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock filename contains a colon",
+        ));
+    }
+    let wide = name.encode_wide().collect::<Vec<u16>>();
+    if wide.is_empty() || wide.len() > (u16::MAX as usize / 2) || wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Windows lock leaf name",
+        ));
+    }
+
+    let access = win::GENERIC_READ
+        | win::GENERIC_WRITE
+        | win::READ_CONTROL
+        | win::WRITE_DAC
+        | win::SYNCHRONIZE
+        | win::FILE_READ_ATTRIBUTES
+        | win::FILE_WRITE_ATTRIBUTES;
+    // Share READ|WRITE but never DELETE: while this handle is held the child
+    // cannot be renamed or deleted out from under the lock. This preserves the
+    // previous lock semantics, which also shared READ|WRITE and omitted DELETE.
+    let share = win::FILE_SHARE_READ | win::FILE_SHARE_WRITE;
+
+    // Exclusive-create first; on an existing lock fall back to open. `created`
+    // drives the one-time DACL set in the caller's validate/repair step. The
+    // collision is surfaced by `open_relative` as `AlreadyExists`.
+    match win::open_relative(
+        parent,
+        &wide,
+        win::FILE_CREATE,
+        win::FILE_NON_DIRECTORY_FILE,
+        access,
+        share,
+    ) {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = win::open_relative(
+                parent,
+                &wide,
+                win::FILE_OPEN,
+                win::FILE_NON_DIRECTORY_FILE,
+                access,
+                share,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "opening existing backup artifact lock relative to held parent failed: {error}"
+                ))
+            })?;
+            Ok((file, false))
+        }
+        Err(error) => Err(std::io::Error::other(format!(
+            "creating backup artifact lock relative to held parent failed: {error}"
+        ))),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_backup_artifact_lock_in_parent(
+    _parent: &std::fs::File,
+    _path: &Path,
+) -> std::io::Result<(std::fs::File, bool)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "stable backup artifact locking is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn validate_and_repair_backup_artifact_lock_handle(
+    file: &std::fs::File,
+    path: &Path,
+    _created: bool,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting backup artifact lock handle {}", path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and reads process identity only.
+    let effective_uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.is_file(),
+        "backup artifact lock {} is not a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.uid() == effective_uid,
+        "backup artifact lock {} is not owned by the current user",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.nlink() == 1,
+        "backup artifact lock {} has {} hard links",
+        path.display(),
+        metadata.nlink()
+    );
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "repairing backup artifact lock handle permissions {}",
+                    path.display()
+                )
+            })?;
+    }
+    let repaired = file.metadata().with_context(|| {
+        format!(
+            "rechecking backup artifact lock handle permissions {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        repaired.is_file()
+            && repaired.uid() == effective_uid
+            && repaired.nlink() == 1
+            && repaired.permissions().mode() & 0o777 == 0o600,
+        "backup artifact lock handle {} failed private regular-file revalidation",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_and_repair_backup_artifact_lock_handle(
+    file: &std::fs::File,
+    path: &Path,
+    created: bool,
+) -> Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting backup artifact lock handle {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "backup artifact lock {} is not a regular non-reparse file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.number_of_links() == Some(1),
+        "backup artifact lock {} does not have exactly one hard link",
+        path.display()
+    );
+    if created {
+        files::set_private_windows_dacl_handle(file)
+            .with_context(|| format!("securing backup artifact lock handle {}", path.display()))?;
+    }
+    files::verify_private_windows_dacl_handle(file)
+        .with_context(|| format!("verifying backup artifact lock handle {}", path.display()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_and_repair_backup_artifact_lock_handle(
+    _file: &std::fs::File,
+    path: &Path,
+    _created: bool,
+) -> Result<()> {
+    anyhow::bail!(
+        "safe backup artifact lock handle validation is unavailable for {}",
+        path.display()
+    )
+}
+
+impl Drop for BackupArtifactLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn sqlite_allocated_bytes(conn: &Connection) -> Result<u64> {
+    let page_count: u64 =
+        conn.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))? as u64;
+    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))? as u64;
+    page_count
+        .checked_mul(page_size)
+        .context("SQLite backup size estimate overflow")
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening backup candidate {} for hashing", path.display()))?;
+    reader_sha256(&mut file).with_context(|| format!("hashing backup candidate {}", path.display()))
+}
+
+fn reader_sha256(reader: &mut impl std::io::Read) -> Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn remove_backup_candidate(path: &Path) -> Result<()> {
+    std::fs::remove_file(path)
+        .with_context(|| format!("removing rejected backup candidate {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Remove candidate files abandoned by a crashed prior lock owner. This must
+/// run only while holding `BackupArtifactLock`; therefore an owned candidate
+/// can never belong to a live creator when it is removed.
+fn remove_stale_backup_candidates(path: &Path) -> Result<usize> {
+    let Some(parent) = path.parent() else {
+        return Ok(0);
+    };
+    let prefix = format!(
+        "{}.",
+        path.file_stem().unwrap_or_default().to_string_lossy()
+    );
+    let mut removed = 0_usize;
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(&prefix)
+            && name.contains(".backup-candidate-")
+            && name.ends_with(".sqlite.tmp"))
+        {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading backup candidate type {}", entry.path().display()))?;
+        anyhow::ensure!(
+            file_type.is_file() || file_type.is_symlink(),
+            "backup candidate path is not a removable file: {}",
+            entry.path().display()
+        );
+        std::fs::remove_file(entry.path()).with_context(|| {
+            format!("removing stale backup candidate {}", entry.path().display())
+        })?;
+        removed += 1;
+    }
+    if removed > 0 {
+        std::fs::File::open(parent)
+            .with_context(|| format!("opening backup directory {} for fsync", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("fsyncing backup directory {}", parent.display()))?;
+    }
+    Ok(removed)
+}
+
+struct BackupCandidateGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl BackupCandidateGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackupCandidateGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent()
+            && let Ok(directory) = std::fs::File::open(parent)
+        {
+            let _ = directory.sync_all();
+        }
+    }
 }
 
 /// Decide whether opening an existing prerelease database must first preserve
@@ -1140,7 +2646,7 @@ fn prerelease_backup_reason(
     Ok(None)
 }
 
-fn validate_migration_backup(path: &Path) -> Result<()> {
+fn validate_migration_backup(path: &Path, expected_schema_version: i64) -> Result<()> {
     let backup = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening migration backup {}", path.display()))?;
     let result: String = backup
@@ -1152,6 +2658,71 @@ fn validate_migration_backup(path: &Path) -> Result<()> {
             path.display()
         );
     }
+    foreign_key_check(&backup).with_context(|| {
+        format!(
+            "validating migration backup {} foreign keys",
+            path.display()
+        )
+    })?;
+
+    validate_compiled_migration_backup_ledger(&backup, expected_schema_version).with_context(
+        || {
+            format!(
+                "migration backup {} was durably preserved but is not a trusted restorable backup",
+                path.display()
+            )
+        },
+    )?;
+    Ok(())
+}
+
+/// Prove that a physically sound backup is the exact schema compiled into this
+/// binary, not merely a self-consistent database with an attacker- or
+/// drift-authored fingerprint. Drift artifacts remain fsynced on disk, but a
+/// caller must never describe them as trusted/restorable.
+fn validate_compiled_migration_backup_ledger(
+    backup: &Connection,
+    expected_schema_version: i64,
+) -> Result<()> {
+    anyhow::ensure!(
+        table_exists(backup, "schema_version")?,
+        "compiled migration ledger is absent"
+    );
+    let columns = table_columns(backup, "schema_version")?;
+    let expected_columns = [
+        "version",
+        "name",
+        "sha256",
+        "schema_fingerprint",
+        "schema_profile",
+        "applied_at",
+    ];
+    anyhow::ensure!(
+        columns.iter().map(String::as_str).eq(expected_columns),
+        "compiled migration ledger columns differ from the exact supported shape"
+    );
+    let ledger_version = current_schema_version(backup)?;
+    anyhow::ensure!(
+        ledger_version == expected_schema_version,
+        "backup ledger version {ledger_version} differs from recorded backup version {expected_schema_version}"
+    );
+    let compiled_version = usize::try_from(ledger_version)
+        .context("backup ledger version cannot select a compiled migration prefix")?;
+    anyhow::ensure!(
+        compiled_version > 0 && compiled_version <= MIGRATIONS.len(),
+        "backup ledger version {ledger_version} has no exact compiled migration prefix"
+    );
+    let compiled_migrations = &MIGRATIONS[..compiled_version];
+    verify_user_version(backup, ledger_version)?;
+    // Verifies every row: contiguous version, exact name and SQL definition
+    // hash, lowercase hash shapes, and the one compiled profile on every row.
+    verify_ledger(backup, compiled_migrations)?;
+    let actual_fingerprint = exact_ddl_fingerprint(backup)?;
+    let compiled_fingerprint = compiled_expected_fingerprint(compiled_migrations)?;
+    anyhow::ensure!(
+        actual_fingerprint == compiled_fingerprint,
+        "backup DDL fingerprint differs from the exact compiled {SCHEMA_PROFILE} schema"
+    );
     Ok(())
 }
 
@@ -1202,6 +2773,164 @@ fn prune_migration_backups(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bound quarantined recovery artifacts independently from trusted backups.
+/// Both count and aggregate bytes are hard bounds; an oversized artifact is
+/// never retained merely because it is the newest one.
+fn prune_untrusted_migration_backups(path: &Path) -> Result<()> {
+    prune_untrusted_migration_backups_with_limits(
+        path,
+        UNTRUSTED_MIGRATION_BACKUP_LIMIT,
+        UNTRUSTED_MIGRATION_BACKUP_TOTAL_BYTES,
+    )
+}
+
+fn reserve_untrusted_migration_backup_capacity(
+    path: &Path,
+    reserve_bytes: u64,
+    total_byte_limit: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        reserve_bytes <= total_byte_limit,
+        "no recovery artifact was created; estimated backup exceeds the hard quarantine limit"
+    );
+    prune_untrusted_migration_backups_with_limits(
+        path,
+        UNTRUSTED_MIGRATION_BACKUP_LIMIT.saturating_sub(1),
+        total_byte_limit - reserve_bytes,
+    )
+}
+
+#[cfg(unix)]
+fn filesystem_available_bytes(path: &Path) -> Result<Option<u64>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let encoded = std::ffi::CString::new(parent.as_os_str().as_bytes())
+        .context("database directory contains an interior NUL")?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `encoded` is NUL-terminated and live for the call, and `stats`
+    // points to writable storage which is read only after statvfs succeeds.
+    let result = unsafe { libc::statvfs(encoded.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading free space for {}", parent.display()));
+    }
+    // SAFETY: statvfs returned success and initialized the output structure.
+    let stats = unsafe { stats.assume_init() };
+    Ok(Some(stats.f_bavail.saturating_mul(stats.f_frsize)))
+}
+
+#[cfg(windows)]
+fn filesystem_available_bytes(path: &Path) -> Result<Option<u64>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetDiskFreeSpaceExW"]
+        fn get_disk_free_space_ex_w(
+            directory_name: *const u16,
+            free_bytes_available: *mut u64,
+            total_bytes: *mut u64,
+            total_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let encoded = parent
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut available = 0_u64;
+    // SAFETY: `encoded` is NUL-terminated and live for the call; `available`
+    // is writable, and the optional aggregate outputs are intentionally null.
+    let result = unsafe {
+        get_disk_free_space_ex_w(
+            encoded.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading free space for {}", parent.display()));
+    }
+    Ok(Some(available))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn filesystem_available_bytes(_path: &Path) -> Result<Option<u64>> {
+    // The hard quarantine budget and completed-candidate size check remain
+    // authoritative on platforms without a portable standard-library free
+    // space query; SQLite itself reports a failed allocation without publish.
+    Ok(None)
+}
+
+fn prune_untrusted_migration_backups_with_limits(
+    path: &Path,
+    count_limit: usize,
+    total_byte_limit: u64,
+) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let prefix = format!(
+        "{}.",
+        path.file_stem().unwrap_or_default().to_string_lossy()
+    );
+    let mut backups = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let candidate = entry.path();
+        let owned = candidate.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with(&prefix)
+                && name.contains(".backup-untrusted-")
+                && name.ends_with(".sqlite.quarantine")
+        });
+        if !owned {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&candidate).with_context(|| {
+            format!(
+                "reading quarantined backup metadata without following links {}",
+                candidate.display()
+            )
+        })?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            std::fs::remove_file(&candidate).with_context(|| {
+                format!(
+                    "unlinking invalid quarantine symlink {} without following it",
+                    candidate.display()
+                )
+            })?;
+            continue;
+        }
+        anyhow::ensure!(
+            file_type.is_file(),
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: quarantine path {} is a directory or special file; remove that exact path manually and retry",
+            candidate.display()
+        );
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        backups.push((modified, metadata.len(), candidate));
+    }
+    backups.sort_by_key(|(modified, _, _)| *modified);
+    let mut total_bytes = backups
+        .iter()
+        .fold(0_u64, |total, (_, bytes, _)| total.saturating_add(*bytes));
+    while !backups.is_empty() && (backups.len() > count_limit || total_bytes > total_byte_limit) {
+        let (_, bytes, stale) = backups.remove(0);
+        std::fs::remove_file(stale)?;
+        total_bytes = total_bytes.saturating_sub(bytes);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .with_context(|| format!("opening backup directory {} for fsync", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("fsyncing backup directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     migrate_with(conn, MIGRATIONS)
 }
@@ -1218,8 +2947,11 @@ fn migration_definition_hash(migration: &Migration) -> String {
     // Omitting the extension made two materially different schemas share a
     // migration checksum and allowed an edited profile extension to pass the
     // ledger check.
-    let mut definition = String::with_capacity(migration.sql.len() + migration.extension_sql.len());
+    let mut definition = String::with_capacity(
+        migration.sql.len() + migration.deferred_sql.len() + migration.extension_sql.len(),
+    );
     definition.push_str(migration.sql);
+    definition.push_str(migration.deferred_sql);
     definition.push_str(migration.extension_sql);
     migration_hash(&definition)
 }
@@ -1228,6 +2960,7 @@ fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
     let expected = Connection::open_in_memory().context("opening expected-schema database")?;
     for migration in migrations {
         expected.execute_batch(migration.sql)?;
+        expected.execute_batch(migration.deferred_sql)?;
         expected.execute_batch(migration.extension_sql)?;
     }
     expected.execute_batch(
@@ -1236,7 +2969,7 @@ fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
             name TEXT NOT NULL CHECK (length(name) > 0), \
             sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
             schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
-            schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'remote-v0.1')), \
+            schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'extended-local-v0.1', 'remote-v0.1', 'remote-extended-v0.1')), \
             applied_at TEXT NOT NULL\
         );",
     )?;
@@ -1403,7 +3136,7 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
                 name TEXT NOT NULL CHECK (length(name) > 0), \
                 sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
                 schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
-                schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'remote-v0.1')), \
+                schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'extended-local-v0.1', 'remote-v0.1', 'remote-extended-v0.1')), \
                 applied_at TEXT NOT NULL\
             );",
         )
@@ -1422,6 +3155,10 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             }
             conn.execute_batch(migration.sql)
                 .with_context(|| format!("applying migration {version}"))?;
+            if !migration.deferred_sql.is_empty() {
+                conn.execute_batch(migration.deferred_sql)
+                    .with_context(|| format!("applying migration {version} deferred profile"))?;
+            }
             if !migration.extension_sql.is_empty() {
                 conn.execute_batch(migration.extension_sql)
                     .with_context(|| format!("applying migration {version} build profile"))?;
@@ -1560,6 +3297,79 @@ fn sqlite_schema_version(conn: &Connection) -> Result<i64> {
         .context("reading SQLite schema version")
 }
 
+fn database_storage_report(
+    conn: &Connection,
+    path: Option<&Path>,
+) -> Result<DatabaseStorageReport> {
+    let nonnegative = |name: &str, value: i64| -> Result<u64> {
+        u64::try_from(value).with_context(|| format!("SQLite {name} was negative: {value}"))
+    };
+    let page_size_bytes = nonnegative(
+        "page_size",
+        conn.pragma_query_value(None, "page_size", |row| row.get(0))
+            .context("reading SQLite page_size")?,
+    )?;
+    let page_count = nonnegative(
+        "page_count",
+        conn.pragma_query_value(None, "page_count", |row| row.get(0))
+            .context("reading SQLite page_count")?,
+    )?;
+    let freelist_page_count = nonnegative(
+        "freelist_count",
+        conn.pragma_query_value(None, "freelist_count", |row| row.get(0))
+            .context("reading SQLite freelist_count")?,
+    )?;
+    anyhow::ensure!(
+        freelist_page_count <= page_count,
+        "SQLite freelist_count {freelist_page_count} exceeds page_count {page_count}"
+    );
+    let allocated_bytes = page_size_bytes
+        .checked_mul(page_count)
+        .context("SQLite allocated byte count overflow")?;
+    let reclaimable_bytes = page_size_bytes
+        .checked_mul(freelist_page_count)
+        .context("SQLite reclaimable byte count overflow")?;
+
+    let required_file_size = |candidate: &Path| -> Result<u64> {
+        std::fs::metadata(candidate)
+            .map(|metadata| metadata.len())
+            .with_context(|| format!("reading database file size {}", candidate.display()))
+    };
+    let optional_sidecar_size = |candidate: &Path| -> Result<u64> {
+        match std::fs::metadata(candidate) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error)
+                .with_context(|| format!("reading database sidecar size {}", candidate.display())),
+        }
+    };
+    let sidecar = |base: &Path, suffix: &str| {
+        let mut name = base.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let (main_file_bytes, wal_file_bytes, shared_memory_file_bytes) = match path {
+        Some(path) => (
+            required_file_size(path)?,
+            optional_sidecar_size(&sidecar(path, "-wal"))?,
+            optional_sidecar_size(&sidecar(path, "-shm"))?,
+        ),
+        None => (0, 0, 0),
+    };
+
+    Ok(DatabaseStorageReport {
+        page_size_bytes,
+        page_count,
+        freelist_page_count,
+        allocated_bytes,
+        reclaimable_bytes,
+        live_bytes: allocated_bytes - reclaimable_bytes,
+        main_file_bytes,
+        wal_file_bytes,
+        shared_memory_file_bytes,
+    })
+}
+
 fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
     let enabled: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
     Ok(enabled != 0)
@@ -1622,10 +3432,75 @@ mod tests {
             .map(|(index, sql)| Migration {
                 name: NAMES[index],
                 sql,
+                deferred_sql: "",
                 extension_sql: "",
             })
             .collect::<Vec<_>>();
         migrate_with(conn, &migrations)
+    }
+
+    #[test]
+    fn storage_failure_contract_is_stable_through_context() {
+        let cases = [
+            (
+                rusqlite::ErrorCode::DiskFull,
+                DatabaseStorageFailure::Capacity,
+                "FCDB_STORAGE_FULL",
+            ),
+            (
+                rusqlite::ErrorCode::ReadOnly,
+                DatabaseStorageFailure::ReadOnly,
+                "FCDB_STORAGE_READ_ONLY",
+            ),
+            (
+                rusqlite::ErrorCode::OutOfMemory,
+                DatabaseStorageFailure::Memory,
+                "FCDB_STORAGE_MEMORY",
+            ),
+            (
+                rusqlite::ErrorCode::SystemIoFailure,
+                DatabaseStorageFailure::Io,
+                "FCDB_STORAGE_IO",
+            ),
+            (
+                rusqlite::ErrorCode::DatabaseCorrupt,
+                DatabaseStorageFailure::Corrupt,
+                "FCDB_STORAGE_CORRUPT",
+            ),
+        ];
+        for (code, expected, diagnostic_code) in cases {
+            let sqlite = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code: 0,
+                },
+                None,
+            );
+            let error = anyhow::Error::new(sqlite).context("writer commit failed");
+            let classified = classify_database_storage_failure(error.as_ref());
+            assert_eq!(classified, Some(expected));
+            assert_eq!(classified.unwrap().diagnostic_code(), diagnostic_code);
+        }
+    }
+
+    #[test]
+    fn storage_report_requires_main_file_but_allows_absent_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("snapshot.db");
+        std::fs::write(&main, b"main").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+
+        let report = database_storage_report(&conn, Some(&main)).unwrap();
+        assert_eq!(report.main_file_bytes, 4);
+        assert_eq!(report.wal_file_bytes, 0);
+        assert_eq!(report.shared_memory_file_bytes, 0);
+
+        std::fs::remove_file(&main).unwrap();
+        let error = database_storage_report(&conn, Some(&main)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reading database file size"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -1727,7 +3602,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_migration_writes_backup_first() {
+    fn uncompiled_pending_schema_preserves_but_does_not_trust_backup() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cockpit.db");
         let conn = Connection::open(&path).unwrap();
@@ -1736,18 +3611,82 @@ mod tests {
             &["CREATE TABLE first_backup_probe (id INTEGER PRIMARY KEY);"],
         )
         .unwrap();
-        backup_before_pending_migration(&conn, &path, 2).unwrap();
+        let error = backup_before_pending_migration(&conn, &path, 2).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a trusted restorable backup"),
+            "unexpected error: {error:#}"
+        );
         let backup = std::fs::read_dir(temp.path())
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
-            .find(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "sqlite")
-            })
+            .find(|path| path.to_string_lossy().ends_with(".sqlite.quarantine"))
             .unwrap();
         let copied = Connection::open(backup).unwrap();
         assert_eq!(current_schema_version(&copied).unwrap(), 1);
+    }
+
+    fn compiled_backup_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        conn
+    }
+
+    #[test]
+    fn compiled_backup_ledger_validator_accepts_only_the_exact_compiled_identity() {
+        let conn = compiled_backup_fixture();
+        validate_compiled_migration_backup_ledger(&conn, EXPECTED_SCHEMA_VERSION).unwrap();
+    }
+
+    #[test]
+    fn exact_compiled_backup_is_promoted_to_the_trusted_sibling_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let conn = Connection::open(&path).unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+
+        create_migration_backup(&conn, &path, EXPECTED_SCHEMA_VERSION, "test promotion").unwrap();
+
+        let names = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            names
+                .iter()
+                .any(|name| name.contains(".backup-") && name.ends_with(".sqlite"))
+        );
+        assert!(!names.iter().any(|name| name.ends_with(".quarantine")));
+    }
+
+    #[test]
+    fn compiled_backup_ledger_validator_rejects_every_forged_identity_axis() {
+        for mutation in [
+            "UPDATE schema_version SET name='forged.sql' WHERE version=1",
+            "UPDATE schema_version SET sha256=lower(hex(randomblob(32))) WHERE version=1",
+            "UPDATE schema_version SET schema_profile=CASE schema_profile WHEN 'local-v0.1' THEN 'remote-v0.1' ELSE 'local-v0.1' END WHERE version=1",
+        ] {
+            let conn = compiled_backup_fixture();
+            conn.execute_batch(mutation).unwrap();
+            assert!(
+                validate_compiled_migration_backup_ledger(&conn, EXPECTED_SCHEMA_VERSION).is_err(),
+                "forged backup identity passed: {mutation}"
+            );
+        }
+
+        // A drift author can recompute a self-consistent fingerprint. The
+        // backup still is not the exact DDL compiled into this binary.
+        let conn = compiled_backup_fixture();
+        conn.execute_batch("CREATE TABLE forged_backup_object(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let forged_fingerprint = exact_ddl_fingerprint(&conn).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET schema_fingerprint=?1 WHERE version=?2",
+            rusqlite::params![forged_fingerprint, EXPECTED_SCHEMA_VERSION],
+        )
+        .unwrap();
+        assert!(validate_compiled_migration_backup_ledger(&conn, EXPECTED_SCHEMA_VERSION).is_err());
     }
 
     #[test]
@@ -1805,6 +3744,565 @@ mod tests {
                 .filter(|entry| entry.file_name().to_string_lossy().contains(".backup-"))
                 .count(),
             MIGRATION_BACKUP_LIMIT
+        );
+    }
+
+    #[test]
+    fn quarantined_backups_are_bounded_independently_from_trusted_backups() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        for index in 0..5 {
+            std::fs::write(
+                temp.path().join(format!(
+                    "cockpit.v1.backup-untrusted-{index:064x}.sqlite.quarantine"
+                )),
+                vec![0_u8; 8],
+            )
+            .unwrap();
+        }
+        std::fs::write(temp.path().join("cockpit.backup-0.sqlite"), b"trusted").unwrap();
+
+        prune_untrusted_migration_backups(&path).unwrap();
+
+        let names = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.ends_with(".sqlite.quarantine"))
+                .count(),
+            UNTRUSTED_MIGRATION_BACKUP_LIMIT
+        );
+        assert!(names.iter().any(|name| name == "cockpit.backup-0.sqlite"));
+    }
+
+    #[test]
+    fn quarantined_backup_byte_budget_removes_every_oversized_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        for index in 0..3 {
+            std::fs::write(
+                temp.path().join(format!(
+                    "cockpit.v1.backup-untrusted-{index:064x}.sqlite.quarantine"
+                )),
+                vec![0_u8; 8],
+            )
+            .unwrap();
+        }
+
+        prune_untrusted_migration_backups_with_limits(&path, 3, 4).unwrap();
+
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".sqlite.quarantine"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn backup_content_digest_distinguishes_equal_size_and_mtime_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let one = temp.path().join("one.sqlite.tmp");
+        let two = temp.path().join("two.sqlite.tmp");
+        std::fs::write(&one, b"source-state-one").unwrap();
+        std::fs::write(&two, b"source-state-two").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&one)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&two)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+
+        assert_eq!(std::fs::metadata(&one).unwrap().len(), 16);
+        assert_eq!(
+            std::fs::metadata(&one).unwrap().modified().unwrap(),
+            std::fs::metadata(&two).unwrap().modified().unwrap()
+        );
+        assert_ne!(file_sha256(&one).unwrap(), file_sha256(&two).unwrap());
+        assert_eq!(file_sha256(&one).unwrap(), file_sha256(&one).unwrap());
+    }
+
+    #[test]
+    fn quarantine_dedupe_requires_exact_regular_private_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let exact_bytes = b"exact quarantined database bytes";
+        let source = temp.path().join("source.sqlite");
+        std::fs::write(&source, exact_bytes).unwrap();
+        let digest = file_sha256(&source).unwrap();
+        let quarantine =
+            database.with_extension(format!("v1.backup-untrusted-{digest}.sqlite.quarantine"));
+
+        std::fs::write(&quarantine, exact_bytes).unwrap();
+        assert!(existing_quarantine_matches(&quarantine, &digest).unwrap());
+
+        std::fs::write(&quarantine, b"same-name but wrong bytes").unwrap();
+        assert!(!existing_quarantine_matches(&quarantine, &digest).unwrap());
+
+        std::fs::write(&quarantine, &exact_bytes[..4]).unwrap();
+        assert!(!existing_quarantine_matches(&quarantine, &digest).unwrap());
+
+        let displaced = displace_invalid_quarantine(&database, &quarantine)
+            .unwrap()
+            .expect("regular displacement");
+        assert!(!quarantine.exists());
+        assert_eq!(std::fs::read(displaced).unwrap(), &exact_bytes[..4]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_dedupe_rejects_symlink_even_when_target_digest_matches() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.sqlite");
+        std::fs::write(&target, b"matching target bytes").unwrap();
+        let digest = file_sha256(&target).unwrap();
+        let quarantine = temp.path().join(format!(
+            "cockpit.v1.backup-untrusted-{digest}.sqlite.quarantine"
+        ));
+        symlink(&target, &quarantine).unwrap();
+
+        assert!(!existing_quarantine_matches(&quarantine, &digest).unwrap());
+        let mut synced_parent = None;
+        unlink_quarantine_symlink(&quarantine, |parent| {
+            synced_parent = Some(parent.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(synced_parent.as_deref(), Some(temp.path()));
+        assert!(!quarantine.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"matching target bytes");
+        std::fs::write(&quarantine, b"later regular admission").unwrap();
+        assert!(quarantine.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_validation_hashes_opened_handle_after_path_is_swapped() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-race.sqlite.quarantine");
+        let opened_bytes = b"opened quarantine bytes";
+        std::fs::write(&quarantine, opened_bytes).unwrap();
+        let source = temp.path().join("source.sqlite");
+        std::fs::write(&source, opened_bytes).unwrap();
+        let digest = file_sha256(&source).unwrap();
+
+        let target = temp.path().join("target.sqlite");
+        std::fs::write(&target, b"must not be read or modified").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let displaced = temp.path().join("displaced.sqlite");
+        assert!(
+            !existing_quarantine_matches_after_open(
+                &quarantine,
+                &digest,
+                || {
+                    std::fs::rename(&quarantine, &displaced).unwrap();
+                    symlink(&target, &quarantine).unwrap();
+                },
+                || {},
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"must not be read or modified"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read(displaced).unwrap(), opened_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_validation_rechecks_identity_before_parent_sync() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-race.sqlite.quarantine");
+        let opened_bytes = b"opened quarantine bytes";
+        std::fs::write(&quarantine, opened_bytes).unwrap();
+        let source = temp.path().join("source.sqlite");
+        std::fs::write(&source, opened_bytes).unwrap();
+        let digest = file_sha256(&source).unwrap();
+
+        let target = temp.path().join("target.sqlite");
+        std::fs::write(&target, b"must not be synced through its path").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let displaced = temp.path().join("displaced.sqlite");
+        assert!(
+            !existing_quarantine_matches_after_open(
+                &quarantine,
+                &digest,
+                || {},
+                || {
+                    std::fs::rename(&quarantine, &displaced).unwrap();
+                    symlink(&target, &quarantine).unwrap();
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"must not be synced through its path"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read(displaced).unwrap(), opened_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_displacement_never_follows_pre_rename_symlink_swap() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-race.sqlite.quarantine");
+        std::fs::write(&quarantine, b"original invalid quarantine").unwrap();
+        let moved_original = temp.path().join("attacker-moved-original.sqlite");
+        let target = temp.path().join("target.sqlite");
+        std::fs::write(&target, b"must remain untouched").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let displaced = displace_invalid_quarantine_after_open(&database, &quarantine, || {
+            std::fs::rename(&quarantine, &moved_original).unwrap();
+            symlink(&target, &quarantine).unwrap();
+        })
+        .unwrap();
+
+        assert!(displaced.is_none());
+        assert!(!quarantine.exists());
+        assert_eq!(
+            std::fs::read(&moved_original).unwrap(),
+            b"original invalid quarantine"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"must remain untouched");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_pruning_unlinks_symlink_without_accounting_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let target = temp.path().join("large-target.sqlite");
+        std::fs::write(&target, vec![7_u8; 4096]).unwrap();
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-swap.sqlite.quarantine");
+        symlink(&target, &quarantine).unwrap();
+
+        prune_untrusted_migration_backups_with_limits(&database, 0, 0).unwrap();
+        assert!(!std::fs::symlink_metadata(&quarantine).is_ok());
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn directory_quarantine_occupant_fails_closed_without_candidate_poisoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-deadbeef.sqlite.quarantine");
+        std::fs::create_dir(&quarantine).unwrap();
+
+        let preflight = prune_untrusted_migration_backups(&database).unwrap_err();
+        assert!(format!("{preflight:#}").contains("remove that exact path manually"));
+        let error = handle_invalid_quarantine_occupant(&database, &quarantine).unwrap_err();
+        assert!(format!("{error:#}").contains("remove that exact path manually"));
+        assert!(quarantine.is_dir());
+        assert!(
+            !std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("backup-candidate")
+                })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_quarantine_occupant_fails_closed_in_place() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-special.sqlite.quarantine");
+        let encoded = std::ffi::CString::new(quarantine.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a live NUL-terminated path and the mode is a
+        // valid permission mask for creating the test FIFO.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let preflight = prune_untrusted_migration_backups(&database).unwrap_err();
+        assert!(format!("{preflight:#}").contains("remove that exact path manually"));
+        let error = handle_invalid_quarantine_occupant(&database, &quarantine).unwrap_err();
+        assert!(format!("{error:#}").contains("directory or special file"));
+        assert!(std::fs::symlink_metadata(&quarantine).is_ok());
+    }
+
+    #[test]
+    fn stale_backup_candidates_are_removed_before_artifact_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        for index in 0..4 {
+            std::fs::write(
+                temp.path().join(format!(
+                    "cockpit.v1.backup-candidate-{index}-0000000000000000.sqlite.tmp"
+                )),
+                vec![0_u8; 8],
+            )
+            .unwrap();
+        }
+        let unrelated = temp.path().join("other.v1.backup-candidate-0.sqlite.tmp");
+        std::fs::write(&unrelated, b"not ours").unwrap();
+
+        let _lock = BackupArtifactLock::acquire(&path).unwrap();
+        assert_eq!(remove_stale_backup_candidates(&path).unwrap(), 4);
+        assert_eq!(remove_stale_backup_candidates(&path).unwrap(), 0);
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn backup_artifact_lock_serializes_concurrent_admission_cleanup() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let first = BackupArtifactLock::acquire(&path).unwrap();
+        let stale = temp
+            .path()
+            .join("cockpit.v1.backup-candidate-crash-0000000000000000.sqlite.tmp");
+        std::fs::write(&stale, b"partial").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _lock = BackupArtifactLock::acquire(&contender_path).unwrap();
+            remove_stale_backup_candidates(&contender_path).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a second artifact admission acquired the live creator's lock"
+        );
+        assert!(stale.exists(), "a contender removed a live candidate");
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        contender.join().unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_artifact_lock_refuses_symlink_occupant_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let lock_path = database.with_extension("backup-artifacts.lock");
+        let target = temp.path().join("attacker-controlled");
+        std::fs::write(&target, b"must remain unchanged").unwrap();
+        symlink(&target, &lock_path).unwrap();
+
+        let error = BackupArtifactLock::acquire(&database).unwrap_err();
+        assert!(format!("{error:#}").contains("opening backup artifact lock"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"must remain unchanged");
+        assert!(std::fs::symlink_metadata(&lock_path).unwrap().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_artifact_lock_refuses_nonregular_occupant() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let lock_path = database.with_extension("backup-artifacts.lock");
+        let encoded = std::ffi::CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a live NUL-terminated path and the mode is a
+        // valid permission mask for creating the test FIFO.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let error = BackupArtifactLock::acquire(&database).unwrap_err();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        assert!(std::fs::symlink_metadata(&lock_path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_artifact_lock_refuses_replaceable_parent_identity() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let replaceable = temp.path().join("replaceable");
+        let private = replaceable.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::set_permissions(&replaceable, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let database = private.join("cockpit.db");
+
+        let error = BackupArtifactLock::acquire(&database).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("replaceable through untrusted or group/other-writable ancestor"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_artifact_lock_refuses_parent_privacy_loss_during_acquire() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let parent = temp.path().to_path_buf();
+        let parent_for_hook = parent.clone();
+        BACKUP_ARTIFACT_LOCK_AFTER_KERNEL_LOCK_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::set_permissions(&parent_for_hook, std::fs::Permissions::from_mode(0o777))
+                    .unwrap();
+            }));
+        });
+
+        let error = BackupArtifactLock::acquire(&database).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("lost its private-directory invariant"),
+            "unexpected error: {error:#}"
+        );
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn backup_artifact_lock_establishes_private_parent_and_file_dacls() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let lock_path = database.with_extension("backup-artifacts.lock");
+
+        let lock = BackupArtifactLock::acquire(&database).unwrap();
+        files::verify_private_windows_dacl_handle(&lock._parent).unwrap();
+        files::verify_private_windows_dacl_handle(&lock.file).unwrap();
+        assert!(lock_path.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn backup_artifact_lock_refuses_hardlinked_occupant() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let lock_path = database.with_extension("backup-artifacts.lock");
+        let other_name = temp.path().join("other-lock-name");
+        std::fs::write(&lock_path, b"occupant").unwrap();
+        std::fs::hard_link(&lock_path, &other_name).unwrap();
+
+        let error = BackupArtifactLock::acquire(&database).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not have exactly one hard link"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(std::fs::read(&other_name).unwrap(), b"occupant");
+    }
+
+    #[test]
+    fn oversized_backup_is_rejected_without_publishing_an_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let conn = Connection::open(&path).unwrap();
+        migrate_test_with(
+            &conn,
+            &["CREATE TABLE oversized_backup_probe (id INTEGER PRIMARY KEY);"],
+        )
+        .unwrap();
+
+        let error =
+            create_migration_backup_with_limit(&conn, &path, 1, "test limit", 1).unwrap_err();
+        assert!(format!("{error:#}").contains("no recovery artifact was created"));
+        assert!(
+            !std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.contains("backup-candidate") || name.ends_with(".sqlite.quarantine")
+                })
+        );
+    }
+
+    #[test]
+    fn identical_rejected_schema_reuses_one_quarantine_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let conn = Connection::open(&path).unwrap();
+        migrate_test_with(
+            &conn,
+            &["CREATE TABLE repeated_rejection_probe (id INTEGER PRIMARY KEY);"],
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let error = backup_before_pending_migration(&conn, &path, 2).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(SCHEMA_REJECTION_AFTER_OPEN_CODE),
+                "unexpected error: {error:#}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".sqlite.quarantine"))
+                .count(),
+            1
         );
     }
 
@@ -2984,7 +5482,7 @@ mod tests {
         db.write(move |conn| {
             conn.execute(
                 "INSERT INTO sessions \
-                 (session_id, project_id, project_root, started_at, last_active_at) \
+                 (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms) \
                  VALUES (?1, 'project', '/tmp/project', 1, 1)",
                 [&session_id],
             )?;
@@ -3283,7 +5781,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let id = session_id.to_string();
         db.write(move |conn| {
-            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
+            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
             conn.execute("INSERT INTO remote_principal_audit (ts_ms, principal, request_kind, session_id, verdict) VALUES (1, 'p', 'request', ?1, 'allowed')", [&id])?;
             Ok(())
         }).await.unwrap();
@@ -3369,7 +5867,7 @@ mod tests {
         std::fs::write(&sidecar, "payload").unwrap();
         let relative_for_db = relative.clone();
         db.write(move |conn| {
-            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
+            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
             conn.execute("INSERT INTO task_delegation_jobs (task_call_id, parent_session_id, parent_agent, status, created_at, updated_at) VALUES ('task', ?1, 'agent', 'completed', 1, 1)", [&id])?;
             conn.execute("INSERT INTO task_delegation_payloads (task_call_id, label, payload_hash, parent_session_id, parent_agent, child_agent, prompt_byte_len, sidecar_path, created_at) VALUES ('task', 'default', 'hash', ?1, 'agent', 'child', 7, ?2, 1)", rusqlite::params![id, relative_for_db])?;
             Ok(())
@@ -3392,7 +5890,7 @@ mod tests {
             let id = id.clone();
             let relative = relative.clone();
             move |conn| {
-                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/p',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
                 Db::enqueue_delegation_sidecar_cleanup_conn(conn, session_id, 2)?;
@@ -3435,7 +5933,7 @@ mod tests {
             let id = id.clone();
             let relative = relative.clone();
             move |conn| {
-                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/p',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
                 conn.execute("INSERT INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms) VALUES(?1,?2,2)",rusqlite::params![relative,id])?;
@@ -3528,9 +6026,10 @@ mod tests {
 
     #[test]
     fn migration_files_on_disk_match_expected_set() {
-        // Pre-release: the directory contains the local base plus the opt-in
-        // remote profile extension. The independent literal catches stray or
-        // deleted schema inputs without deriving expectations from MIGRATIONS.
+        // Pre-release: the directory contains the local base plus independent
+        // opt-in extended and remote profile extensions. The literal catches
+        // stray or deleted schema inputs without deriving expectations from
+        // MIGRATIONS.
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("db")
@@ -3545,6 +6044,7 @@ mod tests {
         assert_eq!(
             migrations,
             vec![
+                "0001_extended_profile.sql".to_string(),
                 "0001_initial.sql".to_string(),
                 "0001_remote_profile.sql".to_string(),
             ]

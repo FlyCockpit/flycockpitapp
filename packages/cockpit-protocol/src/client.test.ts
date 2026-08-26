@@ -536,6 +536,19 @@ describe("RemoteSessionClient", () => {
         new RemoteSessionError("daemon is shutting down", "shutdown", { code: "shutdown" }),
       ),
     ).toBe(true);
+    for (const code of [
+      "storage_full",
+      "storage_memory",
+      "storage_read_only",
+      "storage_io",
+      "storage_corrupt",
+    ]) {
+      expect(
+        isAmbiguousUserMessageSendError(
+          new RemoteSessionError("durability outcome is unknown", code, { code }),
+        ),
+      ).toBe(true);
+    }
     expect(isAmbiguousUserMessageSendError(new Error("socket closed"))).toBe(true);
     expect(
       isAmbiguousUserMessageSendError(

@@ -26,9 +26,11 @@ pub mod agent_installation;
 pub mod agent_management;
 pub(crate) mod authority_token;
 pub mod bulk_staging;
+#[cfg(test)]
 pub mod bulk_upload;
 pub mod caffeinate;
 pub mod client;
+pub(crate) mod config_publication_recovery;
 pub(crate) mod config_refresh;
 pub mod config_source;
 pub(crate) mod config_watch;
@@ -40,11 +42,10 @@ pub(crate) mod diagnostics_probe;
 pub mod effective_default_recovery;
 #[cfg(feature = "remote")]
 pub mod egress;
-pub mod ephemeral_guard;
+pub(crate) mod ephemeral_guard;
 pub mod fs_api;
 pub mod image_generation_worker;
 pub mod image_runtime;
-pub mod image_upload;
 pub mod leak_reveal;
 pub mod leak_reveal_frame;
 #[cfg(unix)]
@@ -86,8 +87,28 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::private_fs::ensure_private_dir;
 use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use cockpit_host::daemon_lifecycle::parse_macos_procargs2;
+#[cfg(unix)]
+use cockpit_host::daemon_lifecycle::reclaim_stale_and_reserve;
+#[cfg(unix)]
+use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
+#[cfg(test)]
+use cockpit_host::daemon_lifecycle::split_proc_cmdline;
+#[cfg(test)]
+use cockpit_host::daemon_lifecycle::write_pid_file;
+#[cfg(any(unix, test))]
+use cockpit_host::daemon_lifecycle::{
+    DaemonPidReceipt, ForegroundMetadataGuard, PidIdentity, retire_metadata_if_receipt_matches,
+    with_lifecycle_lock,
+};
+use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record, read_pid_file};
+#[cfg(target_os = "linux")]
+use cockpit_host::daemon_lifecycle::{VerifiedProcessOutcome, acquire_verified_daemon_process};
+#[cfg(unix)]
+use cockpit_host::daemon_lifecycle::{legacy_pid_identity, verify_cockpit_daemon_receipt_identity};
+use cockpit_host::private_fs::ensure_private_dir;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
@@ -108,41 +129,6 @@ const RESTART_RELEASE_CLEANUP_GRACE: Duration = Duration::from_secs(10);
 pub struct EventEnvelope {
     pub event: proto::Event,
     pub redact: Arc<RedactionTable>,
-}
-
-/// Owns foreground-daemon metadata from pid-file publication through boot and
-/// shutdown. Early startup failures (including schema rejection) must not
-/// leave a dead pid, socket, or endpoint record behind.
-#[cfg(any(unix, test))]
-struct ForegroundMetadataGuard {
-    paths: DaemonPaths,
-    pid: u32,
-    armed: bool,
-}
-
-#[cfg(any(unix, test))]
-impl ForegroundMetadataGuard {
-    fn new(paths: &DaemonPaths) -> Self {
-        Self {
-            paths: paths.clone(),
-            pid: std::process::id(),
-            armed: true,
-        }
-    }
-
-    fn cleanup(&mut self) {
-        if self.armed && remove_metadata_if_pid_matches(&self.paths, self.pid) {
-            remove_endpoint_record_if_owned(&self.paths);
-        }
-        self.armed = false;
-    }
-}
-
-#[cfg(any(unix, test))]
-impl Drop for ForegroundMetadataGuard {
-    fn drop(&mut self) {
-        self.cleanup();
-    }
 }
 
 pub type EventSender = broadcast::Sender<EventEnvelope>;
@@ -196,8 +182,8 @@ pub struct DaemonPaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonEndpointRecord {
     version: u8,
-    pid: u32,
     socket: PathBuf,
+    receipt: DaemonPidReceipt,
     kind: DaemonEndpointKind,
 }
 
@@ -246,9 +232,13 @@ fn endpoint_file_for_state(state: &Path) -> PathBuf {
     state.join("daemon-endpoint.json")
 }
 
-fn read_endpoint_record() -> Option<DaemonEndpointRecord> {
-    let path = endpoint_file().ok()?;
-    read_endpoint_record_from(&path)
+fn read_endpoint_record(canonical: &DaemonPaths) -> Option<DaemonEndpointRecord> {
+    let expected_path = endpoint_file_for_state(canonical.pid_file.parent()?);
+    let configured_path = endpoint_file().ok()?;
+    if configured_path != expected_path {
+        return None;
+    }
+    read_bound_endpoint_record_from(&configured_path, canonical)
 }
 
 fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
@@ -256,23 +246,41 @@ fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
+fn read_bound_endpoint_record_from(
+    path: &Path,
+    canonical: &DaemonPaths,
+) -> Option<DaemonEndpointRecord> {
+    if path != endpoint_file_for_state(canonical.pid_file.parent()?) {
+        return None;
+    }
+    let record = read_endpoint_record_from(path)?;
+    if record.version != 1
+        || record.kind != DaemonEndpointKind::Persistent
+        || record.socket != canonical.socket
+    {
+        return None;
+    }
+    let DaemonPidRecord::Receipt(receipt) = read_daemon_pid_record(&canonical.pid_file)? else {
+        return None;
+    };
+    (record.receipt == receipt).then_some(record)
+}
+
 #[cfg(any(unix, test))]
 fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
-    write_endpoint_record_with_pid(paths, std::process::id())
-}
-
-#[cfg(any(unix, test))]
-fn write_endpoint_record_with_pid(paths: &DaemonPaths, pid: u32) -> Result<()> {
+    let Some(DaemonPidRecord::Receipt(receipt)) = read_daemon_pid_record(&paths.pid_file) else {
+        anyhow::bail!("daemon PID receipt is missing before endpoint publication");
+    };
     let canonical = DaemonPaths::resolve_canonical()
         .context("resolving canonical daemon paths for endpoint publication")?;
-    write_endpoint_record_with_pid_and_canonical(paths, &canonical, pid)
+    write_endpoint_record_with_receipt_and_canonical(paths, &canonical, &receipt)
 }
 
 #[cfg(any(unix, test))]
-fn write_endpoint_record_with_pid_and_canonical(
+fn write_endpoint_record_with_receipt_and_canonical(
     paths: &DaemonPaths,
     canonical: &DaemonPaths,
-    pid: u32,
+    receipt: &DaemonPidReceipt,
 ) -> Result<()> {
     if paths.ephemeral {
         return Ok(());
@@ -284,12 +292,6 @@ fn write_endpoint_record_with_pid_and_canonical(
             paths.socket.display()
         );
     }
-    let record = DaemonEndpointRecord {
-        version: 1,
-        pid,
-        socket: paths.socket.clone(),
-        kind: DaemonEndpointKind::Persistent,
-    };
     let Some(state) = paths.pid_file.parent() else {
         anyhow::bail!(
             "daemon pid file has no parent: {}",
@@ -297,56 +299,22 @@ fn write_endpoint_record_with_pid_and_canonical(
         );
     };
     let path = endpoint_file_for_state(state);
-    let data = serde_json::to_vec_pretty(&record).context("serializing daemon endpoint")?;
-    std::fs::write(&path, data).with_context(|| format!("writing {}", path.display()))
-}
-
-#[cfg(any(unix, test))]
-fn remove_endpoint_record_if_owned(paths: &DaemonPaths) {
-    if paths.ephemeral {
-        return;
-    }
-    let Ok(canonical) = DaemonPaths::resolve_canonical() else {
-        tracing::debug!("skipping shared daemon endpoint cleanup: canonical paths unavailable");
-        return;
-    };
-    remove_endpoint_record_if_owned_with_canonical(paths, &canonical);
-}
-
-#[cfg(any(unix, test))]
-fn remove_endpoint_record_if_owned_with_canonical(paths: &DaemonPaths, canonical: &DaemonPaths) {
-    if paths.ephemeral {
-        return;
-    }
-    if paths != canonical {
-        tracing::debug!(
-            pid_file = %paths.pid_file.display(),
-            socket = %paths.socket.display(),
-            "skipping shared daemon endpoint cleanup for noncanonical paths"
-        );
-        return;
-    }
-    let Some(state) = canonical.pid_file.parent() else {
-        return;
-    };
-    let path = endpoint_file_for_state(state);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-    let Ok(record) = serde_json::from_slice::<DaemonEndpointRecord>(&bytes) else {
-        return;
-    };
-    if record.pid == std::process::id() && record.socket == paths.socket {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-#[cfg(any(unix, test))]
-fn remove_endpoint_record_unverified() {
-    if let Ok(path) = endpoint_file() {
-        let _ = std::fs::remove_file(path);
-    }
+    with_lifecycle_lock(&paths.pid_file, || {
+        if read_daemon_pid_record(&paths.pid_file)
+            != Some(DaemonPidRecord::Receipt(receipt.clone()))
+        {
+            anyhow::bail!("daemon PID receipt changed before endpoint publication");
+        }
+        let record = DaemonEndpointRecord {
+            version: 1,
+            socket: paths.socket.clone(),
+            receipt: receipt.clone(),
+            kind: DaemonEndpointKind::Persistent,
+        };
+        let data = serde_json::to_vec_pretty(&record).context("serializing daemon endpoint")?;
+        cockpit_host::private_fs::write_private_file(&path, &data)
+            .with_context(|| format!("writing {}", path.display()))
+    })
 }
 
 impl DaemonPaths {
@@ -725,28 +693,21 @@ fn socket_responds_blocking(_socket: &Path) -> Option<SocketHelloResponse> {
 
 #[cfg(unix)]
 fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
-    status_for_unreachable_pid_with_cleanup(paths, remove_endpoint_record_unverified)
-}
-
-#[cfg(unix)]
-fn status_for_unreachable_pid_with_cleanup(
-    paths: &DaemonPaths,
-    cleanup: impl FnOnce(),
-) -> DaemonStatus {
-    let Some(pid) = read_pid(paths) else {
+    let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
         return DaemonStatus::Stale;
     };
-    status_for_pid_identity(verify_daemon_pid_identity(pid), cleanup)
+    let identity = match record {
+        DaemonPidRecord::Receipt(receipt) => verify_cockpit_daemon_receipt_identity(&receipt),
+        DaemonPidRecord::LegacyNumeric(pid) => legacy_pid_identity(pid),
+    };
+    status_for_pid_identity(identity)
 }
 
 #[cfg(unix)]
-fn status_for_pid_identity(identity: PidIdentity, cleanup: impl FnOnce()) -> DaemonStatus {
+fn status_for_pid_identity(identity: PidIdentity) -> DaemonStatus {
     match identity {
         PidIdentity::VerifiedDaemon => DaemonStatus::LivePidSocketUnreachable,
-        PidIdentity::Missing | PidIdentity::NotDaemon => {
-            cleanup();
-            DaemonStatus::Stale
-        }
+        PidIdentity::Missing | PidIdentity::NotDaemon => DaemonStatus::Stale,
         PidIdentity::Unverified => DaemonStatus::UnverifiedPid,
     }
 }
@@ -783,7 +744,7 @@ pub async fn discover() -> DaemonProbe {
         return DaemonProbe::new(DaemonStatus::Running, canonical);
     }
 
-    if let Some(record) = read_endpoint_record()
+    if let Some(record) = read_endpoint_record(&canonical)
         && record.kind == DaemonEndpointKind::Persistent
     {
         let recorded = endpoint_paths(&canonical, &record);
@@ -842,7 +803,7 @@ pub fn discover_blocking() -> DaemonProbe {
         return DaemonProbe::new(DaemonStatus::Running, canonical);
     }
 
-    if let Some(record) = read_endpoint_record()
+    if let Some(record) = read_endpoint_record(&canonical)
         && record.kind == DaemonEndpointKind::Persistent
     {
         let recorded = endpoint_paths(&canonical, &record);
@@ -866,7 +827,7 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
     note_blocking_probe_call();
     if let Some(state) = canonical.pid_file.parent() {
         let endpoint = endpoint_file_for_state(state);
-        if let Some(record) = read_endpoint_record_from(&endpoint)
+        if let Some(record) = read_bound_endpoint_record_from(&endpoint, &canonical)
             && record.kind == DaemonEndpointKind::Persistent
         {
             let recorded = endpoint_paths(&canonical, &record);
@@ -878,11 +839,6 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
                 );
             }
             if !canonical.socket.exists() && canonical.pid_file.exists() {
-                #[cfg(unix)]
-                let status = status_for_unreachable_pid_with_cleanup(&canonical, || {
-                    let _ = std::fs::remove_file(&endpoint);
-                });
-                #[cfg(not(unix))]
                 let status = status_for_unreachable_pid(&canonical);
                 return DaemonProbe::new(status, recorded);
             }
@@ -971,7 +927,12 @@ pub fn spawn_detached_with_resume(no_sandbox: bool, resume_all_sessions: bool) -
 
 pub fn restart_no_sandbox_from_argv(args: &[String], explicit_no_sandbox: bool) -> bool {
     explicit_no_sandbox
-        || (cmdline_is_cockpit_daemon(args) && args.iter().any(|arg| arg == "--no-sandbox"))
+        || (argv_requests_daemon_start(args) && args.iter().any(|arg| arg == "--no-sandbox"))
+}
+
+fn argv_requests_daemon_start(args: &[String]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == "daemon" && pair[1] == "start")
 }
 
 pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool) -> bool {
@@ -980,10 +941,10 @@ pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool)
     }
     #[cfg(unix)]
     {
-        let Some(pid) = read_pid(paths) else {
+        let Some(pid) = read_pid_file(&paths.pid_file) else {
             return false;
         };
-        read_process_cmdline(pid)
+        cockpit_host::daemon_lifecycle::read_process_cmdline(pid)
             .map(|args| restart_no_sandbox_from_argv(&args, false))
             .unwrap_or(false)
     }
@@ -995,7 +956,7 @@ pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool)
 }
 
 pub fn daemon_pid(paths: &DaemonPaths) -> Option<u32> {
-    read_pid(paths)
+    read_pid_file(&paths.pid_file)
 }
 
 pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
@@ -1023,7 +984,7 @@ pub async fn wait_for_restart_release(
 }
 
 fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
-    let pid_released = expected_pid.is_none_or(|pid| read_pid(paths) != Some(pid));
+    let pid_released = expected_pid.is_none_or(|pid| read_pid_file(&paths.pid_file) != Some(pid));
     pid_released && !paths.pid_file.exists() && !paths.socket.exists()
 }
 
@@ -1031,13 +992,64 @@ fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> 
 /// `cockpit-eph-<pid>-<nonce>` path set).
 /// The child binds the exact path the parent chose by reading the
 /// internal env vars (Layer B); never via the user-facing CLI surface.
-/// Returns the child PID.
+/// Returns the live child handle. The owning guard retains it until verified
+/// shutdown, so PID reuse is impossible even before the v2 receipt publishes.
 ///
 /// An auto-promoted ephemeral daemon is never launched `--no-sandbox`:
 /// the client's `--no-sandbox` is a *per-session* default passed at
 /// attach time, not a daemon-level one (sandboxing part 2 precedence).
-pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<u32> {
-    spawn_detached_inner(Some(paths), false, false)
+pub struct DetachedEphemeralChild {
+    child: std::process::Child,
+    process_start: cockpit_host::daemon_lifecycle::ProcessStartIdentity,
+    executable: PathBuf,
+}
+
+impl DetachedEphemeralChild {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn into_child(self) -> std::process::Child {
+        self.child
+    }
+
+    fn process_start(&self) -> cockpit_host::daemon_lifecycle::ProcessStartIdentity {
+        self.process_start
+    }
+
+    fn executable(&self) -> &Path {
+        &self.executable
+    }
+}
+
+pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<DetachedEphemeralChild> {
+    ephemeral_guard::initialize_process_reaper()?;
+    let provisional = ephemeral_guard::ProvisionalEphemeralChild::new(
+        paths.clone(),
+        spawn_detached_child(Some(paths), false, false)?,
+    );
+    let process_start = match cockpit_host::daemon_lifecycle::process_start_identity(
+        provisional.id()?,
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return match provisional.shutdown() {
+                Ok(()) => Err(error).context("capturing ephemeral child start identity"),
+                Err(cleanup) => Err(anyhow::anyhow!(
+                    "capturing ephemeral child start identity: {error}; exact child cleanup failed: {cleanup}"
+                )),
+            };
+        }
+    };
+    let executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .context("capturing ephemeral child executable identity")?;
+    let child = provisional.into_child()?;
+    Ok(DetachedEphemeralChild {
+        child,
+        process_start,
+        executable,
+    })
 }
 
 #[cfg(unix)]
@@ -1046,6 +1058,15 @@ fn spawn_detached_inner(
     no_sandbox: bool,
     resume_all_sessions: bool,
 ) -> Result<u32> {
+    Ok(spawn_detached_child(ephemeral, no_sandbox, resume_all_sessions)?.id())
+}
+
+#[cfg(unix)]
+fn spawn_detached_child(
+    ephemeral: Option<&DaemonPaths>,
+    no_sandbox: bool,
+    resume_all_sessions: bool,
+) -> Result<std::process::Child> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1078,14 +1099,13 @@ fn spawn_detached_inner(
     }
     #[cfg(unix)]
     command.process_group(0);
-    let child = command.spawn().context("spawning daemon child")?;
-    Ok(child.id())
+    command.spawn().context("spawning daemon child")
 }
 
 #[cfg(unix)]
 fn open_detach_child_log() -> Option<std::fs::File> {
     let dir = dirs::cache_dir()?.join("cockpit");
-    crate::private_fs::ensure_private_dir(&dir).ok()?;
+    cockpit_host::private_fs::ensure_private_dir(&dir).ok()?;
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1099,6 +1119,15 @@ fn spawn_detached_inner(
     _no_sandbox: bool,
     _resume_all_sessions: bool,
 ) -> Result<u32> {
+    anyhow::bail!("daemon socket transport is not supported on this platform")
+}
+
+#[cfg(not(unix))]
+fn spawn_detached_child(
+    _ephemeral: Option<&DaemonPaths>,
+    _no_sandbox: bool,
+    _resume_all_sessions: bool,
+) -> Result<std::process::Child> {
     anyhow::bail!("daemon socket transport is not supported on this platform")
 }
 
@@ -1144,29 +1173,380 @@ pub async fn run_foreground_with_resume(
     .await
 }
 
+pub struct InProcessDaemonGuard {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    force: shutdown::ShutdownSignal,
+    completion: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    supervisor: Option<std::thread::JoinHandle<()>>,
+}
+
+struct SupervisorReap {
+    supervisor: std::thread::JoinHandle<()>,
+    completed: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+}
+
+static IN_PROCESS_SUPERVISOR_REAPER: std::sync::OnceLock<
+    Option<std::sync::mpsc::Sender<SupervisorReap>>,
+> = std::sync::OnceLock::new();
+
+fn supervisor_reaper() -> Option<&'static std::sync::mpsc::Sender<SupervisorReap>> {
+    IN_PROCESS_SUPERVISOR_REAPER
+        .get_or_init(|| {
+            let (send, receive) = std::sync::mpsc::channel::<SupervisorReap>();
+            std::thread::Builder::new()
+                .name("cockpit-daemon-supervisor-reaper".to_string())
+                .spawn(move || {
+                    while let Ok(reap) = receive.recv() {
+                        let result = reap
+                            .supervisor
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("in-process daemon supervisor panicked"));
+                        if let Some(completed) = reap.completed {
+                            let _ = completed.send(result);
+                        } else if let Err(error) = result {
+                            tracing::error!(%error, "reaped in-process daemon supervisor failed");
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| send)
+        })
+        .as_ref()
+}
+
+fn submit_supervisor_to_reaper(
+    supervisor: std::thread::JoinHandle<()>,
+    completed: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+) {
+    submit_supervisor_reap(
+        supervisor_reaper(),
+        SupervisorReap {
+            supervisor,
+            completed,
+        },
+    );
+}
+
+fn submit_supervisor_reap(
+    reaper: Option<&std::sync::mpsc::Sender<SupervisorReap>>,
+    reap: SupervisorReap,
+) {
+    let reap = match reaper {
+        Some(reaper) => match reaper.send(reap) {
+            Ok(()) => return,
+            Err(error) => error.0,
+        },
+        None => reap,
+    };
+    // Emergency fallback retains the original JoinHandle. There is no second
+    // fallible thread spawn whose closure could consume and detach it.
+    let result = reap
+        .supervisor
+        .join()
+        .map_err(|_| anyhow::anyhow!("in-process daemon supervisor panicked"));
+    if let Some(completed) = reap.completed {
+        let _ = completed.send(result);
+    } else if let Err(error) = result {
+        tracing::error!(%error, "emergency supervisor join failed");
+    }
+}
+
+pub(crate) fn reap_daemon_owner_thread(supervisor: std::thread::JoinHandle<()>) {
+    submit_supervisor_to_reaper(supervisor, None);
+}
+
+impl InProcessDaemonGuard {
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.begin_shutdown();
+        let result = self
+            .completion
+            .take()
+            .context("in-process daemon shutdown completion missing")?
+            .await
+            .context("in-process daemon shutdown supervisor stopped")?;
+        let supervisor = self
+            .supervisor
+            .take()
+            .context("in-process daemon shutdown supervisor handle missing")?;
+        let (joined, join) = tokio::sync::oneshot::channel();
+        submit_supervisor_to_reaper(supervisor, Some(joined));
+        join.await
+            .context("in-process daemon supervisor reaper stopped")??;
+        result
+    }
+
+    pub(crate) fn begin_shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+
+    pub(crate) fn shutdown_force_handle(&self) -> shutdown::ShutdownSignal {
+        self.force.clone()
+    }
+}
+
+impl Drop for InProcessDaemonGuard {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+        // Cancellation/panic never blocks an async executor. The process-wide
+        // OS-thread reaper joins the runtime-independent supervisor even if
+        // the originating Tokio runtime is already disappearing.
+        if let Some(supervisor) = self.supervisor.take() {
+            submit_supervisor_to_reaper(supervisor, None);
+        }
+    }
+}
+
+async fn drain_daemon_context(
+    ctx: &std::sync::Arc<server::DaemonContext>,
+    grace: Duration,
+) -> Result<()> {
+    let force_ctx = ctx.clone();
+    let force_timer = tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        if !force_ctx.shutdown_signal().is_forced() {
+            force_ctx.shutdown_signal().force();
+            force_ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
+        }
+    });
+    let drain = ctx.registry.drain_all(grace).await;
+    let mut failures = Vec::new();
+    if !drain.park_commit.is_clean() {
+        failures.push(format!("interrupt park commit: {:?}", drain.park_commit));
+    }
+    if !drain.is_clean() {
+        failures.push("session worker drain was forced or incomplete".to_string());
+    }
+
+    if ctx.process_containment.is_some() || ctx.write_scope.is_some() {
+        let containment = ctx.process_containment.clone();
+        let write_scope = ctx.write_scope.clone();
+        let wall_cap = grace
+            .checked_add(Duration::from_millis(500))
+            .unwrap_or(grace)
+            .min(Duration::from_secs(2));
+        let barrier = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building shutdown containment runtime")?;
+            runtime.block_on(async move {
+                tokio::time::timeout(wall_cap, async move {
+                    let mut errors = Vec::new();
+                    if let Some(containment) = containment.as_ref()
+                        && let Err(error) = containment.begin_shutdown().await
+                    {
+                        errors.push(format!("containment begin-shutdown: {error}"));
+                    }
+                    if let Some(write_scope) = write_scope.as_ref()
+                        && let Err(error) = write_scope.begin_shutdown().await
+                    {
+                        errors.push(format!("write-scope begin-shutdown: {error}"));
+                    }
+                    if let Some(containment) = containment.as_ref()
+                        && let Err(error) = containment.await_all_empty(Some(grace)).await
+                    {
+                        errors.push(format!("containment not empty: {error}"));
+                    }
+                    if let Some(write_scope) = write_scope.as_ref()
+                        && let Err(error) = write_scope.assert_shutdown_clean().await
+                    {
+                        errors.push(format!("write-scope not clean: {error}"));
+                    }
+                    if errors.is_empty() {
+                        Ok::<(), anyhow::Error>(())
+                    } else {
+                        anyhow::bail!(errors.join("; "))
+                    }
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("containment barrier exceeded {wall_cap:?}"))?
+            })
+        });
+        match barrier.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("containment barrier: {error}")),
+            Err(error) => failures.push(format!("containment barrier task: {error}")),
+        }
+    }
+
+    let result = if failures.is_empty() {
+        Ok(())
+    } else {
+        if !ctx.shutdown_signal().is_forced() {
+            ctx.shutdown_signal().force();
+            ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
+        }
+        Err(anyhow::anyhow!(failures.join("; ")))
+    };
+    force_timer.abort();
+    let _ = force_timer.await;
+    result
+}
+
+async fn shutdown_in_process_context(
+    ctx: std::sync::Arc<server::DaemonContext>,
+    mut tasks: Vec<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
+    server::request_shutdown(&ctx);
+    let grace = ctx
+        .take_shutdown_grace_override()
+        .unwrap_or(shutdown::SHUTDOWN_DRAIN_GRACE);
+    let result = drain_daemon_context(&ctx, grace).await;
+    for task in tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Err(error) = &result {
+        tracing::warn!(%error, "in-process daemon shutdown was not clean");
+    }
+    drop(ctx);
+    result
+}
+
+fn spawn_in_process_shutdown_supervisor(
+    ctx: std::sync::Arc<server::DaemonContext>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+) -> Result<InProcessDaemonGuard> {
+    let force = ctx.shutdown_signal().clone();
+    let (shutdown, shutdown_request) = tokio::sync::oneshot::channel();
+    let (completion, completed) = tokio::sync::oneshot::channel();
+    let supervisor = std::thread::Builder::new()
+        .name("cockpit-in-process-shutdown".to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building in-process daemon shutdown runtime")
+                .and_then(|runtime| {
+                    runtime.block_on(async move {
+                        let _ = shutdown_request.await;
+                        shutdown_in_process_context(ctx, tasks).await
+                    })
+                });
+            let _ = completion.send(result);
+        })
+        .context("spawning in-process daemon shutdown supervisor")?;
+    Ok(InProcessDaemonGuard {
+        shutdown: Some(shutdown),
+        force,
+        completion: Some(completed),
+        supervisor: Some(supervisor),
+    })
+}
+
+struct InProcessBootReady {
+    endpoint: cockpit_client::InProcessEndpoint,
+    force: shutdown::ShutdownSignal,
+}
+
+struct PendingInProcessBoot {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    supervisor: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PendingInProcessBoot {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(supervisor) = self.supervisor.take() {
+            submit_supervisor_to_reaper(supervisor, None);
+        }
+    }
+}
+
+fn spawn_owned_in_process_daemon(
+    paths: DaemonPaths,
+    terminal_factory: terminal::TerminalHostFactory,
+) -> Result<(
+    tokio::sync::oneshot::Receiver<Result<InProcessBootReady>>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<Result<()>>,
+    std::thread::JoinHandle<()>,
+)> {
+    let (booted, boot) = tokio::sync::oneshot::channel();
+    let (shutdown, shutdown_request) = tokio::sync::oneshot::channel();
+    let (completion, completed) = tokio::sync::oneshot::channel();
+    let supervisor = std::thread::Builder::new()
+        .name("cockpit-in-process-daemon".to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building in-process daemon runtime")
+                .and_then(|runtime| {
+                    runtime.block_on(async move {
+                        let ctx = match server::boot(paths, terminal_factory).await {
+                            Ok(ctx) => std::sync::Arc::new(ctx),
+                            Err(error) => {
+                                let _ = booted.send(Err(error));
+                                return Ok(());
+                            }
+                        };
+                        #[cfg(not(test))]
+                        let tasks = {
+                            let mut tasks = Vec::new();
+                            tasks.push(server::spawn_lock_sweeper(ctx.clone()));
+                            #[cfg(feature = "remote")]
+                            tasks.push(org_sync::spawn_background(ctx.clone()));
+                            #[cfg(feature = "remote")]
+                            tasks.push(remote_audit_upload::spawn_background(ctx.clone()));
+                            #[cfg(feature = "remote")]
+                            tasks.push(connector::spawn_background(ctx.clone()));
+                            #[cfg(feature = "remote")]
+                            tasks.push(remote_outbox_worker::spawn_background(ctx.clone()));
+                            tasks
+                        };
+                        #[cfg(test)]
+                        let tasks = Vec::new();
+                        let endpoint = server::register_in_process_context(ctx.clone());
+                        let force = ctx.shutdown_signal().clone();
+                        if booted
+                            .send(Ok(InProcessBootReady { endpoint, force }))
+                            .is_err()
+                        {
+                            return shutdown_in_process_context(ctx, tasks).await;
+                        }
+                        let _ = shutdown_request.await;
+                        shutdown_in_process_context(ctx, tasks).await
+                    })
+                });
+            let _ = completion.send(result);
+        })
+        .context("spawning in-process daemon owner thread")?;
+    Ok((boot, shutdown, completed, supervisor))
+}
+
 pub(crate) async fn boot_in_process(
     paths: DaemonPaths,
     terminal_factory: terminal::TerminalHostFactory,
-) -> Result<std::sync::Arc<server::DaemonContext>> {
-    if let Some(ctx) = server::in_process_context(&paths.socket) {
-        return Ok(ctx);
+) -> Result<(
+    cockpit_client::InProcessEndpoint,
+    Option<InProcessDaemonGuard>,
+)> {
+    if let Some(endpoint) = server::registered_in_process_endpoint(&paths.socket) {
+        return Ok((endpoint, None));
     }
-
-    let ctx = std::sync::Arc::new(server::boot(paths, terminal_factory).await?);
-    #[cfg(not(test))]
-    {
-        server::spawn_lock_sweeper(ctx.clone());
-        #[cfg(feature = "remote")]
-        let _org_sync_task = org_sync::spawn_background(ctx.clone());
-        #[cfg(feature = "remote")]
-        let _remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());
-        #[cfg(feature = "remote")]
-        let _connector_task = connector::spawn_background(ctx.clone());
-        #[cfg(feature = "remote")]
-        let _remote_outbox_task = remote_outbox_worker::spawn_background(ctx.clone());
-    }
-    server::register_in_process_context(ctx.clone());
-    Ok(ctx)
+    let (boot, shutdown, completion, supervisor) =
+        spawn_owned_in_process_daemon(paths, terminal_factory)?;
+    let mut pending = PendingInProcessBoot {
+        shutdown: Some(shutdown),
+        supervisor: Some(supervisor),
+    };
+    let ready = boot
+        .await
+        .context("in-process daemon owner stopped during boot")??;
+    Ok((
+        ready.endpoint,
+        Some(InProcessDaemonGuard {
+            shutdown: pending.shutdown.take(),
+            force: ready.force,
+            completion: Some(completion),
+            supervisor: pending.supervisor.take(),
+        }),
+    ))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1347,11 +1727,38 @@ async fn run_foreground_inner_with_boot_db(
             );
         }
     }
-    // Clear any stale leftover.
-    let _ = std::fs::remove_file(&paths.socket);
-    std::fs::write(&paths.pid_file, std::process::id().to_string())
-        .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
-    let mut metadata_guard = ForegroundMetadataGuard::new(&paths);
+    let executable = std::env::current_exe().context("resolving daemon executable identity")?;
+    let endpoint_record = if !paths.ephemeral
+        && DaemonPaths::resolve_canonical()
+            .as_ref()
+            .is_ok_and(|canonical| canonical == &paths)
+    {
+        paths.pid_file.parent().map(endpoint_file_for_state)
+    } else {
+        None
+    };
+    // The exclusive PID receipt is the starting reservation. Acquire it before
+    // touching the shared socket so a losing concurrent starter cannot unlink
+    // the winner's newly bound endpoint.
+    let pid_receipt = reclaim_stale_and_reserve(
+        &paths.pid_file,
+        &paths.socket,
+        endpoint_record.as_deref(),
+        std::process::id(),
+        &executable,
+    )
+    .with_context(|| format!("reserving pid file {}", paths.pid_file.display()))?;
+    let mut metadata_guard = ForegroundMetadataGuard::new(
+        paths.pid_file.clone(),
+        paths.socket.clone(),
+        endpoint_record,
+        pid_receipt.clone(),
+    );
+    match std::fs::remove_file(&paths.socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("removing stale daemon socket after reservation"),
+    }
 
     let uses_supplied_boot_db = boot_db.is_some();
     let ctx = std::sync::Arc::new(match boot_db {
@@ -1381,7 +1788,7 @@ async fn run_foreground_inner_with_boot_db(
     // before database/config initialization creates a startup handshake race.
     let listener = bind_private_socket(&paths.socket)?;
     if uses_supplied_boot_db {
-        write_endpoint_record_with_pid_and_canonical(&paths, &paths, std::process::id())?;
+        write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
     } else {
         write_endpoint_record(&paths)?;
     }
@@ -1453,7 +1860,7 @@ async fn run_foreground_inner_with_boot_db(
     // daemon-internal periodic task that reclaims locks whose holder has
     // gone idle past the 5-minute threshold, so a hung/abandoned holder
     // can't block a waiting `read` forever.
-    server::spawn_lock_sweeper(ctx.clone());
+    let _lock_sweeper = server::spawn_lock_sweeper(ctx.clone());
     #[cfg(feature = "remote")]
     let org_sync_task = org_sync::spawn_background(ctx.clone());
     #[cfg(feature = "remote")]
@@ -1497,13 +1904,10 @@ async fn run_foreground_inner_with_boot_db(
     // new-request gate is definitely closed before we await workers.
     server::request_shutdown(&ctx);
 
-    // Bounded grace, then force: arm a timer that escalates the central
-    // gate to `Forced` once the grace elapses (also broadcasting the forced
-    // notice), so a hung provider request can't block shutdown past the
-    // deadline. `drain_all` awaits the workers up to the same grace and
-    // aborts whatever remains.
+    // Bounded grace, then force. `drain_daemon_context` owns the shared
+    // foreground/in-process force timer and result policy, so neither path
+    // can report a clean stop with unfinished workers or containment.
     let drain_grace = ctx.take_shutdown_grace_override().unwrap_or(drain_grace);
-    spawn_force_timer(ctx.clone(), drain_grace);
     // `drain_all` now returns BOTH the grace-bounded running-work result and the
     // decoupled interrupt-park commit terminal
     // (`daemon-lifecycle-replay-timing-robustness.md`). Crucially it does not
@@ -1513,107 +1917,15 @@ async fn run_foreground_inner_with_boot_db(
     // a registered interrupt waiter's park is still un-committed. A restart then
     // never reports success (or lets the successor bind) with an interrupt row
     // left `Open`.
-    let drain_outcome = ctx.registry.drain_all(drain_grace).await;
-    if !drain_outcome.park_commit.is_clean() {
-        tracing::warn!(
-            park_commit = ?drain_outcome.park_commit,
-            "daemon shutdown: interrupt park did not commit cleanly; not a clean park success"
-        );
-    }
-    let drained_clean = drain_outcome.is_clean();
-    // Generation-bound containment barrier: clean shutdown only when every
-    // containment is ProvenEmpty. Deadline/failure leaves Uncertain/Stopping
-    // rows durable for restart reconciliation.
-    // Bound the containment barrier with a wall-clock cap so paused-time
-    // tests and wedged adapters cannot prevent daemon exit. Clean status
-    // still requires ProvenEmpty within that bound.
-    let containment_clean = if let Some(pc) = ctx.process_containment.as_ref() {
-        let pc = pc.clone();
-        // The write-scope coordinator drains in the same barrier: shutdown may
-        // not report clean while a lease still holds authority or a permit is
-        // still held, exactly as it may not while a containment is nonempty.
-        let ws = ctx.write_scope.clone();
-        let grace = drain_grace;
-        // Prefer a real-time upper bound slightly above grace so a paused
-        // Tokio clock cannot leave this future pending forever.
-        let wall_cap = grace
-            .checked_add(Duration::from_millis(500))
-            .unwrap_or(grace)
-            .min(Duration::from_secs(2));
-        match tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("containment barrier runtime");
-            rt.block_on(async move {
-                let barrier = async move {
-                    if let Err(error) = pc.begin_shutdown().await {
-                        tracing::warn!(error = %error, "process containment begin_shutdown failed");
-                    }
-                    // Close write-scope intake before draining, so no transfer
-                    // can begin while the barrier is running.
-                    if let Some(ws) = ws.as_ref()
-                        && let Err(error) = ws.begin_shutdown().await
-                    {
-                        tracing::warn!(error = %error, "write scope begin_shutdown failed");
-                    }
-                    pc.await_all_empty(Some(grace)).await?;
-                    if let Some(ws) = ws.as_ref() {
-                        ws.assert_shutdown_clean().await.map_err(|error| {
-                            crate::process_containment::ContainmentError::Internal(format!(
-                                "write scope not drained at shutdown: {error}"
-                            ))
-                        })?;
-                    }
-                    Ok::<(), crate::process_containment::ContainmentError>(())
-                };
-                match tokio::time::timeout(wall_cap, barrier).await {
-                    Ok(Ok(())) => true,
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            error = %error,
-                            "process containment not proven empty at shutdown"
-                        );
-                        false
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "process containment barrier timed out at shutdown; leaving durable rows"
-                        );
-                        false
-                    }
-                }
-            })
-        })
-        .await
-        {
-            Ok(clean) => clean,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "process containment barrier task failed at shutdown"
-                );
-                false
-            }
-        }
-    } else {
-        true
-    };
-    let drained_clean = drained_clean && containment_clean;
-    if !drained_clean {
-        // Make sure the forced state + notice are set even if the timer
-        // hadn't fired yet (e.g. all workers wedged right at the deadline).
-        if !ctx.shutdown_signal().is_forced() {
-            ctx.shutdown_signal().force();
-            ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
-        }
-        tracing::warn!("daemon: forced shutdown — in-flight work aborted at grace deadline");
+    let shutdown_result = drain_daemon_context(&ctx, drain_grace).await;
+    if let Err(error) = &shutdown_result {
+        tracing::warn!(%error, "daemon shutdown was not clean");
     }
 
     // Cleanup on every path, but only while the pid file still names this
     // process. A restart replacement may have taken ownership of the shared
     // canonical paths before the old daemon finishes draining.
-    metadata_guard.cleanup();
+    let metadata_result = metadata_guard.cleanup();
 
     signal_task.abort();
     if let Some(watchdog) = watchdog_task {
@@ -1633,7 +1945,21 @@ async fn run_foreground_inner_with_boot_db(
     }
     #[cfg(unix)]
     let _ = std::fs::remove_file(paths.leak_reveal_socket());
-    result
+    let mut failures = Vec::new();
+    if let Err(error) = result {
+        failures.push(format!("daemon accept loop: {error}"));
+    }
+    if let Err(error) = shutdown_result {
+        failures.push(format!("daemon shutdown: {error}"));
+    }
+    if let Err(error) = metadata_result {
+        failures.push(format!("daemon metadata cleanup: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
 }
 
 #[cfg(not(unix))]
@@ -1645,23 +1971,6 @@ pub async fn run_foreground_inner(
     _terminal_factory: terminal::TerminalHostFactory,
 ) -> Result<()> {
     anyhow::bail!("daemon socket transport is not supported on this platform")
-}
-
-/// Arm the bounded-grace force timer for a graceful drain
-/// (`daemon-graceful-drain-shutdown.md`). Once `grace` elapses, it
-/// escalates the central gate to `Forced` and broadcasts the forced
-/// notice — so even if `drain_all`'s own timeout is somehow still pending,
-/// the gate reflects "forced" for any late observer. Detached; the process
-/// exits shortly after `drain_all` returns regardless.
-#[cfg(any(unix, test))]
-fn spawn_force_timer(ctx: std::sync::Arc<server::DaemonContext>, grace: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
-        if !ctx.shutdown_signal().is_forced() {
-            ctx.shutdown_signal().force();
-            ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
-        }
-    });
 }
 
 #[cfg(any(unix, test))]
@@ -1729,79 +2038,79 @@ async fn idle_watchdog(
 
 /// Kill the running daemon (if any) and clean up its pid + socket files.
 pub fn stop(paths: &DaemonPaths) -> Result<bool> {
-    let Some(pid) = read_pid(paths) else {
+    let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
         return Ok(false);
     };
-    #[cfg(unix)]
-    return stop_unix_with(paths, pid, verify_daemon_pid_identity, send_sigterm, || {
-        paths.pid_file.exists()
-    });
+    #[cfg(target_os = "linux")]
+    return stop_linux(paths, record);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    return stop_unix_without_stable_handle(paths, record);
     #[cfg(not(unix))]
     {
-        let _ = pid;
-        let _ = std::fs::remove_file(&paths.pid_file);
-        let _ = std::fs::remove_file(&paths.socket);
-        Ok(true)
+        let _ = (paths, record);
+        anyhow::bail!(
+            "daemon lifecycle metadata exists but this platform has no stable process handle; preserving metadata and refusing numeric signaling"
+        )
     }
 }
 
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PidIdentity {
-    VerifiedDaemon,
-    NotDaemon,
-    Missing,
-    Unverified,
+pub(crate) fn stop_exact(paths: &DaemonPaths, expected: &DaemonPidReceipt) -> Result<bool> {
+    let current = read_daemon_pid_record(&paths.pid_file);
+    if current != Some(DaemonPidRecord::Receipt(expected.clone())) {
+        anyhow::bail!(
+            "daemon PID receipt changed; refusing to signal or clean a replacement incarnation"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    return stop_linux(paths, DaemonPidRecord::Receipt(expected.clone()));
+    #[cfg(all(unix, not(target_os = "linux")))]
+    return stop_unix_without_stable_handle(paths, DaemonPidRecord::Receipt(expected.clone()));
+    #[cfg(not(unix))]
+    {
+        let _ = (paths, expected);
+        anyhow::bail!("exact daemon process teardown is unsupported on this platform")
+    }
 }
 
-#[cfg(unix)]
-fn stop_unix_with(
-    paths: &DaemonPaths,
-    pid: u32,
-    verify: impl Fn(u32) -> PidIdentity,
-    signal: impl Fn(u32) -> Result<()>,
-    pid_file_exists: impl Fn() -> bool,
-) -> Result<bool> {
-    stop_unix_with_timeout(
-        paths,
-        pid,
-        verify,
-        signal,
-        pid_file_exists,
-        restart_release_timeout(None),
-    )
-}
-
-#[cfg(unix)]
-fn stop_unix_with_timeout(
-    paths: &DaemonPaths,
-    pid: u32,
-    verify: impl Fn(u32) -> PidIdentity,
-    signal: impl Fn(u32) -> Result<()>,
-    pid_file_exists: impl Fn() -> bool,
-    timeout: Duration,
-) -> Result<bool> {
-    match verify(pid) {
-        PidIdentity::VerifiedDaemon => {}
-        PidIdentity::Missing | PidIdentity::NotDaemon => {
-            remove_metadata_if_pid_matches(paths, pid);
+#[cfg(target_os = "linux")]
+fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
+    let receipt = match record {
+        DaemonPidRecord::LegacyNumeric(pid) => return settle_legacy_stop(paths, pid),
+        DaemonPidRecord::Receipt(receipt) => receipt,
+    };
+    let process = match acquire_verified_daemon_process(&receipt) {
+        VerifiedProcessOutcome::Verified(process) => process,
+        VerifiedProcessOutcome::Identity(PidIdentity::Missing | PidIdentity::NotDaemon) => {
+            cleanup_receipt_metadata(paths, &receipt)?;
             return Ok(false);
         }
-        PidIdentity::Unverified => {
-            anyhow::bail!(
-                "refusing to signal pid {pid}: daemon process identity could not be verified"
-            );
+        VerifiedProcessOutcome::Identity(PidIdentity::Unverified) => {
+            anyhow::bail!("refusing to signal daemon: PID receipt could not be verified");
         }
+        VerifiedProcessOutcome::Identity(PidIdentity::VerifiedDaemon) => unreachable!(),
+    };
+    if read_daemon_pid_record(&paths.pid_file) != Some(DaemonPidRecord::Receipt(receipt.clone())) {
+        anyhow::bail!(
+            "daemon PID receipt changed after stable process acquisition; refusing signal"
+        );
     }
-
-    // SIGTERM is graceful — the daemon may legitimately need the full drain
-    // window before its metadata guard removes the pid/socket files. Never
-    // unlink matching metadata while that verified process remains alive:
-    // doing so would let a replacement start against the same database.
-    signal(pid)?;
-    let deadline = std::time::Instant::now() + timeout;
+    if let Err(error) = process.send_sigterm() {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            cleanup_receipt_metadata(paths, &receipt)?;
+            return Ok(true);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "signaling daemon PID {} through its stable pidfd",
+                receipt.pid
+            )
+        });
+    }
+    let deadline = std::time::Instant::now() + restart_release_timeout(None);
     loop {
-        if !pid_file_exists() || read_pid(paths) != Some(pid) {
+        if read_daemon_pid_record(&paths.pid_file)
+            != Some(DaemonPidRecord::Receipt(receipt.clone()))
+        {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -1812,207 +2121,70 @@ fn stop_unix_with_timeout(
                 .min(deadline.saturating_duration_since(std::time::Instant::now())),
         );
     }
-    match verify(pid) {
-        PidIdentity::Missing | PidIdentity::NotDaemon => {
-            remove_metadata_if_pid_matches(paths, pid);
-            Ok(true)
-        }
-        PidIdentity::VerifiedDaemon => anyhow::bail!(
-            "timed out waiting for daemon pid {pid} to stop; preserving its pid and socket metadata"
+    match process.is_alive() {
+        Ok(false) => {}
+        Ok(true) => anyhow::bail!(
+            "timed out waiting for daemon PID {} to stop; preserving its receipt and socket metadata",
+            receipt.pid
         ),
-        PidIdentity::Unverified => anyhow::bail!(
-            "daemon pid {pid} did not stop and its identity can no longer be verified; preserving metadata"
+        Err(error) => anyhow::bail!(
+            "could not prove daemon PID {} exited ({error}); preserving its receipt and socket metadata",
+            receipt.pid
         ),
     }
+    cleanup_receipt_metadata(paths, &receipt)?;
+    Ok(true)
 }
 
-#[cfg(any(unix, test))]
-fn remove_metadata_if_pid_matches(paths: &DaemonPaths, expected_pid: u32) -> bool {
-    if read_pid(paths) != Some(expected_pid) {
-        return false;
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stop_unix_without_stable_handle(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
+    match record {
+        DaemonPidRecord::LegacyNumeric(pid) => settle_legacy_stop(paths, pid),
+        DaemonPidRecord::Receipt(receipt) => {
+            match verify_cockpit_daemon_receipt_identity(&receipt) {
+                PidIdentity::Missing | PidIdentity::NotDaemon => {
+                    cleanup_receipt_metadata(paths, &receipt)?;
+                    Ok(false)
+                }
+                PidIdentity::VerifiedDaemon | PidIdentity::Unverified => anyhow::bail!(
+                    "daemon PID {} is live but this platform has no stable process handle; refusing numeric signaling",
+                    receipt.pid
+                ),
+            }
+        }
     }
-    let _ = std::fs::remove_file(&paths.pid_file);
-    let _ = std::fs::remove_file(&paths.socket);
-    true
 }
 
 #[cfg(unix)]
-fn send_sigterm(pid: u32) -> Result<()> {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    if rc == 0 {
-        Ok(())
+fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
+    match legacy_pid_identity(pid) {
+        PidIdentity::Missing => {
+            remove_dead_legacy_metadata(&paths.pid_file, &paths.socket, pid)?;
+            Ok(false)
+        }
+        PidIdentity::VerifiedDaemon | PidIdentity::NotDaemon | PidIdentity::Unverified => {
+            anyhow::bail!(
+                "legacy numeric-only daemon PID {pid} is live; refusing unbound numeric signaling"
+            )
+        }
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_receipt_metadata(paths: &DaemonPaths, receipt: &DaemonPidReceipt) -> Result<bool> {
+    let endpoint = if paths.ephemeral {
+        None
     } else {
-        Err(std::io::Error::last_os_error()).with_context(|| format!("signaling pid {pid}"))
-    }
-}
-
-#[cfg(unix)]
-fn verify_daemon_pid_identity(pid: u32) -> PidIdentity {
-    if !process_exists(pid) {
-        return PidIdentity::Missing;
-    }
-    match read_process_cmdline(pid) {
-        Ok(args) if cmdline_is_cockpit_daemon(&args) => PidIdentity::VerifiedDaemon,
-        Ok(_) => PidIdentity::NotDaemon,
-        Err(_) => PidIdentity::Unverified,
-    }
-}
-
-#[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(all(unix, target_os = "linux"))]
-fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
-    let bytes = std::fs::read(format!("/proc/{pid}/cmdline"))?;
-    Ok(split_proc_cmdline(&bytes))
-}
-
-#[cfg(all(unix, target_os = "macos"))]
-fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
-    let mut argmax: libc::c_int = 0;
-    let mut argmax_len = std::mem::size_of_val(&argmax);
-    let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    let rc = unsafe {
-        libc::sysctl(
-            argmax_mib.as_mut_ptr(),
-            argmax_mib.len() as libc::c_uint,
-            &mut argmax as *mut _ as *mut libc::c_void,
-            &mut argmax_len,
-            std::ptr::null_mut(),
-            0,
-        )
+        Some(endpoint_file_for_state(
+            paths.pid_file.parent().context("PID file has no parent")?,
+        ))
     };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if argmax <= 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "KERN_ARGMAX returned a non-positive argv buffer size",
-        ));
-    }
-
-    let mut bytes = vec![0_u8; argmax as usize];
-    let mut len = bytes.len();
-    let mut procargs_mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
-    let rc = unsafe {
-        libc::sysctl(
-            procargs_mib.as_mut_ptr(),
-            procargs_mib.len() as libc::c_uint,
-            bytes.as_mut_ptr() as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    bytes.truncate(len);
-    parse_macos_procargs2(&bytes)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn read_process_cmdline(_pid: u32) -> std::io::Result<Vec<String>> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "pid identity verification is unsupported on this platform",
-    ))
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn split_proc_cmdline(bytes: &[u8]) -> Vec<String> {
-    bytes
-        .split(|b| *b == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect()
-}
-
-#[cfg(all(unix, any(test, target_os = "macos")))]
-fn parse_macos_procargs2(bytes: &[u8]) -> std::io::Result<Vec<String>> {
-    const ARG_COUNT_LEN: usize = std::mem::size_of::<libc::c_int>();
-    if bytes.len() < ARG_COUNT_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "KERN_PROCARGS2 data is shorter than argc",
-        ));
-    }
-
-    let argc =
-        i32::from_ne_bytes(bytes[..ARG_COUNT_LEN].try_into().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid argc width")
-        })?);
-    if argc <= 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "KERN_PROCARGS2 argc is not positive",
-        ));
-    }
-
-    let mut pos = ARG_COUNT_LEN;
-    let Some(exec_end) = bytes[pos..].iter().position(|b| *b == 0).map(|n| pos + n) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "KERN_PROCARGS2 data is missing executable path terminator",
-        ));
-    };
-    pos = exec_end + 1;
-
-    while pos < bytes.len() && bytes[pos] == 0 {
-        pos += 1;
-    }
-
-    let mut args = Vec::with_capacity(argc as usize);
-    while args.len() < argc as usize {
-        if pos >= bytes.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "KERN_PROCARGS2 data ended before argc arguments",
-            ));
-        }
-        let Some(arg_end) = bytes[pos..].iter().position(|b| *b == 0).map(|n| pos + n) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "KERN_PROCARGS2 argument is not NUL terminated",
-            ));
-        };
-        if arg_end > pos {
-            args.push(String::from_utf8_lossy(&bytes[pos..arg_end]).into_owned());
-        }
-        pos = arg_end + 1;
-    }
-
-    Ok(args)
-}
-
-fn cmdline_is_cockpit_daemon(args: &[String]) -> bool {
-    let Some(program) = args.first() else {
-        return false;
-    };
-    let program_name = std::path::Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(program);
-    program_name.contains("cockpit")
-        && args
-            .windows(2)
-            .any(|pair| pair[0] == "daemon" && pair[1] == "start")
-}
-
-fn read_pid(paths: &DaemonPaths) -> Option<u32> {
-    let s = std::fs::read_to_string(&paths.pid_file).ok()?;
-    s.trim().parse().ok()
+    retire_metadata_if_receipt_matches(&paths.pid_file, &paths.socket, endpoint.as_deref(), receipt)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
+    use super::client::temp_ephemeral_paths;
     use super::*;
     use crate::daemon::test_harness::{
         CleanupReport, DaemonTestHarness, TEST_OWNER_ENV, TestDaemonManifest,
@@ -2152,7 +2324,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn endpoint_record_recovers_running_daemon_from_different_runtime_dir() {
+    fn endpoint_record_cannot_redirect_discovery_to_a_different_runtime_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_a = dir.path().join("rt-a");
@@ -2160,25 +2332,23 @@ mod tests {
         std::fs::create_dir_all(runtime_a.join("cockpit")).expect("runtime a");
 
         let socket_a = runtime_a.join("cockpit/cockpit.sock");
-        let listener = spawn_hello_socket(socket_a.clone());
-
-        // Wait until the listener thread has bound before probing; in the full
-        // test suite other threads can otherwise let this test race the bind.
-        wait_for_socket(&socket_a);
-
         let paths = canonical_in(&state_home, &runtime_a);
         assert_eq!(paths.socket, socket_a);
-        std::fs::write(&paths.pid_file, std::process::id().to_string()).expect("pid file");
-        write_endpoint_record_with_pid_and_canonical(&paths, &paths, std::process::id())
+        let receipt = write_pid_file(
+            &paths.pid_file,
+            std::process::id(),
+            &std::env::current_exe().unwrap(),
+        )
+        .expect("pid receipt");
+        write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &receipt)
             .expect("endpoint record");
 
         let canonical_b = canonical_in(&state_home, &runtime_b);
         assert_ne!(canonical_b.socket, socket_a);
 
         let probe = discover_blocking_with_canonical(canonical_b);
-        assert_eq!(probe.status, DaemonStatus::Running);
-        assert_eq!(probe.paths.socket, socket_a);
-        listener.join().expect("listener thread");
+        assert_eq!(probe.status, DaemonStatus::Stale);
+        assert_eq!(probe.paths.socket, runtime_b.join("cockpit/cockpit.sock"));
     }
 
     #[cfg(unix)]
@@ -2236,7 +2406,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stale_endpoint_with_missing_pid_is_removed_without_signaling() {
+    fn stale_endpoint_without_bound_receipt_is_preserved_without_signaling() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
@@ -2244,8 +2414,8 @@ mod tests {
         std::fs::write(&paths.pid_file, "999999999").expect("pid file");
         let record = DaemonEndpointRecord {
             version: 1,
-            pid: 999999999,
             socket: runtime_dir.join("other/cockpit.sock"),
+            receipt: test_pid_receipt(999999999),
             kind: DaemonEndpointKind::Persistent,
         };
         let endpoint = endpoint_file_for_state(paths.pid_file.parent().unwrap());
@@ -2253,7 +2423,37 @@ mod tests {
 
         let probe = discover_blocking_with_canonical(paths);
         assert_eq!(probe.status, DaemonStatus::Stale);
-        assert!(!endpoint.exists());
+        assert!(
+            endpoint.exists(),
+            "unbound endpoint cleanup must fail closed"
+        );
+    }
+
+    #[test]
+    fn endpoint_reader_rejects_executable_receipt_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_home = dir.path().join("state");
+        let runtime_dir = dir.path().join("runtime");
+        let paths = canonical_in(&state_home, &runtime_dir);
+        let receipt = write_pid_file(
+            &paths.pid_file,
+            std::process::id(),
+            &std::env::current_exe().unwrap(),
+        )
+        .expect("pid receipt");
+        let endpoint = endpoint_file_for_state(paths.pid_file.parent().unwrap());
+        let record = DaemonEndpointRecord {
+            version: 1,
+            socket: paths.socket.clone(),
+            receipt: DaemonPidReceipt {
+                executable: paths.pid_file.clone(),
+                ..receipt
+            },
+            kind: DaemonEndpointKind::Persistent,
+        };
+        std::fs::write(&endpoint, serde_json::to_vec(&record).unwrap()).expect("endpoint");
+
+        assert!(read_bound_endpoint_record_from(&endpoint, &paths).is_none());
     }
 
     #[test]
@@ -2264,8 +2464,12 @@ mod tests {
         let eph = DaemonPaths::allocate_ephemeral_for_test_in(111, &state_home, Some(&runtime_dir))
             .expect("ephemeral");
         let canonical = canonical_in(&state_home, &runtime_dir);
-        write_endpoint_record_with_pid_and_canonical(&eph, &canonical, std::process::id())
-            .expect("skip endpoint");
+        write_endpoint_record_with_receipt_and_canonical(
+            &eph,
+            &canonical,
+            &test_pid_receipt(std::process::id()),
+        )
+        .expect("skip endpoint");
         assert!(!endpoint_file_for_state(canonical.pid_file.parent().unwrap()).exists());
     }
 
@@ -2281,10 +2485,10 @@ mod tests {
         };
         let canonical = canonical_in(&state_home, &runtime_dir);
 
-        let err = write_endpoint_record_with_pid_and_canonical(
+        let err = write_endpoint_record_with_receipt_and_canonical(
             &noncanonical,
             &canonical,
-            std::process::id(),
+            &test_pid_receipt(std::process::id()),
         )
         .expect_err("noncanonical write rejected");
         assert!(
@@ -2300,7 +2504,8 @@ mod tests {
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
         let canonical = canonical_in(&state_home, &runtime_dir);
-        write_endpoint_record_with_pid_and_canonical(&canonical, &canonical, std::process::id())
+        let receipt = test_pid_receipt(std::process::id());
+        write_endpoint_record_with_receipt_and_canonical(&canonical, &canonical, &receipt)
             .expect("endpoint record");
         let endpoint = endpoint_file_for_state(canonical.pid_file.parent().unwrap());
         assert!(endpoint.exists());
@@ -2310,7 +2515,15 @@ mod tests {
             socket: canonical.socket.clone(),
             ephemeral: false,
         };
-        remove_endpoint_record_if_owned_with_canonical(&noncanonical, &canonical);
+        let receipt = write_pid_file(
+            &noncanonical.pid_file,
+            std::process::id(),
+            &std::env::current_exe().unwrap(),
+        )
+        .expect("noncanonical pid file");
+        let mut guard =
+            ForegroundMetadataGuard::new(noncanonical.pid_file, noncanonical.socket, None, receipt);
+        guard.cleanup().expect("guard cleanup");
 
         assert!(
             endpoint.exists(),
@@ -2332,8 +2545,12 @@ mod tests {
         wait_for_socket(&socket_a);
 
         let paths_a = canonical_in(&state_home, &runtime_a);
-        write_endpoint_record_with_pid_and_canonical(&paths_a, &paths_a, std::process::id())
-            .expect("endpoint record");
+        write_endpoint_record_with_receipt_and_canonical(
+            &paths_a,
+            &paths_a,
+            &test_pid_receipt(std::process::id()),
+        )
+        .expect("endpoint record");
 
         let paths_b = canonical_in(&state_home, &runtime_b);
         assert_ne!(paths_b.socket, socket_a);
@@ -2783,174 +3000,62 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn stop_verified_daemon_sends_sigterm() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-        let signaled = std::cell::Cell::new(false);
-
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::VerifiedDaemon,
-            |_| {
-                signaled.set(true);
-                Ok(())
+    fn test_pid_receipt(pid: u32) -> DaemonPidReceipt {
+        DaemonPidReceipt {
+            pid,
+            executable: std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+            process_start: cockpit_host::daemon_lifecycle::ProcessStartIdentity {
+                primary: 0,
+                secondary: 0,
             },
-            || false,
-        )
-        .unwrap();
-
-        assert!(stopped);
-        assert!(signaled.get());
+            publication_nonce: [0; 32],
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn stop_reused_pid_cleans_metadata_without_signal() {
+    fn live_legacy_numeric_pid_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-        std::fs::write(&paths.socket, "").unwrap();
+        std::fs::write(&paths.pid_file, std::process::id().to_string()).unwrap();
 
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::NotDaemon,
-            |_| panic!("must not signal an unrelated process"),
-            || true,
-        )
-        .unwrap();
+        let error = settle_legacy_stop(&paths, std::process::id()).unwrap_err();
 
-        assert!(!stopped);
-        assert!(!paths.pid_file.exists());
-        assert!(!paths.socket.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_missing_pid_cleans_metadata_without_signal() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::Missing,
-            |_| panic!("must not signal a missing process"),
-            || true,
-        )
-        .unwrap();
-
-        assert!(!stopped);
-        assert!(!paths.pid_file.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_cleanup_does_not_remove_replaced_pid_or_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "456").unwrap();
-        std::fs::write(&paths.socket, "new socket").unwrap();
-
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::NotDaemon,
-            |_| panic!("must not signal an unrelated process"),
-            || true,
-        )
-        .unwrap();
-
-        assert!(!stopped);
-        assert_eq!(std::fs::read_to_string(&paths.pid_file).unwrap(), "456");
-        assert_eq!(
-            std::fs::read_to_string(&paths.socket).unwrap(),
-            "new socket"
+        assert!(
+            error
+                .to_string()
+                .contains("refusing unbound numeric signaling")
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_timeout_cleanup_does_not_remove_new_daemon_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "456").unwrap();
-        std::fs::write(&paths.socket, "new socket").unwrap();
-
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::VerifiedDaemon,
-            |_| Ok(()),
-            || true,
-        )
-        .unwrap();
-
-        assert!(stopped);
-        assert_eq!(std::fs::read_to_string(&paths.pid_file).unwrap(), "456");
-        assert_eq!(
-            std::fs::read_to_string(&paths.socket).unwrap(),
-            "new socket"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_timeout_preserves_matching_live_daemon_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-        std::fs::write(&paths.socket, "live socket").unwrap();
-
-        let error = stop_unix_with_timeout(
-            &paths,
-            123,
-            |_| PidIdentity::VerifiedDaemon,
-            |_| Ok(()),
-            || true,
-            Duration::ZERO,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("preserving"));
-        assert_eq!(std::fs::read_to_string(&paths.pid_file).unwrap(), "123");
-        assert_eq!(
-            std::fs::read_to_string(&paths.socket).unwrap(),
-            "live socket"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_unverified_pid_fails_closed_without_cleanup_or_signal() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-
-        let err = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::Unverified,
-            |_| panic!("must not signal an unverified process"),
-            || true,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("could not be verified"));
         assert!(paths.pid_file.exists());
     }
 
     #[cfg(unix)]
     #[test]
+    fn receipt_cleanup_rejects_replaced_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let executable = std::env::current_exe().unwrap();
+        let old = write_pid_file(&paths.pid_file, std::process::id(), &executable).unwrap();
+        cleanup_receipt_metadata(&paths, &old).unwrap();
+        let replacement = write_pid_file(&paths.pid_file, std::process::id(), &executable).unwrap();
+        std::fs::write(&paths.socket, "replacement socket").unwrap();
+
+        cleanup_receipt_metadata(&paths, &old).unwrap();
+
+        assert_eq!(
+            read_daemon_pid_record(&paths.pid_file),
+            Some(DaemonPidRecord::Receipt(replacement))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths.socket).unwrap(),
+            "replacement socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unreachable_unverified_pid_is_not_reported_stale() {
-        let status = status_for_pid_identity(PidIdentity::Unverified, || {
-            panic!("unverified live pid must not be cleaned up as stale")
-        });
+        let status = status_for_pid_identity(PidIdentity::Unverified);
 
         assert_eq!(status, DaemonStatus::UnverifiedPid);
     }
@@ -3015,25 +3120,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cmdline_identity_requires_cockpit_daemon_start() {
-        assert!(cmdline_is_cockpit_daemon(&[
+        assert!(argv_requests_daemon_start(&[
             "/usr/bin/cockpit".into(),
             "daemon".into(),
             "start".into(),
             "--foreground".into(),
         ]));
-        assert!(!cmdline_is_cockpit_daemon(&[
+        assert!(!argv_requests_daemon_start(&[
             "/usr/bin/sleep".into(),
             "daemon".into(),
             "start".into(),
         ]));
-        assert!(!cmdline_is_cockpit_daemon(&[
+        assert!(!argv_requests_daemon_start(&[
             "/usr/bin/cockpit".into(),
             "session".into(),
             "list".into(),
         ]));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn kern_procargs2_fixture(exec_path: &str, args: &[&str]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(args.len() as libc::c_int).to_ne_bytes());
@@ -3047,7 +3152,7 @@ mod tests {
         bytes
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_procargs2_daemon_start_verifies_through_shared_identity_rule() {
         let bytes = kern_procargs2_fixture(
@@ -3064,10 +3169,10 @@ mod tests {
         let args = parse_macos_procargs2(&bytes).unwrap();
 
         assert_eq!(args[0], "/usr/local/bin/cockpit");
-        assert!(cmdline_is_cockpit_daemon(&args));
+        assert!(argv_requests_daemon_start(&args));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_procargs2_rejects_truncated_or_malformed_data() {
         assert!(parse_macos_procargs2(&[1, 0]).is_err());
@@ -3090,7 +3195,7 @@ mod tests {
             &["/usr/local/bin/cockpit", "session", "list"],
         );
         let args = parse_macos_procargs2(&non_daemon).unwrap();
-        assert!(!cmdline_is_cockpit_daemon(&args));
+        assert!(!argv_requests_daemon_start(&args));
     }
 
     #[cfg(unix)]
@@ -3100,6 +3205,114 @@ mod tests {
             split_proc_cmdline(b"/bin/cockpit\0daemon\0start\0\0"),
             vec!["/bin/cockpit", "daemon", "start"]
         );
+    }
+
+    #[tokio::test]
+    async fn in_process_owner_drop_begins_drain_and_releases_context() {
+        let root = tempfile::tempdir().expect("daemon owner tempdir");
+        let paths = temp_ephemeral_paths(root.path(), "in-process-owner-drop");
+        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
+        let ctx = boot_in_process_with_db(paths.clone(), db)
+            .await
+            .expect("in-process daemon context");
+        let shutdown = ctx.shutdown_signal().clone();
+        let guard =
+            spawn_in_process_shutdown_supervisor(ctx, Vec::new()).expect("shutdown supervisor");
+        drop(guard);
+        wait_until(|| shutdown.is_draining(), Duration::from_secs(1)).await;
+        wait_until(
+            || server::in_process_context(&paths.socket).is_none(),
+            Duration::from_secs(1),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_in_process_shutdown_waiter_does_not_cancel_cleanup() {
+        let root = tempfile::tempdir().expect("daemon owner tempdir");
+        let paths = temp_ephemeral_paths(root.path(), "in-process-owner-cancel");
+        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
+        let ctx = boot_in_process_with_db(paths.clone(), db)
+            .await
+            .expect("in-process daemon context");
+        let shutdown = ctx.shutdown_signal().clone();
+        let guard =
+            spawn_in_process_shutdown_supervisor(ctx, Vec::new()).expect("shutdown supervisor");
+        let waiter = tokio::spawn(guard.shutdown());
+        wait_until(|| shutdown.is_draining(), Duration::from_secs(1)).await;
+        waiter.abort();
+        let _ = waiter.await;
+        wait_until(
+            || server::in_process_context(&paths.socket).is_none(),
+            Duration::from_secs(1),
+        )
+        .await;
+    }
+
+    #[test]
+    fn in_process_shutdown_supervisor_outlives_originating_runtime() {
+        let root = tempfile::tempdir().expect("daemon owner tempdir");
+        let paths = temp_ephemeral_paths(root.path(), "in-process-owner-runtime-drop");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("originating runtime");
+        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
+        let (ctx, guard) = runtime.block_on(async {
+            let ctx = boot_in_process_with_db(paths.clone(), db)
+                .await
+                .expect("in-process daemon context");
+            let guard = spawn_in_process_shutdown_supervisor(ctx.clone(), Vec::new())
+                .expect("shutdown supervisor");
+            (ctx, guard)
+        });
+        drop(ctx);
+        drop(runtime);
+
+        let completion_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("completion runtime");
+        completion_runtime
+            .block_on(guard.shutdown())
+            .expect("runtime-independent shutdown");
+        assert!(server::in_process_context(&paths.socket).is_none());
+    }
+
+    #[test]
+    fn supervisor_reaper_unavailable_joins_retained_handle() {
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_on_thread = completed.clone();
+        let supervisor = std::thread::spawn(move || {
+            completed_on_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        submit_supervisor_reap(
+            None,
+            SupervisorReap {
+                supervisor,
+                completed: None,
+            },
+        );
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn disconnected_supervisor_reaper_recovers_and_joins_handle() {
+        let (send, receive) = std::sync::mpsc::channel();
+        drop(receive);
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_on_thread = completed.clone();
+        let supervisor = std::thread::spawn(move || {
+            completed_on_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        submit_supervisor_reap(
+            Some(&send),
+            SupervisorReap {
+                supervisor,
+                completed: None,
+            },
+        );
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {

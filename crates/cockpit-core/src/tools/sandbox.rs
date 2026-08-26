@@ -325,11 +325,11 @@ pub(crate) fn outside_session_boundary(
 }
 
 fn path_inside_boundary(candidate: &Path, root: &Path, tmp_dir: Option<&Path>) -> bool {
-    if crate::path_containment::contained_under(root, candidate) {
+    if cockpit_host::path_containment::contained_under(root, candidate) {
         return true;
     }
     if let Some(tmp) = tmp_dir
-        && crate::path_containment::contained_under(tmp, candidate)
+        && cockpit_host::path_containment::contained_under(tmp, candidate)
     {
         return true;
     }

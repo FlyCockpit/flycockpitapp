@@ -1397,7 +1397,7 @@ impl App {
                     self.overlay = Overlay::Permissions(pane);
                 }
                 Overlay::Resources(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render_with_buttons(frame, rects.body, Some(&mut self.button_registry));
                     self.overlay = Overlay::Resources(pane);
                 }
                 Overlay::Quick(dialog) => {
@@ -3309,10 +3309,10 @@ impl App {
                 Style::default().fg(Color::White),
             )]
         };
-        if self.paste_registry.is_empty() {
+        if self.composer.paste_is_empty() {
             return plain();
         }
-        let blocks = self.paste_registry.blocks();
+        let blocks = self.composer.paste_spans().collect::<Vec<_>>();
         let chunk_end = chunk_byte_start + text.len();
         // Quick reject: no block overlaps this chunk.
         if !blocks
@@ -3471,8 +3471,8 @@ impl App {
         {
             return tokens;
         }
-        let tokens = (cockpit_core::tokens::count(&pending.text)
-            + cockpit_core::tokens::count(&pending.reasoning))
+        let tokens = (cockpit_tokenizer::count(&pending.text)
+            + cockpit_tokenizer::count(&pending.reasoning))
         .min(u32::MAX as usize) as u32;
         self.pending_token_cache.set(Some((key, tokens)));
         tokens
@@ -3493,7 +3493,7 @@ impl App {
         // Buffered `<git>` blocks (GOALS §1l) ride the next user
         // message; surface their cost before the user commits to send.
         for block in &self.pending_git_blocks {
-            tokens += cockpit_core::tokens::count(block);
+            tokens += cockpit_tokenizer::count(block);
         }
         tokens.min(u32::MAX as usize) as u32
     }
@@ -3508,7 +3508,7 @@ impl App {
         let mut tokens = self.history_estimate_tokens() as u64;
         tokens += self.pending_tokens() as u64;
         for block in &self.pending_git_blocks {
-            tokens += cockpit_core::tokens::count(block) as u64;
+            tokens += cockpit_tokenizer::count(block) as u64;
         }
         tokens
     }
@@ -3570,33 +3570,32 @@ impl App {
         let mut tokens: usize = 0;
         for entry in &self.history {
             tokens += match entry {
-                HistoryEntry::User { text, .. } => cockpit_core::tokens::count(text),
+                HistoryEntry::User { text, .. } => cockpit_tokenizer::count(text),
                 HistoryEntry::Plain { line }
                 | HistoryEntry::CommandError { line }
-                | HistoryEntry::Maintenance { line } => cockpit_core::tokens::count(line),
+                | HistoryEntry::Maintenance { line } => cockpit_tokenizer::count(line),
                 // UI/export-only acknowledgement of a settled interrupt; the
                 // model context receives the actual decision through the
                 // daemon event stream, not this rendered row.
                 HistoryEntry::InterruptDecision { .. } => 0,
-                HistoryEntry::ToolLine { summary, .. } => cockpit_core::tokens::count(summary),
+                HistoryEntry::ToolLine { summary, .. } => cockpit_tokenizer::count(summary),
                 HistoryEntry::ToolBox { calls, .. } => calls
                     .iter()
                     .map(|c| {
-                        cockpit_core::tokens::count(&c.summary)
-                            + cockpit_core::tokens::count(&c.output)
+                        cockpit_tokenizer::count(&c.summary) + cockpit_tokenizer::count(&c.output)
                     })
                     .sum(),
                 HistoryEntry::Diff { old, new, .. } => {
-                    cockpit_core::tokens::count(old) + cockpit_core::tokens::count(new)
+                    cockpit_tokenizer::count(old) + cockpit_tokenizer::count(new)
                 }
                 HistoryEntry::Agent {
                     text, reasoning, ..
-                } => cockpit_core::tokens::count(text) + cockpit_core::tokens::count(reasoning),
+                } => cockpit_tokenizer::count(text) + cockpit_tokenizer::count(reasoning),
                 // The child's report is delivered to the parent as its
                 // `task` tool result, so it enters the model's context.
                 HistoryEntry::Subagent { outcome, .. } => outcome
                     .as_ref()
-                    .map(|o| cockpit_core::tokens::count(&o.report))
+                    .map(|o| cockpit_tokenizer::count(&o.report))
                     .unwrap_or(0),
                 // Local-command output is never sent to the agent
                 // (GOALS §1k); `/git`'s agent-bound cost is accounted
@@ -5759,7 +5758,7 @@ mod render_history_spacing_tests {
     use crate::tui::theme::TRANSCRIPT_HOVER_BG;
     use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
     use cockpit_core::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
-    use cockpit_core::tokens::{count_call_count, reset_count_call_count};
+    use cockpit_tokenizer::{count_call_count, reset_count_call_count};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -9042,6 +9041,7 @@ mod render_history_spacing_tests {
 
         let saved_main = SideConversation {
             side_session_id: uuid::Uuid::new_v4(),
+            endpoint: cockpit_client::ClientEndpoint::Wire(tmp.path().join("missing-daemon.sock")),
             socket: tmp.path().join("missing-daemon.sock"),
             saved_runner: None,
             saved_history: app.history.clone(),

@@ -2,7 +2,7 @@
 //! authority.
 //!
 //! Every path here is *syscall-effective*: resolved through
-//! [`crate::path_containment::effective_path`] so a symlink cannot name one
+//! [`cockpit_host::path_containment::effective_path`] so a symlink cannot name one
 //! path and mean another. A scope that cannot be resolved fails closed.
 
 use std::path::{Path, PathBuf};
@@ -80,7 +80,7 @@ impl CanonicalScope {
     }
 
     fn canonicalize(path: &Path) -> Option<PathBuf> {
-        crate::path_containment::effective_path(path).ok()
+        cockpit_host::path_containment::effective_path(path).ok()
     }
 
     pub fn path(&self) -> &Path {

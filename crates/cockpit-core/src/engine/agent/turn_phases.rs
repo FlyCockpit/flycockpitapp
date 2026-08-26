@@ -2047,7 +2047,7 @@ pub(crate) async fn run_turn(
                 match classifier.finish(&text, &reasoning, translated) {
                     Some(complete) => {
                         let assistant = complete.assistant;
-                        let perf = assistant.response_performance;
+                        let perf = assistant.response_performance.clone();
                         let presentation = assistant.presentation_text.clone();
                         (presentation, perf, Some((complete.attempt_id, assistant)))
                     }

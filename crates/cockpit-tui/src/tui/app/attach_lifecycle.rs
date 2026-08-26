@@ -35,12 +35,11 @@ impl App {
             || true,
         );
         if should_probe && self.display_attach_backoff.can_attempt(Instant::now()) {
-            self.start_display_daemon_probe_action(|| {
-                cockpit_core::daemon::discover_blocking().status
-            });
+            self.try_attach_for_display();
         }
     }
 
+    #[cfg(test)]
     pub(super) fn start_display_daemon_probe_action<F>(&mut self, work: F)
     where
         F: FnOnce() -> cockpit_core::daemon::DaemonStatus + Send + 'static,
@@ -58,6 +57,7 @@ impl App {
         );
     }
 
+    #[cfg(test)]
     pub(super) fn apply_display_daemon_probe_result(
         &mut self,
         cwd: PathBuf,
@@ -85,39 +85,15 @@ impl App {
     /// fresh pid+nonce ephemeral daemon (`AlwaysEphemeral`); otherwise the TUI
     /// attaches to the canonical daemon, auto-promoting a persistent one if
     /// none is running.
-    pub(super) fn lifecycle_mode(&self) -> cockpit_core::daemon::client::LifecycleMode {
+    pub(super) fn lifecycle_intent(&self) -> cockpit_client::LifecycleIntent {
         if self.daemonless {
             // First attach spawns our owned pid+nonce ephemeral daemon; later
             // re-attaches (`/compact`, `/sessions` resume, `/new`) reconnect
             // to that same daemon instead of spawning a second one.
-            cockpit_core::daemon::client::LifecycleMode::AttachOwnEphemeral
+            cockpit_client::LifecycleIntent::AttachOwnEphemeral
         } else {
-            cockpit_core::daemon::client::LifecycleMode::AttachOrAutoPromote
+            cockpit_client::LifecycleIntent::AttachOrAutoPromote
         }
-    }
-
-    /// Build the ephemeral-daemon ownership guard (and arm its signal
-    /// handler) for a runner that just spawned an owned daemon. No-op when
-    /// the runner attached to a daemon we don't own or a guard already
-    /// exists. The signal handler hands control back to the TUI's own
-    /// restore path on SIGINT/SIGTERM rather than `exit`ing outright, so the
-    /// alt-screen teardown still runs.
-    pub(super) fn arm_daemon_guard(&mut self, runner: &mut AgentRunner) {
-        if !runner.owns_daemon {
-            return;
-        }
-        let Some(guard) = runner.take_owned_daemon_guard() else {
-            return;
-        };
-        if self.daemon_guard.is_some() {
-            // A reconnect to the already-owned daemon must not stop it when
-            // this runner is later dropped.
-            guard.disarm();
-            return;
-        }
-        self.daemon_signal_task =
-            cockpit_core::daemon::ephemeral_guard::spawn_signal_shutdown(Some(&guard), false);
-        self.daemon_guard = Some(guard);
     }
 
     /// Spawn (or attach to) the daemon and **latch** the result —
@@ -185,7 +161,8 @@ impl App {
         };
         let cwd = self.launch.cwd.clone();
         let no_sandbox = self.no_sandbox;
-        let mode = self.lifecycle_mode();
+        let intent = self.lifecycle_intent();
+        let lifecycle = self.lifecycle.clone();
         let worker_cwd = cwd.clone();
         let action_id = self
             .async_actions
@@ -200,11 +177,15 @@ impl App {
                                 requested_session_id,
                                 model,
                                 no_sandbox,
-                                mode,
+                                lifecycle,
+                                intent,
                             )
                             .await
                         }
-                        None => agent_runner::try_spawn(&worker_cwd, no_sandbox, mode).await,
+                        None => {
+                            agent_runner::try_spawn(&worker_cwd, no_sandbox, lifecycle, intent)
+                                .await
+                        }
                     }?;
                     Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner)))
                 },
@@ -345,7 +326,6 @@ impl App {
             self.reset_display_attach_backoff();
             // In daemonless mode this runner spawned our own ephemeral
             // daemon; arm the ownership guard so it's reaped on exit.
-            self.arm_daemon_guard(r);
             // Record the daemon-assigned session id so the startup graphic
             // shows it and `/new` re-renders with the fresh one
             // (session-id-display-and-lazy-persist).
@@ -362,12 +342,14 @@ impl App {
             self.project_id = Some(r.project_id.clone());
             self.foreground_input_target = r.foreground_target.clone();
             self.maybe_show_daemon_version_chip(&r.daemon_version, r.daemon_compatible);
+            self.startup_background.daemon_socket = Some(r.socket.clone());
+            self.startup_background.daemon_endpoint = Some(r.endpoint.clone());
             // Flush records buffered before the runner existed,
             // backfilling tag project ids now that we know the project.
             let pid = self.project_id.clone();
             for mut req in std::mem::take(&mut self.pending_usage) {
-                if let cockpit_core::daemon::proto::Request::RecordUsage {
-                    kind: cockpit_core::daemon::proto::UsageKind::Tag,
+                if let cockpit_proto::Request::RecordUsage {
+                    kind: cockpit_proto::UsageKind::Tag,
                     project_id,
                     ..
                 } = &mut req
@@ -388,7 +370,7 @@ impl App {
             // runner's own socket so it reaches an owned pid+nonce ephemeral
             // daemon (daemonless / auto-spawn), not just the canonical one —
             // reuses the just-established daemon, no new spawn, one request.
-            self.refresh_guidance_estimate_from_daemon(&r.socket);
+            self.refresh_guidance_estimate_from_daemon(r.endpoint.clone());
             if let Some(info) = live_btw_fork {
                 self.open_btw_pane_from_info(info, true);
             }
@@ -414,7 +396,7 @@ impl App {
             self.refresh_skill_commands();
             self.send_daemon_request(
                 "/capabilities",
-                cockpit_core::daemon::proto::Request::GetHostCapabilities,
+                cockpit_proto::Request::GetHostCapabilities,
                 crate::tui::app::ControlApplied::None,
             );
         }
@@ -428,7 +410,7 @@ impl App {
     pub(super) fn start_model_state_epoch(
         &mut self,
         new_session_id: Option<uuid::Uuid>,
-        state: Option<&cockpit_core::daemon::proto::ActiveModelState>,
+        state: Option<&cockpit_proto::ActiveModelState>,
     ) {
         for operation in self.pending_sealed_operations.values() {
             operation.invalidate();
@@ -543,7 +525,7 @@ impl App {
             0,
             false,
             waiting_extended,
-            cockpit_core::daemon::proto::ProviderConfigView::default(),
+            cockpit_proto::ProviderConfigView::default(),
         );
         self.apply_tui_config_from_snapshot();
         self.refresh_active_model_projection();
@@ -633,27 +615,29 @@ impl App {
     /// transient miss never blanks a correct local estimate. Touches only the
     /// indicator — never the cached system prompt — so the prompt cache is
     /// undisturbed.
-    pub(super) fn refresh_guidance_estimate_from_daemon(&mut self, socket: &Path) {
+    pub(super) fn refresh_guidance_estimate_from_daemon(
+        &mut self,
+        endpoint: cockpit_client::ClientEndpoint,
+    ) {
         let (provider, model) = match &self.launch.active_model {
             Some((p, m)) => (Some(p.clone()), Some(m.clone())),
             None => (None, None),
         };
-        let socket = socket.to_path_buf();
         let project_root = self.launch.cwd.to_string_lossy().into_owned();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("guidance.estimate"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("guidance.estimate")),
             move || {
                 let resp = agent_runner::daemon_request_at_blocking(
-                    &socket,
-                    cockpit_core::daemon::proto::Request::GuidanceEstimate {
+                    &endpoint,
+                    cockpit_proto::Request::GuidanceEstimate {
                         project_root,
                         provider,
                         model,
                     },
                 )?;
                 match resp {
-                    cockpit_core::daemon::proto::Response::GuidanceEstimate {
+                    cockpit_proto::Response::GuidanceEstimate {
                         file,
                         tokens,
                         system_tokens,
@@ -678,18 +662,18 @@ impl App {
     /// runner exists.
     pub(super) fn record_usage(
         &mut self,
-        kind: cockpit_core::daemon::proto::UsageKind,
+        kind: cockpit_proto::UsageKind,
         key: String,
         project_id: Option<String>,
     ) {
-        use cockpit_core::daemon::proto::UsageKind;
+        use cockpit_proto::UsageKind;
         let map = match kind {
             UsageKind::Model => &mut self.usage_models,
             UsageKind::Slash => &mut self.usage_slash,
             UsageKind::Tag => &mut self.usage_tags,
         };
         *map.entry(key.clone()).or_insert(0) += 1;
-        let req = cockpit_core::daemon::proto::Request::RecordUsage {
+        let req = cockpit_proto::Request::RecordUsage {
             kind,
             key,
             project_id,

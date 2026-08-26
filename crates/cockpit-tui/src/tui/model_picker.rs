@@ -29,9 +29,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, StatefulWidget, Wrap,
+};
 
-use crate::tui::pane::{Pane, ScrollList};
+use crate::tui::pane::Pane;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_config::dirs::{COCKPIT_CONFIG_ENV, config_file_paths_for_load};
@@ -53,8 +56,53 @@ pub const DIALOG_HEIGHT: u16 = 18;
 /// line. Drives the scroll window (same scrolloff=1 behavior as the
 /// composer `@`-popup).
 const MODEL_WINDOW: usize = 11;
-const PICK_FIXED_CHROME: usize = 2;
-const PICK_ERROR_LINES: usize = 2;
+
+fn list_state(selected: usize, offset: usize) -> ListState {
+    let mut state = ListState::default().with_selected(Some(selected));
+    *state.offset_mut() = offset;
+    state
+}
+
+fn list_cursor(state: &ListState) -> usize {
+    state.selected().unwrap_or(0)
+}
+
+fn move_list_selection(state: &mut ListState, delta: isize, total: usize) {
+    if total == 0 {
+        state.select(None);
+        *state.offset_mut() = 0;
+        return;
+    }
+    let current = list_cursor(state);
+    let selected = if delta < 0 {
+        crate::tui::nav::wrap_prev(current, total)
+    } else {
+        crate::tui::nav::wrap_next(current, total)
+    };
+    state.select(Some(selected));
+    *state.offset_mut() =
+        crate::tui::nav::windowed_scroll(selected, state.offset(), total, MODEL_WINDOW);
+}
+
+#[cfg(test)]
+trait PickerListStateTestExt {
+    fn cursor(&self) -> usize;
+    fn scroll(&self) -> usize;
+    fn set_cursor(&mut self, cursor: usize);
+}
+
+#[cfg(test)]
+impl PickerListStateTestExt for ListState {
+    fn cursor(&self) -> usize {
+        list_cursor(self)
+    }
+    fn scroll(&self) -> usize {
+        self.offset()
+    }
+    fn set_cursor(&mut self, cursor: usize) {
+        self.select(Some(cursor));
+    }
+}
 
 pub struct ModelPickerDialog {
     cfg: ProvidersConfig,
@@ -64,8 +112,10 @@ pub struct ModelPickerDialog {
     add_model_provider: Option<String>,
     drift: Option<ModelPickerDrift>,
     filter: TextField,
-    /// Cursor and top visible index of the scroll window over the filtered list.
-    pick: ScrollList,
+    /// Durable ratatui selection/viewport state for the filtered model rows.
+    pick: ListState,
+    /// Domain identity survives filter/refresh/reorder independently of row indices.
+    selected_model: Option<(String, String)>,
     step: Step,
     error: Option<String>,
     done: bool,
@@ -176,7 +226,7 @@ pub struct ModelChoice {
 /// Build ordered model choices from a daemon inventory-bundle model list.
 /// Does not read credentials or the local provider config tree.
 pub fn ordered_model_choices_from_inventory(
-    models: &[cockpit_core::daemon::proto::ModelSummary],
+    models: &[cockpit_proto::ModelSummary],
     global_mode: cockpit_config::extended::LlmMode,
     counts: &HashMap<String, u64>,
 ) -> Vec<ModelChoice> {
@@ -291,12 +341,13 @@ impl ModelPickerDialog {
         Ok(Self {
             cfg,
             entries,
-            active_model,
+            active_model: active_model.clone(),
             scope_provider: None,
             add_model_provider: None,
             drift: None,
             filter: TextField::default(),
-            pick: ScrollList::at(cursor, scroll),
+            pick: list_state(cursor, scroll),
+            selected_model: active_model.clone(),
             step: Step::Pick,
             error: None,
             done: false,
@@ -349,7 +400,8 @@ impl ModelPickerDialog {
         let requested = Some((provider.to_string(), model.to_string()));
         let (cursor, scroll) =
             initial_pick_position(&self.entries, requested.as_ref(), "", MODEL_WINDOW);
-        self.pick = ScrollList::at(cursor, scroll);
+        self.pick = list_state(cursor, scroll);
+        self.selected_model = Some((provider.to_string(), model.to_string()));
     }
 
     /// Restore the complete rejected request as the picker draft so retrying keeps
@@ -421,7 +473,8 @@ impl ModelPickerDialog {
         };
         match hit {
             RowHit::Pick { cursor } => {
-                self.pick.set_cursor(cursor);
+                self.pick.select(Some(cursor));
+                self.remember_pick_identity();
                 self.handle_pick_key(KeyEvent::from(KeyCode::Enter))
             }
             RowHit::Thinking { index } => {
@@ -461,31 +514,31 @@ impl ModelPickerDialog {
         // the filter, since this step is typing-driven.
         match key.code {
             KeyCode::Up => {
-                self.pick.move_by(-1, total);
-                self.pick.clamp_windowed(total, MODEL_WINDOW);
+                move_list_selection(&mut self.pick, -1, total);
+                self.remember_pick_identity();
             }
             KeyCode::Char('p')
                 if key
                     .modifiers
                     .contains(crossterm::event::KeyModifiers::CONTROL) =>
             {
-                self.pick.move_by(-1, total);
-                self.pick.clamp_windowed(total, MODEL_WINDOW);
+                move_list_selection(&mut self.pick, -1, total);
+                self.remember_pick_identity();
             }
             KeyCode::Down => {
-                self.pick.move_by(1, total);
-                self.pick.clamp_windowed(total, MODEL_WINDOW);
+                move_list_selection(&mut self.pick, 1, total);
+                self.remember_pick_identity();
             }
             KeyCode::Char('n')
                 if key
                     .modifiers
                     .contains(crossterm::event::KeyModifiers::CONTROL) =>
             {
-                self.pick.move_by(1, total);
-                self.pick.clamp_windowed(total, MODEL_WINDOW);
+                move_list_selection(&mut self.pick, 1, total);
+                self.remember_pick_identity();
             }
             KeyCode::Enter => {
-                if self.pick.cursor() == 0
+                if list_cursor(&self.pick) == 0
                     && let Some(active) = self.drift_switch_model().cloned()
                 {
                     return self.commit_active_model(
@@ -498,7 +551,7 @@ impl ModelPickerDialog {
                             .contains(crossterm::event::KeyModifiers::CONTROL),
                     );
                 }
-                let entry_cursor = self.pick.cursor().saturating_sub(drift_offset);
+                let entry_cursor = list_cursor(&self.pick).saturating_sub(drift_offset);
                 if let Some(&i) = visible.get(entry_cursor) {
                     let entry = self.entries[i].clone();
                     if let Some(capability) = entry
@@ -560,16 +613,27 @@ impl ModelPickerDialog {
 
     fn retarget_pick_position(&mut self) {
         if self.drift_switch_model().is_some() {
-            self.pick = ScrollList::at(0, 0);
+            self.pick = list_state(0, 0);
             return;
         }
-        let (cursor, scroll) = initial_pick_position(
-            &self.entries,
-            self.active_model.as_ref(),
-            self.filter.text(),
-            MODEL_WINDOW,
-        );
-        self.pick = ScrollList::at(cursor, scroll);
+        let preferred = self.selected_model.as_ref().or(self.active_model.as_ref());
+        let (cursor, scroll) =
+            initial_pick_position(&self.entries, preferred, self.filter.text(), MODEL_WINDOW);
+        self.pick = list_state(cursor, scroll);
+    }
+
+    fn remember_pick_identity(&mut self) {
+        if self.drift_switch_model().is_some() && list_cursor(&self.pick) == 0 {
+            self.selected_model = None;
+            return;
+        }
+        let drift_offset = usize::from(self.drift_switch_model().is_some());
+        let entry_cursor = list_cursor(&self.pick).saturating_sub(drift_offset);
+        let visible = self.filtered_indices();
+        self.selected_model = visible.get(entry_cursor).map(|index| {
+            let entry = &self.entries[*index];
+            (entry.provider_id.clone(), entry.model_id.clone())
+        });
     }
 
     fn handle_thinking_key(&mut self, key: KeyEvent) -> bool {
@@ -730,51 +794,43 @@ impl ModelPickerDialog {
     fn render_pick(&mut self, frame: &mut Frame, area: Rect) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Indexed(178));
-        let mut lines: Vec<Line<'static>> = Vec::new();
         let (filter_before, filter_after) = self.filter.split_at_cursor();
-        lines.push(Line::from(vec![
-            Span::styled("filter: ".to_string(), muted),
-            Span::styled(filter_before.to_string(), Style::default().fg(Color::White)),
-            Span::styled(filter_after.to_string(), Style::default().fg(Color::White)),
-        ]));
-        lines.push(Line::default());
+        let error_height = u16::from(self.error.is_some()) * 2;
+        let regions = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(error_height),
+        ])
+        .split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("filter: ", muted),
+                Span::styled(filter_before.to_string(), Style::default().fg(Color::White)),
+                Span::styled(filter_after.to_string(), Style::default().fg(Color::White)),
+            ])),
+            regions[0],
+        );
+
         let drift_offset = usize::from(self.drift_switch_model().is_some());
+        let mut items: Vec<ListItem<'static>> = Vec::new();
+        let mut item_heights: Vec<u16> = Vec::new();
         if let Some(drift) = &self.drift {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "This session is running {}, but your config's active model is {}.",
-                    drift.session_label, drift.config_label
-                ),
-                Style::default().fg(Color::Indexed(178)),
-            )));
             if let Some(active) = &drift.config_model {
-                let highlighted = self.pick.cursor() == 0;
-                let marker = if highlighted { "▸ " } else { "  " };
-                let style = if highlighted {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                lines.push(Line::from(vec![
-                    Span::raw(marker.to_string()),
-                    Span::styled(
+                items.push(ListItem::new(vec![
+                    Line::from(Span::styled(
                         format!(
-                            "Switch to config model: {}/{}",
-                            active.provider, active.model
+                            "This session is running {}, but your config's active model is {}.",
+                            drift.session_label, drift.config_label
                         ),
-                        style,
-                    ),
+                        Style::default().fg(Color::Indexed(178)),
+                    )),
+                    Line::from(format!(
+                        "Switch to config model: {}/{}",
+                        active.provider, active.model
+                    )),
                 ]));
-                let row = area.y + lines.len() as u16 - 1;
-                if row < area.y + area.height
-                    && let Some(slot) = self.row_hits.get_mut(row as usize)
-                {
-                    *slot = Some(RowHit::Pick { cursor: 0 });
-                }
+                item_heights.push(2);
             }
-            lines.push(Line::default());
         }
 
         let visible = self.filtered_indices();
@@ -792,59 +848,36 @@ impl ModelPickerDialog {
             } else {
                 "(no matches — try a different filter)".to_string()
             };
-            lines.push(Line::from(Span::styled(body, muted)));
+            items.push(ListItem::new(Line::from(Span::styled(body, muted))));
+            item_heights.push(1);
+            self.pick.select(None);
         } else {
             let mut seen_fav = false;
             let mut seen_other = false;
-            let both_sections = visible.iter().any(|&idx| self.entries[idx].is_favorite)
-                && visible.iter().any(|&idx| !self.entries[idx].is_favorite);
-            let banner_rows = lines.len().saturating_sub(2);
-            let window = pick_window(
-                area.height.saturating_sub(banner_rows as u16),
-                self.error.is_some(),
-                both_sections,
-            );
-            // Scroll window: same scrolloff=1 behavior as the @-popup.
-            let offset = crate::tui::nav::windowed_scroll(
-                self.pick.cursor(),
-                self.pick.scroll(),
-                visible.len() + drift_offset,
-                window,
-            );
-            let entry_offset = offset.saturating_sub(drift_offset);
-            for (i, &idx) in visible.iter().enumerate().skip(entry_offset).take(window) {
+            for &idx in &visible {
                 let e = &self.entries[idx];
+                let mut item_lines = Vec::new();
                 if e.is_favorite && !seen_fav {
-                    lines.push(Line::from(Span::styled(
+                    item_lines.push(Line::from(Span::styled(
                         "favorites".to_string(),
                         muted.add_modifier(Modifier::ITALIC),
                     )));
                     seen_fav = true;
                 }
                 if !e.is_favorite && !seen_other {
-                    lines.push(Line::from(Span::styled(
+                    item_lines.push(Line::from(Span::styled(
                         "all models".to_string(),
                         muted.add_modifier(Modifier::ITALIC),
                     )));
                     seen_other = true;
                 }
-                let cursor = i + drift_offset;
-                let highlighted = cursor == self.pick.cursor();
                 let is_active_model = self.is_active_entry(e);
-                let marker = if highlighted { "▸ " } else { "  " };
-                let label_style = if highlighted {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else if e.is_favorite {
+                let label_style = if e.is_favorite {
                     yellow
                 } else {
                     Style::default().fg(Color::White)
                 };
-                let mut spans = vec![
-                    Span::raw(marker.to_string()),
-                    Span::styled(e.label(), label_style),
-                ];
+                let mut spans = vec![Span::styled(e.label(), label_style)];
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     match e.trust {
@@ -887,17 +920,65 @@ impl ModelPickerDialog {
                         Style::default().fg(Color::Red),
                     ));
                 }
-                lines.push(Line::from(spans));
-                let row = area.y + lines.len() as u16 - 1;
-                if row < area.y + area.height
-                    && let Some(slot) = self.row_hits.get_mut(row as usize)
-                {
-                    *slot = Some(RowHit::Pick { cursor });
-                }
+                item_lines.push(Line::from(spans));
+                item_heights.push(item_lines.len() as u16);
+                items.push(ListItem::new(item_lines));
             }
         }
-        push_error_line(&mut lines, self.error.as_deref());
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let total = visible.len() + drift_offset;
+        if total > 0 {
+            let selected = list_cursor(&self.pick).min(total - 1);
+            self.pick.select(Some(selected));
+        }
+        let list_area = regions[1];
+        let list = List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .scroll_padding(1);
+        StatefulWidget::render(list, list_area, frame.buffer_mut(), &mut self.pick);
+
+        let offset = self.pick.offset().min(item_heights.len());
+        let row_offset: usize = item_heights[..offset]
+            .iter()
+            .map(|height| *height as usize)
+            .sum();
+        let total_rows: usize = item_heights.iter().map(|height| *height as usize).sum();
+        if total > 0 {
+            let mut y = list_area.y;
+            for (item_index, height) in item_heights.iter().copied().enumerate().skip(offset) {
+                if y >= list_area.bottom() {
+                    break;
+                }
+                let selectable_row = y.saturating_add(height.saturating_sub(1));
+                if selectable_row < list_area.bottom()
+                    && let Some(slot) = self.row_hits.get_mut(selectable_row as usize)
+                {
+                    *slot = Some(RowHit::Pick { cursor: item_index });
+                }
+                y = y.saturating_add(height);
+            }
+        }
+        if total_rows > list_area.height as usize && list_area.width > 1 {
+            let mut scrollbar = ScrollbarState::new(total_rows)
+                .position(row_offset)
+                .viewport_content_length(list_area.height as usize);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                list_area,
+                &mut scrollbar,
+            );
+        }
+        if let Some(error) = self.error.as_deref() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(error.to_string(), Color::Red)))
+                    .wrap(Wrap { trim: false }),
+                regions[2],
+            );
+        }
         if area.height > 0 && area.width > 0 {
             let col = "filter: ".width() + filter_before.width();
             let col = col.min(area.width.saturating_sub(1) as usize) as u16;
@@ -1084,15 +1165,6 @@ impl ModelPickerDialog {
             })
             .unwrap_or(0)
     }
-}
-
-fn pick_window(body_height: u16, has_error: bool, both_sections: bool) -> usize {
-    let header_lines = if both_sections { 2 } else { 1 };
-    let error_lines = if has_error { PICK_ERROR_LINES } else { 0 };
-    let chrome = PICK_FIXED_CHROME + header_lines + error_lines;
-    usize::from(body_height)
-        .saturating_sub(chrome)
-        .clamp(1, MODEL_WINDOW)
 }
 
 impl Pane for ModelPickerDialog {
@@ -1327,7 +1399,8 @@ mod tests {
             add_model_provider: None,
             drift: None,
             filter: TextField::default(),
-            pick: ScrollList::new(),
+            pick: ListState::default(),
+            selected_model: None,
             step: Step::Pick,
             error: None,
             done: false,
@@ -1524,7 +1597,8 @@ mod tests {
             add_model_provider: None,
             drift: None,
             filter: TextField::default(),
-            pick: ScrollList::new(),
+            pick: ListState::default(),
+            selected_model: None,
             step: Step::Pick,
             error: None,
             done: false,
@@ -1542,7 +1616,8 @@ mod tests {
             add_model_provider: None,
             drift: None,
             filter: TextField::default(),
-            pick: ScrollList::new(),
+            pick: ListState::default(),
+            selected_model: None,
             step: Step::Pick,
             error: None,
             done: false,
@@ -1665,9 +1740,7 @@ mod tests {
         let failures = [(
             ("p".to_string(), "claude".to_string()),
             crate::tui::auth_failure::AuthFailureRecord {
-                kind: cockpit_core::daemon::proto::AuthFailureKind::CredentialsRejected {
-                    status: 403,
-                },
+                kind: cockpit_proto::AuthFailureKind::CredentialsRejected { status: 403 },
                 failed_at_epoch_secs: 10_000,
             },
         )]
@@ -1700,29 +1773,6 @@ mod tests {
         let rendered = rendered_text(&mut d, 60, 12);
 
         assert!(rendered.contains("filter: 中 a"), "{rendered}");
-    }
-
-    #[test]
-    fn pick_window_accounts_for_body_chrome() {
-        assert_eq!(pick_window(40, false, true), MODEL_WINDOW);
-        assert_eq!(
-            pick_window((MODEL_WINDOW + PICK_FIXED_CHROME + 2) as u16, false, true),
-            MODEL_WINDOW
-        );
-        assert_eq!(
-            pick_window(
-                (MODEL_WINDOW + PICK_FIXED_CHROME + 2).saturating_sub(1) as u16,
-                false,
-                true
-            ),
-            MODEL_WINDOW - 1
-        );
-        assert_eq!(pick_window(15, true, true), MODEL_WINDOW - PICK_ERROR_LINES);
-        assert_eq!(pick_window(3, true, true), 1);
-        assert_eq!(
-            pick_window(10, false, false),
-            pick_window(10, false, true) + 1
-        );
     }
 
     #[test]
@@ -1768,6 +1818,37 @@ mod tests {
         // Down from the last item wraps to the first.
         d.handle_key(press(KeyCode::Down));
         assert_eq!(d.pick.cursor(), 0);
+    }
+
+    #[test]
+    fn model_identity_survives_filter_and_reorder() {
+        let mut d = dialog_with_active(vec![entry("alpha"), entry("beta")], "p", "beta");
+        d.filter.set("alpha");
+        d.retarget_pick_position();
+        assert_eq!(d.pick.cursor(), 0);
+
+        d.entries.reverse();
+        d.filter.set("");
+        d.retarget_pick_position();
+
+        let visible = d.filtered_indices();
+        assert_eq!(d.entries[visible[d.pick.cursor()]].model_id, "beta");
+    }
+
+    #[test]
+    fn list_backend_matrix_keeps_unicode_selection_and_hits_aligned() {
+        for (width, height) in [(24, 8), (60, 12), (120, 20)] {
+            let mut unicode = entry("模型-e\u{301}");
+            unicode.display_name = Some("wide 中 combining e\u{301}".to_string());
+            let mut dialog = dialog_with(vec![unicode, entry("second")]);
+            dialog.error = (width == 24).then(|| "loading failed".to_string());
+            let rendered = rendered_text(&mut dialog, width, height);
+            assert!(rendered.contains("模型"), "{width}x{height}: {rendered}");
+            assert!(dialog.row_hits.iter().any(Option::is_some));
+        }
+
+        let mut empty = empty_dialog();
+        assert!(rendered_text(&mut empty, 24, 8).contains("no models"));
     }
 
     #[test]
@@ -2231,12 +2312,13 @@ mod tests {
         ModelPickerDialog {
             cfg: ProvidersConfig::default(),
             entries,
-            active_model,
+            active_model: active_model.clone(),
             scope_provider: None,
             add_model_provider: None,
             drift: None,
             filter: TextField::default(),
-            pick: ScrollList::at(cursor, scroll),
+            pick: list_state(cursor, scroll),
+            selected_model: active_model.clone(),
             step: Step::Pick,
             error: None,
             done: false,

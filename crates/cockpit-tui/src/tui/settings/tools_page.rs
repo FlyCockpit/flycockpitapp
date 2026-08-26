@@ -10,10 +10,10 @@ use ratatui::text::{Line, Span};
 use crate::tui::settings::secret_display::{MASKED_VALUE, mask_value};
 use crate::tui::textfield::TextField;
 use cockpit_config::extended::{ToolCommandTemplate, WebConfig, WebProvider as ConfigWebProvider};
-use cockpit_core::daemon::proto::{Request, SecretInventoryKind};
 use cockpit_core::engine::builtin::{builtin_tool_inventory, is_reserved_custom_tool_name};
 use cockpit_core::mcp::cache;
 use cockpit_core::mcp::protocol::{ToolDescriptor, sanitize_tool_descriptor};
+use cockpit_proto::{Request, SecretInventoryKind};
 
 use super::mcp_page::{ListState as McpListState, McpPage};
 use super::reset::{ResetButton, ResetOutcome};

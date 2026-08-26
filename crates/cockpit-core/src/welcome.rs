@@ -10,7 +10,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::banner::render_unconditional;
-use crate::git::{self, RepoStatus, repo_counts};
+use crate::git::{self, repo_counts};
+pub use cockpit_proto::{LaunchBundle, LaunchInfo};
 
 pub const APP_NAME: &str = "FlyCockpit";
 pub const INPUT_PREFIX: &str = "❯ ";
@@ -26,64 +27,6 @@ const BADGE_LEFT_EDGE: &str = "\x1b[38;5;220m▐\x1b[0m";
 /// Left half-block (▌) in yellow-220 foreground — right edge of the
 /// pill, same fade behavior as `BADGE_LEFT_EDGE`.
 const BADGE_RIGHT_EDGE: &str = "\x1b[38;5;220m▌\x1b[0m";
-
-#[derive(Debug, Clone)]
-pub struct LaunchBundle {
-    pub launch: LaunchInfo,
-    pub providers: crate::config::providers::ProvidersConfig,
-    pub extended: crate::config::extended::ExtendedConfig,
-}
-
-#[derive(Debug, Clone)]
-pub struct LaunchInfo {
-    pub version: &'static str,
-    /// Current session id, used for internal routing (e.g. `/copy-id`). Not
-    /// shown in the banner — the user-facing short id is displayed instead
-    /// (see `session_short_id`). `None` at `load` time; the daemon assigns it
-    /// when the TUI attaches, after which the TUI sets it.
-    pub session_id: Option<uuid::Uuid>,
-    /// Current session's 6-char Crockford base32 short id, shown in the TUI
-    /// startup graphic right after the version (session-id-short-display).
-    /// `None` at `load` time — the daemon assigns it when the TUI attaches,
-    /// after which the TUI sets it and re-renders the banner. TUI-only: the
-    /// headless `print` / `header_lines` splash never shows it.
-    pub session_short_id: Option<String>,
-    pub provider_line: String,
-    /// Currently selected (provider_id, model_id). None when nothing
-    /// has been picked yet.
-    pub active_model: Option<(String, String)>,
-    /// True when the session row and config `active_model` do not match.
-    pub active_model_diverged: bool,
-    /// True when the active model has `favorite: true` in config.
-    pub active_model_is_favorite: bool,
-    /// True when the active provider/model resolves to `trust: "trusted"`.
-    pub active_model_is_trusted: bool,
-    /// Max context window of the active model, in tokens, when the
-    /// config carries it. Drives the `(max Nk)` part of the chrome's
-    /// context indicator.
-    pub active_model_max_context: Option<u32>,
-    /// True when the active model effectively supports image input via
-    /// config (vision-capable). Drives the composer image-paste send-time
-    /// decision: bytes vs. text note. Recomputed on every
-    /// `reload_launch_info` so a `/model` switch round-trips images
-    /// without a re-paste (composer-paste-handling).
-    pub active_model_supports_images: bool,
-    pub cwd: PathBuf,
-    pub cwd_display: String,
-    pub repo_status: Option<RepoStatus>,
-    pub agent_name: String,
-    /// User's configured display name from `config.json`.
-    /// When `Some`, the splash renders `Welcome, {name}` between the
-    /// title and provider lines.
-    pub user_name: Option<String>,
-    /// Whether the pixel-banner splash (GOALS §1g) is enabled. Read
-    /// from `tui.banner.enabled` in `config.json`. Even when
-    /// `true`, the banner suppresses itself on `NO_COLOR`, non-TTY
-    /// stdout, or narrow terminals. A truthy `COCKPIT_ROOSTER`
-    /// (`true`/`1`/`yes`, case-insensitive) does not suppress — it
-    /// renders the rooster art instead of the P-51.
-    pub banner_enabled: bool,
-}
 
 /// Build the launch splash/chrome info for `project`.
 ///
@@ -193,7 +136,7 @@ fn build_launch_info(
     let agent_name = extended.default_primary_agent.agent_name().to_string();
 
     LaunchInfo {
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         session_id: None,
         session_short_id: None,
         provider_line,

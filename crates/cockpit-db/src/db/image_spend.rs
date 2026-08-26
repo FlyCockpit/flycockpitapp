@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use super::Db;
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 use super::external_journal::{ExternalJournalDigest, ExternalJournalToken};
 use super::external_journal::{
     ExternalJournalRecord, ExternalJournalState, ExternalPrepareOutcome, ExternalTransitionOutcome,
@@ -198,7 +198,7 @@ pub enum ImageSpendDispatchEvidence {
     SubmissionUnknown,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 mod tests {
     use super::*;
 
@@ -1544,7 +1544,7 @@ impl Db {
     /// Resolve a caller-derived calendar/rolling membership to a durable,
     /// monotonic sequence. A changed wall-clock label can only advance; it can
     /// never select an older sequence after clock rollback.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     pub async fn resolve_image_spend_epoch(
         &self,
         project_key: String,

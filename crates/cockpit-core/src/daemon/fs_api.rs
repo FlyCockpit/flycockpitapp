@@ -13,13 +13,15 @@ use uuid::Uuid;
 
 use crate::daemon::principal::ClientPrincipal;
 use crate::daemon::proto::{
-    ErrorCode, ErrorPayload, FsEntry, FsEntryKind, FsReadKind, GitStatusEntry, Response,
+    ErrorCode, ErrorPayload, FsEntry, FsEntryKind, FsReadKind, GitReadSource,
+    GitReviewSourceResult, GitStatusEntry, Response,
 };
 use crate::daemon::server::DaemonContext;
 
 const FS_LIST_ENTRY_CAP: usize = 1_000;
 const FS_TEXT_READ_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
 const FS_BINARY_READ_BYTE_CAP: usize = 256 * 1024;
+const GIT_REVIEW_PR_REFERENCE_BYTE_CAP: usize = 256;
 const REMOTE_FILE_AGENT: &str = "remote-project-files";
 const SETTINGS_CAPABILITY_TTL: Duration = Duration::from_secs(30 * 60);
 const SETTINGS_CAPABILITY_GLOBAL_CAP: usize = 256;
@@ -926,8 +928,8 @@ pub async fn apply_extended_config_patch(
                 None
             };
             drop(_publication_guard);
-            if let Some(published) = published_generation {
-                if published != config_generation {
+            if let Some(published) = published_generation
+                && published != config_generation {
                     if let Response::ExtendedConfigSaved { config_generation, .. } = &mut terminal_response {
                         *config_generation = published;
                     }
@@ -946,7 +948,6 @@ pub async fn apply_extended_config_patch(
                         Ok(())
                     })).map_err(internal)?;
                 }
-            }
             Ok(terminal_response)
         }),
     )
@@ -1005,6 +1006,7 @@ async fn trusted_settings_root(
 /// occurred and permit a fresh snapshot/retry. Divergence remains pending.
 pub(super) async fn recover_extended_config_patch_journals(
     ctx: &crate::daemon::server::DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
 ) -> Result<(), ErrorPayload> {
     type Row = (String, String, Vec<u8>, i64, String, String, String, String);
     let rows: Vec<Row> = ctx
@@ -1034,13 +1036,18 @@ pub(super) async fn recover_extended_config_patch_journals(
         .await
         .map_err(internal)?;
     for (owner, operation, request_hash, fence, target, consumed, intended, response_json) in rows {
-        let observed = tokio::task::spawn_blocking(move || {
-            let path = std::path::PathBuf::from(target);
-            let (bytes, _) = read_optional_config(&path)?;
-            Ok::<_, ErrorPayload>(content_hash(&bytes))
+        let path = std::path::PathBuf::from(target);
+        let observed_path = path.clone();
+        let observed = publication.with_target(&path, move |_| {
+            let (bytes, _) = read_optional_config(&observed_path)
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            Ok(content_hash(&bytes))
         })
         .await
-        .map_err(|error| internal(error))??;
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: format!("bounded typed-settings recovery could not acquire publication authority: {error:#}"),
+        })?;
         let terminal = if observed == intended {
             let mut response: Response = serde_json::from_str(&response_json).map_err(internal)?;
             let generation = if intended == consumed {
@@ -1772,6 +1779,142 @@ pub(crate) fn git_diff_file_blocking(
         diff: outcome.stdout[..cap].to_string(),
         truncated: outcome.stdout.len() > cap,
     })
+}
+
+pub async fn git_diff(
+    project_root: String,
+    source: GitReadSource,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "git_diff",
+        tokio::task::spawn_blocking(move || git_diff_blocking(&project_root, source)),
+    )
+    .await
+}
+
+pub(crate) fn git_diff_blocking(
+    project_root: &str,
+    source: GitReadSource,
+) -> Result<Response, ErrorPayload> {
+    let root = canonical_project_root(project_root)?;
+    let diff = match &source {
+        GitReadSource::Worktree => crate::git::diff_worktree(&root),
+        GitReadSource::Staged => crate::git::diff_staged(&root),
+        _ => return Err(bad_request("unsupported source for git_diff")),
+    }
+    .map_err(internal)?;
+    let cap = crate::text::floor_char_boundary(&diff, FS_TEXT_READ_BYTE_CAP.min(diff.len()));
+    Ok(Response::GitDiff {
+        source,
+        diff: diff[..cap].to_string(),
+        truncated: diff.len() > cap,
+    })
+}
+
+pub async fn git_review_sources(
+    project_root: String,
+    sources: Vec<GitReadSource>,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "git_review_sources",
+        tokio::task::spawn_blocking(move || git_review_sources_blocking(&project_root, sources)),
+    )
+    .await
+}
+
+pub(crate) fn git_review_sources_blocking(
+    project_root: &str,
+    sources: Vec<GitReadSource>,
+) -> Result<Response, ErrorPayload> {
+    const MAX_REVIEW_SOURCES: usize = 4;
+
+    if sources.is_empty() || sources.len() > MAX_REVIEW_SOURCES {
+        return Err(bad_request(
+            "git review source count must be between 1 and 4",
+        ));
+    }
+    let root = canonical_project_root(project_root)?;
+    let mut results = Vec::with_capacity(sources.len());
+    for source in sources {
+        let projection = match &source {
+            GitReadSource::Worktree => crate::git::review_source_uncommitted(&root),
+            GitReadSource::Unstaged => crate::git::review_source_unstaged(&root),
+            GitReadSource::Unpushed => crate::git::review_source_unpushed(&root),
+            GitReadSource::PullRequest(pr) if valid_pr_reference(pr) => {
+                crate::git::review_source_pr(&root, pr)
+            }
+            GitReadSource::PullRequest(_) => Err(anyhow::anyhow!(
+                "PR source requires a non-empty, single-line reference of at most 256 bytes"
+            )),
+            GitReadSource::Staged => Err(anyhow::anyhow!(
+                "staged is a diff-pane source, not a multireview source"
+            )),
+        };
+        results.push(match projection {
+            Ok(projection) => GitReviewSourceResult {
+                source,
+                label: projection.label,
+                command: Some(projection.command),
+                has_changes: !projection.diff.trim().is_empty(),
+                error: None,
+            },
+            Err(error) => GitReviewSourceResult {
+                label: review_source_label(&source),
+                source,
+                command: None,
+                has_changes: false,
+                error: Some(format!("{error:#}")),
+            },
+        });
+    }
+    Ok(Response::GitReviewSources { sources: results })
+}
+
+fn review_source_label(source: &GitReadSource) -> String {
+    match source {
+        GitReadSource::Worktree => "Uncommitted changes".into(),
+        GitReadSource::Staged => "Staged changes".into(),
+        GitReadSource::Unstaged => "Unstaged changes".into(),
+        GitReadSource::Unpushed => "Unpushed changes".into(),
+        GitReadSource::PullRequest(pr) if valid_pr_reference(pr) => {
+            format!("PR {}", pr.trim())
+        }
+        GitReadSource::PullRequest(_) => "PR".into(),
+    }
+}
+
+fn valid_pr_reference(pr: &str) -> bool {
+    !pr.trim().is_empty()
+        && pr.len() <= GIT_REVIEW_PR_REFERENCE_BYTE_CAP
+        && pr.chars().all(|ch| !ch.is_control() && ch != '`')
+}
+
+pub async fn git_repo_status(project_root: String) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "git_repo_status",
+        tokio::task::spawn_blocking(move || git_repo_status_blocking(&project_root)),
+    )
+    .await
+}
+
+pub(crate) fn git_repo_status_blocking(project_root: &str) -> Result<Response, ErrorPayload> {
+    let root = canonical_project_root(project_root)?;
+    let status = crate::git::repo_status(&root).map_err(internal)?;
+    Ok(Response::GitRepoStatus { status })
+}
+
+pub async fn find_worktree_root(path: String) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "find_worktree_root",
+        tokio::task::spawn_blocking(move || find_worktree_root_blocking(&path)),
+    )
+    .await
+}
+
+pub(crate) fn find_worktree_root_blocking(path: &str) -> Result<Response, ErrorPayload> {
+    let root = crate::git::find_worktree_root(std::path::Path::new(path))
+        .map(|root| root.display().to_string());
+    Ok(Response::WorktreeRoot { root })
 }
 
 async fn join_fs_handler(

@@ -661,14 +661,12 @@ fn agent_with_perf_entry(performance_expanded: bool) -> HistoryEntry {
         reasoning_offset: 0,
         think_duration: None,
         seq: Some(1),
-        performance: Some(
-            cockpit_core::engine::response_performance::ResponsePerformance {
-                ttft_ms: 3000,
-                generation_ms: 500,
-                displayed_tokens: 27,
-                encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
-            },
-        ),
+        performance: Some(cockpit_client::presentation::ResponsePerformance {
+            ttft_ms: 3000,
+            generation_ms: 500,
+            displayed_tokens: 27,
+            encoding: "cl100k_base".to_string(),
+        }),
         performance_expanded,
     }
 }

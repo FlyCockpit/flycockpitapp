@@ -8,11 +8,11 @@ use crate::tui::async_action::{
 };
 use crate::tui::composer::Composer;
 use crate::tui::history::{HistoryEntry, PendingMsg};
-use cockpit_core::daemon::proto::{self, Request, Response};
-use cockpit_core::engine::TurnEvent;
-use cockpit_core::engine::message::{
-    QueueItemStatus, QueueTarget, QueuedUserMessage, UserSubmission,
-};
+use cockpit_client::presentation::TurnEvent;
+use cockpit_client::submission::ClientUserSubmission as UserSubmission;
+use cockpit_proto::QueueItem as QueuedUserMessage;
+use cockpit_proto::{self as proto, Request, Response};
+use cockpit_proto::{QueueItemStatus, QueueTarget};
 
 use super::{
     App, FreshQueueAck, RunnerAttachContinuation,
@@ -76,7 +76,7 @@ pub(super) struct BtwPane {
     pub history: Vec<HistoryEntry>,
     pub pending: Option<PendingMsg>,
     /// Live typed-display attempt owning BTW provisional UI (mirrors main TUI).
-    active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
+    active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     pub queue: Vec<QueuedUserMessage>,
     fresh_queue_ack: FreshQueueAck,
     folded_queue_item_ids: std::collections::HashSet<Uuid>,
@@ -586,21 +586,14 @@ impl BtwPane {
         let submission = UserSubmission {
             expected_model_state_generation: None,
             expected_model: None,
-            kind: cockpit_core::engine::message::UserSubmissionKind::User,
-            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
+            kind: cockpit_client::submission::UserSubmissionKind::User,
+            origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
             text: text.clone(),
             display_text: Some(text.clone()),
             tag_expansions: Vec::new(),
             images: Vec::new(),
             forced_skill: None,
-            origin_principal: None,
-            job_id: None,
-            preflight_cleaned: None,
-            queue_item_ids: Vec::new(),
-            client_submissions: Vec::new(),
-            queue_target: None,
-            pending_terminal_disposition: None,
-            run_invocation_id: None,
+            ..Default::default()
         };
         let client_submission_id = Uuid::new_v4();
         runner
@@ -643,7 +636,7 @@ impl BtwPane {
                 }
                 match self.send_text(text) {
                     Ok(()) => {
-                        self.composer.clear();
+                        self.composer = Composer::new(self.composer.vim_enabled());
                         BtwFocusedKeyOutcome::Consumed
                     }
                     Err(error) => BtwFocusedKeyOutcome::Error(error),
@@ -1005,14 +998,17 @@ impl App {
     ) -> crate::tui::async_action::AsyncActionId {
         let cwd = self.launch.cwd.clone();
         let no_sandbox = self.no_sandbox;
-        let mode = self.lifecycle_mode();
+        let intent = self.lifecycle_intent();
+        let lifecycle = self.lifecycle.clone();
         self.async_actions
             .start(
                 AsyncActionKind::Internal("btw.runner.attach"),
                 AsyncActionPolicy::Replace(AsyncActionKey::new("btw.runner.attach")),
                 async move {
-                    let runner =
-                        agent_runner::attach_to_session(&cwd, session_id, no_sandbox, mode).await?;
+                    let runner = agent_runner::attach_to_session(
+                        &cwd, session_id, no_sandbox, lifecycle, intent,
+                    )
+                    .await?;
                     Ok(AsyncActionPayload::BtwRunnerAttached {
                         session_id,
                         runner: Box::new(runner),
@@ -1128,13 +1124,11 @@ impl App {
             return;
         };
         let lockout = match reason {
-            cockpit_core::daemon::proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
-            cockpit_core::daemon::proto::InterruptRaiseReason::Advance => {
+            cockpit_proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
+            cockpit_proto::InterruptRaiseReason::Advance => {
                 crate::tui::dialog::DialogState::NO_LOCKOUT
             }
-            cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
-                self.rehydrated_dialog_lockout()
-            }
+            cockpit_proto::InterruptRaiseReason::Rehydration => self.rehydrated_dialog_lockout(),
         };
         self.question_dialog = Some(
             crate::tui::dialog::question::QuestionDialog::new(
@@ -1157,7 +1151,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_core::daemon::proto::{
+    use cockpit_proto::{
         InterruptOption, InterruptQuestion, InterruptQuestionSet, InterruptRaiseReason,
     };
 
@@ -1352,7 +1346,7 @@ mod tests {
     #[test]
     fn btw_pane_concurrent_with_main_turn() {
         let mut pane = BtwPane::new(info(false), false);
-        let attempt = cockpit_core::engine::AssistantAttemptId::new(1);
+        let attempt = cockpit_client::presentation::AssistantAttemptId::new(1);
         pane.apply_event(
             TurnEvent::ThinkingStarted {
                 agent: "Btw".to_string(),
@@ -1371,7 +1365,7 @@ mod tests {
         pane.apply_event(
             TurnEvent::AgentIdle {
                 turn_id: Some("side".to_string()),
-                reason: cockpit_core::engine::IdleReason::Completed,
+                reason: cockpit_proto::IdleReason::Completed,
             },
             true,
         );
@@ -1383,8 +1377,8 @@ mod tests {
     #[test]
     fn btw_typed_display_attempt_correlation_rejects_stale_and_raw_deltas() {
         let mut pane = BtwPane::new(info(false), false);
-        let failed = cockpit_core::engine::AssistantAttemptId::new(7);
-        let replacement = cockpit_core::engine::AssistantAttemptId::new(8);
+        let failed = cockpit_client::presentation::AssistantAttemptId::new(7);
+        let replacement = cockpit_client::presentation::AssistantAttemptId::new(8);
         pane.apply_event(
             TurnEvent::ThinkingStarted {
                 agent: "Btw".to_string(),

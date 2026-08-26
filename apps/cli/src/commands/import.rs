@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 
-use crate::daemon::client::{DaemonClient, ensure_persistent_daemon};
+use cockpit_client::DaemonClient;
+
+use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{Request, Response};
 
 use crate::cli::ImportArgs;

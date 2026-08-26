@@ -118,7 +118,7 @@ use crate::tui::async_action::{
     AsyncActionCancellation, AsyncActionId, AsyncActionKey, AsyncActionKind, AsyncActionPayload,
     AsyncActionPolicy, AsyncActionResult, AsyncActionRunner, AsyncActionStart,
 };
-use crate::tui::composer::{Composer, VimMode, input_prefix_width};
+use crate::tui::composer::{RegisteredComposer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
 use crate::tui::history::{
     HistoryEntry, MarkdownOpts, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCall,
@@ -126,13 +126,14 @@ use crate::tui::history::{
 };
 use crate::tui::input_source::{MAX_DRAIN_PER_PASS, ObservedTerminalEvent, TerminalInput};
 use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
-use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
-use cockpit_core::engine::message::{QueueTarget, QueuedUserMessage};
-use cockpit_core::engine::{
+use cockpit_client::presentation::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
-use cockpit_core::git::{self, RepoStatus};
-use cockpit_core::welcome::{self, LaunchBundle, LaunchInfo};
+use cockpit_client::submission::ClientUserSubmission;
+use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
+use cockpit_core::welcome;
+use cockpit_proto::QueueItem as QueuedUserMessage;
+use cockpit_proto::{LaunchBundle, LaunchInfo, QueueTarget, RepoStatus};
 pub(super) use history_log::{DirtyScan, HistoryEntryId, HistoryLog};
 pub(super) use history_window::HistoryWindow;
 #[cfg(test)]
@@ -320,7 +321,7 @@ pub(crate) struct PendingModelSelection {
     pub requested: cockpit_config::providers::ActiveModelRef,
     // Origin retained for lifecycle diagnostics. It is metadata only: the
     // daemon remains the authority for the resulting session state.
-    pub trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+    pub trigger: cockpit_proto::ActiveModelSwitchTrigger,
     /// Any terminal result from an older authoritative state is stale and
     /// cannot release input into this selection.
     pub minimum_generation: u64,
@@ -334,8 +335,8 @@ pub(crate) struct QueuedModelSubmission {
     /// applied result may clear only this exact draft; later edits remain.
     pub composer_text: String,
     pub display: String,
-    pub submission: cockpit_core::engine::message::UserSubmission,
-    pub tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
+    pub submission: ClientUserSubmission,
+    pub tag_expansions: Vec<cockpit_proto::TagExpansionMeta>,
 }
 
 pub(crate) struct PendingPasteProbe {
@@ -349,13 +350,17 @@ pub(crate) struct PendingPasteProbe {
     pub owner_fence: Option<uuid::Uuid>,
     pub original_offset: usize,
     pub deadline: std::time::Duration,
+    /// Stable daemon idempotency identity for image admission. It lives with
+    /// the pending paste, outside the RPC future, so transport retries cannot
+    /// accidentally mint and charge a second retained attachment.
+    pub image_admission_id: Option<uuid::Uuid>,
     pub async_action_id: Option<crate::tui::async_action::AsyncActionId>,
 }
 
 pub(crate) struct DeferredFenceDispatch {
     pub display: String,
-    pub submission: cockpit_core::engine::message::UserSubmission,
-    pub tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
+    pub submission: ClientUserSubmission,
+    pub tag_expansions: Vec<cockpit_proto::TagExpansionMeta>,
     pub waiting_model_selection: Option<uuid::Uuid>,
     pub parked_fence_sequence: Option<u64>,
 }
@@ -404,7 +409,7 @@ pub(crate) struct McpLocalCompletion {
     pub project_root: String,
     pub intent: McpLocalIntent,
     pub phase: McpLocalPhase,
-    pub response: Result<cockpit_core::daemon::proto::Response, String>,
+    pub response: Result<cockpit_proto::Response, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -436,7 +441,7 @@ pub(crate) struct ModelSelectionRetry {
     /// preference. It remains paired with the optional held wire submission
     /// so a later unrelated quick/cycle choice cannot silently consume it.
     pub requested: cockpit_config::providers::ActiveModelRef,
-    pub trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+    pub trigger: cockpit_proto::ActiveModelSwitchTrigger,
     pub queued_submission: Option<QueuedModelSubmission>,
 }
 
@@ -543,64 +548,9 @@ fn resolve_tui_llm_mode(
 fn startup_daemon_state(
     autostart: cockpit_config::extended::DaemonAutostart,
 ) -> StartupDaemonState {
-    let notice_seen = false;
-    match cockpit_core::daemon::DaemonPaths::resolve() {
-        Ok(paths) if paths.ephemeral => match cockpit_core::daemon::probe_blocking(&paths) {
-            cockpit_core::daemon::DaemonStatus::Running => StartupDaemonState {
-                prompt: None,
-                connected: true,
-                socket: Some(paths.socket.clone()),
-                daemonless: false,
-                notice: None,
-            },
-            status => daemon_not_running_state(status, paths, autostart, notice_seen),
-        },
-        Ok(_) => {
-            let probe = cockpit_core::daemon::discover_blocking();
-            match probe.status {
-                cockpit_core::daemon::DaemonStatus::Running => StartupDaemonState {
-                    prompt: None,
-                    connected: true,
-                    socket: Some(probe.paths.socket.clone()),
-                    daemonless: false,
-                    notice: None,
-                },
-                status => daemon_not_running_state(status, probe.paths, autostart, notice_seen),
-            }
-        }
-        Err(_) => StartupDaemonState {
-            prompt: None,
-            connected: false,
-            socket: None,
-            daemonless: false,
-            notice: None,
-        },
-    }
-}
-
-fn daemon_not_running_state(
-    status: cockpit_core::daemon::DaemonStatus,
-    paths: cockpit_core::daemon::DaemonPaths,
-    autostart: cockpit_config::extended::DaemonAutostart,
-    notice_seen: bool,
-) -> StartupDaemonState {
-    daemon_not_running_state_with_spawn(status, paths, autostart, notice_seen, || {
-        cockpit_core::daemon::spawn_detached(false)
-    })
-}
-
-fn daemon_not_running_state_with_spawn(
-    status: cockpit_core::daemon::DaemonStatus,
-    paths: cockpit_core::daemon::DaemonPaths,
-    autostart: cockpit_config::extended::DaemonAutostart,
-    notice_seen: bool,
-    spawn_shared: impl FnOnce() -> anyhow::Result<u32>,
-) -> StartupDaemonState {
     match autostart {
         cockpit_config::extended::DaemonAutostart::Ask => StartupDaemonState {
-            prompt: Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
-                status, paths,
-            )),
+            prompt: Some(crate::tui::daemon_prompt::DaemonPromptDialog::new()),
             connected: false,
             socket: None,
             daemonless: false,
@@ -612,34 +562,16 @@ fn daemon_not_running_state_with_spawn(
             socket: None,
             daemonless: true,
             notice: daemon_autostart_notice(
-                notice_seen,
+                false,
                 "started a private cockpit daemon for this window only",
             ),
         },
-        cockpit_config::extended::DaemonAutostart::Shared => match spawn_shared() {
-            Ok(pid) => StartupDaemonState {
-                prompt: None,
-                connected: true,
-                socket: Some(paths.socket.clone()),
-                daemonless: false,
-                notice: daemon_autostart_notice(
-                    notice_seen,
-                    &format!(
-                        "started the cockpit daemon (pid {pid}) — persists across windows; `cockpit daemon stop` to stop"
-                    ),
-                ),
-            },
-            Err(error) => {
-                let mut prompt = crate::tui::daemon_prompt::DaemonPromptDialog::new(status, paths);
-                prompt.set_error(format!("failed to spawn daemon: {error}"));
-                StartupDaemonState {
-                    prompt: Some(prompt),
-                    connected: false,
-                    socket: None,
-                    daemonless: false,
-                    notice: None,
-                }
-            }
+        cockpit_config::extended::DaemonAutostart::Shared => StartupDaemonState {
+            prompt: None,
+            connected: true,
+            socket: None,
+            daemonless: false,
+            notice: None,
         },
     }
 }
@@ -685,6 +617,26 @@ pub(crate) fn seed_ready_model_for_tests(app: &mut App) {
 }
 
 impl App {
+    /// Replace the entire composer document and retire every paste authority
+    /// tied to byte ranges in the previous document. Whole-buffer callers
+    /// must use this seam so placeholders can never outlive their registry.
+    pub(super) fn replace_composer_buffer(&mut self, text: impl Into<String>) {
+        self.composer.replace_buffer(text);
+    }
+
+    /// Clear the composer document and all byte-range paste authority as one
+    /// app-level operation.
+    pub(super) fn clear_composer_buffer(&mut self) {
+        self.composer.clear_buffer();
+    }
+
+    pub(super) fn attached_daemon_endpoint(&self) -> Option<cockpit_client::ClientEndpoint> {
+        self.agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok().map(|runner| runner.endpoint.clone()))
+            .or_else(|| self.startup_background.daemon_endpoint.clone())
+    }
+
     /// The required startup modal that is both rendered and allowed to
     /// consume keys. Keep this as the single ordering source; duplicating it
     /// in render and input caused trust choices to be recorded invisibly.
@@ -704,14 +656,12 @@ impl App {
         mode: cockpit_config::WorkspaceTrustMode,
     ) -> bool {
         let rpc_mode = match mode {
-            cockpit_config::WorkspaceTrustMode::Trust => {
-                cockpit_core::daemon::proto::WorkspaceTrustMode::Trust
-            }
+            cockpit_config::WorkspaceTrustMode::Trust => cockpit_proto::WorkspaceTrustMode::Trust,
             cockpit_config::WorkspaceTrustMode::IgnoreConfig => {
-                cockpit_core::daemon::proto::WorkspaceTrustMode::IgnoreConfig
+                cockpit_proto::WorkspaceTrustMode::IgnoreConfig
             }
             cockpit_config::WorkspaceTrustMode::Untrusted => {
-                cockpit_core::daemon::proto::WorkspaceTrustMode::Untrusted
+                cockpit_proto::WorkspaceTrustMode::Untrusted
             }
         };
         if self.pending_workspace_trust.is_some() {
@@ -729,12 +679,18 @@ impl App {
             project_root: project_root.clone(),
             expected_generation,
         });
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("workspace-trust.effect"),
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("workspace-trust.effect")),
             async move {
-                let result =
-                    set_workspace_trust_async(&project_root, rpc_mode, expected_generation).await;
+                let result = set_workspace_trust_async(
+                    lifecycle,
+                    &project_root,
+                    rpc_mode,
+                    expected_generation,
+                )
+                .await;
                 Ok(AsyncActionPayload::WorkspaceTrust(
                     WorkspaceTrustCompletion {
                         operation_id,
@@ -812,7 +768,7 @@ struct PendingWorkspaceTrust {
     operation_id: uuid::Uuid,
     root: cockpit_config::trust::TrustRoot,
     mode: cockpit_config::WorkspaceTrustMode,
-    rpc_mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    rpc_mode: cockpit_proto::WorkspaceTrustMode,
     project_root: String,
     expected_generation: u64,
 }
@@ -821,22 +777,29 @@ struct PendingWorkspaceTrust {
 pub(crate) struct WorkspaceTrustCompletion {
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) project_root: String,
-    pub(crate) mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    pub(crate) mode: cockpit_proto::WorkspaceTrustMode,
     pub(crate) expected_generation: u64,
     pub(crate) result: Result<u64, String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ImageIngressDraftDiscardCompletion {
+    pub(crate) draft: crate::tui::composer::ImageIngressDraftAuthority,
+    pub(crate) response: Result<cockpit_proto::Response, String>,
+}
+
 async fn set_workspace_trust_async(
+    lifecycle: cockpit_client::LifecycleClient,
     project_root: &str,
-    mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    mode: cockpit_proto::WorkspaceTrustMode,
     mut expected_generation: u64,
 ) -> Result<u64, String> {
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|error| error.to_string())?;
     for attempt in 0..=1 {
         let response = client
-            .request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+            .request(cockpit_proto::Request::SetWorkspaceTrust {
                 project_root: project_root.to_string(),
                 mode,
                 expected_config_generation: expected_generation,
@@ -844,31 +807,25 @@ async fn set_workspace_trust_async(
             .await
             .map_err(|error| format!("daemon request: {error}"))?;
         match response {
-            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { config_generation })
+            Ok(cockpit_proto::Response::WorkspaceTrustSet { config_generation })
                 if config_generation > expected_generation =>
             {
                 return Ok(config_generation);
             }
-            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { .. }) => {
+            Ok(cockpit_proto::Response::WorkspaceTrustSet { .. }) => {
                 return Err("daemon returned a non-advancing workspace trust generation".into());
             }
             Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),
-            Err(error)
-                if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict
-                    && attempt == 0 =>
-            {
+            Err(error) if error.code == cockpit_proto::ErrorCode::Conflict && attempt == 0 => {
                 expected_generation = match client
-                    .request(
-                        cockpit_core::daemon::proto::Request::GetStartupDisclosures {
-                            project_root: project_root.to_string(),
-                        },
-                    )
+                    .request(cockpit_proto::Request::GetStartupDisclosures {
+                        project_root: project_root.to_string(),
+                    })
                     .await
                     .map_err(|error| format!("daemon request: {error}"))?
                 {
-                    Ok(cockpit_core::daemon::proto::Response::StartupDisclosures {
-                        config_generation,
-                        ..
+                    Ok(cockpit_proto::Response::StartupDisclosures {
+                        config_generation, ..
                     }) => config_generation,
                     Ok(other) => {
                         return Err(format!(
@@ -885,39 +842,38 @@ async fn set_workspace_trust_async(
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum BlockingDaemonRequestError {
+    Conflict(String),
+    Other(String),
+}
+
+#[cfg(test)]
 fn set_workspace_trust_with_retry(
     project_root: &str,
-    mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    mode: cockpit_proto::WorkspaceTrustMode,
     mut expected_generation: u64,
     mut request: impl FnMut(
-        cockpit_core::daemon::proto::Request,
-    ) -> Result<
-        cockpit_core::daemon::proto::Response,
-        crate::tui::agent_runner::BlockingDaemonRequestError,
-    >,
+        cockpit_proto::Request,
+    ) -> Result<cockpit_proto::Response, BlockingDaemonRequestError>,
 ) -> Result<u64, String> {
     for attempt in 0..=1 {
-        let response = request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+        let response = request(cockpit_proto::Request::SetWorkspaceTrust {
             project_root: project_root.to_string(),
             mode,
             expected_config_generation: expected_generation,
         });
         match response {
-            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { config_generation }) => {
+            Ok(cockpit_proto::Response::WorkspaceTrustSet { config_generation }) => {
                 return Ok(config_generation);
             }
             Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),
-            Err(crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(_))
-                if attempt == 0 =>
-            {
-                expected_generation = match request(
-                    cockpit_core::daemon::proto::Request::GetStartupDisclosures {
-                        project_root: project_root.to_string(),
-                    },
-                ) {
-                    Ok(cockpit_core::daemon::proto::Response::StartupDisclosures {
-                        config_generation,
-                        ..
+            Err(BlockingDaemonRequestError::Conflict(_)) if attempt == 0 => {
+                expected_generation = match request(cockpit_proto::Request::GetStartupDisclosures {
+                    project_root: project_root.to_string(),
+                }) {
+                    Ok(cockpit_proto::Response::StartupDisclosures {
+                        config_generation, ..
                     }) => config_generation,
                     Ok(other) => {
                         return Err(format!(
@@ -934,12 +890,12 @@ fn set_workspace_trust_with_retry(
 }
 
 #[cfg(test)]
-fn blocking_request_error(error: crate::tui::agent_runner::BlockingDaemonRequestError) -> String {
+fn blocking_request_error(error: BlockingDaemonRequestError) -> String {
     match error {
-        crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(message) => {
+        BlockingDaemonRequestError::Conflict(message) => {
             format!("config conflict after refresh: {message}")
         }
-        crate::tui::agent_runner::BlockingDaemonRequestError::Other(message) => message,
+        BlockingDaemonRequestError::Other(message) => message,
     }
 }
 
@@ -1368,7 +1324,7 @@ pub(super) struct PendingPausedWork {
 /// history needs an explicit repair/fork/export decision.
 pub(super) struct PendingResumeRepair {
     pub(super) interrupt_id: uuid::Uuid,
-    pub(super) state: cockpit_core::daemon::proto::ResumeRepairState,
+    pub(super) state: cockpit_proto::ResumeRepairState,
 }
 
 #[derive(Default)]
@@ -1395,6 +1351,16 @@ pub(super) enum Overlay {
 }
 
 impl Overlay {
+    pub(super) fn has_unsettled_local_authority(&self) -> bool {
+        match self {
+            Self::Sessions(pane) => pane.has_unsettled_local_authority(),
+            Self::Tools(pane) => pane.has_unsettled_local_authority(),
+            Self::GoalSettings(pane) => pane.has_unsettled_local_authority(),
+            Self::Sealed(overlay) => overlay.has_unsettled_local_authority(),
+            _ => false,
+        }
+    }
+
     pub(super) fn is_open(&self) -> bool {
         !matches!(self, Self::None)
     }
@@ -1486,6 +1452,7 @@ pub(super) struct SideConversation {
     /// The daemon socket the side fork lives on (the same one the parent
     /// runner is attached to), so the discard RPC reaches the right daemon.
     pub(super) socket: std::path::PathBuf,
+    pub(super) endpoint: cockpit_client::ClientEndpoint,
     /// Saved main-session view, restored on exit.
     saved_runner: Option<Result<AgentRunner, String>>,
     saved_history: HistoryWindow,
@@ -1495,7 +1462,7 @@ pub(super) struct SideConversation {
     saved_history_render_cache_rows: usize,
     saved_queue: Vec<QueuedUserMessage>,
     saved_pending: Option<PendingMsg>,
-    saved_active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
+    saved_active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     saved_prunable_tokens: u64,
     saved_cache_cold: bool,
     saved_elided_event_ids: std::collections::HashSet<String>,
@@ -1543,7 +1510,7 @@ pub(super) enum DispatchOutcome {
 }
 
 pub(super) struct PendingSessionSwitchSubmission {
-    pub submission: cockpit_core::engine::message::UserSubmission,
+    pub submission: ClientUserSubmission,
     /// Stable client-local identity shared by the exact wire payload and its
     /// optimistic transcript or queue row.
     pub optimistic_submission_id: uuid::Uuid,
@@ -1575,7 +1542,7 @@ pub(super) enum RunnerAttachContinuation {
         label: String,
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger,
     },
     BtwCommand(String),
     Compact,
@@ -1685,16 +1652,12 @@ pub(super) fn sandbox_down_notice_text_with_intent(
     remedy: &str,
     fix_command: Option<&str>,
     copy_chip: bool,
-    intent: Option<cockpit_core::tools::sandbox_mode::SandboxMode>,
+    intent: Option<cockpit_proto::SandboxMode>,
 ) -> String {
     let selected = match intent {
-        Some(cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox) => {
-            "Sandbox is selected but effective Off"
-        }
-        Some(cockpit_core::tools::sandbox_mode::SandboxMode::Container) => {
-            "Container is selected but effective Off"
-        }
-        Some(cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly) => {
+        Some(cockpit_proto::SandboxMode::Sandbox) => "Sandbox is selected but effective Off",
+        Some(cockpit_proto::SandboxMode::Container) => "Container is selected but effective Off",
+        Some(cockpit_proto::SandboxMode::ContainerReadonly) => {
             "Container-readonly is selected but effective Off"
         }
         _ => "shell sandbox can't start",
@@ -1854,6 +1817,7 @@ pub(super) enum PaneSide {
 #[derive(Debug, Clone)]
 struct StartupBackground {
     daemon_socket: Option<PathBuf>,
+    daemon_endpoint: Option<cockpit_client::ClientEndpoint>,
     started: bool,
 }
 
@@ -1876,7 +1840,7 @@ pub(crate) struct HeldConfig {
     /// The daemon's redacted provider projection: header *values* stripped,
     /// header *names* + `credential_configured` retained. Read by consumers
     /// that need provider identity/auth state without secret material.
-    pub(crate) provider_view: cockpit_core::daemon::proto::ProviderConfigView,
+    pub(crate) provider_view: cockpit_proto::ProviderConfigView,
     /// Reconstructed from [`Self::provider_view`] for the `resolve_*` /
     /// model-listing consumers. Header values are absent (never needed for
     /// resolution); the TUI never renders credential material from it.
@@ -1888,7 +1852,7 @@ impl HeldConfig {
         generation: u64,
         from_daemon: bool,
         extended: cockpit_config::extended::ExtendedConfig,
-        provider_view: cockpit_core::daemon::proto::ProviderConfigView,
+        provider_view: cockpit_proto::ProviderConfigView,
     ) -> Self {
         let mut providers = providers_from_view(&provider_view);
         providers.set_resolution_generation(generation);
@@ -1906,7 +1870,7 @@ impl HeldConfig {
 /// view carries no secrets (credential refs and header values are stripped
 /// daemon-side); the TUI only ever renders this projection.
 fn providers_from_view(
-    view: &cockpit_core::daemon::proto::ProviderConfigView,
+    view: &cockpit_proto::ProviderConfigView,
 ) -> cockpit_config::providers::ProvidersConfig {
     cockpit_config::providers::ProvidersConfig {
         providers: view
@@ -1926,6 +1890,8 @@ fn providers_from_view(
 
 #[allow(private_interfaces)]
 pub struct App {
+    /// Typed channel to the CLI-owned lifecycle composition task.
+    pub(super) lifecycle: cockpit_client::LifecycleClient,
     pub(super) monotonic_origin: Instant,
     pub(super) paste_client_instance_id: uuid::Uuid,
     pub(super) launch: LaunchInfo,
@@ -1954,7 +1920,7 @@ pub struct App {
     /// value and never reconstruct session state from the config default.
     pub(super) active_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
 
-    pub(super) composer: Composer,
+    composer: RegisteredComposer,
     /// Ownership epoch for asynchronous paste results. Edits keep the same
     /// epoch; detaching a submitted draft advances it.
     pub(super) draft_generation: u64,
@@ -2047,7 +2013,7 @@ pub struct App {
     /// Live typed-display attempt that owns provisional UI / chip state.
     /// Advanced to the replacement on `AssistantDisplayAttemptReset` so late
     /// deltas for the failed attempt cannot recreate a provisional row.
-    pub(super) active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
+    pub(super) active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     /// Currently rendered transcript view. `Main` is the normal session transcript;
     /// `Subagent` means `history`/`pending` have been swapped to the selected child.
     pub(super) transcript_view: TranscriptViewMeta,
@@ -2099,6 +2065,11 @@ pub struct App {
     /// `run`. The event loop syncs this into `launch.repo_status` once
     /// per tick.
     pub(super) repo_status: Arc<Mutex<Option<RepoStatus>>>,
+    /// Daemon-resolved git worktree root for `launch.cwd`, resolved once by
+    /// the background task spawned in `run` (the cwd is stable for the
+    /// session). `None` until resolved or when the cwd is not in a repo. Panes
+    /// read this instead of shelling out to git themselves.
+    pub(super) worktree_root: Arc<Mutex<Option<std::path::PathBuf>>>,
     pub(super) dialog: Dialog,
     /// User-opened modal/pane overlays. Required prompts (`daemon_prompt` and
     /// `question_dialog`) stay separate so they can shadow and resume this
@@ -2137,15 +2108,6 @@ pub struct App {
     /// flips the agent-runner lifecycle to `AlwaysEphemeral` so we spawn (and
     /// own) a fresh daemon rather than auto-promoting the canonical one.
     pub(super) daemonless: bool,
-    /// RAII guard that reaps the owned ephemeral daemon on every exit path
-    /// (clean quit, error, panic/unwind, SIGINT/SIGTERM) — the same
-    /// ownership contract `cockpit run` uses. `Some` only in daemonless mode
-    /// once the runner has spawned the owned daemon; `None` when attached to
-    /// a daemon we don't own.
-    pub(super) daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
-    /// Signal task that fires the guard's shutdown on SIGINT/SIGTERM. Held so
-    /// it can be aborted once the happy-path teardown has run.
-    pub(super) daemon_signal_task: Option<tokio::task::JoinHandle<()>>,
     /// Lines emitted by an in-flight `/fetch-models` task. The event
     /// loop drains this each tick and appends to history.
     pub(super) fetch_models_progress: Arc<Mutex<Vec<String>>>,
@@ -2330,12 +2292,13 @@ pub struct App {
     /// editing elsewhere in the buffer can't desync it; cleared on
     /// submit and on `/new`.
     pub(super) accepted_tags: Vec<String>,
-    /// Registry of condensed-text / image paste blocks currently in the
-    /// composer buffer (composer-paste-handling). Kept byte-range-synced
-    /// with [`Self::composer`] across every edit; consumed at submit to
-    /// inline text + emit real image parts (vision) or text notes
-    /// (non-vision). Cleared on submit and `/new`.
-    pub(super) paste_registry: crate::tui::paste::PasteRegistry,
+    /// Admitted image drafts still owned by this frontend. Entries survive
+    /// composer/view removal until the daemon returns a terminal discard
+    /// receipt, or are explicitly transferred to a possibly-sent message.
+    pub(super) image_ingress_draft_discards: std::collections::HashMap<
+        uuid::Uuid,
+        (crate::tui::composer::ImageIngressDraftAuthority, bool),
+    >,
     pub(super) terminal_paste_classifier: crate::tui::structured_paste::TerminalPasteClassifier,
     pub(super) terminal_input_generation: Option<u64>,
     pub(super) submission_order: crate::tui::structured_paste::SubmissionOrderCoordinator,
@@ -2428,7 +2391,7 @@ pub struct App {
     /// the live context counter (see `context_tokens`): the displayed
     /// value is this total plus a local estimate of everything streamed
     /// since it arrived. `None` until the first call returns.
-    pub(super) last_usage: Option<cockpit_core::tokens::TokenUsage>,
+    pub(super) last_usage: Option<cockpit_client::presentation::TokenUsage>,
     /// Local cl100k_base estimate captured the instant `last_usage` was
     /// set — the baseline the live counter measures streamed tokens
     /// against, so the number climbs per token and re-snaps to the
@@ -2580,7 +2543,7 @@ pub struct App {
     pub(super) pending_stop_confirm: Option<Vec<String>>,
     /// `RecordUsage` requests made before the daemon runner exists.
     /// Flushed (with tag project ids backfilled) once it's created.
-    pub(super) pending_usage: Vec<cockpit_core::daemon::proto::Request>,
+    pub(super) pending_usage: Vec<cockpit_proto::Request>,
     /// Ctrl+G was pressed — the event loop suspends ratatui, runs
     /// `$EDITOR` against the composer text, then reloads the file back
     /// into the composer.
@@ -2680,10 +2643,10 @@ pub struct App {
     /// filesystem sandboxing OFF (unless the daemon itself was launched
     /// `--no-sandbox`, which wins). A `/sandbox` flip still overrides.
     pub(super) no_sandbox: bool,
-    pub(super) sandbox_mode: cockpit_core::tools::sandbox_mode::SandboxMode,
-    pub(super) sandbox_intent: cockpit_core::tools::sandbox_mode::SandboxMode,
+    pub(super) sandbox_mode: cockpit_proto::SandboxMode,
+    pub(super) sandbox_intent: cockpit_proto::SandboxMode,
     pub(super) container_network_enabled: bool,
-    pub(super) container_availability: cockpit_core::container::ContainerAvailability,
+    pub(super) container_availability: cockpit_proto::ContainerAvailability,
     pub(super) host_capabilities: cockpit_proto::HostCapabilitySnapshot,
     pub(super) capability_refresh_queue: Vec<cockpit_proto::HostCapabilitySnapshot>,
     pub(super) capability_refresh_calls: usize,
@@ -2797,11 +2760,11 @@ pub struct App {
     /// Persistent enterprise org-policy session-log sync disclosure. Loaded
     /// from durable sync state at startup; absence means no active policy.
     #[cfg(feature = "remote")]
-    pub(super) org_sync_disclosure: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
+    pub(super) org_sync_disclosure: Option<cockpit_proto::OrgSyncDisclosure>,
     /// Persisted/daemon-broadcast remote connector status. Drives the additive
     /// remote-access chrome slot while connector access is enabled.
     #[cfg(feature = "remote")]
-    pub(super) connector_disclosure: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
+    pub(super) connector_disclosure: Option<cockpit_proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
     first_run_flow: FirstRunFlow,
     /// An open `/side` side conversation, or `None` in the main session. While
@@ -3047,31 +3010,31 @@ pub(super) struct IdleReasonStatus {
     kind: ToastKind,
 }
 
-fn idle_reason_status(reason: cockpit_core::engine::IdleReason) -> Option<IdleReasonStatus> {
+fn idle_reason_status(reason: cockpit_proto::IdleReason) -> Option<IdleReasonStatus> {
     match reason {
-        cockpit_core::engine::IdleReason::Completed => None,
-        cockpit_core::engine::IdleReason::GoalComplete => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::Completed => None,
+        cockpit_proto::IdleReason::GoalComplete => Some(IdleReasonStatus {
             text: "goal session completed".to_string(),
             kind: ToastKind::Success,
         }),
-        cockpit_core::engine::IdleReason::NeedsIntervention { code } => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::NeedsIntervention { code } => Some(IdleReasonStatus {
             text: format!("goal stalled ({code}) — run `/goal resume` or send guidance"),
             kind: ToastKind::Warning,
         }),
-        cockpit_core::engine::IdleReason::BudgetLimited => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::BudgetLimited => Some(IdleReasonStatus {
             text: "goal paused: token budget reached — run `/goal resume` or adjust budget"
                 .to_string(),
             kind: ToastKind::Warning,
         }),
-        cockpit_core::engine::IdleReason::UsageLimited => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::UsageLimited => Some(IdleReasonStatus {
             text: "usage limit — auto-resuming shortly".to_string(),
             kind: ToastKind::Warning,
         }),
-        cockpit_core::engine::IdleReason::Error { class } => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::Error { class } => Some(IdleReasonStatus {
             text: format!("turn stopped on {class} — inspect the error and retry"),
             kind: ToastKind::Error,
         }),
-        cockpit_core::engine::IdleReason::Interrupted => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::Interrupted => Some(IdleReasonStatus {
             text: "turn interrupted".to_string(),
             kind: ToastKind::Info,
         }),
@@ -3327,7 +3290,7 @@ pub(super) struct StoredTranscriptView {
     pub(super) meta: TranscriptViewMeta,
     pub(super) history: HistoryWindow,
     pub(super) pending: Option<PendingMsg>,
-    pub(super) active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
+    pub(super) active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     pub(super) history_render_versions: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_fingerprints: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
@@ -3428,7 +3391,13 @@ pub(crate) fn startup_first_paint_log_count() -> usize {
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
-        Self::new_inner(project, no_sandbox, StartupWorkspaceTrust::Decided, None)
+        Self::new_inner(
+            project,
+            no_sandbox,
+            StartupWorkspaceTrust::Decided,
+            None,
+            None,
+        )
     }
 
     pub fn new_with_workspace_trust(
@@ -3445,7 +3414,30 @@ impl App {
         trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
     ) -> Self {
-        Self::new_inner(project, no_sandbox, trust, launch_start)
+        Self::new_inner(project, no_sandbox, trust, launch_start, None)
+    }
+
+    pub fn new_composed(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        trust: StartupWorkspaceTrust,
+        launch_start: Option<Instant>,
+        lifecycle: cockpit_client::LifecycleClient,
+    ) -> Self {
+        Self::new_inner(project, no_sandbox, trust, launch_start, Some(lifecycle))
+    }
+
+    pub fn new_composed_with_session(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        trust: StartupWorkspaceTrust,
+        session_id: uuid::Uuid,
+        launch_start: Option<Instant>,
+        lifecycle: cockpit_client::LifecycleClient,
+    ) -> Self {
+        let mut app = Self::new_inner(project, no_sandbox, trust, launch_start, Some(lifecycle));
+        app.launch.session_id = Some(session_id);
+        app
     }
 
     pub fn new_with_session(
@@ -3467,6 +3459,7 @@ impl App {
             no_sandbox,
             StartupWorkspaceTrust::Decided,
             launch_start,
+            None,
         );
         app.launch.session_id = Some(session_id);
         app
@@ -3483,6 +3476,7 @@ impl App {
         no_sandbox: bool,
         startup_trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
+        lifecycle: Option<cockpit_client::LifecycleClient>,
     ) -> Self {
         let mut timer = cockpit_core::startup::PhaseTimer::start("App::new");
         // Skip the synchronous `git status` here — it can take seconds in a
@@ -3540,7 +3534,7 @@ impl App {
             agent: tui_cfg.render_agent_markdown,
             user: tui_cfg.render_user_markdown,
         };
-        let mut composer = Composer::new(vim_setting.vim_enabled());
+        let mut composer = RegisteredComposer::new(vim_setting.vim_enabled());
         // We start in Insert mode regardless — landing in Normal on
         // first keystroke is jarring for users new to the TUI. The
         // hint (when enabled) tells them how to switch back if they
@@ -3548,6 +3542,7 @@ impl App {
         composer.set_vim_mode(VimMode::Insert);
 
         let repo_status = Arc::new(Mutex::new(launch.repo_status.clone()));
+        let worktree_root = Arc::new(Mutex::new(None));
 
         // Probe the daemon synchronously up front so startup can either
         // autostart it per config or show the ask-mode/failure prompt on the
@@ -3596,6 +3591,7 @@ impl App {
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
+            lifecycle: lifecycle.unwrap_or_else(cockpit_client::LifecycleClient::disconnected),
             monotonic_origin: Instant::now(),
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,
@@ -3652,6 +3648,7 @@ impl App {
             reconnect: None,
             daemon_link: None,
             repo_status,
+            worktree_root,
             dialog: Dialog::None,
             overlay: Overlay::None,
             daemon_prompt: daemon_state.prompt,
@@ -3662,8 +3659,6 @@ impl App {
             pending_local_choice: None,
             daemon_connected: daemon_state.connected,
             daemonless: daemon_state.daemonless,
-            daemon_guard: None,
-            daemon_signal_task: None,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
             pending_runner_attach: None,
@@ -3679,6 +3674,7 @@ impl App {
             skills_pane_generation: 0,
             startup_background: StartupBackground {
                 daemon_socket: daemon_state.socket,
+                daemon_endpoint: None,
                 started: false,
             },
             startup_daemon_notice: daemon_state.notice,
@@ -3717,7 +3713,7 @@ impl App {
             at_suggestions_loaded_query: None,
             at_suggestions_error: None,
             accepted_tags: Vec::new(),
-            paste_registry: crate::tui::paste::PasteRegistry::new(),
+            image_ingress_draft_discards: Default::default(),
             terminal_paste_classifier:
                 crate::tui::structured_paste::TerminalPasteClassifier::default(),
             terminal_input_generation: None,
@@ -3834,12 +3830,10 @@ impl App {
             active_schedules: std::collections::BTreeMap::new(),
             ctrl_c_armed_at: None,
             no_sandbox,
-            sandbox_mode: cockpit_core::tools::sandbox_mode::SandboxMode::from_enabled(!no_sandbox),
-            sandbox_intent: cockpit_core::tools::sandbox_mode::SandboxMode::from_enabled(
-                !no_sandbox,
-            ),
+            sandbox_mode: cockpit_proto::SandboxMode::from_enabled(!no_sandbox),
+            sandbox_intent: cockpit_proto::SandboxMode::from_enabled(!no_sandbox),
             container_network_enabled: false,
-            container_availability: cockpit_core::container::initial_availability_unknown(),
+            container_availability: cockpit_proto::ContainerAvailability::unpublished(),
             host_capabilities: crate::tui::capability_gate::empty_capability_snapshot(),
             capability_refresh_queue: Vec::new(),
             capability_refresh_calls: 0,
@@ -3928,34 +3922,34 @@ impl App {
         )
         .await;
         if let Some(notice) = self.startup_daemon_notice.take() {
-            let key = cockpit_core::daemon::proto::AppFlagKey::DaemonAutostartNotice;
+            let key = cockpit_proto::AppFlagKey::DaemonAutostartNotice;
             // Startup is already async. Await the daemon directly so the runtime
             // worker remains available to the daemon connection and terminal
             // event sources instead of synchronously re-entering it.
             let state = async {
-                let client = crate::tui::settings::settings_daemon_client()
+                let client = crate::tui::settings::settings_daemon_client(&self.lifecycle)
                     .await
                     .map_err(|error| error.to_string())?;
                 client
-                    .request(cockpit_core::daemon::proto::Request::GetAppFlag { key })
+                    .request(cockpit_proto::Request::GetAppFlag { key })
                     .await
                     .map_err(|error| error.to_string())?
                     .map_err(|error| error.to_string())
             }
             .await;
             match state {
-                Ok(cockpit_core::daemon::proto::Response::AppFlag { seen: true, .. }) => {}
-                Ok(cockpit_core::daemon::proto::Response::AppFlag {
+                Ok(cockpit_proto::Response::AppFlag { seen: true, .. }) => {}
+                Ok(cockpit_proto::Response::AppFlag {
                     seen: false,
                     version,
                     ..
                 }) => {
                     let _ = async {
-                        let client = crate::tui::settings::settings_daemon_client()
+                        let client = crate::tui::settings::settings_daemon_client(&self.lifecycle)
                             .await
                             .map_err(|error| error.to_string())?;
                         client
-                            .request(cockpit_core::daemon::proto::Request::MarkAppFlagSeen {
+                            .request(cockpit_proto::Request::MarkAppFlagSeen {
                                 key,
                                 expected_version: version,
                             })
@@ -4027,11 +4021,21 @@ impl App {
             }
         }
 
-        let refresh_handle = spawn_git_refresh(self.launch.cwd.clone(), self.repo_status.clone());
+        let refresh_handle = spawn_git_refresh(
+            self.launch.cwd.clone(),
+            self.lifecycle.clone(),
+            self.repo_status.clone(),
+        );
+        let worktree_handle = spawn_worktree_root_resolve(
+            self.launch.cwd.clone(),
+            self.lifecycle.clone(),
+            self.worktree_root.clone(),
+        );
 
         let result = self.event_loop(&mut terminal).await;
 
         refresh_handle.abort();
+        worktree_handle.abort();
 
         // Process-exit cleanup for an open `/side` (no orphaned ephemeral
         // sessions): discard the throwaway fork *before* the daemon guard
@@ -4044,7 +4048,7 @@ impl App {
             if let Some(Ok(runner)) = self.agent_runner.as_ref() {
                 let binding = runner.attached_request_binding();
                 let _ = binding
-                    .request(cockpit_core::daemon::proto::Request::EndBtwFork {
+                    .request(cockpit_proto::Request::EndBtwFork {
                         parent_session_id: runner.session_id(),
                     })
                     .await;
@@ -4081,12 +4085,6 @@ impl App {
         // for an uncatchable death (SIGKILL). Reaping here is independent of
         // whether a message was sent — a persisted session never keeps an
         // owned ephemeral daemon alive past its owner's exit.
-        if let Some(task) = self.daemon_signal_task.take() {
-            task.abort();
-        }
-        if let Some(guard) = &self.daemon_guard {
-            guard.shutdown();
-        }
 
         // Build the exit-tail text while we still own the alt screen
         // (history is in memory; rendering is irrelevant — we want
@@ -4141,7 +4139,10 @@ impl App {
             {
                 needs_redraw = true;
             }
-            if self.exit_requested {
+            // Programmatic exits cross the same process-wide authority fence
+            // as Ctrl+C, Ctrl+D, and `/exit`. Do not surrender an operation
+            // merely because a completion handler requested shutdown.
+            if self.exit_requested && !self.has_unsettled_local_authority() {
                 break;
             }
             if self.tick_attention_interrupt() {
@@ -4648,32 +4649,103 @@ fn editor_argv_for_target(editor: &std::ffi::OsStr, target: &str) -> Vec<String>
     argv
 }
 
-/// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`
-/// without blocking the event-loop thread. The result lands in `shared`;
-/// the event loop reads it on the next tick.
+/// Background task that polls the repository status pill every
+/// `GIT_REFRESH_INTERVAL` without blocking the event-loop thread. Git
+/// authority is daemon-owned: each tick issues a `GitRepoStatus` RPC rather
+/// than shelling out to `git` in the TUI process. The result lands in
+/// `shared`; the event loop reads it on the next tick.
 fn spawn_git_refresh(
     cwd: std::path::PathBuf,
+    lifecycle: cockpit_client::LifecycleClient,
     shared: Arc<Mutex<Option<RepoStatus>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let project_root = cwd.display().to_string();
         let mut interval = tokio::time::interval(GIT_REFRESH_INTERVAL);
         // Do NOT skip the first tick: `App::new` no longer fetches git
         // status synchronously (it would block the first frame in a giant
         // repo), so this background poller owns the initial fetch too. The
-        // first `interval.tick()` completes immediately, populating the
+        // first `interval.tick()` completes immediately, requesting the
         // branch pill a tick after launch; subsequent ticks refresh on
         // `GIT_REFRESH_INTERVAL`.
         loop {
             interval.tick().await;
-            let cwd = cwd.clone();
-            let status = tokio::task::spawn_blocking(move || git::repo_status(&cwd).ok().flatten())
-                .await
-                .unwrap_or(None);
-            if let Ok(mut guard) = shared.lock() {
+            // Only overwrite on a successful RPC. A transiently unavailable
+            // daemon (or the daemonless fallback) leaves the last-known pill
+            // in place instead of clearing it; a successful `None` (not in a
+            // repo / detached HEAD) still clears it, matching the old local
+            // behaviour.
+            if let Some(status) = daemon_repo_status(&lifecycle, &project_root).await
+                && let Ok(mut guard) = shared.lock()
+            {
                 *guard = status;
             }
         }
     })
+}
+
+/// One-shot background task that resolves the git worktree root for `cwd`
+/// through the daemon (`FindWorktreeRoot`) and stores it in `shared`. The cwd
+/// is fixed for the session, so a single resolution suffices; panes read the
+/// stored root instead of shelling out to git. Runs off the event loop so it
+/// never blocks the first frame.
+fn spawn_worktree_root_resolve(
+    cwd: std::path::PathBuf,
+    lifecycle: cockpit_client::LifecycleClient,
+    shared: Arc<Mutex<Option<std::path::PathBuf>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let path = cwd.display().to_string();
+        if let Some(root) = daemon_find_worktree_root(&lifecycle, &path).await
+            && let Ok(mut guard) = shared.lock()
+        {
+            *guard = root;
+        }
+    })
+}
+
+/// Issue a `GitRepoStatus` RPC. Returns `Some(status)` on success (where the
+/// inner `Option` distinguishes "in a repo" from "not"), or `None` when the
+/// daemon is unavailable or replies with an unexpected shape.
+async fn daemon_repo_status(
+    lifecycle: &cockpit_client::LifecycleClient,
+    project_root: &str,
+) -> Option<Option<RepoStatus>> {
+    let client = crate::tui::settings::settings_daemon_client(lifecycle)
+        .await
+        .ok()?;
+    match client
+        .request(cockpit_proto::Request::GitRepoStatus {
+            project_root: project_root.to_string(),
+        })
+        .await
+    {
+        Ok(Ok(cockpit_proto::Response::GitRepoStatus { status })) => Some(status),
+        _ => None,
+    }
+}
+
+/// Issue a `FindWorktreeRoot` RPC. Returns `Some(root)` on success (where the
+/// inner `Option` is `None` when `path` is not inside a git worktree), or
+/// `None` when the daemon is unavailable or replies with an unexpected shape.
+async fn daemon_find_worktree_root(
+    lifecycle: &cockpit_client::LifecycleClient,
+    path: &str,
+) -> Option<Option<std::path::PathBuf>> {
+    let client = crate::tui::settings::settings_daemon_client(lifecycle)
+        .await
+        .ok()?;
+    match client
+        .request(cockpit_proto::Request::FindWorktreeRoot {
+            path: path.to_string(),
+        })
+        .await
+    {
+        Ok(Ok(cockpit_proto::Response::WorktreeRoot { root })) => {
+            Some(root.map(std::path::PathBuf::from))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

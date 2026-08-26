@@ -1725,6 +1725,18 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "admit_image_ingress"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "discard_image_ingress_draft"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "retain_https_media"
       },
       {
@@ -2658,6 +2670,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "local_path_media_registration"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_ingress_admitted"
       },
       {
         "class": "bounded_request_response",

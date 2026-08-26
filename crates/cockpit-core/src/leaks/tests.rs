@@ -43,7 +43,7 @@ async fn test_db() -> Db {
         let root = root.to_owned();
         db.write(move |conn| {
             conn.execute(
-                "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) \
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) \
                  VALUES(?1,'p',?2,1,1)",
                 rusqlite::params![sid, root],
             )?;

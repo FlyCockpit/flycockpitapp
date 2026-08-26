@@ -15,7 +15,7 @@ pub async fn run(cmd: SkillCommand) -> Result<()> {
 }
 
 async fn curator_request(
-    client: &crate::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     project_root: &str,
     action: CuratorAction,
 ) -> Result<CuratorResult> {

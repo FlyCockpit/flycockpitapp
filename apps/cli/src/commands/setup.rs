@@ -387,31 +387,386 @@ fn submit(run: &mut WizardRun, answer: WizardAnswer, io: &mut dyn TerminalIo) ->
     }
 }
 
+async fn request_durable_local_mutation(
+    client: &cockpit_client::DaemonClient,
+    client_operation_id: &str,
+    operation_kind: &str,
+    request: Request,
+) -> Result<Response> {
+    let mut initial_rejection = match client.request(request.clone()).await {
+        Ok(Ok(response)) => return Ok(response),
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => None,
+    };
+    let mut attempts = 0_u32;
+    loop {
+        let settlement = client
+            .request(Request::GetLocalOperationSettlement {
+                client_operation_id: client_operation_id.to_string(),
+            })
+            .await;
+        match settlement {
+            Ok(Ok(Response::LocalOperationSettlement {
+                client_operation_id: returned_operation_id,
+                operation_kind: returned_kind,
+                pending,
+                response,
+                terminal_error,
+                terminal_cancelled,
+                ..
+            })) if returned_operation_id == client_operation_id
+                && returned_kind == operation_kind =>
+            {
+                if let Some(error) = terminal_error {
+                    bail!("daemon rejected {operation_kind}: {error}");
+                }
+                if terminal_cancelled {
+                    bail!("daemon cancelled {operation_kind}");
+                }
+                if let Some(response) = response {
+                    return Ok(*response);
+                }
+                if !pending {
+                    bail!("daemon returned an incomplete terminal settlement for {operation_kind}");
+                }
+            }
+            Ok(Ok(other)) => {
+                bail!("daemon returned an unbound settlement for {operation_kind}: {other:?}")
+            }
+            Ok(Err(error)) => {
+                if let Some(rejection) = initial_rejection.as_deref() {
+                    bail!("daemon rejected {operation_kind}: {rejection}");
+                }
+                // A response can be lost after the daemon accepted the
+                // mutation but before its receipt became queryable. Re-submit
+                // the exact same operation id/body periodically; daemon-side
+                // fencing makes this an idempotent reconciliation, never a
+                // second mutation.
+                if attempts.is_multiple_of(40) {
+                    match client.request(request.clone()).await {
+                        Ok(Ok(response)) => return Ok(response),
+                        Ok(Err(rejection)) => initial_rejection = Some(rejection.to_string()),
+                        Err(_) => {}
+                    }
+                }
+                let _ = error;
+            }
+            Err(_) => {}
+        }
+        attempts = attempts.wrapping_add(1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+fn is_provider_revision(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(not(test))]
-async fn apply_setup_wizard_via_daemon(
-    cwd: &std::path::Path,
-    wizard_id: &str,
-    run: &WizardRun,
-) -> Result<(bool, bool, Option<String>)> {
+async fn apply_security_wizard_via_daemon(cwd: &std::path::Path, run: &WizardRun) -> Result<bool> {
     let daemon = ensure_persistent_daemon()
         .await
-        .context("starting persistent daemon for setup wizard")?;
+        .context("starting persistent daemon for security setup")?;
+    let project_root = cwd.display().to_string();
+    let snapshot_session_id = uuid::Uuid::new_v4().to_string();
     let response = daemon
         .client
-        .request(Request::ApplySetupWizard {
-            project_root: cwd.display().to_string(),
-            wizard_id: wizard_id.to_string(),
-            answers_json: run.answers_json()?,
+        .request(Request::GetExtendedConfigSnapshot {
+            project_root: project_root.clone(),
+            snapshot_session_id: snapshot_session_id.clone(),
         })
         .await?
-        .map_err(|error| anyhow!("daemon rejected setup wizard: {error}"))?;
+        .map_err(|error| anyhow!("daemon rejected security settings snapshot: {error}"))?;
+    let Response::ExtendedConfigSnapshot { layers, .. } = response else {
+        bail!("daemon returned unexpected security settings snapshot: {response:?}");
+    };
+    let layer = layers
+        .into_iter()
+        .last()
+        .context("daemon returned no writable security settings layer")?;
+    let mut operations = Vec::new();
+    if let Some(value) = cockpit_core::wizard::sandbox_mode_answer(run)
+        && value != layer.config.sandbox.default_mode
+    {
+        operations.push(cockpit_proto::ExtendedConfigPathMutation::Set {
+            path: vec!["sandbox".into(), "default_mode".into()],
+            value: serde_json::to_value(value)?,
+        });
+    }
+    if let Some(value) = cockpit_core::wizard::approval_mode_answer(run)
+        && value != layer.config.default_approval_mode
+    {
+        operations.push(cockpit_proto::ExtendedConfigPathMutation::Set {
+            path: vec!["default_approval_mode".into()],
+            value: serde_json::to_value(value)?,
+        });
+    }
+    if let Some(value) = cockpit_core::wizard::min_secret_length_answer(run)
+        && value != layer.config.redact.min_secret_length
+    {
+        operations.push(cockpit_proto::ExtendedConfigPathMutation::Set {
+            path: vec!["redact".into(), "min_secret_length".into()],
+            value: serde_json::to_value(value)?,
+        });
+    }
+    if operations.is_empty() {
+        return Ok(false);
+    }
+    let denylist = layer
+        .denylist
+        .iter()
+        .map(|entry| cockpit_proto::DesiredDenylistEntry::Existing {
+            entry_id: entry.entry_id.clone(),
+        })
+        .collect();
+    let patch = cockpit_proto::ExtendedConfigPatch {
+        operations,
+        materialize: false,
+        denylist,
+        redacted_mutations: Vec::new(),
+    };
+    let mutation_intent_hash = patch
+        .sanitized_intent_hash()
+        .context("identifying security settings mutation")?;
+    let client_operation_id = uuid::Uuid::new_v4().to_string();
+    let response = request_durable_local_mutation(
+        &daemon.client,
+        &client_operation_id,
+        "apply_extended_config_patch",
+        Request::ApplyExtendedConfigPatch {
+            client_operation_id: client_operation_id.clone(),
+            project_root,
+            layer_id: layer.layer_id.clone(),
+            patch,
+            expected_revision: layer.revision.clone(),
+            snapshot_session_id,
+        },
+    )
+    .await?;
     match response {
-        Response::SetupWizardApplied {
-            changed,
-            model_file_written,
-            default_scope,
-        } => Ok((changed, model_file_written, default_scope)),
-        other => bail!("daemon returned unexpected setup response: {other:?}"),
+        Response::ExtendedConfigSaved {
+            client_operation_id: returned_operation_id,
+            mutation_intent_hash: returned_intent_hash,
+            layer_id,
+            consumed_revision,
+            status: cockpit_proto::ConfigCommitStatus::Committed,
+            ..
+        } if returned_operation_id == client_operation_id
+            && returned_intent_hash == mutation_intent_hash
+            && layer_id == layer.layer_id
+            && consumed_revision == layer.revision =>
+        {
+            Ok(true)
+        }
+        other => bail!("daemon returned an unbound security settings receipt: {other:?}"),
+    }
+}
+
+#[cfg(not(test))]
+fn provider_view_entry_for_edit(
+    view: &cockpit_proto::ProviderEntryView,
+) -> cockpit_config::config::providers::ProviderEntry {
+    let mut entry = view.entry.clone();
+    entry.headers = view
+        .headers
+        .iter()
+        .map(|header| cockpit_config::config::providers::HeaderSpec {
+            name: header.name.clone(),
+            value: "********".into(),
+        })
+        .collect();
+    entry
+}
+
+fn provider_view_matches_entry(
+    view: &cockpit_proto::ProviderEntryView,
+    expected: &cockpit_config::config::providers::ProviderEntry,
+) -> bool {
+    let expected_headers = expected.headers.clone();
+    let mut expected = expected.clone();
+    expected.url = cockpit_proto::redact_url_for_owner_view(&expected.url);
+    expected.credential_ref = None;
+    expected.headers.clear();
+    serde_json::to_value(expected).ok() == serde_json::to_value(&view.entry).ok()
+        && view.headers.len() == expected_headers.len()
+        && view
+            .headers
+            .iter()
+            .zip(&expected_headers)
+            .all(|(actual, wanted)| {
+                actual.redacted && actual.name.eq_ignore_ascii_case(&wanted.name)
+            })
+}
+
+#[cfg(not(test))]
+async fn apply_model_wizard_via_daemon(
+    cwd: &std::path::Path,
+    run: &WizardRun,
+) -> Result<(bool, bool, Option<String>)> {
+    use cockpit_config::config::providers::{ActiveModelRef, CapabilityStatus};
+
+    let (provider_id, model_id) =
+        cockpit_core::wizard::model_ref_answer(run).context("model answer")?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for model setup")?;
+    let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+    let response = daemon
+        .client
+        .request(Request::GetProviderCatalogSnapshot {
+            project_root: cwd.display().to_string(),
+            provider_id: Some(provider_id.clone()),
+            snapshot_session_id: snapshot_session_id.clone(),
+        })
+        .await?
+        .map_err(|error| anyhow!("daemon rejected model settings snapshot: {error}"))?;
+    let Response::ProviderCatalogSnapshot {
+        config,
+        snapshot_session_id: returned_session_id,
+        layer_id,
+        owner_root,
+        base_revision,
+        config_generation: consumed_config_generation,
+        ..
+    } = response
+    else {
+        bail!("daemon returned unexpected model settings snapshot: {response:?}");
+    };
+    if returned_session_id != snapshot_session_id {
+        bail!("daemon returned an unbound model settings snapshot");
+    }
+    let provider_view = config
+        .providers
+        .get(&provider_id)
+        .with_context(|| format!("provider `{provider_id}` not found"))?;
+    let mut entry = provider_view_entry_for_edit(provider_view);
+    let model = entry
+        .models
+        .iter_mut()
+        .find(|model| model.id == model_id)
+        .with_context(|| format!("model `{provider_id}:{model_id}` not found"))?;
+    let before = serde_json::to_value(&*model)?;
+    if let Some(value) = cockpit_core::wizard::model_class_answer(run) {
+        model.mode = Some(value);
+    }
+    if let Some(value) = cockpit_core::wizard::model_trust_answer(run) {
+        model.trust = Some(value);
+    }
+    let capabilities = cockpit_core::wizard::model_capability_answers(run);
+    let status = |name: &str| {
+        Some(if capabilities.contains(name) {
+            CapabilityStatus::Supported
+        } else {
+            CapabilityStatus::Unsupported
+        })
+    };
+    model.capability_overrides.image_input = status("images");
+    model.capability_overrides.tool_calling = status("tools");
+    model.capability_overrides.reasoning = status("reasoning");
+    model.capability_overrides.structured_outputs = status("structured_outputs");
+    model.capability_overrides.context_tokens =
+        cockpit_core::wizard::model_context_tokens_answer(run);
+    model.capability_overrides.max_output_tokens =
+        cockpit_core::wizard::model_max_output_tokens_answer(run);
+    if let Some(value) = cockpit_core::wizard::model_default_thinking_answer(run) {
+        model.default_thinking_mode = value;
+    }
+    let subagent = cockpit_core::wizard::model_subagent_answers(run);
+    model.subagent_invokable = Some(subagent.contains("subagent_invokable"));
+    model.can_delegate = Some(subagent.contains("can_delegate"));
+    if let Some(value) = cockpit_core::wizard::model_system_prompt_answer(run) {
+        model.system_prompt = value;
+    }
+    let model_changed = before != serde_json::to_value(&*model)?;
+    let active_model =
+        cockpit_core::wizard::model_make_default_answer(run).then(|| ActiveModelRef {
+            provider: provider_id.clone(),
+            model: model_id.clone(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        });
+    let default_changed = active_model
+        .as_ref()
+        .is_some_and(|next| config.active_model.as_ref() != Some(next));
+    if !model_changed && !default_changed {
+        return Ok((false, false, None));
+    }
+    let expected_entry = entry.clone();
+    let mutation = cockpit_proto::ProviderMutationBatch {
+        upserts: model_changed
+            .then(|| cockpit_proto::ProviderMutationUpsert {
+                provider_id: provider_id.clone(),
+                header_secrets: vec![None; entry.headers.len()],
+                entry,
+            })
+            .into_iter()
+            .collect(),
+        deletes: Vec::new(),
+        metadata: default_changed.then(|| cockpit_proto::ProviderLayerMetadataPatch {
+            category_defaults: config.category_defaults.clone(),
+            on_unlisted_models_fetch: config.on_unlisted_models_fetch.unwrap_or_default(),
+            active_model: active_model.clone(),
+        }),
+    };
+    let mutation_intent_hash = mutation
+        .sanitized_intent_hash()
+        .context("identifying model settings mutation")?;
+    let client_operation_id = uuid::Uuid::new_v4().to_string();
+    let response = request_durable_local_mutation(
+        &daemon.client,
+        &client_operation_id,
+        "apply_provider_mutation",
+        Request::ApplyProviderMutation {
+            snapshot_session_id: snapshot_session_id.clone(),
+            layer_id: layer_id.clone(),
+            expected_revision: base_revision.clone(),
+            client_operation_id: client_operation_id.clone(),
+            mutation_intent_hash: mutation_intent_hash.clone(),
+            mutation,
+        },
+    )
+    .await?;
+    match response {
+        Response::ProviderMutationCommitted {
+            client_operation_id: returned_operation_id,
+            snapshot_session_id: returned_session_id,
+            layer_id: returned_layer_id,
+            owner_root: returned_owner_root,
+            mutation_intent_hash: returned_intent_hash,
+            consumed_revision,
+            result_revision,
+            config_generation,
+            config: result,
+            status: cockpit_proto::ConfigCommitStatus::Committed,
+            publication: cockpit_proto::ConfigPublicationStatus::Published,
+            ..
+        } if returned_operation_id == client_operation_id
+            && returned_session_id == snapshot_session_id
+            && returned_layer_id == layer_id
+            && returned_owner_root == owner_root
+            && returned_intent_hash == mutation_intent_hash
+            && consumed_revision == base_revision
+            && is_provider_revision(&result_revision)
+            && result_revision != consumed_revision
+            && config_generation == consumed_config_generation.saturating_add(1)
+            && (!model_changed
+                || result
+                    .providers
+                    .get(&provider_id)
+                    .is_some_and(|view| provider_view_matches_entry(view, &expected_entry)))
+            && (!default_changed || result.active_model == active_model) =>
+        {
+            Ok((
+                true,
+                model_changed,
+                default_changed.then(|| "daemon-selected layer".to_string()),
+            ))
+        }
+        other => bail!("daemon returned an unbound model settings receipt: {other:?}"),
     }
 }
 
@@ -513,8 +868,7 @@ impl ProviderSetupActions {
                 .map(|_| true)
                 .unwrap_or(false);
                 #[cfg(not(test))]
-                let (result, _, _) =
-                    apply_setup_wizard_via_daemon(&self.cwd, "security", run).await?;
+                let result = apply_security_wizard_via_daemon(&self.cwd, run).await?;
                 if result {
                     self.security_saved =
                         Some(cockpit_core::wizard::security_config_path(&self.cwd));
@@ -535,7 +889,7 @@ impl ProviderSetupActions {
                 };
                 #[cfg(not(test))]
                 let (changed, model_file_written, default_scope) =
-                    apply_setup_wizard_via_daemon(&self.cwd, "model", run).await?;
+                    apply_model_wizard_via_daemon(&self.cwd, run).await?;
                 if model_file_written {
                     self.model_saved = Some(self.cwd.join(CONFIG_FILE));
                     io.write_line("Saved model settings through the daemon.")?;
@@ -557,16 +911,17 @@ impl ProviderSetupActions {
     async fn save_provider(&mut self, run: &WizardRun, io: &mut dyn TerminalIo) -> Result<()> {
         let id = provider_id_answer(run).context("provider id answer")?;
         let headers = provider_headers_for_answers(run, &self.headers)?;
-        let entry = provider_entry_from_answers(run, headers).context("provider answers")?;
+        let mut entry = provider_entry_from_answers(run, headers).context("provider answers")?;
         let daemon = ensure_persistent_daemon()
             .await
             .context("starting persistent daemon for provider setup")?;
         // The daemon stages vault bytes and the reference-only config entry
         // under one recoverable journal.  The CLI never allocates predictable
         // vault names or performs a secret/config two-step.
+        let header_reference_notice = env_var_reference_notice(&entry.headers);
         let header_secrets = entry
             .headers
-            .iter()
+            .iter_mut()
             .map(|header| {
                 let value = header.value.trim();
                 // Only literal secret material is owner-remoted. A structurally
@@ -575,34 +930,103 @@ impl ProviderSetupActions {
                 // extracting an env-var reference would replace it with an
                 // opaque `$secret:` vault entry and break the provider's auth.
                 // Mirrors the TUI's `upsert_provider_config_via_daemon` gate.
-                (!value.is_empty()
+                let is_secret = !value.is_empty()
                     && !crate::config::providers::is_safe_provider_header_reference(
                         &header.name.to_ascii_lowercase(),
                         value,
-                    ))
-                .then(|| header.value.clone())
+                    );
+                is_secret.then(|| {
+                    cockpit_proto::ProviderSecretValue::new(std::mem::take(&mut header.value))
+                })
             })
-            .collect();
-        let headers_for_notice = entry.headers.clone();
-        match daemon
+            .collect::<Vec<_>>();
+        let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+        let snapshot = daemon
             .client
-            .request(Request::SaveProviderConfig {
+            .request(Request::GetProviderCatalogSnapshot {
                 project_root: self.cwd.display().to_string(),
+                // A first-time provider has no catalog row to filter by. The
+                // full layer snapshot still issues the exact CAS capability
+                // needed for an add or replacement.
+                provider_id: None,
+                snapshot_session_id: snapshot_session_id.clone(),
+            })
+            .await?
+            .map_err(|error| anyhow!("daemon rejected provider catalog snapshot: {error}"))?;
+        let Response::ProviderCatalogSnapshot {
+            snapshot_session_id: returned_session_id,
+            layer_id,
+            owner_root,
+            base_revision,
+            config_generation: consumed_config_generation,
+            ..
+        } = snapshot
+        else {
+            bail!("daemon returned unexpected provider catalog snapshot: {snapshot:?}");
+        };
+        if returned_session_id != snapshot_session_id {
+            bail!("daemon returned an unbound provider catalog snapshot");
+        }
+        let expected_entry = entry.clone();
+        let mutation = cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
                 provider_id: id.clone(),
                 entry,
                 header_secrets,
-            })
-            .await?
-        {
-            Ok(Response::ProviderConfigUpserted { .. }) => {}
-            Ok(other) => {
-                bail!("daemon returned unexpected response to provider config save: {other:?}")
-            }
-            Err(error) => bail!("daemon rejected provider config save: {error}"),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        };
+        let mutation_intent_hash = mutation
+            .sanitized_intent_hash()
+            .context("identifying provider configuration mutation")?;
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let response = request_durable_local_mutation(
+            &daemon.client,
+            &client_operation_id,
+            "apply_provider_mutation",
+            Request::ApplyProviderMutation {
+                snapshot_session_id: snapshot_session_id.clone(),
+                layer_id: layer_id.clone(),
+                expected_revision: base_revision.clone(),
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash: mutation_intent_hash.clone(),
+                mutation,
+            },
+        )
+        .await?;
+        match response {
+            Response::ProviderMutationCommitted {
+                client_operation_id: returned_operation_id,
+                snapshot_session_id: returned_session_id,
+                layer_id: returned_layer_id,
+                owner_root: returned_owner_root,
+                mutation_intent_hash: returned_intent_hash,
+                consumed_revision,
+                result_revision,
+                config_generation,
+                config,
+                status: cockpit_proto::ConfigCommitStatus::Committed,
+                publication: cockpit_proto::ConfigPublicationStatus::Published,
+                ..
+            } if returned_operation_id == client_operation_id
+                && returned_session_id == snapshot_session_id
+                && returned_layer_id == layer_id
+                && returned_owner_root == owner_root
+                && returned_intent_hash == mutation_intent_hash
+                && consumed_revision == base_revision
+                && is_provider_revision(&result_revision)
+                && result_revision != consumed_revision
+                && config_generation == consumed_config_generation.saturating_add(1)
+                && config
+                    .providers
+                    .get(&id)
+                    .is_some_and(|view| provider_view_matches_entry(view, &expected_entry)) => {}
+            other => bail!("daemon returned an unbound provider configuration receipt: {other:?}"),
         }
         self.saved = Some((id.clone(), self.cwd.join(".cockpit").join(CONFIG_FILE)));
         io.write_line(&format!("Saved provider `{id}`."))?;
-        if let Some(message) = env_var_reference_notice(&headers_for_notice) {
+        if let Some(message) = header_reference_notice {
             io.write_line(&message)?;
         }
         Ok(())

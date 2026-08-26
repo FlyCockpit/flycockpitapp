@@ -8,6 +8,54 @@ use uuid::Uuid;
 use crate::welcome;
 use cockpit_tui::tui::app::{App, StartupWorkspaceTrust};
 
+fn lifecycle_composition() -> (
+    cockpit_client::LifecycleClient,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (client, requests) = cockpit_client::LifecycleClient::channel(16);
+    let task = tokio::spawn(cockpit_core::daemon::client::serve_lifecycle_requests(
+        requests,
+    ));
+    (client, task)
+}
+
+async fn finish_lifecycle(mut task: tokio::task::JoinHandle<anyhow::Result<()>>) -> Result<()> {
+    finish_lifecycle_with_deadline(&mut task, std::time::Duration::from_secs(35)).await
+}
+
+async fn finish_lifecycle_with_deadline(
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    deadline: std::time::Duration,
+) -> Result<()> {
+    match tokio::time::timeout(deadline, &mut *task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(error).context("daemon lifecycle task failed"),
+        Err(_) => {
+            // Aborting only retires the async request actor. Every accepted or
+            // provisional daemon owner is RAII-bound to a process-lifetime OS
+            // reaper/supervisor, so dropping the actor transfers cleanup
+            // rather than cancelling it. Bound the abort acknowledgement too:
+            // top-level CLI exit must never turn 35 seconds into infinity.
+            task.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut *task).await;
+            anyhow::bail!(
+                "daemon lifecycle cleanup exceeded {deadline:?}; ownership transferred to the runtime-independent reaper"
+            )
+        }
+    }
+}
+
+fn combine_app_and_lifecycle(app: Result<()>, lifecycle: Result<()>) -> Result<()> {
+    match (app, lifecycle) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(app), Ok(())) => Err(app),
+        (Ok(()), Err(lifecycle)) => Err(lifecycle),
+        (Err(app), Err(lifecycle)) => {
+            anyhow::bail!("application failed: {app:#}; daemon lifecycle failed: {lifecycle:#}")
+        }
+    }
+}
+
 pub async fn run(
     project: Option<&Path>,
     no_sandbox: bool,
@@ -20,9 +68,12 @@ pub async fn run(
 
     let trust = prepare_tui_workspace_trust(project)?;
 
-    let mut app =
-        App::new_with_workspace_trust_and_launch_start(project, no_sandbox, trust, launch_start);
-    app.run().await
+    let (lifecycle, lifecycle_task) = lifecycle_composition();
+    let mut app = App::new_composed(project, no_sandbox, trust, launch_start, lifecycle);
+    let result = app.run().await;
+    drop(app);
+    let lifecycle_result = finish_lifecycle(lifecycle_task).await;
+    combine_app_and_lifecycle(result, lifecycle_result)
 }
 
 pub async fn run_with_session(
@@ -44,10 +95,19 @@ pub async fn run_with_session(
 
     let trust = prepare_tui_workspace_trust(project)?;
 
-    let mut app =
-        App::new_with_session_and_launch_start(project, no_sandbox, session_id, launch_start);
-    app.set_startup_workspace_trust(trust);
-    app.run().await
+    let (lifecycle, lifecycle_task) = lifecycle_composition();
+    let mut app = App::new_composed_with_session(
+        project,
+        no_sandbox,
+        trust,
+        session_id,
+        launch_start,
+        lifecycle,
+    );
+    let result = app.run().await;
+    drop(app);
+    let lifecycle_result = finish_lifecycle(lifecycle_task).await;
+    combine_app_and_lifecycle(result, lifecycle_result)
 }
 
 fn prepare_tui_workspace_trust(project: Option<&Path>) -> Result<StartupWorkspaceTrust> {
@@ -68,6 +128,32 @@ mod tests {
     use super::*;
     use crate::config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
     use cockpit_test_support::TestEnvGuard;
+
+    #[tokio::test]
+    async fn wedged_lifecycle_actor_is_bounded_and_drops_its_owner() {
+        struct DropNotice(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropNotice {
+            fn drop(&mut self) {
+                if let Some(notice) = self.0.take() {
+                    let _ = notice.send(());
+                }
+            }
+        }
+
+        let (dropped, drop_notice) = tokio::sync::oneshot::channel();
+        let mut task = tokio::spawn(async move {
+            let _owner = DropNotice(Some(dropped));
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        });
+        let result =
+            finish_lifecycle_with_deadline(&mut task, std::time::Duration::from_millis(10)).await;
+        assert!(result.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(1), drop_notice)
+            .await
+            .expect("wedged lifecycle owner was not transferred/dropped")
+            .expect("drop notice sender disappeared");
+    }
 
     fn write_provider_config(cwd: &Path) {
         let cockpit = cwd.join(".cockpit");

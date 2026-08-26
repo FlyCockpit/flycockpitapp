@@ -73,15 +73,16 @@ pub fn seed_identity_files(home_dir: &Path) -> Result<()> {
 }
 
 fn seed_file(path: &Path, body: &str) -> Result<()> {
-    if crate::private_fs::read_private_file(path, "assistant identity")?.is_some() {
+    if cockpit_host::private_fs::read_private_file(path, "assistant identity")?.is_some() {
         return Ok(());
     }
-    match crate::private_fs::write_private_file_exclusive(path, body.as_bytes()) {
+    match cockpit_host::private_fs::write_private_file_exclusive(path, body.as_bytes()) {
         Ok(()) => Ok(()),
         // Another creator may have won the exclusive publish. Accept only an
         // audited no-follow re-open of the resulting private regular file.
         Err(error)
-            if crate::private_fs::read_private_file(path, "assistant identity")?.is_some() =>
+            if cockpit_host::private_fs::read_private_file(path, "assistant identity")?
+                .is_some() =>
         {
             tracing::debug!(path = %path.display(), %error, "identity seed already published");
             Ok(())
@@ -92,7 +93,7 @@ fn seed_file(path: &Path, body: &str) -> Result<()> {
 
 pub fn hash_optional_file(path: &Path) -> Result<Option<String>> {
     Ok(
-        crate::private_fs::read_private_file(path, "assistant identity")?
+        cockpit_host::private_fs::read_private_file(path, "assistant identity")?
             .map(|bytes| crate::assistants::sha256_hex(&bytes)),
     )
 }
@@ -181,27 +182,8 @@ fn update_identity_hashes_cas_blocking(
     expected: AssistantRow,
     config_json: String,
 ) -> Result<AssistantRow> {
-    serde_json::from_str::<serde_json::Value>(&config_json)
-        .context("assistant config must be valid JSON")?;
     db.write_blocking(move |conn| {
-        let changed = conn.execute(
-            "UPDATE assistants SET config_json = ?6
-             WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
-               AND config_json = ?4 AND content_hash = ?5",
-            rusqlite::params![
-                expected.name,
-                expected.created_at,
-                expected.home_dir,
-                expected.config_json,
-                expected.content_hash,
-                config_json,
-            ],
-        )?;
-        if changed != 1 {
-            anyhow::bail!("assistant registry changed while identity files were read");
-        }
-        crate::db::Db::get_assistant_conn(conn, &expected.name)?
-            .context("assistant disappeared after identity hash update")
+        crate::db::Db::update_assistant_identity_hashes_cas_conn(conn, expected, &config_json)
     })
 }
 
@@ -225,8 +207,8 @@ struct IdentityPiece {
 }
 
 fn load_piece(path: &Path, label: &'static str, max_tokens: usize) -> Result<IdentityPiece> {
-    let bytes =
-        crate::private_fs::read_private_file(path, "assistant identity")?.unwrap_or_default();
+    let bytes = cockpit_host::private_fs::read_private_file(path, "assistant identity")?
+        .unwrap_or_default();
     let hash = if bytes.is_empty() {
         None
     } else {

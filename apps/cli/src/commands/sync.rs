@@ -82,7 +82,7 @@ async fn status() -> Result<()> {
         Ok(Ok(Response::FlycockpitAccount { account })) => account,
         _ => None,
     };
-    let connector = fetch_connector_state(&daemon).await?;
+    let connector = fetch_connector_state(&daemon.client).await?;
     let (current_server, current_instance) = match &account {
         Some(account) => (
             Some(account.server_url.as_str()),
@@ -108,10 +108,9 @@ async fn status() -> Result<()> {
 /// failures instead of downgrading them to a benign "inactive". The daemon
 /// emits `null` when no connector row exists yet — the only legitimate `None`.
 async fn fetch_connector_state(
-    daemon: &crate::daemon::client::ConnectedDaemon,
+    client: &cockpit_client::DaemonClient,
 ) -> Result<Option<ConnectorForSync>> {
-    let Response::ConnectorState { connector_json } = daemon
-        .client
+    let Response::ConnectorState { connector_json } = client
         .request(Request::GetConnectorState)
         .await
         .context("requesting FlyCockpit connector state from daemon")?

@@ -14,31 +14,25 @@ fn valid_settlement_request_hash(value: &str) -> bool {
 }
 
 async fn oauth_settlement(
-    client: &cockpit_core::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     client_operation_id: String,
-) -> anyhow::Result<
-    Result<cockpit_core::daemon::proto::Response, cockpit_core::daemon::proto::ErrorPayload>,
-> {
+) -> anyhow::Result<Result<cockpit_proto::Response, cockpit_proto::ErrorPayload>> {
     const ATTEMPTS: usize = 3;
     for attempt in 0..ATTEMPTS {
         let response = tokio::time::timeout(
             OAUTH_SETTLEMENT_TIMEOUT,
-            client.request(
-                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
-                    client_operation_id: client_operation_id.clone(),
-                },
-            ),
+            client.request(cockpit_proto::Request::GetLocalOperationSettlement {
+                client_operation_id: client_operation_id.clone(),
+            }),
         )
         .await;
         if let Ok(result) = response {
             if !matches!(
                 result,
-                Ok(Ok(
-                    cockpit_core::daemon::proto::Response::LocalOperationSettlement {
-                        pending: true,
-                        ..
-                    }
-                ))
+                Ok(Ok(cockpit_proto::Response::LocalOperationSettlement {
+                    pending: true,
+                    ..
+                }))
             ) || attempt + 1 == ATTEMPTS
             {
                 return result;
@@ -88,16 +82,17 @@ fn oauth_begin_operation_id(
 }
 
 async fn begin_provider_oauth(
+    lifecycle: cockpit_client::LifecycleClient,
     provider_id: &str,
     client_operation_id: String,
 ) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
     let expected_hash = oauth_request_hash(&("begin_provider_oauth", provider_id))?;
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|e| e.to_string())?;
     let response = tokio::time::timeout(
         OAUTH_BEGIN_TIMEOUT,
-        client.request(cockpit_core::daemon::proto::Request::BeginProviderOAuth {
+        client.request(cockpit_proto::Request::BeginProviderOAuth {
             client_operation_id: client_operation_id.clone(),
             provider_id: provider_id.to_string(),
         }),
@@ -114,7 +109,7 @@ async fn begin_provider_oauth(
         ),
     };
     match response.map_err(|e: anyhow::Error| e.to_string())? {
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -126,7 +121,7 @@ async fn begin_provider_oauth(
             && valid_settlement_request_hash(&settlement_hash) =>
         {
             match *response {
-                cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+                cockpit_proto::Response::ProviderOAuthStarted {
                     client_operation_id: receipt_operation_id,
                     request_hash,
                     flow_id,
@@ -146,7 +141,7 @@ async fn begin_provider_oauth(
                 ))),
             }
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -160,7 +155,7 @@ async fn begin_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+        Ok(cockpit_proto::Response::ProviderOAuthStarted {
             client_operation_id: receipt_operation_id,
             request_hash,
             flow_id,
@@ -173,7 +168,7 @@ async fn begin_provider_oauth(
                 user_code,
             })
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -195,11 +190,12 @@ async fn begin_provider_oauth(
 }
 
 async fn complete_provider_oauth(
+    lifecycle: cockpit_client::LifecycleClient,
     client_operation_id: String,
     flow_id: String,
     input: Option<zeroize::Zeroizing<String>>,
 ) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|e| e.to_string())?;
     let expected_hash = oauth_request_hash(&(
@@ -207,7 +203,7 @@ async fn complete_provider_oauth(
         &client_operation_id,
         &flow_id,
     ))?;
-    let request = cockpit_core::daemon::proto::Request::CompleteProviderOAuth {
+    let request = cockpit_proto::Request::CompleteProviderOAuth {
         client_operation_id: client_operation_id.clone(),
         flow_id: flow_id.clone(),
         input: input
@@ -225,7 +221,7 @@ async fn complete_provider_oauth(
         ),
     };
     match response.map_err(|e: anyhow::Error| e.to_string())? {
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -237,7 +233,7 @@ async fn complete_provider_oauth(
             && valid_settlement_request_hash(&settlement_hash) =>
         {
             match *response {
-                cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
+                cockpit_proto::Response::ProviderOAuthCompleted {
                     client_operation_id: receipt_operation_id,
                     request_hash,
                     flow_id: receipt_flow_id,
@@ -254,7 +250,7 @@ async fn complete_provider_oauth(
                 ))),
             }
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -268,7 +264,7 @@ async fn complete_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
+        Ok(cockpit_proto::Response::ProviderOAuthCompleted {
             client_operation_id: receipt_operation_id,
             request_hash,
             flow_id: receipt_flow_id,
@@ -280,7 +276,7 @@ async fn complete_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -302,6 +298,7 @@ async fn complete_provider_oauth(
 }
 
 async fn cancel_provider_oauth(
+    lifecycle: cockpit_client::LifecycleClient,
     client_operation_id: String,
     begin_client_operation_id: String,
     flow_id: Option<String>,
@@ -311,12 +308,12 @@ async fn cancel_provider_oauth(
         &begin_client_operation_id,
         &flow_id,
     ))?;
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|e| e.to_string())?;
     let response = tokio::time::timeout(
         OAUTH_CANCEL_TIMEOUT,
-        client.request(cockpit_core::daemon::proto::Request::CancelProviderOAuth {
+        client.request(cockpit_proto::Request::CancelProviderOAuth {
             client_operation_id: client_operation_id.clone(),
             begin_client_operation_id: begin_client_operation_id.clone(),
             flow_id: flow_id.clone(),
@@ -332,7 +329,7 @@ async fn cancel_provider_oauth(
         },
     };
     match response {
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -344,7 +341,7 @@ async fn cancel_provider_oauth(
             && settlement_hash == expected_hash =>
         {
             match *response {
-                cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                cockpit_proto::Response::ProviderOAuthCancelled {
                     client_operation_id: receipt_operation_id,
                     request_hash,
                     flow_id: receipt_flow_id,
@@ -355,7 +352,7 @@ async fn cancel_provider_oauth(
                 {
                     Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
                 }
-                cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                cockpit_proto::Response::ProviderOAuthCancelled {
                     client_operation_id: receipt_operation_id,
                     request_hash,
                     flow_id: receipt_flow_id,
@@ -371,7 +368,7 @@ async fn cancel_provider_oauth(
                 ))),
             }
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -385,7 +382,7 @@ async fn cancel_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+        Ok(cockpit_proto::Response::ProviderOAuthCancelled {
             client_operation_id: receipt_operation_id,
             request_hash,
             flow_id: receipt_flow_id,
@@ -396,7 +393,7 @@ async fn cancel_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
         }
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+        Ok(cockpit_proto::Response::ProviderOAuthCancelled {
             client_operation_id: receipt_operation_id,
             request_hash,
             flow_id: receipt_flow_id,
@@ -407,7 +404,7 @@ async fn cancel_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -436,53 +433,6 @@ fn oauth_request_hash<T: serde::Serialize>(value: &T) -> Result<String, String> 
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
-}
-
-fn provider_usage_from_wire(
-    row: cockpit_core::daemon::proto::ProviderUsageSnapshotView,
-) -> cockpit_core::providers::usage::ProviderUsageSnapshot {
-    use cockpit_core::daemon::proto::ProviderUsageAvailabilityView as Wire;
-    use cockpit_core::providers::usage::{ProviderUsageSnapshot, UsageAvailability, UsageWindow};
-
-    let availability = match row.availability {
-        Wire::Fetched {
-            source: _,
-            plan,
-            windows,
-            details,
-        } => UsageAvailability::Fetched {
-            // The core renderer only uses this as a diagnostic label. Wire
-            // values are daemon-defined, so retain the conservative static
-            // label instead of inventing a leaked remote payload.
-            source: "daemon",
-            plan,
-            windows: windows
-                .into_iter()
-                .map(|window| UsageWindow {
-                    label: window.label,
-                    used_percent: window.used_percent,
-                    reset_at: window.reset_at,
-                    detail: window.detail,
-                })
-                .collect(),
-            details,
-        },
-        Wire::Unsupported { reason: _ } => UsageAvailability::Unsupported {
-            // This legacy local rendering type uses a static reason; detailed
-            // daemon data is intentionally not required for this state.
-            reason: "unsupported by provider",
-        },
-        Wire::Unavailable { reason, hint_url } => {
-            UsageAvailability::Unavailable { reason, hint_url }
-        }
-        Wire::Error { message } => UsageAvailability::Error { message },
-    };
-    ProviderUsageSnapshot {
-        provider_id: row.provider_id,
-        display_name: row.display_name,
-        fetched_at: row.fetched_at,
-        availability,
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -560,6 +510,7 @@ impl App {
     }
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
+        self.start_pending_image_ingress_discards();
         self.start_pending_goal_settings_effect();
         self.start_pending_tools_effect();
         self.start_pending_settings_daemon_effects();
@@ -579,12 +530,13 @@ impl App {
             .filter(|result| {
                 matches!(
                     result.kind,
-                    AsyncActionKind::Blocking("settings.blocking-effect")
+                    AsyncActionKind::Blocking("settings.blocking-effect" | "settings.path-suggest")
                 )
             })
             .map(|result| AsyncActionResult {
                 id: result.id,
                 kind: result.kind.clone(),
+                presentation_stale: result.presentation_stale,
                 payload: Err("operation cancelled".into()),
             })
             .collect::<Vec<_>>();
@@ -639,6 +591,82 @@ impl App {
         changed
     }
 
+    fn start_pending_image_ingress_discards(&mut self) {
+        let mut retained = self
+            .composer
+            .image_ingress_drafts()
+            .into_iter()
+            .map(|draft| draft.admission_id)
+            .collect::<std::collections::HashSet<_>>();
+        for fence in self.submission_fences.values() {
+            let possibly_sent =
+                fence.lifecycle == crate::tui::structured_paste::FenceLifecycle::PossiblySent;
+            if possibly_sent {
+                for draft in &fence.retained_drafts {
+                    self.image_ingress_draft_discards
+                        .remove(&draft.admission_id);
+                }
+            } else {
+                retained.extend(fence.retained_drafts.iter().map(|draft| draft.admission_id));
+            }
+            for slot in &fence.slots {
+                if let crate::tui::structured_paste::PasteSlotState::Ready {
+                    image:
+                        Some(crate::tui::structured_paste::PasteImageAdmission::Handle {
+                            draft, ..
+                        }),
+                    ..
+                } = slot
+                {
+                    if possibly_sent && fence.model.supports_images {
+                        self.image_ingress_draft_discards
+                            .remove(&draft.admission_id);
+                    } else if !possibly_sent {
+                        retained.insert(draft.admission_id);
+                    }
+                }
+            }
+        }
+        let pending = self
+            .image_ingress_draft_discards
+            .iter_mut()
+            .filter_map(|(_, (draft, in_flight))| {
+                (!*in_flight && !retained.contains(&draft.admission_id)).then(|| {
+                    *in_flight = true;
+                    draft.clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        for draft in pending {
+            let request = cockpit_proto::Request::DiscardImageIngressDraft {
+                session_id: draft.session_id,
+                admission_id: draft.admission_id,
+                local_operation_id: draft.local_operation_id,
+            };
+            let lifecycle = self.lifecycle.clone();
+            self.async_actions.start(
+                AsyncActionKind::DaemonRpc("paste.image_ingress_discard"),
+                AsyncActionPolicy::AllowConcurrent,
+                async move {
+                    let response = async {
+                        let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        client
+                            .request(request)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .map_err(|error| error.to_string())
+                    }
+                    .await;
+                    Ok(AsyncActionPayload::ImageIngressDraftDiscard(
+                        super::ImageIngressDraftDiscardCompletion { draft, response },
+                    ))
+                },
+            );
+        }
+    }
+
     fn start_pending_goal_settings_effect(&mut self) {
         let effect = match &mut self.overlay {
             Overlay::GoalSettings(pane) => pane.take_effect(),
@@ -652,12 +680,13 @@ impl App {
         let project_root = effect.project_root;
         let expected_revision = effect.expected_revision;
         let request = effect.request;
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("goal-settings.effect"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
                 let response = async {
-                    let client = crate::tui::settings::settings_daemon_client()
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                         .await
                         .map_err(|error| error.to_string())?;
                     client
@@ -693,12 +722,13 @@ impl App {
         let project_root = effect.project_root;
         let expected_revision = effect.expected_revision;
         let request = effect.request;
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("tools.effect"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
                 let response = async {
-                    let client = crate::tui::settings::settings_daemon_client()
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                         .await
                         .map_err(|error| error.to_string())?;
                     client
@@ -722,16 +752,19 @@ impl App {
     }
 
     fn start_pending_settings_daemon_effects(&mut self) {
+        self.dialog.bind_lifecycle(self.lifecycle.clone());
         while let Some(effect) = self.dialog.take_settings_daemon_effect() {
             let dialog_id = effect.dialog_id;
             let operation_id = effect.operation_id;
             let target = effect.target;
             let work = effect.work;
+            let lifecycle = self.lifecycle.clone();
             self.async_actions.start(
                 AsyncActionKind::DaemonRpc("settings.effect"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
-                    let outcome = crate::tui::settings::execute_settings_daemon_work(work).await;
+                    let outcome =
+                        crate::tui::settings::execute_settings_daemon_work(work, lifecycle).await;
                     let (response, authoritative_rejection, committed_refresh_needed) =
                         match outcome {
                             Ok(outcome) => (
@@ -762,6 +795,7 @@ impl App {
             let operation_id = effect.operation_id;
             let target = effect.target;
             let work = effect.work;
+            let action_label = work.action_label();
             let metadata = crate::tui::settings::SettingsBlockingEffectMetadata {
                 dialog_id,
                 operation_id,
@@ -770,7 +804,7 @@ impl App {
             let action_id = self
                 .async_actions
                 .start_blocking(
-                    AsyncActionKind::Blocking("settings.blocking-effect"),
+                    AsyncActionKind::Blocking(action_label),
                     AsyncActionPolicy::AllowConcurrent,
                     move || {
                         let outcome = crate::tui::settings::execute_settings_blocking_work(work);
@@ -797,12 +831,13 @@ impl App {
         let operation_id = effect.operation_id;
         let target = effect.target;
         let request = effect.request;
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("sessions.mutation"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
                 let response = async {
-                    let client = crate::tui::settings::settings_daemon_client()
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                         .await
                         .map_err(|error| error.to_string())?;
                     client
@@ -825,11 +860,23 @@ impl App {
     }
 
     pub(super) fn apply_async_action_result(&mut self, result: AsyncActionResult) {
+        if result.presentation_stale && !stale_completion_requires_reducer(&result.kind) {
+            // The runner has consumed the terminal completion and released its
+            // process authority. Nothing in these handlers owns additional
+            // correlated state; running them would only publish output into a
+            // replacement view. Mouse copy is the one presentation-only host
+            // action with a local gesture record to retire.
+            if matches!(result.kind, AsyncActionKind::Blocking("mouse.copy")) {
+                self.pending_mouse_copies.remove(&result.id);
+            }
+            return;
+        }
         // Provisional `/new` owns a cleared view. Only the switch/resume
         // settlement path and outgoing delivery-receipt fence bookkeeping may
         // run; every other completion is presentation noise from the discarded
         // transcript (including Blocking timeouts that bypass view-generation).
-        if self.provisional_new_session
+        if (result.presentation_stale || self.provisional_new_session)
+            && result.kind.authority() == crate::tui::async_action::AsyncActionAuthority::ReadOnly
             && !matches!(
                 result.kind,
                 AsyncActionKind::Internal(
@@ -838,12 +885,6 @@ impl App {
                     | AsyncActionKind::DaemonRpc("sealed.effect" | "mcp.local")
             )
         {
-            if matches!(
-                result.kind,
-                AsyncActionKind::Blocking("settings.blocking-effect")
-            ) {
-                self.settings_blocking_actions.remove(&result.id);
-            }
             return;
         }
         match result.kind {
@@ -858,7 +899,7 @@ impl App {
                     self.dialog.apply_settings_daemon_completion(completion);
                 }
             }
-            AsyncActionKind::Blocking("settings.blocking-effect") => {
+            AsyncActionKind::Blocking("settings.blocking-effect" | "settings.path-suggest") => {
                 let metadata = self.settings_blocking_actions.remove(&result.id);
                 let completion = match result.payload {
                     Ok(AsyncActionPayload::SettingsBlocking(completion)) => Some(completion),
@@ -935,6 +976,32 @@ impl App {
                     self.apply_mcp_local_cancellation(result.id);
                 }
             }
+            AsyncActionKind::DaemonRpc("paste.image_ingress_discard") => {
+                if let Ok(AsyncActionPayload::ImageIngressDraftDiscard(completion)) = result.payload
+                {
+                    let terminal = matches!(
+                        &completion.response,
+                        Ok(cockpit_proto::Response::LocalMediaMutation(receipt))
+                            if receipt.schema_version == 1
+                                && receipt.kind == "localMediaMutationReceipt"
+                                && receipt.local_operation_id
+                                    == completion.draft.local_operation_id
+                                && receipt.action == "discard"
+                                && receipt.subject_id == completion.draft.attachment_id
+                                && receipt.discard_result.is_some()
+                    );
+                    if terminal {
+                        self.image_ingress_draft_discards
+                            .remove(&completion.draft.admission_id);
+                    } else if let Some((owned, in_flight)) = self
+                        .image_ingress_draft_discards
+                        .get_mut(&completion.draft.admission_id)
+                        && *owned == completion.draft
+                    {
+                        *in_flight = false;
+                    }
+                }
+            }
             AsyncActionKind::DaemonRpc("btw.resolve-interrupt") => match result.payload {
                 Ok(AsyncActionPayload::Unit) => {}
                 Ok(_) => self.push_plain("question: unexpected daemon response".to_string()),
@@ -1000,8 +1067,12 @@ impl App {
             }
             AsyncActionKind::DaemonRpc("skills.list") => {
                 if let Ok(AsyncActionPayload::Skills(result)) = result.payload {
-                    if let Some(bundle) = result.bundle.clone() {
-                        self.apply_inventory_bundle_response(bundle);
+                    let owns_result = matches!(
+                        &self.overlay,
+                        Overlay::Skills(pane) if pane.owns_fetch_generation(result.generation)
+                    );
+                    if !owns_result {
+                        return;
                     }
                     if let Overlay::Skills(pane) = &mut self.overlay {
                         pane.apply_fetch_result(result);
@@ -1034,57 +1105,85 @@ impl App {
                     self.apply_startup_guidance_estimate(cwd, active_model, estimate);
                 }
             }
-            AsyncActionKind::Internal("paste.image_path_probe") => match result.payload {
-                Ok(AsyncActionPayload::ImagePathProbe {
-                    request_id,
-                    request_generation,
-                    terminal_generation,
-                    original: _,
-                    source_draft_generation,
-                    cursor,
-                    png: Some(png),
-                }) if terminal_generation == self.terminal_input_generation => {
-                    self.settle_paste_probe(
+            AsyncActionKind::DaemonRpc("paste.image_path_admission") => {
+                let presentation_stale = result.presentation_stale;
+                let action_id = result.id;
+                match result.payload {
+                    Ok(AsyncActionPayload::ImagePathProbe {
                         request_id,
                         request_generation,
+                        terminal_generation,
+                        original: _,
                         source_draft_generation,
                         cursor,
-                        Some(png),
-                        false,
-                    );
-                }
-                Ok(AsyncActionPayload::ImagePathProbe {
-                    request_id,
-                    request_generation,
-                    terminal_generation,
-                    original: _,
-                    source_draft_generation,
-                    cursor: _,
-                    png: None,
-                }) if terminal_generation == self.terminal_input_generation => {
-                    self.settle_paste_probe(
+                        admission: Some(admission),
+                    }) if terminal_generation == self.terminal_input_generation => {
+                        self.settle_paste_probe(
+                            request_id,
+                            request_generation,
+                            source_draft_generation,
+                            cursor,
+                            Some(admission),
+                            false,
+                        );
+                    }
+                    Ok(AsyncActionPayload::ImagePathProbe {
                         request_id,
                         request_generation,
+                        terminal_generation,
+                        original: _,
                         source_draft_generation,
-                        0,
-                        None,
-                        true,
-                    );
-                }
-                Err(_) => {
-                    let caps = self.refresh_host_capabilities();
-                    let media = caps.feature(cockpit_core::host_capabilities::FEATURE_MEDIA_DECODE);
-                    if media.is_none_or(|row| !row.state.is_available()) {
-                        self.show_toast(
-                            crate::tui::capability_gate::media_decode_instruct(&caps).display(),
-                            ToastKind::Error,
+                        cursor: _,
+                        admission: None,
+                    }) if terminal_generation == self.terminal_input_generation => {
+                        self.settle_paste_probe(
+                            request_id,
+                            request_generation,
+                            source_draft_generation,
+                            0,
+                            None,
+                            true,
                         );
-                    } else {
-                        self.show_toast("Paste unavailable", ToastKind::Error);
                     }
+                    Err(_) => {
+                        if let Some((request_id, request_generation, source_draft_generation)) =
+                            self.pending_paste_probes
+                                .iter()
+                                .find_map(|(request_id, probe)| {
+                                    (probe.async_action_id == Some(action_id)).then_some((
+                                        *request_id,
+                                        probe.request.paste_generation,
+                                        probe.source_draft_generation,
+                                    ))
+                                })
+                        {
+                            self.settle_paste_probe(
+                                request_id,
+                                request_generation,
+                                source_draft_generation,
+                                0,
+                                None,
+                                !presentation_stale,
+                            );
+                        }
+                        if presentation_stale {
+                            return;
+                        }
+                        let caps = self.refresh_host_capabilities();
+                        let media =
+                            caps.feature(cockpit_core::host_capabilities::FEATURE_MEDIA_DECODE);
+                        if media.is_none_or(|row| !row.state.is_available()) {
+                            self.show_toast(
+                                crate::tui::capability_gate::media_decode_instruct(&caps).display(),
+                                ToastKind::Error,
+                            );
+                        } else {
+                            self.show_toast("Paste unavailable", ToastKind::Error);
+                        }
+                    }
+                    Ok(_) => {}
                 }
-                Ok(_) => {}
-            },
+            }
             AsyncActionKind::Internal("paste.native_image") => match result.payload {
                 Ok(AsyncActionPayload::NativeImagePaste {
                     request_id,
@@ -1092,7 +1191,7 @@ impl App {
                     terminal_generation,
                     source_draft_generation,
                     cursor,
-                    png: Some(png),
+                    admission: Some(admission),
                 }) if terminal_generation == self.terminal_input_generation => {
                     self.terminal_paste_classifier.resolve_shortcut_intent();
                     self.settle_paste_probe(
@@ -1100,7 +1199,7 @@ impl App {
                         request_generation,
                         source_draft_generation,
                         cursor,
-                        Some(png),
+                        Some(admission),
                         false,
                     );
                 }
@@ -1112,7 +1211,7 @@ impl App {
                     request_generation,
                     terminal_generation,
                     source_draft_generation,
-                    png: None,
+                    admission: None,
                     ..
                 }) if terminal_generation == self.terminal_input_generation => {
                     self.settle_paste_probe(
@@ -1134,8 +1233,7 @@ impl App {
                 }) = result.payload
                 {
                     match result {
-                        Ok(cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Pending)
-                        | Err(_) => {
+                        Ok(cockpit_proto::ClientSubmissionReceiptStatus::Pending) | Err(_) => {
                             if let Some(record) = self
                                 .delivery_unconfirmed_records
                                 .get_mut(&client_submission_id)
@@ -1150,15 +1248,17 @@ impl App {
                         }
                         Ok(status) => {
                             let (outcome, wire_fingerprint) = match status {
-                                cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Accepted {
+                                cockpit_proto::ClientSubmissionReceiptStatus::Accepted {
                                     wire_fingerprint,
                                     ..
                                 } => ("accepted".to_string(), wire_fingerprint),
-                                cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Terminal {
+                                cockpit_proto::ClientSubmissionReceiptStatus::Terminal {
                                     disposition,
                                     wire_fingerprint,
                                 } => (disposition, wire_fingerprint),
-                                cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Pending => unreachable!(),
+                                cockpit_proto::ClientSubmissionReceiptStatus::Pending => {
+                                    unreachable!()
+                                }
                             };
                             if let Some(record) = self
                                 .delivery_unconfirmed_records
@@ -1274,7 +1374,7 @@ impl App {
                     self.flush_pending_session_switch_submissions();
                     self.push_plain(format!("/fork: switched to fork {fork_short_id}."));
                     if let Some(seed) = seed_composer {
-                        self.composer.set(seed);
+                        self.replace_composer_buffer(seed);
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                 }
@@ -1316,7 +1416,7 @@ impl App {
                 }
                 Err(error) => {
                     if let Some(side) = self.side_conversation.take() {
-                        let discard_socket = side.socket.clone();
+                        let discard_endpoint = side.endpoint.clone();
                         let discard_session_id = side.side_session_id;
                         self.restore_side_snapshot(side);
                         self.async_actions.start_blocking(
@@ -1324,7 +1424,7 @@ impl App {
                             AsyncActionPolicy::AllowConcurrent,
                             move || {
                                 agent_runner::discard_session_blocking(
-                                    &discard_socket,
+                                    &discard_endpoint,
                                     discard_session_id,
                                 )
                                 .map(|_| AsyncActionPayload::Unit)
@@ -1439,6 +1539,24 @@ impl App {
                     pane.apply_fetch_result(result);
                 }
             }
+            AsyncActionKind::DaemonRpc("git.diff") => {
+                if let Overlay::Diff(pane) = &mut self.overlay
+                    && let Ok(AsyncActionPayload::GitDiff(result)) = result.payload
+                {
+                    pane.apply_fetch_result(result);
+                }
+            }
+            AsyncActionKind::DaemonRpc("git.review_sources") => {
+                if let Overlay::Multireview(dialog) = &mut self.overlay
+                    && let Ok(AsyncActionPayload::GitReviewSources(completion)) = result.payload
+                {
+                    dialog.apply_git_sources(completion);
+                    if let Some(kickoff) = dialog.take_done() {
+                        self.overlay = Overlay::None;
+                        self.start_multireview(kickoff.prompt);
+                    }
+                }
+            }
             AsyncActionKind::Internal("subagent.history") => {
                 if let Ok(AsyncActionPayload::SubagentHistory {
                     session_id,
@@ -1459,19 +1577,19 @@ impl App {
                     );
                 }
             }
-            AsyncActionKind::Refresh("provider.usage") => match result.payload {
-                Ok(AsyncActionPayload::ProviderUsage(rows)) => {
-                    self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::open(rows));
+            AsyncActionKind::Refresh("provider.usage") => {
+                if let Overlay::Usage(pane) = &mut self.overlay {
+                    match result.payload {
+                        Ok(AsyncActionPayload::ProviderUsage {
+                            pane_generation,
+                            result,
+                        }) if pane_generation == pane.generation() => pane.apply_result(result),
+                        Ok(AsyncActionPayload::ProviderUsage { .. }) => {}
+                        Ok(_) => pane.apply_result(Err("unexpected usage response".to_string())),
+                        Err(e) => pane.apply_result(Err(e)),
+                    }
                 }
-                Ok(_) => {
-                    self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::error(
-                        "unexpected usage response".to_string(),
-                    ));
-                }
-                Err(e) => {
-                    self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::error(e));
-                }
-            },
+            }
             AsyncActionKind::Internal("paste.token_count") => match result.payload {
                 Ok(AsyncActionPayload::PasteTokenCount { block_id, tokens }) => {
                     self.apply_paste_token_count(block_id, tokens);
@@ -1546,7 +1664,11 @@ impl App {
             AsyncActionKind::DaemonRpc("resources.snapshot") => {
                 if let Overlay::Resources(pane) = &mut self.overlay {
                     let payload = match result.payload {
-                        Ok(AsyncActionPayload::ResourceSnapshot(snapshot)) => Ok(snapshot),
+                        Ok(AsyncActionPayload::ResourceSnapshot {
+                            pane_generation,
+                            result,
+                        }) if pane_generation == pane.generation() => result,
+                        Ok(AsyncActionPayload::ResourceSnapshot { .. }) => return,
                         Ok(_) => Err("unexpected daemon response".to_string()),
                         Err(e) => Err(e),
                     };
@@ -1555,24 +1677,21 @@ impl App {
             }
             AsyncActionKind::DaemonRpc("resources.promote") => match result.payload {
                 Ok(AsyncActionPayload::PromoteResource {
+                    pane_generation,
                     status,
                     message,
                     snapshot,
                 }) => {
-                    if let Overlay::Resources(pane) = &mut self.overlay {
+                    if let Overlay::Resources(pane) = &mut self.overlay
+                        && pane_generation == Some(pane.generation())
+                    {
                         pane.apply_snapshot_result(Ok(snapshot));
                     }
                     let kind = match status {
-                        cockpit_core::daemon::proto::ResourcePromoteStatus::Promoted => {
-                            ToastKind::Success
-                        }
-                        cockpit_core::daemon::proto::ResourcePromoteStatus::NotQueued
-                        | cockpit_core::daemon::proto::ResourcePromoteStatus::NotFound => {
-                            ToastKind::Info
-                        }
-                        cockpit_core::daemon::proto::ResourcePromoteStatus::Disabled => {
-                            ToastKind::Warning
-                        }
+                        cockpit_proto::ResourcePromoteStatus::Promoted => ToastKind::Success,
+                        cockpit_proto::ResourcePromoteStatus::NotQueued
+                        | cockpit_proto::ResourcePromoteStatus::NotFound => ToastKind::Info,
+                        cockpit_proto::ResourcePromoteStatus::Disabled => ToastKind::Warning,
                     };
                     self.show_toast(message, kind);
                 }
@@ -1581,15 +1700,26 @@ impl App {
                 }
                 Err(e) => self.show_toast(format!("/resources: {e}"), ToastKind::Error),
             },
-            AsyncActionKind::Internal("notes.rpc") => {
-                if let Overlay::Notes(pane) = &mut self.overlay {
-                    let payload = match result.payload {
-                        Ok(AsyncActionPayload::NotesRpc(result)) => Ok(result),
-                        Ok(_) => Err("notes db returned an unexpected response".to_string()),
-                        Err(e) => Err(e),
-                    };
-                    pane.apply_rpc_result(payload);
-                }
+            AsyncActionKind::NotesProjection {
+                instance_id,
+                generation,
+            } => {
+                let next = if let Overlay::Notes(pane) = &mut self.overlay {
+                    match result.payload {
+                        Ok(AsyncActionPayload::NotesRpc(result)) => {
+                            pane.apply_rpc_result(Ok(result))
+                        }
+                        Ok(_) => pane.apply_transport_error(
+                            instance_id,
+                            generation,
+                            "notes db returned an unexpected response".to_string(),
+                        ),
+                        Err(error) => pane.apply_transport_error(instance_id, generation, error),
+                    }
+                } else {
+                    None
+                };
+                debug_assert!(next.is_none(), "notes actions are app-lane owned");
             }
             AsyncActionKind::Internal("leaks.rpc") => {
                 if let Overlay::Leaks(pane) = &mut self.overlay {
@@ -1805,6 +1935,7 @@ impl App {
             AsyncActionKind::DaemonRpc("fork.create") => match result.payload {
                 Ok(AsyncActionPayload::ForkCreated {
                     parent_session_id,
+                    endpoint,
                     socket,
                     session_id,
                     short_id,
@@ -1814,6 +1945,7 @@ impl App {
                 }) => {
                     self.apply_fork_created(
                         parent_session_id,
+                        endpoint,
                         socket,
                         session_id,
                         short_id,
@@ -1831,12 +1963,19 @@ impl App {
             AsyncActionKind::DaemonRpc("side.start") => match result.payload {
                 Ok(AsyncActionPayload::ForkCreated {
                     parent_session_id,
+                    endpoint,
                     socket,
                     session_id,
                     short_id,
                     ..
                 }) => {
-                    self.apply_side_created(parent_session_id, socket, session_id, short_id);
+                    self.apply_side_created(
+                        parent_session_id,
+                        endpoint,
+                        socket,
+                        session_id,
+                        short_id,
+                    );
                 }
                 Ok(_) => self.history.push(HistoryEntry::CommandError {
                     line: "/side: unexpected daemon response".to_string(),
@@ -1898,6 +2037,7 @@ impl App {
                 ),
                 Err(e) => self.show_toast(format!("copy file: {e}"), ToastKind::Error),
             },
+            #[cfg(test)]
             AsyncActionKind::Refresh("display.daemon.probe") => match result.payload {
                 Ok(AsyncActionPayload::DaemonProbe { cwd, status }) => {
                     self.apply_display_daemon_probe_result(cwd, status);
@@ -2186,9 +2326,20 @@ impl App {
         request_generation: u64,
         source_draft_generation: u64,
         cursor: usize,
-        png: Option<Vec<u8>>,
+        admission: Option<crate::tui::async_action::DaemonImagePathAdmission>,
         report_unavailable: bool,
     ) {
+        if let Some(admission) = admission.as_ref() {
+            let draft = crate::tui::composer::ImageIngressDraftAuthority {
+                session_id: admission.session_id,
+                admission_id: admission.admission_id,
+                attachment_id: admission.image_ref.id,
+                local_operation_id: admission.discard_operation_id,
+            };
+            self.image_ingress_draft_discards
+                .entry(draft.admission_id)
+                .or_insert((draft, false));
+        }
         let Some(probe) = self.pending_paste_probes.remove(&request_id) else {
             return;
         };
@@ -2208,19 +2359,35 @@ impl App {
             if source_draft_generation != self.draft_generation {
                 return;
             }
-            if let Some(png) = png {
+            if let Some(admission) = admission {
                 self.composer.set_cursor(cursor);
-                self.insert_image_block(png);
+                self.insert_image_handle_block(admission);
             } else if report_unavailable {
                 self.show_toast("Paste unavailable", ToastKind::Error);
             }
             return;
         };
-        if png.is_none() && report_unavailable {
+        if admission.is_none() && report_unavailable {
             self.show_toast("Paste unavailable", ToastKind::Error);
         }
         let ready = if let Some(fence) = self.submission_fences.get_mut(&fence_id) {
-            let result = png.map(|png| ("[image]".to_string(), String::new(), Some(png)));
+            let result = admission.map(|admission| {
+                (
+                    "[image]".to_string(),
+                    String::new(),
+                    Some(crate::tui::structured_paste::PasteImageAdmission::Handle {
+                        draft: crate::tui::composer::ImageIngressDraftAuthority {
+                            session_id: admission.session_id,
+                            admission_id: admission.admission_id,
+                            attachment_id: admission.image_ref.id,
+                            local_operation_id: admission.discard_operation_id,
+                        },
+                        image_ref: admission.image_ref,
+                        normalized_byte_length: admission.normalized_byte_length,
+                        sha256: admission.sha256,
+                    }),
+                )
+            });
             let _ = fence.settle_slot(
                 request_id,
                 request_generation,
@@ -2263,11 +2430,11 @@ impl App {
         for slot in &fence.slots {
             if let crate::tui::structured_paste::PasteSlotState::Ready {
                 original_offset,
-                png: Some(png),
+                image: Some(image),
                 ..
             } = slot
             {
-                resolved_images.push((*original_offset, png.clone()));
+                resolved_images.push((*original_offset, image.clone()));
             }
         }
         resolved_images.sort_by_key(|(offset, _)| *offset);
@@ -2311,30 +2478,47 @@ impl App {
         }
         if positional_wire {
             let original_wire = deferred.submission.text.clone();
-            for (inserted, (offset, png)) in resolved_images.iter().enumerate() {
+            for (inserted, (offset, image)) in resolved_images.iter().enumerate() {
                 let offset = floor_char_boundary(&original_wire, *offset);
                 let existing_before = original_wire[..offset]
-                    .matches(cockpit_core::daemon::proto::IMAGE_PART_SENTINEL)
+                    .matches(cockpit_proto::IMAGE_PART_SENTINEL)
                     .count();
-                deferred
-                    .submission
-                    .images
-                    .insert(existing_before + inserted, png.clone());
+                deferred.submission.images.insert(
+                    existing_before + inserted,
+                    match image {
+                        crate::tui::structured_paste::PasteImageAdmission::Bytes(bytes) => {
+                            cockpit_client::image_upload::SubmissionImage::png(bytes.clone())
+                        }
+                        crate::tui::structured_paste::PasteImageAdmission::Handle {
+                            image_ref,
+                            ..
+                        } => cockpit_client::image_upload::SubmissionImage::retained(
+                            image_ref.clone(),
+                        ),
+                    },
+                );
             }
             for (offset, _) in resolved_images.iter().rev() {
                 let offset = floor_char_boundary(&deferred.submission.text, *offset);
                 deferred
                     .submission
                     .text
-                    .insert_str(offset, cockpit_core::daemon::proto::IMAGE_PART_SENTINEL);
+                    .insert_str(offset, cockpit_proto::IMAGE_PART_SENTINEL);
             }
         } else {
-            for (_, png) in &resolved_images {
+            for (_, image) in &resolved_images {
                 deferred
                     .submission
                     .text
-                    .push_str(cockpit_core::daemon::proto::IMAGE_PART_SENTINEL);
-                deferred.submission.images.push(png.clone());
+                    .push_str(cockpit_proto::IMAGE_PART_SENTINEL);
+                deferred.submission.images.push(match image {
+                    crate::tui::structured_paste::PasteImageAdmission::Bytes(bytes) => {
+                        cockpit_client::image_upload::SubmissionImage::png(bytes.clone())
+                    }
+                    crate::tui::structured_paste::PasteImageAdmission::Handle {
+                        image_ref, ..
+                    } => cockpit_client::image_upload::SubmissionImage::retained(image_ref.clone()),
+                });
             }
         }
         if positional_display {
@@ -2447,6 +2631,7 @@ impl App {
             let provider = action.provider;
             let client_flow_id = action.client_flow_id;
             let operation_id = action.operation_id;
+            let lifecycle = self.lifecycle.clone();
             match (action.provider, action.op) {
                 (provider, OAuthFlowOp::Acknowledge) => {
                     self.async_actions.start(
@@ -2462,7 +2647,7 @@ impl App {
                                         cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER
                                     }
                                 };
-                                let client = crate::tui::settings::settings_daemon_client()
+                                let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                                     .await
                                     .map_err(|e| e.to_string())?;
                                 // Retrying acknowledgement for the same visible
@@ -2471,7 +2656,7 @@ impl App {
                                     client_flow_id.subscription_ack_operation_id();
                                 let expected_hash =
                                     oauth_request_hash(&("put_subscription_ack", provider_id))?;
-                                let request = cockpit_core::daemon::proto::Request::PutSubscriptionAck {
+                                let request = cockpit_proto::Request::PutSubscriptionAck {
                                     client_operation_id: client_operation_id.clone(),
                                     provider_id: provider_id.to_string(),
                                 };
@@ -2491,7 +2676,7 @@ impl App {
                                     Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
                                         let settlement = match tokio::time::timeout(
                                             std::time::Duration::from_secs(10),
-                                            client.request(cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                                            client.request(cockpit_proto::Request::GetLocalOperationSettlement {
                                                 client_operation_id: client_operation_id.clone(),
                                             }),
                                         )
@@ -2504,7 +2689,7 @@ impl App {
                                             )),
                                         };
                                         match settlement {
-                                            cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                                            cockpit_proto::Response::LocalOperationSettlement {
                                                 client_operation_id: returned_id,
                                                 operation_kind,
                                                 request_hash,
@@ -2515,7 +2700,7 @@ impl App {
                                             } if returned_id == client_operation_id
                                                 && operation_kind == "put_subscription_ack"
                                                 && request_hash == expected_hash => *response,
-                                            cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                                            cockpit_proto::Response::LocalOperationSettlement {
                                                 client_operation_id: returned_id,
                                                 operation_kind,
                                                 request_hash,
@@ -2536,7 +2721,7 @@ impl App {
                                     }
                                 };
                                 match response {
-                                    cockpit_core::daemon::proto::Response::SubscriptionAckCommitted {
+                                    cockpit_proto::Response::SubscriptionAckCommitted {
                                         client_operation_id: returned_id,
                                         provider_id: returned_provider,
                                         request_hash,
@@ -2569,6 +2754,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 begin_provider_oauth(
+                                    lifecycle,
                                     "codex-oauth",
                                     oauth_begin_operation_id(client_flow_id),
                                 )
@@ -2586,6 +2772,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 complete_provider_oauth(
+                                    lifecycle,
                                     oauth_operation_id(client_flow_id, "complete"),
                                     flow_id,
                                     None,
@@ -2604,6 +2791,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 begin_provider_oauth(
+                                    lifecycle,
                                     "grok-oauth",
                                     oauth_begin_operation_id(client_flow_id),
                                 )
@@ -2621,6 +2809,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 complete_provider_oauth(
+                                    lifecycle,
                                     oauth_operation_id(client_flow_id, "complete"),
                                     flow_id,
                                     Some(input),
@@ -2681,6 +2870,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 cancel_provider_oauth(
+                                    lifecycle,
                                     oauth_operation_id(client_flow_id, "cancel"),
                                     oauth_begin_operation_id(client_flow_id),
                                     flow_id,
@@ -2697,38 +2887,72 @@ impl App {
     }
 
     pub(super) fn start_resources_snapshot_action(&mut self) {
-        self.async_actions.start_blocking(
+        let Overlay::Resources(pane) = &self.overlay else {
+            return;
+        };
+        let pane_generation = pane.generation();
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.snapshot"),
-            AsyncActionPolicy::Replace(AsyncActionKey::new("resources.snapshot")),
-            || match crate::tui::agent_runner::resource_snapshot_blocking()? {
-                cockpit_core::daemon::proto::Response::ResourceSnapshot { snapshot } => {
-                    Ok(AsyncActionPayload::ResourceSnapshot(snapshot))
-                }
-                other => Err(format!("unexpected resource_snapshot response: {other:?}")),
+            AsyncActionKey::new("resources.projection"),
+            async {
+                let result = tokio::task::spawn_blocking(move || {
+                    match crate::tui::agent_runner::resource_snapshot_blocking(lifecycle)? {
+                        cockpit_proto::Response::ResourceSnapshot { snapshot } => Ok(snapshot),
+                        other => Err(format!("unexpected resource_snapshot response: {other:?}")),
+                    }
+                })
+                .await
+                .map_err(|error| format!("resources.snapshot worker failed: {error}"))
+                .and_then(|result| result);
+                Ok(AsyncActionPayload::ResourceSnapshot {
+                    pane_generation,
+                    result,
+                })
             },
         );
     }
 
-    pub(super) fn start_resource_promote_action(&mut self, request_id: String) {
+    pub(super) fn start_resource_promote_action(&mut self, request_id: uuid::Uuid) {
         let session_id = self.current_session_id();
-        self.async_actions.start_blocking(
+        let request = crate::tui::agent_runner::promote_resource_request(request_id, session_id);
+        self.start_resource_promote_request_action(request);
+    }
+
+    pub(super) fn start_resource_promote_token_action(&mut self, request_id: String) {
+        let session_id = self.current_session_id();
+        let request =
+            crate::tui::agent_runner::promote_resource_token_request(request_id, session_id);
+        self.start_resource_promote_request_action(request);
+    }
+
+    fn start_resource_promote_request_action(&mut self, request: cockpit_proto::Request) {
+        let pane_generation = match &self.overlay {
+            Overlay::Resources(pane) => Some(pane.generation()),
+            _ => None,
+        };
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.promote"),
-            AsyncActionPolicy::Replace(AsyncActionKey::new(format!(
-                "resources.promote:{request_id}"
-            ))),
-            move || match crate::tui::agent_runner::promote_resource_blocking(
-                request_id, session_id,
-            )? {
-                cockpit_core::daemon::proto::Response::PromoteResourceResult {
-                    status,
-                    message,
-                    snapshot,
-                } => Ok(AsyncActionPayload::PromoteResource {
-                    status,
-                    message,
-                    snapshot,
-                }),
-                other => Err(format!("unexpected promote_resource response: {other:?}")),
+            AsyncActionKey::new("resources.projection"),
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    match crate::tui::agent_runner::promote_resource_blocking(lifecycle, request)? {
+                        cockpit_proto::Response::PromoteResourceResult {
+                            status,
+                            message,
+                            snapshot,
+                        } => Ok(AsyncActionPayload::PromoteResource {
+                            pane_generation,
+                            status,
+                            message,
+                            snapshot,
+                        }),
+                        other => Err(format!("unexpected promote_resource response: {other:?}")),
+                    }
+                })
+                .await
+                .map_err(|error| format!("resources.promote worker failed: {error}"))?
             },
         );
     }
@@ -2755,34 +2979,49 @@ impl App {
             .or(self.startup_background.daemon_socket.as_deref())
     }
 
+    /// The daemon-resolved git worktree root for the launch cwd, if the
+    /// background resolver (`spawn_worktree_root_resolve`) has populated it.
+    /// `None` when the cwd is not in a repo or has not been resolved yet.
+    /// Panes read this instead of shelling out to git themselves.
+    pub(super) fn resolved_worktree_root(&self) -> Option<std::path::PathBuf> {
+        self.worktree_root
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    pub(super) fn sessions_daemon_endpoint(&self) -> Option<cockpit_client::ClientEndpoint> {
+        self.attached_daemon_endpoint()
+    }
+
     pub(super) fn start_sessions_list_action(&mut self) {
         let Overlay::Sessions(pane) = &self.overlay else {
             return;
         };
         let (project_id, parent) = pane.root_request();
-        let socket = self.sessions_daemon_socket().map(Path::to_path_buf);
+        let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.list"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.list")),
             move || {
-                let socket = socket
-                    .ok_or_else(|| "daemon socket unavailable for sessions.list".to_string())?;
-                crate::tui::agent_runner::list_sessions_blocking(&socket, project_id, parent)
+                let endpoint = endpoint
+                    .ok_or_else(|| "daemon endpoint unavailable for sessions.list".to_string())?;
+                crate::tui::agent_runner::list_sessions_blocking(&endpoint, project_id, parent)
                     .map(AsyncActionPayload::Sessions)
             },
         );
     }
 
     pub(super) fn start_sessions_live_status_action(&mut self, ids: Vec<uuid::Uuid>) {
-        let socket = self.sessions_daemon_socket().map(Path::to_path_buf);
+        let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.live"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.live")),
             move || {
-                let socket = socket
-                    .ok_or_else(|| "daemon socket unavailable for sessions.live".to_string())?;
+                let endpoint = endpoint
+                    .ok_or_else(|| "daemon endpoint unavailable for sessions.live".to_string())?;
                 Ok(AsyncActionPayload::SessionLiveStatus(
-                    crate::tui::agent_runner::session_live_status_blocking(&socket, ids),
+                    crate::tui::agent_runner::session_live_status_blocking(&endpoint, ids),
                 ))
             },
         );
@@ -2793,16 +3032,17 @@ impl App {
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
     ) {
-        let socket = self.sessions_daemon_socket().map(Path::to_path_buf);
+        let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.preview"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.preview")),
             move || {
-                let socket = socket
-                    .ok_or_else(|| "daemon socket unavailable for sessions.preview".to_string())?;
+                let endpoint = endpoint.ok_or_else(|| {
+                    "daemon endpoint unavailable for sessions.preview".to_string()
+                })?;
                 let (messages, has_more) =
                     crate::tui::agent_runner::read_session_messages_blocking(
-                        &socket, session_id, before_seq, 50,
+                        &endpoint, session_id, before_seq, 50,
                     )?;
                 Ok(AsyncActionPayload::SessionMessages {
                     session_id,
@@ -2817,37 +3057,42 @@ impl App {
     pub(super) fn start_provider_usage_action(&mut self, args: String) {
         let filter = args.split_whitespace().next().map(str::to_string);
         let cwd = self.launch.cwd.clone();
+        let lifecycle = self.lifecycle.clone();
         self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::loading());
+        let pane_generation = match &self.overlay {
+            Overlay::Usage(pane) => pane.generation(),
+            _ => unreachable!(),
+        };
         self.async_actions.start(
             AsyncActionKind::Refresh("provider.usage"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("provider.usage")),
             async move {
-                let client = crate::tui::settings::settings_daemon_client()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                match client
-                    .request(
-                        cockpit_core::daemon::proto::Request::GetProviderUsageSnapshot {
+                let result = async {
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    match client
+                        .request(cockpit_proto::Request::GetProviderUsageSnapshot {
                             project_root: cwd.display().to_string(),
                             provider_id: filter,
-                        },
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    Ok(cockpit_core::daemon::proto::Response::ProviderUsageSnapshot {
-                        snapshots,
-                    }) => Ok(AsyncActionPayload::ProviderUsage(
-                        snapshots
-                            .into_iter()
-                            .map(provider_usage_from_wire)
-                            .collect(),
-                    )),
-                    Ok(other) => Err(format!(
-                        "unexpected provider usage daemon response: {other:?}"
-                    )),
-                    Err(error) => Err(error.to_string()),
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        Ok(cockpit_proto::Response::ProviderUsageSnapshot { snapshots }) => {
+                            Ok(snapshots)
+                        }
+                        Ok(other) => Err(format!(
+                            "unexpected provider usage daemon response: {other:?}"
+                        )),
+                        Err(error) => Err(error.to_string()),
+                    }
                 }
+                .await;
+                Ok(AsyncActionPayload::ProviderUsage {
+                    pane_generation,
+                    result,
+                })
             },
         );
     }
@@ -2856,13 +3101,121 @@ impl App {
         &mut self,
         key: crate::tui::stats_pane::StatsPaneFetchKey,
     ) {
-        let socket = self.startup_background.daemon_socket.clone();
+        let endpoint = self.attached_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::Refresh("stats.rollup"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("stats.rollup")),
             move || {
                 Ok(AsyncActionPayload::StatsRollup(
-                    crate::tui::stats_pane::fetch_stats_rollup(socket.as_deref(), key),
+                    crate::tui::stats_pane::fetch_stats_rollup(endpoint.as_ref(), key),
+                ))
+            },
+        );
+    }
+
+    pub(super) fn start_git_diff_action(
+        &mut self,
+        operation_id: uuid::Uuid,
+        source: crate::tui::diff_pane::DiffSource,
+    ) {
+        let (project_root, source_wire) = match &self.overlay {
+            Overlay::Diff(pane) => (
+                pane.project_root().display().to_string(),
+                match source {
+                    crate::tui::diff_pane::DiffSource::Worktree => {
+                        cockpit_proto::GitReadSource::Worktree
+                    }
+                    crate::tui::diff_pane::DiffSource::Staged => {
+                        cockpit_proto::GitReadSource::Staged
+                    }
+                    crate::tui::diff_pane::DiffSource::Last => return,
+                },
+            ),
+            _ => return,
+        };
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("git.diff"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("git.diff")),
+            async move {
+                let result = async {
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    match client
+                        .request(cockpit_proto::Request::GitDiff {
+                            project_root,
+                            source: source_wire.clone(),
+                        })
+                        .await
+                        .map_err(|error| format!("daemon request: {error}"))?
+                    {
+                        Ok(cockpit_proto::Response::GitDiff {
+                            source: returned_source,
+                            diff,
+                            truncated,
+                        }) if returned_source == source_wire => {
+                            if truncated {
+                                Err("git diff exceeded the daemon response limit".to_string())
+                            } else {
+                                Ok(diff)
+                            }
+                        }
+                        Ok(other) => Err(format!("unexpected git_diff response: {other:?}")),
+                        Err(error) => Err(error.message),
+                    }
+                }
+                .await;
+                Ok(AsyncActionPayload::GitDiff(
+                    crate::tui::diff_pane::DiffPaneFetchResult {
+                        operation_id,
+                        source,
+                        result,
+                    },
+                ))
+            },
+        );
+    }
+
+    pub(super) fn start_git_review_sources_action(
+        &mut self,
+        operation_id: uuid::Uuid,
+        sources: Vec<cockpit_proto::GitReadSource>,
+    ) {
+        let project_root = match &self.overlay {
+            Overlay::Multireview(dialog) => dialog.project_root().display().to_string(),
+            _ => return,
+        };
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("git.review_sources"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("git.review_sources")),
+            async move {
+                let result = async {
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    match client
+                        .request(cockpit_proto::Request::GitReviewSources {
+                            project_root,
+                            sources,
+                        })
+                        .await
+                        .map_err(|error| format!("daemon request: {error}"))?
+                    {
+                        Ok(cockpit_proto::Response::GitReviewSources { sources }) => Ok(sources),
+                        Ok(other) => {
+                            Err(format!("unexpected git_review_sources response: {other:?}"))
+                        }
+                        Err(error) => Err(error.message),
+                    }
+                }
+                .await;
+                Ok(AsyncActionPayload::GitReviewSources(
+                    crate::tui::multireview_dialog::GitReviewSourcesCompletion {
+                        operation_id,
+                        result,
+                    },
                 ))
             },
         );
@@ -2877,6 +3230,50 @@ impl App {
         }
         false
     }
+}
+
+fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
+    matches!(
+        kind,
+        AsyncActionKind::Blocking(
+            "btw.teardown" | "paste.delivery_receipt" | "queue.edit" | "settings.blocking-effect"
+        ) | AsyncActionKind::DaemonRpc(
+            "assistant.resolve"
+                | "btw.resolve-interrupt"
+                | "fork.create"
+                | "goal-settings.effect"
+                | "mcp.local"
+                | "paste.image_path_admission"
+                | "resources.promote"
+                | "sealed.effect"
+                | "sessions.mutation"
+                | "settings.effect"
+                | "side.discard"
+                | "side.start"
+                | "subagent.steer"
+                | "tools.effect"
+                | "workspace-trust.effect"
+        ) | AsyncActionKind::NotesProjection { .. }
+            | AsyncActionKind::Internal(
+                "btw.runner.attach"
+                    | "leaks.rpc"
+                    | "oauth.acknowledge"
+                    | "oauth.cancel"
+                    | "oauth.codex.begin"
+                    | "oauth.codex.poll"
+                    | "oauth.grok.begin"
+                    | "oauth.grok.complete"
+                    | "pins.pin"
+                    | "pins.toggle"
+                    | "pins.unpin"
+                    | "runner.attach"
+                    | "session.fork"
+                    | "session.resume"
+                    | "session.side"
+                    | "session.side.return"
+                    | "session.switch"
+            )
+    )
 }
 
 #[cfg(test)]

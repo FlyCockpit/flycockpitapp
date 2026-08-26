@@ -20,6 +20,75 @@ use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
+fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePayload {
+    let value = serde_json::to_value(config).unwrap();
+    let operations = value
+        .get("servers")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(
+            |(name, server)| cockpit_proto::McpConfigPatchOperation::AddServer {
+                name: name.clone(),
+                server_json: serde_json::to_string(server).unwrap().into(),
+            },
+        )
+        .collect();
+    serde_json::to_string(&cockpit_proto::McpConfigPatch { operations })
+        .unwrap()
+        .into()
+}
+
+#[test]
+fn mcp_publication_is_a_raw_target_layer_patch() {
+    let source = include_str!("dispatch.rs");
+    let save = source
+        .split("async fn save_mcp_config")
+        .nth(1)
+        .expect("MCP save owner")
+        .split("async fn publish_mcp_journal_generation")
+        .next()
+        .expect("MCP save body");
+    for required in [
+        "McpConfigPatchOperation::AddServer",
+        "McpConfigPatchOperation::MaterializeInheritedServer",
+        "McpConfigPatchOperation::UpdateAuthoredServer",
+        "McpConfigPatchOperation::DeleteAuthoredServer",
+        "raw_document",
+        "patch_intent_json",
+        "mcp_target_layer_revision(&path)",
+    ] {
+        assert!(
+            save.contains(required),
+            "MCP raw-layer owner lost {required}"
+        );
+    }
+    assert!(!save.contains("config.write_private(&path)"));
+    let snapshot = source
+        .split("fn redacted_mcp_config_snapshot")
+        .nth(1)
+        .expect("MCP snapshot owner")
+        .split("fn canonical_mcp_target_path")
+        .next()
+        .expect("MCP snapshot body");
+    assert!(snapshot.contains("effective_config_json"));
+    assert!(snapshot.contains("authored_config_json"));
+}
+
+#[test]
+fn inherited_mcp_materialization_detects_legacy_literal_credentials() {
+    for raw in [
+        r#"{"servers":{"legacy":{"transport":"streamable","endpoint":"https://example.test","auth":{"kind":"header","value":"Bearer legacy"}}}}"#,
+        r#"{"servers":{"legacy":{"transport":"stdio","command":"legacy","env":{"TOKEN":"legacy"}}}}"#,
+        r#"{"servers":{"legacy":{"transport":"stdio","command":"legacy","auth":{"kind":"env","vars":{"TOKEN":"legacy"}}}}}"#,
+    ] {
+        let config = crate::mcp::config::McpConfig::parse(raw).unwrap();
+        assert!(crate::mcp::config::server_has_credential_material(
+            &config.servers["legacy"]
+        ));
+    }
+}
+
 #[test]
 fn client_teardown_quiesces_dispatch_before_capability_cancellation() {
     let source = include_str!("mod.rs");
@@ -75,9 +144,7 @@ fn oversized_response_is_replaced_before_the_ndjson_writer() {
         },
     );
     assert!(matches!(&envelope.body, proto::Body::Error { .. }));
-    assert!(
-        serde_json::to_vec(&envelope).unwrap().len() + 1 <= proto::MAX_SERIALIZED_RESPONSE_BYTES
-    );
+    assert!(serde_json::to_vec(&envelope).unwrap().len() < proto::MAX_SERIALIZED_RESPONSE_BYTES);
 }
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
@@ -663,10 +730,11 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     let ctx = test_ctx();
     // Project-note RPCs run through the uniform `project_root` FCOR
     // authorization, which canonicalizes the root and requires it to exist on
-    // disk. Use a real temp dir and key the direct db calls by the same string
-    // so the parity assertions hold.
+    // disk. Use a real temp dir and key direct DB assertions by the exact
+    // daemon-derived opaque identity so the parity assertions hold.
     let project = tempfile::tempdir().unwrap();
     let root = project.path().to_str().unwrap().to_string();
+    let identity = canonical_project_note_identity(&root).unwrap().0;
     let mut state = owner_state();
     let response = handle_request(
         Request::CreateProjectNote {
@@ -694,7 +762,7 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     .await
     .unwrap();
     assert_eq!(
-        ctx.db.list_project_notes(&root).await.unwrap()[0].content,
+        ctx.db.list_project_notes(&identity).await.unwrap()[0].content,
         "body"
     );
     let response = handle_request(
@@ -721,7 +789,7 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     let Response::ProjectNotes { notes } = response else {
         panic!("expected project notes")
     };
-    let direct = ctx.db.list_project_notes(&root).await.unwrap();
+    let direct = ctx.db.list_project_notes(&identity).await.unwrap();
     assert_eq!(notes.len(), direct.len());
     assert_eq!(notes[0].id, direct[0].id);
     assert_eq!(notes[0].name, direct[0].name);
@@ -736,7 +804,134 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     .await
     .unwrap();
     assert!(matches!(response, Response::Ack));
-    assert!(ctx.db.list_project_notes(&root).await.unwrap().is_empty());
+    assert!(
+        ctx.db
+            .list_project_notes(&identity)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn project_note_rpc_uses_one_daemon_canonical_identity_for_symlink_aliases() {
+    let ctx = test_ctx();
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("project");
+    let alias = parent.path().join("project-alias");
+    std::fs::create_dir(&project).unwrap();
+    std::os::unix::fs::symlink(&project, &alias).unwrap();
+    let canonical = canonical_project_note_identity(project.to_str().unwrap())
+        .unwrap()
+        .0;
+    let mut state = owner_state();
+
+    handle_request(
+        Request::CreateProjectNote {
+            project_root: alias.to_string_lossy().into_owned(),
+            name: "shared".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    let response = handle_request(
+        Request::ListProjectNotes {
+            project_root: project.to_string_lossy().into_owned(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::ProjectNotes { notes } = response else {
+        panic!("project notes");
+    };
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].project_root, canonical);
+}
+
+#[test]
+fn project_note_identity_groups_nested_git_worktree_paths_without_shelling_out() {
+    let parent = tempfile::tempdir().unwrap();
+    let worktree = parent.path().join("worktree");
+    let nested = worktree.join("packages/app");
+    std::fs::create_dir_all(worktree.join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+
+    assert_eq!(
+        canonical_project_note_identity(worktree.to_str().unwrap())
+            .unwrap()
+            .0,
+        canonical_project_note_identity(nested.to_str().unwrap())
+            .unwrap()
+            .0
+    );
+}
+
+#[test]
+fn project_note_identity_accepts_linked_worktree_git_file() {
+    let parent = tempfile::tempdir().unwrap();
+    let worktree = parent.path().join("linked-worktree");
+    let nested = worktree.join("src");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: ../repository/.git/worktrees/linked-worktree\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        canonical_project_note_identity(worktree.to_str().unwrap())
+            .unwrap()
+            .0,
+        canonical_project_note_identity(nested.to_str().unwrap())
+            .unwrap()
+            .0
+    );
+}
+
+#[test]
+fn project_note_identity_uses_exact_canonical_launch_path_outside_a_repo() {
+    let parent = tempfile::tempdir().unwrap();
+    let one = parent.path().join("one");
+    let two = parent.path().join("two");
+    std::fs::create_dir(&one).unwrap();
+    std::fs::create_dir(&two).unwrap();
+
+    assert_ne!(
+        canonical_project_note_identity(one.to_str().unwrap())
+            .unwrap()
+            .0,
+        canonical_project_note_identity(two.to_str().unwrap())
+            .unwrap()
+            .0
+    );
+}
+
+#[test]
+fn project_note_identity_fails_closed_when_git_marker_metadata_is_indeterminate() {
+    let project = tempfile::tempdir().unwrap();
+    let canonical = std::fs::canonicalize(project.path()).unwrap();
+    let failing_marker = canonical.join(".git");
+    let error = canonical_project_note_identity_with_metadata(canonical, |path| {
+        if path == failing_marker {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected metadata denial",
+            ))
+        } else {
+            std::fs::symlink_metadata(path)
+        }
+    })
+    .err()
+    .expect("indeterminate metadata must fail closed");
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(error.message.contains("could not be inspected"));
 }
 
 #[tokio::test]
@@ -810,7 +1005,8 @@ async fn project_note_create_returns_resolved_name() {
     let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();
     let root = project.path().to_str().unwrap().to_string();
-    ctx.db.create_project_note(&root, "todo").await.unwrap();
+    let identity = canonical_project_note_identity(&root).unwrap().0;
+    ctx.db.create_project_note(&identity, "todo").await.unwrap();
     let mut state = owner_state();
     let response = handle_request(
         Request::CreateProjectNote {
@@ -833,12 +1029,13 @@ async fn project_note_list_preserves_sidebar_order() {
     let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();
     let root = project.path().to_str().unwrap().to_string();
+    let identity = canonical_project_note_identity(&root).unwrap().0;
     for name in ["first", "second", "third"] {
-        ctx.db.create_project_note(&root, name).await.unwrap();
+        ctx.db.create_project_note(&identity, name).await.unwrap();
     }
     let expected: Vec<_> = ctx
         .db
-        .list_project_notes(&root)
+        .list_project_notes(&identity)
         .await
         .unwrap()
         .into_iter()
@@ -3675,7 +3872,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .await
             .unwrap()
             .unwrap()
-            .archived_at
+            .archived_at_unix_ms
             .is_some()
     );
     assert!(
@@ -3684,7 +3881,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .await
             .unwrap()
             .unwrap()
-            .archived_at
+            .archived_at_unix_ms
             .is_none()
     );
     let unarchive_operation = proto::RemoteOperationIdentityV1::new(
@@ -3744,7 +3941,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .await
             .unwrap()
             .unwrap()
-            .archived_at
+            .archived_at_unix_ms
             .is_none()
     );
     // The second session's paused work was cancelled earlier; the
@@ -4224,7 +4421,7 @@ fn table_for(secret: &str) -> Arc<RedactionTable> {
 #[tokio::test]
 async fn detached_client_cannot_remove_editable_queued_messages() {
     let ctx = test_ctx();
-    let client = crate::daemon::client::DaemonClient::from_in_process(ctx);
+    let client = cockpit_client::DaemonClient::from_in_process(spawn_in_process_client(ctx));
 
     let err = client
         .request(Request::RemoveEditableQueuedUserMessages { target_id: None })
@@ -8404,6 +8601,7 @@ async fn owner_secret_write_does_not_ack_when_redaction_publication_fails() {
     );
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn provider_config_save_redaction_failure_compensates_all_staged_secrets() {
     let tmp = tempfile::tempdir().unwrap();
@@ -8431,8 +8629,12 @@ async fn provider_config_save_redaction_failure_compensates_all_staged_secrets()
             provider_id: "multi-provider".into(),
             entry,
             header_secrets: vec![
-                Some("first-staged-secret".into()),
-                Some("second-staged-secret".into()),
+                Some(cockpit_proto::ProviderSecretValue::new(
+                    "first-staged-secret".into(),
+                )),
+                Some(cockpit_proto::ProviderSecretValue::new(
+                    "second-staged-secret".into(),
+                )),
             ],
         },
         &mut state,
@@ -8523,9 +8725,8 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
         }),
     ];
     for (i, config) in cases.into_iter().enumerate() {
-        let config_json = serde_json::to_string(&config).unwrap();
-        let mutation_intent_hash =
-            cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
+        let patch = mcp_patch(&config);
+        let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &patch);
         let result = handle_request(
             Request::SaveMcpConfig {
                 client_operation_id: format!("reject-literal-mcp-save-{i}").into(),
@@ -8535,9 +8736,8 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
                 config_path: authority.config_path.clone(),
                 expected_revision: authority.revision.clone(),
                 mutation_intent_hash,
-                config_json,
+                patch,
                 secret_values_json: "{}".into(),
-                cleanup_names_json: "[]".into(),
             },
             &mut state,
             &ctx,
@@ -8572,8 +8772,8 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
             "auth": {"kind": "header", "value": "Bearer staged-value"}
         }}
     });
-    let config_json = serde_json::to_string(&config).unwrap();
-    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
+    let patch = mcp_patch(&config);
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &patch);
     let response = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "staged-mcp-save".into(),
@@ -8583,13 +8783,12 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
             config_path: authority.config_path,
             expected_revision: authority.revision,
             mutation_intent_hash,
-            config_json,
+            patch,
             secret_values_json: serde_json::json!({
                 "mcp:staged:header": "Bearer staged-value"
             })
             .to_string()
             .into(),
-            cleanup_names_json: "[]".into(),
         },
         &mut state,
         &ctx,
@@ -8658,8 +8857,8 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
     let mut state = owner_state();
     let authority =
         mint_mcp_edit_authority(&ctx, &mut state, &root, "ownership-race-mcp-save").await;
-    let config_json = serde_json::to_string(&config).unwrap();
-    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
+    let patch = mcp_patch(&config);
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &patch);
     let result = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "ownership-race-mcp-save".into(),
@@ -8669,9 +8868,8 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
             config_path: authority.config_path,
             expected_revision: authority.revision,
             mutation_intent_hash,
-            config_json,
+            patch,
             secret_values_json: serde_json::Value::Object(secret_values).to_string().into(),
-            cleanup_names_json: "[]".into(),
         },
         &mut state,
         &ctx,
@@ -9098,8 +9296,8 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
     let mut state = owner_state();
     let authority =
         mint_mcp_edit_authority(&ctx, &mut state, &root, "foreign-reference-mcp-save").await;
-    let config_json = serde_json::to_string(&config).unwrap();
-    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
+    let patch = mcp_patch(&config);
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &patch);
     let result = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "foreign-reference-mcp-save".into(),
@@ -9109,9 +9307,8 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
             config_path: authority.config_path,
             expected_revision: authority.revision,
             mutation_intent_hash,
-            config_json,
+            patch,
             secret_values_json: "{}".into(),
-            cleanup_names_json: "[]".into(),
         },
         &mut state,
         &ctx,
@@ -9201,9 +9398,13 @@ async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
             .write(move |conn| {
                 conn.execute(
                     "INSERT INTO provider_config_journals
-                     (journal_id, project_root, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json, created_at)
-                     VALUES (?1, ?2, 'victim', 'save', ?3, '[]', '[]', ?4)",
-                    rusqlite::params![journal_id, root_owned, entry_json, now],
+                     (journal_id, project_root, provider_id, action, config_path,
+                      consumed_revision, intended_revision, consumed_config_generation,
+                      intended_config_generation, entry_json,
+                      cleanup_named_json, cleanup_credential_json, created_at)
+                     VALUES (?1, ?2, 'victim', 'save', '/invalid/dead-reference-test',
+                             ?3, ?3, 7, 8, ?4, '[]', '[]', ?5)",
+                    rusqlite::params![journal_id, root_owned, "00".repeat(32), entry_json, now],
                 )?;
                 Ok(())
             })
@@ -9282,10 +9483,15 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
     let mut state = owner_state();
     let root = tmp.path().to_string_lossy().into_owned();
     let authority = mint_mcp_edit_authority(&ctx, &mut state, &root, "cleanup-mcp-save").await;
-    let config_json = serde_json::json!({"servers": {}}).to_string();
-    let cleanup_names_json = serde_json::json!(["unrelated"]).to_string();
-    let mutation_intent_hash =
-        cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, &cleanup_names_json);
+    let patch: cockpit_proto::SensitiveWirePayload =
+        serde_json::to_string(&cockpit_proto::McpConfigPatch {
+            operations: vec![
+                cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer { name: "old".into() },
+            ],
+        })
+        .unwrap()
+        .into();
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &patch);
     let response = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "cleanup-mcp-save".into(),
@@ -9295,9 +9501,8 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
             config_path: authority.config_path,
             expected_revision: authority.revision,
             mutation_intent_hash,
-            config_json,
+            patch,
             secret_values_json: "{}".into(),
-            cleanup_names_json,
         },
         &mut state,
         &ctx,
@@ -9328,8 +9533,8 @@ async fn mcp_save_rejects_missing_capability_before_any_mutation() {
     trust_workspace_root(&ctx, tmp.path()).await;
     let mut state = owner_state();
     let root = tmp.path().to_string_lossy().into_owned();
-    let config_json = serde_json::json!({"servers": {}}).to_string();
-    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
+    let patch = mcp_patch(&serde_json::json!({"servers": {}}));
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &patch);
     let error = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "missing-capability-mcp-save".into(),
@@ -9339,9 +9544,8 @@ async fn mcp_save_rejects_missing_capability_before_any_mutation() {
             config_path: format!("{root}/.cockpit/mcp.json"),
             expected_revision: "00".repeat(32),
             mutation_intent_hash,
-            config_json,
+            patch,
             secret_values_json: "{}".into(),
-            cleanup_names_json: "[]".into(),
         },
         &mut state,
         &ctx,
@@ -9373,7 +9577,7 @@ async fn mcp_save_rejects_mismatched_mutation_intent_hash() {
     let mut state = owner_state();
     let root = tmp.path().to_string_lossy().into_owned();
     let authority = mint_mcp_edit_authority(&ctx, &mut state, &root, "intent-mismatch-save").await;
-    let config_json = serde_json::json!({"servers": {}}).to_string();
+    let patch = mcp_patch(&serde_json::json!({"servers": {}}));
     let error = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "intent-mismatch-save".into(),
@@ -9383,9 +9587,8 @@ async fn mcp_save_rejects_mismatched_mutation_intent_hash() {
             config_path: authority.config_path,
             expected_revision: authority.revision,
             mutation_intent_hash: "11".repeat(32),
-            config_json,
+            patch,
             secret_values_json: "{}".into(),
-            cleanup_names_json: "[]".into(),
         },
         &mut state,
         &ctx,
@@ -9419,8 +9622,8 @@ async fn mcp_save_rejects_stale_or_foreign_edit_authority() {
     let root = tmp.path().to_string_lossy().into_owned();
     let authority =
         mint_mcp_edit_authority(&ctx, &mut state, &root, "authority-mismatch-save").await;
-    let config_json = serde_json::json!({"servers": {}}).to_string();
-    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
+    let patch = mcp_patch(&serde_json::json!({"servers": {}}));
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &patch);
     // A capability fabricated for a different principal — the one legitimate
     // use of the test-only registrar (a real mint always binds the caller).
     super::dispatch::register_mcp_edit_capability_for_test(
@@ -9460,9 +9663,8 @@ async fn mcp_save_rejects_stale_or_foreign_edit_authority() {
                 config_path,
                 expected_revision,
                 mutation_intent_hash: mutation_intent_hash.clone(),
-                config_json: config_json.clone(),
+                patch: patch.clone(),
                 secret_values_json: "{}".into(),
-                cleanup_names_json: "[]".into(),
             },
             &mut state,
             &ctx,
@@ -10284,7 +10486,7 @@ async fn remote_archive_stops_worker_before_committing_archive() {
             .await
             .unwrap()
             .unwrap()
-            .archived_at
+            .archived_at_unix_ms
             .is_none(),
         "archive transaction must not commit when worker stop fails"
     );
@@ -10984,7 +11186,7 @@ async fn remote_setup_copilot_auth_refuses_ambient_github_token_read() {
 /// the DB write once, commits the durable replay record, and a same-operation
 /// replay returns the cached response without a second write.
 #[tokio::test]
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "extended"))]
 async fn remote_owner_save_image_spend_policy_commits_and_replays() {
     let ctx = persistent_test_ctx();
     let operation = remote_owner_operation().await;
@@ -11699,6 +11901,7 @@ fn oauth_completion_receipts_and_cancel_race_are_secret_safe() {
 #[test]
 fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
     let source = include_str!("../agent_management.rs");
+    let request_source = include_str!("../../../../cockpit-proto/src/request.rs");
     assert!(source.contains("SealedEditorReplay"));
     assert!(source.contains("SealedEditorCompletion"));
     assert!(source.contains("SecretVaultKind::SealedState"));
@@ -11721,7 +11924,28 @@ fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
     assert!(lease_table.contains("snapshot_identity"));
     assert!(lease_table.contains("completion_operation_id"));
     assert!(lease_table.contains("completion_handle"));
+    assert!(lease_table.contains("publication_phase"));
+    assert!(lease_table.contains("consumed_projection_identity"));
+    assert!(lease_table.contains("intended_projection_identity"));
     assert!(lease_table.contains("publication_result_revision"));
+    assert!(lease_table.contains("consumed_config_generation"));
+    assert!(lease_table.contains("result_config_generation"));
+    assert!(source.contains("prepare_agent_editor_publication_under_publication_lock"));
+    assert!(source.contains("record_agent_editor_publication_under_publication_lock"));
+    assert!(source.contains("authoritative_identity == intended_identity"));
+    assert!(source.contains("authoritative_identity != consumed_identity"));
+    let completion_request = request_source
+        .split("CompleteAgentEditorLease {")
+        .nth(1)
+        .and_then(|tail| tail.split("GetAgentEditorLeaseSettlement {").next())
+        .expect("editor completion request must exist");
+    assert!(completion_request.contains("markdown: Option<SensitiveWirePayload>"));
+    let completion_handler = source
+        .split("async fn complete_editor_lease_inner")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn editor_lease_settlement").next())
+        .expect("editor completion handler must exist");
+    assert!(!completion_handler.contains("markdown.clone()"));
     assert!(source.contains("fail_agent_editor_completion_conn"));
     assert!(!lease_table.contains("snapshot_digest"));
     assert!(!lease_table.contains("snapshot_json"));
@@ -11965,18 +12189,40 @@ fn editor_replay_precedes_mutable_trust_and_terminal_replay_is_exact() {
         begin.find("agent_editor_lease_by_operation").unwrap()
             < begin.find("trusted_canonical_root").unwrap()
     );
+    assert_eq!(
+        begin
+            .matches("agent editor lease completion is already in progress")
+            .count(),
+        2,
+        "both initial replay and duplicate-insert race must direct completing leases to settlement",
+    );
     let complete = source
         .split("async fn complete_editor_lease_inner")
         .nth(1)
         .and_then(|tail| tail.split("pub async fn editor_lease_settlement").next())
         .expect("complete editor lease handler must exist");
     assert!(complete.contains("known_lease.completion_identity != Some(completion_identity)"));
-    assert!(complete.contains("identical bytes"));
+    assert!(complete.contains("authoritative_identity == intended_identity"));
+    assert!(complete.contains("authoritative_identity != consumed_identity"));
+    assert!(complete.contains("workspace_is_trusted"));
+    assert!(complete.contains("if !retry_is_trusted"));
+    assert!(complete.contains("EditorPublicationAttempt::Rejected(mutation_error)"));
+    assert!(complete.contains("EditorPublicationAttempt::Pending(mutation_error)"));
     assert!(complete.contains("retaining sealed payload"));
     assert!(!complete.contains("terminalize_editor_failure"));
     assert!(
         complete.find("known_lease.state == \"terminal\"").unwrap()
             < complete.find("trusted_canonical_root").unwrap()
+    );
+    assert!(
+        complete
+            .find("lease.publication_result_revision.clone()")
+            .unwrap()
+            < complete.find("trusted_canonical_root").unwrap()
+    );
+    assert!(
+        complete.find("match markdown").unwrap() < complete.find("trusted_canonical_root").unwrap(),
+        "cancellation must settle without consulting mutable trust"
     );
     let settlement = source
         .split("pub async fn editor_lease_settlement")
@@ -11984,6 +12230,176 @@ fn editor_replay_precedes_mutable_trust_and_terminal_replay_is_exact() {
         .and_then(|tail| tail.split("fn editor_completion").next())
         .expect("editor settlement handler must exist");
     assert!(!settlement.contains("trusted_root("));
+    assert!(settlement.contains("editor_root_matches"));
+    let root_match = source
+        .split("fn editor_root_matches")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn trusted_root").next())
+        .expect("editor root binding helper must exist");
+    assert!(root_match.contains("canonical_root == requested_root"));
+    assert!(root_match.contains("canonical_project_root(requested_root)"));
+    assert!(!root_match.contains("resolve_workspace_trust_policy"));
+}
+
+#[test]
+fn published_editor_recovery_is_metadata_only_and_terminalizes_before_vault_load() {
+    let source = include_str!("../agent_management.rs");
+    let maintenance = source
+        .split("pub(crate) async fn maintain_editor_leases")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub(crate) async fn recover_editor_leases_before_publish")
+                .next()
+        })
+        .expect("editor maintenance handler");
+    let boot = source
+        .split("pub(crate) async fn recover_editor_leases_before_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn inventory").next())
+        .expect("editor boot recovery handler");
+    for handler in [maintenance, boot] {
+        assert!(
+            handler
+                .find("publication_result_revision.is_some()")
+                .unwrap()
+                < handler.find("load_editor_completion").unwrap(),
+            "published metadata must settle before sealed payload lookup"
+        );
+        assert!(handler.contains("settle_published_editor_completion"));
+    }
+    let settlement = source
+        .split("async fn settle_published_editor_completion")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub(crate) async fn maintain_editor_leases")
+                .next()
+        })
+        .expect("published metadata settlement helper");
+    assert!(settlement.contains("AgentEditorSettlementStatus::Saved"));
+    assert!(settlement.contains("row.owner_digest"));
+    assert!(source.contains("owner_scope: format!(\"project:{project_root}\")"));
+    assert!(settlement.contains("row.completion_operation_id"));
+    assert!(settlement.contains("row.publication_result_revision"));
+    assert!(settlement.contains("row.consumed_config_generation"));
+    assert!(settlement.contains("row.result_config_generation"));
+    assert!(settlement.contains("publish_committed_config_generation_at_least"));
+    assert!(!settlement.contains("publish_committed_config_generation();"));
+    assert!(settlement.contains(".transaction(move |conn|"));
+    assert!(settlement.contains("delete_item_on_conn"));
+    assert!(settlement.contains("finish_agent_editor_completion_conn"));
+    assert!(
+        settlement.find("delete_item_on_conn").unwrap()
+            < settlement
+                .find("finish_agent_editor_completion_conn")
+                .unwrap(),
+        "payload deletion must be part of the transaction before terminalization"
+    );
+    assert!(!settlement.contains(".delete_item("));
+    assert!(!settlement.contains("load_editor_completion"));
+    assert!(source.contains("current_definition_revision_sync"));
+    assert!(source.contains("snapshot: None"));
+    assert!(source.contains("zeroize_agent_edit_snapshot"));
+}
+
+#[test]
+fn editor_vault_reads_and_boot_publication_lock_waits_are_off_loop_and_bounded() {
+    let source = include_str!("../agent_management.rs");
+    for helper in ["load_editor_completion", "load_editor_replay"] {
+        let body = source
+            .split(&format!("async fn {helper}"))
+            .nth(1)
+            .and_then(|tail| tail.split("\n}").next())
+            .unwrap_or_else(|| panic!("missing async {helper} helper"));
+        assert!(body.contains("tokio::task::spawn_blocking"));
+    }
+    let completion = source
+        .split("async fn complete_editor_lease_inner")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn editor_lease_settlement").next())
+        .expect("editor completion handler");
+    assert!(completion.contains("try_hold_config_mutation_lock_until"));
+    assert!(completion.contains("pre_socket_lock_deadline"));
+    assert!(completion.contains("EditorPublicationAttempt::Pending"));
+    assert!(completion.contains("tokio::task::spawn_blocking"));
+    assert!(
+        completion.find("tokio::task::spawn_blocking").unwrap()
+            < completion
+                .find("try_hold_config_mutation_lock_until")
+                .unwrap(),
+        "config lock polling must run inside the blocking worker"
+    );
+    let boot = source
+        .split("pub(crate) async fn recover_editor_leases_before_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn inventory").next())
+        .expect("editor boot recovery handler");
+    assert!(boot.contains("publication.deadline()"));
+    assert!(boot.contains("Some(config_lock_deadline)"));
+
+    let config_files = include_str!("../../../../cockpit-config/src/config/files.rs");
+    let bounded_lock = config_files
+        .split("pub(crate) fn acquire_until")
+        .nth(1)
+        .and_then(|tail| tail.split("fn enter").next())
+        .expect("bounded config lock acquisition helper");
+    assert!(
+        bounded_lock.find("Instant::now() >= deadline").unwrap()
+            < bounded_lock.find("file.try_lock()").unwrap(),
+        "an expired recovery deadline must be checked before lock acquisition",
+    );
+
+    let vault = include_str!("../../secure_key/vault.rs");
+    let delete = vault
+        .split("pub fn delete_item_on_conn")
+        .nth(1)
+        .and_then(|tail| tail.split("pub fn mutate_item").next())
+        .expect("vault transactional delete helper");
+    assert!(delete.contains("delete_item_conn"));
+    assert!(!delete.contains("get_item_on_conn"));
+}
+
+#[test]
+fn pre_socket_file_recovery_uses_one_bounded_publication_authority() {
+    let server = include_str!("mod.rs");
+    let boot = server
+        .split("pub async fn recover_before_socket_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn run_accept_loop").next())
+        .expect("pre-socket recovery body");
+    assert_eq!(
+        boot.matches("PreSocketConfigPublication::new()").count(),
+        1,
+        "boot must mint one absolute config-publication deadline",
+    );
+    for recovery in [
+        "recover_all_provider_config_journals",
+        "recover_all_mcp_config_journals",
+        "recover_extended_config_patch_journals",
+        "recover_image_config_mutation_journals",
+        "recover_known_workspace_resets",
+        "recover_agent_mutation_journals",
+        "recover_editor_leases_before_publish",
+        "recover_effective_default_journals_before_socket",
+    ] {
+        let call = boot
+            .split(recovery)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing recovery family: {recovery}"));
+        assert!(
+            call[..call.len().min(180)].contains("config_publication"),
+            "unbounded recovery family: {recovery}",
+        );
+    }
+
+    let helper = include_str!("../config_publication_recovery.rs");
+    assert!(helper.contains("tokio::task::spawn_blocking"));
+    assert!(helper.contains("try_hold_config_mutation_lock_until"));
+    assert!(helper.contains("action(&guard)"));
+    assert!(
+        helper.contains(
+            "durable DB claim -> with_target(sync classify/publish) -> durable DB settle"
+        )
+    );
 }
 
 #[test]
@@ -13815,7 +14231,7 @@ async fn retention_tick_runs_one_pass_without_sleep() {
     let session = db.create_session("p", "/x", "Build").await.unwrap();
     db.write(move |conn| {
         conn.execute(
-            "UPDATE sessions SET started_at = 5, ended_at = 10, last_active_at = 10 WHERE session_id = ?1",
+            "UPDATE sessions SET started_at_unix_ms = 5, ended_at_unix_ms = 10, last_active_at_unix_ms = 10 WHERE session_id = ?1",
             [session.session_id.to_string()],
         )?;
         conn.execute(
@@ -13828,7 +14244,9 @@ async fn retention_tick_runs_one_pass_without_sleep() {
     .await
     .unwrap();
     let cfg = RetentionConfig {
-        payload_window_days: 1,
+        transcript_window_days: 1,
+        raw_wire_window_days: 0,
+        terminal_evidence_window_days: 0,
         vacuum_interval_days: 0,
         ..RetentionConfig::default()
     };
@@ -16083,6 +16501,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "register_local_path_media" | "retain_https_media" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
+        "admit_image_ingress" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
             AuthzAllowedOutcome::Response
         }
@@ -16414,7 +16833,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("get_extended_config_snapshot"),
         authz_owner_only("export_policy"),
         authz_owner_only("import_policy"),
+        #[cfg(feature = "extended")]
         authz_owner_only("get_image_spend_policy"),
+        #[cfg(feature = "extended")]
         authz_owner_only("save_image_spend_policy"),
         authz_owner_only("image_endpoint_list"),
         authz_owner_only("image_endpoint_get"),
@@ -16452,6 +16873,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("set_workspace_trust"),
         authz_owner_only("recover_security_blocked_media"),
         authz_owner_only("register_local_path_media"),
+        authz_session_writer("admit_image_ingress"),
         authz_owner_only("retain_https_media"),
         authz_owner_only("list_leak_reports"),
         authz_owner_only("begin_leak_reveal"),
@@ -17838,6 +18260,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_root: root.clone(),
             provider_id: None,
         },
+        #[cfg(feature = "remote")]
         "upsert_provider_config" => Request::UpsertProviderConfig {
             project_root: root.clone(),
             provider_id: "matrix-provider".into(),
@@ -17850,6 +18273,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 ..Default::default()
             },
         },
+        #[cfg(feature = "remote")]
         "save_provider_config" => Request::SaveProviderConfig {
             project_root: root.clone(),
             provider_id: "matrix-provider".into(),
@@ -17859,11 +18283,13 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             },
             header_secrets: Vec::new(),
         },
+        #[cfg(feature = "remote")]
         "delete_provider_config" => Request::DeleteProviderConfig {
             project_root: root.clone(),
             provider_id: "matrix-provider".into(),
             delete_stored_secrets: false,
         },
+        #[cfg(feature = "remote")]
         "set_provider_layer_metadata" => Request::SetProviderLayerMetadata {
             project_root: root.clone(),
             category_defaults_json: "{}".into(),
@@ -17932,7 +18358,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 kind: "registerLocalPathMedia".into(),
                 local_operation_id: Uuid::now_v7(),
                 owner_principal_digest: "11".repeat(32),
-                session_id: Uuid::now_v7(),
+                session_id: Uuid::nil(),
                 canonical_project_digest: "22".repeat(32),
                 client_draft_id: Uuid::now_v7(),
                 requested_media_kind:
@@ -17940,6 +18366,13 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 path: "/repo/file.png".into(),
             },
         ),
+        "admit_image_ingress" => Request::AdmitImageIngress {
+            session_id: Uuid::now_v7(),
+            source: cockpit_proto::ImageIngressSourceV1::PrivateTerminalCapability {
+                capability: "a".repeat(26),
+            },
+            admission_id: Uuid::now_v7(),
+        },
         "retain_https_media" => {
             Request::RetainHttpsMedia(cockpit_db::media_attachments::RetainHttpsMediaV1 {
                 schema_version: 1,
@@ -18012,9 +18445,16 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             config_path: format!("{root}/.cockpit/mcp.json"),
             expected_revision: "00".repeat(32),
             mutation_intent_hash: "11".repeat(32),
-            config_json: "{}".into(),
+            patch: serde_json::to_string(&cockpit_proto::McpConfigPatch {
+                operations: vec![
+                    cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer {
+                        name: "fixture".into(),
+                    },
+                ],
+            })
+            .unwrap()
+            .into(),
             secret_values_json: "{}".into(),
-            cleanup_names_json: "[]".into(),
         },
         "export_policy" => Request::ExportPolicy {
             project_root: root.clone(),
@@ -18024,6 +18464,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             bundle_json: "{}".into(),
             replace: false,
         },
+        #[cfg(feature = "extended")]
         "get_image_spend_policy" => Request::GetImageSpendPolicy {
             project_key: root.clone(),
         },
@@ -18167,6 +18608,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "save_image_spend_policy" => Request::SaveImageSpendPolicy {
             client_operation_id: "authz-image-save".into(),
             project_key: root.clone(),
@@ -18184,6 +18626,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_root: root.clone(),
             provider_id: "matrix-provider".into(),
         },
+        #[cfg(feature = "remote")]
         "apply_setup_wizard" => Request::ApplySetupWizard {
             project_root: root.clone(),
             // A recognized wizard id ("security"/"model") so the request passes
@@ -21078,6 +21521,7 @@ impl MediaUploadHarness {
                     attachment_version,
                     availability_generation,
                     reference_generation,
+                    origin_admission_id: None,
                     origin_upload,
                 },
             }),
@@ -21339,6 +21783,7 @@ async fn assert_media_mutating_malformed(kind: &str) {
                 attachment_version: 1,
                 availability_generation: 1,
                 reference_generation: 1,
+                origin_admission_id: None,
                 origin_upload: None,
             }),
         ),
@@ -22334,7 +22779,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
                     .await
                     .unwrap()
                     .unwrap()
-                    .archived_at
+                    .archived_at_unix_ms
                     .is_some()
             );
         }
@@ -22358,7 +22803,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
                     .await
                     .unwrap()
                     .unwrap()
-                    .archived_at
+                    .archived_at_unix_ms
                     .is_none()
             );
         }
@@ -23237,6 +23682,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "fs_read",
         "fs_stat",
         "get_host_capabilities",
+        #[cfg(feature = "extended")]
         "get_image_spend_policy",
         "image_endpoint_list",
         "image_endpoint_get",
@@ -24913,6 +25359,19 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::AdmitImageIngress {
+                session_id: Uuid::nil(),
+                source: cockpit_proto::ImageIngressSourceV1::PrivateTerminalCapability {
+                    capability: "a".repeat(26),
+                },
+                admission_id: Uuid::now_v7(),
+            },
+            kind: "admit_image_ingress",
+            session_id: Some(Uuid::nil()),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::RetainHttpsMedia(
                 cockpit_db::media_attachments::RetainHttpsMediaV1 {
                     schema_version: 1,
@@ -25059,6 +25518,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                             attachment_version: 1,
                             availability_generation: 1,
                             reference_generation: 1,
+                            origin_admission_id: None,
                             origin_upload: None,
                         },
                 },
@@ -25129,9 +25589,11 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::GetLocalOperationSettlement { client_operation_id: "fixture-operation".into() }, kind: "get_local_operation_settlement", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::FetchProviderModels { project_root: "/tmp/project".into(), provider_id: None, model_id: None, deep: false, on_unlisted: None, allow_fallback: false }, kind: "fetch_provider_models", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetProviderUsageSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_usage_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::UpsertProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default() }, kind: "upsert_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SaveProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }, kind: "save_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), config_json: "{}".into(), secret_values_json: "{}".into(), cleanup_names_json: "[]".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), patch: r#"{"operations":[{"operation":"delete_authored_server","name":"fixture"}]}"#.into(), secret_values_json: "{}".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveAssistantDefinition { client_operation_id: "fixture-operation".into(), mutation_intent_hash: "22".repeat(32), project_root: "/tmp/project".into(), name: "helper".into(), markdown: "---\n---\n".into(), expected_revision: "rev-1".into(), expected_config_generation: 7 }, kind: "save_assistant_definition", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetAgentInventory { project_root: "/tmp/project".into() }, kind: "get_agent_inventory", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::GetAgentEditSnapshot { project_root: "/tmp/project".into(), name: "builder".into() }, kind: "get_agent_edit_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
@@ -25141,14 +25603,19 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::GetAgentEditorLeaseSettlement { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), lease_id: "lease-1".into() }, kind: "get_agent_editor_lease_settlement", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::GetExtendedConfigSnapshot { project_root: "/tmp/project".into(), snapshot_session_id: "snap-1".into() }, kind: "get_extended_config_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ApplyExtendedConfigPatch { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), layer_id: "layer-1".into(), patch: cockpit_proto::ExtendedConfigPatch { operations: vec![], materialize: false, denylist: vec![], redacted_mutations: vec![] }, expected_revision: "rev-1".into(), snapshot_session_id: "snap-1".into() }, kind: "apply_extended_config_patch", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::DeleteProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), delete_stored_secrets: false }, kind: "delete_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SetProviderLayerMetadata { project_root: "/tmp/project".into(), category_defaults_json: "{}".into(), on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch::Keep }, kind: "set_provider_layer_metadata", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SetupCopilotAuth { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), provider_id: "example".into() }, kind: "setup_copilot_auth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::ApplySetupWizard { project_root: "/tmp/project".into(), wizard_id: "security".into(), answers_json: "{}".into() }, kind: "apply_setup_wizard", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveExtendedConfig { project_root: "/tmp/project".into(), path: "AGENTS.md".into(), content: String::new(), base_hash: None }, kind: "save_extended_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ExportPolicy { project_root: "/tmp/project".into() }, kind: "export_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        #[cfg(feature = "extended")]
         CommandMetadataCase { request: Request::GetImageSpendPolicy { project_key: "proj".into() }, kind: "get_image_spend_policy", session_id: None, audit_path: None, mutating: false },
+        #[cfg(feature = "extended")]
         CommandMetadataCase { request: Request::SaveImageSpendPolicy { client_operation_id: "image-save".into(), project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImageEndpointList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_endpoint_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageEndpointGet { project_root: "/tmp/project".into(), endpoint_id: "ep1".into() }, kind: "image_endpoint_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
@@ -25309,6 +25776,11 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         FsDelete,
         GitStatus,
         GitDiffFile,
+        GitDiff,
+        GitReviewSources,
+        GitRepoStatus,
+        FindWorktreeRoot,
+        DiscardImageIngressDraft,
         OpenTerminal,
         AttachTerminal,
         TerminalInput,
@@ -25394,10 +25866,14 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ApplyProviderMutation,
         FetchProviderModels,
         GetProviderUsageSnapshot,
+        #[cfg(feature = "remote")]
         UpsertProviderConfig,
+        #[cfg(feature = "remote")]
         SaveProviderConfig,
         SaveMcpConfig,
+        #[cfg(feature = "remote")]
         DeleteProviderConfig,
+        #[cfg(feature = "remote")]
         SetProviderLayerMetadata,
         DaemonStatus,
         RefreshEnv,
@@ -25406,17 +25882,21 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         GetUsageCounts,
         StatsRollup,
         GuidanceEstimate,
+        AdmitImageIngress,
         RestartIfIdle,
         StopDaemon,
         GetHostCapabilities,
         RefreshHostCapabilities,
         MigrateKekPlacement,
         SetupCopilotAuth,
+        #[cfg(feature = "remote")]
         ApplySetupWizard,
         SaveExtendedConfig,
         ExportPolicy,
         ImportPolicy,
+        #[cfg(feature = "extended")]
         GetImageSpendPolicy,
+        #[cfg(feature = "extended")]
         SaveImageSpendPolicy,
         ImageEndpointList,
         ImageEndpointGet,
@@ -25533,7 +26013,10 @@ fn sample_png() -> Vec<u8> {
     out
 }
 
-fn assert_same_png_pixels(got: &[u8], want: &[u8]) {
+fn assert_same_png_pixels(got: &crate::engine::message::SubmissionImage, want: &[u8]) {
+    let crate::engine::message::SubmissionImage::Png { bytes: got } = got else {
+        panic!("dispatcher must resolve retained references to PNG bytes");
+    };
     let got = image::load_from_memory(got)
         .expect("got png")
         .to_rgba8()
@@ -29145,7 +29628,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
         host_capability_probes: base.host_capability_probes.clone(),
     });
-    let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
+    let client =
+        cockpit_client::DaemonClient::from_in_process(spawn_in_process_client(ctx.clone()));
 
     assert!(matches!(
         tokio::time::timeout(std::time::Duration::from_secs(1), client.next_event())
@@ -29359,7 +29843,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
         host_capability_probes: base.host_capability_probes.clone(),
     });
-    let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
+    let client =
+        cockpit_client::DaemonClient::from_in_process(spawn_in_process_client(ctx.clone()));
 
     assert!(matches!(
         client
@@ -29599,7 +30084,7 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
         .await
         .unwrap()
         .expect("row remains");
-    assert!(row.archived_at.is_none());
+    assert!(row.archived_at_unix_ms.is_none());
 }
 
 #[tokio::test]

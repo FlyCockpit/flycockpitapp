@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 17 as const;
+export const PROTOCOL_VERSION = 18 as const;
 
 /**
  * JSON form of a bulk transfer reference, mirroring Rust
@@ -1178,8 +1178,8 @@ const sessionSummaryWireSchema = z
     session_id: uuidSchema,
     project_root: projectRootSchema,
     project_id: z.string(),
-    started_at: safeI64NumberSchema,
-    last_active_at: safeI64NumberSchema,
+    started_at_unix_ms: safeI64NumberSchema,
+    last_active_at_unix_ms: safeI64NumberSchema,
     turns: safeU64NumberSchema,
     active_agent: z.string(),
   })
@@ -2010,8 +2010,8 @@ export const sessionSummarySchema = z
     short_id: z.string().optional(),
     project_root: projectRootSchema,
     project_id: z.string(),
-    started_at: safeI64NumberSchema,
-    last_active_at: safeI64NumberSchema,
+    started_at_unix_ms: safeI64NumberSchema,
+    last_active_at_unix_ms: safeI64NumberSchema,
     turns: safeU64NumberSchema,
     active_agent: z.string(),
     title: z.string().nullable().optional(),

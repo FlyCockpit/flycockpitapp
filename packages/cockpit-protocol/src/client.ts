@@ -128,7 +128,15 @@ export function isRemoteSessionError(error: unknown): error is RemoteSessionErro
  */
 export function isAmbiguousUserMessageSendError(error: unknown): boolean {
   if (!isRemoteSessionError(error)) return true;
-  return error.code === "internal" || error.code === "shutdown";
+  return (
+    error.code === "internal" ||
+    error.code === "shutdown" ||
+    error.code === "storage_full" ||
+    error.code === "storage_memory" ||
+    error.code === "storage_read_only" ||
+    error.code === "storage_io" ||
+    error.code === "storage_corrupt"
+  );
 }
 
 export function shouldRetainUserMessageSubmission(error: unknown): boolean {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use cockpit_cli::daemon::agent_installation::{
+use cockpit_cli::integration_test_api::agent_installation::{
     AgentInstallationFetcher, AgentInstallationService, AgentWorkspaceAuthorizer,
     CanonicalAgentSource, FetchedAgentSource,
 };

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 
-use cockpit_core::engine::response_performance::ResponsePerformance;
+use cockpit_client::presentation::ResponsePerformance;
 
 /// In-flight assistant turn. Lives in `App.pending` from
 /// `ThinkingStarted` to `AssistantText`; once finalized it gets pushed
@@ -39,7 +39,7 @@ pub struct PendingMsg {
     /// Whether this pending row is keyed to a live typed display attempt.
     /// `None` until an `AssistantDisplay*` event owns the provisional UI;
     /// live chip/body updates never re-enter raw `<think>` parsing.
-    pub attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
+    pub attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     /// `session_events.seq` of this assistant message, set from the
     /// finalizing `AssistantText` event and stamped onto the frozen
     /// [`HistoryEntry::Agent`] (the stable id a pin references —

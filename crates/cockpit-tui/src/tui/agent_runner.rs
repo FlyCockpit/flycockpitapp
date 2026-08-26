@@ -2,11 +2,11 @@
 //!
 //! Phase 4 of the daemon migration: the TUI no longer owns the
 //! engine. Instead [`try_spawn`] probes (or auto-promotes) the daemon
-//! via [`cockpit_core::daemon::client`], attaches a session at the cwd, and
+//! via [`cockpit_client`], attaches a session at the cwd, and
 //! pipes the per-tick event stream from the daemon's broadcast back
 //! to the TUI in the same `Arc<Mutex<Vec<TurnEvent>>>` shape the rest
 //! of `app.rs` already consumes. The wire-shape of events is
-//! [`cockpit_core::daemon::proto::Event`]; we translate to [`TurnEvent`] at
+//! [`cockpit_proto::Event`]; we translate to [`TurnEvent`] at
 //! the boundary so the TUI rendering paths don't need to know they
 //! talk to a daemon.
 
@@ -20,17 +20,18 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, mpsc, on
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
-use cockpit_core::daemon::bulk_upload::{
+use cockpit_client::bulk_upload::{
     BulkUserMessageUploadError, INLINE_USER_MESSAGE_TEXT_BYTES, stage_opaque_user_text,
     user_message_needs_bulk,
 };
-use cockpit_core::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
-use cockpit_core::daemon::image_upload::{ImageUploadError, upload_submission_images};
-use cockpit_core::daemon::proto::{self, ErrorCode, ErrorPayload, Request, Response};
-use cockpit_core::engine::{
+use cockpit_client::image_upload::{ImageUploadError, upload_submission_images};
+use cockpit_client::presentation::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
-use cockpit_core::jitter::{JitterSource, SystemJitter};
+use cockpit_client::submission::ClientUserSubmission;
+use cockpit_client::{ClientEndpoint, DaemonClient, LifecycleClient, LifecycleIntent};
+use cockpit_host::jitter::{JitterSource, SystemJitter};
+use cockpit_proto::{self as proto, ErrorCode, ErrorPayload, Request, Response};
 
 /// The three 30-day autocomplete count maps fetched at session start.
 /// `models` and `slash` are global; `tags` is scoped to this session's
@@ -145,7 +146,7 @@ pub struct ControlRequest {
 
 #[derive(Clone)]
 pub(crate) struct BoundUserSubmission {
-    pub(crate) submission: cockpit_core::engine::message::UserSubmission,
+    pub(crate) submission: ClientUserSubmission,
     pub(crate) optimistic_submission_id: Uuid,
     pub(crate) intended_session_id: Uuid,
     pub(crate) intended_attachment_epoch: u64,
@@ -238,7 +239,13 @@ fn classify_user_message_response(
             proto::ErrorCode::ModelGenerationStale => {
                 Err(UserSubmissionSendError::Rejected(error.message))
             }
-            proto::ErrorCode::Internal | proto::ErrorCode::Shutdown => {
+            proto::ErrorCode::Internal
+            | proto::ErrorCode::Shutdown
+            | proto::ErrorCode::StorageFull
+            | proto::ErrorCode::StorageMemory
+            | proto::ErrorCode::StorageReadOnly
+            | proto::ErrorCode::StorageIo
+            | proto::ErrorCode::StorageCorrupt => {
                 Err(UserSubmissionSendError::Ambiguous(error.message))
             }
             _ => Err(UserSubmissionSendError::Rejected(error.message)),
@@ -253,7 +260,7 @@ pub(crate) enum InputNotDelivered {
 }
 
 impl std::ops::Deref for BoundUserSubmission {
-    type Target = cockpit_core::engine::message::UserSubmission;
+    type Target = ClientUserSubmission;
 
     fn deref(&self) -> &Self::Target {
         &self.submission
@@ -261,8 +268,8 @@ impl std::ops::Deref for BoundUserSubmission {
 }
 
 #[cfg(test)]
-impl From<cockpit_core::engine::message::UserSubmission> for BoundUserSubmission {
-    fn from(submission: cockpit_core::engine::message::UserSubmission) -> Self {
+impl From<ClientUserSubmission> for BoundUserSubmission {
+    fn from(submission: ClientUserSubmission) -> Self {
         Self {
             submission,
             optimistic_submission_id: Uuid::new_v4(),
@@ -273,8 +280,8 @@ impl From<cockpit_core::engine::message::UserSubmission> for BoundUserSubmission
 }
 
 #[cfg(test)]
-impl From<cockpit_core::engine::message::UserSubmission> for RunnerInput {
-    fn from(submission: cockpit_core::engine::message::UserSubmission) -> Self {
+impl From<ClientUserSubmission> for RunnerInput {
+    fn from(submission: ClientUserSubmission) -> Self {
         Self::Submission(Box::new(submission.into()))
     }
 }
@@ -322,7 +329,7 @@ pub struct AgentRunner {
     pub skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
     /// Queue-edit foreground target from the attach snapshot. Live updates
     /// arrive as `TurnEvent::ForegroundInputTarget`.
-    pub foreground_target: Option<cockpit_core::engine::message::QueueTarget>,
+    pub foreground_target: Option<proto::QueueTarget>,
     /// Authoritative active-model snapshot from `Attach`, used to seed chrome
     /// before any later live active-model event arrives.
     pub active_model_state: Option<proto::ActiveModelState>,
@@ -348,14 +355,13 @@ pub struct AgentRunner {
     pub usage: UsageCounts,
     /// `true` when this TUI *spawned* the daemon it's attached to (the
     /// daemonless `AlwaysEphemeral` path) and therefore owns its teardown
-    /// — the app builds an [`cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard`]
-    /// from this. `false` when it attached to a pre-existing (canonical or
+    /// — the CLI lifecycle composition retains its teardown guard. `false`
+    /// when it attached to a pre-existing (canonical or
     /// auto-promoted persistent) daemon, which it must never stop.
     pub owns_daemon: bool,
-    /// Armed while the runner is still a provisional async attach result.
-    /// Adoption transfers this guard to `App`; dropping a stale/replaced
-    /// result therefore cannot orphan the ephemeral daemon it spawned.
-    owned_daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    /// Capability used for every fresh connection to this exact daemon,
+    /// including session switches and reconnects.
+    pub(crate) endpoint: ClientEndpoint,
     /// The socket of the daemon this runner is attached to. Carried so an
     /// owned ephemeral daemon can be reaped on exit via the guard.
     pub socket: PathBuf,
@@ -538,7 +544,7 @@ impl AgentRunner {
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+            foreground_target: Some(proto::QueueTarget::root("Build")),
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(session_id)),
             attachment_epoch: Arc::new(AtomicU64::new(0)),
@@ -548,7 +554,11 @@ impl AgentRunner {
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
             owns_daemon: false,
-            owned_daemon_guard: None,
+            endpoint: ClientEndpoint::Wire(
+                socket
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("/tmp/cockpit-test.sock")),
+            ),
             socket: socket.unwrap_or_else(|| PathBuf::from("/tmp/cockpit-test.sock")),
             history: Vec::new(),
             paused_work: Vec::new(),
@@ -571,12 +581,6 @@ impl AgentRunner {
     /// daemon-owned session.
     pub fn shutdown(&mut self) {
         self.client_tasks.shutdown();
-    }
-
-    pub(crate) fn take_owned_daemon_guard(
-        &mut self,
-    ) -> Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard> {
-        self.owned_daemon_guard.take()
     }
 
     pub fn event_notifier(&self) -> Arc<Notify> {
@@ -604,7 +608,7 @@ impl AgentRunner {
 
     pub(crate) fn try_send_input(
         &self,
-        submission: cockpit_core::engine::message::UserSubmission,
+        submission: ClientUserSubmission,
     ) -> Result<(), InputNotDelivered> {
         self.try_send_optimistic_input(submission, Uuid::new_v4())
             .map_err(|(outcome, _submission)| outcome)
@@ -612,15 +616,9 @@ impl AgentRunner {
 
     pub(crate) fn try_send_optimistic_input(
         &self,
-        submission: cockpit_core::engine::message::UserSubmission,
+        submission: ClientUserSubmission,
         optimistic_submission_id: Uuid,
-    ) -> Result<
-        (),
-        (
-            InputNotDelivered,
-            Box<cockpit_core::engine::message::UserSubmission>,
-        ),
-    > {
+    ) -> Result<(), (InputNotDelivered, Box<ClientUserSubmission>)> {
         let bound = BoundUserSubmission {
             submission,
             optimistic_submission_id,
@@ -652,14 +650,8 @@ impl AgentRunner {
     /// post-switch item even when the batch is larger than its capacity.
     pub(crate) fn try_send_session_switch_inputs(
         &self,
-        submissions: Vec<(Uuid, cockpit_core::engine::message::UserSubmission)>,
-    ) -> Result<
-        (),
-        (
-            InputNotDelivered,
-            Vec<(Uuid, cockpit_core::engine::message::UserSubmission)>,
-        ),
-    > {
+        submissions: Vec<(Uuid, ClientUserSubmission)>,
+    ) -> Result<(), (InputNotDelivered, Vec<(Uuid, ClientUserSubmission)>)> {
         if submissions.is_empty() {
             return Ok(());
         }
@@ -796,7 +788,7 @@ impl AgentRunner {
         let current_client = self.current_client.clone();
         let attach_context = self.attach_context.clone();
         let last_applied_seq = self.last_applied_seq.clone();
-        let socket = self.socket.clone();
+        let endpoint = self.endpoint.clone();
         let input_tx = self.input_tx.clone();
         async move {
             #[cfg(test)]
@@ -813,7 +805,7 @@ impl AgentRunner {
                     cancel_outgoing_turn_after_attach,
                     current_client,
                     last_applied_seq,
-                    socket,
+                    endpoint,
                     input_tx,
                 );
                 return Ok(outcome);
@@ -841,7 +833,7 @@ impl AgentRunner {
             let mut outcome = switch_session_inner(
                 current_client,
                 attach_context,
-                socket,
+                endpoint,
                 target,
                 cancel_outgoing_turn_after_attach,
             )
@@ -1014,7 +1006,7 @@ async fn dispatch_user_submission_for_current_attachment<F, Fut>(
     send: F,
 ) -> UserSubmissionDispatchOutcome
 where
-    F: FnOnce(Uuid, u64, cockpit_core::engine::message::UserSubmission) -> Fut,
+    F: FnOnce(Uuid, u64, ClientUserSubmission) -> Fut,
     Fut: std::future::Future<Output = Result<(), UserSubmissionSendError>>,
 {
     let transition_guard = transition_gate.lock_owned().await;
@@ -1240,7 +1232,7 @@ async fn run_user_submission_dispatcher<F, Fut>(
     mut context: UserSubmissionDispatcherContext,
     send: F,
 ) where
-    F: Fn(Uuid, u64, cockpit_core::engine::message::UserSubmission) -> Fut + Clone,
+    F: Fn(Uuid, u64, ClientUserSubmission) -> Fut + Clone,
     Fut: std::future::Future<Output = Result<(), UserSubmissionSendError>>,
 {
     enum DispatcherWake {
@@ -1456,7 +1448,7 @@ fn advance_attachment_epoch(context: &AttachRequestContext) -> u64 {
 pub(crate) struct AttachRequestContext {
     project_root: String,
     no_sandbox: bool,
-    env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire,
+    env_snapshot: cockpit_proto::EnvSnapshotWire,
     transition_gate: Arc<AsyncMutex<()>>,
     client_epoch_tx: watch::Sender<u64>,
     attachment_epoch: Arc<AtomicU64>,
@@ -1479,7 +1471,7 @@ pub struct SessionSwitchOutcome {
     pub active_agent: String,
     pub active_agent_path: Vec<String>,
     pub last_applied_seq: Option<i64>,
-    pub foreground_target: Option<cockpit_core::engine::message::QueueTarget>,
+    pub foreground_target: Option<proto::QueueTarget>,
     pub active_model_state: Option<proto::ActiveModelState>,
     pub project_id: String,
     pub history: Vec<proto::HistoryEntry>,
@@ -1499,12 +1491,12 @@ pub struct SessionSwitchOutcome {
 
 #[derive(Clone)]
 struct LocalReconnectDriver {
-    socket: PathBuf,
+    endpoint: ClientEndpoint,
 }
 
 impl LocalReconnectDriver {
     async fn connect(&self) -> Result<DaemonClient, anyhow::Error> {
-        DaemonClient::connect(&self.socket).await
+        DaemonClient::connect_endpoint(&self.endpoint).await
     }
 }
 
@@ -1866,7 +1858,7 @@ fn should_refresh_skill_inventory(event: &proto::Event) -> bool {
 async fn switch_session_inner(
     current_client: Arc<RwLock<DaemonClient>>,
     attach_context: Arc<RwLock<AttachRequestContext>>,
-    socket: PathBuf,
+    endpoint: ClientEndpoint,
     target: SessionTarget,
     cancel_outgoing_turn_after_attach: bool,
 ) -> Result<SessionSwitchOutcome, String> {
@@ -1874,7 +1866,7 @@ async fn switch_session_inner(
     // same session id. Adopt a fresh client so the old connection cannot feed
     // pre-Attach events into the new epoch.
     let outgoing_client = current_client.read().await.clone();
-    let replacement_client = DaemonClient::connect(&socket)
+    let replacement_client = DaemonClient::connect_endpoint(&endpoint)
         .await
         .map_err(|error| format!("connect replacement session client: {error:#}"))?;
     let client_protocol_version = replacement_client.negotiated().version;
@@ -1956,7 +1948,7 @@ where
         model_override: None,
         client_protocol_version,
         env_snapshot: Some(ctx.env_snapshot.clone()),
-        env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+        env_policy: cockpit_proto::EnvDriftPolicy::Client,
     })
     .await
     .map_err(|e| format!("attach: {e}"))?;
@@ -2109,9 +2101,10 @@ impl Drop for AgentRunner {
 pub async fn try_spawn(
     cwd: &Path,
     no_sandbox: bool,
-    mode: LifecycleMode,
+    lifecycle: LifecycleClient,
+    intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, None, None, no_sandbox, mode).await
+    try_spawn_inner(cwd, None, None, no_sandbox, lifecycle, intent).await
 }
 
 /// Attach a fresh or model-less existing session seeded with the complete
@@ -2122,9 +2115,18 @@ pub async fn try_spawn_with_model(
     session_id: Option<uuid::Uuid>,
     initial_model: cockpit_config::providers::ActiveModelRef,
     no_sandbox: bool,
-    mode: LifecycleMode,
+    lifecycle: LifecycleClient,
+    intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, session_id, Some(initial_model), no_sandbox, mode).await
+    try_spawn_inner(
+        cwd,
+        session_id,
+        Some(initial_model),
+        no_sandbox,
+        lifecycle,
+        intent,
+    )
+    .await
 }
 
 /// Re-attach to an existing session by id (the `/compact` commit path,
@@ -2137,9 +2139,10 @@ pub async fn attach_to_session(
     cwd: &Path,
     session_id: uuid::Uuid,
     no_sandbox: bool,
-    mode: LifecycleMode,
+    lifecycle: LifecycleClient,
+    intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, mode).await
+    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, lifecycle, intent).await
 }
 
 async fn try_spawn_inner(
@@ -2147,22 +2150,23 @@ async fn try_spawn_inner(
     session_id: Option<uuid::Uuid>,
     initial_model: Option<cockpit_config::providers::ActiveModelRef>,
     no_sandbox: bool,
-    mode: LifecycleMode,
+    lifecycle: LifecycleClient,
+    intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
     let attached = {
         let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
-        let mut daemon = probe_or_spawn(mode)
-            .await
-            .map_err(|e| format!("daemon probe: {e}"))?;
-        timer.phase("probe_or_spawn");
+        let daemon = lifecycle.resolve(intent).await?;
+        timer.phase("resolve_lifecycle");
         let owns_daemon = daemon.owns_daemon;
-        let owned_daemon_guard = daemon.take_owned_daemon_guard();
         let socket = daemon.socket.clone();
         let startup_notice = daemon.startup_notice.clone();
+        let endpoint = daemon.endpoint;
+        let client = DaemonClient::connect_endpoint(&endpoint)
+            .await
+            .map_err(|error| format!("daemon connect: {error}"))?;
         let project_root = cwd.to_string_lossy().into_owned();
         let (env_snapshot, _env_diagnostic) = cockpit_core::env_snapshot::capture_tui_shell_env();
-        let attached = match daemon
-            .client
+        let attached = match client
             .request(Request::Attach {
                 session_id,
                 since_seq: None,
@@ -2177,9 +2181,9 @@ async fn try_spawn_inner(
                 // plan-level override is only for the headless plan-run
                 // path (`cockpit run --model`).
                 model_override: None,
-                client_protocol_version: daemon.client.negotiated().version,
+                client_protocol_version: client.negotiated().version,
                 env_snapshot: Some(env_snapshot.to_wire()),
-                env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+                env_policy: cockpit_proto::EnvDriftPolicy::Client,
             })
             .await
         {
@@ -2240,8 +2244,7 @@ async fn try_spawn_inner(
         // Fetch the autocomplete frequency maps for this session's
         // project. Best-effort: a daemon that doesn't speak
         // `GetUsageCounts` just leaves the maps empty (no ranking).
-        let usage = match daemon
-            .client
+        let usage = match client
             .request_ok(Request::GetUsageCounts {
                 project_id: Some(project_id.clone()),
             })
@@ -2258,8 +2261,7 @@ async fn try_spawn_inner(
             },
             _ => UsageCounts::default(),
         };
-        let skill_inventory_names = match daemon
-            .client
+        let skill_inventory_names = match client
             .request_ok(Request::GetInventoryBundle {
                 project_root: cwd.to_string_lossy().into_owned(),
                 session_id,
@@ -2278,7 +2280,8 @@ async fn try_spawn_inner(
         timer.phase("attach_and_usage");
         timer.done();
         Ok::<_, String>((
-            daemon.client,
+            client,
+            endpoint,
             session_id,
             short_id,
             active_agent_name,
@@ -2297,11 +2300,11 @@ async fn try_spawn_inner(
             btw_fork,
             daemon_version,
             daemon_compatible,
-            owned_daemon_guard,
         ))
     }?;
     let (
         client,
+        endpoint,
         session_id,
         short_id,
         initial_active_agent,
@@ -2320,7 +2323,6 @@ async fn try_spawn_inner(
         btw_fork,
         daemon_version,
         daemon_compatible,
-        owned_daemon_guard,
     ) = attached;
 
     let (input_tx, input_rx) = mpsc::channel::<RunnerInput>(32);
@@ -2587,7 +2589,7 @@ async fn try_spawn_inner(
         let attachment_ready_tx = attachment_ready_tx.clone();
         let transition_gate = transition_gate.clone();
         let driver = LocalReconnectDriver {
-            socket: socket.clone(),
+            endpoint: endpoint.clone(),
         };
         // The current primary (root-frame) agent, tracked so a subagent pop
         // returns the active-agent slot to the right primary after a `/plan`
@@ -2790,7 +2792,7 @@ async fn try_spawn_inner(
         project_id,
         usage,
         owns_daemon,
-        owned_daemon_guard,
+        endpoint,
         socket,
         history,
         paused_work,
@@ -2904,16 +2906,17 @@ pub struct GuidanceEstimate {
 /// a local raw-cl100k computation via [`cockpit_core::engine::builtin`]. The two
 /// modes may differ by the calibration factor; each is the best available
 /// for its mode. Best-effort and non-blocking for launch.
-pub async fn fetch_guidance_estimate_with_socket(
+pub async fn fetch_guidance_estimate_with_endpoint(
     cwd: &Path,
     providers: cockpit_config::providers::ProvidersConfig,
     provider: Option<String>,
     model: Option<String>,
-    socket: Option<std::path::PathBuf>,
+    endpoint: Option<ClientEndpoint>,
 ) -> GuidanceEstimate {
-    if let Some(socket) = socket
+    if let Some(endpoint) = endpoint
         && let Some(est) =
-            daemon_guidance_estimate_at_socket(cwd, provider.clone(), model.clone(), &socket).await
+            daemon_guidance_estimate_at_endpoint(cwd, provider.clone(), model.clone(), &endpoint)
+                .await
     {
         return est;
     }
@@ -2923,13 +2926,13 @@ pub async fn fetch_guidance_estimate_with_socket(
 /// Ask an already-running daemon for the calibrated estimate. Returns
 /// `None` on any failure (no daemon, transport error, or a malformed
 /// response) so the caller can fall back to the local computation.
-async fn daemon_guidance_estimate_at_socket(
+async fn daemon_guidance_estimate_at_endpoint(
     cwd: &Path,
     provider: Option<String>,
     model: Option<String>,
-    socket: &Path,
+    endpoint: &ClientEndpoint,
 ) -> Option<GuidanceEstimate> {
-    let client = cockpit_core::daemon::client::DaemonClient::connect(socket)
+    let client = cockpit_client::DaemonClient::connect_endpoint(endpoint)
         .await
         .ok()?;
     let resp = client
@@ -2957,7 +2960,7 @@ async fn daemon_guidance_estimate_at_socket(
 }
 
 /// Daemonless fallback: size the guidance file body and the full composed
-/// system prompt in-process with raw cl100k (`cockpit_core::tokens::count`).
+/// system prompt in-process with the shared raw cl100k tokenizer.
 /// Cheap and synchronous — `load_agent_guidance` only stats/reads one
 /// small file along the cwd→git-root walk — so it never blocks launch.
 fn local_guidance_estimate(
@@ -2971,18 +2974,18 @@ fn local_guidance_estimate(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        (name, cockpit_core::tokens::count(&body) as u64)
+        (name, cockpit_tokenizer::count(&body) as u64)
     });
     // No session exists yet at the fresh-chat indicator, so the system
     // prompt omits the `Session:` line — matching what the engine sends.
     let system_prompt = cockpit_core::engine::builtin::default_chat_system_prompt(cwd, "");
-    let system_tokens = cockpit_core::tokens::count(&system_prompt) as u64;
+    let system_tokens = cockpit_tokenizer::count(&system_prompt) as u64;
     let model_instruction_tokens = provider
         .zip(model)
         .and_then(|(provider, model)| {
             providers
                 .resolve_model_system_prompt(provider, model)
-                .map(|prompt| cockpit_core::tokens::count(prompt) as u64)
+                .map(|prompt| cockpit_tokenizer::count(prompt) as u64)
         })
         .unwrap_or(0);
     match file {
@@ -3008,26 +3011,28 @@ fn local_guidance_estimate(
 /// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker; reducers and
 /// event handlers use typed async effects. `Err(String)` for any
 /// transport/typed failure.
-pub(crate) fn daemon_request_blocking(req: Request) -> Result<Response, String> {
+pub(crate) fn daemon_request_blocking(
+    lifecycle: cockpit_client::LifecycleClient,
+    req: Request,
+) -> Result<Response, String> {
     #[cfg(test)]
     {
+        let _ = lifecycle;
         return crate::tui::settings::test_daemon_request(req);
     }
     #[cfg(not(test))]
     {
-        use cockpit_core::daemon::{DaemonStatus, discover};
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                let probe = discover().await;
-                if !matches!(probe.status, DaemonStatus::Running) {
-                    return Err("daemon not running".to_string());
-                }
-                let client =
-                    cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
-                        .await
-                        .map_err(|e| format!("daemon connect: {e}"))?;
+                let resolved = lifecycle
+                    .resolve(LifecycleIntent::EnsurePersistent)
+                    .await
+                    .map_err(|error| format!("daemon lifecycle: {error}"))?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint)
+                    .await
+                    .map_err(|e| format!("daemon connect: {e}"))?;
                 client
                     .request_ok(req)
                     .await
@@ -3042,53 +3047,6 @@ pub(crate) fn daemon_request_blocking(req: Request) -> Result<Response, String> 
 /// accidental use from reducers and the async event-loop thread.
 ///
 /// [`AsyncActionRunner::start_blocking`]: crate::tui::async_action::AsyncActionRunner::start_blocking
-pub(crate) fn daemon_request_from_blocking_worker(req: Request) -> Result<Response, String> {
-    daemon_request_blocking(req)
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) enum BlockingDaemonRequestError {
-    Conflict(String),
-    Other(String),
-}
-
-/// Blocking request variant that preserves optimistic-concurrency conflicts.
-#[cfg(test)]
-pub(crate) fn daemon_request_blocking_classified(
-    req: Request,
-) -> Result<Response, BlockingDaemonRequestError> {
-    use cockpit_core::daemon::{DaemonStatus, discover};
-    let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|_| BlockingDaemonRequestError::Other("no tokio runtime".to_string()))?;
-    tokio::task::block_in_place(|| {
-        runtime.block_on(async {
-            let probe = discover().await;
-            if !matches!(probe.status, DaemonStatus::Running) {
-                return Err(BlockingDaemonRequestError::Other(
-                    "daemon not running".to_string(),
-                ));
-            }
-            let client = cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
-                .await
-                .map_err(|error| {
-                    BlockingDaemonRequestError::Other(format!("daemon connect: {error}"))
-                })?;
-            match client.request(req).await.map_err(|error| {
-                BlockingDaemonRequestError::Other(format!("daemon request: {error}"))
-            })? {
-                Ok(response) => Ok(response),
-                Err(error) if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict => {
-                    Err(BlockingDaemonRequestError::Conflict(error.message))
-                }
-                Err(error) => Err(BlockingDaemonRequestError::Other(format!(
-                    "daemon request: {error}"
-                ))),
-            }
-        })
-    })
-}
-
 /// Run one blocking request against the daemon at a *known* `socket` —
 /// the socket the attached [`AgentRunner`] is already bound to. Unlike
 /// [`daemon_request_blocking`], this never re-resolves the canonical path,
@@ -3096,13 +3054,16 @@ pub(crate) fn daemon_request_blocking_classified(
 /// auto-spawn paths) whose socket env is set only in the daemon child, not
 /// in this client process. Connects only — never spawns. `Err(String)` on
 /// any transport/typed failure.
-pub(crate) fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Response, String> {
+pub(crate) fn daemon_request_at_blocking(
+    endpoint: &ClientEndpoint,
+    req: Request,
+) -> Result<Response, String> {
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    let socket = socket.to_path_buf();
+    let endpoint = endpoint.clone();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let client = cockpit_core::daemon::client::DaemonClient::connect(&socket)
+            let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                 .await
                 .map_err(|e| format!("daemon connect: {e}"))?;
             client
@@ -3118,7 +3079,7 @@ pub(crate) fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<
 /// Returns the revealed `Zeroizing` plaintext **directly** to the caller — it
 /// never rides an `AsyncActionPayload` or any ordinary daemon codec.
 pub(crate) fn daemon_reveal_leak_blocking(
-    control_socket: &Path,
+    endpoint: &ClientEndpoint,
     capability: &proto::LeakRevealToken,
 ) -> Result<
     cockpit_core::daemon::leak_reveal::RevealedLeakSecret,
@@ -3130,10 +3091,11 @@ pub(crate) fn daemon_reveal_leak_blocking(
             return Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::UnavailablePlatform);
         }
     };
-    let socket = control_socket.to_path_buf();
+    let endpoint = endpoint.clone();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            cockpit_core::daemon::leak_reveal::reveal_leak_secret(&socket, capability).await
+            cockpit_core::daemon::leak_reveal::reveal_leak_secret_at_endpoint(&endpoint, capability)
+                .await
         })
     })
 }
@@ -3143,13 +3105,13 @@ pub(crate) fn daemon_reveal_leak_blocking(
 /// this targets a specific socket — the one the live runner is attached to.
 /// That matters in daemonless mode, where the runner owns a pid+nonce
 /// ephemeral daemon the canonical paths don't point at.
-fn request_on_socket(socket: &Path, req: Request) -> Result<Response, String> {
+fn request_on_endpoint(endpoint: &ClientEndpoint, req: Request) -> Result<Response, String> {
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    let socket = socket.to_path_buf();
+    let endpoint = endpoint.clone();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let client = cockpit_core::daemon::client::DaemonClient::connect(&socket)
+            let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                 .await
                 .map_err(|e| format!("daemon connect: {e}"))?;
             client
@@ -3165,13 +3127,13 @@ fn request_on_socket(socket: &Path, req: Request) -> Result<Response, String> {
 /// throwaway `/side` side-conversation fork (excluded from lists, never
 /// auto-titled, discarded on end/exit).
 pub fn fork_session_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     parent_session_id: uuid::Uuid,
     fork_point_turn_id: Option<String>,
     ephemeral: bool,
 ) -> Result<(uuid::Uuid, String), String> {
-    match request_on_socket(
-        socket,
+    match request_on_endpoint(
+        endpoint,
         Request::ForkSession {
             parent_session_id,
             fork_point_turn_id,
@@ -3190,8 +3152,11 @@ pub fn fork_session_blocking(
 /// Discard an ephemeral side-conversation (`/side`) on the daemon at
 /// `socket`: stops its worker and deletes its row + descendant forks. A
 /// non-ephemeral session is left untouched (daemon-side guard).
-pub fn discard_session_blocking(socket: &Path, session_id: uuid::Uuid) -> Result<(), String> {
-    match request_on_socket(socket, Request::DiscardSession { session_id })? {
+pub fn discard_session_blocking(
+    endpoint: &ClientEndpoint,
+    session_id: uuid::Uuid,
+) -> Result<(), String> {
+    match request_on_endpoint(endpoint, Request::DiscardSession { session_id })? {
         Response::Ack => Ok(()),
         other => Err(format!("unexpected discard response: {other:?}")),
     }
@@ -3201,12 +3166,12 @@ pub fn discard_session_blocking(socket: &Path, session_id: uuid::Uuid) -> Result
 /// `parent = None` → root sessions in `p`; `parent = Some(s)` → direct
 /// forks of `s`; both `None` → every open session (all-projects scope).
 pub fn list_sessions_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     project_id: Option<String>,
     parent_session_id: Option<uuid::Uuid>,
 ) -> Result<Vec<proto::SessionSummary>, String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ListSessions {
             project_id,
             parent_session_id,
@@ -3219,13 +3184,13 @@ pub fn list_sessions_blocking(
 }
 
 pub fn read_session_messages_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_id: uuid::Uuid,
     before_seq: Option<i64>,
     limit: u32,
 ) -> Result<(Vec<proto::SessionMessage>, bool), String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ReadSessionMessages {
             session_id,
             before_seq,
@@ -3244,12 +3209,12 @@ pub fn read_session_messages_blocking(
 }
 
 pub fn read_client_submission_receipt_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_id: uuid::Uuid,
     client_submission_id: uuid::Uuid,
 ) -> Result<proto::ClientSubmissionReceiptStatus, String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ReadClientSubmissionReceipt {
             session_id,
             client_submission_id,
@@ -3267,13 +3232,13 @@ pub fn read_client_submission_receipt_blocking(
 }
 
 pub fn read_history_page_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_id: uuid::Uuid,
     before_seq: Option<i64>,
     limit: u32,
 ) -> Result<(Vec<proto::HistoryEntry>, bool, Option<i64>), String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ReadHistoryPage {
             session_id,
             before_seq,
@@ -3291,7 +3256,7 @@ pub fn read_history_page_blocking(
 }
 
 pub fn read_subagent_history_page_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_id: uuid::Uuid,
     task_call_id: String,
     label: String,
@@ -3299,7 +3264,7 @@ pub fn read_subagent_history_page_blocking(
     limit: u32,
 ) -> Result<(Vec<proto::HistoryEntry>, bool, Option<i64>), String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ReadSubagentHistoryPage {
             session_id,
             task_call_id: task_call_id.clone(),
@@ -3324,21 +3289,52 @@ pub fn read_subagent_history_page_blocking(
     }
 }
 
-pub(crate) fn resource_snapshot_blocking() -> Result<proto::Response, String> {
-    match daemon_request_blocking(Request::ResourceSnapshot)? {
+pub(crate) fn resource_snapshot_blocking(
+    lifecycle: cockpit_client::LifecycleClient,
+) -> Result<proto::Response, String> {
+    match daemon_request_blocking(lifecycle, Request::ResourceSnapshot)? {
         response @ Response::ResourceSnapshot { .. } => Ok(response),
         other => Err(format!("unexpected resource_snapshot response: {other:?}")),
     }
 }
 
-pub fn promote_resource_blocking(
+pub(crate) fn promote_resource_request(
+    request_id: uuid::Uuid,
+    session_id: Option<uuid::Uuid>,
+) -> Request {
+    promote_resource_token_request(request_id.to_string(), session_id)
+}
+
+pub(crate) fn promote_resource_token_request(
     request_id: String,
     session_id: Option<uuid::Uuid>,
-) -> Result<proto::Response, String> {
-    match daemon_request_blocking(Request::PromoteResource {
+) -> Request {
+    let request = Request::PromoteResource {
         request_id,
         session_id,
-    })? {
+    };
+    #[cfg(test)]
+    TEST_RESOURCE_PROMOTE_REQUESTS.with(|requests| requests.borrow_mut().push(request.clone()));
+    request
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RESOURCE_PROMOTE_REQUESTS: std::cell::RefCell<Vec<Request>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_resource_promote_requests() -> Vec<Request> {
+    TEST_RESOURCE_PROMOTE_REQUESTS.with(|requests| std::mem::take(&mut *requests.borrow_mut()))
+}
+
+pub fn promote_resource_blocking(
+    lifecycle: cockpit_client::LifecycleClient,
+    request: Request,
+) -> Result<proto::Response, String> {
+    match daemon_request_blocking(lifecycle, request)? {
         response @ Response::PromoteResourceResult { .. } => Ok(response),
         other => Err(format!("unexpected promote_resource response: {other:?}")),
     }
@@ -3348,10 +3344,10 @@ pub fn promote_resource_blocking(
 /// session ids. Daemon down / no live worker → empty map; callers treat
 /// absent ids as not-processing / no-jobs.
 pub fn session_live_status_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_ids: Vec<uuid::Uuid>,
 ) -> std::collections::HashMap<uuid::Uuid, (bool, bool)> {
-    match daemon_request_at_blocking(socket, Request::SessionLiveStatus { session_ids }) {
+    match daemon_request_at_blocking(endpoint, Request::SessionLiveStatus { session_ids }) {
         Ok(Response::SessionLiveStatus { statuses }) => statuses
             .into_iter()
             .map(|s| (s.session_id, (s.has_active_schedules, s.processing)))
@@ -3577,7 +3573,7 @@ where
         model_override: None,
         client_protocol_version,
         env_snapshot: Some(attach_context.env_snapshot.clone()),
-        env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+        env_policy: cockpit_proto::EnvDriftPolicy::Client,
     })
     .await
     .map_err(ReconnectAttachError::Retriable)?;
@@ -3818,7 +3814,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayTextDelta {
             agent,
-            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
             delta,
         },
         AssistantDisplayReasoningDelta {
@@ -3828,7 +3824,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayReasoningDelta {
             agent,
-            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
             delta,
         },
         AssistantDisplayAttemptReset {
@@ -3839,8 +3835,10 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayAttemptReset {
             agent,
-            failed_attempt_id: cockpit_core::engine::AssistantAttemptId::new(failed_attempt_id),
-            replacement_attempt_id: cockpit_core::engine::AssistantAttemptId::new(
+            failed_attempt_id: cockpit_client::presentation::AssistantAttemptId::new(
+                failed_attempt_id,
+            ),
+            replacement_attempt_id: cockpit_client::presentation::AssistantAttemptId::new(
                 replacement_attempt_id,
             ),
             reason,
@@ -3856,15 +3854,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayComplete {
             agent,
-            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
-            assistant: cockpit_core::engine::AssistantTextPayload {
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
+            assistant: cockpit_client::presentation::AssistantTextPayload {
                 text,
                 presentation_text,
                 reasoning,
                 seq,
-                response_performance: response_performance.as_ref().and_then(
-                    cockpit_core::engine::response_performance::ResponsePerformance::from_proto,
-                ),
+                response_performance: response_performance
+                    .and_then(cockpit_client::presentation::ResponsePerformance::from_proto),
             },
         },
         AssistantDisplayError {
@@ -3876,10 +3873,10 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::AssistantDisplayError {
             agent,
-            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
             kind: match kind.as_str() {
-                "cancelled" => cockpit_core::engine::DisplayErrorKind::Cancelled,
-                _ => cockpit_core::engine::DisplayErrorKind::Failed,
+                "cancelled" => cockpit_client::presentation::DisplayErrorKind::Cancelled,
+                _ => cockpit_client::presentation::DisplayErrorKind::Failed,
             },
             message,
             presentation_text,
@@ -3898,9 +3895,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             presentation_text,
             reasoning,
             seq,
-            response_performance: response_performance.as_ref().and_then(
-                cockpit_core::engine::response_performance::ResponsePerformance::from_proto,
-            ),
+            response_performance: response_performance
+                .and_then(cockpit_client::presentation::ResponsePerformance::from_proto),
         },
         UserMessageRecorded {
             seq,
@@ -4026,7 +4022,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             total,
             unit,
             ..
-        } => TurnEvent::ToolProgress(cockpit_core::engine::ToolProgress {
+        } => TurnEvent::ToolProgress(cockpit_client::presentation::ToolProgress {
             call_id,
             done,
             total,
@@ -4225,7 +4221,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::Usage {
             agent,
-            usage: cockpit_core::tokens::TokenUsage {
+            usage: cockpit_client::presentation::TokenUsage {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
@@ -4491,18 +4487,12 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
     })
 }
 
-fn queue_item_from_proto(
-    item: proto::QueueItem,
-) -> cockpit_core::engine::message::QueuedUserMessage {
-    cockpit_core::engine::message::QueuedUserMessage {
+fn queue_item_from_proto(item: proto::QueueItem) -> cockpit_proto::QueueItem {
+    cockpit_proto::QueueItem {
         id: item.id,
         status: match item.status {
-            proto::QueueItemStatus::Queued => {
-                cockpit_core::engine::message::QueueItemStatus::Queued
-            }
-            proto::QueueItemStatus::Folding => {
-                cockpit_core::engine::message::QueueItemStatus::Folding
-            }
+            proto::QueueItemStatus::Queued => proto::QueueItemStatus::Queued,
+            proto::QueueItemStatus::Folding => proto::QueueItemStatus::Folding,
         },
         text: item.text,
         display_text: item.display_text,
@@ -4510,10 +4500,8 @@ fn queue_item_from_proto(
     }
 }
 
-fn queue_target_from_proto(
-    target: proto::QueueTarget,
-) -> cockpit_core::engine::message::QueueTarget {
-    cockpit_core::engine::message::QueueTarget {
+fn queue_target_from_proto(target: proto::QueueTarget) -> proto::QueueTarget {
+    proto::QueueTarget {
         id: target.id,
         agent: target.agent,
         depth: target.depth,
@@ -4527,11 +4515,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    fn complete_test_submission() -> cockpit_core::engine::message::UserSubmission {
-        cockpit_core::engine::message::UserSubmission {
+    fn complete_test_submission() -> ClientUserSubmission {
+        ClientUserSubmission {
             expected_model_state_generation: None,
             expected_model: None,
-            kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            kind: cockpit_client::submission::UserSubmissionKind::User,
             origin: Default::default(),
             text: "wire text with expanded tag and image sentinel".to_string(),
             display_text: Some("visible @src/lib.rs [image]".to_string()),
@@ -4541,16 +4529,10 @@ mod tests {
                 detail: "expanded source".to_string(),
                 ok: true,
             }],
-            images: vec![vec![0x89, b'P', b'N', b'G', 0, 1, 2, 3]],
+            images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
+                0x89, b'P', b'N', b'G', 0, 1, 2, 3,
+            ])],
             forced_skill: Some("review".to_string()),
-            origin_principal: Some("flycockpit:test-user".to_string()),
-            job_id: Some("job-123".to_string()),
-            preflight_cleaned: Some("cleaned wire text".to_string()),
-            queue_item_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
-            client_submissions: Vec::new(),
-            pending_terminal_disposition: None,
-            run_invocation_id: None,
-            queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         }
     }
 
@@ -4617,9 +4599,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_history_page_blocking_rejects_unexpected_response() {
-        use cockpit_core::daemon::proto::{
-            Body, Envelope, ProtoStream, RecvFrame, Request, Response,
-        };
+        use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame, Request, Response};
         use tokio::net::UnixListener;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4639,7 +4619,7 @@ mod tests {
                         active_sessions: 0,
                         socket_path: "test.sock".to_string(),
                         daemon_version: "test".to_string(),
-                        protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+                        protocol_version: cockpit_proto::PROTOCOL_VERSION,
                         paused_sessions: 0,
                         database_path: "test.db".to_string(),
                         // Handshake negotiation intentionally ignores database
@@ -4683,7 +4663,8 @@ mod tests {
                 .unwrap();
         });
 
-        let err = read_history_page_blocking(&socket, session_id, None, 20)
+        let endpoint = ClientEndpoint::Wire(socket);
+        let err = read_history_page_blocking(&endpoint, session_id, None, 20)
             .expect_err("mismatched response variant is rejected");
 
         assert!(err.contains("unexpected read_history_page response"));
@@ -4695,8 +4676,8 @@ mod tests {
         Arc::new(RwLock::new(AttachRequestContext {
             project_root: project_root.to_string(),
             no_sandbox: true,
-            env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire {
-                source: cockpit_core::env_snapshot::EnvSnapshotSource::TuiShell,
+            env_snapshot: cockpit_proto::EnvSnapshotWire {
+                source: cockpit_proto::EnvSnapshotSource::TuiShell,
                 digest: String::new(),
                 vars: std::collections::HashMap::new(),
             },
@@ -4734,7 +4715,7 @@ mod tests {
             env_baseline: None,
             env_session: None,
             env_drift: None,
-            env_policy_applied: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+            env_policy_applied: cockpit_proto::EnvDriftPolicy::Client,
             btw_fork: None,
         }
     }
@@ -4930,9 +4911,7 @@ mod tests {
         for text in ["held first", "queued second"] {
             input_tx
                 .send(RunnerInput::Submission(Box::new(BoundUserSubmission {
-                    submission: cockpit_core::engine::message::UserSubmission::text(
-                        text.to_string(),
-                    ),
+                    submission: ClientUserSubmission::text(text.to_string()),
                     optimistic_submission_id: Uuid::new_v4(),
                     intended_session_id: old_session_id,
                     intended_attachment_epoch: 7,
@@ -5172,7 +5151,7 @@ mod tests {
             active_agent: "Build".to_string(),
             active_agent_path: vec!["Build".to_string()],
             last_applied_seq: Some(41),
-            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+            foreground_target: Some(cockpit_proto::QueueTarget::root("Build")),
             active_model_state: None,
             project_id: "project".to_string(),
             history: vec![proto::HistoryEntry::User {
@@ -5581,7 +5560,7 @@ mod tests {
                     intended_attachment_epoch: 4,
                 },
                 BoundUserSubmission {
-                    submission: cockpit_core::engine::message::UserSubmission::text("next payload"),
+                    submission: ClientUserSubmission::text("next payload"),
                     optimistic_submission_id: delivered_id,
                     intended_session_id: session_id,
                     intended_attachment_epoch: 4,
@@ -5618,6 +5597,25 @@ mod tests {
             assert!(matches!(
                 classify_image_upload_error(error),
                 UserSubmissionSendError::Ambiguous(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn storage_failures_leave_user_message_commit_ambiguous() {
+        for code in [
+            proto::ErrorCode::StorageFull,
+            proto::ErrorCode::StorageMemory,
+            proto::ErrorCode::StorageReadOnly,
+            proto::ErrorCode::StorageIo,
+            proto::ErrorCode::StorageCorrupt,
+        ] {
+            assert!(matches!(
+                classify_user_message_response(Err(proto::ErrorPayload {
+                    code,
+                    message: "database durability boundary was not confirmed".to_string(),
+                })),
+                Err(UserSubmissionSendError::Ambiguous(_))
             ));
         }
     }
@@ -5755,9 +5753,7 @@ mod tests {
         let optimistic_submission_id = Uuid::new_v4();
         let outcome = dispatch_user_submission_for_current_attachment(
             BoundUserSubmission {
-                submission: cockpit_core::engine::message::UserSubmission::text(
-                    "current payload".to_string(),
-                ),
+                submission: ClientUserSubmission::text("current payload".to_string()),
                 optimistic_submission_id,
                 intended_session_id: session_id,
                 intended_attachment_epoch: 4,
@@ -5977,7 +5973,7 @@ mod tests {
                                 session_id,
                                 &attach_context,
                                 &last,
-                                cockpit_core::daemon::proto::PROTOCOL_VERSION,
+                                cockpit_proto::PROTOCOL_VERSION,
                                 |request| async move {
                                     match request {
                                         Request::Attach {
@@ -6060,8 +6056,8 @@ mod tests {
         let attach_context = AttachRequestContext {
             project_root: "/tmp/project".to_string(),
             no_sandbox: false,
-            env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire {
-                source: cockpit_core::env_snapshot::EnvSnapshotSource::TuiShell,
+            env_snapshot: cockpit_proto::EnvSnapshotWire {
+                source: cockpit_proto::EnvSnapshotSource::TuiShell,
                 digest: String::new(),
                 vars: std::collections::HashMap::new(),
             },
@@ -6297,8 +6293,8 @@ mod tests {
         let attach_context = Arc::new(RwLock::new(AttachRequestContext {
             project_root: "/tmp/project".to_string(),
             no_sandbox: true,
-            env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire {
-                source: cockpit_core::env_snapshot::EnvSnapshotSource::TuiShell,
+            env_snapshot: cockpit_proto::EnvSnapshotWire {
+                source: cockpit_proto::EnvSnapshotSource::TuiShell,
                 digest: String::new(),
                 vars: std::collections::HashMap::new(),
             },
@@ -6316,7 +6312,7 @@ mod tests {
         let outcome = switch_session_with_attach_request(
             attach_context,
             SessionTarget::New,
-            cockpit_core::daemon::proto::PROTOCOL_VERSION,
+            cockpit_proto::PROTOCOL_VERSION,
             move |request| {
                 captured.lock().unwrap().push(request);
                 async move {
@@ -6338,7 +6334,7 @@ mod tests {
                         env_baseline: None,
                         env_session: None,
                         env_drift: None,
-                        env_policy_applied: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+                        env_policy_applied: cockpit_proto::EnvDriftPolicy::Client,
                         btw_fork: None,
                     }))
                 }
@@ -6434,14 +6430,14 @@ mod tests {
         let event = proto_event_to_turn_event(proto::Event::AgentIdle {
             session_id,
             turn_id: Some("turn-1".to_string()),
-            reason: cockpit_core::engine::IdleReason::Completed,
+            reason: cockpit_proto::IdleReason::Completed,
         })
         .expect("idle event maps");
         assert!(matches!(
             event,
             TurnEvent::AgentIdle {
                 turn_id: Some(turn_id),
-                reason: cockpit_core::engine::IdleReason::Completed,
+                reason: cockpit_proto::IdleReason::Completed,
             } if turn_id == "turn-1"
         ));
     }
@@ -6632,13 +6628,13 @@ mod tests {
             "image-control config changes are not chat-history events"
         );
 
-        let meta = cockpit_core::env_snapshot::EnvSnapshotMeta {
-            source: cockpit_core::env_snapshot::EnvSnapshotSource::DaemonStart,
+        let meta = cockpit_proto::EnvSnapshotMeta {
+            source: cockpit_proto::EnvSnapshotSource::DaemonStart,
             digest: "digest".into(),
             key_count: 3,
             path_entry_count: 1,
         };
-        let drift = cockpit_core::env_snapshot::EnvDiffSummary {
+        let drift = cockpit_proto::EnvDiffSummary {
             baseline_digest: "base".into(),
             candidate_digest: "candidate".into(),
             added_keys: 1,
@@ -6652,7 +6648,7 @@ mod tests {
             baseline: meta.clone(),
             candidate: meta,
             diff: drift,
-            policy: cockpit_core::env_snapshot::EnvDriftPolicy::Daemon,
+            policy: cockpit_proto::EnvDriftPolicy::Daemon,
         };
         assert!(event_session(&warning).is_none());
         assert!(is_global_event(&warning));
@@ -6891,13 +6887,13 @@ mod tests {
             awaiting_durable: &awaiting_durable,
         };
         apply_incoming_event(proto::Event::LspNotice { text: "lsp".into() }, &ctx);
-        let meta = cockpit_core::env_snapshot::EnvSnapshotMeta {
-            source: cockpit_core::env_snapshot::EnvSnapshotSource::DaemonStart,
+        let meta = cockpit_proto::EnvSnapshotMeta {
+            source: cockpit_proto::EnvSnapshotSource::DaemonStart,
             digest: "digest".into(),
             key_count: 3,
             path_entry_count: 1,
         };
-        let drift = cockpit_core::env_snapshot::EnvDiffSummary {
+        let drift = cockpit_proto::EnvDiffSummary {
             baseline_digest: "base".into(),
             candidate_digest: "candidate".into(),
             added_keys: 1,
@@ -6912,7 +6908,7 @@ mod tests {
                 baseline: meta.clone(),
                 candidate: meta,
                 diff: drift,
-                policy: cockpit_core::env_snapshot::EnvDriftPolicy::Daemon,
+                policy: cockpit_proto::EnvDriftPolicy::Daemon,
             },
             &ctx,
         );
@@ -6930,7 +6926,7 @@ mod tests {
         assert!(!is_global_turn_event(&TurnEvent::InterruptDecision {
             session_id: Uuid::new_v4(),
             interrupt_id: Uuid::new_v4(),
-            decision: cockpit_core::daemon::proto::InterruptDecision {
+            decision: cockpit_proto::InterruptDecision {
                 permission: true,
                 cancelled: false,
                 lines: Vec::new(),
@@ -6940,7 +6936,7 @@ mod tests {
         assert!(is_global_event(&proto::Event::InterruptResolved {
             session_id: Uuid::new_v4(),
             interrupt_id: Uuid::new_v4(),
-            decision: Some(cockpit_core::daemon::proto::InterruptDecision {
+            decision: Some(cockpit_proto::InterruptDecision {
                 permission: true,
                 cancelled: false,
                 lines: Vec::new(),

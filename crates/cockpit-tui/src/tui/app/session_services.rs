@@ -92,9 +92,7 @@ impl App {
     }
 
     pub(super) fn service_delivery_unconfirmed_reconciliation(&mut self) -> bool {
-        let socket = self
-            .sessions_daemon_socket()
-            .map(std::path::Path::to_path_buf);
+        let endpoint = self.attached_daemon_endpoint();
         let attachment_epoch = self
             .agent_runner
             .as_ref()
@@ -119,7 +117,7 @@ impl App {
                 record.probe_in_flight = false;
             }
         }
-        let Some(socket) = socket else {
+        let Some(endpoint) = endpoint else {
             for record in self
                 .delivery_unconfirmed_records
                 .values_mut()
@@ -140,21 +138,21 @@ impl App {
                 (
                     record.client_submission_id,
                     record.session_id,
-                    socket.clone(),
+                    endpoint.clone(),
                 )
             })
             .collect::<Vec<_>>();
-        for (client_submission_id, session_id, socket) in &pending {
+        for (client_submission_id, session_id, endpoint) in &pending {
             let client_submission_id = *client_submission_id;
             let session_id = *session_id;
-            let socket = socket.clone();
+            let endpoint = endpoint.clone();
             self.async_actions.start(
                 AsyncActionKind::Blocking("paste.delivery_receipt"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
                     let result = tokio::task::spawn_blocking(move || {
                         agent_runner::read_client_submission_receipt_blocking(
-                            &socket,
+                            &endpoint,
                             session_id,
                             client_submission_id,
                         )

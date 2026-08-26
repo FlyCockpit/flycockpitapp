@@ -257,18 +257,9 @@ pub fn assistant_mutation_intent_hash(
 /// every client (CLI, TUI) and the daemon must derive it through this one
 /// function. Secret values are deliberately excluded: the hash binds the
 /// reference-only config shape, not credential material.
-pub fn mcp_mutation_intent_hash(
-    project_root: &str,
-    config_json: &str,
-    cleanup_names_json: &str,
-) -> String {
-    let encoded = serde_json::to_vec(&(
-        "save_mcp_config",
-        project_root,
-        config_json,
-        cleanup_names_json,
-    ))
-    .expect("a tuple of strings serializes infallibly");
+pub fn mcp_mutation_intent_hash(project_root: &str, patch_json: &str) -> String {
+    let encoded = serde_json::to_vec(&("save_mcp_config", project_root, patch_json))
+        .expect("a tuple of strings serializes infallibly");
     crate::hex_lower(Sha256::digest(&encoded))
 }
 
@@ -284,9 +275,18 @@ pub struct AgentEditorLease {
 pub struct AgentEditorCompletion {
     pub client_operation_id: String,
     pub project_root: String,
+    /// Canonical authority scope which owned the lease and publication.
+    pub owner_scope: String,
     pub agent_name: String,
     pub lease_id: String,
     pub consumed_revision: String,
+    /// Exact configuration generation consumed and produced by a terminal
+    /// save/cancel. Pending and rejected settlements have no committed
+    /// generation pair.
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub consumed_config_generation: Option<u64>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub result_config_generation: Option<u64>,
     pub status: AgentEditorSettlementStatus,
 }
 
@@ -323,6 +323,7 @@ pub fn validate_agent_editor_completion(
         return Err("editor settlement is bound to the wrong client operation");
     }
     if receipt.project_root != expected_project_root
+        || receipt.owner_scope != format!("project:{expected_project_root}")
         || receipt.agent_name != expected_agent_name
         || receipt.lease_id != expected_lease_id
     {
@@ -336,8 +337,32 @@ pub fn validate_agent_editor_completion(
     match &receipt.status {
         AgentEditorSettlementStatus::Saved {
             result_revision, ..
-        } if !crate::is_opaque_authority_token(result_revision) => {
-            Err("editor settlement returned a malformed result revision")
+        } => {
+            if !crate::is_opaque_authority_token(result_revision) {
+                return Err("editor settlement returned a malformed result revision");
+            }
+            let (Some(consumed), Some(result)) = (
+                receipt.consumed_config_generation,
+                receipt.result_config_generation,
+            ) else {
+                return Err("saved editor settlement omitted its generation pair");
+            };
+            if result < consumed {
+                return Err("saved editor settlement returned a regressive generation");
+            }
+            Ok(())
+        }
+        AgentEditorSettlementStatus::Cancelled => {
+            let (Some(consumed), Some(result)) = (
+                receipt.consumed_config_generation,
+                receipt.result_config_generation,
+            ) else {
+                return Err("cancelled editor settlement omitted its generation pair");
+            };
+            if result != consumed {
+                return Err("cancelled editor settlement changed the configuration generation");
+            }
+            Ok(())
         }
         AgentEditorSettlementStatus::Rejected { error }
             if error.message.trim().is_empty()
@@ -345,25 +370,35 @@ pub fn validate_agent_editor_completion(
         {
             Err("editor settlement returned an invalid rejection")
         }
+        _ if receipt.consumed_config_generation.is_some()
+            || receipt.result_config_generation.is_some() =>
+        {
+            Err("non-committed editor settlement carried a generation pair")
+        }
         _ => Ok(()),
     }
 }
 
+/// Expected correlation values for validating an agent mutation receipt.
+pub struct AgentMutationExpectations<'a> {
+    pub client_operation_id: &'a str,
+    pub mutation_intent_hash: &'a str,
+    pub project_root: &'a str,
+    pub agent_name: Option<&'a str>,
+    pub consumed_revision: Option<&'a str>,
+    pub completed_lease_id: Option<&'a str>,
+    pub inventory_wide: bool,
+}
+
 pub fn validate_agent_mutation_envelope(
     result: &AgentMutationResult,
-    expected_client_operation_id: &str,
-    expected_mutation_intent_hash: &str,
-    expected_project_root: &str,
-    expected_agent_name: Option<&str>,
-    expected_consumed_revision: Option<&str>,
-    expected_completed_lease_id: Option<&str>,
-    inventory_wide: bool,
+    expected: &AgentMutationExpectations<'_>,
 ) -> Result<(), &'static str> {
     let token = |value: &str| crate::is_opaque_authority_token(value);
-    if result.client_operation_id != expected_client_operation_id
-        || result.mutation_intent_hash != expected_mutation_intent_hash
-        || result.requested_project_root != expected_project_root
-        || result.agent_name.as_deref() != expected_agent_name
+    if result.client_operation_id != expected.client_operation_id
+        || result.mutation_intent_hash != expected.mutation_intent_hash
+        || result.requested_project_root != expected.project_root
+        || result.agent_name.as_deref() != expected.agent_name
     {
         return Err("agent mutation receipt is bound to the wrong operation or target");
     }
@@ -406,16 +441,16 @@ pub fn validate_agent_mutation_envelope(
     {
         return Err("agent mutation contains a malformed authority token");
     }
-    if result.consumed_revision.as_deref() != expected_consumed_revision {
+    if result.consumed_revision.as_deref() != expected.consumed_revision {
         return Err("agent mutation consumed the wrong revision");
     }
-    if result.completed_lease_id.as_deref() != expected_completed_lease_id {
+    if result.completed_lease_id.as_deref() != expected.completed_lease_id {
         return Err("agent mutation completion is bound to the wrong editor lease");
     }
-    if !inventory_wide && result.inventory_revision.is_some() {
+    if !expected.inventory_wide && result.inventory_revision.is_some() {
         return Err("agent mutation inventory revision has the wrong scope");
     }
-    if inventory_wide {
+    if expected.inventory_wide {
         match (&result.outcome, result.inventory_revision.as_deref()) {
             (AgentMutationOutcome::Reconciled, Some(revision))
                 if revision == result.result_revision => {}
@@ -427,7 +462,7 @@ pub fn validate_agent_mutation_envelope(
             }
         }
     }
-    if !inventory_wide
+    if !expected.inventory_wide
         && result
             .snapshot
             .as_ref()
@@ -435,7 +470,7 @@ pub fn validate_agent_mutation_envelope(
     {
         return Err("agent mutation snapshot disagrees with its result revision");
     }
-    if !inventory_wide && result.affected > 1 {
+    if !expected.inventory_wide && result.affected > 1 {
         return Err("single-agent mutation affected multiple definitions");
     }
     if let AgentMutationOutcome::CommittedRefreshNeeded { warning } = &result.outcome
@@ -692,13 +727,15 @@ mod tests {
         assert!(
             validate_agent_mutation_envelope(
                 &result,
-                "operation-b",
-                &hash,
-                "/project",
-                None,
-                Some(&revision),
-                None,
-                true,
+                &AgentMutationExpectations {
+                    client_operation_id: "operation-b",
+                    mutation_intent_hash: &hash,
+                    project_root: "/project",
+                    agent_name: None,
+                    consumed_revision: Some(&revision),
+                    completed_lease_id: None,
+                    inventory_wide: true,
+                },
             )
             .is_err()
         );

@@ -62,9 +62,9 @@ use cockpit_config::providers::{
     provider_model_fetch_reason_display, redact_model_fetch_reason,
 };
 use cockpit_core::auth::copilot_setup::Shell as CopilotShell;
-use cockpit_core::providers::models_fetch::FetchOutcome;
 use cockpit_core::providers::{self as templates, ProviderTemplate};
 use cockpit_core::wizard::{WizardAnswer, WizardRun};
+use cockpit_proto::ProviderModelFetchOutcome as FetchOutcome;
 
 pub(super) use row_editor::{
     HeaderEditor, HeaderMode, HeaderResult, ModelEditor, ModelField, ModelMode, ModelResult,
@@ -856,7 +856,7 @@ impl CopilotSetupState {
                 owner: provider_id.clone(),
                 revision: Some(operation_id.0.to_string()),
             },
-            cockpit_core::daemon::proto::Request::SetupCopilotAuth {
+            cockpit_proto::Request::SetupCopilotAuth {
                 client_operation_id: client_operation_id.clone(),
                 project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
@@ -1166,6 +1166,9 @@ impl SettingsDialog {
                 Ok(FetchOutcome::Models { .. }) | Ok(FetchOutcome::FallbackAvailable { .. }) => {
                     unreachable!()
                 }
+                Ok(FetchOutcome::UnlistedModelsPreview { .. } | FetchOutcome::Error { .. }) => {
+                    unreachable!("FetchHandle converts protocol-only outcomes into errors")
+                }
             }
         }
 
@@ -1472,7 +1475,12 @@ impl SettingsCx {
                 Some(notice) => format!("saved. {notice} Fetching /models…"),
                 None => "saved. Fetching /models…".into(),
             });
-            s.fetch = Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
+            s.fetch = Some(FetchHandle::spawn(
+                self.lifecycle.clone(),
+                id,
+                entry,
+                self.provider_fetch_root(),
+            ));
             let _ = s.run.submit(WizardAnswer::Acknowledged);
         } else if s.is_step("test-key-choice") {
             s.error = Some(match notice {
@@ -1779,8 +1787,12 @@ impl SettingsCx {
                         } else if let Some(id) = s.saved_provider_id.clone() {
                             if let Some(entry) = self.config.providers.get(&id).cloned() {
                                 s.error = Some("Testing key via /models…".into());
-                                s.fetch =
-                                    Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
+                                s.fetch = Some(FetchHandle::spawn(
+                                    self.lifecycle.clone(),
+                                    id,
+                                    entry,
+                                    self.provider_fetch_root(),
+                                ));
                             }
                             let _ = s.run.submit(WizardAnswer::Acknowledged);
                         }
@@ -1862,7 +1874,7 @@ impl SettingsCx {
         // cache miss asynchronously instead of waiting on the daemon socket.
         self.cached_secret_inventory_contains(
             provider_id,
-            Some(cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord),
+            Some(cockpit_proto::SecretInventoryKind::CredentialRecord),
         )
     }
 
@@ -1900,7 +1912,7 @@ impl SettingsCx {
                 owner: provider_id.clone(),
                 revision: Some(client_operation_id.clone()),
             },
-            cockpit_core::daemon::proto::Request::DeleteProviderCredential {
+            cockpit_proto::Request::DeleteProviderCredential {
                 client_operation_id: client_operation_id.clone(),
                 provider_id: provider_id.clone(),
                 project_root: Some(project_root.clone()),
@@ -1987,6 +1999,7 @@ impl SettingsCx {
                     s.status = status;
                 } else {
                     s.fetch = Some(FetchHandle::spawn(
+                        self.lifecycle.clone(),
                         s.provider_id.clone(),
                         (*s.entry).clone(),
                         self.provider_fetch_root(),
@@ -2154,6 +2167,7 @@ impl SettingsCx {
                     s.status = status;
                 } else {
                     s.fetch = Some(FetchHandle::spawn(
+                        self.lifecycle.clone(),
                         s.provider_id.clone(),
                         (*s.entry).clone(),
                         self.provider_fetch_root(),
@@ -2774,6 +2788,7 @@ impl SettingsCx {
                     let mut edit = EditState::new(s.provider_id.clone(), entry.clone());
                     edit.status = Some("retrying live model fetch...".into());
                     edit.fetch = Some(FetchHandle::spawn(
+                        self.lifecycle.clone(),
                         s.provider_id.clone(),
                         entry,
                         self.provider_fetch_root(),
@@ -4675,7 +4690,7 @@ fn render_header_edit_popup(cx: &SettingsCx, frame: &mut Frame, area: Rect, h: &
             matches!(
                 cx.cached_secret_inventory_contains(
                     name,
-                    Some(cockpit_core::daemon::proto::SecretInventoryKind::NamedSecret),
+                    Some(cockpit_proto::SecretInventoryKind::NamedSecret),
                 ),
                 Some(false)
             )
@@ -4986,7 +5001,7 @@ fn render_field_row(
     ];
     if active {
         let text = field.text();
-        let cursor = cockpit_core::text::floor_char_boundary(text, field.cursor());
+        let cursor = cockpit_host::text::floor_char_boundary(text, field.cursor());
         let (before, after) = text.split_at(cursor);
         spans.push(Span::styled(before.to_string(), value_style));
         spans.push(super::shell::cursor_marker_span());

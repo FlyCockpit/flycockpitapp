@@ -1,3 +1,5 @@
+//! Private, held-directory scratch roots for bounded host work.
+
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]

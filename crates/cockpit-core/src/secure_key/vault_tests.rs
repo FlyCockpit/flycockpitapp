@@ -382,7 +382,7 @@ fn vault_unix_owner_only_modes() {
 fn vault_windows_refuses_database_mode_without_dacl() {
     #[cfg(windows)]
     {
-        if !crate::private_fs::PRIVATE_FS_POLICY.windows_dacl_enforced {
+        if !cockpit_host::private_fs::PRIVATE_FS_POLICY.windows_dacl_enforced {
             let tmp = tempfile::TempDir::new().unwrap();
             let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
             let err = match ensure_secret_vault(
@@ -406,8 +406,8 @@ fn vault_windows_refuses_database_mode_without_dacl() {
         #[allow(clippy::assertions_on_constants)]
         {
             assert!(
-                crate::private_fs::PRIVATE_FS_POLICY.unix_mode_enforced
-                    || !crate::private_fs::PRIVATE_FS_POLICY.windows_dacl_enforced
+                cockpit_host::private_fs::PRIVATE_FS_POLICY.unix_mode_enforced
+                    || !cockpit_host::private_fs::PRIVATE_FS_POLICY.windows_dacl_enforced
             );
         }
     }

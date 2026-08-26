@@ -157,7 +157,9 @@ fn rich_client_submission(
             detail: "73 lines".into(),
             ok: true,
         }],
-        images: vec![vec![9, 8, 7, 6]],
+        images: vec![crate::engine::message::SubmissionImage::png(vec![
+            9, 8, 7, 6,
+        ])],
         forced_skill: Some("review".into()),
         origin_principal: Some("flycockpit:exact-user".into()),
         job_id: Some("job-exact-retry".into()),
@@ -620,7 +622,9 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
                 detail: "42 lines".into(),
                 ok: true,
             }],
-            images: vec![vec![1, 2, 3, 4]],
+            images: vec![crate::engine::message::SubmissionImage::png(vec![
+                1, 2, 3, 4,
+            ])],
             forced_skill: Some("review".into()),
             origin_principal: Some("flycockpit:user-1".into()),
             job_id: Some("job-exact".into()),

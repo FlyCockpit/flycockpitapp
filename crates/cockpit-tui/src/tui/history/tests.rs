@@ -85,10 +85,10 @@ fn link_reference_definition_start_shape_is_position_aware() {
 #[test]
 fn interrupt_decision_renders_as_dedicated_styled_dismissed_row() {
     let entry = HistoryEntry::InterruptDecision {
-        decision: cockpit_core::daemon::proto::InterruptDecision {
+        decision: cockpit_proto::InterruptDecision {
             permission: true,
             cancelled: true,
-            lines: vec![cockpit_core::daemon::proto::InterruptDecisionLine {
+            lines: vec![cockpit_proto::InterruptDecisionLine {
                 prompt: "Run command?".to_string(),
                 answer: "Allow".to_string(),
             }],
@@ -2747,7 +2747,7 @@ fn sample_perf() -> ResponsePerformance {
         ttft_ms: 3000,
         generation_ms: 500,
         displayed_tokens: 27, // 27*1000/500 = 54 TPS exactly
-        encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+        encoding: "cl100k_base".to_string(),
     }
 }
 
@@ -2776,7 +2776,13 @@ fn agent_with_perf(
 fn response_performance_chip_renders_and_expands_independently() {
     let perf = sample_perf();
     let closed = render_entry(
-        &agent_with_perf("hello world", "secret think", Some(perf), false, false),
+        &agent_with_perf(
+            "hello world",
+            "secret think",
+            Some(perf.clone()),
+            false,
+            false,
+        ),
         120,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2810,7 +2816,13 @@ fn response_performance_chip_renders_and_expands_independently() {
     assert!(closed.chip_row.is_some());
 
     let open = render_entry(
-        &agent_with_perf("hello world", "secret think", Some(perf), false, true),
+        &agent_with_perf(
+            "hello world",
+            "secret think",
+            Some(perf.clone()),
+            false,
+            true,
+        ),
         120,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2854,7 +2866,7 @@ fn response_performance_chip_rounding_matches_detail() {
         ttft_ms: 3000,
         generation_ms: 1000,
         displayed_tokens: 54, // 54 TPS exact; 53.5 would round up
-        encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+        encoding: "cl100k_base".to_string(),
     };
     assert_eq!(format_tps(&perf).as_deref(), Some("54"));
     assert_eq!(metric_chip_text(&perf).as_deref(), Some("3/54"));
@@ -2865,7 +2877,7 @@ fn response_performance_chip_rounding_matches_detail() {
         ttft_ms: 1000,
         generation_ms: 2000,
         displayed_tokens: 107, // 107000/2000 = 53.5
-        encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+        encoding: "cl100k_base".to_string(),
     };
     assert_eq!(format_tps(&half).as_deref(), Some("54"));
 }
@@ -2882,7 +2894,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
 
     // Width 120: inline metric with controls/timestamp.
     let wide = render_entry(
-        &agent_with_perf("ok", "", Some(perf), false, false),
+        &agent_with_perf("ok", "", Some(perf.clone()), false, false),
         120,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2899,7 +2911,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
 
     // Width 48: dedicated metric row, controls preserved.
     let mid = render_entry(
-        &agent_with_perf("ok", "", Some(perf), false, false),
+        &agent_with_perf("ok", "", Some(perf.clone()), false, false),
         48,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2914,7 +2926,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
 
     // Width 24: accessible header returns (floor).
     let floor = render_entry(
-        &agent_with_perf("ok", "", Some(perf), false, false),
+        &agent_with_perf("ok", "", Some(perf.clone()), false, false),
         24,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2933,7 +2945,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
     // Below 24: ↔ resize state, no metric hit target.
     for w in [23u16, 12, 1] {
         let narrow = render_entry(
-            &agent_with_perf("ok", "", Some(perf), false, false),
+            &agent_with_perf("ok", "", Some(perf.clone()), false, false),
             w,
             ThinkingDisplay::Condensed,
             MarkdownOpts::default(),

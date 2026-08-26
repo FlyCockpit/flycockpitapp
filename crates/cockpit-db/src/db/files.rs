@@ -172,29 +172,108 @@ impl Drop for UmaskGuard {
 
 #[cfg(unix)]
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     {
         let _umask = UmaskGuard::set(0o077);
         std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 0700 {}", path.display()))?;
-    let mode = std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("opening private directory {}", path.display()))?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("inspecting private directory {}", path.display()))?;
+    let effective_uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.uid() == effective_uid,
+        "refusing to use {}: expected a current-user-owned non-symlink directory",
+        path.display()
+    );
+    directory
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 held directory {}", path.display()))?;
+    let mode = directory
+        .metadata()
+        .with_context(|| format!("rechecking private directory {}", path.display()))?
         .permissions()
         .mode()
         & 0o777;
-    if mode != 0o700 {
-        anyhow::bail!(
-            "refusing to use {}: expected private directory mode 0700, got {mode:03o}",
-            path.display()
-        );
+    anyhow::ensure!(
+        mode == 0o700,
+        "refusing to use {}: expected private directory mode 0700, got {mode:03o}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const DIRECTORY_SECURITY_ACCESS: u32 = 0x0002_0000 | 0x0004_0000 | 0x0010_0000 | 0x0000_0080;
+
+    reject_windows_reparse_components(path)?;
+    std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    reject_windows_reparse_components(path)?;
+    // Excluding FILE_SHARE_DELETE makes this held handle a rename/delete lease
+    // while the descriptor is inspected and repaired. Long-lived callers that
+    // need the lease retain their own handle after this preflight.
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        // READ_CONTROL | WRITE_DAC | SYNCHRONIZE | FILE_READ_ATTRIBUTES.
+        .access_mode(DIRECTORY_SECURITY_ACCESS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("opening private directory {}", path.display()))?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("inspecting private directory {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "refusing to use {}: expected a non-reparse directory",
+        path.display()
+    );
+    set_private_windows_dacl_handle(&directory)
+        .with_context(|| format!("securing private directory {}", path.display()))?;
+    verify_private_windows_dacl_handle(&directory)
+        .with_context(|| format!("verifying private directory {}", path.display()))
+}
+
+#[cfg(windows)]
+fn reject_windows_reparse_components(path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let mut traversed = PathBuf::new();
+    for component in path.components() {
+        traversed.push(component.as_os_str());
+        match std::fs::symlink_metadata(&traversed) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                "refusing private database path with reparse component {}",
+                traversed.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspecting database path component {}", traversed.display())
+                });
+            }
+        }
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))
 }
@@ -225,9 +304,300 @@ pub(crate) fn repair_private_file(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn repair_private_file(path: &Path, label: &str) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SECURITY_ACCESS: u32 = 0xC000_0000 | 0x0002_0000 | 0x0004_0000;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .access_mode(FILE_SECURITY_ACCESS)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("opening {label} file {}", path.display()))?;
+    set_private_windows_dacl_handle(&file)
+        .with_context(|| format!("securing {label} file {}", path.display()))?;
+    verify_private_windows_dacl_handle(&file)
+        .with_context(|| format!("verifying {label} file {}", path.display()))
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn repair_private_file(_path: &Path, _label: &str) -> Result<()> {
     Ok(())
+}
+
+/// Apply a protected current-user-and-SYSTEM-only full-control DACL to an
+/// already-open Windows filesystem object, then verify the descriptor through
+/// that same handle. Path-based ACL inspection is deliberately insufficient:
+/// a reparse or rename race must not redirect the security decision.
+#[cfg(windows)]
+pub(crate) fn set_private_windows_dacl_handle(file: &std::fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            value: *const u16,
+            revision: u32,
+            descriptor: *mut *mut core::ffi::c_void,
+            length: *mut u32,
+        ) -> i32;
+        fn GetSecurityDescriptorOwner(
+            descriptor: *mut core::ffi::c_void,
+            owner: *mut *mut core::ffi::c_void,
+            defaulted: *mut i32,
+        ) -> i32;
+        fn GetSecurityDescriptorDacl(
+            descriptor: *mut core::ffi::c_void,
+            present: *mut i32,
+            dacl: *mut *mut core::ffi::c_void,
+            defaulted: *mut i32,
+        ) -> i32;
+        fn SetSecurityInfo(
+            handle: *mut core::ffi::c_void,
+            object_type: u32,
+            information: u32,
+            owner: *mut core::ffi::c_void,
+            group: *mut core::ffi::c_void,
+            dacl: *mut core::ffi::c_void,
+            sacl: *mut core::ffi::c_void,
+        ) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    const SE_FILE_OBJECT: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 4;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+
+    let sid = current_windows_user_sid()?;
+    let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+    let wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut descriptor = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } != 0,
+        "building private database DACL failed"
+    );
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut ignored = 0;
+    let valid = unsafe {
+        GetSecurityDescriptorOwner(descriptor, &mut owner, &mut ignored) != 0
+            && GetSecurityDescriptorDacl(descriptor, &mut ignored, &mut dacl, &mut ignored) != 0
+    };
+    if !valid || owner.is_null() || dacl.is_null() {
+        unsafe { LocalFree(descriptor) };
+        anyhow::bail!("extracting private database DACL failed");
+    }
+    let result = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(descriptor) };
+    anyhow::ensure!(
+        result == 0,
+        "setting private database DACL failed ({result})"
+    );
+    verify_private_windows_dacl_handle(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn verify_private_windows_dacl_handle(file: &std::fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn GetSecurityInfo(
+            handle: *mut core::ffi::c_void,
+            object_type: u32,
+            information: u32,
+            owner: *mut *mut core::ffi::c_void,
+            group: *mut *mut core::ffi::c_void,
+            dacl: *mut *mut core::ffi::c_void,
+            sacl: *mut *mut core::ffi::c_void,
+            descriptor: *mut *mut core::ffi::c_void,
+        ) -> u32;
+        fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor: *mut core::ffi::c_void,
+            revision: u32,
+            security_information: u32,
+            string_descriptor: *mut *mut u16,
+            string_length: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 4;
+    let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut descriptor = std::ptr::null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    anyhow::ensure!(
+        result == 0 && !descriptor.is_null(),
+        "reading database object security descriptor failed ({result})"
+    );
+    let mut sddl = std::ptr::null_mut();
+    let mut length = 0_u32;
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            information,
+            &mut sddl,
+            &mut length,
+        )
+    };
+    unsafe { LocalFree(descriptor) };
+    anyhow::ensure!(
+        converted != 0 && !sddl.is_null(),
+        "converting database object security descriptor failed"
+    );
+    let value = String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(sddl, usize::try_from(length).unwrap_or(0))
+    });
+    unsafe { LocalFree(sddl.cast()) };
+    validate_private_windows_sddl(&value)
+}
+
+#[cfg(windows)]
+fn validate_private_windows_sddl(sddl: &str) -> Result<()> {
+    let owner = sddl
+        .strip_prefix("O:")
+        .and_then(|value| value.split_once("D:"))
+        .map(|(owner, _)| owner);
+    let ace_sids = sddl
+        .split(";;FA;;;")
+        .skip(1)
+        .filter_map(|value| value.split(')').next())
+        .collect::<Vec<_>>();
+    let current_user = current_windows_user_sid()?;
+    anyhow::ensure!(
+        sddl.contains("D:P")
+            && sddl.matches('(').count() == 2
+            && sddl.matches("(A;").count() == 2
+            && owner == Some(current_user.as_str())
+            && ace_sids.contains(&current_user.as_str())
+            && ace_sids
+                .iter()
+                .any(|sid| *sid == "SY" || *sid == "S-1-5-18"),
+        "database object DACL is not protected current-user-and-SYSTEM-only full control"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_windows_user_sid() -> Result<String> {
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut core::ffi::c_void,
+        attributes: u32,
+    }
+    #[repr(C)]
+    struct TokenUser {
+        user: SidAndAttributes,
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut core::ffi::c_void,
+            desired_access: u32,
+            token_handle: *mut *mut core::ffi::c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut core::ffi::c_void,
+            token_information_class: u32,
+            token_information: *mut core::ffi::c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut core::ffi::c_void, string_sid: *mut *mut u16) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: u32 = 1;
+    let mut token = std::ptr::null_mut();
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error()).context("opening process token");
+        }
+        let mut needed = 0_u32;
+        GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        if needed == 0 {
+            CloseHandle(token);
+            return Err(std::io::Error::last_os_error()).context("reading process SID size");
+        }
+        let mut buffer = vec![0_u8; usize::try_from(needed)?];
+        if GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            CloseHandle(token);
+            return Err(std::io::Error::last_os_error()).context("reading process SID");
+        }
+        let token_user = &*buffer.as_ptr().cast::<TokenUser>();
+        let mut sid_text = std::ptr::null_mut();
+        if ConvertSidToStringSidW(token_user.user.sid, &mut sid_text) == 0 {
+            CloseHandle(token);
+            return Err(std::io::Error::last_os_error()).context("formatting process SID");
+        }
+        let mut length = 0_usize;
+        while *sid_text.add(length) != 0 {
+            length += 1;
+        }
+        let result = String::from_utf16_lossy(std::slice::from_raw_parts(sid_text, length));
+        LocalFree(sid_text.cast());
+        CloseHandle(token);
+        Ok(result)
+    }
 }
 
 #[cfg(unix)]
@@ -421,6 +791,27 @@ pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path
     directory
         .sync_all()
         .context("fsyncing delegation payload sidecar parent")
+}
+
+#[cfg(all(test, windows))]
+mod windows_acl_tests {
+    use super::*;
+
+    #[test]
+    fn database_private_dacl_policy_rejects_extra_and_inherited_access() {
+        let sid = current_windows_user_sid().unwrap();
+        let private = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+        validate_private_windows_sddl(&private).unwrap();
+
+        let everyone = format!("{private}(A;;FA;;;WD)");
+        assert!(validate_private_windows_sddl(&everyone).is_err());
+        let inherited = format!("O:{sid}D:(A;;FA;;;{sid})(A;;FA;;;SY)");
+        assert!(validate_private_windows_sddl(&inherited).is_err());
+        let wrong_owner = format!("O:SYD:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+        assert!(validate_private_windows_sddl(&wrong_owner).is_err());
+        let extra_deny = format!("{private}(D;;FA;;;WD)");
+        assert!(validate_private_windows_sddl(&extra_deny).is_err());
+    }
 }
 
 #[cfg(windows)]

@@ -1,6 +1,44 @@
 use super::history_window::{HISTORY_WINDOW_TARGET_ENTRIES, HistoryWindow};
 use super::*;
 
+fn subagent_steer_message(
+    composer: &crate::tui::composer::RegisteredComposer,
+) -> Result<Option<String>, &'static str> {
+    let Some(message) = composer.plain_payload() else {
+        return Err(
+            "Subagent steering does not accept image attachments; remove them before sending.",
+        );
+    };
+    let message = message.trim().to_string();
+    Ok((!message.is_empty()).then_some(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subagent_steer_message;
+    use crate::tui::composer::RegisteredComposer;
+
+    #[test]
+    fn condensed_text_steer_expands_payload_instead_of_sending_placeholder() {
+        let mut composer = RegisteredComposer::new(false);
+        composer.insert_registered_text("actual steering text".to_string(), 3);
+        let message = subagent_steer_message(&composer)
+            .expect("text paste is supported")
+            .expect("message is non-empty");
+        assert_eq!(message, "actual steering text");
+        assert!(!message.contains("[Pasted text"));
+    }
+
+    #[test]
+    fn image_steer_fails_closed_without_losing_registry_authority() {
+        let mut composer = RegisteredComposer::new(false);
+        composer.insert_registered_image(vec![1, 2, 3]);
+        let error = subagent_steer_message(&composer).expect_err("images unsupported");
+        assert!(error.contains("does not accept image attachments"));
+        assert_eq!(composer.test_paste_blocks().len(), 1);
+    }
+}
+
 fn subagent_view_notice(read_only: bool, truncated: bool) -> Option<String> {
     let mut parts = Vec::new();
     if read_only {
@@ -135,7 +173,7 @@ impl App {
         task_call_id: String,
         label: String,
     ) {
-        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
             self.push_plain(
                 "Subagent history unavailable — reconnect to the daemon, then Retry".to_string(),
             );
@@ -146,7 +184,7 @@ impl App {
             AsyncActionKind::Internal("subagent.history"),
             AsyncActionPolicy::Replace(AsyncActionKey::new(key)),
             move || {
-                let request = cockpit_core::daemon::proto::Request::ReadSubagentHistoryPage {
+                let request = cockpit_proto::Request::ReadSubagentHistoryPage {
                     session_id,
                     task_call_id: task_call_id.clone(),
                     label: label.clone(),
@@ -154,8 +192,8 @@ impl App {
                     limit: HISTORY_WINDOW_TARGET_ENTRIES as u32,
                 };
                 let response =
-                    crate::tui::agent_runner::daemon_request_at_blocking(&socket, request)?;
-                let cockpit_core::daemon::proto::Response::SubagentHistoryPage {
+                    crate::tui::agent_runner::daemon_request_at_blocking(&endpoint, request)?;
+                let cockpit_proto::Response::SubagentHistoryPage {
                     entries,
                     has_more,
                     oldest_seq,
@@ -338,10 +376,16 @@ impl App {
         let Some(view) = self.active_subagent_view().cloned() else {
             return false;
         };
-        let message = self.composer.text().trim().to_string();
-        if message.is_empty() {
-            return true;
-        }
+        let message = match subagent_steer_message(&self.composer) {
+            Ok(Some(message)) => message,
+            Ok(None) => return true,
+            Err(error) => {
+                if let Some(active) = self.active_subagent_view_mut() {
+                    active.notice = Some(error.to_string());
+                }
+                return true;
+            }
+        };
         if view.read_only || view.finished {
             if let Some(active) = self.active_subagent_view_mut() {
                 active.notice =
@@ -355,9 +399,29 @@ impl App {
             }
             return true;
         };
-        self.composer.clear();
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            self.push_plain("Subagent steering unavailable — daemon is not attached".to_string());
+            return true;
+        };
+        let req = cockpit_proto::Request::SteerDelegation {
+            session_id,
+            task_call_id: view.task_call_id,
+            label: view.label,
+            message: message.clone(),
+        };
+        self.async_actions.start_blocking(
+            AsyncActionKind::DaemonRpc("subagent.steer"),
+            AsyncActionPolicy::AllowConcurrent,
+            move || match agent_runner::daemon_request_at_blocking(&endpoint, req)? {
+                cockpit_proto::Response::DelegationSteer { result } => {
+                    Ok(AsyncActionPayload::DelegationSteer(result))
+                }
+                other => Err(format!("unexpected steer response: {other:?}")),
+            },
+        );
+        self.clear_composer_buffer();
         self.history.push(HistoryEntry::User {
-            text: message.clone(),
+            text: message,
             cleaned: None,
             expanded: false,
             timestamp: chrono::Local::now(),
@@ -367,53 +431,37 @@ impl App {
             persist_failed: false,
         });
         self.push_plain("steer queued for next turn boundary".to_string());
-        let req = cockpit_core::daemon::proto::Request::SteerDelegation {
-            session_id,
-            task_call_id: view.task_call_id,
-            label: view.label,
-            message,
-        };
-        self.async_actions.start_blocking(
-            AsyncActionKind::DaemonRpc("subagent.steer"),
-            AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::daemon_request_from_blocking_worker(req)? {
-                cockpit_core::daemon::proto::Response::DelegationSteer { result } => {
-                    Ok(AsyncActionPayload::DelegationSteer(result))
-                }
-                other => Err(format!("unexpected steer response: {other:?}")),
-            },
-        );
         true
     }
 
     pub(super) fn apply_subagent_steer_result(
         &mut self,
-        result: cockpit_core::daemon::proto::DelegationSteerResult,
+        result: cockpit_proto::DelegationSteerResult,
     ) {
         let line = match result.status {
-            cockpit_core::daemon::proto::DelegationSteerStatus::Queued => {
+            cockpit_proto::DelegationSteerStatus::Queued => {
                 let label = result.label.clone().unwrap_or_default();
                 format!(
                     "steer queued for {}/{} at next turn boundary",
                     result.task_call_id, label
                 )
             }
-            cockpit_core::daemon::proto::DelegationSteerStatus::NotSteerable => {
+            cockpit_proto::DelegationSteerStatus::NotSteerable => {
                 format!("steer not queued: {}", result.message)
             }
-            cockpit_core::daemon::proto::DelegationSteerStatus::InternalError => {
+            cockpit_proto::DelegationSteerStatus::InternalError => {
                 format!("steer failed: {}", result.message)
             }
         };
         match result.status {
-            cockpit_core::daemon::proto::DelegationSteerStatus::Queued => {
+            cockpit_proto::DelegationSteerStatus::Queued => {
                 if let Some(view) = self.active_subagent_view_mut() {
                     view.notice = Some(line);
                 } else {
                     self.show_toast(line, ToastKind::Success);
                 }
             }
-            cockpit_core::daemon::proto::DelegationSteerStatus::NotSteerable => {
+            cockpit_proto::DelegationSteerStatus::NotSteerable => {
                 if let Some(view) = self.active_subagent_view_mut() {
                     view.read_only = true;
                     view.finished = true;
@@ -426,7 +474,7 @@ impl App {
                     self.show_toast(line, ToastKind::Warning);
                 }
             }
-            cockpit_core::daemon::proto::DelegationSteerStatus::InternalError => {
+            cockpit_proto::DelegationSteerStatus::InternalError => {
                 if let Some(view) = self.active_subagent_view_mut() {
                     view.notice = Some(line);
                 } else {

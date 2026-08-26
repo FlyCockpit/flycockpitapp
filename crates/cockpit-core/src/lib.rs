@@ -10,7 +10,7 @@
 //! this crate and plug in through explicit boundary traits.
 //!
 //! Crate direction is one-way:
-//! `cockpit-cli -> cockpit-core -> cockpit-config/cockpit-db/cockpit-proto`;
+//! `cockpit-cli -> cockpit-core -> cockpit-client/cockpit-proto/cockpit-config/cockpit-db`;
 //! the lower crates do not depend on `cockpit-core` or `cockpit-cli`.
 
 pub mod agents;
@@ -37,7 +37,6 @@ pub mod external_runtime;
 pub mod generated_svg;
 pub mod git;
 pub mod gitignore;
-pub mod goal_scratch;
 pub mod harness;
 pub mod host_capabilities;
 pub mod image_generation;
@@ -62,10 +61,7 @@ mod media_storage;
 pub mod model_system_prompt;
 pub mod openai_images_adapter;
 pub mod packages;
-pub mod path_containment;
 pub mod policy;
-pub mod private_fs;
-pub mod process;
 pub mod process_containment;
 #[cfg(test)]
 mod production_path_ratchet;

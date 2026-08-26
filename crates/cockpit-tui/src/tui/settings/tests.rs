@@ -185,6 +185,28 @@ fn authority_success_is_receipt_driven_and_committed_refresh_is_explicit() {
 }
 
 #[test]
+fn path_suggestion_filesystem_reads_are_blocking_worker_only() {
+    let reducer = include_str!("category.rs");
+    let settings = include_str!("mod.rs");
+    let worker = settings
+        .split("pub(crate) fn execute_settings_blocking_work")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("pub(crate) enum SettingsDaemonEffectWork")
+                .next()
+        })
+        .expect("settings blocking worker inventory");
+
+    assert!(!reducer.contains("suggest_paths("));
+    assert!(!reducer.contains("std::fs::read_dir"));
+    assert!(worker.contains("dir_suggest::suggest_paths"));
+    assert!(settings.contains("\"settings.path-suggest\""));
+    assert!(settings.contains("editor_generation"));
+    assert!(settings.contains("draft_generation"));
+}
+
+#[test]
 fn oauth_acknowledgement_keeps_explicit_authority_until_typed_settlement() {
     let flow = include_str!("providers/oauth_flow.rs");
     let providers = include_str!("providers/mod.rs");
@@ -291,7 +313,7 @@ fn settings_layer_base(
     );
     object.insert(
         "__cockpit_settings_layer_kind".into(),
-        serde_json::to_value(cockpit_core::daemon::proto::CockpitConfigLayer::Project).unwrap(),
+        serde_json::to_value(cockpit_proto::CockpitConfigLayer::Project).unwrap(),
     );
     object.insert(
         "__cockpit_settings_generation".into(),
@@ -316,18 +338,18 @@ fn injected_settings_transport_uses_production_receipt_and_reconciliation_path()
                 hash: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243".into(),
                 config_generation: 8,
                 layer_id: layer_id.into(),
-                layer: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
+                layer: cockpit_proto::CockpitConfigLayer::Project,
                 consumed_revision: "revision-1".into(),
                 result_revision: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243"
                     .into(),
-                status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
-                publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
+                status: cockpit_proto::ConfigCommitStatus::Committed,
+                publication: cockpit_proto::ConfigPublicationStatus::Published,
                 denylist: Vec::new(),
             }),
             Ok(Response::ExtendedConfigSnapshot {
-                layers: vec![cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot {
+                layers: vec![cockpit_proto::ExtendedConfigLayerSnapshot {
                     layer_id: layer_id.into(),
-                    kind: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
+                    kind: cockpit_proto::CockpitConfigLayer::Project,
                     display_path: path.display().to_string(),
                     config: Box::new(config.clone()),
                     denylist: Vec::new(),
@@ -374,12 +396,12 @@ fn injected_settings_transport_rejects_wrong_consumed_revision() {
                 hash: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243".into(),
                 config_generation: 8,
                 layer_id: "layer-capability".into(),
-                layer: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
+                layer: cockpit_proto::CockpitConfigLayer::Project,
                 consumed_revision: "wrong-revision".into(),
                 result_revision: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243"
                     .into(),
-                status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
-                publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
+                status: cockpit_proto::ConfigCommitStatus::Committed,
+                publication: cockpit_proto::ConfigPublicationStatus::Published,
                 denylist: Vec::new(),
             },
         )])),
@@ -434,11 +456,11 @@ fn settings_config_mutations_stay_daemon_owned() {
 #[test]
 fn denylist_draft_occurrences_do_not_infer_identity_from_equal_masks() {
     let entries = vec![
-        cockpit_core::daemon::proto::RedactedDenylistEntry {
+        cockpit_proto::RedactedDenylistEntry {
             entry_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
         },
-        cockpit_core::daemon::proto::RedactedDenylistEntry {
+        cockpit_proto::RedactedDenylistEntry {
             entry_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
         },
@@ -459,12 +481,12 @@ fn denylist_draft_occurrences_do_not_infer_identity_from_equal_masks() {
     let planned = super::denylist_mutations(&base, &desired).unwrap();
     assert!(matches!(
         &planned[0],
-        cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+        cockpit_proto::DesiredDenylistEntry::Existing { entry_id }
             if entry_id == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     ));
     assert!(matches!(
         &planned[1],
-        cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+        cockpit_proto::DesiredDenylistEntry::Existing { entry_id }
             if entry_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ));
 }
@@ -487,22 +509,22 @@ fn denylist_commit_receipt_binds_consumed_and_created_occurrences_exactly() {
     let result_new = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let nonce = "11111111-1111-4111-8111-111111111111";
     let planned = vec![
-        cockpit_core::daemon::proto::DesiredDenylistEntry::Existing {
+        cockpit_proto::DesiredDenylistEntry::Existing {
             entry_id: existing.into(),
         },
-        cockpit_core::daemon::proto::DesiredDenylistEntry::New {
+        cockpit_proto::DesiredDenylistEntry::New {
             client_nonce: nonce.into(),
-            literal: cockpit_core::daemon::proto::SensitiveWireLiteral::new("secret".into()),
+            literal: cockpit_proto::SensitiveWireLiteral::new("secret".into()),
         },
     ];
     let committed = vec![
-        cockpit_core::daemon::proto::CommittedDenylistEntry {
+        cockpit_proto::CommittedDenylistEntry {
             entry_id: result_existing.into(),
             consumed_entry_id: Some(existing.into()),
             client_nonce: None,
             display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
         },
-        cockpit_core::daemon::proto::CommittedDenylistEntry {
+        cockpit_proto::CommittedDenylistEntry {
             entry_id: result_new.into(),
             consumed_entry_id: None,
             client_nonce: Some(nonce.into()),
@@ -4996,8 +5018,8 @@ fn behavior_jobs_max_concurrent_rejects_zero() {
 #[test]
 fn privacy_sandbox_rows_cycle_edit_and_persist() {
     use cockpit_config::extended::ExtendedConfigDoc;
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
     use cockpit_proto::FeatureCapabilityState;
+    use cockpit_proto::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -5083,7 +5105,7 @@ fn inject_secret_store(
 #[test]
 fn privacy_sandbox_on_blocked_when_host_cap_missing() {
     use cockpit_config::extended::ExtendedConfigDoc;
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -5111,7 +5133,7 @@ fn privacy_sandbox_on_blocked_when_host_cap_missing() {
 #[test]
 fn sandbox_on_recheck_then_instruct() {
     use cockpit_config::extended::ExtendedConfigDoc;
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -5737,7 +5759,8 @@ fn seed_workspace_trust(root: &std::path::Path) {
         .build()
         .expect("settings trust seed runtime");
     runtime.block_on(async {
-        let client = crate::tui::settings::settings_daemon_client()
+        let lifecycle = crate::tui::settings::test_lifecycle_client();
+        let client = crate::tui::settings::settings_daemon_client(&lifecycle)
             .await
             .expect("settings daemon client for trust seed");
         let project_root = root.display().to_string();
@@ -5757,7 +5780,7 @@ fn seed_workspace_trust(root: &std::path::Path) {
         match client
             .request(Request::SetWorkspaceTrust {
                 project_root,
-                mode: cockpit_core::daemon::proto::WorkspaceTrustMode::Trust,
+                mode: cockpit_proto::WorkspaceTrustMode::Trust,
                 expected_config_generation,
             })
             .await
@@ -5823,6 +5846,27 @@ fn root_menu_exposes_the_default_model_row_first() {
     let d = open_fixture_dialog(&path);
     assert_eq!(root_nodes()[0].title, DEFAULT_MODEL_TITLE);
     assert!(matches!(d.test_page(), TestPageRef::Root { cursor: 0 }));
+}
+
+#[cfg(not(feature = "extended"))]
+#[test]
+fn root_menu_inventory_matches_the_default_profile() {
+    let nodes = root_nodes();
+    assert_eq!(nodes.len(), 15);
+    assert_eq!(nodes[0].id, pointer_actions::RootNodeId::DefaultModel);
+}
+
+#[cfg(feature = "extended")]
+#[test]
+fn root_menu_inventory_adds_image_spend_in_extended_profile() {
+    let nodes = root_nodes();
+    assert_eq!(nodes.len(), 16);
+    assert_eq!(nodes[0].id, pointer_actions::RootNodeId::DefaultModel);
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.id == pointer_actions::RootNodeId::ImageSpend)
+    );
 }
 
 #[test]
@@ -6314,6 +6358,7 @@ async fn fetch_all_in_flight_ignores_keys_except_esc() {
     // fast the spawned task completes (we never tick, so in_flight
     // stays populated).
     let state = ProvidersPage::FetchAll(FetchAllState::spawn(
+        crate::tui::settings::test_lifecycle_client(),
         &d.config,
         tmp.path().display().to_string(),
     ));
@@ -8720,7 +8765,8 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
     // `settings_daemon_client()`; without priming, that spawn can race the
     // owner-remoted save's own boot and split-brain into two in-memory daemon
     // DBs (the save lands in one, the verification reads the other, empty).
-    crate::tui::settings::settings_daemon_client()
+    let lifecycle = crate::tui::settings::test_lifecycle_client();
+    crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .expect("prime in-process settings daemon");
     let mut d = fresh_dialog(&tmp);
@@ -8744,13 +8790,14 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
         !tmp.path().join("credentials.json").exists(),
         "web-key save must persist through the owner vault, not credentials.json"
     );
-    let client = crate::tui::settings::settings_daemon_client()
+    let lifecycle = crate::tui::settings::test_lifecycle_client();
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .expect("settings daemon client");
     let response = client
         .request(Request::ListSecretInventory {
             cursor: None,
-            limit: Some(cockpit_core::daemon::proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
+            limit: Some(cockpit_proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
         })
         .await
         .expect("owner inventory transport")
@@ -8760,7 +8807,7 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
     };
     assert!(
         entries.iter().any(|entry| entry.name == "firecrawl"
-            && entry.kind == cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord),
+            && entry.kind == cockpit_proto::SecretInventoryKind::CredentialRecord),
         "owner vault must hold the firecrawl web-key credential: {entries:?}"
     );
     let wire = serde_json::to_string(&entries).expect("inventory serializes");

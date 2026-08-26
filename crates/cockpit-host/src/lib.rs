@@ -7,6 +7,7 @@
 
 pub mod daemon_lifecycle;
 pub mod goal_scratch;
+pub mod jitter;
 pub mod path_containment;
 pub mod private_fs;
 pub mod process;

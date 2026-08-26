@@ -156,6 +156,10 @@ pub(super) struct EditorPasteRebuild {
 pub(crate) struct EditorPasteSnapshot {
     images: BTreeMap<u32, RetainedImage>,
     text_numbers_by_nonce: BTreeMap<String, u32>,
+    /// First block identity that has never been issued by the owning registry.
+    /// Editor rebuilds must preserve this floor because token-count work can
+    /// complete after the editor has returned.
+    next_block_id: u64,
     next_text_number: u32,
     next_image_number: u64,
 }
@@ -432,7 +436,10 @@ impl PasteRegistry {
 
     fn next_block_id(&mut self) -> u64 {
         let id = self.next_block_id;
-        self.next_block_id = self.next_block_id.saturating_add(1);
+        self.next_block_id = self
+            .next_block_id
+            .checked_add(1)
+            .expect("paste block identity exhausted");
         id
     }
 
@@ -1169,6 +1176,7 @@ impl PasteRegistry {
         EditorPasteSnapshot {
             images: self.image_payloads_by_number(),
             text_numbers_by_nonce,
+            next_block_id: self.next_block_id,
             next_text_number: self.next_text_number,
             next_image_number: self.next_image_number,
         }
@@ -1225,6 +1233,7 @@ impl PasteRegistry {
         let snapshot = EditorPasteSnapshot {
             images: retained_images.clone(),
             text_numbers_by_nonce: BTreeMap::new(),
+            next_block_id: 1,
             next_text_number: 1,
             next_image_number: retained_images
                 .keys()
@@ -1248,6 +1257,7 @@ impl PasteRegistry {
             .map(|(number, _)| number)
             .max()
             .max();
+        registry.next_block_id = snapshot.next_block_id;
         registry.next_text_number = snapshot.next_text_number;
         registry.next_image_number = unknown_image_max
             .map_or(snapshot.next_image_number, |number| {
@@ -2049,6 +2059,7 @@ gamma",
         let snapshot = EditorPasteSnapshot {
             images: BTreeMap::new(),
             text_numbers_by_nonce: BTreeMap::new(),
+            next_block_id: 1,
             next_text_number: 1,
             next_image_number: 7,
         };

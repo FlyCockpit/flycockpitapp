@@ -1375,4 +1375,30 @@ mod tests {
             Some("expanded editor payload")
         );
     }
+
+    #[test]
+    fn editor_rebuild_never_reuses_an_async_token_count_block_id() {
+        let mut owner = RegisteredComposer::new(false);
+        let first = "before editor\n".repeat(10);
+        let (stale_id, _) = owner
+            .insert_pasted_text(first)
+            .expect("multiline paste is condensed");
+        let editor = owner.editor_text();
+        let snapshot = owner.editor_snapshot();
+
+        owner.rebuild_from_editor(&editor, &snapshot);
+        owner.insert_char(' ');
+        let second = "after editor\n".repeat(10);
+        let (current_id, _) = owner
+            .insert_pasted_text(second)
+            .expect("second multiline paste is condensed");
+
+        assert!(current_id > stale_id);
+        assert!(!owner.apply_paste_token_count(stale_id, 999));
+        assert!(matches!(
+            &owner.paste_registry.blocks()[1].kind,
+            PasteKind::Text { tokens: None, .. }
+        ));
+        assert!(owner.apply_paste_token_count(current_id, 7));
+    }
 }

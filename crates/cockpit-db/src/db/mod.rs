@@ -1209,95 +1209,193 @@ fn create_migration_backup(
     schema_version: i64,
     reason: &str,
 ) -> Result<()> {
+    create_migration_backup_with_limit(
+        conn,
+        path,
+        schema_version,
+        reason,
+        UNTRUSTED_MIGRATION_BACKUP_TOTAL_BYTES,
+    )
+}
+
+fn create_migration_backup_with_limit(
+    conn: &Connection,
+    path: &Path,
+    schema_version: i64,
+    reason: &str,
+    quarantine_byte_limit: u64,
+) -> Result<()> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let backup = path.with_extension(format!("v{schema_version}.backup-{stamp}.sqlite"));
-    let source_fingerprint = migration_backup_source_fingerprint(conn, path, schema_version);
-    // The initial artifact is intentionally outside doctor's trusted sibling
-    // glob. Its source/version/schema identity makes repeated failed boots
-    // reuse one quarantine artifact instead of copying the same database until
-    // the disk fills. Only exact compiled-ledger validation promotes a fresh
-    // artifact to `*.sqlite`; quarantine artifacts are never promoted later.
-    let untrusted = path.with_extension(format!(
-        "v{schema_version}.backup-untrusted-{source_fingerprint}.sqlite.quarantine"
-    ));
-    if untrusted.exists() {
-        files::repair_private_file(&untrusted, "quarantined database backup artifact")?;
-        fsync_file_and_parent(&untrusted)?;
-        prune_untrusted_migration_backups(path)?;
+    let estimated_bytes = sqlite_allocated_bytes(conn)?;
+    if estimated_bytes > quarantine_byte_limit {
         anyhow::bail!(
-            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: an identical source/version/schema backup is already durably quarantined at {}; it is not a trusted restorable backup before {reason}",
-            untrusted.display()
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was created before {reason}; the estimated {estimated_bytes}-byte backup exceeds the hard {quarantine_byte_limit}-byte quarantine limit"
         );
     }
-    conn.execute("VACUUM INTO ?1", [untrusted.to_string_lossy().as_ref()])
-        .with_context(|| {
+    reserve_untrusted_migration_backup_capacity(path, estimated_bytes, quarantine_byte_limit)
+        .context("backing up database before migration: reserving quarantine capacity")?;
+    if let Some(available) = filesystem_available_bytes(path)
+        .context("backing up database before migration: checking filesystem free space")?
+        && available < estimated_bytes
+    {
+        anyhow::bail!(
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was created before {reason}; only {available} filesystem bytes are available for the estimated {estimated_bytes}-byte online backup"
+        );
+    }
+    let candidate = path.with_extension(format!(
+        "v{schema_version}.backup-candidate-{stamp}-{:016x}.sqlite.tmp",
+        rand::random::<u64>()
+    ));
+    if let Err(error) = conn.execute("VACUUM INTO ?1", [candidate.to_string_lossy().as_ref()]) {
+        if candidate.exists() {
+            remove_backup_candidate(&candidate)?;
+        }
+        return Err(error).with_context(|| {
             format!(
-                "creating SQLite online backup of {} at {} before {reason}",
-                path.display(),
-                untrusted.display()
+                "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was created; creating SQLite online backup of {} at {} before {reason} failed",
+                path.display(), candidate.display()
             )
-        })?;
-    files::repair_private_file(&untrusted, "database backup artifact")?;
+        });
+    }
+    let mut candidate_guard = BackupCandidateGuard::new(candidate.clone());
+    files::repair_private_file(&candidate, "database backup candidate")?;
+    let candidate_bytes = std::fs::metadata(&candidate)
+        .with_context(|| format!("reading backup candidate size {}", candidate.display()))?
+        .len();
+    if candidate_bytes > quarantine_byte_limit {
+        remove_backup_candidate(&candidate)?;
+        candidate_guard.disarm();
+        anyhow::bail!(
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was created before {reason}; the completed {candidate_bytes}-byte backup exceeds the hard {quarantine_byte_limit}-byte quarantine limit"
+        );
+    }
+    if let Err(error) =
+        reserve_untrusted_migration_backup_capacity(path, candidate_bytes, quarantine_byte_limit)
+    {
+        remove_backup_candidate(&candidate)?;
+        candidate_guard.disarm();
+        return Err(error).context("no recovery artifact was created after backup sizing");
+    }
     // Preserve the physical recovery artifact before performing logical
     // validation. A drifted source can legitimately fail the latter check;
     // its online backup must still reach the filesystem durability boundary.
-    fsync_file_and_parent(&untrusted)?;
-    let validation = validate_migration_backup(&untrusted, schema_version).with_context(|| {
+    fsync_file_and_parent(&candidate)?;
+    let content_digest = file_sha256(&candidate)?;
+    let untrusted = path.with_extension(format!(
+        "v{schema_version}.backup-untrusted-{content_digest}.sqlite.quarantine"
+    ));
+    if untrusted.exists() {
+        remove_backup_candidate(&candidate)?;
+        candidate_guard.disarm();
+        files::repair_private_file(&untrusted, "quarantined database backup artifact")?;
+        fsync_file_and_parent(&untrusted)?;
+        anyhow::bail!(
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: an exact content-identical backup is already durably quarantined at {}; it is not a trusted restorable backup before {reason}",
+            untrusted.display()
+        );
+    }
+    let validation = validate_migration_backup(&candidate, schema_version).with_context(|| {
         format!(
             "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: migration backup artifact {} was durably preserved but remains untrusted before {reason}",
             untrusted.display()
         )
     });
     if let Err(error) = validation {
+        std::fs::rename(&candidate, &untrusted).with_context(|| {
+            format!(
+                "publishing quarantined database backup {} at {}",
+                candidate.display(),
+                untrusted.display()
+            )
+        })?;
+        candidate_guard.disarm();
+        fsync_file_and_parent(&untrusted)?;
         prune_untrusted_migration_backups(path)?;
         return Err(error);
     }
-    std::fs::rename(&untrusted, &backup).with_context(|| {
+    std::fs::rename(&candidate, &backup).with_context(|| {
         format!(
             "promoting trusted migration backup {} to {}",
-            untrusted.display(),
+            candidate.display(),
             backup.display()
         )
     })?;
+    candidate_guard.disarm();
     fsync_file_and_parent(&backup)?;
     prune_migration_backups(path)?;
     Ok(())
 }
 
-fn migration_backup_source_fingerprint(
-    conn: &Connection,
-    path: &Path,
-    schema_version: i64,
-) -> String {
-    let ddl =
-        exact_ddl_fingerprint(conn).unwrap_or_else(|error| format!("unreadable-ddl:{error:#}"));
-    let sidecar = |suffix: &str| {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(suffix);
-        PathBuf::from(name)
-    };
-    let identity = [path.to_path_buf(), sidecar("-wal")]
-        .into_iter()
-        .map(|candidate| match std::fs::metadata(&candidate) {
-            Ok(metadata) => {
-                let modified = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |duration| duration.as_nanos());
-                format!("{}:{}:{modified}", candidate.display(), metadata.len())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                format!("{}:absent", candidate.display())
-            }
-            Err(error) => format!("{}:metadata-error:{error}", candidate.display()),
-        })
-        .collect::<Vec<_>>()
-        .join("\0");
-    migration_hash(&format!("{schema_version}\0{ddl}\0{identity}"))
+fn sqlite_allocated_bytes(conn: &Connection) -> Result<u64> {
+    let page_count: u64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    page_count
+        .checked_mul(page_size)
+        .context("SQLite backup size estimate overflow")
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening backup candidate {} for hashing", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("hashing backup candidate {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn remove_backup_candidate(path: &Path) -> Result<()> {
+    std::fs::remove_file(path)
+        .with_context(|| format!("removing rejected backup candidate {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+struct BackupCandidateGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl BackupCandidateGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackupCandidateGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent()
+            && let Ok(directory) = std::fs::File::open(parent)
+        {
+            let _ = directory.sync_all();
+        }
+    }
 }
 
 /// Decide whether opening an existing prerelease database must first preserve
@@ -1494,14 +1592,96 @@ fn prune_migration_backups(path: &Path) -> Result<()> {
 }
 
 /// Bound quarantined recovery artifacts independently from trusted backups.
-/// At least the newest artifact is preserved even when it alone exceeds the
-/// byte budget; older artifacts are removed until both bounds are satisfied.
+/// Both count and aggregate bytes are hard bounds; an oversized artifact is
+/// never retained merely because it is the newest one.
 fn prune_untrusted_migration_backups(path: &Path) -> Result<()> {
     prune_untrusted_migration_backups_with_limits(
         path,
         UNTRUSTED_MIGRATION_BACKUP_LIMIT,
         UNTRUSTED_MIGRATION_BACKUP_TOTAL_BYTES,
     )
+}
+
+fn reserve_untrusted_migration_backup_capacity(
+    path: &Path,
+    reserve_bytes: u64,
+    total_byte_limit: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        reserve_bytes <= total_byte_limit,
+        "no recovery artifact was created; estimated backup exceeds the hard quarantine limit"
+    );
+    prune_untrusted_migration_backups_with_limits(
+        path,
+        UNTRUSTED_MIGRATION_BACKUP_LIMIT.saturating_sub(1),
+        total_byte_limit - reserve_bytes,
+    )
+}
+
+#[cfg(unix)]
+fn filesystem_available_bytes(path: &Path) -> Result<Option<u64>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let encoded = std::ffi::CString::new(parent.as_os_str().as_bytes())
+        .context("database directory contains an interior NUL")?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `encoded` is NUL-terminated and live for the call, and `stats`
+    // points to writable storage which is read only after statvfs succeeds.
+    let result = unsafe { libc::statvfs(encoded.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading free space for {}", parent.display()));
+    }
+    // SAFETY: statvfs returned success and initialized the output structure.
+    let stats = unsafe { stats.assume_init() };
+    Ok(Some(
+        (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64),
+    ))
+}
+
+#[cfg(windows)]
+fn filesystem_available_bytes(path: &Path) -> Result<Option<u64>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetDiskFreeSpaceExW"]
+        fn get_disk_free_space_ex_w(
+            directory_name: *const u16,
+            free_bytes_available: *mut u64,
+            total_bytes: *mut u64,
+            total_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let encoded = parent
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut available = 0_u64;
+    // SAFETY: `encoded` is NUL-terminated and live for the call; `available`
+    // is writable, and the optional aggregate outputs are intentionally null.
+    let result = unsafe {
+        get_disk_free_space_ex_w(
+            encoded.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading free space for {}", parent.display()));
+    }
+    Ok(Some(available))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn filesystem_available_bytes(_path: &Path) -> Result<Option<u64>> {
+    // The hard quarantine budget and completed-candidate size check remain
+    // authoritative on platforms without a portable standard-library free
+    // space query; SQLite itself reports a failed allocation without publish.
+    Ok(None)
 }
 
 fn prune_untrusted_migration_backups_with_limits(
@@ -1547,7 +1727,7 @@ fn prune_untrusted_migration_backups_with_limits(
     let mut total_bytes = backups
         .iter()
         .fold(0_u64, |total, (_, bytes, _)| total.saturating_add(*bytes));
-    while backups.len() > 1 && (backups.len() > count_limit || total_bytes > total_byte_limit) {
+    while !backups.is_empty() && (backups.len() > count_limit || total_bytes > total_byte_limit) {
         let (_, bytes, stale) = backups.remove(0);
         std::fs::remove_file(stale)?;
         total_bytes = total_bytes.saturating_sub(bytes);
@@ -2410,7 +2590,7 @@ mod tests {
     }
 
     #[test]
-    fn quarantined_backup_byte_budget_preserves_only_the_newest_oversized_artifact() {
+    fn quarantined_backup_byte_budget_removes_every_oversized_artifact() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cockpit.db");
         for index in 0..3 {
@@ -2434,7 +2614,62 @@ mod tests {
                     .to_string_lossy()
                     .ends_with(".sqlite.quarantine"))
                 .count(),
-            1
+            0
+        );
+    }
+
+    #[test]
+    fn backup_content_digest_distinguishes_equal_size_and_mtime_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let one = temp.path().join("one.sqlite.tmp");
+        let two = temp.path().join("two.sqlite.tmp");
+        std::fs::write(&one, b"source-state-one").unwrap();
+        std::fs::write(&two, b"source-state-two").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&one)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&two)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+
+        assert_eq!(std::fs::metadata(&one).unwrap().len(), 16);
+        assert_eq!(
+            std::fs::metadata(&one).unwrap().modified().unwrap(),
+            std::fs::metadata(&two).unwrap().modified().unwrap()
+        );
+        assert_ne!(file_sha256(&one).unwrap(), file_sha256(&two).unwrap());
+        assert_eq!(file_sha256(&one).unwrap(), file_sha256(&one).unwrap());
+    }
+
+    #[test]
+    fn oversized_backup_is_rejected_without_publishing_an_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let conn = Connection::open(&path).unwrap();
+        migrate_test_with(
+            &conn,
+            &["CREATE TABLE oversized_backup_probe (id INTEGER PRIMARY KEY);"],
+        )
+        .unwrap();
+
+        let error =
+            create_migration_backup_with_limit(&conn, &path, 1, "test limit", 1).unwrap_err();
+        assert!(format!("{error:#}").contains("no recovery artifact was created"));
+        assert!(
+            !std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.contains("backup-candidate") || name.ends_with(".sqlite.quarantine")
+                })
         );
     }
 

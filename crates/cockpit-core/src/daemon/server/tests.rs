@@ -15692,6 +15692,32 @@ impl AuthzLevel {
             Self::NoAccess => "no_access",
         }
     }
+
+    /// Whether this level can attach to a session at all. Local builds only
+    /// have `Owner`, so the answer is unconditionally yes there.
+    fn can_attach(self) -> bool {
+        #[cfg(feature = "remote")]
+        {
+            self != Self::NoAccess
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            true
+        }
+    }
+
+    /// Whether this level holds write-capable session access. Local builds
+    /// only have `Owner`, so the answer is unconditionally yes there.
+    fn can_write(self) -> bool {
+        #[cfg(feature = "remote")]
+        {
+            matches!(self, Self::Owner | Self::Writer)
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            true
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -17260,8 +17286,8 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
         // at all, so the owner cell exercises the attached dispatch path
         // instead of re-proving the attach gate (which has its own dedicated
         // negative tests).
-        || (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
-        || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
+        || (kind == "get_inventory_bundle" && level.can_attach())
+        || (kind == "lsp_control" && level.can_write())
 }
 
 #[cfg(unix)]

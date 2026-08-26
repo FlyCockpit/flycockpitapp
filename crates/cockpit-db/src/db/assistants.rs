@@ -124,28 +124,8 @@ impl Db {
         config_json: &str,
     ) -> Result<AssistantRow> {
         let config_json = config_json.to_string();
-        validate_config_json(&config_json)?;
         self.write(move |conn| {
-            let changed = conn
-                .execute(
-                    "UPDATE assistants SET config_json = ?6
-                     WHERE name = ?1 AND created_at_unix_ms = ?2 AND home_dir = ?3
-                       AND config_json = ?4 AND content_hash = ?5",
-                    params![
-                        expected.name,
-                        expected.created_at_unix_ms,
-                        expected.home_dir,
-                        expected.config_json,
-                        expected.content_hash,
-                        config_json,
-                    ],
-                )
-                .context("compare-and-swap assistant identity hashes")?;
-            if changed != 1 {
-                anyhow::bail!("assistant registry changed while identity files were read");
-            }
-            Db::get_assistant_conn(conn, &expected.name)?
-                .ok_or_else(|| anyhow::anyhow!("assistant disappeared after identity update"))
+            Db::update_assistant_identity_hashes_cas_conn(conn, expected, &config_json)
         })
         .await
     }
@@ -158,24 +138,74 @@ impl Db {
         expected_hash: &str,
         next_hash: &str,
     ) -> Result<AssistantRow> {
-        validate_content_hash(expected_hash)?;
-        validate_content_hash(next_hash)?;
         let name = name.to_string();
         let home_dir = home_dir.to_string();
         let config_json = config_json.to_string();
         let expected_hash = expected_hash.to_string();
         let next_hash = next_hash.to_string();
         self.write(move |conn| {
-            let changed = conn.execute(
+            Db::update_assistant_content_hash_cas_conn(
+                conn,
+                &name,
+                &home_dir,
+                &config_json,
+                &expected_hash,
+                &next_hash,
+            )
+        })
+        .await
+    }
+
+    pub fn update_assistant_identity_hashes_cas_conn(
+        conn: &rusqlite::Connection,
+        expected: AssistantRow,
+        config_json: &str,
+    ) -> Result<AssistantRow> {
+        validate_config_json(config_json)?;
+        let changed = conn
+            .execute(
+                "UPDATE assistants SET config_json = ?6
+                 WHERE name = ?1 AND created_at_unix_ms = ?2 AND home_dir = ?3
+                   AND config_json = ?4 AND content_hash = ?5",
+                params![
+                    expected.name,
+                    expected.created_at_unix_ms,
+                    expected.home_dir,
+                    expected.config_json,
+                    expected.content_hash,
+                    config_json,
+                ],
+            )
+            .context("compare-and-swap assistant identity hashes")?;
+        if changed != 1 {
+            anyhow::bail!("assistant registry changed while identity files were read");
+        }
+        Db::get_assistant_conn(conn, &expected.name)?
+            .ok_or_else(|| anyhow::anyhow!("assistant disappeared after identity update"))
+    }
+
+    pub fn update_assistant_content_hash_cas_conn(
+        conn: &rusqlite::Connection,
+        name: &str,
+        home_dir: &str,
+        config_json: &str,
+        expected_hash: &str,
+        next_hash: &str,
+    ) -> Result<AssistantRow> {
+        validate_config_json(config_json)?;
+        validate_content_hash(expected_hash)?;
+        validate_content_hash(next_hash)?;
+        let changed = conn
+            .execute(
                 "UPDATE assistants SET content_hash=?5 WHERE name=?1 AND home_dir=?2 AND config_json=?3 AND content_hash=?4",
                 params![name, home_dir, config_json, expected_hash, next_hash],
-            ).context("compare-and-swap assistant definition revision")?;
-            if changed != 1 {
-                anyhow::bail!("assistant registry changed before definition commit");
-            }
-            Db::get_assistant_conn(conn, &name)?
-                .ok_or_else(|| anyhow::anyhow!("assistant `{name}` disappeared after update"))
-        }).await
+            )
+            .context("compare-and-swap assistant definition revision")?;
+        if changed != 1 {
+            anyhow::bail!("assistant registry changed before definition commit");
+        }
+        Db::get_assistant_conn(conn, name)?
+            .ok_or_else(|| anyhow::anyhow!("assistant `{name}` disappeared after update"))
     }
 
     pub fn upsert_assistant_conn(

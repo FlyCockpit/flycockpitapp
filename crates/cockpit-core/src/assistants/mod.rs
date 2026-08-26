@@ -904,15 +904,14 @@ fn save_definition_cas_sync(
     let expected = row.clone();
     let next_hash_for_db = next_hash.clone();
     let updated = match db.write_blocking(move |conn| {
-        let changed = conn.execute(
-            "UPDATE assistants SET content_hash=?5 WHERE name=?1 AND home_dir=?2 AND config_json=?3 AND content_hash=?4",
-            rusqlite::params![expected.name, expected.home_dir, expected.config_json, expected.content_hash, next_hash_for_db],
-        )?;
-        if changed != 1 {
-            bail!("assistant registry changed before definition commit");
-        }
-        crate::db::Db::get_assistant_conn(conn, &expected.name)?
-            .context("assistant disappeared after definition update")
+        crate::db::Db::update_assistant_content_hash_cas_conn(
+            conn,
+            &expected.name,
+            &expected.home_dir,
+            &expected.config_json,
+            &expected.content_hash,
+            &next_hash_for_db,
+        )
     }) {
         Ok(updated) => updated,
         Err(error) => {

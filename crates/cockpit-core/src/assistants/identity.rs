@@ -182,27 +182,8 @@ fn update_identity_hashes_cas_blocking(
     expected: AssistantRow,
     config_json: String,
 ) -> Result<AssistantRow> {
-    serde_json::from_str::<serde_json::Value>(&config_json)
-        .context("assistant config must be valid JSON")?;
     db.write_blocking(move |conn| {
-        let changed = conn.execute(
-            "UPDATE assistants SET config_json = ?6
-             WHERE name = ?1 AND created_at_unix_ms = ?2 AND home_dir = ?3
-               AND config_json = ?4 AND content_hash = ?5",
-            rusqlite::params![
-                expected.name,
-                expected.created_at_unix_ms,
-                expected.home_dir,
-                expected.config_json,
-                expected.content_hash,
-                config_json,
-            ],
-        )?;
-        if changed != 1 {
-            anyhow::bail!("assistant registry changed while identity files were read");
-        }
-        crate::db::Db::get_assistant_conn(conn, &expected.name)?
-            .context("assistant disappeared after identity hash update")
+        crate::db::Db::update_assistant_identity_hashes_cas_conn(conn, expected, &config_json)
     })
 }
 

@@ -24,6 +24,7 @@ use anyhow::{Result, anyhow};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use cockpit_proto::{self as proto, ErrorPayload, Request, Response};
 #[cfg(unix)]
@@ -35,11 +36,37 @@ use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame};
 #[derive(Clone, Debug)]
 pub struct InProcessEndpoint {
     connections: mpsc::Sender<oneshot::Sender<Option<InProcessConnection>>>,
+    sensitive: mpsc::Sender<InProcessSensitiveRequest>,
+}
+
+pub struct InProcessSensitiveRequest {
+    pub payload: Zeroizing<Vec<u8>>,
+    pub reply: oneshot::Sender<Zeroizing<Vec<u8>>>,
 }
 
 impl InProcessEndpoint {
-    pub fn new(connections: mpsc::Sender<oneshot::Sender<Option<InProcessConnection>>>) -> Self {
-        Self { connections }
+    pub fn new(
+        connections: mpsc::Sender<oneshot::Sender<Option<InProcessConnection>>>,
+        sensitive: mpsc::Sender<InProcessSensitiveRequest>,
+    ) -> Self {
+        Self {
+            connections,
+            sensitive,
+        }
+    }
+
+    pub async fn sensitive_request(
+        &self,
+        payload: Zeroizing<Vec<u8>>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let (reply, receive) = oneshot::channel();
+        self.sensitive
+            .send(InProcessSensitiveRequest { payload, reply })
+            .await
+            .map_err(|_| anyhow!("in-process sensitive endpoint has retired"))?;
+        receive
+            .await
+            .map_err(|_| anyhow!("in-process sensitive endpoint dropped its reply"))
     }
 
     async fn connect(&self) -> Result<InProcessConnection> {

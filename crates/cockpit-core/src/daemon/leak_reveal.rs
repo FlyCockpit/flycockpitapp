@@ -183,6 +183,48 @@ pub async fn reveal_leak_secret(
     }
 }
 
+/// Reveal through the exact transport capability returned by lifecycle
+/// composition. In-process attachments use a private capability-bearing
+/// channel; wire attachments use the peer-authenticated reveal socket.
+pub async fn reveal_leak_secret_at_endpoint(
+    endpoint: &cockpit_client::ClientEndpoint,
+    capability: &crate::daemon::proto::LeakRevealToken,
+) -> Result<RevealedLeakSecret, LeakRevealDenied> {
+    match endpoint {
+        cockpit_client::ClientEndpoint::Wire(control_socket) => {
+            reveal_leak_secret(control_socket, capability).await
+        }
+        cockpit_client::ClientEndpoint::InProcess(endpoint) => {
+            let request = crate::daemon::leak_reveal_frame::encode_request(
+                &crate::daemon::leak_reveal_frame::LeakRevealSocketRequest {
+                    capability_hex: capability.clone(),
+                },
+            )
+            .map_err(|_| LeakRevealDenied::Internal)?;
+            let response = endpoint
+                .sensitive_request(request)
+                .await
+                .map_err(|_| LeakRevealDenied::UnavailablePlatform)?;
+            match crate::daemon::leak_reveal_frame::decode_response(&response)
+                .map_err(|_| LeakRevealDenied::Internal)?
+            {
+                crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Ok {
+                    report_id,
+                    generation,
+                    plaintext,
+                } => Ok(RevealedLeakSecret {
+                    report_id,
+                    generation,
+                    plaintext,
+                }),
+                crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(denied) => {
+                    Err(denied)
+                }
+            }
+        }
+    }
+}
+
 /// In-process reveal caller: resolve the registered in-process [`DaemonContext`]
 /// for `socket` and invoke the consumption core. This is the production path
 /// when the TUI hosts the daemon, and the **only** production path on Windows

@@ -3293,6 +3293,8 @@ pub(crate) fn register_in_process_context(ctx: Arc<DaemonContext>) {
 
 pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::InProcessEndpoint {
     let (connections, mut requests) = mpsc::channel(16);
+    let (sensitive, mut sensitive_requests) =
+        mpsc::channel::<cockpit_client::InProcessSensitiveRequest>(4);
     let weak = Arc::downgrade(ctx);
     tokio::spawn(async move {
         while let Some(reply) = requests.recv().await {
@@ -3304,7 +3306,43 @@ pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::I
             }
         }
     });
-    cockpit_client::InProcessEndpoint::new(connections)
+    let weak = Arc::downgrade(ctx);
+    tokio::spawn(async move {
+        while let Some(request) = sensitive_requests.recv().await {
+            let Some(ctx) = weak.upgrade() else {
+                break;
+            };
+            let response = match crate::daemon::leak_reveal_frame::decode_request(&request.payload)
+            {
+                Ok(decoded) => match crate::daemon::leak_reveal::consume_leak_reveal(
+                    &ctx,
+                    decoded.capability_hex.as_str(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                {
+                    Ok(revealed) => {
+                        crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Ok {
+                            report_id: revealed.report_id,
+                            generation: revealed.generation,
+                            plaintext: revealed.plaintext,
+                        }
+                    }
+                    Err(denied) => {
+                        crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(denied)
+                    }
+                },
+                Err(_) => crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(
+                    crate::daemon::leak_reveal::LeakRevealDenied::Unauthorized,
+                ),
+            };
+            let encoded = zeroize::Zeroizing::new(
+                crate::daemon::leak_reveal_frame::encode_response(&response),
+            );
+            let _ = request.reply.send(encoded);
+        }
+    });
+    cockpit_client::InProcessEndpoint::new(connections, sensitive)
 }
 
 pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {

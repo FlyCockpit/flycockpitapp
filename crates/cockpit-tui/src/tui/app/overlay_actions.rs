@@ -127,13 +127,10 @@ impl App {
             }
             return;
         }
-        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
             if let Overlay::Leaks(pane) = &mut self.overlay {
                 pane.set_reveal_error("daemon detached — reveal unavailable");
             }
-            return;
-        };
-        let Some(endpoint) = self.attached_daemon_endpoint() else {
             return;
         };
         let operation_id = uuid::Uuid::new_v4();
@@ -176,7 +173,8 @@ impl App {
                     });
                 }
                 let token = capability.capability;
-                let reveal = crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, &token);
+                let reveal =
+                    crate::tui::agent_runner::daemon_reveal_leak_blocking(&endpoint, &token);
                 if reveal.is_err() {
                     // `RateLimited` and unavailable-channel paths do not consume
                     // the slot. An authorization failure may already have spent

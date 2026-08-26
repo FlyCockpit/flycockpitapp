@@ -701,19 +701,10 @@ fn every_production_block_on_is_test_only_or_worker_owned() {
     assert!(runner.contains("may be called only from an\n/// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker"));
 
     let settings = include_str!("../settings/mod.rs");
-    let daemon_adapter = settings
-        .split("fn run_settings_daemon")
-        .nth(1)
-        .expect("settings blocking still funnels through `run_settings_daemon`");
     assert_eq!(
         settings.matches(".block_on(").count(),
-        2,
-        "settings blocking adapters require a fresh call-site audit"
-    );
-    assert_eq!(
-        daemon_adapter.matches(".block_on(").count(),
-        2,
-        "no settings block_on may live outside `run_settings_daemon`"
+        0,
+        "settings reducers must enqueue effects and never block on daemon work"
     );
     assert!(
         settings.contains("#[cfg(not(test))]\nstruct ProductionSettingsDaemonEffect;"),

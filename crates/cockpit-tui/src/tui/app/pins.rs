@@ -114,7 +114,7 @@ impl App {
     fn start_pin_state_refresh(
         &mut self,
         sid: uuid::Uuid,
-        socket: std::path::PathBuf,
+        endpoint: cockpit_client::ClientEndpoint,
         clear_first: bool,
     ) {
         if clear_first {
@@ -127,7 +127,7 @@ impl App {
             AsyncActionKind::Refresh("pins.state"),
             AsyncActionPolicy::Replace(AsyncActionKey::new(format!("pins.state:{sid}"))),
             move || {
-                let (count, pinned_seqs) = load_pin_state(&socket, sid)?;
+                let (count, pinned_seqs) = load_pin_state(&endpoint, sid)?;
                 Ok(AsyncActionPayload::PinState {
                     session_id: sid,
                     count,

@@ -23,6 +23,7 @@ cockpit-proto = { path = "../cockpit-proto" }
 tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

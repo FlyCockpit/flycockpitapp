@@ -1002,35 +1002,6 @@ pub(crate) struct SettingsBlockingEffectMetadata {
     pub(crate) target: SettingsEffectTarget,
 }
 
-/// Run a short daemon RPC from an input reducer. Production reducers execute
-/// beneath the application's multi-thread Tokio runtime. Unit reducers are
-/// intentionally synchronous, so give those tests the same daemon boundary
-/// instead of panicking before the request can be exercised.
-fn run_settings_daemon<T>(
-    future: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<T, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        if matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            return tokio::task::block_in_place(|| handle.block_on(future));
-        }
-        return Err("settings daemon RPC requires a multi-thread application runtime".to_string());
-    }
-    #[cfg(test)]
-    {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?
-            .block_on(future)
-    }
-    #[cfg(not(test))]
-    Err("settings daemon RPC requires the application runtime".to_string())
-}
-
 /// Injectable transport boundary for settings daemon effects.  Both the real
 /// client and tests feed responses through the same snapshot/patch/receipt
 /// validation below; a test double may replace only transport, never config

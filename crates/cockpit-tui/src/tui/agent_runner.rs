@@ -3127,7 +3127,7 @@ pub(crate) fn daemon_request_at_blocking(
 /// Returns the revealed `Zeroizing` plaintext **directly** to the caller — it
 /// never rides an `AsyncActionPayload` or any ordinary daemon codec.
 pub(crate) fn daemon_reveal_leak_blocking(
-    control_socket: &Path,
+    endpoint: &ClientEndpoint,
     capability: &proto::LeakRevealToken,
 ) -> Result<
     cockpit_core::daemon::leak_reveal::RevealedLeakSecret,
@@ -3139,10 +3139,11 @@ pub(crate) fn daemon_reveal_leak_blocking(
             return Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::UnavailablePlatform);
         }
     };
-    let socket = control_socket.to_path_buf();
+    let endpoint = endpoint.clone();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            cockpit_core::daemon::leak_reveal::reveal_leak_secret(&socket, capability).await
+            cockpit_core::daemon::leak_reveal::reveal_leak_secret_at_endpoint(&endpoint, capability)
+                .await
         })
     })
 }

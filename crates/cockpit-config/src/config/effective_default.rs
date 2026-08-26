@@ -1500,10 +1500,12 @@ impl RetainedEffectiveDefaultTarget {
         ensure_single_leaf(&backup_leaf)?;
         ensure!(canonical_config_path.is_absolute(), "retained config target path is not absolute");
         ensure!(project_root.is_absolute(), "retained config project root is not absolute");
-        let expected_journal = journal_path_for_config(&canonical_config_path)
+        let journal_path = journal_path_for_config(&canonical_config_path);
+        let expected_journal = journal_path
             .file_name()
             .context("retained journal has no filename")?;
-        let expected_backup = backup_path_for_config(&canonical_config_path)
+        let backup_path = backup_path_for_config(&canonical_config_path);
+        let expected_backup = backup_path
             .file_name()
             .context("retained backup has no filename")?;
         ensure!(
@@ -3107,10 +3109,11 @@ pub fn recover_retained_effective_default_journal(
         } else if current_digest != record.old_config_digest {
             anyhow::bail!("retained config changed concurrently during compensation");
         }
+        let config_bytes = target.read_config()?;
         record.correlation.clone().map(|correlation| RecoveredTransaction {
             correlation,
             outcome: RecoveredOutcome::Restored {
-                restored: active_model_from_config_bytes(&target.read_config()?),
+                restored: active_model_from_config_bytes(&config_bytes),
                 session: SessionCompensation::NotApplicable,
             },
             scope_label: target.scope_label().to_string(),
@@ -4039,10 +4042,11 @@ fn recover_captured_under_lock(
     }
 
     let session_outcome = compensate_captured(target, &record, recovery.sessions.as_deref_mut())?;
+    let config_bytes = target.read_config()?;
     let transaction = record.correlation.clone().map(|correlation| RecoveredTransaction {
         correlation,
         outcome: RecoveredOutcome::Restored {
-            restored: active_model_from_config_bytes(&target.read_config()?),
+            restored: active_model_from_config_bytes(&config_bytes),
             session: session_outcome,
         },
         scope_label,

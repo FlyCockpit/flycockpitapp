@@ -111,7 +111,7 @@ pub fn unlinkat(dir_fd: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()
 /// `renameat` relative to held directory descriptors.  Unlike a path based
 /// rename, both names are resolved from capabilities the caller already owns;
 /// callers that must refuse replacement use [`rename_noreplace`] instead.
-pub(crate) fn renameat(
+pub fn renameat(
     from_dir_fd: RawFd,
     from: &CStr,
     to_dir_fd: RawFd,

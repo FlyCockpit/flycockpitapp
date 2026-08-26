@@ -494,6 +494,41 @@ impl ConfigMutationLock {
         }
     }
 
+    /// Try to acquire the mutation lock, polling until the deadline. Returns
+    /// `Ok(None)` when the deadline elapses without acquiring the lock (it
+    /// remained busy). Re-entrant acquisition on the same thread succeeds
+    /// immediately regardless of the deadline.
+    pub(crate) fn acquire_until(
+        target: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<Option<Self>> {
+        let target_identity = mutation_lock_identity(target);
+        let (parent, lock_leaf, display_path) = open_mutation_lock_parent(target)?;
+        let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
+        if Self::is_held_identity(&identity) {
+            return Ok(Some(Self::enter(None, identity)));
+        }
+        let file = open_private_lock_file_at(&parent, &lock_leaf, &display_path)?;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            match file.try_lock() {
+                Ok(()) => {
+                    return Ok(Some(Self::enter(Some(file), identity)));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| {
+                        format!("locking config mutation at {}", display_path.display())
+                    });
+                }
+            }
+        }
+    }
+
     /// Acquire the target's deterministic lock leaf relative to an already
     /// verified directory capability. The caller must pass the canonical
     /// target identity that the ambient backend uses for the same config file.
@@ -652,7 +687,7 @@ fn mutation_lock_leaf_for_identity(identity: &str) -> std::ffi::OsString {
     let mut hasher = Sha256::new();
     hasher.update(b"cockpit-effective-default-lock-v1\0");
     hasher.update(identity.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     std::ffi::OsString::from(format!(".cockpit-effective-default-lock-{digest}.lock"))
 }
 
@@ -1304,7 +1339,7 @@ fn workspace_snapshot(
         config_json,
         provider_files,
         effective_default_artifact_digest,
-        digest: format!("{:x}", hasher.finalize()),
+        digest: hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
     }
 }
 
@@ -1348,7 +1383,7 @@ fn effective_default_artifact_digest(
             None => hasher.update([0]),
         }
     }
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>())
 }
 
 fn is_not_found(error: &anyhow::Error) -> bool {
@@ -1506,6 +1541,14 @@ pub(crate) fn open_retained_child_directory_optional(_: &std::fs::File, _: &std:
 #[cfg(all(not(unix), not(windows)))]
 fn retained_directory_names(_: &std::fs::File) -> Result<Vec<std::ffi::OsString>> {
     anyhow::bail!("retained workspace config snapshots are unsupported on this platform")
+}
+
+struct KnowledgeSnapshotLimits {
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
 }
 
 pub(crate) fn snapshot_markdown_tree_nofollow(

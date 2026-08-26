@@ -829,9 +829,9 @@ impl PreparedSkillRoot {
         if entry_exists_nofollow(&parent, &package_name)? {
             bail!("skill package already exists: {name}");
         }
-        crate::private_fs::held_fd::mkdirat(parent.as_raw_fd(), &package_name, 0o755)
+        cockpit_host::private_fs::held_fd::mkdirat(parent.as_raw_fd(), &package_name, 0o755)
             .with_context(|| format!("creating skill package {name}"))?;
-        let package = crate::private_fs::held_fd::openat(
+        let package = cockpit_host::private_fs::held_fd::openat(
             parent.as_raw_fd(),
             &package_name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -841,7 +841,7 @@ impl PreparedSkillRoot {
             .and_then(|_| atomic_write_at(&package, PROVENANCE_FILE, provenance))
         {
             let _ = remove_tree_nofollow(&package);
-            let _ = crate::private_fs::held_fd::unlinkat(
+            let _ = cockpit_host::private_fs::held_fd::unlinkat(
                 parent.as_raw_fd(),
                 &package_name,
                 libc::AT_REMOVEDIR,
@@ -1034,7 +1034,7 @@ impl ManagedTarget {
             .context("support file path must end in a UTF-8 file name")?
             .to_owned();
         let leaf_c = component_cstring(&leaf)?;
-        let stat = crate::private_fs::held_fd::fstatat_nofollow(
+        let stat = cockpit_host::private_fs::held_fd::fstatat_nofollow(
             parent.directory.as_raw_fd(),
             &leaf_c,
         )
@@ -1083,7 +1083,7 @@ impl ManagedTarget {
             );
             return Err(error).context("removing staged skill package");
         }
-        crate::private_fs::held_fd::unlinkat(
+        cockpit_host::private_fs::held_fd::unlinkat(
             self.package_parent.as_raw_fd(),
             &tombstone,
             libc::AT_REMOVEDIR,
@@ -1107,7 +1107,7 @@ impl ManagedTarget {
         validate_directory_bindings(&parent.bindings)?;
         let leaf = component_cstring(leaf)?;
         let staged = component_cstring(staged)?;
-        let stat = crate::private_fs::held_fd::fstatat_nofollow(parent.directory.as_raw_fd(), &leaf)
+        let stat = cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.directory.as_raw_fd(), &leaf)
             .context("checking prepared support file before staging")?;
         ensure!(
             stat.st_mode & libc::S_IFMT == libc::S_IFREG,
@@ -1115,7 +1115,7 @@ impl ManagedTarget {
         );
         move_noreplace(&parent.directory, &leaf, &parent.directory, &staged)
             .context("staging support-file removal")?;
-        let staged_stat = crate::private_fs::held_fd::fstatat_nofollow(
+        let staged_stat = cockpit_host::private_fs::held_fd::fstatat_nofollow(
             parent.directory.as_raw_fd(),
             &staged,
         )
@@ -1124,7 +1124,7 @@ impl ManagedTarget {
             let _ = move_noreplace(&parent.directory, &staged, &parent.directory, &leaf);
             bail!("support file changed while staging; refusing mutation");
         }
-        if let Err(error) = crate::private_fs::held_fd::unlinkat(
+        if let Err(error) = cockpit_host::private_fs::held_fd::unlinkat(
             parent.directory.as_raw_fd(),
             &staged,
             0,
@@ -1227,7 +1227,7 @@ fn open_absolute_directory_nofollow(path: &Path) -> Result<HeldDirectoryPath> {
     use std::os::unix::ffi::OsStringExt as _;
 
     ensure!(path.is_absolute(), "skills root must be absolute");
-    let mut current = crate::private_fs::held_fd::open_fs_root()
+    let mut current = cockpit_host::private_fs::held_fd::open_fs_root()
         .context("opening filesystem root for skill mutation")?;
     let mut bindings = Vec::new();
     for component in path.components() {
@@ -1235,7 +1235,7 @@ fn open_absolute_directory_nofollow(path: &Path) -> Result<HeldDirectoryPath> {
             Component::RootDir | Component::CurDir => {}
             Component::Normal(name) => {
                 let name = component_cstring_os(name)?;
-                let child = crate::private_fs::held_fd::openat(
+                let child = cockpit_host::private_fs::held_fd::openat(
                     current.as_raw_fd(),
                     &name,
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -1278,7 +1278,7 @@ fn open_directory_chain(root: &std::fs::File, relative: &Path) -> Result<std::fs
             bail!("skill support path may not contain traversal components");
         };
         let name = component_cstring_os(name)?;
-        current = crate::private_fs::held_fd::openat(
+        current = cockpit_host::private_fs::held_fd::openat(
             current.as_raw_fd(),
             &name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -1308,7 +1308,7 @@ fn open_directory_chain_with_bindings(
             bail!("skill support path may not contain traversal components");
         };
         let name = component_cstring_os(name)?;
-        let child = crate::private_fs::held_fd::openat(
+        let child = cockpit_host::private_fs::held_fd::openat(
             current.as_raw_fd(),
             &name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -1344,7 +1344,7 @@ fn open_directory_child_cstr(
 ) -> Result<std::fs::File> {
     use std::os::fd::AsRawFd as _;
 
-    crate::private_fs::held_fd::openat(
+    cockpit_host::private_fs::held_fd::openat(
         parent.as_raw_fd(),
         name,
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -1368,7 +1368,7 @@ fn open_or_create_directory_child_os(
     match open_directory_child_cstr(parent, &name) {
         Ok(directory) => Ok(directory),
         Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {
-            match crate::private_fs::held_fd::mkdirat(parent.as_raw_fd(), &name, 0o755) {
+            match cockpit_host::private_fs::held_fd::mkdirat(parent.as_raw_fd(), &name, 0o755) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error).context("creating skill directory component"),
@@ -1384,7 +1384,7 @@ fn open_or_create_directory_child_os(
 fn entry_exists_nofollow(parent: &std::fs::File, name: &std::ffi::CStr) -> Result<bool> {
     use std::os::fd::AsRawFd as _;
 
-    match crate::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), name) {
+    match cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), name) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error).context("checking held skill directory entry"),
@@ -1424,7 +1424,7 @@ fn move_noreplace(
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        return crate::private_fs::held_fd::rename_noreplace(
+        return cockpit_host::private_fs::held_fd::rename_noreplace(
             source_parent.as_raw_fd(),
             source,
             destination_parent.as_raw_fd(),
@@ -1451,7 +1451,7 @@ fn atomic_write_at(parent: &std::fs::File, name: &str, bytes: &[u8]) -> Result<(
     // no-follow stat before the replacement step.
     let temporary_name = format!(".{name}.tmp-{}", uuid::Uuid::new_v4());
     let temporary = component_cstring(&temporary_name)?;
-    let mut file = crate::private_fs::held_fd::openat_mode(
+    let mut file = cockpit_host::private_fs::held_fd::openat_mode(
         parent.as_raw_fd(),
         &temporary,
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -1461,19 +1461,19 @@ fn atomic_write_at(parent: &std::fs::File, name: &str, bytes: &[u8]) -> Result<(
     let write_result = file.write_all(bytes).and_then(|_| file.sync_all());
     drop(file);
     if let Err(error) = write_result {
-        let _ = crate::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+        let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
         return Err(error).context("writing held skill file");
     }
-    match crate::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), &destination) {
+    match cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), &destination) {
         Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFLNK => {
-            let _ = crate::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+            let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
             bail!("refusing to replace symlinked skill metadata")
         }
         Ok(stat) if stat.st_mode & libc::S_IFMT != libc::S_IFREG => {
-            let _ = crate::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+            let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
             bail!("refusing to replace non-file skill metadata")
         }
-        Ok(_) => crate::private_fs::held_fd::renameat(
+        Ok(_) => cockpit_host::private_fs::held_fd::renameat(
             parent.as_raw_fd(),
             &temporary,
             parent.as_raw_fd(),
@@ -1483,21 +1483,21 @@ fn atomic_write_at(parent: &std::fs::File, name: &str, bytes: &[u8]) -> Result<(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // `linkat` publishes without replacement. A collision after the
             // absence probe fails closed rather than replacing another entry.
-            if let Err(error) = crate::private_fs::held_fd::linkat(
+            if let Err(error) = cockpit_host::private_fs::held_fd::linkat(
                 parent.as_raw_fd(),
                 &temporary,
                 parent.as_raw_fd(),
                 &destination,
                 0,
             ) {
-                let _ = crate::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+                let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
                 return Err(error).context("publishing held skill file without replacement");
             }
-            crate::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0)
+            cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0)
                 .context("removing published held skill temporary")?;
         }
         Err(error) => {
-            let _ = crate::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+            let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
             return Err(error).context("checking held skill metadata destination");
         }
     }
@@ -1553,7 +1553,7 @@ fn remove_tree_nofollow(directory: &std::fs::File) -> Result<()> {
                 return Err(error);
             }
         };
-        let stat = match crate::private_fs::held_fd::fstatat_nofollow(directory.as_raw_fd(), &name_c) {
+        let stat = match cockpit_host::private_fs::held_fd::fstatat_nofollow(directory.as_raw_fd(), &name_c) {
             Ok(stat) => stat,
             Err(error) => {
                 // SAFETY: stream still has one owner.
@@ -1567,7 +1567,7 @@ fn remove_tree_nofollow(directory: &std::fs::File) -> Result<()> {
                 .context("opening held skill child without following links")
             {
                 Ok(child) => remove_tree_nofollow(&child).and_then(|_| {
-                    crate::private_fs::held_fd::unlinkat(
+                    cockpit_host::private_fs::held_fd::unlinkat(
                         directory.as_raw_fd(),
                         &name_c,
                         libc::AT_REMOVEDIR,
@@ -1581,7 +1581,7 @@ fn remove_tree_nofollow(directory: &std::fs::File) -> Result<()> {
                 "refusing to traverse symlink while deleting skill package"
             ))
         } else {
-            crate::private_fs::held_fd::unlinkat(directory.as_raw_fd(), &name_c, 0)
+            cockpit_host::private_fs::held_fd::unlinkat(directory.as_raw_fd(), &name_c, 0)
                 .map_err(Into::into)
         };
         if let Err(error) = result {

@@ -3892,7 +3892,7 @@ mod tests {
         let operation_kind_for_insert = operation_kind.clone();
         let canonical_input_for_insert = canonical_input_json.clone();
         let input_digest_for_insert = input_digest.clone();
-        let selected_response_json = r#"{"data":{"selected_id":"approve"},"kind":"single"}".to_owned();
+        let selected_response_json = r#"{"data":{"selected_id":"approve"},"kind":"single"}"#.to_owned();
         let selected_candidate_json = String::from_utf8(
             crate::agent_tree::canonical_json_bytes(&serde_json::json!({
                 "selection": "approve",

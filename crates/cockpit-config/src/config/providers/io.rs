@@ -452,11 +452,11 @@ impl RetainedProviderModelFavoriteTarget {
         .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?
         .context("captured provider file is missing")
         .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
-        anyhow::ensure!(
-            sha256_bytes(&bytes) == self.source.provider_digest,
-            "captured provider file changed after attached snapshot"
-        )
-        .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
+        if sha256_bytes(&bytes) != self.source.provider_digest {
+            return Err(RetainedProviderModelFavoriteWriteError::Rejected(
+                anyhow::anyhow!("captured provider file changed after attached snapshot"),
+            ));
+        }
         let mut raw: Value = if bytes.iter().all(u8::is_ascii_whitespace) {
             Value::Object(Map::new())
         } else {

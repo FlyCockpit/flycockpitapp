@@ -216,7 +216,7 @@ pub struct AuthorizedWorkspaceRoot {
     /// An owned directory capability captured at attach.  All workspace-shared
     /// definition reads must stay beneath this handle; `canonical_path` is
     /// only a canonical identity spelling and is never read as authority.
-    held_directory: Arc<crate::private_fs::held_directory::HeldWorkspaceDirectoryAuthority>,
+    held_directory: Arc<cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority>,
 }
 
 impl Clone for AuthorizedWorkspaceRoot {
@@ -251,7 +251,7 @@ impl AuthorizedWorkspaceRoot {
         let canonical_path =
             std::fs::canonicalize(path).context("canonicalizing authorized workspace")?;
         let held_directory = Arc::new(
-            crate::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+            cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
                 &canonical_path,
             )?,
         );
@@ -307,7 +307,7 @@ impl AuthorizedWorkspaceRoot {
     #[cfg(windows)]
     fn acquire_windows_execution_lease(
         &self,
-    ) -> Result<crate::private_fs::held_directory::WindowsWorkspaceExecutionLease> {
+    ) -> Result<cockpit_host::private_fs::held_directory::WindowsWorkspaceExecutionLease> {
         self.held_directory
             .acquire_windows_execution_lease(&self.canonical_path)
     }
@@ -459,7 +459,7 @@ impl RetainedHookExecutionBundleRoot {
         let state_root = cockpit_config::config::resolve::cockpit_state_dir()
             .map_err(|error| format!("locating daemon hook state directory failed: {error:#}"))?
             .join("hook-execution");
-        crate::private_fs::ensure_private_dir(&state_root).map_err(|error| {
+        cockpit_host::private_fs::ensure_private_dir(&state_root).map_err(|error| {
             format!("securing daemon hook state directory failed: {error}")
         })?;
         // `pre_exec` changes the child cwd before the absolute bundle program
@@ -609,7 +609,7 @@ impl RetainedHookExecutionBundleRoot {
         let state_root = cockpit_config::config::resolve::cockpit_state_dir()
             .map_err(|error| format!("locating daemon hook state directory failed: {error:#}"))?
             .join("hook-execution");
-        crate::private_fs::ensure_private_dir(&state_root).map_err(|error| {
+        cockpit_host::private_fs::ensure_private_dir(&state_root).map_err(|error| {
             format!("securing daemon hook state directory failed: {error}")
         })?;
         let state_root = std::fs::canonicalize(&state_root)
@@ -622,7 +622,7 @@ impl RetainedHookExecutionBundleRoot {
         // `tempfile` does not itself promise the strict daemon DACL contract
         // on Windows. Verify/repair the directory before the executable bundle
         // or its liveness lease is created beneath it.
-        crate::private_fs::ensure_private_dir(directory.path()).map_err(|error| {
+        cockpit_host::private_fs::ensure_private_dir(directory.path()).map_err(|error| {
             format!("securing private Windows hook execution root failed: {error}")
         })?;
         let path = directory.path().to_path_buf();
@@ -645,7 +645,7 @@ impl RetainedHookExecutionBundleRoot {
                     .remove(&path);
                 format!("creating Windows hook execution root lease failed: {error}")
             })?;
-        crate::private_fs::repair_private_file(&lease_path, "hook execution root lease")
+        cockpit_host::private_fs::repair_private_file(&lease_path, "hook execution root lease")
             .map_err(|error| {
                 active_hook_execution_roots()
                     .lock()
@@ -920,7 +920,7 @@ impl RetainedHookExecutionAuthority {
             .prefix("bundle-")
             .tempdir_in(self.bundle_root.path())
             .map_err(|error| format!("creating private hook execution bundle failed: {error}"))?;
-        crate::private_fs::ensure_private_dir(directory.path()).map_err(|error| {
+        cockpit_host::private_fs::ensure_private_dir(directory.path()).map_err(|error| {
             format!("securing private Windows hook execution bundle failed: {error}")
         })?;
         let leaf = relative_components
@@ -942,7 +942,7 @@ impl RetainedHookExecutionAuthority {
                     format!("writing private Windows hook executable snapshot failed: {error}")
                 })?;
         }
-        crate::private_fs::repair_private_file(&executable, "hook execution bundle")
+        cockpit_host::private_fs::repair_private_file(&executable, "hook execution bundle")
             .map_err(|error| format!("securing private Windows hook executable snapshot failed: {error}"))?;
         *total_bytes = new_total;
         worker_budget.total_bytes += source.bytes.len();
@@ -8825,7 +8825,7 @@ mod tests {
         let state_root = cockpit_config::config::resolve::cockpit_state_dir()
             .expect("state directory")
             .join("hook-execution");
-        crate::private_fs::ensure_private_dir(&state_root).expect("secure state root");
+        cockpit_host::private_fs::ensure_private_dir(&state_root).expect("secure state root");
         let orphan = tempfile::Builder::new()
             .prefix(RetainedHookExecutionBundleRoot::PREFIX)
             .tempdir_in(&state_root)

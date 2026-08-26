@@ -109,7 +109,7 @@ pub fn workspace_config_layer_snapshot_chain_with_exclusive(
     WorkspaceConfigLayerSnapshotChain {
         layers,
         exclusive,
-        digest: format!("{:x}", hasher.finalize()),
+        digest: hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
     }
 }
 

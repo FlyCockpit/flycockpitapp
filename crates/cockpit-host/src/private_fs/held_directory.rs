@@ -149,7 +149,7 @@ pub struct HeldDirectoryAuthority {
 /// refuses symlink/reparse traversal, so a later pathname replacement cannot
 /// change what an already-attached session reads.
 #[derive(Debug)]
-pub(crate) struct HeldWorkspaceDirectoryAuthority {
+pub struct HeldWorkspaceDirectoryAuthority {
     imp: imp::HeldDirectory,
     identity: String,
 }
@@ -218,14 +218,14 @@ impl cockpit_config::config::extended::hooks::RetainedWindowsHookWorkingDirector
 /// Exact bytes and executable eligibility read through a held workspace
 /// directory. This is intentionally not serializable: it is only the bridge
 /// from a no-follow source lookup to a daemon-private hook execution snapshot.
-pub(crate) struct HeldWorkspaceExecutableFile {
-    pub(crate) bytes: Vec<u8>,
+pub struct HeldWorkspaceExecutableFile {
+    pub bytes: Vec<u8>,
     #[cfg(unix)]
-    pub(crate) executable: bool,
+    pub executable: bool,
 }
 
 impl HeldWorkspaceDirectoryAuthority {
-    pub(crate) fn open_existing(path: &Path) -> Result<Self> {
+    pub fn open_existing(path: &Path) -> Result<Self> {
         let imp = imp::HeldDirectory::open_existing_workspace(path)?;
         let identity = imp.workspace_identity()?;
         Ok(Self { imp, identity })
@@ -233,11 +233,11 @@ impl HeldWorkspaceDirectoryAuthority {
 
     /// Stable platform identity only: Unix device/inode or Windows volume
     /// serial/file index.  Mutable metadata is intentionally excluded.
-    pub(crate) fn identity(&self) -> &str {
+    pub fn identity(&self) -> &str {
         &self.identity
     }
 
-    pub(crate) fn read_regular_file_relative(&self, components: &[&str]) -> Result<Vec<u8>> {
+    pub fn read_regular_file_relative(&self, components: &[&str]) -> Result<Vec<u8>> {
         ensure!(
             !components.is_empty(),
             "held workspace read requires a relative file"
@@ -252,7 +252,7 @@ impl HeldWorkspaceDirectoryAuthority {
     /// refusing an oversized file before allocating its full contents.  The
     /// streaming cap also protects against a file that grows after metadata
     /// is read.
-    pub(crate) fn read_regular_file_relative_bounded(
+    pub fn read_regular_file_relative_bounded(
         &self,
         components: &[&str],
         max_bytes: usize,
@@ -270,7 +270,7 @@ impl HeldWorkspaceDirectoryAuthority {
     /// Read one executable descendant through the held root. On Unix this also
     /// preserves the source file's execute permission as an authority check so
     /// snapshotting never turns a non-executable workspace file into code.
-    pub(crate) fn read_regular_executable_file_relative_bounded(
+    pub fn read_regular_executable_file_relative_bounded(
         &self,
         components: &[&str],
         max_bytes: usize,
@@ -288,7 +288,7 @@ impl HeldWorkspaceDirectoryAuthority {
     /// Clone the retained root handle for a lower-layer, capability-neutral
     /// parser.  The caller receives no path authority: all descendant lookup
     /// remains relative to this exact directory object.
-    pub(crate) fn retained_directory_handle(&self) -> Result<File> {
+    pub fn retained_directory_handle(&self) -> Result<File> {
         self.imp.directory_handle_clone()
     }
 

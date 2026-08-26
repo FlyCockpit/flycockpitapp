@@ -918,7 +918,7 @@ fn ambient_recovery_never_converges_or_delivers_a_retained_default_journal() {
         mutate_effective_default_retained(
             &target,
             Some(&requested),
-            Some(requested),
+            Some(requested.clone()),
             TransactionCorrelation::RetainedDefaultUpdate {
                 default_update_id: update_id,
                 session_id: Uuid::new_v4(),
@@ -940,7 +940,7 @@ fn ambient_recovery_never_converges_or_delivers_a_retained_default_journal() {
     };
     let ambient = recover_effective_default_journal(
         &config_path,
-        JournalRecovery::with_sink(&mut sink),
+        JournalRecovery::read_only().with_sink(&mut sink),
     )
     .expect("ambient recovery declines retained work rather than failing startup");
     assert!(ambient.is_empty());
@@ -1398,7 +1398,7 @@ fn retained_receipt_marker_makes_post_receipt_recovery_cleanup_only() {
     let mut pending = mutate_effective_default_retained(
         &target,
         Some(&target_selection),
-        Some(target_selection),
+        Some(target_selection.clone()),
         TransactionCorrelation::RetainedDefaultUpdate {
             default_update_id,
             session_id,
@@ -1450,7 +1450,7 @@ fn retained_receipt_marker_missing_or_mismatched_proof_fails_closed() {
     let mut pending = mutate_effective_default_retained(
         &target,
         Some(&requested),
-        Some(requested),
+        Some(requested.clone()),
         TransactionCorrelation::RetainedDefaultUpdate {
             default_update_id,
             session_id,
@@ -1525,8 +1525,10 @@ fn retained_corrupt_authority_seal_fails_closed_without_rewriting_journal() {
     let journal_path = journal_path_for_config(&config_path);
     let before = std::fs::read(&journal_path).unwrap();
 
-    let error = recover_retained_effective_default_journal(&target)
-        .expect_err("a corrupt authority seal must not be interpreted as unbound");
+    let error = match recover_retained_effective_default_journal(&target) {
+        Err(error) => error,
+        Ok(_) => panic!("a corrupt authority seal must not be interpreted as unbound"),
+    };
     assert!(
         format!("{error:#}").contains("authority revision"),
         "{error:#}"
@@ -1588,8 +1590,10 @@ fn retained_terminal_phases_require_a_sealed_authority_and_stay_pending_without_
     record.phase = JournalPhase::ReceiptEmitted;
     target.write_journal(&record).unwrap();
     let before_recovery = std::fs::read(&journal_path).unwrap();
-    let error = recover_retained_effective_default_journal(&target)
-        .expect_err("receipt-emitted cleanup cannot proceed without the seal");
+    let error = match recover_retained_effective_default_journal(&target) {
+        Err(error) => error,
+        Ok(_) => panic!("receipt-emitted cleanup cannot proceed without the seal"),
+    };
     assert!(
         format!("{error:#}").contains("no sealed authority"),
         "{error:#}"
@@ -2666,7 +2670,7 @@ fn a_plain_reader_never_converges_a_correlated_journal_and_the_daemon_pass_deliv
         ActiveModelWriteMode::Replace,
         None,
         None,
-        Some(correlation),
+        Some(correlation.clone()),
     );
     set_crash_inject(None);
     assert!(journal_path_for_config(&config_path).exists());
@@ -3117,7 +3121,7 @@ fn a_second_mutation_never_swallows_a_pending_correlated_transaction() {
         ActiveModelWriteMode::Replace,
         None,
         None,
-        Some(waiting),
+        Some(waiting.clone()),
     );
     set_crash_inject(None);
     let journal_before = std::fs::read_to_string(journal_path_for_config(&config_path)).unwrap();

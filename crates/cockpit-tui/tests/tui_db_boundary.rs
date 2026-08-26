@@ -1803,3 +1803,66 @@ fn pasted_images_use_opaque_daemon_retained_ingress() {
     assert!(database.contains("record.first_referenced_at_unix_ms.is_some()"));
     assert!(database.contains("media_attachment_component_leases"));
 }
+
+#[test]
+fn daemon_lifecycle_and_reconnect_authority_is_injected() {
+    const FORBIDDEN: &[&str] = &[
+        "DaemonClient::connect(",
+        "probe_or_spawn",
+        "spawn_detached",
+        "ensure_persistent_daemon",
+        "EphemeralDaemonGuard",
+        "OwnedDaemonGuard",
+        "cockpit_core::daemon::discover",
+        "cockpit_core::daemon::probe",
+    ];
+
+    fn visit(path: &Path, findings: &mut Vec<String>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, findings);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("rs")
+                || path.components().any(|part| part.as_os_str() == "tests")
+                || is_explicit_cfg_test_module(&path)
+            {
+                continue;
+            }
+            let source = production_source(&fs::read_to_string(&path).unwrap());
+            for forbidden in FORBIDDEN {
+                if source.contains(forbidden) {
+                    findings.push(format!(
+                        "{} retains daemon lifecycle/reconnect authority `{forbidden}`",
+                        path.strip_prefix(repo_root()).unwrap().display()
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    visit(&repo_root().join("crates/cockpit-tui/src"), &mut findings);
+    assert!(
+        findings.is_empty(),
+        "TUI daemon lifecycle/reconnect authority must be injected:\n{}",
+        findings.join("\n")
+    );
+
+    let app = read("apps/cli/src/commands/tui.rs");
+    assert!(app.contains("LifecycleClient::channel"));
+    assert!(app.contains("serve_lifecycle_requests"));
+    let tui = tui_sources();
+    for required in [
+        "LifecycleIntent::AlwaysEphemeral",
+        "LifecycleIntent::EnsurePersistent",
+        "connect_endpoint",
+        "ClientEndpoint",
+    ] {
+        assert!(
+            tui.contains(required),
+            "TUI injection is missing {required}"
+        );
+    }
+}

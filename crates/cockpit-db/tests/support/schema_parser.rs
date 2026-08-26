@@ -4,8 +4,21 @@ use std::collections::{BTreeMap, BTreeSet};
 enum Token {
     Word(String),
     QuotedName(String),
-    Literal,
+    Literal(String),
     Mark(char),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedColumn {
+    pub column: String,
+    pub collation: Option<String>,
+    pub direction: Direction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,24 +41,41 @@ pub struct Table {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Key {
-    pub columns: Vec<String>,
-    pub collations: Vec<Option<String>>,
+    pub terms: Vec<IndexedColumn>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Index {
     pub name: String,
     pub table: String,
-    pub columns: Vec<String>,
+    pub terms: Vec<IndexedColumn>,
     pub unique: bool,
-    pub partial: bool,
-    pub collations: Vec<Option<String>>,
+    pub predicate: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectKind {
+    Table,
+    Index,
+    View,
+    VirtualTable,
+    Trigger,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Object {
+    pub kind: ObjectKind,
+    pub name: String,
+    pub owner: Option<String>,
+    pub columns: Vec<String>,
+    pub definition: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Schema {
     pub tables: BTreeMap<String, Table>,
     pub indexes: Vec<Index>,
+    pub objects: Vec<Object>,
 }
 
 fn lex(sql: &str) -> Vec<Token> {
@@ -70,19 +100,24 @@ fn lex(sql: &str) -> Vec<Token> {
                 at += 2;
             }
             b'\'' => {
+                let mut value = Vec::new();
                 at += 1;
                 loop {
                     assert!(at < bytes.len(), "unterminated SQL string literal");
                     if bytes[at] != b'\'' {
+                        value.push(bytes[at]);
                         at += 1;
                     } else if bytes.get(at + 1) == Some(&b'\'') {
+                        value.push(b'\'');
                         at += 2;
                     } else {
                         at += 1;
                         break;
                     }
                 }
-                tokens.push(Token::Literal);
+                tokens.push(Token::Literal(
+                    String::from_utf8(value).expect("SQL string literal must be UTF-8"),
+                ));
             }
             quote @ (b'"' | b'`' | b'[') => {
                 let close = if quote == b'[' { b']' } else { quote };
@@ -202,6 +237,7 @@ fn key_in_parens(tokens: &[Token], open: usize) -> Key {
         .map(|part| {
             let column = name(part.first()).expect("key term must start with an identifier");
             let mut collation = None;
+            let mut direction = Direction::Asc;
             let mut cursor = 1;
             while cursor < part.len() {
                 if is(part.get(cursor), "collate") {
@@ -209,19 +245,37 @@ fn key_in_parens(tokens: &[Token], open: usize) -> Key {
                     collation =
                         Some(name(part.get(cursor + 1)).expect("COLLATE requires an identifier"));
                     cursor += 2;
-                } else if is(part.get(cursor), "asc") || is(part.get(cursor), "desc") {
+                } else if is(part.get(cursor), "asc") {
+                    direction = Direction::Asc;
+                    cursor += 1;
+                } else if is(part.get(cursor), "desc") {
+                    direction = Direction::Desc;
                     cursor += 1;
                 } else {
                     panic!("key/index expressions are unsupported: {part:?}");
                 }
             }
-            (column, collation)
+            IndexedColumn {
+                column,
+                collation,
+                direction,
+            }
         })
         .collect::<Vec<_>>();
-    Key {
-        columns: terms.iter().map(|(column, _)| column.clone()).collect(),
-        collations: terms.into_iter().map(|(_, collation)| collation).collect(),
+    Key { terms }
+}
+
+fn token_sql(token: &Token) -> String {
+    match token {
+        Token::Word(value) => value.clone(),
+        Token::QuotedName(value) => format!("\"{}\"", value.replace('"', "\"\"")),
+        Token::Literal(value) => format!("'{}'", value.replace('\'', "''")),
+        Token::Mark(mark) => mark.to_string(),
     }
+}
+
+fn normalized_tokens(tokens: &[Token]) -> String {
+    tokens.iter().map(token_sql).collect::<Vec<_>>().join(" ")
 }
 
 fn reject_unsupported_schema_forms(tokens: &[Token]) {
@@ -233,7 +287,7 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
                 || is(Some(token), "drop")
                     && matches!(
                         name(tokens.get(index + 1)).as_deref(),
-                        Some("table" | "index")
+                        Some("table" | "index" | "view" | "trigger")
                     )
                 || is(Some(token), "create")
                     && matches!(
@@ -278,6 +332,128 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
     }
 }
 
+fn statement_end(tokens: &[Token], start: usize, kind: &str) -> usize {
+    if kind == "trigger" {
+        let begin = tokens[start..]
+            .iter()
+            .position(|token| is(Some(token), "begin"))
+            .map(|offset| start + offset)
+            .expect("CREATE TRIGGER requires BEGIN");
+        let mut case_depth = 0_u32;
+        for index in begin + 1..tokens.len().saturating_sub(1) {
+            if is(tokens.get(index), "case") {
+                case_depth = case_depth.checked_add(1).expect("CASE nesting overflow");
+            } else if is(tokens.get(index), "end") {
+                if case_depth > 0 {
+                    case_depth -= 1;
+                } else if tokens.get(index + 1) == Some(&Token::Mark(';')) {
+                    return index + 1;
+                }
+            }
+        }
+        panic!("CREATE TRIGGER requires terminal END;");
+    }
+    tokens[start..]
+        .iter()
+        .position(|token| *token == Token::Mark(';'))
+        .map(|offset| start + offset)
+        .expect("schema statement requires a terminating semicolon")
+}
+
+fn assert_unique_object(schema: &Schema, name: &str) {
+    assert!(
+        schema.objects.iter().all(|object| object.name != name),
+        "duplicate ordered schema object: {name}"
+    );
+}
+
+fn object_columns(schema: &Schema, name: &str) -> Option<BTreeSet<String>> {
+    schema
+        .objects
+        .iter()
+        .find(|object| object.name == name)
+        .map(|object| object.columns.iter().cloned().collect())
+}
+
+fn view_columns(schema: &Schema, tokens: &[Token]) -> (Vec<String>, String) {
+    let select = top_level_position(tokens, "select").expect("CREATE VIEW requires SELECT");
+    let from = top_level_position(&tokens[select + 1..], "from")
+        .map(|offset| select + 1 + offset)
+        .expect("CREATE VIEW requires FROM");
+    let owner = name(tokens.get(from + 1)).expect("CREATE VIEW source relation");
+    assert_eq!(
+        from + 2,
+        tokens.len(),
+        "only the reviewed single-source CREATE VIEW grammar is supported"
+    );
+    let source_columns = object_columns(schema, &owner)
+        .unwrap_or_else(|| panic!("view source relation {owner} is not available yet"));
+    let columns = clauses(&tokens[select + 1..from])
+        .into_iter()
+        .flat_map(|term| {
+            if word(term.first()).as_deref() == Some("*") {
+                return source_columns.iter().cloned().collect::<Vec<_>>();
+            }
+            if let Some(alias) = top_level_position(term, "as") {
+                vec![name(term.get(alias + 1)).expect("view AS alias")]
+            } else {
+                let names = term
+                    .iter()
+                    .filter_map(|token| name(Some(token)))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names.len(),
+                    1,
+                    "view output needs an explicit AS alias: {term:?}"
+                );
+                vec![names[0].clone()]
+            }
+        })
+        .collect();
+    (columns, owner)
+}
+
+fn virtual_table_columns(tokens: &[Token]) -> Vec<String> {
+    let using = top_level_position(tokens, "using").expect("virtual table requires USING");
+    assert_eq!(
+        name(tokens.get(using + 1)).as_deref(),
+        Some("fts5"),
+        "only the reviewed FTS5 virtual-table grammar is supported"
+    );
+    let open = using + 2;
+    assert_eq!(tokens.get(open), Some(&Token::Mark('(')));
+    let close = closing(tokens, open);
+    assert_eq!(
+        close + 1,
+        tokens.len(),
+        "unsupported trailing virtual-table grammar"
+    );
+    let parts = clauses(&tokens[open + 1..close]);
+    let mut columns = Vec::new();
+    let mut options = Vec::new();
+    for part in parts {
+        if part.len() == 1 {
+            columns.push(name(part.first()).expect("FTS5 column name"));
+        } else {
+            assert!(
+                word(part.first()).is_some_and(|option| option.ends_with('=')),
+                "FTS5 option must be an explicit name=value term: {part:?}"
+            );
+            options.push(normalized_tokens(part));
+        }
+    }
+    assert!(
+        !columns.is_empty(),
+        "FTS5 requires at least one indexed column"
+    );
+    assert_eq!(
+        options.len(),
+        options.iter().collect::<BTreeSet<_>>().len(),
+        "duplicate FTS5 option"
+    );
+    columns
+}
+
 fn top_level_position(tokens: &[Token], keyword: &str) -> Option<usize> {
     let mut depth = 0_i32;
     for (index, token) in tokens.iter().enumerate() {
@@ -304,6 +480,26 @@ fn top_level_pair(tokens: &[Token], first: &str, second: &str) -> bool {
         }
     }
     false
+}
+
+fn validate_checks(tokens: &[Token]) {
+    let mut depth = 0_i32;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Mark('(') => depth += 1,
+            Token::Mark(')') => depth -= 1,
+            _ if depth == 0 && is(Some(token), "check") => {
+                assert_eq!(
+                    tokens.get(index + 1),
+                    Some(&Token::Mark('(')),
+                    "CHECK requires a parenthesized expression"
+                );
+                let close = closing(tokens, index + 1);
+                assert!(close > index + 1, "CHECK expression cannot be empty");
+            }
+            _ => {}
+        }
+    }
 }
 
 fn action(tokens: &[Token], kind: &str) -> Option<String> {
@@ -333,6 +529,24 @@ fn action(tokens: &[Token], kind: &str) -> Option<String> {
 
 fn foreign_key(tokens: &[Token], inline: Option<String>) -> Option<ForeignKey> {
     let reference = top_level_position(tokens, "references")?;
+    let mut depth = 0_i32;
+    let mut reference_count = 0_usize;
+    for token in tokens {
+        match token {
+            Token::Mark('(') => {
+                depth += 1;
+            }
+            Token::Mark(')') => {
+                depth -= 1;
+            }
+            _ if depth == 0 && is(Some(token), "references") => reference_count += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        reference_count, 1,
+        "one FK clause must declare one REFERENCES"
+    );
     let child_columns = match inline {
         Some(column) => vec![column],
         None => {
@@ -374,6 +588,7 @@ fn apply_script(schema: &mut Schema, sql: &str) {
         let unique = is(tokens.get(cursor), "unique");
         cursor += usize::from(unique);
         if is(tokens.get(cursor), "table") {
+            let end = statement_end(&tokens, at, "table");
             cursor += 1;
             if is(tokens.get(cursor), "if") {
                 assert!(
@@ -390,6 +605,7 @@ fn apply_script(schema: &mut Schema, sql: &str) {
                 "CREATE TABLE must declare a structural body"
             );
             let close = closing(&tokens, open);
+            assert_eq!(close + 1, end, "unsupported trailing CREATE TABLE grammar");
             let mut table = Table::default();
             for original in clauses(&tokens[open + 1..close]) {
                 let clause = if is(original.first(), "constraint") {
@@ -409,6 +625,7 @@ fn apply_script(schema: &mut Schema, sql: &str) {
                 } else {
                     original
                 };
+                validate_checks(clause);
                 if is(clause.first(), "foreign") {
                     table.foreign_keys.push(foreign_key(clause, None).unwrap());
                 } else if is(clause.first(), "primary") || is(clause.first(), "unique") {
@@ -428,6 +645,11 @@ fn apply_script(schema: &mut Schema, sql: &str) {
                         Some(&Token::Mark('(')),
                         "table CHECK requires a parenthesized expression"
                     );
+                    assert_eq!(
+                        closing(clause, 1),
+                        clause.len() - 1,
+                        "table CHECK has trailing unsupported grammar"
+                    );
                 } else if let Some(column) = name(clause.first()) {
                     assert!(
                         table.columns.insert(column.clone()),
@@ -440,13 +662,19 @@ fn apply_script(schema: &mut Schema, sql: &str) {
                     }
                     if top_level_pair(clause, "primary", "key") {
                         table.primary_keys.push(Key {
-                            columns: vec![column.clone()],
-                            collations: vec![None],
+                            terms: vec![IndexedColumn {
+                                column: column.clone(),
+                                collation: None,
+                                direction: Direction::Asc,
+                            }],
                         });
                     } else if top_level_position(clause, "unique").is_some() {
                         table.unique_keys.push(Key {
-                            columns: vec![column.clone()],
-                            collations: vec![None],
+                            terms: vec![IndexedColumn {
+                                column: column.clone(),
+                                collation: None,
+                                direction: Direction::Asc,
+                            }],
                         });
                     }
                     if let Some(reference) = foreign_key(clause, Some(column)) {
@@ -456,12 +684,22 @@ fn apply_script(schema: &mut Schema, sql: &str) {
                     panic!("unsupported CREATE TABLE clause: {clause:?}");
                 }
             }
+            assert_unique_object(schema, &table_name);
+            let columns = table.columns.iter().cloned().collect::<Vec<_>>();
             assert!(
-                schema.tables.insert(table_name, table).is_none(),
+                schema.tables.insert(table_name.clone(), table).is_none(),
                 "duplicate table in ordered effective schema"
             );
-            at = close + 1;
+            schema.objects.push(Object {
+                kind: ObjectKind::Table,
+                name: table_name,
+                owner: None,
+                columns,
+                definition: normalized_tokens(&tokens[at..end]),
+            });
+            at = end + 1;
         } else if is(tokens.get(cursor), "index") {
+            let end = statement_end(&tokens, at, "index");
             cursor += 1;
             if is(tokens.get(cursor), "if") {
                 assert!(
@@ -481,28 +719,100 @@ fn apply_script(schema: &mut Schema, sql: &str) {
                 "CREATE INDEX requires structural terms"
             );
             let close = closing(&tokens, open);
-            let end = tokens[close + 1..]
-                .iter()
-                .position(|token| *token == Token::Mark(';'))
-                .map_or(tokens.len(), |offset| close + 1 + offset);
             let key = key_in_parens(&tokens, open);
-            assert!(
-                schema.indexes.iter().all(|index| index.name != index_name),
-                "duplicate index in ordered effective schema: {index_name}"
-            );
+            let owner = schema
+                .tables
+                .get(&table)
+                .unwrap_or_else(|| panic!("index {index_name} precedes or lacks table {table}"));
+            for term in &key.terms {
+                assert!(
+                    owner.columns.contains(&term.column),
+                    "index {index_name} names absent column {table}.{}",
+                    term.column
+                );
+            }
+            let predicate = top_level_position(&tokens[close + 1..end], "where")
+                .map(|offset| close + 1 + offset)
+                .map(|where_at| {
+                    assert_eq!(where_at, close + 1, "unexpected tokens before index WHERE");
+                    assert!(where_at + 1 < end, "partial index predicate is empty");
+                    normalized_tokens(&tokens[where_at + 1..end])
+                });
+            if predicate.is_none() {
+                assert_eq!(close + 1, end, "unexpected tokens after index terms");
+            }
+            assert_unique_object(schema, &index_name);
             schema.indexes.push(Index {
-                name: index_name,
-                table,
-                columns: key.columns,
+                name: index_name.clone(),
+                table: table.clone(),
+                terms: key.terms.clone(),
                 unique,
-                partial: tokens[close + 1..end]
-                    .iter()
-                    .any(|token| is(Some(token), "where")),
-                collations: key.collations,
+                predicate,
+            });
+            schema.objects.push(Object {
+                kind: ObjectKind::Index,
+                name: index_name,
+                owner: Some(table),
+                columns: key.terms.into_iter().map(|term| term.column).collect(),
+                definition: normalized_tokens(&tokens[at..end]),
+            });
+            at = end + 1;
+        } else if is(tokens.get(cursor), "view") {
+            let end = statement_end(&tokens, at, "view");
+            let view_name = name(tokens.get(cursor + 1)).expect("CREATE VIEW name");
+            assert_unique_object(schema, &view_name);
+            let (columns, owner) = view_columns(schema, &tokens[at..end]);
+            assert!(
+                object_columns(schema, &owner).is_some(),
+                "view {view_name} precedes or lacks source relation {owner}"
+            );
+            schema.objects.push(Object {
+                kind: ObjectKind::View,
+                name: view_name,
+                owner: Some(owner),
+                columns,
+                definition: normalized_tokens(&tokens[at..end]),
+            });
+            at = end + 1;
+        } else if is(tokens.get(cursor), "virtual") {
+            let end = statement_end(&tokens, at, "virtual");
+            assert!(is(tokens.get(cursor + 1), "table"));
+            let table_name = name(tokens.get(cursor + 2)).expect("CREATE VIRTUAL TABLE name");
+            assert_unique_object(schema, &table_name);
+            let columns = virtual_table_columns(&tokens[at..end]);
+            schema.objects.push(Object {
+                kind: ObjectKind::VirtualTable,
+                name: table_name,
+                owner: None,
+                columns,
+                definition: normalized_tokens(&tokens[at..end]),
+            });
+            at = end + 1;
+        } else if is(tokens.get(cursor), "trigger") {
+            let end = statement_end(&tokens, at, "trigger");
+            let trigger_name = name(tokens.get(cursor + 1)).expect("CREATE TRIGGER name");
+            let begin = top_level_position(&tokens[at..end], "begin")
+                .map(|offset| at + offset)
+                .expect("CREATE TRIGGER BEGIN");
+            let on = (cursor + 2..begin)
+                .find(|index| is(tokens.get(*index), "on"))
+                .expect("CREATE TRIGGER owner");
+            let owner = name(tokens.get(on + 1)).expect("CREATE TRIGGER owner name");
+            assert!(
+                object_columns(schema, &owner).is_some(),
+                "trigger {trigger_name} precedes or lacks owner {owner}"
+            );
+            assert_unique_object(schema, &trigger_name);
+            schema.objects.push(Object {
+                kind: ObjectKind::Trigger,
+                name: trigger_name,
+                owner: Some(owner),
+                columns: Vec::new(),
+                definition: normalized_tokens(&tokens[at..end]),
             });
             at = end + 1;
         } else {
-            at += 1;
+            panic!("unconsumed CREATE statement near token {at}");
         }
     }
 }
@@ -514,15 +824,12 @@ fn validate_schema(schema: &Schema) {
             "{table_name} declares multiple primary keys"
         );
         for key in table.primary_keys.iter().chain(&table.unique_keys) {
-            assert!(
-                !key.columns.is_empty(),
-                "{table_name} declares an empty key"
-            );
-            assert_eq!(key.columns.len(), key.collations.len());
-            for column in &key.columns {
+            assert!(!key.terms.is_empty(), "{table_name} declares an empty key");
+            for term in &key.terms {
                 assert!(
-                    table.columns.contains(column),
-                    "{table_name} key names absent column {column}"
+                    table.columns.contains(&term.column),
+                    "{table_name} key names absent column {}",
+                    term.column
                 );
             }
         }
@@ -569,13 +876,13 @@ fn validate_schema(schema: &Schema) {
             .tables
             .get(&index.table)
             .unwrap_or_else(|| panic!("index {} owns absent table {}", index.name, index.table));
-        assert_eq!(index.columns.len(), index.collations.len());
-        for column in &index.columns {
+        for term in &index.terms {
             assert!(
-                table.columns.contains(column),
-                "index {} names absent column {}.{column}",
+                table.columns.contains(&term.column),
+                "index {} names absent column {}.{}",
                 index.name,
-                index.table
+                index.table,
+                term.column
             );
         }
     }
@@ -601,22 +908,19 @@ pub fn exact_target_keys(schema: &Schema, table: &str) -> Vec<Vec<String>> {
         .iter()
         .chain(&owner.unique_keys)
         .filter(|key| {
-            key.columns
-                .iter()
-                .zip(&key.collations)
-                .all(|(column, collation)| {
-                    collation.as_deref().unwrap_or_else(|| {
-                        owner
-                            .collations
-                            .get(column)
-                            .map_or("binary", String::as_str)
-                    }) == owner
+            key.terms.iter().all(|term| {
+                term.collation.as_deref().unwrap_or_else(|| {
+                    owner
                         .collations
-                        .get(column)
+                        .get(&term.column)
                         .map_or("binary", String::as_str)
-                })
+                }) == owner
+                    .collations
+                    .get(&term.column)
+                    .map_or("binary", String::as_str)
+            })
         })
-        .map(|key| key.columns.clone())
+        .map(|key| key.terms.iter().map(|term| term.column.clone()).collect())
         .collect::<Vec<_>>();
     keys.extend(
         schema
@@ -625,43 +929,80 @@ pub fn exact_target_keys(schema: &Schema, table: &str) -> Vec<Vec<String>> {
             .filter(|index| {
                 index.table == table
                     && index.unique
-                    && !index.partial
-                    && index
-                        .columns
-                        .iter()
-                        .zip(&index.collations)
-                        .all(|(column, collation)| {
-                            collation.as_deref().unwrap_or_else(|| {
-                                schema.tables[table]
-                                    .collations
-                                    .get(column)
-                                    .map_or("binary", String::as_str)
-                            }) == schema.tables[table]
+                    && index.predicate.is_none()
+                    && index.terms.iter().all(|term| {
+                        term.collation.as_deref().unwrap_or_else(|| {
+                            schema.tables[table]
                                 .collations
-                                .get(column)
+                                .get(&term.column)
                                 .map_or("binary", String::as_str)
-                        })
+                        }) == schema.tables[table]
+                            .collations
+                            .get(&term.column)
+                            .map_or("binary", String::as_str)
+                    })
             })
-            .map(|index| index.columns.clone()),
+            .map(|index| index.terms.iter().map(|term| term.column.clone()).collect()),
     );
     keys
 }
 
-pub fn child_leading_keys(schema: &Schema, table: &str) -> Vec<Vec<String>> {
+pub fn child_leading_keys(
+    schema: &Schema,
+    table: &str,
+    target_table: &str,
+    child_columns: &[String],
+    target_columns: &[String],
+) -> Vec<Vec<String>> {
+    let child = &schema.tables[table];
+    let parent = &schema.tables[target_table];
+    let compatible = |terms: &[IndexedColumn]| {
+        terms.len() >= child_columns.len()
+            && terms
+                .iter()
+                .zip(child_columns.iter().zip(target_columns))
+                .all(|(term, (child_column, target_column))| {
+                    term.column == child_column.as_str()
+                        && term.collation.as_deref().unwrap_or_else(|| {
+                            child
+                                .collations
+                                .get(child_column)
+                                .map_or("binary", String::as_str)
+                        }) == parent
+                            .collations
+                            .get(target_column)
+                            .map_or("binary", String::as_str)
+                })
+    };
     let mut keys = schema.tables[table]
         .primary_keys
         .iter()
         .chain(&schema.tables[table].unique_keys)
-        .map(|key| key.columns.clone())
+        .filter(|key| compatible(&key.terms))
+        .map(|key| key.terms.iter().map(|term| term.column.clone()).collect())
         .collect::<Vec<_>>();
     keys.extend(
         schema
             .indexes
             .iter()
-            .filter(|index| index.table == table && !index.partial)
-            .map(|index| index.columns.clone()),
+            .filter(|index| {
+                index.table == table && index.predicate.is_none() && compatible(&index.terms)
+            })
+            .map(|index| index.terms.iter().map(|term| term.column.clone()).collect()),
     );
     keys
+}
+
+pub fn classified_objects(schema: &Schema) -> impl Iterator<Item = (&str, &[String])> {
+    schema
+        .objects
+        .iter()
+        .filter_map(|object| match object.kind {
+            ObjectKind::Table | ObjectKind::View | ObjectKind::VirtualTable => {
+                Some((object.name.as_str(), object.columns.as_slice()))
+            }
+            ObjectKind::Index | ObjectKind::Trigger => None,
+        })
 }
 
 #[cfg(test)]
@@ -686,6 +1027,8 @@ mod tests {
             CREATE UNIQUE INDEX partial_not_target ON child(child_id) WHERE right_id IS NOT NULL;
             CREATE VIEW child_view AS SELECT * FROM child;
             CREATE VIRTUAL TABLE child_search USING fts5(note);
+            CREATE TRIGGER child_guard BEFORE UPDATE ON child
+              BEGIN SELECT RAISE(ABORT, 'immutable'); END;
             /* REFERENCES also_ignored(id) */
         "#]);
         assert_eq!(schema.tables.len(), 2);
@@ -701,9 +1044,35 @@ mod tests {
             schema
                 .indexes
                 .iter()
-                .any(|index| index.unique && index.partial)
+                .any(|index| index.unique && index.predicate.is_some())
         );
+        let partial = schema
+            .indexes
+            .iter()
+            .find(|index| index.name == "partial_not_target")
+            .unwrap();
+        assert_eq!(partial.predicate.as_deref(), Some("right_id is not null"));
+        assert_eq!(partial.terms[0].direction, Direction::Asc);
         assert!(!exact_target_keys(&schema, "child").contains(&vec!["child_id".into()]));
+        assert_eq!(schema.objects.len(), 8);
+        assert_eq!(
+            object_columns(&schema, "child_search").unwrap(),
+            BTreeSet::from(["note".to_owned()])
+        );
+        assert_eq!(
+            object_columns(&schema, "child_view").unwrap(),
+            schema.tables["child"].columns.clone()
+        );
+        assert_eq!(
+            schema
+                .objects
+                .iter()
+                .find(|object| object.name == "child_guard")
+                .unwrap()
+                .owner
+                .as_deref(),
+            Some("child")
+        );
     }
 
     #[test]
@@ -729,6 +1098,40 @@ mod tests {
         let inherited = parse(&["CREATE TABLE parent(id TEXT COLLATE nocase); \
              CREATE UNIQUE INDEX parent_id_nocase ON parent(id);"]);
         assert_eq!(exact_target_keys(&inherited, "parent"), [vec!["id".into()]]);
+    }
+
+    #[test]
+    fn child_index_collation_must_match_parent_comparison() {
+        let binary = parse(
+            &["CREATE TABLE parent(id TEXT COLLATE nocase PRIMARY KEY); \
+             CREATE TABLE child(parent_id TEXT REFERENCES parent(id) ON DELETE RESTRICT ON UPDATE RESTRICT); \
+             CREATE INDEX child_parent_binary ON child(parent_id COLLATE binary);"],
+        );
+        assert!(
+            child_leading_keys(
+                &binary,
+                "child",
+                "parent",
+                &["parent_id".to_owned()],
+                &["id".to_owned()]
+            )
+            .is_empty()
+        );
+        let matching = parse(
+            &["CREATE TABLE parent(id TEXT COLLATE nocase PRIMARY KEY); \
+             CREATE TABLE child(parent_id TEXT REFERENCES parent(id) ON DELETE RESTRICT ON UPDATE RESTRICT); \
+             CREATE INDEX child_parent_nocase ON child(parent_id COLLATE nocase);"],
+        );
+        assert_eq!(
+            child_leading_keys(
+                &matching,
+                "child",
+                "parent",
+                &["parent_id".to_owned()],
+                &["id".to_owned()]
+            ),
+            [vec!["parent_id".to_owned()]]
+        );
     }
 
     #[test]
@@ -763,6 +1166,13 @@ mod tests {
              CREATE TABLE child(parent_id TEXT REFERENCES parent(id));",
             "CREATE TABLE child(id TEXT); CREATE INDEX child_missing ON child(missing_id);",
             "CREATE TABLE child(id TEXT); CREATE INDEX child_expression ON child(lower(id));",
+            "CREATE INDEX child_early ON child(id); CREATE TABLE child(id TEXT);",
+            "CREATE VIEW child_view AS SELECT id FROM child; CREATE TABLE child(id TEXT);",
+            "CREATE TRIGGER child_guard BEFORE UPDATE ON child BEGIN SELECT 1; END; \
+             CREATE TABLE child(id TEXT);",
+            "CREATE TABLE parent(id TEXT PRIMARY KEY); \
+             CREATE TABLE child(parent_id TEXT REFERENCES parent(id) ON DELETE RESTRICT ON UPDATE RESTRICT \
+             REFERENCES parent(id));",
         ] {
             assert!(
                 std::panic::catch_unwind(|| parse(&[sql])).is_err(),

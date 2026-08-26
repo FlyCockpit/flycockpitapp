@@ -13,10 +13,11 @@ const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
     "e32fef009c919d44dd8de06788cc473394959a8835de3d4f40dc4bd4a62ed1e2";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
-    "7bfa5210915fa6c642baba54f6281786164efa8159c243d207be3d187826c88f";
+    "53c7a4020a9bf5f12bd29897f489540f31565baccd6baa765cd55ee067fb7264";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {
+    NonRelationship,
     Primary,
     LocalIdentity,
     Foreign,
@@ -27,18 +28,33 @@ enum RelationshipClass {
 
 fn relationship_inventory()
 -> std::collections::BTreeMap<(String, String, String), RelationshipClass> {
-    let mut inventory = std::collections::BTreeMap::new();
-    for line in RELATIONSHIP_INVENTORY
+    assert_eq!(
+        RELATIONSHIP_INVENTORY.lines().next(),
+        Some("# profile\ttable\tcolumn\tclass"),
+        "relationship inventory header drifted"
+    );
+    let reviewed_rows = RELATIONSHIP_INVENTORY
         .lines()
         .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-    {
+        .collect::<Vec<_>>();
+    assert!(
+        reviewed_rows.windows(2).all(|rows| rows[0] < rows[1]),
+        "relationship inventory must be strictly sorted"
+    );
+    let mut inventory = std::collections::BTreeMap::new();
+    for line in reviewed_rows {
         let fields = line.split('\t').collect::<Vec<_>>();
         assert_eq!(
             fields.len(),
             4,
             "invalid relationship inventory row: {line}"
         );
+        assert!(
+            matches!(fields[0], "local" | "extended"),
+            "unknown schema profile in relationship inventory: {line}"
+        );
         let class = match fields[3] {
+            "non_relationship" => RelationshipClass::NonRelationship,
             "primary" => RelationshipClass::Primary,
             "local_identity" => RelationshipClass::LocalIdentity,
             "foreign" => RelationshipClass::Foreign,
@@ -63,35 +79,17 @@ fn relationship_inventory()
     inventory
 }
 
-fn structurally_owned_identifier_columns(
+fn classified_columns(
     schema: &schema_parser::Schema,
-    tables: impl Iterator<Item = String>,
+    objects: &std::collections::BTreeSet<String>,
 ) -> std::collections::BTreeSet<(String, String)> {
-    tables
-        .flat_map(|table_name| {
-            let table = &schema.tables[&table_name];
-            let mut columns = table
-                .primary_keys
-                .iter()
-                .chain(&table.unique_keys)
-                .flat_map(|key| key.columns.iter().cloned())
-                .collect::<std::collections::BTreeSet<_>>();
-            columns.extend(
-                schema
-                    .indexes
-                    .iter()
-                    .filter(|index| index.table == table_name && index.unique && !index.partial)
-                    .flat_map(|index| index.columns.iter().cloned()),
-            );
-            columns.extend(
-                table
-                    .foreign_keys
-                    .iter()
-                    .flat_map(|foreign_key| foreign_key.child_columns.iter().cloned()),
-            );
+    schema_parser::classified_objects(schema)
+        .filter(|(object, _)| objects.contains(*object))
+        .flat_map(|(object, columns)| {
             columns
-                .into_iter()
-                .map(move |column| (table_name.clone(), column))
+                .iter()
+                .cloned()
+                .map(move |column| (object.to_owned(), column))
         })
         .collect()
 }
@@ -226,8 +224,9 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
         1,
         "marker must occur exactly once: {marker}"
     );
+    let syntax = syn::parse_file(source).unwrap();
     let mut literals = Literals(Vec::new());
-    syn::visit::Visit::visit_file(&mut literals, &syn::parse_file(source).unwrap());
+    syn::visit::Visit::visit_file(&mut literals, &syntax);
     let bound = literals
         .0
         .into_iter()
@@ -239,7 +238,128 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
         1,
         "hot-query marker must immediately precede exactly one Rust SQL literal: {marker}"
     );
-    bound.into_iter().next().unwrap()
+    let bound = bound.into_iter().next().unwrap();
+
+    struct ContainsLiteral {
+        line: usize,
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ContainsLiteral {
+        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+            self.found |= literal.span().start().line == self.line;
+        }
+    }
+    fn contains_literal(expression: &syn::Expr, line: usize) -> bool {
+        let mut visitor = ContainsLiteral { line, found: false };
+        syn::visit::Visit::visit_expr(&mut visitor, expression);
+        visitor.found
+    }
+    fn block_contains_literal(block: &syn::Block, line: usize) -> bool {
+        let mut visitor = ContainsLiteral { line, found: false };
+        syn::visit::Visit::visit_block(&mut visitor, block);
+        visitor.found
+    }
+    fn path_identifier(expression: &syn::Expr) -> Option<String> {
+        let syn::Expr::Path(path) = expression else {
+            return None;
+        };
+        (path.path.segments.len() == 1).then(|| path.path.segments[0].ident.to_string())
+    }
+    struct SqlBinding {
+        line: usize,
+        connections: std::collections::BTreeSet<String>,
+        variables: std::collections::BTreeSet<String>,
+        consumed: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for SqlBinding {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if let Some(initializer) = &local.init
+                && contains_literal(&initializer.expr, self.line)
+                && let syn::Pat::Ident(binding) = &local.pat
+            {
+                self.variables.insert(binding.ident.to_string());
+            }
+            syn::visit::visit_local(self, local);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let method = call.method.to_string();
+            if matches!(
+                method.as_str(),
+                "prepare" | "prepare_cached" | "execute" | "query_row" | "query_row_and_then"
+            ) && path_identifier(&call.receiver)
+                .is_some_and(|identifier| self.connections.contains(&identifier))
+                && let Some(sql) = call.args.first()
+            {
+                self.consumed |= contains_literal(sql, self.line)
+                    || path_identifier(sql)
+                        .is_some_and(|identifier| self.variables.contains(&identifier));
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    struct BindingScope {
+        line: usize,
+        consumed: bool,
+    }
+    impl BindingScope {
+        fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
+            if !block_contains_literal(block, self.line) {
+                return;
+            }
+            fn is_connection_type(ty: &syn::Type) -> bool {
+                match ty {
+                    syn::Type::Reference(reference) => is_connection_type(&reference.elem),
+                    syn::Type::Path(path) => path
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|segment| segment.ident == "Connection"),
+                    _ => false,
+                }
+            }
+            let connections = signature
+                .inputs
+                .iter()
+                .filter_map(|argument| {
+                    let syn::FnArg::Typed(argument) = argument else {
+                        return None;
+                    };
+                    let syn::Pat::Ident(binding) = argument.pat.as_ref() else {
+                        return None;
+                    };
+                    is_connection_type(&argument.ty).then(|| binding.ident.to_string())
+                })
+                .collect();
+            let mut binding = SqlBinding {
+                line: self.line,
+                connections,
+                variables: std::collections::BTreeSet::new(),
+                consumed: false,
+            };
+            syn::visit::Visit::visit_block(&mut binding, block);
+            self.consumed |= binding.consumed;
+        }
+    }
+    impl<'ast> syn::visit::Visit<'ast> for BindingScope {
+        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            self.inspect(&function.sig, &function.block);
+        }
+
+        fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+            self.inspect(&function.sig, &function.block);
+        }
+    }
+    let mut sql_binding = BindingScope {
+        line: marker_lines[0] + 1,
+        consumed: false,
+    };
+    syn::visit::Visit::visit_file(&mut sql_binding, &syntax);
+    assert!(
+        sql_binding.consumed,
+        "hot-query marker must bind to the SQL argument of a rusqlite query method: {marker}"
+    );
+    bound
 }
 
 fn normalized_sql(sql: &str) -> String {
@@ -249,10 +369,12 @@ fn normalized_sql(sql: &str) -> String {
 #[test]
 fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
     let stale = r#"
-        fn owner() {
+        fn owner(conn: &Connection) {
             let unrelated = "SELECT stale FROM elsewhere";
-            // schema-hot-query: reviewed.shape
-            let query = "SELECT exact FROM owned WHERE id=?1";
+            conn.prepare(
+                // schema-hot-query: reviewed.shape
+                "SELECT exact FROM owned WHERE id=?1"
+            );
         }
     "#;
     assert_eq!(
@@ -260,7 +382,7 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
         "SELECT exact FROM owned WHERE id=?1"
     );
     let duplicate = r#"
-        fn owner() {
+        fn owner(conn: &Connection) {
             // schema-hot-query: reviewed.shape
             let one = "SELECT 1";
             // schema-hot-query: reviewed.shape
@@ -270,8 +392,32 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
     assert!(
         std::panic::catch_unwind(|| annotated_sql_literal(duplicate, "reviewed.shape")).is_err()
     );
+    let dead = r#"
+        fn owner(conn: &Connection) {
+            // schema-hot-query: reviewed.shape
+            let reviewed = "SELECT exact FROM owned WHERE id=?1";
+            conn.prepare("SELECT drifted FROM owned");
+        }
+    "#;
+    assert!(
+        std::panic::catch_unwind(|| annotated_sql_literal(dead, "reviewed.shape")).is_err(),
+        "dead reviewed literal was mistaken for the executed query"
+    );
+    let fake_connection = r#"
+        fn owner(fake: &FakeConnection) {
+            fake.prepare(
+                // schema-hot-query: reviewed.shape
+                "SELECT exact FROM owned WHERE id=?1"
+            );
+        }
+    "#;
+    assert!(
+        std::panic::catch_unwind(|| { annotated_sql_literal(fake_connection, "reviewed.shape") })
+            .is_err(),
+        "non-rusqlite prepare-like method was mistaken for a database query"
+    );
     let spoofed = r###"
-        fn owner() {
+        fn owner(conn: &Connection) {
             let raw = r#"
                 // schema-hot-query: reviewed.shape
             "#;
@@ -281,13 +427,15 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
             println!(r#"
                 // schema-hot-query: reviewed.shape
             "#);
-            // schema-hot-query: reviewed.shape
-            "SELECT exact FROM owned WHERE id=?1";
+            conn.prepare(
+                // schema-hot-query: reviewed.shape
+                "SELECT exact FROM owned WHERE id=?1"
+            );
         }
     "###;
     assert_eq!(
         hot_query_comments(spoofed),
-        vec![(12, "reviewed.shape".to_owned())]
+        vec![(13, "reviewed.shape".to_owned())]
     );
     assert_eq!(
         annotated_sql_literal(spoofed, "reviewed.shape"),
@@ -363,6 +511,57 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
         extended.tables.len() > local.tables.len(),
         "extended profile must add its deferred-domain inventory"
     );
+    assert_eq!(
+        local.objects.len(),
+        476,
+        "local ordered object inventory drifted"
+    );
+    assert_eq!(
+        extended.objects.len(),
+        681,
+        "extended ordered object inventory drifted"
+    );
+    assert!(
+        extended.objects.starts_with(&local.objects),
+        "extended objects must retain the exact ordered local prefix"
+    );
+    let view = local
+        .objects
+        .iter()
+        .find(|object| object.name == "tool_call_stats")
+        .expect("reviewed tool_call_stats view");
+    assert_eq!(view.kind, schema_parser::ObjectKind::View);
+    assert_eq!(view.owner.as_deref(), Some("tool_call_events"));
+    assert_eq!(
+        view.columns.as_slice(),
+        [
+            "event_id",
+            "session_id",
+            "call_id",
+            "timestamp",
+            "model",
+            "provider",
+            "project_id",
+            "project_root",
+            "tool",
+            "path",
+            "language",
+            "recovery_kind",
+            "recovery_stage",
+            "hard_fail",
+            "llm_mode",
+            "shape_fingerprint",
+            "recoverable",
+            "severity",
+        ]
+    );
+    let fts = local
+        .objects
+        .iter()
+        .find(|object| object.name == "session_fts")
+        .expect("reviewed session_fts virtual table");
+    assert_eq!(fts.kind, schema_parser::ObjectKind::VirtualTable);
+    assert_eq!(fts.columns.as_slice(), ["body"]);
 
     for (profile, schema) in [(local_name, &local), (extended_name, &extended)] {
         for (table_name, table) in &schema.tables {
@@ -392,9 +591,15 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
                     foreign_key.target_columns
                 );
                 assert!(
-                    schema_parser::child_leading_keys(schema, table_name)
-                        .iter()
-                        .any(|key| key.starts_with(&foreign_key.child_columns)),
+                    schema_parser::child_leading_keys(
+                        schema,
+                        table_name,
+                        &foreign_key.target_table,
+                        &foreign_key.child_columns,
+                        &foreign_key.target_columns,
+                    )
+                    .iter()
+                    .any(|key| key.starts_with(&foreign_key.child_columns)),
                     "{profile}.{table_name} foreign key {:?} lacks a usable leading child index",
                     foreign_key.child_columns
                 );
@@ -411,12 +616,10 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
 fn validate_relationship_inventory(
     profile: &str,
     schema: &schema_parser::Schema,
-    owned_tables: std::collections::BTreeSet<String>,
+    owned_objects: std::collections::BTreeSet<String>,
     effective_rows: &std::collections::BTreeMap<(String, String), RelationshipClass>,
 ) -> Result<(), String> {
-    let mut expected =
-        structurally_owned_identifier_columns(schema, owned_tables.clone().into_iter());
-    expected.extend(effective_rows.keys().cloned());
+    let expected = classified_columns(schema, &owned_objects);
     let actual = effective_rows
         .keys()
         .cloned()
@@ -429,15 +632,16 @@ fn validate_relationship_inventory(
         ));
     }
     for (table, column) in &actual {
-        if !owned_tables.contains(table) || !schema.tables[table].columns.contains(column) {
+        if !owned_objects.contains(table) || !expected.contains(&(table.clone(), column.clone())) {
             return Err(format!(
                 "{profile} inventory names absent column {table}.{column}"
             ));
         }
     }
 
-    let foreign = owned_tables
+    let foreign = owned_objects
         .iter()
+        .filter(|table_name| schema.tables.contains_key(*table_name))
         .flat_map(|table_name| {
             schema.tables[table_name]
                 .foreign_keys
@@ -462,21 +666,27 @@ fn validate_relationship_inventory(
     }
 
     for ((table_name, column), class) in effective_rows {
-        let table = &schema.tables[table_name];
-        let primary = table
-            .primary_keys
-            .iter()
-            .any(|key| key.columns.contains(column));
-        let unique = table
-            .unique_keys
-            .iter()
-            .any(|key| key.columns.contains(column))
-            || schema.indexes.iter().any(|index| {
-                index.table == *table_name
-                    && index.unique
-                    && !index.partial
-                    && index.columns.contains(column)
-            });
+        let table = schema.tables.get(table_name);
+        let primary = table.is_some_and(|table| {
+            table
+                .primary_keys
+                .iter()
+                .any(|key| key.terms.iter().any(|term| term.column == column.as_str()))
+        });
+        let unique = table.is_some_and(|table| {
+            table
+                .unique_keys
+                .iter()
+                .any(|key| key.terms.iter().any(|term| term.column == column.as_str()))
+        }) || schema.indexes.iter().any(|index| {
+            index.table == table_name.as_str()
+                && index.unique
+                && index.predicate.is_none()
+                && index
+                    .terms
+                    .iter()
+                    .any(|term| term.column == column.as_str())
+        });
         match class {
             RelationshipClass::Primary if !primary => {
                 return Err(format!("{profile}.{table_name}.{column} is not PK-owned"));
@@ -491,6 +701,13 @@ fn validate_relationship_inventory(
             {
                 return Err(format!(
                     "{profile}.{table_name}.{column} is not an FK child"
+                ));
+            }
+            RelationshipClass::NonRelationship
+                if primary || unique || foreign.contains(&(table_name.clone(), column.clone())) =>
+            {
+                return Err(format!(
+                    "{profile}.{table_name}.{column} hides a structural relationship as non_relationship"
                 ));
             }
             _ => {}
@@ -529,18 +746,14 @@ fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
     );
     let [(_, local), (_, extended)] = effective_profiles();
     let inventory = relationship_inventory();
-    let local_tables = local
-        .tables
-        .keys()
-        .cloned()
+    let local_objects = schema_parser::classified_objects(&local)
+        .map(|(object, _)| object.to_owned())
         .collect::<std::collections::BTreeSet<_>>();
-    let extended_tables = extended
-        .tables
-        .keys()
-        .cloned()
+    let extended_objects = schema_parser::classified_objects(&extended)
+        .map(|(object, _)| object.to_owned())
         .collect::<std::collections::BTreeSet<_>>();
-    let deferred_tables = extended_tables
-        .difference(&local_tables)
+    let deferred_objects = extended_objects
+        .difference(&local_objects)
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
 
@@ -564,19 +777,19 @@ fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
         "extended identifier ownership must be an additive table layer"
     );
 
-    validate_relationship_inventory("local", &local, local_tables.clone(), &manifest_local)
+    validate_relationship_inventory("local", &local, local_objects.clone(), &manifest_local)
         .expect("local identifier inventory must be exact");
     validate_relationship_inventory(
         "extended-owned",
         &extended,
-        deferred_tables,
+        deferred_objects,
         &manifest_deferred,
     )
     .expect("extended identifier inventory must be exact");
     validate_relationship_inventory(
         "extended-effective",
         &extended,
-        extended_tables,
+        extended_objects,
         &manifest_effective_extended,
     )
     .expect("effective extended identifier inventory must be exact");
@@ -585,10 +798,8 @@ fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
 #[test]
 fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
     let [(_, mut local), _] = effective_profiles();
-    let tables = local
-        .tables
-        .keys()
-        .cloned()
+    let objects = schema_parser::classified_objects(&local)
+        .map(|(object, _)| object.to_owned())
         .collect::<std::collections::BTreeSet<_>>();
     let inventory = relationship_inventory()
         .into_iter()
@@ -603,16 +814,26 @@ fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
         .columns
         .insert("unreviewed_authority_ref".to_owned());
     local
+        .objects
+        .iter_mut()
+        .find(|object| object.name == "sessions")
+        .unwrap()
+        .columns
+        .push("unreviewed_authority_ref".to_owned());
+    local
         .tables
         .get_mut("sessions")
         .unwrap()
         .unique_keys
         .push(schema_parser::Key {
-            columns: vec!["unreviewed_authority_ref".to_owned()],
-            collations: vec![None],
+            terms: vec![schema_parser::IndexedColumn {
+                column: "unreviewed_authority_ref".to_owned(),
+                collation: None,
+                direction: schema_parser::Direction::Asc,
+            }],
         });
     assert!(
-        validate_relationship_inventory("adversarial", &local, tables.clone(), &inventory)
+        validate_relationship_inventory("adversarial", &local, objects.clone(), &inventory)
             .unwrap_err()
             .contains("missing")
     );
@@ -622,7 +843,47 @@ fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
         .unwrap()
         .columns
         .remove("unreviewed_authority_ref");
+    local
+        .objects
+        .iter_mut()
+        .find(|object| object.name == "sessions")
+        .unwrap()
+        .columns
+        .retain(|column| column != "unreviewed_authority_ref");
     local.tables.get_mut("sessions").unwrap().unique_keys.pop();
+
+    local
+        .tables
+        .get_mut("sessions")
+        .unwrap()
+        .columns
+        .insert("unreviewed_soft_identity".to_owned());
+    local
+        .objects
+        .iter_mut()
+        .find(|object| object.name == "sessions")
+        .unwrap()
+        .columns
+        .push("unreviewed_soft_identity".to_owned());
+    assert!(
+        validate_relationship_inventory("adversarial", &local, objects.clone(), &inventory)
+            .unwrap_err()
+            .contains("missing"),
+        "non-key soft identity must not fall through the explicit manifest"
+    );
+    local
+        .tables
+        .get_mut("sessions")
+        .unwrap()
+        .columns
+        .remove("unreviewed_soft_identity");
+    local
+        .objects
+        .iter_mut()
+        .find(|object| object.name == "sessions")
+        .unwrap()
+        .columns
+        .retain(|column| column != "unreviewed_soft_identity");
 
     let foreign_identity = inventory
         .iter()
@@ -632,7 +893,7 @@ fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
     let mut missing = inventory.clone();
     missing.remove(&foreign_identity);
     assert!(
-        validate_relationship_inventory("adversarial", &local, tables.clone(), &missing)
+        validate_relationship_inventory("adversarial", &local, objects.clone(), &missing)
             .unwrap_err()
             .contains("missing")
     );
@@ -667,7 +928,7 @@ fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
         let mut misclassified = inventory.clone();
         misclassified.insert(identity, to);
         assert!(
-            validate_relationship_inventory("adversarial", &local, tables.clone(), &misclassified)
+            validate_relationship_inventory("adversarial", &local, objects.clone(), &misclassified)
                 .unwrap_err()
                 .contains(expected_error),
             "{from:?} -> {to:?} did not fail with {expected_error}"
@@ -747,8 +1008,16 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
             false,
             "sessions",
             "idx_sessions_open",
-            &["ephemeral", "last_active_at_unix_ms"][..],
-            true,
+            &[
+                ("ephemeral", None, schema_parser::Direction::Asc),
+                (
+                    "last_active_at_unix_ms",
+                    None,
+                    schema_parser::Direction::Desc,
+                ),
+            ][..],
+            false,
+            Some("ended_at_unix_ms is null"),
         ),
         (
             "local.agent-preparation.terminalize",
@@ -758,8 +1027,12 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
             false,
             "agent_session_preparation_claims",
             "idx_agent_session_preparation_claims_recovery",
-            &["claim_state", "session_id"],
+            &[
+                ("claim_state", None, schema_parser::Direction::Asc),
+                ("session_id", None, schema_parser::Direction::Asc),
+            ],
             false,
+            None,
         ),
         (
             "extended.scheduler.by-owner",
@@ -769,8 +1042,9 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
             true,
             "scheduled_jobs",
             "idx_scheduled_jobs_owner",
-            &["owner"],
+            &[("owner", None, schema_parser::Direction::Asc)],
             false,
+            None,
         ),
         (
             "extended.image-generation.dispatch-scan",
@@ -780,8 +1054,13 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
             true,
             "image_generation_jobs",
             "idx_image_generation_jobs_dispatch_scan",
-            &["state", "created_at_unix_ms", "job_id"],
+            &[
+                ("state", None, schema_parser::Direction::Asc),
+                ("created_at_unix_ms", None, schema_parser::Direction::Asc),
+                ("job_id", None, schema_parser::Direction::Asc),
+            ],
             false,
+            None,
         ),
     ];
     let expected_markers = shapes
@@ -813,8 +1092,18 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
     );
 
     let [(_, local), (_, extended)] = effective_profiles();
-    for (marker, owner, query, query_digest, uses_extended, table, index_name, columns, partial) in
-        shapes
+    for (
+        marker,
+        owner,
+        query,
+        query_digest,
+        uses_extended,
+        table,
+        index_name,
+        terms,
+        unique,
+        predicate,
+    ) in shapes
     {
         let owner_source = source(root.join(owner));
         let bound_query = normalized_sql(&annotated_sql_literal(&owner_source, marker));
@@ -831,14 +1120,17 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
         assert!(
             schema.indexes.iter().any(|index| index.name == index_name
                 && index.table == table
-                && index.columns.len() >= columns.len()
+                && index.unique == unique
+                && index.terms.len() == terms.len()
                 && index
-                    .columns
+                    .terms
                     .iter()
-                    .zip(columns)
-                    .all(|(actual, expected)| actual == *expected)
-                && index.partial == partial),
-            "reviewed leading index missing for {marker}: {index_name} on {table}{columns:?} partial={partial}"
+                    .zip(terms)
+                    .all(|(actual, expected)| actual.column == expected.0
+                        && actual.collation.as_deref() == expected.1
+                        && actual.direction == expected.2)
+                && index.predicate.as_deref() == predicate),
+            "exact reviewed index missing for {marker}: {index_name} on {table}{terms:?} unique={unique} predicate={predicate:?}"
         );
     }
 }

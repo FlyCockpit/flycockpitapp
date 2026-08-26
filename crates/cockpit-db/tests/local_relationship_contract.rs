@@ -1,11 +1,17 @@
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 #[path = "support/schema_parser.rs"]
 mod schema_parser;
 
 const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
+const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
+    "507d665693bbdec5536d9515a02d413a62371ee72f7de688509ac8a3de257eae";
+const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
+    "e32fef009c919d44dd8de06788cc473394959a8835de3d4f40dc4bd4a62ed1e2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {
@@ -17,8 +23,8 @@ enum RelationshipClass {
     Denormalized,
 }
 
-fn relationship_inventory(
-) -> std::collections::BTreeMap<(String, String, String), RelationshipClass> {
+fn relationship_inventory()
+-> std::collections::BTreeMap<(String, String, String), RelationshipClass> {
     let mut inventory = std::collections::BTreeMap::new();
     for line in RELATIONSHIP_INVENTORY
         .lines()
@@ -55,26 +61,7 @@ fn relationship_inventory(
     inventory
 }
 
-fn reviewed_identifier(column: &str) -> bool {
-    column == "id"
-        || [
-            "_id",
-            "_ids",
-            "_ids_json",
-            "_key",
-            "_uuid",
-            "_token",
-            "_handle",
-            "_digest",
-            "_identity",
-            "_ref",
-        ]
-        .iter()
-        .any(|suffix| column.ends_with(suffix))
-        || matches!(column, "owner" | "namespace")
-}
-
-fn owned_identifier_columns(
+fn structurally_owned_identifier_columns(
     schema: &schema_parser::Schema,
     tables: impl Iterator<Item = String>,
 ) -> std::collections::BTreeSet<(String, String)> {
@@ -82,11 +69,19 @@ fn owned_identifier_columns(
         .flat_map(|table_name| {
             let table = &schema.tables[&table_name];
             let mut columns = table
-                .columns
+                .primary_keys
                 .iter()
-                .filter(|column| reviewed_identifier(column))
+                .chain(&table.unique_keys)
+                .flatten()
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>();
+            columns.extend(
+                schema
+                    .indexes
+                    .iter()
+                    .filter(|index| index.table == table_name && index.unique && !index.partial)
+                    .flat_map(|index| index.columns.iter().cloned()),
+            );
             columns.extend(
                 table
                     .foreign_keys
@@ -102,6 +97,65 @@ fn owned_identifier_columns(
 
 fn source(path: impl AsRef<Path>) -> String {
     std::fs::read_to_string(path).expect("read production query owner")
+}
+
+fn annotated_sql_literal(source: &str, marker: &str) -> String {
+    struct Literals(Vec<(usize, String)>);
+    impl<'ast> syn::visit::Visit<'ast> for Literals {
+        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+            self.0.push((literal.span().start().line, literal.value()));
+        }
+    }
+    let marker_lines = source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(&format!("schema-hot-query: {marker}")))
+        .map(|(line, _)| line + 1)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        marker_lines.len(),
+        1,
+        "marker must occur exactly once: {marker}"
+    );
+    let mut literals = Literals(Vec::new());
+    syn::visit::Visit::visit_file(&mut literals, &syn::parse_file(source).unwrap());
+    literals
+        .0
+        .into_iter()
+        .filter(|(line, _)| *line > marker_lines[0])
+        .min_by_key(|(line, _)| *line)
+        .map(|(_, value)| value)
+        .expect("annotated query must be followed by a Rust SQL literal")
+}
+
+fn normalized_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
+    let stale = r#"
+        fn owner() {
+            let unrelated = "SELECT stale FROM elsewhere";
+            // schema-hot-query: reviewed.shape
+            let query = "SELECT exact FROM owned WHERE id=?1";
+        }
+    "#;
+    assert_eq!(
+        annotated_sql_literal(stale, "reviewed.shape"),
+        "SELECT exact FROM owned WHERE id=?1"
+    );
+    let duplicate = r#"
+        fn owner() {
+            // schema-hot-query: reviewed.shape
+            let one = "SELECT 1";
+            // schema-hot-query: reviewed.shape
+            let two = "SELECT 2";
+        }
+    "#;
+    assert!(
+        std::panic::catch_unwind(|| annotated_sql_literal(duplicate, "reviewed.shape")).is_err()
+    );
 }
 
 fn workspace() -> PathBuf {
@@ -127,6 +181,10 @@ fn effective_profiles() -> [(&'static str, schema_parser::Schema); 2] {
         ("local", schema_parser::parse(&[SCHEMA])),
         ("extended", schema_parser::parse(&[SCHEMA, EXTENDED_SCHEMA])),
     ]
+}
+
+fn schema_digest(schema: &str) -> String {
+    format!("{:x}", Sha256::digest(schema.as_bytes()))
 }
 
 #[test]
@@ -191,7 +249,9 @@ fn validate_relationship_inventory(
     owned_tables: std::collections::BTreeSet<String>,
     effective_rows: &std::collections::BTreeMap<(String, String), RelationshipClass>,
 ) -> Result<(), String> {
-    let expected = owned_identifier_columns(schema, owned_tables.clone().into_iter());
+    let mut expected =
+        structurally_owned_identifier_columns(schema, owned_tables.clone().into_iter());
+    expected.extend(effective_rows.keys().cloned());
     let actual = effective_rows
         .keys()
         .cloned()
@@ -202,6 +262,13 @@ fn validate_relationship_inventory(
             expected.difference(&actual).collect::<Vec<_>>(),
             actual.difference(&expected).collect::<Vec<_>>()
         ));
+    }
+    for (table, column) in &actual {
+        if !owned_tables.contains(table) || !schema.tables[table].columns.contains(column) {
+            return Err(format!(
+                "{profile} inventory names absent column {table}.{column}"
+            ));
+        }
     }
 
     let foreign = owned_tables
@@ -280,8 +347,18 @@ fn validate_relationship_inventory(
 
 #[test]
 fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
+    assert_eq!(schema_digest(SCHEMA), LOCAL_SCHEMA_REVIEW_DIGEST);
+    assert_eq!(
+        schema_digest(EXTENDED_SCHEMA),
+        EXTENDED_SCHEMA_REVIEW_DIGEST
+    );
     let [(_, local), (_, extended)] = effective_profiles();
     let inventory = relationship_inventory();
+    assert_eq!(
+        inventory.len(),
+        778,
+        "reviewed identity-map cardinality drifted"
+    );
     let local_tables = local
         .tables
         .keys()
@@ -355,6 +432,12 @@ fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
         .unwrap()
         .columns
         .insert("unreviewed_authority_ref".to_owned());
+    local
+        .tables
+        .get_mut("sessions")
+        .unwrap()
+        .unique_keys
+        .push(vec!["unreviewed_authority_ref".to_owned()]);
     assert!(
         validate_relationship_inventory("adversarial", &local, tables.clone(), &inventory)
             .unwrap_err()
@@ -366,6 +449,7 @@ fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
         .unwrap()
         .columns
         .remove("unreviewed_authority_ref");
+    local.tables.get_mut("sessions").unwrap().unique_keys.pop();
 
     let foreign_identity = inventory
         .iter()
@@ -422,33 +506,41 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
             "local.sessions.open",
             "crates/cockpit-db/src/db/sessions.rs",
             "WHERE ended_at_unix_ms IS NULL AND ephemeral = 0",
+            "e676358dd6092ff77aa5915f430806d623c0987afd982014542b4e9cb4ea55c9",
             false,
             "sessions",
             &["ended_at_unix_ms"][..],
+            true,
         ),
         (
             "local.agent-preparation.terminalize",
             "crates/cockpit-db/src/db/agent_installations.rs",
             "WHERE session_id=?1 AND claim_state IN ('claimed', 'running')",
+            "529c9bf816b241c309b49f2e54c8ae0f398e87c117103eb4063d98eceb0d129a",
             false,
             "agent_session_preparation_claims",
             &["claim_state", "session_id"],
+            false,
         ),
         (
             "extended.scheduler.by-owner",
             "crates/cockpit-db/src/db/scheduler.rs",
             "WHERE owner = ?1",
+            "4c04bc561abef009306ec51c13858d2a4c801c130781eeda44a1cff97abfacd1",
             true,
             "scheduled_jobs",
             &["owner"],
+            false,
         ),
         (
             "extended.image-generation.dispatch-scan",
             "crates/cockpit-db/src/db/image_generation.rs",
             "WHERE j.state='queued' AND s.state='queued' AND a.state='planned'",
+            "5235dd10724aef22eb5daf2e4e543db47aac88d0f0b5d7a4eb603522684df7bf",
             true,
             "image_generation_jobs",
             &["state", "created_at_unix_ms", "job_id"],
+            false,
         ),
     ];
     let expected_markers = shapes
@@ -461,7 +553,7 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
         Path::new("crates/cockpit-db/src/db"),
         &mut production_sources,
     );
-    let actual_markers = production_sources
+    let actual_marker_rows = production_sources
         .into_iter()
         .flat_map(|owner| {
             let contents = source(root.join(&owner));
@@ -473,25 +565,40 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
                 })
                 .collect::<Vec<_>>()
         })
+        .collect::<Vec<_>>();
+    let actual_markers = actual_marker_rows
+        .iter()
+        .cloned()
         .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        actual_marker_rows.len(),
+        actual_markers.len(),
+        "duplicate hot-query annotation"
+    );
     assert_eq!(
         actual_markers, expected_markers,
         "hot-query annotations drifted"
     );
 
     let [(_, local), (_, extended)] = effective_profiles();
-    for (marker, owner, query, uses_extended, table, leading) in shapes {
+    for (marker, owner, query, query_digest, uses_extended, table, columns, partial) in shapes {
+        let owner_source = source(root.join(owner));
+        let bound_query = normalized_sql(&annotated_sql_literal(&owner_source, marker));
         assert!(
-            source(root.join(owner)).contains(query),
-            "query shape drifted for {marker}: {owner}: {query}"
+            bound_query.contains(&normalized_sql(query)),
+            "bound query shape drifted for {marker}: {bound_query}"
+        );
+        assert_eq!(
+            schema_digest(&bound_query),
+            query_digest,
+            "full bound query drifted for {marker}"
         );
         let schema = if uses_extended { &extended } else { &local };
         assert!(
-            schema
-                .indexes
-                .iter()
-                .any(|index| { index.table == table && index.columns.starts_with(leading) }),
-            "reviewed leading index missing for {marker}: {table}{leading:?}"
+            schema.indexes.iter().any(|index| index.table == table
+                && index.columns == columns
+                && index.partial == partial),
+            "exact reviewed index missing for {marker}: {table}{columns:?} partial={partial}"
         );
     }
 }

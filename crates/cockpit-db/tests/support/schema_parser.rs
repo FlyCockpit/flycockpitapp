@@ -19,6 +19,7 @@ pub struct ForeignKey {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
     pub columns: BTreeSet<String>,
+    pub collations: BTreeMap<String, String>,
     pub primary_keys: Vec<Vec<String>>,
     pub unique_keys: Vec<Vec<String>>,
     pub foreign_keys: Vec<ForeignKey>,
@@ -30,6 +31,7 @@ pub struct Index {
     pub columns: Vec<String>,
     pub unique: bool,
     pub partial: bool,
+    pub collations: Vec<Option<String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -170,6 +172,67 @@ fn names_in_parens(tokens: &[Token], open: usize) -> Vec<String> {
         .collect()
 }
 
+fn terms_in_parens(tokens: &[Token], open: usize) -> Vec<(String, Option<String>)> {
+    let close = closing(tokens, open);
+    clauses(&tokens[open + 1..close])
+        .into_iter()
+        .map(|part| {
+            let column = name(part.first()).expect("index term must start with an identifier");
+            let collation = part
+                .windows(2)
+                .find(|pair| is(pair.first(), "collate"))
+                .and_then(|pair| name(pair.get(1)));
+            (column, collation)
+        })
+        .collect()
+}
+
+fn reject_unsupported_schema_forms(tokens: &[Token]) {
+    for (index, token) in tokens.iter().enumerate() {
+        if is(Some(token), "alter") && is(tokens.get(index + 1), "table")
+            || is(Some(token), "drop")
+                && matches!(
+                    name(tokens.get(index + 1)).as_deref(),
+                    Some("table" | "index")
+                )
+            || is(Some(token), "create")
+                && matches!(
+                    name(tokens.get(index + 1)).as_deref(),
+                    Some("temp" | "temporary")
+                )
+        {
+            panic!("unsupported schema-changing statement near token {index}");
+        }
+        if is(Some(token), "create") {
+            let kind = name(tokens.get(index + 1));
+            assert!(
+                matches!(
+                    kind.as_deref(),
+                    Some("table" | "index" | "unique" | "trigger")
+                ),
+                "unsupported CREATE form near token {index}"
+            );
+            if kind.as_deref() == Some("unique") {
+                assert!(
+                    is(tokens.get(index + 2), "index"),
+                    "UNIQUE must create an index"
+                );
+            }
+        }
+        if matches!(token, Token::Mark('.')) {
+            let schema_context = index >= 2
+                && matches!(
+                    name(tokens.get(index - 2)).as_deref(),
+                    Some("table" | "references" | "on")
+                );
+            assert!(
+                !schema_context,
+                "schema-qualified object names are unsupported"
+            );
+        }
+    }
+}
+
 fn action(tokens: &[Token], kind: &str) -> Option<String> {
     let on = tokens
         .windows(2)
@@ -217,6 +280,7 @@ fn foreign_key(tokens: &[Token], inline: Option<String>) -> Option<ForeignKey> {
 
 pub fn parse(scripts: &[&str]) -> Schema {
     let tokens = lex(&scripts.concat());
+    reject_unsupported_schema_forms(&tokens);
     let mut schema = Schema::default();
     let mut at = 0;
     while at < tokens.len() {
@@ -262,6 +326,13 @@ pub fn parse(scripts: &[&str]) -> Schema {
                     }
                 } else if let Some(column) = name(clause.first()) {
                     table.columns.insert(column.clone());
+                    if let Some(collation) = clause
+                        .windows(2)
+                        .find(|pair| is(pair.first(), "collate"))
+                        .and_then(|pair| name(pair.get(1)))
+                    {
+                        table.collations.insert(column.clone(), collation);
+                    }
                     if clause
                         .windows(2)
                         .any(|pair| is(pair.first(), "primary") && is(pair.get(1), "key"))
@@ -303,13 +374,15 @@ pub fn parse(scripts: &[&str]) -> Schema {
                 .iter()
                 .position(|token| *token == Token::Mark(';'))
                 .map_or(tokens.len(), |offset| close + 1 + offset);
+            let terms = terms_in_parens(&tokens, open);
             schema.indexes.push(Index {
                 table,
-                columns: names_in_parens(&tokens, open),
+                columns: terms.iter().map(|(column, _)| column.clone()).collect(),
                 unique,
                 partial: tokens[close + 1..end]
                     .iter()
                     .any(|token| is(Some(token), "where")),
+                collations: terms.into_iter().map(|(_, collation)| collation).collect(),
             });
             at = end + 1;
         } else {
@@ -326,7 +399,22 @@ pub fn exact_target_keys(schema: &Schema, table: &str) -> Vec<Vec<String>> {
         schema
             .indexes
             .iter()
-            .filter(|index| index.table == table && index.unique && !index.partial)
+            .filter(|index| {
+                index.table == table
+                    && index.unique
+                    && !index.partial
+                    && index
+                        .columns
+                        .iter()
+                        .zip(&index.collations)
+                        .all(|(column, collation)| {
+                            collation.as_deref().unwrap_or("binary")
+                                == schema.tables[table]
+                                    .collations
+                                    .get(column)
+                                    .map_or("binary", String::as_str)
+                        })
+            })
             .map(|index| index.columns.clone()),
     );
     keys
@@ -370,10 +458,36 @@ mod tests {
             schema.tables["child"].foreign_keys[1].child_columns,
             ["child_id", "right_id"]
         );
-        assert!(schema
-            .indexes
-            .iter()
-            .any(|index| index.unique && index.partial));
+        assert!(
+            schema
+                .indexes
+                .iter()
+                .any(|index| index.unique && index.partial)
+        );
         assert!(!exact_target_keys(&schema, "child").contains(&vec!["child_id".into()]));
+    }
+
+    #[test]
+    fn rejects_unsupported_schema_mutations_and_qualified_objects() {
+        for sql in [
+            "ALTER TABLE child ADD COLUMN parent_id TEXT REFERENCES parent(id);",
+            "DROP TABLE child;",
+            "CREATE TEMP TABLE child(id TEXT);",
+            "CREATE VIEW children AS SELECT * FROM child;",
+            "CREATE VIRTUAL TABLE search USING fts5(body);",
+            "CREATE TABLE main.child(id TEXT);",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| parse(&[sql])).is_err(),
+                "accepted {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_unique_index_collation_must_match_the_column() {
+        let schema = parse(&["CREATE TABLE parent(id TEXT COLLATE nocase); \
+             CREATE UNIQUE INDEX parent_id_binary ON parent(id COLLATE binary);"]);
+        assert!(exact_target_keys(&schema, "parent").is_empty());
     }
 }

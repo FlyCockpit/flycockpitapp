@@ -2757,11 +2757,10 @@ mod resource_button_dispatch_tests {
     use crate::tui::async_action::{AsyncActionKind, AsyncActionPayload, AsyncActionResult};
     use crate::tui::button::ButtonDispatch;
     use crate::tui::resources_pane::ResourcesPane;
-    use cockpit_core::engine::resource_scheduler::{
+    use cockpit_proto::{
         ResourceQueuedSnapshot, ResourceRequestMetadata, ResourceRequirements,
         ResourceSchedulerSnapshot,
     };
-    use cockpit_proto::ResourceQueuedState;
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     fn resource_generation(app: &App) -> u64 {

@@ -484,6 +484,13 @@ fn production_uses_cockpit_proto_directly() {
                 "cockpit_core::env_snapshot::EnvSnapshotWire",
                 "cockpit_core::engine::IdleReason",
                 "cockpit_core::engine::model::InferenceErrorClass",
+                "cockpit_core::engine::resource_scheduler::ResourcePoolSnapshot",
+                "cockpit_core::engine::resource_scheduler::ResourceQueuedSnapshot",
+                "cockpit_core::engine::resource_scheduler::ResourceQueuedState",
+                "cockpit_core::engine::resource_scheduler::ResourceRequestMetadata",
+                "cockpit_core::engine::resource_scheduler::ResourceRequirements",
+                "cockpit_core::engine::resource_scheduler::ResourceRunningSnapshot",
+                "cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot",
                 "cockpit_core::engine::tool::ToolFailKind",
             ] {
                 if compact.contains(migrated_wire_type) {
@@ -520,6 +527,17 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::env_snapshot::EnvSnapshotWire"
                     || imported == "cockpit_core::engine::IdleReason"
                     || imported == "cockpit_core::engine::model::InferenceErrorClass"
+                    || imported == "cockpit_core::engine::resource_scheduler::ResourcePoolSnapshot"
+                    || imported
+                        == "cockpit_core::engine::resource_scheduler::ResourceQueuedSnapshot"
+                    || imported == "cockpit_core::engine::resource_scheduler::ResourceQueuedState"
+                    || imported
+                        == "cockpit_core::engine::resource_scheduler::ResourceRequestMetadata"
+                    || imported == "cockpit_core::engine::resource_scheduler::ResourceRequirements"
+                    || imported
+                        == "cockpit_core::engine::resource_scheduler::ResourceRunningSnapshot"
+                    || imported
+                        == "cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot"
                     || imported == "cockpit_core::engine::tool::ToolFailKind"
                 {
                     findings.push(format!(

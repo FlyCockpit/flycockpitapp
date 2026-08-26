@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tui::pane::Pane;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
-use cockpit_core::engine::resource_scheduler::{
+use cockpit_proto::{
     ResourceQueuedSnapshot, ResourceQueuedState, ResourceRunningSnapshot, ResourceSchedulerSnapshot,
 };
 
@@ -520,9 +520,7 @@ fn command_label(label: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_core::engine::resource_scheduler::{
-        ResourcePoolSnapshot, ResourceRequestMetadata, ResourceRequirements,
-    };
+    use cockpit_proto::{ResourcePoolSnapshot, ResourceRequestMetadata, ResourceRequirements};
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;

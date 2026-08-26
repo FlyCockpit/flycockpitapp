@@ -215,13 +215,13 @@ pub enum AsyncActionPayload {
     SessionLiveStatus(std::collections::HashMap<uuid::Uuid, (bool, bool)>),
     ResourceSnapshot {
         pane_generation: u64,
-        result: Result<cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot, String>,
+        result: Result<cockpit_proto::ResourceSchedulerSnapshot, String>,
     },
     PromoteResource {
         pane_generation: Option<u64>,
         status: cockpit_proto::ResourcePromoteStatus,
         message: String,
-        snapshot: cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot,
+        snapshot: cockpit_proto::ResourceSchedulerSnapshot,
     },
     ForkCreated {
         parent_session_id: uuid::Uuid,

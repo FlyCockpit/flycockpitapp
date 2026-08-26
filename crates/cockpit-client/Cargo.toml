@@ -24,6 +24,7 @@ base64 = { workspace = true }
 cockpit-proto = { path = "../cockpit-proto" }
 rand = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }
@@ -32,6 +33,5 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

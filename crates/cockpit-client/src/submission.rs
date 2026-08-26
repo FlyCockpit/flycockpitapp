@@ -1,6 +1,7 @@
 //! Authored user-message state retained by daemon clients until acceptance.
 
 use cockpit_proto::{ActiveModelRef, TagExpansionMeta};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::image_upload::SubmissionImage;
@@ -25,6 +26,25 @@ pub enum SubmissionOrigin {
     CompactNotice,
     #[default]
     Internal,
+}
+
+impl SubmissionOrigin {
+    pub fn advances_activity_epoch(self) -> bool {
+        matches!(self, Self::ExternalRoot)
+    }
+
+    pub fn user_prompt_submit_source(self) -> Option<&'static str> {
+        match self {
+            Self::ExternalRoot => Some("user"),
+            Self::GoalContinuation
+            | Self::ScheduledJob
+            | Self::AutoContinue
+            | Self::RetryRecovery
+            | Self::ToolResult
+            | Self::CompactNotice
+            | Self::Internal => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -85,5 +105,60 @@ impl ClientUserSubmission {
             text: "/compact: assembling handoff (prune-first, model brief, deterministic appendix, context tags)...".to_owned(),
             ..Self::default()
         }
+    }
+
+    pub fn client_fingerprint(&self) -> String {
+        fn part(hasher: &mut Sha256, bytes: &[u8]) {
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        fn optional_part(hasher: &mut Sha256, value: Option<&str>) {
+            match value {
+                None => part(hasher, b"none"),
+                Some(value) => {
+                    part(hasher, b"some");
+                    part(hasher, value.as_bytes());
+                }
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        part(
+            &mut hasher,
+            match self.kind {
+                UserSubmissionKind::User => b"user",
+                UserSubmissionKind::Compact => b"compact",
+            },
+        );
+        part(
+            &mut hasher,
+            &self.expected_model_state_generation.map_or_else(
+                || b"none".to_vec(),
+                |generation| generation.to_be_bytes().to_vec(),
+            ),
+        );
+        part(
+            &mut hasher,
+            &serde_json::to_vec(&self.expected_model).unwrap_or_default(),
+        );
+        part(&mut hasher, self.text.as_bytes());
+        optional_part(&mut hasher, self.display_text.as_deref());
+        part(
+            &mut hasher,
+            &serde_json::to_vec(&self.tag_expansions).unwrap_or_default(),
+        );
+        for image in &self.images {
+            part(&mut hasher, &serde_json::to_vec(image).unwrap_or_default());
+        }
+        optional_part(&mut hasher, self.forced_skill.as_deref());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub fn is_text_only(&self) -> bool {
+        self.images.is_empty()
     }
 }

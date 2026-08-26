@@ -97,12 +97,17 @@ impl ResourcesPane {
         }
     }
 
-    pub(crate) fn pointer_promote(&mut self, index: usize) -> Option<ResourcesOutcome> {
-        self.select_index(index);
-        self.snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.queued.get(index))
-            .map(|entry| ResourcesOutcome::Promote(entry.display_id.clone()))
+    pub(crate) fn pointer_promote(&mut self, request_id: &str) -> Option<ResourcesOutcome> {
+        let request_id = self
+            .snapshot
+            .as_ref()?
+            .queued
+            .iter()
+            .find(|entry| entry.display_id == request_id)?
+            .display_id
+            .clone();
+        self.selected_request_id = Some(request_id.clone());
+        Some(ResourcesOutcome::Promote(request_id))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<ResourcesOutcome> {
@@ -156,13 +161,16 @@ impl ResourcesPane {
             .list
             .offset()
             .min(self.last_content_rows.saturating_sub(self.last_body_height));
+        let mut viewport = self.list.clone();
+        viewport.select(None);
         frame.render_stateful_widget(
             List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
                 .highlight_style(Style::default().add_modifier(Modifier::BOLD))
                 .scroll_padding(1),
             body,
-            &mut self.list,
+            &mut viewport,
         );
+        *self.list.offset_mut() = viewport.offset();
         render_scrollbar(
             frame,
             body,
@@ -172,7 +180,7 @@ impl ResourcesPane {
         );
         if let Some(registry) = buttons.as_mut() {
             let offset = self.list.offset();
-            for (index, row) in queued_rows {
+            for (request_id, row) in queued_rows {
                 if row < offset || row >= offset + self.last_body_height {
                     continue;
                 }
@@ -181,11 +189,15 @@ impl ResourcesPane {
                     continue;
                 }
                 let spec = crate::tui::button::ButtonSpec::new(
-                    crate::tui::button::ButtonId::ResourcePromote { index },
+                    crate::tui::button::ButtonId::ResourcePromote {
+                        request_id: request_id.clone(),
+                    },
                     "promote",
-                    crate::tui::button::ButtonDispatch::ResourcePromote { index },
+                    crate::tui::button::ButtonDispatch::ResourcePromote {
+                        request_id: request_id.clone(),
+                    },
                 )
-                .focused(index == self.selected_index());
+                .focused(self.selected_request_id.as_deref() == Some(&request_id));
                 let _ = registry.paint(frame, body.right().saturating_sub(10), y, 9, spec);
             }
         }
@@ -217,10 +229,24 @@ impl ResourcesPane {
         self.body_lines_with_selected_row(true).0
     }
 
+    #[cfg(test)]
+    pub(crate) fn queued_display_ids(&self) -> Vec<String> {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .queued
+                    .iter()
+                    .map(|entry| entry.display_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn body_lines_with_selected_row(
         &self,
         show_inline_action: bool,
-    ) -> (Vec<Line<'static>>, Option<usize>, Vec<(usize, usize)>) {
+    ) -> (Vec<Line<'static>>, Option<usize>, Vec<(String, usize)>) {
         let mut lines = Vec::new();
         let mut selected_row = None;
         let mut queued_rows = Vec::new();
@@ -279,7 +305,7 @@ impl ResourcesPane {
                 if selected {
                     selected_row = Some(lines.len());
                 }
-                queued_rows.push((i, lines.len()));
+                queued_rows.push((entry.display_id.clone(), lines.len()));
                 lines.push(queued_line(entry, selected, show_inline_action));
             }
         }
@@ -477,6 +503,7 @@ mod tests {
         ResourcePoolSnapshot, ResourceRequestMetadata, ResourceRequirements,
     };
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use uuid::Uuid;
@@ -487,6 +514,15 @@ mod tests {
             modifiers: KeyModifiers::empty(),
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
+        }
+    }
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
         }
     }
 
@@ -629,9 +665,104 @@ mod tests {
             .expect("draw resources with buttons");
         assert_eq!(registry.targets().len(), 1);
         assert!(matches!(
-            registry.targets()[0].id,
-            crate::tui::button::ButtonId::ResourcePromote { index: 0 }
+            &registry.targets()[0].id,
+            crate::tui::button::ButtonId::ResourcePromote { request_id }
+                if request_id == "rs-0002"
         ));
         assert!(registry.targets()[0].rect.y < 11);
+    }
+
+    #[test]
+    fn pressed_promote_identity_survives_reorder_and_activates_exact_request() {
+        let mut value = snapshot();
+        let mut other = value.queued[0].clone();
+        other.id = Uuid::new_v4();
+        other.display_id = "rs-0003".to_string();
+        value.queued.push(other);
+        let mut pane = ResourcesPane::open();
+        pane.apply_snapshot_result(Ok(value.clone()));
+        let mut registry = crate::tui::button::ButtonRegistry::default();
+        registry.begin_frame(true, 7);
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                pane.render_with_buttons(frame, Rect::new(0, 0, 80, 16), Some(&mut registry))
+            })
+            .expect("initial render");
+        registry.end_frame();
+        let pressed = registry
+            .targets()
+            .iter()
+            .find(|target| matches!(&target.id, crate::tui::button::ButtonId::ResourcePromote { request_id } if request_id == "rs-0002"))
+            .expect("original request target")
+            .rect;
+        assert!(matches!(
+            registry.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                pressed.x,
+                pressed.y
+            )),
+            Some(crate::tui::button::ButtonPointerOutcome::Pressed(_))
+        ));
+
+        value.queued.reverse();
+        pane.apply_snapshot_result(Ok(value));
+        registry.begin_frame(true, 7);
+        terminal
+            .draw(|frame| {
+                pane.render_with_buttons(frame, Rect::new(0, 0, 80, 16), Some(&mut registry))
+            })
+            .expect("reordered render");
+        registry.end_frame();
+        let moved = registry
+            .targets()
+            .iter()
+            .find(|target| matches!(&target.id, crate::tui::button::ButtonId::ResourcePromote { request_id } if request_id == "rs-0002"))
+            .expect("same request after reorder")
+            .rect;
+        assert!(matches!(
+            registry.handle_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                moved.x,
+                moved.y
+            )),
+            Some(crate::tui::button::ButtonPointerOutcome::Activated(
+                crate::tui::button::ButtonDispatch::ResourcePromote { request_id }
+            )) if request_id == "rs-0002"
+        ));
+    }
+
+    #[test]
+    fn wheel_viewport_remains_independent_of_selected_queued_row() {
+        let mut value = snapshot();
+        for index in 0..6 {
+            let mut pool = value.pools[0].clone();
+            pool.name = format!("pool-{index}");
+            value.pools.push(pool);
+            let mut running = value.running[0].clone();
+            running.id = Uuid::new_v4();
+            running.display_id = format!("running-{index}");
+            value.running.push(running);
+        }
+        let mut pane = ResourcesPane::open();
+        pane.apply_snapshot_result(Ok(value));
+        let initial = rendered_buffer(&mut pane, 80, 10);
+        assert!(initial.contains("Pools"));
+        assert_eq!(pane.list.offset(), 0);
+
+        pane.scroll_down();
+        pane.scroll_down();
+        let scrolled = rendered_buffer(&mut pane, 80, 10);
+        assert_eq!(pane.list.offset(), 2);
+        assert_ne!(scrolled, initial);
+
+        for _ in 0..100 {
+            pane.scroll_down();
+        }
+        let _ = rendered_buffer(&mut pane, 80, 10);
+        assert_eq!(
+            pane.list.offset(),
+            pane.last_content_rows.saturating_sub(pane.last_body_height)
+        );
     }
 }

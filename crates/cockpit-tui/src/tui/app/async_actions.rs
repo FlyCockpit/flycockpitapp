@@ -907,6 +907,15 @@ impl App {
     }
 
     pub(super) fn apply_async_action_result(&mut self, result: AsyncActionResult) {
+        if matches!(
+            result.kind,
+            AsyncActionKind::DaemonRpc("resources.snapshot" | "resources.promote")
+        ) {
+            if self.pending_resource_action != Some(result.id) {
+                return;
+            }
+            self.pending_resource_action = None;
+        }
         if result.presentation_stale && !stale_completion_requires_reducer(&result.kind) {
             // The runner has consumed the terminal completion and released its
             // process authority. Nothing in these handlers owns additional
@@ -2886,40 +2895,52 @@ impl App {
     }
 
     pub(super) fn start_resources_snapshot_action(&mut self) {
-        self.async_actions.start_blocking(
+        let start = self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.snapshot"),
-            AsyncActionPolicy::Replace(AsyncActionKey::new("resources.snapshot")),
-            || match crate::tui::agent_runner::resource_snapshot_blocking()? {
-                cockpit_proto::Response::ResourceSnapshot { snapshot } => {
-                    Ok(AsyncActionPayload::ResourceSnapshot(snapshot))
-                }
-                other => Err(format!("unexpected resource_snapshot response: {other:?}")),
+            AsyncActionKey::new("resources.projection"),
+            async {
+                tokio::task::spawn_blocking(|| {
+                    match crate::tui::agent_runner::resource_snapshot_blocking()? {
+                        cockpit_proto::Response::ResourceSnapshot { snapshot } => {
+                            Ok(AsyncActionPayload::ResourceSnapshot(snapshot))
+                        }
+                        other => Err(format!("unexpected resource_snapshot response: {other:?}")),
+                    }
+                })
+                .await
+                .map_err(|error| format!("resources.snapshot worker failed: {error}"))?
             },
         );
+        self.pending_resource_action = Some(start.id());
     }
 
     pub(super) fn start_resource_promote_action(&mut self, request_id: String) {
         let session_id = self.current_session_id();
-        self.async_actions.start_blocking(
+        let start = self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.promote"),
-            AsyncActionPolicy::Replace(AsyncActionKey::new(format!(
-                "resources.promote:{request_id}"
-            ))),
-            move || match crate::tui::agent_runner::promote_resource_blocking(
-                request_id, session_id,
-            )? {
-                cockpit_proto::Response::PromoteResourceResult {
-                    status,
-                    message,
-                    snapshot,
-                } => Ok(AsyncActionPayload::PromoteResource {
-                    status,
-                    message,
-                    snapshot,
-                }),
-                other => Err(format!("unexpected promote_resource response: {other:?}")),
+            AsyncActionKey::new("resources.projection"),
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    match crate::tui::agent_runner::promote_resource_blocking(
+                        request_id, session_id,
+                    )? {
+                        cockpit_proto::Response::PromoteResourceResult {
+                            status,
+                            message,
+                            snapshot,
+                        } => Ok(AsyncActionPayload::PromoteResource {
+                            status,
+                            message,
+                            snapshot,
+                        }),
+                        other => Err(format!("unexpected promote_resource response: {other:?}")),
+                    }
+                })
+                .await
+                .map_err(|error| format!("resources.promote worker failed: {error}"))?
             },
         );
+        self.pending_resource_action = Some(start.id());
     }
 
     pub(super) fn start_resources_outcome(

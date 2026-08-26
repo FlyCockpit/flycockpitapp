@@ -68,7 +68,9 @@ pub(crate) fn button_inventory() -> Vec<InventoryAssignment> {
     push_button(
         &mut out,
         "resources",
-        ButtonId::ResourcePromote { index: 0 },
+        ButtonId::ResourcePromote {
+            request_id: "inventory".to_string(),
+        },
     );
     push_button(&mut out, "notes", ButtonId::NoteNew);
 

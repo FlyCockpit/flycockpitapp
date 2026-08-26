@@ -115,9 +115,13 @@ fn button_primitive_exact_bounds() {
 
     registry.begin_frame(true, 1);
     let zero = ButtonSpec::new(
-        ButtonId::ResourcePromote { index: 0 },
+        ButtonId::ResourcePromote {
+            request_id: "rs-zero".to_string(),
+        },
         "promote",
-        ButtonDispatch::ResourcePromote { index: 0 },
+        ButtonDispatch::ResourcePromote {
+            request_id: "rs-zero".to_string(),
+        },
     );
     let backend = TestBackend::new(40, 3);
     let mut terminal = Terminal::new(backend).expect("terminal");

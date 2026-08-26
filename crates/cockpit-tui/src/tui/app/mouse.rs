@@ -698,9 +698,9 @@ impl App {
                     pane.pointer_activate_confirm(dispatch);
                 }
             }
-            crate::tui::button::ButtonDispatch::ResourcePromote { index } => {
+            crate::tui::button::ButtonDispatch::ResourcePromote { request_id } => {
                 let outcome = match &mut self.overlay {
-                    Overlay::Resources(pane) => pane.pointer_promote(index),
+                    Overlay::Resources(pane) => pane.pointer_promote(&request_id),
                     _ => None,
                 };
                 if let Some(outcome) = outcome {
@@ -2749,7 +2749,7 @@ mod affordance_hover_tests {
 #[cfg(test)]
 mod resource_button_dispatch_tests {
     use super::{App, Overlay};
-    use crate::tui::async_action::AsyncActionKind;
+    use crate::tui::async_action::{AsyncActionKind, AsyncActionPayload, AsyncActionResult};
     use crate::tui::button::ButtonDispatch;
     use crate::tui::resources_pane::ResourcesPane;
     use cockpit_core::engine::resource_scheduler::{
@@ -2758,41 +2758,96 @@ mod resource_button_dispatch_tests {
     };
     use cockpit_proto::ResourceQueuedState;
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn promote_button_enqueues_daemon_mutation_for_clicked_request() {
-        let mut pane = ResourcesPane::open();
-        let queued = ["rs-first", "rs-clicked"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, display_id)| ResourceQueuedSnapshot {
-                id: uuid::Uuid::new_v4(),
-                display_id: display_id.to_string(),
-                resources: ResourceRequirements::new([("cpu", 1)]),
-                metadata: ResourceRequestMetadata::default(),
-                queued_at_ms: index as i64,
-                wait_ms: index as u64,
-                state: ResourceQueuedState::Queued,
-                promoted_by: None,
-                promoted_at_ms: None,
-            })
-            .collect();
-        pane.apply_snapshot_result(Ok(ResourceSchedulerSnapshot {
+    fn scheduler_snapshot(display_ids: &[&str]) -> ResourceSchedulerSnapshot {
+        ResourceSchedulerSnapshot {
             enabled: true,
             pools: Vec::new(),
             running: Vec::new(),
-            queued,
+            queued: display_ids
+                .iter()
+                .enumerate()
+                .map(|(index, display_id)| ResourceQueuedSnapshot {
+                    id: uuid::Uuid::new_v4(),
+                    display_id: (*display_id).to_string(),
+                    resources: ResourceRequirements::new([("cpu", 1)]),
+                    metadata: ResourceRequestMetadata::default(),
+                    queued_at_ms: index as i64,
+                    wait_ms: index as u64,
+                    state: ResourceQueuedState::Queued,
+                    promoted_by: None,
+                    promoted_at_ms: None,
+                })
+                .collect(),
             max_queued: 16,
-        }));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn promote_button_enqueues_daemon_mutation_for_clicked_request() {
+        let mut pane = ResourcesPane::open();
+        pane.apply_snapshot_result(Ok(scheduler_snapshot(&["rs-first", "rs-clicked"])));
         let mut app = App::new(None, false);
         app.overlay = Overlay::Resources(pane);
 
-        app.dispatch_button(ButtonDispatch::ResourcePromote { index: 1 });
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: "rs-clicked".to_string(),
+        });
 
         assert_eq!(
             app.async_actions.pending_kinds(),
             vec![AsyncActionKind::DaemonRpc("resources.promote")]
         );
         assert!(matches!(app.overlay, Overlay::Resources(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_resource_completion_cannot_regress_newer_projection() {
+        let mut pane = ResourcesPane::open();
+        pane.apply_snapshot_result(Ok(scheduler_snapshot(&["rs-first", "rs-clicked"])));
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Resources(pane);
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: "rs-first".to_string(),
+        });
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: "rs-clicked".to_string(),
+        });
+        let ids = app.async_actions.pending_ids();
+        assert_eq!(
+            ids.len(),
+            2,
+            "resource mutations must remain serialized, not replaced"
+        );
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: ids[0],
+            kind: AsyncActionKind::DaemonRpc("resources.promote"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::PromoteResource {
+                status: cockpit_proto::ResourcePromoteStatus::Promoted,
+                message: "stale".to_string(),
+                snapshot: scheduler_snapshot(&["stale"]),
+            }),
+        });
+        let Overlay::Resources(pane) = &app.overlay else {
+            panic!("resources overlay")
+        };
+        assert_eq!(pane.queued_display_ids(), ["rs-first", "rs-clicked"]);
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: ids[1],
+            kind: AsyncActionKind::DaemonRpc("resources.promote"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::PromoteResource {
+                status: cockpit_proto::ResourcePromoteStatus::Promoted,
+                message: "fresh".to_string(),
+                snapshot: scheduler_snapshot(&["fresh"]),
+            }),
+        });
+        let Overlay::Resources(pane) = &app.overlay else {
+            panic!("resources overlay")
+        };
+        assert_eq!(pane.queued_display_ids(), ["fresh"]);
     }
 }
 

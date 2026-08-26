@@ -2098,6 +2098,10 @@ pub struct App {
     /// blocking filesystem/subprocess probes can complete through this tick
     /// drain instead of freezing the event loop.
     pub(super) async_actions: AsyncActionRunner,
+    /// Latest resource projection/mutation requested by this view. Resource
+    /// RPCs are serialized, and only this correlated completion may publish a
+    /// full scheduler snapshot; older snapshots are terminal but stale.
+    pub(super) pending_resource_action: Option<crate::tui::async_action::AsyncActionId>,
     /// Exact owner and phase of the one active `/mcp` local command. A newer
     /// command supersedes the old action; late or cancelled results cannot
     /// mutate the cached projection or print a success line.
@@ -3644,6 +3648,7 @@ impl App {
             pending_leak_reveal: None,
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
+            pending_resource_action: None,
             pending_mcp_local: None,
             mcp_local_snapshot: None,
             settings_blocking_actions: std::collections::HashMap::new(),

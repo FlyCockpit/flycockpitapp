@@ -6483,7 +6483,7 @@ impl SettingsDialog {
             page: root_page(0),
             stack: Vec::new(),
             cx: SettingsCx {
-                lifecycle: cockpit_client::LifecycleClient::channel(1).0,
+                lifecycle: cockpit_client::LifecycleClient::disconnected(),
                 dialog_id: uuid::Uuid::new_v4(),
                 daemon_effects: VecDeque::new(),
                 blocking_effects: VecDeque::new(),

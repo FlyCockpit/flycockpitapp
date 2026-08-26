@@ -123,6 +123,14 @@ impl LifecycleClient {
         (Self { requests }, receive)
     }
 
+    /// An explicitly unavailable lifecycle capability for presentation state
+    /// that must be bound by its host before it can enqueue daemon work.
+    pub fn disconnected() -> Self {
+        let (client, receive) = Self::channel(1);
+        drop(receive);
+        client
+    }
+
     pub async fn resolve(&self, intent: LifecycleIntent) -> Result<LifecycleResolution, String> {
         let (reply, receive) = oneshot::channel();
         self.requests

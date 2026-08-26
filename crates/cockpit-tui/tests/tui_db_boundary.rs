@@ -13,18 +13,31 @@ fn read(relative: &str) -> String {
 }
 
 fn cfg_test_only(attributes: &[syn::Attribute]) -> bool {
+    fn requires_test(meta: &syn::Meta) -> bool {
+        match meta {
+            syn::Meta::Path(path) => path.is_ident("test"),
+            syn::Meta::List(list) if list.path.is_ident("all") => list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .is_ok_and(|items| items.iter().any(requires_test)),
+            syn::Meta::List(list) if list.path.is_ident("any") => list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .is_ok_and(|items| !items.is_empty() && items.iter().all(requires_test)),
+            syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
+        }
+    }
     attributes.iter().any(|attribute| {
         if !attribute.path().is_ident("cfg") {
             return false;
         }
-        let compact: String = attribute
-            .meta
-            .to_token_stream()
-            .to_string()
-            .chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect();
-        compact == "cfg(test)"
+        let syn::Meta::List(cfg) = &attribute.meta else {
+            return false;
+        };
+        cfg.parse_args::<syn::Meta>()
+            .is_ok_and(|predicate| requires_test(&predicate))
     })
 }
 
@@ -364,6 +377,24 @@ fn tui_sources() -> String {
                 collect(&path, out);
             } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
                 out.push_str(&fs::read_to_string(path).unwrap());
+            }
+        }
+    }
+    let mut sources = String::new();
+    collect(&repo_root().join("crates/cockpit-tui/src"), &mut sources);
+    sources
+}
+
+fn tui_production_sources() -> String {
+    fn collect(path: &Path, out: &mut String) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("rs")
+                && !is_explicit_cfg_test_module(&path)
+            {
+                out.push_str(&production_source(&fs::read_to_string(path).unwrap()));
             }
         }
     }
@@ -1816,6 +1847,8 @@ fn pasted_images_use_opaque_daemon_retained_ingress() {
 fn daemon_lifecycle_and_reconnect_authority_is_injected() {
     const FORBIDDEN: &[&str] = &[
         "DaemonClient::connect(",
+        "LifecycleClient::channel(",
+        "serve_lifecycle_requests",
         "probe_or_spawn",
         "spawn_detached",
         "ensure_persistent_daemon",
@@ -1823,6 +1856,10 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         "OwnedDaemonGuard",
         "cockpit_core::daemon::discover",
         "cockpit_core::daemon::probe",
+        "request_on_socket",
+        "daemon_reveal_leak_blocking(&socket",
+        "tokio::net::UnixStream::connect",
+        "UnixStream::connect",
     ];
 
     fn visit(path: &Path, findings: &mut Vec<String>) {
@@ -1839,8 +1876,21 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
                 continue;
             }
             let source = production_source(&fs::read_to_string(&path).unwrap());
+            let tokens: String = syn::parse_file(&source)
+                .expect("production TUI source remains parseable")
+                .to_token_stream()
+                .to_string()
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
             for forbidden in FORBIDDEN {
-                if source.contains(forbidden) {
+                if *forbidden == "UnixStream::connect"
+                    && path.ends_with("crates/cockpit-tui/src/clipboard/display.rs")
+                {
+                    continue;
+                }
+                let compact: String = forbidden.chars().filter(|ch| !ch.is_whitespace()).collect();
+                if tokens.contains(&compact) {
                     findings.push(format!(
                         "{} retains daemon lifecycle/reconnect authority `{forbidden}`",
                         path.strip_prefix(repo_root()).unwrap().display()
@@ -1859,9 +1909,19 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
     );
 
     let app = read("apps/cli/src/commands/tui.rs");
+    let app = production_source(&app);
+    let (run, run_with_session) = app
+        .split_once("pub async fn run_with_session")
+        .expect("CLI TUI composition must expose both run entrypoints");
+    assert!(run.contains("lifecycle_composition()"));
+    let run_with_session = run_with_session
+        .split_once("fn prepare_tui_workspace_trust")
+        .expect("CLI TUI run_with_session boundary remains explicit")
+        .0;
+    assert!(run_with_session.contains("lifecycle_composition()"));
     assert!(app.contains("LifecycleClient::channel"));
     assert!(app.contains("serve_lifecycle_requests"));
-    let tui = tui_sources();
+    let tui = tui_production_sources();
     for required in [
         "LifecycleIntent::AlwaysEphemeral",
         "LifecycleIntent::EnsurePersistent",
@@ -1873,4 +1933,24 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
             "TUI injection is missing {required}"
         );
     }
+}
+
+#[test]
+fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
+    let masked = production_source(
+        "#[cfg(all(unix, test))]\nfn hidden() { cockpit_client :: DaemonClient :: connect(path); }\n",
+    );
+    assert!(!masked.contains("DaemonClient"));
+
+    let still_production = production_source(
+        "#[cfg(any(unix, test))]\nfn visible() { cockpit_client :: DaemonClient :: connect(path); }\n",
+    );
+    assert!(still_production.contains("DaemonClient"));
+
+    let aliased = "use cockpit_client::DaemonClient as HiddenClient;";
+    let findings = obscured_authority_findings(aliased);
+    assert!(
+        !findings.is_empty(),
+        "renaming a daemon transport must not evade the authority inventory"
+    );
 }

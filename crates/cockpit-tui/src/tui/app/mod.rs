@@ -3579,7 +3579,7 @@ impl App {
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
-            lifecycle: lifecycle.unwrap_or_else(|| cockpit_client::LifecycleClient::channel(1).0),
+            lifecycle: lifecycle.unwrap_or_else(cockpit_client::LifecycleClient::disconnected),
             monotonic_origin: Instant::now(),
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,

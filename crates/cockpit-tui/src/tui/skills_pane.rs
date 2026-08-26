@@ -167,17 +167,24 @@ impl SkillsPane {
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
         *self.list.offset_mut() = self.list.offset().min(max_scroll);
 
+        let overflow = self.last_content_rows > self.last_body_height;
+        let (list_area, scrollbar_area) = if overflow && body.width >= 2 {
+            let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(1)]).split(body);
+            (cols[0], Some(cols[1]))
+        } else {
+            (body, None)
+        };
         let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
-        frame.render_stateful_widget(List::new(items), body, &mut self.list);
-        if self.last_content_rows > self.last_body_height && body.width > 0 {
+        frame.render_stateful_widget(List::new(items), list_area, &mut self.list);
+        if let Some(scrollbar_area) = scrollbar_area {
             let mut scrollbar = ScrollbarState::new(self.last_content_rows)
                 .position(self.list.offset())
-                .viewport_content_length(self.last_body_height);
+                .viewport_content_length(list_area.height as usize);
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .begin_symbol(None)
                     .end_symbol(None),
-                body,
+                scrollbar_area,
                 &mut scrollbar,
             );
         }
@@ -468,6 +475,8 @@ mod tests {
         );
         let scrolled = rendered_buffer(&mut pane, 32, 7);
         assert_ne!(narrow, scrolled);
+        assert!(scrolled.contains("技能-17"));
+        assert!(!scrolled.contains("技能-0 "));
 
         let wide = rendered_buffer(&mut pane, 90, 12);
         assert_eq!(
@@ -475,5 +484,25 @@ mod tests {
             bottom.min(pane.last_content_rows.saturating_sub(pane.last_body_height))
         );
         assert!(wide.contains("q quit"));
+    }
+
+    #[test]
+    fn scrollbar_has_a_reserved_column_and_does_not_overwrite_content_edge() {
+        let edge_name = format!("{}Z", "a".repeat(36));
+        let skills = std::iter::once(summary(&edge_name, "first", "/s"))
+            .chain((1..20).map(|index| summary(&format!("skill-{index}"), "desc", "/s")))
+            .collect();
+        let mut pane = pane_with(Ok(skills));
+        let mut terminal = Terminal::new(TestBackend::new(40, 7)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 40, 7)))
+            .expect("draw skills");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(37, 1)].symbol(), "Z");
+        assert_ne!(buffer[(38, 1)].symbol(), "Z");
+        assert!(
+            (1..5).any(|row| !buffer[(38, row)].symbol().trim().is_empty()),
+            "reserved rightmost body column contains the scrollbar"
+        );
     }
 }

@@ -69,6 +69,7 @@ pub struct NotesPane {
     /// Durable sidebar selection and viewport. The final selectable row is
     /// always the `+ new note` affordance at index `notes.len()`.
     sidebar: ListState,
+    selection: SidebarSelection,
     mode: Mode,
     /// The reused composer editing engine for the raw-markdown editor. Holds
     /// the note source while [`Mode::Editing`]; honors vim when enabled.
@@ -79,13 +80,23 @@ pub struct NotesPane {
     view_scroll: usize,
     /// Raw editor vertical scroll offset while editing a note.
     edit_scroll: usize,
+    /// Mouse-wheel scrolling temporarily owns the editor viewport. Any
+    /// subsequent keyboard edit/motion returns ownership to cursor follow.
+    edit_scroll_manual: bool,
     /// Last main-pane content width/height — for render-side scroll clamping.
     last_view_width: usize,
     last_view_height: usize,
     last_view_rows: usize,
+    last_edit_rows: usize,
     /// A transient error/status line shown under the sidebar (e.g. a failed
     /// DB write). Cleared on the next successful action.
     status: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarSelection {
+    Note(Uuid),
+    New,
 }
 
 /// Outcome of routing a key to the pane.
@@ -109,15 +120,22 @@ enum NotesRpcActionKind {
     Save { id: Uuid, content: String },
     Rename { id: Uuid, name: String },
     Create { name: String },
-    Delete { id: Uuid },
+    Delete { id: Uuid, fallback_index: usize },
 }
 
 #[derive(Debug, Clone)]
 pub struct NotesRpcResult {
     project_root: String,
     notes: Vec<ProjectNote>,
-    keep: Option<Uuid>,
+    selection: SelectionAfterRpc,
     enter_edit: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SelectionAfterRpc {
+    Preserve,
+    Keep(Uuid),
+    Deleted { fallback_index: usize },
 }
 
 impl NotesRpcAction {
@@ -140,7 +158,7 @@ impl NotesRpcAction {
                 Ok(NotesRpcResult {
                     project_root: response_project_root,
                     notes,
-                    keep,
+                    selection: keep.map_or(SelectionAfterRpc::Preserve, SelectionAfterRpc::Keep),
                     enter_edit: false,
                 })
             }
@@ -157,7 +175,7 @@ impl NotesRpcAction {
                 Ok(NotesRpcResult {
                     project_root: response_project_root,
                     notes,
-                    keep: Some(id),
+                    selection: SelectionAfterRpc::Keep(id),
                     enter_edit: false,
                 })
             }
@@ -174,7 +192,7 @@ impl NotesRpcAction {
                 Ok(NotesRpcResult {
                     project_root: response_project_root,
                     notes,
-                    keep: Some(id),
+                    selection: SelectionAfterRpc::Keep(id),
                     enter_edit: false,
                 })
             }
@@ -193,11 +211,11 @@ impl NotesRpcAction {
                 Ok(NotesRpcResult {
                     project_root: response_project_root,
                     notes,
-                    keep: Some(note.id),
+                    selection: SelectionAfterRpc::Keep(note.id),
                     enter_edit: true,
                 })
             }
-            NotesRpcActionKind::Delete { id } => {
+            NotesRpcActionKind::Delete { id, fallback_index } => {
                 send(Request::DeleteProjectNote {
                     project_root: project_root.clone(),
                     id,
@@ -209,7 +227,7 @@ impl NotesRpcAction {
                 Ok(NotesRpcResult {
                     project_root: response_project_root,
                     notes,
-                    keep: None,
+                    selection: SelectionAfterRpc::Deleted { fallback_index },
                     enter_edit: false,
                 })
             }
@@ -287,14 +305,17 @@ impl NotesPane {
             daemon_socket,
             notes: Vec::new(),
             sidebar: initial_sidebar_state(),
+            selection: SidebarSelection::New,
             mode: Mode::Browsing,
             editor: Composer::new(vim_enabled),
             vim_enabled,
             view_scroll: 0,
             edit_scroll: 0,
+            edit_scroll_manual: false,
             last_view_width: 0,
             last_view_height: 0,
             last_view_rows: 0,
+            last_edit_rows: 0,
             status,
         }
     }
@@ -309,15 +330,29 @@ impl NotesPane {
 
     /// Currently-selected note, if any.
     fn current(&self) -> Option<&ProjectNote> {
-        self.notes.get(self.selected_index())
+        let SidebarSelection::Note(id) = self.selection else {
+            return None;
+        };
+        self.notes.iter().find(|note| note.id == id)
     }
 
     fn selected_index(&self) -> usize {
-        self.sidebar.selected().unwrap_or(0)
+        match self.selection {
+            SidebarSelection::Note(id) => self
+                .notes
+                .iter()
+                .position(|note| note.id == id)
+                .unwrap_or(self.notes.len()),
+            SidebarSelection::New => self.notes.len(),
+        }
     }
 
     fn select_sidebar(&mut self, index: usize) {
-        self.sidebar.select(Some(index.min(self.notes.len())));
+        let index = index.min(self.notes.len());
+        self.selection = self.notes.get(index).map_or(SidebarSelection::New, |note| {
+            SidebarSelection::Note(note.id)
+        });
+        self.sidebar.select(Some(index));
     }
 
     pub fn apply_rpc_result(&mut self, result: Result<NotesRpcResult, String>) {
@@ -326,15 +361,39 @@ impl NotesPane {
                 if result.project_root != self.project_root {
                     return;
                 }
+                let old_index = self.selected_index();
+                let old_selection = self.selection;
                 self.notes = result.notes;
-                if let Some(id) = result.keep
-                    && let Some(idx) = self.notes.iter().position(|n| n.id == id)
-                {
-                    self.select_sidebar(idx);
-                }
-                if self.selected_index() >= self.notes.len() {
-                    self.select_sidebar(self.notes.len().saturating_sub(1));
-                }
+                let requested = match result.selection {
+                    SelectionAfterRpc::Preserve => old_selection,
+                    SelectionAfterRpc::Keep(id) => SidebarSelection::Note(id),
+                    SelectionAfterRpc::Deleted { fallback_index } => {
+                        self.notes.get(fallback_index).map_or_else(
+                            || {
+                                self.notes.last().map_or(SidebarSelection::New, |note| {
+                                    SidebarSelection::Note(note.id)
+                                })
+                            },
+                            |note| SidebarSelection::Note(note.id),
+                        )
+                    }
+                };
+                let resolved = match requested {
+                    SidebarSelection::New => SidebarSelection::New,
+                    SidebarSelection::Note(id) if self.notes.iter().any(|note| note.id == id) => {
+                        SidebarSelection::Note(id)
+                    }
+                    SidebarSelection::Note(_) => self.notes.get(old_index).map_or_else(
+                        || {
+                            self.notes.last().map_or(SidebarSelection::New, |note| {
+                                SidebarSelection::Note(note.id)
+                            })
+                        },
+                        |note| SidebarSelection::Note(note.id),
+                    ),
+                };
+                self.selection = resolved;
+                self.sidebar.select(Some(self.selected_index()));
                 self.mode = Mode::Browsing;
                 self.status = None;
                 if result.enter_edit {
@@ -363,6 +422,8 @@ impl NotesPane {
         self.editor.set(content);
         // Park the cursor at the start so a fresh edit begins at the top.
         self.editor.set_cursor(0);
+        self.edit_scroll = 0;
+        self.edit_scroll_manual = false;
         self.mode = Mode::Editing;
     }
 
@@ -524,7 +585,10 @@ impl NotesPane {
                 if let Some(note) = self.current() {
                     let id = note.id;
                     self.mode = Mode::Browsing;
-                    if let Some(action) = self.action(NotesRpcActionKind::Delete { id }) {
+                    let fallback_index = self.selected_index();
+                    if let Some(action) =
+                        self.action(NotesRpcActionKind::Delete { id, fallback_index })
+                    {
                         return NotesOutcome::Rpc(action);
                     };
                     self.status = Some("notes db unavailable".to_string());
@@ -549,6 +613,7 @@ impl NotesPane {
             use crate::tui::composer::VimMode;
             if self.vim_enabled && self.editor.vim_mode() != VimMode::Normal {
                 // Let the editor handle Esc (Insert/Visual/Operator → Normal).
+                self.edit_scroll_manual = false;
                 self.editor.handle_vim_key(key);
             } else {
                 // Already in Normal (or vim off): leave edit mode, saving.
@@ -558,6 +623,7 @@ impl NotesPane {
         }
         // Everything else is editing — driven through the reused composer vim
         // engine (or plain insert when vim is off).
+        self.edit_scroll_manual = false;
         self.editor.handle_vim_key(key);
         NotesOutcome::Stay
     }
@@ -569,12 +635,29 @@ impl NotesPane {
 
     /// Mouse-wheel scroll for the viewed note.
     pub fn scroll_up(&mut self) {
-        self.view_scroll = self.view_scroll.saturating_sub(1);
+        match self.mode {
+            Mode::Editing => {
+                self.edit_scroll = self.edit_scroll.saturating_sub(1);
+                self.edit_scroll_manual = true;
+            }
+            Mode::Browsing => self.view_scroll = self.view_scroll.saturating_sub(1),
+            Mode::Naming { .. } | Mode::ConfirmingDelete => {}
+        }
     }
 
     pub fn scroll_down(&mut self) {
-        let max_scroll = self.last_view_rows.saturating_sub(self.last_view_height);
-        self.view_scroll = (self.view_scroll + 1).min(max_scroll);
+        match self.mode {
+            Mode::Editing => {
+                let max_scroll = self.last_edit_rows.saturating_sub(self.last_view_height);
+                self.edit_scroll = (self.edit_scroll + 1).min(max_scroll);
+                self.edit_scroll_manual = true;
+            }
+            Mode::Browsing => {
+                let max_scroll = self.last_view_rows.saturating_sub(self.last_view_height);
+                self.view_scroll = (self.view_scroll + 1).min(max_scroll);
+            }
+            Mode::Naming { .. } | Mode::ConfirmingDelete => {}
+        }
     }
 
     #[cfg(test)]
@@ -584,14 +667,17 @@ impl NotesPane {
             daemon_socket: Some(std::path::PathBuf::from("/test-daemon.sock")),
             notes: Vec::new(),
             sidebar: initial_sidebar_state(),
+            selection: SidebarSelection::New,
             mode: Mode::Editing,
             editor: Composer::new(vim_enabled),
             vim_enabled,
             view_scroll: 0,
             edit_scroll: 0,
+            edit_scroll_manual: false,
             last_view_width: 80,
             last_view_height: 24,
             last_view_rows: 0,
+            last_edit_rows: 0,
             status: None,
         };
         pane.editor.set(content.to_string());
@@ -658,22 +744,25 @@ impl NotesPane {
         } else {
             Style::default()
         };
+        let row_count = self.notes.len() + 1;
+        self.sidebar.select(Some(self.selected_index()));
+        let (list_content, scrollbar_area) =
+            scrollbar_areas(list_area, row_count > list_area.height as usize);
         frame.render_stateful_widget(
             List::new(items).highlight_style(highlight),
-            list_area,
+            list_content,
             &mut self.sidebar,
         );
 
-        let row_count = self.notes.len() + 1;
-        if row_count > list_area.height as usize && list_area.width > 0 {
+        if let Some(scrollbar_area) = scrollbar_area {
             let mut scrollbar = ScrollbarState::new(row_count)
                 .position(self.sidebar.offset())
-                .viewport_content_length(list_area.height as usize);
+                .viewport_content_length(list_content.height as usize);
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .begin_symbol(None)
                     .end_symbol(None),
-                list_area,
+                scrollbar_area,
                 &mut scrollbar,
             );
         }
@@ -732,10 +821,7 @@ impl NotesPane {
             }
             Mode::Editing => {
                 // Raw editable markdown source (never rendered while editing).
-                let width = area.width.max(1) as usize;
                 let height = area.height.max(1) as usize;
-                self.last_view_width = width;
-                self.last_view_height = height;
                 let text = self.editor.text().to_string();
                 let lines: Vec<Line<'static>> = if text.is_empty() {
                     vec![Line::default()]
@@ -744,19 +830,26 @@ impl NotesPane {
                         .map(|l| Line::from(l.to_string()))
                         .collect()
                 };
-                let (cursor_line, cursor_col) = self.editor.cursor_line_col();
+                self.last_edit_rows = lines.len();
                 let max_scroll = lines.len().saturating_sub(height);
-                if cursor_line < self.edit_scroll {
-                    self.edit_scroll = cursor_line;
-                } else if cursor_line >= self.edit_scroll + height {
-                    self.edit_scroll = cursor_line.saturating_sub(height.saturating_sub(1));
+                let (content_area, scrollbar_area) = scrollbar_areas(area, max_scroll > 0);
+                let width = content_area.width.max(1) as usize;
+                self.last_view_width = width;
+                self.last_view_height = height;
+                let (cursor_line, cursor_col) = self.editor.cursor_line_col();
+                if !self.edit_scroll_manual {
+                    if cursor_line < self.edit_scroll {
+                        self.edit_scroll = cursor_line;
+                    } else if cursor_line >= self.edit_scroll + height {
+                        self.edit_scroll = cursor_line.saturating_sub(height.saturating_sub(1));
+                    }
                 }
                 self.edit_scroll = self.edit_scroll.min(max_scroll);
                 frame.render_widget(
                     Paragraph::new(lines).scroll((self.edit_scroll as u16, 0)),
-                    area,
+                    content_area,
                 );
-                if max_scroll > 0 && area.width > 0 {
+                if let Some(scrollbar_area) = scrollbar_area {
                     let mut scrollbar = ScrollbarState::new(max_scroll + height)
                         .position(self.edit_scroll)
                         .viewport_content_length(height);
@@ -764,23 +857,24 @@ impl NotesPane {
                         Scrollbar::new(ScrollbarOrientation::VerticalRight)
                             .begin_symbol(None)
                             .end_symbol(None),
-                        area,
+                        scrollbar_area,
                         &mut scrollbar,
                     );
                 }
-                let cursor_y = area.y + cursor_line.saturating_sub(self.edit_scroll) as u16;
-                let cursor_x = area.x + (cursor_col.min(width.saturating_sub(1)) as u16);
-                if cursor_y < area.y + area.height {
+                let cursor_y = content_area.y + cursor_line.saturating_sub(self.edit_scroll) as u16;
+                let cursor_x = content_area.x + (cursor_col.min(width.saturating_sub(1)) as u16);
+                if cursor_y < content_area.y + content_area.height
+                    && cursor_line >= self.edit_scroll
+                {
                     frame.set_cursor_position((cursor_x, cursor_y));
                 }
             }
             Mode::Browsing => {
-                let width = area.width.max(1) as usize;
-                self.last_view_width = width;
                 self.last_view_height = area.height as usize;
-                let lines = match self.current() {
-                    Some(note) if !note.content.is_empty() => {
-                        markdown::render_with_width(&note.content, width)
+                let note_content = self.current().map(|note| note.content.clone());
+                let render_lines = |width: usize| match note_content.as_deref() {
+                    Some(content) if !content.is_empty() => {
+                        markdown::render_with_width(content, width)
                     }
                     Some(_) => vec![Line::from(Span::styled(
                         "(empty note — press e or ↵ to edit)",
@@ -791,6 +885,17 @@ impl NotesPane {
                         Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
                     ))],
                 };
+                let full_width = area.width.max(1) as usize;
+                let initial_lines = render_lines(full_width);
+                let overflow = initial_lines.len() > self.last_view_height;
+                let (content_area, scrollbar_area) = scrollbar_areas(area, overflow);
+                let width = content_area.width.max(1) as usize;
+                let lines = if width == full_width {
+                    initial_lines
+                } else {
+                    render_lines(width)
+                };
+                self.last_view_width = width;
                 self.last_view_rows = lines.len();
                 let max_scroll = self.last_view_rows.saturating_sub(self.last_view_height);
                 if self.view_scroll > max_scroll {
@@ -798,9 +903,9 @@ impl NotesPane {
                 }
                 frame.render_widget(
                     Paragraph::new(lines).scroll((self.view_scroll as u16, 0)),
-                    area,
+                    content_area,
                 );
-                if max_scroll > 0 && area.width > 0 {
+                if let Some(scrollbar_area) = scrollbar_area {
                     let mut scrollbar = ScrollbarState::new(self.last_view_rows)
                         .position(self.view_scroll)
                         .viewport_content_length(self.last_view_height);
@@ -808,7 +913,7 @@ impl NotesPane {
                         Scrollbar::new(ScrollbarOrientation::VerticalRight)
                             .begin_symbol(None)
                             .end_symbol(None),
-                        area,
+                        scrollbar_area,
                         &mut scrollbar,
                     );
                 }
@@ -835,6 +940,14 @@ fn initial_sidebar_state() -> ListState {
     state
 }
 
+fn scrollbar_areas(area: Rect, overflow: bool) -> (Rect, Option<Rect>) {
+    if !overflow || area.width < 2 {
+        return (area, None);
+    }
+    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    (cols[0], Some(cols[1]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,26 +964,32 @@ mod tests {
     }
 
     fn pane(connected: bool) -> NotesPane {
-        NotesPane {
+        let id = Uuid::new_v4();
+        let mut pane = NotesPane {
             project_root: "/proj".to_string(),
             daemon_socket: connected.then(|| std::path::PathBuf::from("/test-daemon.sock")),
             notes: vec![ProjectNote {
-                id: Uuid::new_v4(),
+                id,
                 project_root: "/proj".into(),
                 name: "ideas".into(),
                 content: "before".into(),
             }],
             sidebar: initial_sidebar_state(),
+            selection: SidebarSelection::Note(id),
             mode: Mode::Browsing,
             editor: Composer::new(false),
             vim_enabled: false,
             view_scroll: 0,
             edit_scroll: 0,
+            edit_scroll_manual: false,
             last_view_width: 80,
             last_view_height: 24,
             last_view_rows: 0,
+            last_edit_rows: 0,
             status: None,
-        }
+        };
+        pane.sidebar.select(Some(0));
+        pane
     }
 
     fn note(id: Uuid, name: impl Into<String>, content: impl Into<String>) -> ProjectNote {
@@ -938,7 +1057,7 @@ mod tests {
                 note(Uuid::new_v4(), "first", "one"),
                 note(keep, "選択中 🚀", "two"),
             ],
-            keep: Some(keep),
+            selection: SelectionAfterRpc::Keep(keep),
             enter_edit: false,
         }));
         assert_eq!(pane.selected_index(), 2);
@@ -952,6 +1071,93 @@ mod tests {
             pane.handle_key(press(KeyCode::Up));
         }
         assert_eq!(pane.selected_index(), 0);
+    }
+
+    #[test]
+    fn refresh_preserves_new_and_note_id_and_has_defined_missing_fallbacks() {
+        let selected = Uuid::new_v4();
+        let mut pane = pane(true);
+        pane.notes = vec![
+            note(Uuid::new_v4(), "a", "a"),
+            note(selected, "selected", "b"),
+        ];
+
+        pane.select_sidebar(pane.notes.len());
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: (0..8)
+                .map(|index| note(Uuid::new_v4(), format!("new-{index}"), "x"))
+                .collect(),
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(pane.selection, SidebarSelection::New);
+        assert_eq!(pane.selected_index(), pane.notes.len());
+
+        pane.notes = vec![
+            note(Uuid::new_v4(), "before", "a"),
+            note(selected, "selected", "b"),
+            note(Uuid::new_v4(), "after", "c"),
+        ];
+        pane.select_sidebar(1);
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: vec![
+                note(Uuid::new_v4(), "after", "c"),
+                note(selected, "selected", "b"),
+                note(Uuid::new_v4(), "before", "a"),
+            ],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(pane.selection, SidebarSelection::Note(selected));
+        assert_eq!(pane.selected_index(), 1);
+
+        let fallback = pane.notes[1].id;
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: pane.notes.clone(),
+            selection: SelectionAfterRpc::Keep(Uuid::new_v4()),
+            enter_edit: false,
+        }));
+        assert_eq!(pane.selection, SidebarSelection::Note(fallback));
+
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: Vec::new(),
+            selection: SelectionAfterRpc::Deleted { fallback_index: 1 },
+            enter_edit: false,
+        }));
+        assert_eq!(pane.selection, SidebarSelection::New);
+        assert_eq!(pane.selected_index(), 0);
+    }
+
+    #[test]
+    fn delete_fallback_selects_next_then_clamps_to_previous() {
+        let mut pane = pane(true);
+        let first = Uuid::new_v4();
+        let next = Uuid::new_v4();
+        pane.notes = vec![
+            note(first, "first", "a"),
+            note(Uuid::new_v4(), "deleted", "b"),
+            note(next, "next", "c"),
+        ];
+        pane.select_sidebar(1);
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: vec![note(first, "first", "a"), note(next, "next", "c")],
+            selection: SelectionAfterRpc::Deleted { fallback_index: 1 },
+            enter_edit: false,
+        }));
+        assert_eq!(pane.selection, SidebarSelection::Note(next));
+
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: vec![note(first, "first", "a")],
+            selection: SelectionAfterRpc::Deleted { fallback_index: 1 },
+            enter_edit: false,
+        }));
+        assert_eq!(pane.selection, SidebarSelection::Note(first));
     }
 
     #[test]
@@ -984,6 +1190,15 @@ mod tests {
         let narrow = rendered_buffer(&mut pane, 58, 10);
         assert!(narrow.contains("筆記-0"));
         assert!(pane.last_view_rows > pane.last_view_height);
+        let narrow_rows = pane.last_view_rows;
+        let narrow_max_scroll = pane.last_view_rows.saturating_sub(pane.last_view_height);
+
+        pane.select_sidebar(pane.notes.len() - 1);
+        let offscreen_selected = rendered_buffer(&mut pane, 58, 10);
+        assert!(pane.sidebar.offset() > 0);
+        assert!(offscreen_selected.contains("筆記-23"));
+        assert!(!offscreen_selected.contains("筆記-0 "));
+        pane.select_sidebar(0);
 
         for _ in 0..200 {
             pane.scroll_down();
@@ -1001,5 +1216,106 @@ mod tests {
         let resized = rendered_buffer(&mut pane, 90, 16);
         assert!(resized.contains("/scratchpad"));
         assert!(pane.view_scroll <= pane.last_view_rows.saturating_sub(pane.last_view_height));
+        assert!(pane.last_view_rows < narrow_rows);
+        assert!(
+            pane.last_view_rows.saturating_sub(pane.last_view_height) < narrow_max_scroll,
+            "wider/taller resize must reduce the wrapped-note scroll range"
+        );
+    }
+
+    #[test]
+    fn editor_wheel_owns_viewport_until_keyboard_motion_reenables_cursor_follow() {
+        let content = (0..30)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut pane = NotesPane::editing_for_test(&content, false);
+        rendered_buffer(&mut pane, 60, 8);
+        assert!(pane.last_edit_rows > pane.last_view_height);
+        let cursor_follow_bottom = pane.edit_scroll;
+
+        pane.scroll_up();
+        pane.scroll_up();
+        assert!(pane.edit_scroll_manual);
+        assert_eq!(pane.edit_scroll, cursor_follow_bottom.saturating_sub(2));
+        let manual_scroll = pane.edit_scroll;
+        rendered_buffer(&mut pane, 60, 8);
+        assert_eq!(pane.edit_scroll, manual_scroll);
+
+        pane.handle_key(press(KeyCode::Up));
+        assert!(!pane.edit_scroll_manual);
+        rendered_buffer(&mut pane, 60, 8);
+        assert!(pane.edit_scroll >= manual_scroll);
+        for _ in 0..100 {
+            pane.scroll_down();
+        }
+        assert_eq!(
+            pane.edit_scroll,
+            pane.last_edit_rows.saturating_sub(pane.last_view_height)
+        );
+    }
+
+    #[test]
+    fn editor_scrollbar_reserves_the_rightmost_content_cell() {
+        let first_line = format!("{}Z", "a".repeat(28));
+        let content = std::iter::once(first_line)
+            .chain((1..20).map(|index| format!("line {index}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut pane = NotesPane::editing_for_test(&content, false);
+        pane.editor.set_cursor(0);
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 60, 8)))
+            .expect("draw notes editor");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(57, 1)].symbol(), "Z");
+        assert_ne!(buffer[(58, 1)].symbol(), "Z");
+        assert!(
+            (1..7).any(|row| !buffer[(58, row)].symbol().trim().is_empty()),
+            "reserved rightmost editor column contains the scrollbar"
+        );
+    }
+
+    #[test]
+    fn sidebar_and_markdown_scrollbars_reserve_their_rightmost_content_cells() {
+        let edge_name = format!("{}Z", "n".repeat(24));
+        let edge_content = std::iter::once(format!("{}Z", "m".repeat(28)))
+            .chain((1..20).map(|index| format!("markdown row {index}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let selected = Uuid::new_v4();
+        let mut pane = pane(true);
+        pane.notes = std::iter::once(note(selected, edge_name, edge_content))
+            .chain((1..20).map(|index| {
+                note(
+                    Uuid::new_v4(),
+                    format!("note-{index}"),
+                    format!("row {index}"),
+                )
+            }))
+            .collect();
+        pane.selection = SidebarSelection::Note(selected);
+        pane.sidebar.select(Some(0));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 60, 8)))
+            .expect("draw notes");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(pane.last_view_width, 29);
+        assert_eq!(buffer[(26, 1)].symbol(), "Z");
+        assert_ne!(buffer[(27, 1)].symbol(), "Z");
+        assert!(
+            (1..5).any(|row| !buffer[(27, row)].symbol().trim().is_empty()),
+            "reserved sidebar column contains its scrollbar"
+        );
+        assert_eq!(buffer[(57, 1)].symbol(), "Z");
+        assert_ne!(buffer[(58, 1)].symbol(), "Z");
+        assert!(
+            (1..7).any(|row| !buffer[(58, row)].symbol().trim().is_empty()),
+            "reserved markdown column contains its scrollbar"
+        );
     }
 }

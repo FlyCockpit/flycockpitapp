@@ -998,7 +998,9 @@ CREATE INDEX idx_media_downstream_invocation ON media_downstream_ownership(invoc
 
 CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at_unix_ms DESC);
 CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at_unix_ms DESC);
-CREATE INDEX idx_sessions_open            ON sessions (ended_at_unix_ms) WHERE ended_at_unix_ms IS NULL;
+CREATE INDEX idx_sessions_open
+    ON sessions (ephemeral, last_active_at_unix_ms DESC)
+    WHERE ended_at_unix_ms IS NULL;
 CREATE INDEX idx_sessions_parent_fork_point ON sessions(parent_session_id, fork_point_turn_id);
 CREATE INDEX idx_sessions_parent_started ON sessions (parent_session_id, started_at_unix_ms DESC);
 CREATE INDEX idx_sessions_parent          ON sessions (parent_session_id);

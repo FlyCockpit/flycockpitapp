@@ -9,9 +9,11 @@ const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "507d665693bbdec5536d9515a02d413a62371ee72f7de688509ac8a3de257eae";
+    "5c15f7acb82576b40c178036da773a5963de471b79f3c899599048f902df4f64";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
     "e32fef009c919d44dd8de06788cc473394959a8835de3d4f40dc4bd4a62ed1e2";
+const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
+    "7bfa5210915fa6c642baba54f6281786164efa8159c243d207be3d187826c88f";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {
@@ -72,8 +74,7 @@ fn structurally_owned_identifier_columns(
                 .primary_keys
                 .iter()
                 .chain(&table.unique_keys)
-                .flatten()
-                .cloned()
+                .flat_map(|key| key.columns.iter().cloned())
                 .collect::<std::collections::BTreeSet<_>>();
             columns.extend(
                 schema
@@ -99,6 +100,115 @@ fn source(path: impl AsRef<Path>) -> String {
     std::fs::read_to_string(path).expect("read production query owner")
 }
 
+#[derive(Clone, Copy)]
+struct SourceSpan {
+    start_line: usize,
+    start_column: usize,
+    end_line: usize,
+    end_column: usize,
+}
+
+fn literal_spans(source: &str) -> Vec<SourceSpan> {
+    fn record_macro_literals(tokens: proc_macro2::TokenStream, output: &mut Vec<SourceSpan>) {
+        for token in tokens {
+            match token {
+                proc_macro2::TokenTree::Group(group) => {
+                    record_macro_literals(group.stream(), output);
+                }
+                proc_macro2::TokenTree::Literal(literal) => {
+                    let start = literal.span().start();
+                    let end = literal.span().end();
+                    output.push(SourceSpan {
+                        start_line: start.line,
+                        start_column: start.column,
+                        end_line: end.line,
+                        end_column: end.column,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    struct Literals(Vec<SourceSpan>);
+    impl<'ast> syn::visit::Visit<'ast> for Literals {
+        fn visit_lit(&mut self, literal: &'ast syn::Lit) {
+            let start = syn::spanned::Spanned::span(literal).start();
+            let end = syn::spanned::Spanned::span(literal).end();
+            self.0.push(SourceSpan {
+                start_line: start.line,
+                start_column: start.column,
+                end_line: end.line,
+                end_column: end.column,
+            });
+        }
+
+        fn visit_macro(&mut self, invocation: &'ast syn::Macro) {
+            record_macro_literals(invocation.tokens.clone(), &mut self.0);
+        }
+    }
+    let mut literals = Literals(Vec::new());
+    syn::visit::Visit::visit_file(&mut literals, &syn::parse_file(source).unwrap());
+    literals.0
+}
+
+fn span_contains(span: SourceSpan, line: usize, column: usize) -> bool {
+    (line > span.start_line || line == span.start_line && column >= span.start_column)
+        && (line < span.end_line || line == span.end_line && column < span.end_column)
+}
+
+fn hot_query_comments(source: &str) -> Vec<(usize, String)> {
+    let literal_spans = literal_spans(source);
+    let mut markers = Vec::new();
+    let mut block_comment_depth = 0_u32;
+    for (line_offset, line) in source.lines().enumerate() {
+        let line_number = line_offset + 1;
+        let bytes = line.as_bytes();
+        let mut column = 0;
+        while column + 1 < bytes.len() {
+            if literal_spans
+                .iter()
+                .any(|span| span_contains(*span, line_number, column))
+            {
+                column += 1;
+                continue;
+            }
+            match (bytes[column], bytes[column + 1], block_comment_depth) {
+                (b'/', b'*', _) => {
+                    block_comment_depth = block_comment_depth
+                        .checked_add(1)
+                        .expect("Rust block-comment nesting overflow");
+                    column += 2;
+                }
+                (b'*', b'/', depth) if depth > 0 => {
+                    block_comment_depth -= 1;
+                    column += 2;
+                }
+                (b'/', b'/', 0) => {
+                    if let Some(marker) =
+                        line[column + 2..].trim().strip_prefix("schema-hot-query:")
+                    {
+                        assert!(
+                            line[..column].trim().is_empty(),
+                            "hot-query marker must be a standalone line comment"
+                        );
+                        let marker = marker.trim();
+                        assert!(!marker.is_empty(), "hot-query marker cannot be empty");
+                        markers.push((line_number, marker.to_owned()));
+                    }
+                    break;
+                }
+                _ => column += 1,
+            }
+        }
+    }
+    assert_eq!(
+        block_comment_depth, 0,
+        "unterminated Rust block comment in query owner"
+    );
+    markers
+}
+
 fn annotated_sql_literal(source: &str, marker: &str) -> String {
     struct Literals(Vec<(usize, String)>);
     impl<'ast> syn::visit::Visit<'ast> for Literals {
@@ -106,11 +216,10 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
             self.0.push((literal.span().start().line, literal.value()));
         }
     }
-    let marker_lines = source
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains(&format!("schema-hot-query: {marker}")))
-        .map(|(line, _)| line + 1)
+    let marker_lines = hot_query_comments(source)
+        .into_iter()
+        .filter(|(_, candidate)| candidate == marker)
+        .map(|(line, _)| line)
         .collect::<Vec<_>>();
     assert_eq!(
         marker_lines.len(),
@@ -119,13 +228,18 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
     );
     let mut literals = Literals(Vec::new());
     syn::visit::Visit::visit_file(&mut literals, &syn::parse_file(source).unwrap());
-    literals
+    let bound = literals
         .0
         .into_iter()
-        .filter(|(line, _)| *line > marker_lines[0])
-        .min_by_key(|(line, _)| *line)
+        .filter(|(line, _)| *line == marker_lines[0] + 1)
         .map(|(_, value)| value)
-        .expect("annotated query must be followed by a Rust SQL literal")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bound.len(),
+        1,
+        "hot-query marker must immediately precede exactly one Rust SQL literal: {marker}"
+    );
+    bound.into_iter().next().unwrap()
 }
 
 fn normalized_sql(sql: &str) -> String {
@@ -156,6 +270,29 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
     assert!(
         std::panic::catch_unwind(|| annotated_sql_literal(duplicate, "reviewed.shape")).is_err()
     );
+    let spoofed = r###"
+        fn owner() {
+            let raw = r#"
+                // schema-hot-query: reviewed.shape
+            "#;
+            /*
+                // schema-hot-query: reviewed.shape
+            */
+            println!(r#"
+                // schema-hot-query: reviewed.shape
+            "#);
+            // schema-hot-query: reviewed.shape
+            "SELECT exact FROM owned WHERE id=?1";
+        }
+    "###;
+    assert_eq!(
+        hot_query_comments(spoofed),
+        vec![(12, "reviewed.shape".to_owned())]
+    );
+    assert_eq!(
+        annotated_sql_literal(spoofed, "reviewed.shape"),
+        "SELECT exact FROM owned WHERE id=?1"
+    );
 }
 
 fn workspace() -> PathBuf {
@@ -174,6 +311,29 @@ fn rust_sources_below(root: &Path, relative: &Path, output: &mut Vec<PathBuf>) {
             output.push(child);
         }
     }
+}
+
+fn production_rust_sources(root: &Path) -> Vec<PathBuf> {
+    let mut output = Vec::new();
+    for family in ["apps", "crates"] {
+        let family_root = root.join(family);
+        for entry in std::fs::read_dir(&family_root).expect("read Rust workspace family") {
+            let entry = entry.expect("read Rust workspace member");
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let relative_src = Path::new(family).join(entry.file_name()).join("src");
+            if root.join(&relative_src).is_dir() {
+                rust_sources_below(root, &relative_src, &mut output);
+            }
+        }
+    }
+    output.sort();
+    output
+}
+
+fn portable_relative_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn effective_profiles() -> [(&'static str, schema_parser::Schema); 2] {
@@ -210,7 +370,7 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
                 assert!(
                     matches!(
                         foreign_key.on_delete.as_deref(),
-                        Some("cascade" | "restrict" | "set null" | "no action")
+                        Some("cascade" | "restrict" | "set null" | "set default" | "no action")
                     ),
                     "{profile}.{table_name} lacks an explicit ON DELETE action: {foreign_key:?}"
                 );
@@ -241,6 +401,11 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
             }
         }
     }
+
+    assert!(
+        std::panic::catch_unwind(|| schema_parser::parse(&[EXTENDED_SCHEMA])).is_err(),
+        "the extended layer unexpectedly became a standalone or first-applied schema"
+    );
 }
 
 fn validate_relationship_inventory(
@@ -298,8 +463,14 @@ fn validate_relationship_inventory(
 
     for ((table_name, column), class) in effective_rows {
         let table = &schema.tables[table_name];
-        let primary = table.primary_keys.iter().any(|key| key.contains(column));
-        let unique = table.unique_keys.iter().any(|key| key.contains(column))
+        let primary = table
+            .primary_keys
+            .iter()
+            .any(|key| key.columns.contains(column));
+        let unique = table
+            .unique_keys
+            .iter()
+            .any(|key| key.columns.contains(column))
             || schema.indexes.iter().any(|index| {
                 index.table == *table_name
                     && index.unique
@@ -352,13 +523,12 @@ fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
         schema_digest(EXTENDED_SCHEMA),
         EXTENDED_SCHEMA_REVIEW_DIGEST
     );
+    assert_eq!(
+        schema_digest(RELATIONSHIP_INVENTORY),
+        RELATIONSHIP_INVENTORY_REVIEW_DIGEST
+    );
     let [(_, local), (_, extended)] = effective_profiles();
     let inventory = relationship_inventory();
-    assert_eq!(
-        inventory.len(),
-        778,
-        "reviewed identity-map cardinality drifted"
-    );
     let local_tables = local
         .tables
         .keys()
@@ -437,7 +607,10 @@ fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
         .get_mut("sessions")
         .unwrap()
         .unique_keys
-        .push(vec!["unreviewed_authority_ref".to_owned()]);
+        .push(schema_parser::Key {
+            columns: vec!["unreviewed_authority_ref".to_owned()],
+            collations: vec![None],
+        });
     assert!(
         validate_relationship_inventory("adversarial", &local, tables.clone(), &inventory)
             .unwrap_err()
@@ -456,13 +629,50 @@ fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
         .find(|(_, class)| **class == RelationshipClass::Foreign)
         .map(|(identity, _)| identity.clone())
         .unwrap();
-    let mut misclassified = inventory;
-    misclassified.insert(foreign_identity, RelationshipClass::External);
+    let mut missing = inventory.clone();
+    missing.remove(&foreign_identity);
     assert!(
-        validate_relationship_inventory("adversarial", &local, tables, &misclassified)
+        validate_relationship_inventory("adversarial", &local, tables.clone(), &missing)
             .unwrap_err()
-            .contains("bidirectional")
+            .contains("missing")
     );
+
+    for (from, to, expected_error) in [
+        (
+            RelationshipClass::Foreign,
+            RelationshipClass::External,
+            "bidirectional",
+        ),
+        (
+            RelationshipClass::Primary,
+            RelationshipClass::External,
+            "hides primary",
+        ),
+        (
+            RelationshipClass::LocalIdentity,
+            RelationshipClass::External,
+            "hides local unique",
+        ),
+        (
+            RelationshipClass::External,
+            RelationshipClass::Primary,
+            "is not PK-owned",
+        ),
+    ] {
+        let identity = inventory
+            .iter()
+            .find(|(_, class)| **class == from)
+            .map(|(identity, _)| identity.clone())
+            .unwrap();
+        let mut misclassified = inventory.clone();
+        misclassified.insert(identity, to);
+        assert!(
+            validate_relationship_inventory("adversarial", &local, tables.clone(), &misclassified)
+                .unwrap_err()
+                .contains(expected_error),
+            "{from:?} -> {to:?} did not fail with {expected_error}"
+        );
+    }
 }
 
 #[test]
@@ -496,6 +706,33 @@ fn intentional_session_soft_relationships_are_classified_in_schema() {
             "missing relationship classification: {classification}"
         );
     }
+
+    let inventory = relationship_inventory();
+    for (table, column, expected) in [
+        ("sessions", "provider", RelationshipClass::Denormalized),
+        ("sessions", "model", RelationshipClass::Denormalized),
+        (
+            "sessions",
+            "assistant_name",
+            RelationshipClass::Denormalized,
+        ),
+        (
+            "tool_call_events",
+            "provider_call_id",
+            RelationshipClass::External,
+        ),
+        (
+            "write_scope_leases",
+            "owner_id",
+            RelationshipClass::Polymorphic,
+        ),
+    ] {
+        assert_eq!(
+            inventory.get(&("local".to_owned(), table.to_owned(), column.to_owned())),
+            Some(&expected),
+            "soft relationship policy drifted for {table}.{column}"
+        );
+    }
 }
 
 #[test]
@@ -509,7 +746,8 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
             "e676358dd6092ff77aa5915f430806d623c0987afd982014542b4e9cb4ea55c9",
             false,
             "sessions",
-            &["ended_at_unix_ms"][..],
+            "idx_sessions_open",
+            &["ephemeral", "last_active_at_unix_ms"][..],
             true,
         ),
         (
@@ -519,6 +757,7 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
             "529c9bf816b241c309b49f2e54c8ae0f398e87c117103eb4063d98eceb0d129a",
             false,
             "agent_session_preparation_claims",
+            "idx_agent_session_preparation_claims_recovery",
             &["claim_state", "session_id"],
             false,
         ),
@@ -529,6 +768,7 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
             "4c04bc561abef009306ec51c13858d2a4c801c130781eeda44a1cff97abfacd1",
             true,
             "scheduled_jobs",
+            "idx_scheduled_jobs_owner",
             &["owner"],
             false,
         ),
@@ -539,6 +779,7 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
             "5235dd10724aef22eb5daf2e4e543db47aac88d0f0b5d7a4eb603522684df7bf",
             true,
             "image_generation_jobs",
+            "idx_image_generation_jobs_dispatch_scan",
             &["state", "created_at_unix_ms", "job_id"],
             false,
         ),
@@ -547,22 +788,13 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
         .iter()
         .map(|(marker, owner, ..)| (marker.to_string(), owner.to_string()))
         .collect::<std::collections::BTreeSet<_>>();
-    let mut production_sources = Vec::new();
-    rust_sources_below(
-        &root,
-        Path::new("crates/cockpit-db/src/db"),
-        &mut production_sources,
-    );
-    let actual_marker_rows = production_sources
+    let actual_marker_rows = production_rust_sources(&root)
         .into_iter()
         .flat_map(|owner| {
             let contents = source(root.join(&owner));
-            contents
-                .lines()
-                .filter_map(|line| {
-                    line.split_once("schema-hot-query:")
-                        .map(|(_, marker)| (marker.trim().to_owned(), owner.display().to_string()))
-                })
+            hot_query_comments(&contents)
+                .into_iter()
+                .map(|(_, marker)| (marker, portable_relative_path(&owner)))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -581,7 +813,9 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
     );
 
     let [(_, local), (_, extended)] = effective_profiles();
-    for (marker, owner, query, query_digest, uses_extended, table, columns, partial) in shapes {
+    for (marker, owner, query, query_digest, uses_extended, table, index_name, columns, partial) in
+        shapes
+    {
         let owner_source = source(root.join(owner));
         let bound_query = normalized_sql(&annotated_sql_literal(&owner_source, marker));
         assert!(
@@ -595,10 +829,16 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
         );
         let schema = if uses_extended { &extended } else { &local };
         assert!(
-            schema.indexes.iter().any(|index| index.table == table
-                && index.columns == columns
+            schema.indexes.iter().any(|index| index.name == index_name
+                && index.table == table
+                && index.columns.len() >= columns.len()
+                && index
+                    .columns
+                    .iter()
+                    .zip(columns)
+                    .all(|(actual, expected)| actual == *expected)
                 && index.partial == partial),
-            "exact reviewed index missing for {marker}: {table}{columns:?} partial={partial}"
+            "reviewed leading index missing for {marker}: {index_name} on {table}{columns:?} partial={partial}"
         );
     }
 }

@@ -1823,8 +1823,8 @@ fn terminalize_preparation_claim(
     session_id: Uuid,
     now_unix_ms: i64,
 ) -> Result<()> {
-    // schema-hot-query: local.agent-preparation.terminalize
     conn.execute(
+        // schema-hot-query: local.agent-preparation.terminalize
         "UPDATE agent_session_preparation_claims SET claim_state='terminal',terminal_at_unix_ms=?2 WHERE session_id=?1 AND claim_state IN ('claimed', 'running')",
         params![session_id.to_string(), now_unix_ms],
     )

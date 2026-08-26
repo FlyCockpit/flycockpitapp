@@ -593,11 +593,13 @@ struct StateMutation {
     line: usize,
     family: &'static str,
     edge: Option<(String, String)>,
+    exact_cas: bool,
 }
 #[derive(Default)]
 struct TransitionAstAudit {
     validators: Vec<TransitionEvidence>,
     mutations: Vec<StateMutation>,
+    row_count_checks: usize,
 }
 
 fn image_family(value: &str) -> Option<&'static str> {
@@ -640,6 +642,7 @@ fn sql_literal_edge(sql: &str) -> Option<(String, String)> {
 
 impl<'ast> Visit<'ast> for TransitionAstAudit {
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.row_count_checks += mac.tokens.to_string().matches("== 1").count();
         if let Ok(arguments) =
             syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
                 .parse2(mac.tokens.clone())
@@ -649,6 +652,7 @@ impl<'ast> Visit<'ast> for TransitionAstAudit {
                 nested.visit_expr(&argument);
                 self.validators.extend(nested.validators);
                 self.mutations.extend(nested.mutations);
+                self.row_count_checks += nested.row_count_checks;
             }
         }
     }
@@ -703,10 +707,16 @@ impl<'ast> Visit<'ast> for TransitionAstAudit {
                         .next()
                         .is_some_and(|set| set.contains("state=") || set.contains("state ="))
                 {
+                    let predicate = normalized.split(" WHERE ").nth(1).unwrap_or_default();
                     self.mutations.push(StateMutation {
                         line: call.span().start().line,
                         family: image_family(table).unwrap(),
                         edge: sql_literal_edge(&normalized),
+                        exact_cas: (predicate.contains("state=") || predicate.contains("state ="))
+                            && (predicate.contains("version=")
+                                || predicate.contains("version =")
+                                || predicate.contains("generation=")
+                                || predicate.contains("generation =")),
                     });
                 }
             }
@@ -772,7 +782,7 @@ const IMAGE_STATE_EXECUTORS: &[&str] = &[
     "execute_artifact_tombstone_transition_conn",
     "execute_basic_image_slot_transition_conn",
     "execute_basic_image_attempt_transition_conn",
-    "execute_queue_all_image_slots_conn",
+    "execute_queue_image_slots_conn",
     "execute_image_publication_attempt_transition_conn",
     "execute_image_publication_slot_transition_conn",
     "execute_image_dispatch_preparation_transitions_conn",
@@ -787,21 +797,43 @@ const IMAGE_STATE_EXECUTORS: &[&str] = &[
     "execute_cancellation_slot_transition_conn",
     "execute_validating_slot_cancellation_marker_conn",
     "execute_late_publication_slot_transition_conn",
+    "execute_security_blocked_artifact_cleanup_transition_conn",
+    "execute_ready_component_cleanup_transition_conn",
+    "execute_security_blocked_component_cleanup_transition_conn",
+    "execute_late_quarantined_artifact_retention_transition_conn",
+    "execute_security_blocked_artifact_retention_transition_conn",
 ];
 
-fn raw_transition_boundary_error(name: &str, block: &syn::Block) -> Option<String> {
+fn raw_transition_boundary_error(
+    name: &str,
+    block: &syn::Block,
+    trust_executor: bool,
+) -> Option<String> {
     let mut audit = TransitionAstAudit::default();
     audit.visit_block(block);
-    audit.mutations.into_iter().find_map(|mutation| {
-        (!IMAGE_STATE_EXECUTORS.contains(&name))
-            .then_some(())
-            .map(|_| {
-                format!(
-                    "{name} contains raw {} state SQL outside a typed executor",
-                    mutation.family
-                )
-            })
-    })
+    let mutation_count = audit.mutations.len();
+    audit
+        .mutations
+        .into_iter()
+        .find_map(|mutation| {
+            (!(trust_executor && IMAGE_STATE_EXECUTORS.contains(&name)))
+                .then_some(())
+                .map(|_| {
+                    format!(
+                        "{name} contains raw {} state SQL outside a typed executor",
+                        mutation.family
+                    )
+                })
+                .or_else(|| {
+                    (!mutation.exact_cas).then(|| {
+                        format!("{name} contains a state mutation without exact state/version CAS")
+                    })
+                })
+        })
+        .or_else(|| {
+            (mutation_count > 0 && audit.row_count_checks == 0)
+                .then(|| format!("{name} does not enforce changed == 1 for its state mutation"))
+        })
 }
 
 #[derive(Default)]
@@ -863,11 +895,15 @@ impl RawImageSqlLiteralAudit {
     }
 }
 
-fn raw_sql_literal_boundary_error(name: &str, block: &syn::Block) -> Option<String> {
+fn raw_sql_literal_boundary_error(
+    name: &str,
+    block: &syn::Block,
+    trust_executor: bool,
+) -> Option<String> {
     let mut audit = RawImageSqlLiteralAudit::default();
     audit.visit_block(block);
     let line = audit.state_mutation_line()?;
-    if !IMAGE_STATE_EXECUTORS.contains(&name) {
+    if !(trust_executor && IMAGE_STATE_EXECUTORS.contains(&name)) {
         return Some(format!(
             "{name} contains image state-table UPDATE SQL at line {line} outside an executor"
         ));
@@ -881,7 +917,7 @@ fn raw_sql_literal_boundary_error(name: &str, block: &syn::Block) -> Option<Stri
     })
 }
 
-fn transition_source_errors(source: &str) -> Vec<String> {
+fn transition_source_errors_with_trust(source: &str, trust_executor: bool) -> Vec<String> {
     fn is_test_only(attrs: &[syn::Attribute]) -> bool {
         attrs.iter().any(|attr| {
             attr.path().is_ident("cfg")
@@ -889,29 +925,39 @@ fn transition_source_errors(source: &str) -> Vec<String> {
         })
     }
     let mut errors = Vec::new();
-    fn audit_block(name: &str, block: &syn::Block, errors: &mut Vec<String>) {
-        if let Some(error) = raw_transition_boundary_error(name, block) {
+    fn audit_block(name: &str, block: &syn::Block, trust_executor: bool, errors: &mut Vec<String>) {
+        if let Some(error) = raw_transition_boundary_error(name, block, trust_executor) {
             errors.push(error);
         }
-        if let Some(error) = raw_sql_literal_boundary_error(name, block) {
+        if let Some(error) = raw_sql_literal_boundary_error(name, block, trust_executor) {
             errors.push(error);
         }
         if let Err(error) = audit_transition_block(block) {
             errors.push(format!("{name}: {error}"));
         }
     }
-    fn audit_items(items: Vec<syn::Item>, errors: &mut Vec<String>) {
+    fn audit_items(items: Vec<syn::Item>, trust_executor: bool, errors: &mut Vec<String>) {
         for item in items {
             match item {
                 syn::Item::Fn(function) if !is_test_only(&function.attrs) => {
-                    audit_block(&function.sig.ident.to_string(), &function.block, errors);
+                    audit_block(
+                        &function.sig.ident.to_string(),
+                        &function.block,
+                        trust_executor,
+                        errors,
+                    );
                 }
                 syn::Item::Impl(item_impl) if !is_test_only(&item_impl.attrs) => {
                     for item in item_impl.items {
                         if let syn::ImplItem::Fn(function) = item
                             && !is_test_only(&function.attrs)
                         {
-                            audit_block(&function.sig.ident.to_string(), &function.block, errors);
+                            audit_block(
+                                &function.sig.ident.to_string(),
+                                &function.block,
+                                trust_executor,
+                                errors,
+                            );
                         }
                     }
                 }
@@ -921,13 +967,18 @@ fn transition_source_errors(source: &str) -> Vec<String> {
                             && !is_test_only(&function.attrs)
                             && let Some(block) = function.default
                         {
-                            audit_block(&function.sig.ident.to_string(), &block, errors);
+                            audit_block(
+                                &function.sig.ident.to_string(),
+                                &block,
+                                trust_executor,
+                                errors,
+                            );
                         }
                     }
                 }
                 syn::Item::Mod(module) if !is_test_only(&module.attrs) => {
                     if let Some((_, items)) = module.content {
-                        audit_items(items, errors);
+                        audit_items(items, trust_executor, errors);
                     }
                 }
                 syn::Item::Const(item_const) if !is_test_only(&item_const.attrs) => {
@@ -966,8 +1017,12 @@ fn transition_source_errors(source: &str) -> Vec<String> {
         }
     }
     let file = syn::parse_file(source).expect("image-generation source parses");
-    audit_items(file.items, &mut errors);
+    audit_items(file.items, trust_executor, &mut errors);
     errors
+}
+
+fn transition_source_errors(source: &str) -> Vec<String> {
+    transition_source_errors_with_trust(source, true)
 }
 
 fn assert_production_image_mutations_use_ast(source: &str) {
@@ -976,6 +1031,88 @@ fn assert_production_image_mutations_use_ast(source: &str) {
         errors.is_empty(),
         "image transition AST audit failed: {errors:#?}"
     );
+}
+
+fn collect_production_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()));
+    for entry in entries {
+        let path = entry.expect("production source entry is readable").path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|name| {
+                matches!(
+                    name.to_str(),
+                    Some("target" | "tests" | "benches" | "examples")
+                )
+            }) {
+                continue;
+            }
+            collect_production_rust_sources(&path, sources);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            sources.push(path);
+        }
+    }
+}
+
+fn assert_repo_wide_image_state_write_boundary(image_source_path: &Path) {
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("cockpit-db is nested under the repository crates directory")
+        .to_path_buf();
+    let mut sources = Vec::new();
+    collect_production_rust_sources(&repository.join("apps"), &mut sources);
+    collect_production_rust_sources(&repository.join("crates"), &mut sources);
+    let canonical_owner = image_source_path
+        .canonicalize()
+        .expect("image-generation owner path canonicalizes");
+    let mut failures = Vec::new();
+    for path in sources {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        let trusted = path
+            .canonicalize()
+            .is_ok_and(|candidate| candidate == canonical_owner);
+        for error in transition_source_errors_with_trust(&source, trusted) {
+            failures.push(format!("{}: {error}", path.display()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "repo-wide image state-write boundary failed: {failures:#?}"
+    );
+}
+
+fn assert_image_executor_visibility_and_fixed_api(source: &str) {
+    for generic in [
+        "transition_image_generation_artifact_conn",
+        "transition_image_generation_artifact_component_conn",
+    ] {
+        assert!(
+            source.contains(&format!("    fn {generic}("))
+                && !source.contains(&format!("pub fn {generic}(")),
+            "generic image transition executor {generic} must remain private"
+        );
+    }
+    for semantic in [
+        "begin_image_generation_artifact_write_conn",
+        "begin_image_generation_artifact_component_write_conn",
+        "commit_image_generation_artifact_component_ready_conn",
+        "commit_image_generation_artifact_retained_conn",
+        "commit_image_generation_artifact_late_quarantined_conn",
+        "commit_image_generation_security_cleanup_conn",
+        "commit_image_generation_security_publication_conn",
+    ] {
+        let body = source
+            .split(&format!("pub fn {semantic}"))
+            .nth(1)
+            .and_then(|tail| tail.split("\n    }").next())
+            .unwrap_or_else(|| panic!("semantic image operation {semantic} is absent"));
+        assert!(
+            !body.contains("input.from") && !body.contains("input.to"),
+            "semantic image operation {semantic} exposes an arbitrary edge"
+        );
+    }
 }
 
 #[test]
@@ -998,9 +1135,9 @@ fn image_transition_ast_audit_rejects_decoys_and_unvalidated_occurrences() {
     assert!(!transition_source_errors(missing_second).is_empty());
 
     let async_restricted_visibility = r#"
-        pub(crate) async fn good(conn: &Connection) {
+        async fn execute_basic_image_attempt_transition_conn(conn: &Connection) {
             ensure!(attempt_transition_allowed(ImageGenerationAttemptState::Planned, ImageGenerationAttemptState::Preparing));
-            conn.execute("UPDATE image_generation_attempts SET state='preparing' WHERE state='planned'", []);
+            ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=2 WHERE state='planned' AND version=1", []) == 1);
         }
     "#;
     assert!(transition_source_errors(async_restricted_visibility).is_empty());
@@ -1054,6 +1191,30 @@ fn image_transition_ast_audit_rejects_decoys_and_unvalidated_occurrences() {
         }
     "#;
     assert!(!transition_source_errors(invocation_macro).is_empty());
+
+    let missing_version_fence = r#"
+        fn execute_basic_image_slot_transition_conn(conn: &Connection) {
+            ensure!(slot_transition_allowed(ImageGenerationSlotState::Planned, ImageGenerationSlotState::Queued));
+            ensure!(conn.execute("UPDATE image_generation_slots SET state='queued' WHERE state='planned'", []) == 1);
+        }
+    "#;
+    assert!(!transition_source_errors(missing_version_fence).is_empty());
+
+    let missing_row_count = r#"
+        fn execute_basic_image_slot_transition_conn(conn: &Connection) {
+            ensure!(slot_transition_allowed(ImageGenerationSlotState::Planned, ImageGenerationSlotState::Queued));
+            conn.execute("UPDATE image_generation_slots SET state='queued',version=2 WHERE state='planned' AND version=1", []);
+        }
+    "#;
+    assert!(!transition_source_errors(missing_row_count).is_empty());
+
+    let copied_executor_outside_owner = r#"
+        fn execute_basic_image_slot_transition_conn(conn: &Connection) {
+            ensure!(slot_transition_allowed(ImageGenerationSlotState::Planned, ImageGenerationSlotState::Queued));
+            ensure!(conn.execute("UPDATE image_generation_slots SET state='queued',version=2 WHERE state='planned' AND version=1", []) == 1);
+        }
+    "#;
+    assert!(!transition_source_errors_with_trust(copied_executor_outside_owner, false).is_empty());
 }
 
 fn sql_registry_edges(sql: &str, registry: &str) -> BTreeSet<String> {
@@ -1249,8 +1410,12 @@ fn sql_only_edges(name: &str, trigger: &str) -> BTreeSet<String> {
 fn ownership() -> BTreeMap<String, Ownership> {
     let parsed: toml::Value = toml::from_str(include_str!("../schema-ownership.toml"))
         .expect("schema-ownership.toml must be valid TOML");
+    let image_source_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/db/image_generation.rs");
     let image_source = include_str!("../src/db/image_generation.rs");
     assert_production_image_mutations_use_ast(image_source);
+    assert_repo_wide_image_state_write_boundary(&image_source_path);
+    assert_image_executor_visibility_and_fixed_api(image_source);
     let reconciliation = image_source
         .split("fn reconcile_image_generation_attempt_inner")
         .nth(1)

@@ -507,7 +507,11 @@ fn execute_basic_image_attempt_transition_conn(
     Ok(next)
 }
 
-fn execute_queue_all_image_slots_conn(conn: &Connection, job_id: Uuid) -> Result<usize> {
+fn execute_queue_image_slots_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    expected_count: usize,
+) -> Result<()> {
     ensure!(
         slot_transition_allowed(
             ImageGenerationSlotState::Planned,
@@ -515,7 +519,34 @@ fn execute_queue_all_image_slots_conn(conn: &Connection, job_id: Uuid) -> Result
         ),
         "queue slot transition is not canonical"
     );
-    conn.execute("UPDATE image_generation_slots SET state='queued',version=version+1 WHERE job_id=?1 AND state='planned' AND version=1",[job_id.to_string()]).map_err(Into::into)
+    let mut statement = conn.prepare(
+        "SELECT slot_id,version FROM image_generation_slots WHERE job_id=?1 ORDER BY slot_index",
+    )?;
+    let inventory = statement
+        .query_map([job_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    ensure!(
+        inventory.len() == expected_count,
+        "image generation queue slot inventory differs"
+    );
+    for (slot_id, version) in inventory {
+        ensure!(
+            version == 1,
+            "image generation queue slot version is not initial"
+        );
+        execute_basic_image_slot_transition_conn(
+            conn,
+            job_id,
+            Uuid::parse_str(&slot_id)?,
+            ImageGenerationSlotState::Planned,
+            u64::try_from(version)?,
+            ImageGenerationSlotState::Queued,
+        )?;
+    }
+    Ok(())
 }
 
 fn execute_image_publication_attempt_transition_conn(
@@ -2024,19 +2055,16 @@ impl Db {
                 at_unix_ms,
                 ImageJobTransitionContext::Ordinary,
             )?;
-            let changed = execute_queue_all_image_slots_conn(conn, authority.job_id)?;
             let expected: i64 = conn.query_row(
                 "SELECT slot_count FROM image_generation_plans WHERE job_id=?1",
                 [authority.job_id.to_string()],
                 |row| row.get(0),
             )?;
-            ensure!(
-                i64::try_from(changed)? == expected,
-                "image generation queue slot graph changed"
-            );
+            let expected = usize::try_from(expected)?;
+            execute_queue_image_slots_conn(conn, authority.job_id, expected)?;
             let activated=conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) SELECT job_id,slot_id,1,'initial',NULL,?1 FROM image_generation_slots WHERE job_id=?2",params![at_unix_ms,authority.job_id.to_string()])?;
             ensure!(
-                activated == changed,
+                activated == expected,
                 "image generation initial attempt activation differs"
             );
             Ok(())
@@ -4063,24 +4091,89 @@ pub struct CreateImageGenerationArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransitionImageGenerationArtifact {
-    pub artifact_id: Uuid,
-    pub expected_generation: u64,
-    pub from: ImageGenerationArtifactState,
-    pub to: ImageGenerationArtifactState,
-    pub now_unix_ms: i64,
-    pub terminal_reason: Option<String>,
+struct TransitionImageGenerationArtifact {
+    artifact_id: Uuid,
+    expected_generation: u64,
+    from: ImageGenerationArtifactState,
+    to: ImageGenerationArtifactState,
+    now_unix_ms: i64,
+    terminal_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransitionImageGenerationArtifactComponent {
+struct TransitionImageGenerationArtifactComponent {
+    artifact_id: Uuid,
+    component_id: Uuid,
+    expected_generation: u64,
+    from: ImageGenerationArtifactComponentState,
+    to: ImageGenerationArtifactComponentState,
+    stable_identity_json: Option<String>,
+    deletion_evidence_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeginImageGenerationArtifactWrite {
+    pub artifact_id: Uuid,
+    pub expected_generation: u64,
+    pub now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeginImageGenerationArtifactComponentWrite {
     pub artifact_id: Uuid,
     pub component_id: Uuid,
     pub expected_generation: u64,
-    pub from: ImageGenerationArtifactComponentState,
-    pub to: ImageGenerationArtifactComponentState,
-    pub stable_identity_json: Option<String>,
-    pub deletion_evidence_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitImageGenerationArtifactComponentReady<'a> {
+    pub artifact_id: Uuid,
+    pub component_id: Uuid,
+    pub expected_generation: u64,
+    pub stable_identity_json: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitImageGenerationArtifactRetention {
+    pub artifact_id: Uuid,
+    pub expected_generation: u64,
+    pub now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverImageGenerationArtifactComponent {
+    pub component_id: Uuid,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitImageGenerationSecurityCleanup<'a> {
+    pub recovery_operation_id: Uuid,
+    pub principal_digest: &'a str,
+    pub artifact_id: Uuid,
+    pub expected_artifact_generation: u64,
+    pub component_set_digest: &'a str,
+    pub cleanup_operation_id: Uuid,
+    pub components: &'a [RecoverImageGenerationArtifactComponent],
+    pub outcome_digest: &'a str,
+    pub now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitImageGenerationSecurityPublication<'a> {
+    pub recovery_operation_id: Uuid,
+    pub principal_digest: &'a str,
+    pub publication_operation_id: Uuid,
+    pub expected_lease_version: u64,
+    pub artifact_id: Uuid,
+    pub expected_artifact_generation: u64,
+    pub expected_slot_version: u64,
+    pub output_authority_digest: &'a str,
+    pub output_authority_generation: u64,
+    pub destination_name: &'a str,
+    pub output_evidence_json: &'a str,
+    pub outcome_digest: &'a str,
+    pub now_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4475,7 +4568,98 @@ impl Db {
         })
     }
 
-    pub fn transition_image_generation_artifact_conn(
+    pub fn begin_image_generation_artifact_write_conn(
+        conn: &Connection,
+        input: &BeginImageGenerationArtifactWrite,
+    ) -> Result<()> {
+        Self::transition_image_generation_artifact_conn(
+            conn,
+            &TransitionImageGenerationArtifact {
+                artifact_id: input.artifact_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactState::Allocating,
+                to: ImageGenerationArtifactState::Writing,
+                now_unix_ms: input.now_unix_ms,
+                terminal_reason: None,
+            },
+        )
+    }
+
+    pub fn begin_image_generation_artifact_component_write_conn(
+        conn: &Connection,
+        input: &BeginImageGenerationArtifactComponentWrite,
+    ) -> Result<()> {
+        Self::transition_image_generation_artifact_component_conn(
+            conn,
+            &TransitionImageGenerationArtifactComponent {
+                artifact_id: input.artifact_id,
+                component_id: input.component_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactComponentState::Planned,
+                to: ImageGenerationArtifactComponentState::Writing,
+                stable_identity_json: None,
+                deletion_evidence_digest: None,
+            },
+        )
+    }
+
+    pub fn commit_image_generation_artifact_component_ready_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationArtifactComponentReady<'_>,
+    ) -> Result<()> {
+        ensure!(
+            !input.stable_identity_json.is_empty(),
+            "artifact component stable identity is empty"
+        );
+        Self::transition_image_generation_artifact_component_conn(
+            conn,
+            &TransitionImageGenerationArtifactComponent {
+                artifact_id: input.artifact_id,
+                component_id: input.component_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactComponentState::Writing,
+                to: ImageGenerationArtifactComponentState::Ready,
+                stable_identity_json: Some(input.stable_identity_json.to_owned()),
+                deletion_evidence_digest: None,
+            },
+        )
+    }
+
+    pub fn commit_image_generation_artifact_retained_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationArtifactRetention,
+    ) -> Result<()> {
+        Self::transition_image_generation_artifact_conn(
+            conn,
+            &TransitionImageGenerationArtifact {
+                artifact_id: input.artifact_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactState::Writing,
+                to: ImageGenerationArtifactState::Retained,
+                now_unix_ms: input.now_unix_ms,
+                terminal_reason: None,
+            },
+        )
+    }
+
+    pub fn commit_image_generation_artifact_late_quarantined_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationArtifactRetention,
+    ) -> Result<()> {
+        Self::transition_image_generation_artifact_conn(
+            conn,
+            &TransitionImageGenerationArtifact {
+                artifact_id: input.artifact_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactState::Writing,
+                to: ImageGenerationArtifactState::LateQuarantined,
+                now_unix_ms: input.now_unix_ms,
+                terminal_reason: None,
+            },
+        )
+    }
+
+    fn transition_image_generation_artifact_conn(
         conn: &Connection,
         input: &TransitionImageGenerationArtifact,
     ) -> Result<()> {
@@ -4507,7 +4691,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn transition_image_generation_artifact_component_conn(
+    fn transition_image_generation_artifact_component_conn(
         conn: &Connection,
         input: &TransitionImageGenerationArtifactComponent,
     ) -> Result<()> {
@@ -4537,6 +4721,198 @@ impl Db {
             "image artifact component compare-and-set lost"
         );
         Ok(())
+    }
+
+    fn execute_security_blocked_artifact_cleanup_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        expected_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::SecurityBlocked,
+                ImageGenerationArtifactState::CleanupPending,
+            ),
+            "security recovery artifact cleanup edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("security recovery artifact generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='cleanup_pending',generation=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='security_blocked' AND generation=?4 AND active_lease_count=0",params![i64::try_from(next)?,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?==1,"security recovery artifact compare-and-set lost");
+        Ok(next)
+    }
+
+    fn execute_ready_component_cleanup_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        component_id: Uuid,
+        expected_generation: u64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_component_transition_allowed(
+                ImageGenerationArtifactComponentState::Ready,
+                ImageGenerationArtifactComponentState::CleanupPending
+            ),
+            "ready component cleanup edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("ready component cleanup generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifact_components SET state='cleanup_pending',generation=?1 WHERE artifact_id=?2 AND component_id=?3 AND state='ready' AND generation=?4",params![i64::try_from(next)?,artifact_id.to_string(),component_id.to_string(),i64::try_from(expected_generation)?])?==1,"ready component cleanup compare-and-set lost");
+        Ok(next)
+    }
+
+    fn execute_security_blocked_component_cleanup_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        component_id: Uuid,
+        expected_generation: u64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_component_transition_allowed(
+                ImageGenerationArtifactComponentState::SecurityBlocked,
+                ImageGenerationArtifactComponentState::CleanupPending
+            ),
+            "security-blocked component cleanup edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("security-blocked component cleanup generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifact_components SET state='cleanup_pending',generation=?1 WHERE artifact_id=?2 AND component_id=?3 AND state='security_blocked' AND generation=?4",params![i64::try_from(next)?,artifact_id.to_string(),component_id.to_string(),i64::try_from(expected_generation)?])?==1,"security-blocked component cleanup compare-and-set lost");
+        Ok(next)
+    }
+
+    fn execute_late_quarantined_artifact_retention_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        expected_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::LateQuarantined,
+                ImageGenerationArtifactState::Retained
+            ),
+            "late-quarantined artifact retention edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("late-quarantined artifact retention generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='retained',generation=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='late_quarantined' AND generation=?4",params![i64::try_from(next)?,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?==1,"late-quarantined artifact retention compare-and-set lost");
+        Ok(next)
+    }
+
+    fn execute_security_blocked_artifact_retention_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        expected_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::SecurityBlocked,
+                ImageGenerationArtifactState::Retained
+            ),
+            "security-blocked artifact retention edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("security-blocked artifact retention generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='retained',generation=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='security_blocked' AND generation=?4",params![i64::try_from(next)?,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?==1,"security-blocked artifact retention compare-and-set lost");
+        Ok(next)
+    }
+
+    pub fn commit_image_generation_security_cleanup_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationSecurityCleanup<'_>,
+    ) -> Result<()> {
+        atomic_conn(conn, "image_generation_security_cleanup", || {
+            ensure_digest(input.outcome_digest, "security cleanup outcome")?;
+            let expected_component_count: i64 = conn.query_row("SELECT a.expected_component_count FROM image_generation_artifact_security_recovery_audits r JOIN image_generation_artifacts a ON a.artifact_id=r.artifact_id WHERE r.recovery_operation_id=?1 AND r.principal_digest=?2 AND r.artifact_id=?3 AND r.artifact_generation=?4 AND r.component_set_digest=?5 AND r.disposition='resume_verified_cleanup' AND r.state='recorded' AND a.state='security_blocked' AND a.generation=r.artifact_generation AND a.component_set_digest=r.component_set_digest AND a.active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references x WHERE x.artifact_id=a.artifact_id AND x.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=a.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed','security_blocked','delete_authorized'))",params![input.recovery_operation_id.to_string(),input.principal_digest,input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,input.component_set_digest],|row|row.get(0)).context("security cleanup recovery authority is unavailable")?;
+            ensure!(
+                usize::try_from(expected_component_count)? == input.components.len(),
+                "security cleanup component inventory differs"
+            );
+            let next_artifact_generation = input
+                .expected_artifact_generation
+                .checked_add(1)
+                .context("security cleanup artifact generation overflow")?;
+            ensure!(conn.execute("INSERT INTO image_generation_artifact_cleanup_intents(cleanup_operation_id,artifact_id,expected_artifact_generation,reason,state,version,created_at_unix_ms) VALUES(?1,?2,?3,'owner_recovery','pending',1,?4)",params![input.cleanup_operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(next_artifact_generation)?,input.now_unix_ms])?==1,"security cleanup intent was not recorded");
+            Self::execute_security_blocked_artifact_cleanup_transition_conn(
+                conn,
+                input.artifact_id,
+                input.expected_artifact_generation,
+                input.now_unix_ms,
+            )?;
+            for component in input.components {
+                let state: String = conn.query_row("SELECT state FROM image_generation_artifact_components WHERE artifact_id=?1 AND component_id=?2 AND generation=?3 AND EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_components WHERE recovery_operation_id=?4 AND artifact_id=?1 AND component_id=?2 AND component_generation=?3)",params![input.artifact_id.to_string(),component.component_id.to_string(),i64::try_from(component.expected_generation)?,input.recovery_operation_id.to_string()],|row|row.get(0)).context("security cleanup component authority is unavailable")?;
+                match ImageGenerationArtifactComponentState::parse(&state) {
+                    Some(ImageGenerationArtifactComponentState::Ready) => {
+                        Self::execute_ready_component_cleanup_transition_conn(
+                            conn,
+                            input.artifact_id,
+                            component.component_id,
+                            component.expected_generation,
+                        )?
+                    }
+                    Some(ImageGenerationArtifactComponentState::SecurityBlocked) => {
+                        Self::execute_security_blocked_component_cleanup_transition_conn(
+                            conn,
+                            input.artifact_id,
+                            component.component_id,
+                            component.expected_generation,
+                        )?
+                    }
+                    _ => anyhow::bail!("security cleanup component source state is unavailable"),
+                };
+            }
+            ensure!(conn.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND disposition='resume_verified_cleanup' AND state='recorded'",params![input.outcome_digest,input.now_unix_ms,input.recovery_operation_id.to_string(),input.principal_digest])?==1,"security cleanup audit compare-and-set lost");
+            Ok(())
+        })
+    }
+
+    pub fn commit_image_generation_security_publication_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationSecurityPublication<'_>,
+    ) -> Result<()> {
+        atomic_conn(conn, "image_generation_security_publication", || {
+            ensure_digest(input.outcome_digest, "security publication outcome")?;
+            ensure!(
+                !input.output_evidence_json.is_empty() && !input.destination_name.is_empty(),
+                "security publication evidence is incomplete"
+            );
+            let authority:(String,String,String)=conn.query_row("SELECT a.state,a.job_id,a.slot_id FROM image_generation_artifact_security_recovery_audits r JOIN image_generation_artifacts a ON a.artifact_id=r.artifact_id JOIN image_generation_late_publication_leases p ON p.publication_operation_id=r.publication_operation_id WHERE r.recovery_operation_id=?1 AND r.principal_digest=?2 AND r.disposition='complete_verified_late_publication' AND r.state='recorded' AND a.artifact_id=?3 AND a.generation=?4 AND p.publication_operation_id=?5 AND p.state='security_blocked' AND p.version=?6 AND p.expected_slot_version=?7 AND p.output_authority_digest=?8 AND p.output_authority_generation=?9 AND p.destination_name=?10",params![input.recovery_operation_id.to_string(),input.principal_digest,input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,input.publication_operation_id.to_string(),i64::try_from(input.expected_lease_version)?,i64::try_from(input.expected_slot_version)?,input.output_authority_digest,i64::try_from(input.output_authority_generation)?,input.destination_name],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).context("security publication recovery authority is unavailable")?;
+            ensure!(conn.execute("INSERT INTO image_generation_user_published_outputs(publication_operation_id,artifact_id,artifact_generation,output_authority_digest,output_authority_generation,destination_name,output_evidence_json,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![input.publication_operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,input.output_authority_digest,i64::try_from(input.output_authority_generation)?,input.destination_name,input.output_evidence_json,input.now_unix_ms])?==1,"security publication output was not recorded");
+            ensure!(conn.execute("UPDATE image_generation_late_publication_leases SET state='published',version=version+1,output_evidence_json=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND state='security_blocked' AND version=?4",params![input.output_evidence_json,input.now_unix_ms,input.publication_operation_id.to_string(),i64::try_from(input.expected_lease_version)?])?==1,"security publication lease compare-and-set lost");
+            ensure!(conn.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND disposition='complete_verified_late_publication' AND state='recorded'",params![input.outcome_digest,input.now_unix_ms,input.recovery_operation_id.to_string(),input.principal_digest])?==1,"security publication audit compare-and-set lost");
+            match ImageGenerationArtifactState::parse(&authority.0) {
+                Some(ImageGenerationArtifactState::LateQuarantined) => {
+                    Self::execute_late_quarantined_artifact_retention_transition_conn(
+                        conn,
+                        input.artifact_id,
+                        input.expected_artifact_generation,
+                        input.now_unix_ms,
+                    )?
+                }
+                Some(ImageGenerationArtifactState::SecurityBlocked) => {
+                    Self::execute_security_blocked_artifact_retention_transition_conn(
+                        conn,
+                        input.artifact_id,
+                        input.expected_artifact_generation,
+                        input.now_unix_ms,
+                    )?
+                }
+                _ => anyhow::bail!("security publication artifact source state is unavailable"),
+            };
+            execute_late_publication_slot_transition_conn(
+                conn,
+                Uuid::parse_str(&authority.1)?,
+                Uuid::parse_str(&authority.2)?,
+                input.expected_slot_version,
+            )?;
+            Ok(())
+        })
     }
 
     fn execute_late_publication_artifact_transition_conn(

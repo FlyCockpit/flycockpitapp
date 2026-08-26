@@ -27,16 +27,19 @@ use cockpit_db::db::external_journal::{
 };
 use cockpit_db::db::image_generation::{
     AcquireImageGenerationArtifactLease, AcquiredImageGenerationArtifactLease,
-    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
+    AdvanceImageGenerationLatePublication, BeginImageGenerationArtifactComponentWrite,
+    BeginImageGenerationArtifactWrite, BlockVerifiedImageGenerationLatePublication,
+    CommitImageGenerationArtifactComponentReady, CommitImageGenerationArtifactRetention,
+    CommitImageGenerationSecurityCleanup, CommitImageGenerationSecurityPublication,
     CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
     DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
     ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
     ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
     ImageGenerationDispatchCandidate, ImageGenerationHandoffFinishDisposition,
     ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
-    PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
-    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
-    image_generation_attempt_media_reservation_id, image_generation_component_set_binding,
+    PreparedImageGenerationDispatch, RecoverImageGenerationArtifactComponent,
+    ReserveImageGenerationLatePublication, image_generation_attempt_media_reservation_id,
+    image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
@@ -3251,20 +3254,31 @@ impl ImageGenerationOwnerContextAuthority {
             [],
             |row| row.get(0),
         )?;
-        let next_generation = recorded
-            .artifact_generation
-            .checked_add(1)
-            .context("security recovery generation overflow")?;
-        tx.execute("INSERT INTO image_generation_artifact_cleanup_intents(cleanup_operation_id,artifact_id,expected_artifact_generation,reason,state,version,created_at_unix_ms) VALUES(?1,?2,?3,'owner_recovery','pending',1,?4)",params![cleanup_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(next_generation)?,now])?;
-        ensure!(tx.execute("UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state='security_blocked' AND generation=?3 AND active_lease_count=0",params![now,recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?])?==1,"security recovery artifact compare-and-set lost");
-        for component in components {
-            ensure!(tx.execute("UPDATE image_generation_artifact_components SET state='cleanup_pending',generation=generation+1 WHERE artifact_id=?1 AND component_id=?2 AND state IN ('ready','security_blocked')",params![recorded.artifact_id.to_string(),component.component_id.to_string()])?==1,"security recovery component compare-and-set lost");
-        }
         let outcome = crate::intel::hex_lower(&Sha256::digest(format!(
             "cleanup:{}:{}",
             recorded.operation_id, recorded.component_set_digest
         )));
-        ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
+        let component_transitions = components
+            .iter()
+            .map(|component| RecoverImageGenerationArtifactComponent {
+                component_id: component.component_id,
+                expected_generation: component.generation,
+            })
+            .collect::<Vec<_>>();
+        cockpit_db::Db::commit_image_generation_security_cleanup_conn(
+            &tx,
+            &CommitImageGenerationSecurityCleanup {
+                recovery_operation_id: recorded.operation_id,
+                principal_digest: &self.principal_digest,
+                artifact_id: recorded.artifact_id,
+                expected_artifact_generation: recorded.artifact_generation,
+                component_set_digest: &recorded.component_set_digest,
+                cleanup_operation_id,
+                components: &component_transitions,
+                outcome_digest: &outcome,
+                now_unix_ms: now,
+            },
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -3506,14 +3520,27 @@ impl ImageGenerationOwnerContextAuthority {
             [],
             |row| row.get(0),
         )?;
-        tx.execute("INSERT INTO image_generation_user_published_outputs(publication_operation_id,artifact_id,artifact_generation,output_authority_digest,output_authority_generation,destination_name,output_evidence_json,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![publication_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,row.2,row.3,row.1,evidence,now])?;
-        ensure!(tx.execute("UPDATE image_generation_late_publication_leases SET state='published',version=version+1,output_evidence_json=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND state='security_blocked' AND version=?4",params![evidence,now,publication_operation_id.to_string(),row.0])?==1,"security publication lease compare-and-set lost");
         let outcome = crate::intel::hex_lower(&Sha256::digest(format!(
             "published:{publication_operation_id}:{evidence}"
         )));
-        ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
-        ensure!(tx.execute("UPDATE image_generation_artifacts SET state='retained',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state IN ('late_quarantined','security_blocked') AND generation=?3",params![now,recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?])?==1,"security publication artifact compare-and-set lost");
-        ensure!(tx.execute("UPDATE image_generation_slots SET state='published',version=version+1,published_disposition='late_authorized',published_disposition_generation=version+1 WHERE job_id=(SELECT job_id FROM image_generation_artifacts WHERE artifact_id=?1) AND slot_id=(SELECT slot_id FROM image_generation_artifacts WHERE artifact_id=?1) AND state='late_quarantined' AND version=?2 AND result_after_cancel=1",params![recorded.artifact_id.to_string(),row.4])?==1,"security publication slot compare-and-set lost");
+        cockpit_db::Db::commit_image_generation_security_publication_conn(
+            &tx,
+            &CommitImageGenerationSecurityPublication {
+                recovery_operation_id: recorded.operation_id,
+                principal_digest: &self.principal_digest,
+                publication_operation_id,
+                expected_lease_version,
+                artifact_id: recorded.artifact_id,
+                expected_artifact_generation: recorded.artifact_generation,
+                expected_slot_version: u64::try_from(row.4)?,
+                output_authority_digest: &row.2,
+                output_authority_generation: u64::try_from(row.3)?,
+                destination_name: &row.1,
+                output_evidence_json: &evidence,
+                outcome_digest: &outcome,
+                now_unix_ms: now,
+            },
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -4795,27 +4822,20 @@ pub fn retain_generated_image_artifact(
             now_unix_ms: input.now_unix_ms,
         },
     )?;
-    cockpit_db::Db::transition_image_generation_artifact_conn(
+    cockpit_db::Db::begin_image_generation_artifact_write_conn(
         conn,
-        &TransitionImageGenerationArtifact {
+        &BeginImageGenerationArtifactWrite {
             artifact_id: input.artifact_id,
             expected_generation: 1,
-            from: ImageGenerationArtifactState::Allocating,
-            to: ImageGenerationArtifactState::Writing,
             now_unix_ms: input.now_unix_ms,
-            terminal_reason: None,
         },
     )?;
-    cockpit_db::Db::transition_image_generation_artifact_component_conn(
+    cockpit_db::Db::begin_image_generation_artifact_component_write_conn(
         conn,
-        &TransitionImageGenerationArtifactComponent {
+        &BeginImageGenerationArtifactComponentWrite {
             artifact_id: input.artifact_id,
             component_id: input.component_id,
             expected_generation: 1,
-            from: ImageGenerationArtifactComponentState::Planned,
-            to: ImageGenerationArtifactComponentState::Writing,
-            stable_identity_json: None,
-            deletion_evidence_digest: None,
         },
     )?;
     let mut temporary = root.create_component_temporary(&temporary_name)?;
@@ -4899,33 +4919,25 @@ pub fn retain_generated_image_artifact(
         }
         .into());
     }
-    cockpit_db::Db::transition_image_generation_artifact_component_conn(
+    cockpit_db::Db::commit_image_generation_artifact_component_ready_conn(
         conn,
-        &TransitionImageGenerationArtifactComponent {
+        &CommitImageGenerationArtifactComponentReady {
             artifact_id: input.artifact_id,
             component_id: input.component_id,
             expected_generation: 2,
-            from: ImageGenerationArtifactComponentState::Writing,
-            to: ImageGenerationArtifactComponentState::Ready,
-            stable_identity_json: Some(evidence_json),
-            deletion_evidence_digest: None,
+            stable_identity_json: &evidence_json,
         },
     )?;
-    cockpit_db::Db::transition_image_generation_artifact_conn(
-        conn,
-        &TransitionImageGenerationArtifact {
-            artifact_id: input.artifact_id,
-            expected_generation: 2,
-            from: ImageGenerationArtifactState::Writing,
-            to: if input.late_quarantined {
-                ImageGenerationArtifactState::LateQuarantined
-            } else {
-                ImageGenerationArtifactState::Retained
-            },
-            now_unix_ms: input.now_unix_ms,
-            terminal_reason: None,
-        },
-    )?;
+    let retention = CommitImageGenerationArtifactRetention {
+        artifact_id: input.artifact_id,
+        expected_generation: 2,
+        now_unix_ms: input.now_unix_ms,
+    };
+    if input.late_quarantined {
+        cockpit_db::Db::commit_image_generation_artifact_late_quarantined_conn(conn, &retention)?;
+    } else {
+        cockpit_db::Db::commit_image_generation_artifact_retained_conn(conn, &retention)?;
+    }
     Ok(evidence)
 }
 

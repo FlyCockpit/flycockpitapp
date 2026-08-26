@@ -2350,6 +2350,7 @@ impl Db {
         limit: u32,
     ) -> Result<Vec<SessionRow>> {
         let sql = if only_open {
+            // schema-hot-query: local.sessions.open
             "SELECT * FROM sessions WHERE ended_at_unix_ms IS NULL AND ephemeral = 0
              ORDER BY last_active_at_unix_ms DESC LIMIT ?1"
         } else {

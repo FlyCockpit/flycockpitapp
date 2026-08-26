@@ -14,6 +14,20 @@ fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+fn rust_sources_below(root: &Path, relative: &Path, output: &mut Vec<PathBuf>) {
+    let directory = root.join(relative);
+    for entry in std::fs::read_dir(&directory).expect("read production source directory") {
+        let entry = entry.expect("read production source entry");
+        let path = entry.path();
+        let child = relative.join(entry.file_name());
+        if path.is_dir() {
+            rust_sources_below(root, &child, output);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            output.push(child);
+        }
+    }
+}
+
 fn effective_profiles() -> [(&'static str, schema_parser::Schema); 2] {
     [
         ("local", schema_parser::parse(&[SCHEMA])),
@@ -111,33 +125,83 @@ fn intentional_session_soft_relationships_are_classified_in_schema() {
 }
 
 #[test]
-fn hot_query_shapes_keep_reviewed_leading_indexes() {
+fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
     let root = workspace();
     let shapes = [
         (
-            "crates/cockpit-db/src/db/sessions.rs",
-            "WHERE parent_session_id = ?1 ORDER BY started_at_unix_ms",
-            "CREATE INDEX idx_sessions_parent_started ON sessions (parent_session_id, started_at_unix_ms DESC)",
-        ),
-        (
+            "local.sessions.open",
             "crates/cockpit-db/src/db/sessions.rs",
             "WHERE ended_at_unix_ms IS NULL AND ephemeral = 0",
-            "CREATE INDEX idx_sessions_open            ON sessions (ended_at_unix_ms) WHERE ended_at_unix_ms IS NULL",
+            false,
+            "sessions",
+            &["ended_at_unix_ms"][..],
         ),
         (
+            "local.agent-preparation.terminalize",
             "crates/cockpit-db/src/db/agent_installations.rs",
             "WHERE session_id=?1 AND claim_state IN ('claimed', 'running')",
-            "CREATE INDEX idx_agent_session_preparation_claims_recovery\n    ON agent_session_preparation_claims(claim_state, session_id)",
+            false,
+            "agent_session_preparation_claims",
+            &["claim_state", "session_id"],
+        ),
+        (
+            "extended.scheduler.by-owner",
+            "crates/cockpit-db/src/db/scheduler.rs",
+            "WHERE owner = ?1",
+            true,
+            "scheduled_jobs",
+            &["owner"],
+        ),
+        (
+            "extended.image-generation.dispatch-scan",
+            "crates/cockpit-db/src/db/image_generation.rs",
+            "WHERE j.state='queued' AND s.state='queued' AND a.state='planned'",
+            true,
+            "image_generation_jobs",
+            &["state", "created_at_unix_ms", "job_id"],
         ),
     ];
-    for (owner, query, index) in shapes {
+    let expected_markers = shapes
+        .iter()
+        .map(|(marker, owner, ..)| (marker.to_string(), owner.to_string()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut production_sources = Vec::new();
+    rust_sources_below(
+        &root,
+        Path::new("crates/cockpit-db/src/db"),
+        &mut production_sources,
+    );
+    let actual_markers = production_sources
+        .into_iter()
+        .flat_map(|owner| {
+            let contents = source(root.join(&owner));
+            contents
+                .lines()
+                .filter_map(|line| {
+                    line.split_once("schema-hot-query:")
+                        .map(|(_, marker)| (marker.trim().to_owned(), owner.display().to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        actual_markers, expected_markers,
+        "hot-query annotations drifted"
+    );
+
+    let [(_, local), (_, extended)] = effective_profiles();
+    for (marker, owner, query, uses_extended, table, leading) in shapes {
         assert!(
             source(root.join(owner)).contains(query),
-            "query shape drifted: {owner}: {query}"
+            "query shape drifted for {marker}: {owner}: {query}"
         );
+        let schema = if uses_extended { &extended } else { &local };
         assert!(
-            SCHEMA.contains(index),
-            "reviewed index missing for {owner}: {index}"
+            schema
+                .indexes
+                .iter()
+                .any(|index| { index.table == table && index.columns.starts_with(leading) }),
+            "reviewed leading index missing for {marker}: {table}{leading:?}"
         );
     }
 }

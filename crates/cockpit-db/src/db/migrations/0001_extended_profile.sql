@@ -168,6 +168,8 @@ CREATE TABLE image_generation_jobs (
     updated_at_unix_ms INTEGER NOT NULL,
     CHECK(terminal_event_version IS NULL OR terminal_event_version >= 1)
 );
+CREATE INDEX idx_image_generation_jobs_dispatch_scan
+    ON image_generation_jobs(state, created_at_unix_ms, job_id);
 
 -- Terminal-event counts are a DISJOINT partition of the job's slots: every slot
 -- contributes to EXACTLY ONE column, keyed by (state, and for published slots
@@ -273,6 +275,8 @@ CREATE TABLE image_generation_slots (
     ),
     CHECK((state='published' AND published_disposition IS NOT NULL AND published_disposition_generation=version) OR (state!='published' AND published_disposition IS NULL AND published_disposition_generation IS NULL))
 );
+CREATE INDEX idx_image_generation_slots_dispatch_scan
+    ON image_generation_slots(job_id, state, slot_index);
 
 CREATE TABLE image_generation_attempts (
     job_id TEXT NOT NULL,
@@ -317,6 +321,8 @@ CREATE TABLE image_generation_attempts (
     -- so no attempt can be handed to a provider without a successful revalidation.
     CHECK(state NOT IN ('prepared','dispatching') OR dispatch_proof_endpoint_id IS NOT NULL)
 );
+CREATE INDEX idx_image_generation_attempts_dispatch_scan
+    ON image_generation_attempts(job_id, slot_id, state, attempt_number);
 CREATE TABLE image_generation_handoff_evidence (
  job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
  external_operation_id TEXT NOT NULL UNIQUE,
@@ -408,6 +414,8 @@ CREATE TABLE image_generation_scheduler_claims (
  PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
  FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
+CREATE INDEX idx_image_generation_scheduler_claims_live
+    ON image_generation_scheduler_claims(job_id, slot_id, attempt_number, expires_at_unix_ms);
 CREATE TABLE image_generation_scheduler_claim_consumptions (
  job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, claim_generation INTEGER NOT NULL,
  consumed_at_unix_ms INTEGER NOT NULL,

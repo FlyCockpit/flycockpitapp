@@ -239,6 +239,7 @@ pub fn list_scheduled_jobs_conn(
 ) -> Result<Vec<ScheduledJobRow>> {
     let sql = match owner {
         Some(_) => {
+            // schema-hot-query: extended.scheduler.by-owner
             "SELECT *
                FROM scheduled_jobs
               WHERE owner = ?1

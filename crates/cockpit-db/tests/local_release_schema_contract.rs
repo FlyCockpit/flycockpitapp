@@ -762,6 +762,31 @@ fn audit_transition_block(block: &syn::Block) -> Result<(), String> {
     Ok(())
 }
 
+fn raw_transition_boundary_error(name: &str, block: &syn::Block) -> Option<String> {
+    let mut audit = TransitionAstAudit::default();
+    audit.visit_block(block);
+    let allowed = [
+        "execute_image_job_transition_conn",
+        "transition_image_generation_artifact_conn",
+        "transition_image_generation_artifact_component_conn",
+        "execute_late_publication_artifact_transition_conn",
+        "execute_artifact_cleanup_transition_conn",
+        "execute_component_tombstone_transition_conn",
+        "execute_artifact_tombstone_transition_conn",
+    ];
+    audit.mutations.into_iter().find_map(|mutation| {
+        matches!(mutation.family, "job" | "artifact" | "component")
+            .then(|| ())
+            .filter(|_| !allowed.contains(&name))
+            .map(|_| {
+                format!(
+                    "{name} contains raw {} state SQL outside a typed executor",
+                    mutation.family
+                )
+            })
+    })
+}
+
 fn transition_source_errors(source: &str) -> Vec<String> {
     fn is_test_only(attrs: &[syn::Attribute]) -> bool {
         attrs.iter().any(|attr| {
@@ -774,6 +799,11 @@ fn transition_source_errors(source: &str) -> Vec<String> {
     for item in file.items {
         match item {
             syn::Item::Fn(function) if !is_test_only(&function.attrs) => {
+                if let Some(error) =
+                    raw_transition_boundary_error(&function.sig.ident.to_string(), &function.block)
+                {
+                    errors.push(error);
+                }
                 if let Err(error) = audit_transition_block(&function.block) {
                     errors.push(format!("{}: {error}", function.sig.ident));
                 }
@@ -782,9 +812,16 @@ fn transition_source_errors(source: &str) -> Vec<String> {
                 for item in item_impl.items {
                     if let syn::ImplItem::Fn(function) = item
                         && !is_test_only(&function.attrs)
-                        && let Err(error) = audit_transition_block(&function.block)
                     {
-                        errors.push(format!("{}: {error}", function.sig.ident));
+                        if let Some(error) = raw_transition_boundary_error(
+                            &function.sig.ident.to_string(),
+                            &function.block,
+                        ) {
+                            errors.push(error);
+                        }
+                        if let Err(error) = audit_transition_block(&function.block) {
+                            errors.push(format!("{}: {error}", function.sig.ident));
+                        }
                     }
                 }
             }

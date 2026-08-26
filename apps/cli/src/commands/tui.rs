@@ -24,9 +24,23 @@ async fn finish_lifecycle(mut task: tokio::task::JoinHandle<anyhow::Result<()>>)
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(error).context("daemon lifecycle task failed"),
         Err(_) => {
-            task.abort();
-            let _ = task.await;
-            anyhow::bail!("daemon lifecycle teardown exceeded 35s; forced shutdown was requested")
+            // The lifecycle service owns a runtime-independent supervisor for
+            // every in-process daemon and does not return until each is
+            // joined. Do not abort it and let the top-level runtime disappear
+            // beneath cleanup.
+            task.await
+                .context("daemon lifecycle task failed after its grace deadline")?
+        }
+    }
+}
+
+fn combine_app_and_lifecycle(app: Result<()>, lifecycle: Result<()>) -> Result<()> {
+    match (app, lifecycle) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(app), Ok(())) => Err(app),
+        (Ok(()), Err(lifecycle)) => Err(lifecycle),
+        (Err(app), Err(lifecycle)) => {
+            anyhow::bail!("application failed: {app:#}; daemon lifecycle failed: {lifecycle:#}")
         }
     }
 }
@@ -48,7 +62,7 @@ pub async fn run(
     let result = app.run().await;
     drop(app);
     let lifecycle_result = finish_lifecycle(lifecycle_task).await;
-    result.and(lifecycle_result)
+    combine_app_and_lifecycle(result, lifecycle_result)
 }
 
 pub async fn run_with_session(
@@ -82,7 +96,7 @@ pub async fn run_with_session(
     let result = app.run().await;
     drop(app);
     let lifecycle_result = finish_lifecycle(lifecycle_task).await;
-    result.and(lifecycle_result)
+    combine_app_and_lifecycle(result, lifecycle_result)
 }
 
 fn prepare_tui_workspace_trust(project: Option<&Path>) -> Result<StartupWorkspaceTrust> {

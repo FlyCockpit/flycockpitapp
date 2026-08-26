@@ -1104,30 +1104,55 @@ pub async fn run_foreground_with_resume(
 }
 
 pub struct InProcessDaemonGuard {
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    force: shutdown::ShutdownSignal,
     completion: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    supervisor: Option<std::thread::JoinHandle<()>>,
 }
 
 impl InProcessDaemonGuard {
     pub async fn shutdown(mut self) -> Result<()> {
         self.begin_shutdown();
-        self.completion
+        let result = self
+            .completion
             .take()
             .context("in-process daemon shutdown completion missing")?
             .await
-            .context("in-process daemon shutdown supervisor stopped")?
+            .context("in-process daemon shutdown supervisor stopped")?;
+        let supervisor = self
+            .supervisor
+            .take()
+            .context("in-process daemon shutdown supervisor handle missing")?;
+        supervisor
+            .join()
+            .map_err(|_| anyhow::anyhow!("in-process daemon shutdown supervisor panicked"))?;
+        result
     }
 
-    fn begin_shutdown(&mut self) {
+    pub(crate) fn begin_shutdown(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
+    }
+
+    pub(crate) fn shutdown_force_handle(&self) -> shutdown::ShutdownSignal {
+        self.force.clone()
     }
 }
 
 impl Drop for InProcessDaemonGuard {
     fn drop(&mut self) {
         self.begin_shutdown();
+        // This is the cancellation/panic fallback. The supervisor owns its
+        // own runtime, so joining here cannot cancel cleanup when the caller's
+        // Tokio runtime is unwinding. Normal lifecycle shutdown takes and
+        // joins the handle after asynchronous completion, avoiding a blocking
+        // Drop on the ordinary path.
+        if let Some(supervisor) = self.supervisor.take()
+            && supervisor.join().is_err()
+        {
+            tracing::error!("in-process daemon shutdown supervisor panicked during drop");
+        }
     }
 }
 
@@ -1135,6 +1160,14 @@ async fn drain_daemon_context(
     ctx: &std::sync::Arc<server::DaemonContext>,
     grace: Duration,
 ) -> Result<()> {
+    let force_ctx = ctx.clone();
+    let force_timer = tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        if !force_ctx.shutdown_signal().is_forced() {
+            force_ctx.shutdown_signal().force();
+            force_ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
+        }
+    });
     let drain = ctx.registry.drain_all(grace).await;
     let mut failures = Vec::new();
     if !drain.park_commit.is_clean() {
@@ -1196,15 +1229,18 @@ async fn drain_daemon_context(
         }
     }
 
-    if failures.is_empty() {
+    let result = if failures.is_empty() {
         Ok(())
     } else {
         if !ctx.shutdown_signal().is_forced() {
             ctx.shutdown_signal().force();
             ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
         }
-        anyhow::bail!(failures.join("; "))
-    }
+        Err(anyhow::anyhow!(failures.join("; ")))
+    };
+    force_timer.abort();
+    let _ = force_timer.await;
+    result
 }
 
 async fn shutdown_in_process_context(
@@ -1230,18 +1266,28 @@ async fn shutdown_in_process_context(
 fn spawn_in_process_shutdown_supervisor(
     ctx: std::sync::Arc<server::DaemonContext>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-) -> InProcessDaemonGuard {
-    let (shutdown, shutdown_request) = tokio::sync::oneshot::channel();
+) -> Result<InProcessDaemonGuard> {
+    let force = ctx.shutdown_signal().clone();
+    let (shutdown, shutdown_request) = std::sync::mpsc::channel();
     let (completion, completed) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let _ = shutdown_request.await;
-        let result = shutdown_in_process_context(ctx, tasks).await;
-        let _ = completion.send(result);
-    });
-    InProcessDaemonGuard {
+    let supervisor = std::thread::Builder::new()
+        .name("cockpit-in-process-shutdown".to_string())
+        .spawn(move || {
+            let _ = shutdown_request.recv();
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building in-process daemon shutdown runtime")
+                .and_then(|runtime| runtime.block_on(shutdown_in_process_context(ctx, tasks)));
+            let _ = completion.send(result);
+        })
+        .context("spawning in-process daemon shutdown supervisor")?;
+    Ok(InProcessDaemonGuard {
         shutdown: Some(shutdown),
+        force,
         completion: Some(completed),
-    }
+        supervisor: Some(supervisor),
+    })
 }
 
 pub(crate) async fn boot_in_process(
@@ -1275,7 +1321,7 @@ pub(crate) async fn boot_in_process(
     server::register_in_process_context(ctx.clone());
     Ok((
         ctx.clone(),
-        Some(spawn_in_process_shutdown_supervisor(ctx, tasks)),
+        Some(spawn_in_process_shutdown_supervisor(ctx, tasks)?),
     ))
 }
 
@@ -1634,13 +1680,10 @@ async fn run_foreground_inner_with_boot_db(
     // new-request gate is definitely closed before we await workers.
     server::request_shutdown(&ctx);
 
-    // Bounded grace, then force: arm a timer that escalates the central
-    // gate to `Forced` once the grace elapses (also broadcasting the forced
-    // notice), so a hung provider request can't block shutdown past the
-    // deadline. `drain_all` awaits the workers up to the same grace and
-    // aborts whatever remains.
+    // Bounded grace, then force. `drain_daemon_context` owns the shared
+    // foreground/in-process force timer and result policy, so neither path
+    // can report a clean stop with unfinished workers or containment.
     let drain_grace = ctx.take_shutdown_grace_override().unwrap_or(drain_grace);
-    spawn_force_timer(ctx.clone(), drain_grace);
     // `drain_all` now returns BOTH the grace-bounded running-work result and the
     // decoupled interrupt-park commit terminal
     // (`daemon-lifecycle-replay-timing-robustness.md`). Crucially it does not
@@ -1650,14 +1693,15 @@ async fn run_foreground_inner_with_boot_db(
     // a registered interrupt waiter's park is still un-committed. A restart then
     // never reports success (or lets the successor bind) with an interrupt row
     // left `Open`.
-    if let Err(error) = drain_daemon_context(&ctx, drain_grace).await {
+    let shutdown_result = drain_daemon_context(&ctx, drain_grace).await;
+    if let Err(error) = &shutdown_result {
         tracing::warn!(%error, "daemon shutdown was not clean");
     }
 
     // Cleanup on every path, but only while the pid file still names this
     // process. A restart replacement may have taken ownership of the shared
     // canonical paths before the old daemon finishes draining.
-    metadata_guard.cleanup()?;
+    let metadata_result = metadata_guard.cleanup();
 
     signal_task.abort();
     if let Some(watchdog) = watchdog_task {
@@ -1677,7 +1721,21 @@ async fn run_foreground_inner_with_boot_db(
     }
     #[cfg(unix)]
     let _ = std::fs::remove_file(paths.leak_reveal_socket());
-    result
+    let mut failures = Vec::new();
+    if let Err(error) = result {
+        failures.push(format!("daemon accept loop: {error}"));
+    }
+    if let Err(error) = shutdown_result {
+        failures.push(format!("daemon shutdown: {error}"));
+    }
+    if let Err(error) = metadata_result {
+        failures.push(format!("daemon metadata cleanup: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
 }
 
 #[cfg(not(unix))]
@@ -1689,23 +1747,6 @@ pub async fn run_foreground_inner(
     _terminal_factory: terminal::TerminalHostFactory,
 ) -> Result<()> {
     anyhow::bail!("daemon socket transport is not supported on this platform")
-}
-
-/// Arm the bounded-grace force timer for a graceful drain
-/// (`daemon-graceful-drain-shutdown.md`). Once `grace` elapses, it
-/// escalates the central gate to `Forced` and broadcasts the forced
-/// notice — so even if `drain_all`'s own timeout is somehow still pending,
-/// the gate reflects "forced" for any late observer. Detached; the process
-/// exits shortly after `drain_all` returns regardless.
-#[cfg(any(unix, test))]
-fn spawn_force_timer(ctx: std::sync::Arc<server::DaemonContext>, grace: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
-        if !ctx.shutdown_signal().is_forced() {
-            ctx.shutdown_signal().force();
-            ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
-        }
-    });
 }
 
 #[cfg(any(unix, test))]
@@ -2927,7 +2968,8 @@ mod tests {
             .await
             .expect("in-process daemon context");
         let shutdown = ctx.shutdown_signal().clone();
-        let guard = spawn_in_process_shutdown_supervisor(ctx, Vec::new());
+        let guard =
+            spawn_in_process_shutdown_supervisor(ctx, Vec::new()).expect("shutdown supervisor");
         drop(guard);
         wait_until(|| shutdown.is_draining(), Duration::from_secs(1)).await;
         wait_until(
@@ -2946,7 +2988,8 @@ mod tests {
             .await
             .expect("in-process daemon context");
         let shutdown = ctx.shutdown_signal().clone();
-        let guard = spawn_in_process_shutdown_supervisor(ctx, Vec::new());
+        let guard =
+            spawn_in_process_shutdown_supervisor(ctx, Vec::new()).expect("shutdown supervisor");
         let waiter = tokio::spawn(guard.shutdown());
         wait_until(|| shutdown.is_draining(), Duration::from_secs(1)).await;
         waiter.abort();
@@ -2956,6 +2999,36 @@ mod tests {
             Duration::from_secs(1),
         )
         .await;
+    }
+
+    #[test]
+    fn in_process_shutdown_supervisor_outlives_originating_runtime() {
+        let root = tempfile::tempdir().expect("daemon owner tempdir");
+        let paths = temp_ephemeral_paths(root.path(), "in-process-owner-runtime-drop");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("originating runtime");
+        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
+        let (ctx, guard) = runtime.block_on(async {
+            let ctx = boot_in_process_with_db(paths.clone(), db)
+                .await
+                .expect("in-process daemon context");
+            let guard = spawn_in_process_shutdown_supervisor(ctx.clone(), Vec::new())
+                .expect("shutdown supervisor");
+            (ctx, guard)
+        });
+        drop(ctx);
+        drop(runtime);
+
+        let completion_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("completion runtime");
+        completion_runtime
+            .block_on(guard.shutdown())
+            .expect("runtime-independent shutdown");
+        assert!(server::in_process_context(&paths.socket).is_none());
     }
 
     async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {

@@ -549,6 +549,22 @@ fn call_name(call: &syn::ExprCall) -> Option<String> {
 fn lifecycle_authority_findings(source: &str) -> Vec<String> {
     use std::collections::HashMap;
 
+    const FORBIDDEN_AUTHORITY_NAMES: &[&str] = &[
+        "DaemonClient",
+        "EphemeralDaemonGuard",
+        "LifecycleClient",
+        "OwnedDaemonGuard",
+        "UnixStream",
+        "discover",
+        "ensure_persistent_daemon",
+        "probe",
+        "probe_or_spawn",
+        "request_on_socket",
+        "serve_lifecycle_requests",
+        "spawn_detached",
+        "spawn_detached_ephemeral",
+    ];
+
     fn collect_use(
         tree: &syn::UseTree,
         prefix: &mut Vec<String>,
@@ -595,13 +611,21 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
             let paths = flattened_use_paths(&item.tree);
             for path in paths.iter().filter(|path| path.ends_with("::*")) {
-                if path == "cockpit_client::*"
-                    || path == "cockpit_core::daemon::*"
-                    || path == "std::os::unix::net::*"
-                    || path == "tokio::net::*"
+                let raw_prefix = path.trim_end_matches("::*");
+                let resolved_prefix = resolve(
+                    &raw_prefix
+                        .split("::")
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                    &self.aliases,
+                );
+                if resolved_prefix == "cockpit_client"
+                    || resolved_prefix == "cockpit_core::daemon"
+                    || resolved_prefix == "std::os::unix::net"
+                    || resolved_prefix == "tokio::net"
                 {
                     self.findings.push(format!(
-                        "line {}: forbidden authority glob `{path}`",
+                        "line {}: forbidden authority glob `{resolved_prefix}::*`",
                         item.span().start().line
                     ));
                 }
@@ -659,14 +683,7 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
             }
             let resolved = resolve(&parts, self.aliases);
             let last = resolved.rsplit("::").next().unwrap_or_default();
-            let forbidden_named = matches!(
-                last,
-                "probe_or_spawn"
-                    | "spawn_detached"
-                    | "ensure_persistent_daemon"
-                    | "serve_lifecycle_requests"
-                    | "request_on_socket"
-            );
+            let forbidden_named = FORBIDDEN_AUTHORITY_NAMES.contains(&last);
             let forbidden_core_probe = matches!(
                 resolved.as_str(),
                 "cockpit_core::daemon::discover" | "cockpit_core::daemon::probe"
@@ -726,24 +743,21 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
                 .chars()
                 .filter(|character| !character.is_whitespace())
                 .collect();
-            let mut spellings = vec![
-                "DaemonClient::connect".to_string(),
-                "UnixStream::connect".to_string(),
-                "LifecycleClient::channel".to_string(),
-                "probe_or_spawn".to_string(),
-                "serve_lifecycle_requests".to_string(),
-                "request_on_socket".to_string(),
-            ];
+            let mut spellings = FORBIDDEN_AUTHORITY_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .chain([
+                    "cockpit_client".to_string(),
+                    "cockpit_core::daemon".to_string(),
+                ])
+                .collect::<Vec<_>>();
             for (alias, target) in self.aliases {
-                if target.ends_with("DaemonClient") || target.ends_with("UnixStream") {
-                    spellings.push(format!("{alias}::connect"));
-                }
-                if target.ends_with("LifecycleClient") {
-                    spellings.push(format!("{alias}::channel"));
-                }
-                if target.ends_with("probe_or_spawn")
-                    || target.ends_with("serve_lifecycle_requests")
-                    || target.ends_with("request_on_socket")
+                if FORBIDDEN_AUTHORITY_NAMES
+                    .iter()
+                    .any(|name| target.ends_with(name))
+                    || target == "cockpit_client"
+                    || target == "cockpit_core"
+                    || target == "cockpit_core::daemon"
                 {
                     spellings.push(alias.clone());
                 }
@@ -2310,7 +2324,20 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         abort: false,
     };
     finish_calls.visit_block(&finish.block);
-    assert!(finish_calls.timeout && finish_calls.abort);
+    assert!(finish_calls.timeout && !finish_calls.abort);
+    let cli_source = production_source(&read("apps/cli/src/commands/tui.rs"));
+    assert!(cli_source.contains("combine_app_and_lifecycle(result, lifecycle_result)"));
+    let daemon_source = production_source(&read("crates/cockpit-core/src/daemon/mod.rs"));
+    assert_eq!(
+        daemon_source.matches("drain_daemon_context(&ctx").count(),
+        2,
+        "foreground and in-process shutdown must share one drain/force policy"
+    );
+    assert!(daemon_source.contains("std::thread::Builder::new()"));
+    assert!(daemon_source.contains("supervisor.join()"));
+    let lifecycle_source = production_source(&read("crates/cockpit-core/src/daemon/client.rs"));
+    assert!(lifecycle_source.contains("futures::future::join_all"));
+    assert!(lifecycle_source.contains("for force in &force_handles"));
     let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
     assert!(!settings.contains("serve_lifecycle_requests"));
     assert!(!settings.contains("LifecycleClient::channel"));
@@ -2356,14 +2383,35 @@ fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
         "type S = std::os::unix::net::UnixStream; type T = S; fn f() { let _ = T::connect; }",
         "extern crate cockpit_client as cc; fn f() { let _ = cc::DaemonClient::connect; }",
         "use cockpit_core::daemon::*; fn f() { let _ = discover; }",
+        "use cockpit_core as cc; use cc::daemon::*; fn f() { let _ = discover; }",
         "use cockpit_core::daemon::probe_or_spawn as p; fn f() { p(); }",
         "use cockpit_core::daemon::client::serve_lifecycle_requests as serve; fn f() { serve(rx); }",
         "macro_rules! hidden { () => { cockpit_client::DaemonClient::connect(path) } }",
         "use cockpit_core::daemon::probe_or_spawn as p; macro_rules! hidden { () => { p() } }",
+        "use cockpit_core as cc; macro_rules! hidden { () => { cc::daemon::discover() } }",
+        "macro_rules! hidden { () => { type C = cockpit_client::DaemonClient; C::connect(path) } }",
+        "macro_rules! hidden { () => { <cockpit_client::DaemonClient>::connect(path) } }",
+        "macro_rules! hidden { () => { use cockpit_core::daemon::probe_or_spawn as p; p() } }",
     ] {
         assert!(
             !lifecycle_authority_findings(source).is_empty(),
             "AST lifecycle gate missed alternate authority spelling: {source}"
+        );
+    }
+    for name in [
+        "discover",
+        "probe",
+        "probe_or_spawn",
+        "spawn_detached",
+        "spawn_detached_ephemeral",
+        "ensure_persistent_daemon",
+        "serve_lifecycle_requests",
+        "request_on_socket",
+    ] {
+        let source = format!("macro_rules! hidden {{ () => {{ {name}() }} }}");
+        assert!(
+            !lifecycle_authority_findings(&source).is_empty(),
+            "macro inventory missed {name}"
         );
     }
 }

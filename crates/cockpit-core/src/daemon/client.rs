@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use cockpit_client::DaemonClient;
 
 use crate::daemon::proto::{self, Request};
@@ -92,10 +92,28 @@ pub enum OwnedDaemonGuard {
 }
 
 impl OwnedDaemonGuard {
+    fn begin_shutdown(&mut self) {
+        if let Self::InProcess(guard) = self {
+            guard.begin_shutdown();
+        }
+    }
+
+    fn shutdown_force_handle(&self) -> Option<crate::daemon::shutdown::ShutdownSignal> {
+        match self {
+            Self::Process(_) => None,
+            Self::InProcess(guard) => Some(guard.shutdown_force_handle()),
+        }
+    }
+
     async fn shutdown(self) -> Result<()> {
         match self {
             Self::Process(guard) => {
-                drop(guard);
+                tokio::task::spawn_blocking(move || {
+                    guard.shutdown();
+                    drop(guard);
+                })
+                .await
+                .context("joining ephemeral daemon stop request")?;
                 Ok(())
             }
             Self::InProcess(guard) => guard.shutdown().await,
@@ -183,12 +201,45 @@ pub async fn serve_lifecycle_requests(
             }
         }
     }
-    let mut failures = Vec::new();
-    for guard in owned_daemons {
-        if let Err(error) = guard.shutdown().await {
-            failures.push(error.to_string());
-        }
+    // Start every owned daemon before waiting for any one of them. A single
+    // slow teardown must not consume the grace period of all later owners.
+    for guard in &mut owned_daemons {
+        guard.begin_shutdown();
     }
+    let force_handles = owned_daemons
+        .iter()
+        .filter_map(OwnedDaemonGuard::shutdown_force_handle)
+        .collect::<Vec<_>>();
+    let mut shutdowns = std::pin::pin!(futures::future::join_all(
+        owned_daemons.into_iter().map(OwnedDaemonGuard::shutdown)
+    ));
+    let outcomes = match tokio::time::timeout(
+        crate::daemon::shutdown::SHUTDOWN_DRAIN_GRACE + std::time::Duration::from_secs(5),
+        &mut shutdowns,
+    )
+    .await
+    {
+        Ok(outcomes) => outcomes,
+        Err(_) => {
+            // Each in-process supervisor owns its context on an independent
+            // OS thread. Promote every still-running context to Forced, then
+            // join all supervisors instead of abandoning them with the CLI
+            // runtime. Process guards have already synchronously delivered
+            // their idempotent StopDaemon requests concurrently through the
+            // same join set.
+            for force in &force_handles {
+                force.force();
+            }
+            // Awaiting here is intentional: runtime exit is forbidden while
+            // an owned supervisor is alive, even after its forced deadline.
+            shutdowns.await
+        }
+    };
+    let failures = outcomes
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
     if failures.is_empty() {
         Ok(())
     } else {

@@ -26,9 +26,14 @@ pub mod test_env {
 }
 pub(crate) mod daemon {
     pub(crate) use cockpit_core::daemon::{
-        DaemonPaths, DaemonProbe, DaemonStatus, caffeinate, client, discover, image_upload, proto,
-        server, session_worker, terminal,
+        DaemonPaths, DaemonProbe, DaemonStatus, caffeinate, discover, image_upload, proto, server,
+        session_worker, terminal,
     };
+    pub(crate) mod client {
+        pub(crate) use cockpit_core::daemon::client::{
+            OwnedDaemonRunError, OwnedSessionMode, ensure_persistent_daemon, run_owned_daemon,
+        };
+    }
     #[cfg(test)]
     pub(crate) use cockpit_core::daemon::{
         boot_test_persistent_daemon, enable_in_process_auto_promote,

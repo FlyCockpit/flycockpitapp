@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 
 use crate::cli::LearnArgs;
-use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
+use crate::daemon::client::{OwnedSessionMode, run_owned_daemon};
 pub use crate::skills::{build_learn_prompt, subject_from_parts};
 
 pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
@@ -19,17 +19,21 @@ pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
     } else {
         OwnedSessionMode::AttachOrEphemeral
     };
-    let daemon = OwnedDaemonSession::connect(mode).await?;
     eprintln!("Authoring a reusable skill from the supplied sources…");
-    let result = crate::commands::run::attach_send_pump(
-        daemon.client(),
-        prompt,
-        no_sandbox,
-        crate::cli::OutputFormat::Default,
-        crate::commands::run::RunPumpOptions::default(),
-    )
-    .await;
-    let exit_code = daemon.finish(result.context("running learn turn")).await?;
+    let exit_code = run_owned_daemon(mode, |client| {
+        Box::pin(async move {
+            crate::commands::run::attach_send_pump(
+                client,
+                prompt,
+                no_sandbox,
+                crate::cli::OutputFormat::Default,
+                crate::commands::run::RunPumpOptions::default(),
+            )
+            .await
+            .context("running learn turn")
+        })
+    })
+    .await?;
     if exit_code != 0 {
         anyhow::bail!("`cockpit assistant learn` ran but the agent reported an error");
     }

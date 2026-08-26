@@ -150,7 +150,7 @@ impl ConnectedDaemon {
 /// separated from its client. Construction arms signal cleanup before the
 /// value is published; [`finish`](Self::finish) joins that cleanup and
 /// combines it with the command result.
-pub struct OwnedDaemonSession {
+struct OwnedDaemonSession {
     client: DaemonClient,
     guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
     signal_task: Option<tokio::task::JoinHandle<()>>,
@@ -177,7 +177,7 @@ impl OwnedSessionMode {
 }
 
 impl OwnedDaemonSession {
-    pub async fn connect(mode: OwnedSessionMode) -> Result<Self> {
+    async fn connect(mode: OwnedSessionMode) -> Result<Self> {
         let mut connected = probe_or_spawn(mode.lifecycle()).await?;
         let guard = connected.take_owned_daemon_guard();
         let signal_task =
@@ -199,11 +199,11 @@ impl OwnedDaemonSession {
         })
     }
 
-    pub fn client(&self) -> &DaemonClient {
+    fn client(&self) -> &DaemonClient {
         &self.client
     }
 
-    pub async fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+    async fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         let signal_task = self.signal_task.take();
         if let Some(task) = &signal_task {
             task.abort();
@@ -215,6 +215,47 @@ impl OwnedDaemonSession {
         }
         crate::daemon::ephemeral_guard::aggregate_shutdown_result(result, shutdown)
     }
+}
+
+/// Run one foreground operation while this module retains inseparable
+/// ownership of any ephemeral daemon it starts. The operation can only borrow
+/// the authority-free client; every return path joins signal cleanup and
+/// aggregates the operation and exact-child shutdown results.
+#[derive(Debug, thiserror::Error)]
+pub enum OwnedDaemonRunError {
+    #[error("connecting to owned daemon: {0:#}")]
+    Connect(#[source] anyhow::Error),
+    #[error(transparent)]
+    OperationOrCleanup(#[from] anyhow::Error),
+}
+
+impl OwnedDaemonRunError {
+    pub fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Connect(error) | Self::OperationOrCleanup(error) => error,
+        }
+    }
+}
+
+pub async fn run_owned_daemon<T, F>(
+    mode: OwnedSessionMode,
+    operation: F,
+) -> std::result::Result<T, OwnedDaemonRunError>
+where
+    F: for<'client> FnOnce(
+        &'client DaemonClient,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<T>> + 'client>,
+    >,
+{
+    let session = OwnedDaemonSession::connect(mode)
+        .await
+        .map_err(OwnedDaemonRunError::Connect)?;
+    let result = operation(session.client()).await;
+    session
+        .finish(result)
+        .await
+        .map_err(OwnedDaemonRunError::OperationOrCleanup)
 }
 
 impl Drop for OwnedDaemonSession {

@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
-use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
+use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, run_owned_daemon};
 use crate::daemon::proto::{self, Request, Response};
 
 #[derive(Debug, thiserror::Error)]
@@ -237,39 +237,43 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         OwnedSessionMode::AttachOrEphemeral
     };
 
-    let daemon = match OwnedDaemonSession::connect(mode).await {
-        Ok(daemon) => daemon,
-        Err(error) => exit_run_error(format, 4, "daemon_connection", &format!("{error:#}")),
-    };
-    let client = daemon.client().clone();
-    let result = async {
-        // Preflight via daemon RPCs — the CLI never opens SQLite.
-        emit_org_logging_indicator_via_daemon(&client, &cwd).await;
-        enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd)
-            .await
-            .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
-        let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
-            .await
-            .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-        let image_files = resolve_attachment_paths(&cwd, &args.file)
-            .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-        let image_data = load_and_validate_images(&image_files).map_err(|error| {
-            RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
-        })?;
+    let result = run_owned_daemon(mode, |client| {
+        Box::pin(async move {
+            // Preflight via daemon RPCs — the CLI never opens SQLite.
+            emit_org_logging_indicator_via_daemon(client, &cwd).await;
+            enforce_noninteractive_workspace_trust_via_daemon(client, &cwd)
+                .await
+                .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
+            let requested_session = resolve_requested_session_via_daemon(&args, client, &cwd)
+                .await
+                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+            let image_files = resolve_attachment_paths(&cwd, &args.file)
+                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+            let image_data = load_and_validate_images(&image_files).map_err(|error| {
+                RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
+            })?;
 
-        run_turn(
-            &client,
-            &args,
-            prompt,
-            no_sandbox,
-            &cwd,
-            requested_session,
-            &image_data,
-        )
-        .await
-    }
+            run_turn(
+                client,
+                &args,
+                prompt,
+                no_sandbox,
+                &cwd,
+                requested_session,
+                &image_data,
+            )
+            .await
+        })
+    })
     .await;
-    let result = daemon.finish(result).await;
+
+    let result = match result {
+        Err(OwnedDaemonRunError::Connect(error)) => {
+            exit_run_error(format, 4, "daemon_connection", &format!("{error:#}"))
+        }
+        Err(error) => Err(error.into_inner()),
+        Ok(value) => Ok(value),
+    };
 
     let exit_code = match result {
         Ok(code) => code,

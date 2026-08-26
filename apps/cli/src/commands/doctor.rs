@@ -26,7 +26,7 @@ pub struct DoctorChecksFailed;
 pub struct DoctorCouldNotRun(#[source] pub anyhow::Error);
 
 use crate::cli::DoctorArgs;
-use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
+use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, run_owned_daemon};
 use crate::daemon::proto::{Request, Response};
 
 const DIAGNOSTIC_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,31 +73,30 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
             })?;
         return finish_snapshot(worker.rendered, worker.has_failures);
     }
-    let daemon = match OwnedDaemonSession::connect(OwnedSessionMode::AttachOrEphemeral).await {
-        Ok(daemon) => daemon,
-        Err(daemon_error) if ephemeral_boot_attempted => {
+    let response = match run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
+        Box::pin(async {
+            client
+                .request(build_doctor_request(&args, no_sandbox))
+                .await
+                .map_err(DoctorCouldNotRun)?
+                .map_err(|error| {
+                    DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
+                })
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(OwnedDaemonRunError::Connect(daemon_error)) if ephemeral_boot_attempted => {
             return recover_ephemeral_database_boot_failure(&args, no_sandbox, daemon_error).await;
         }
-        Err(daemon_error) => return Err(DoctorCouldNotRun(daemon_error).into()),
+        Err(error) => return Err(DoctorCouldNotRun(error.into_inner()).into()),
     };
-    let response = daemon
-        .client()
-        .request(build_doctor_request(&args, no_sandbox))
-        .await
-        .map_err(DoctorCouldNotRun)
-        .and_then(|response| {
-            response.map_err(|error| {
-                DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
-            })
-        });
-    let response = daemon
-        .finish(response.map_err(|error| anyhow::anyhow!("{error:#}")))
-        .await
-        .map_err(DoctorCouldNotRun);
     let Response::DoctorSnapshot {
         rendered,
         has_failures,
-    } = response?
+    } = response
     else {
         return Err(DoctorCouldNotRun(anyhow::anyhow!(
             "daemon returned unexpected response to doctor snapshot"

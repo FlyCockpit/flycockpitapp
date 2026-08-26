@@ -69,6 +69,21 @@ async fn fail_lock_state_deletes(db: &Db) {
     .unwrap();
 }
 
+async fn fail_lock_state_inserts(db: &Db) {
+    db.write(move |conn| {
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_lock_state_insert
+                 BEFORE INSERT ON lock_state
+                 BEGIN
+                     SELECT RAISE(FAIL, 'forced lock_state insert failure');
+                 END;",
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn acquire_and_release_round_trip() {
     let tmp = TempDir::new().unwrap();
@@ -1263,6 +1278,110 @@ async fn sweep_skips_holder_refreshed_between_collect_and_mutate() {
     let held = db.list_held_locks().await.unwrap();
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].session_id, sid);
+}
+
+/// Regression: a DB failure in the wait loop's re-acquire must clear this
+/// task's `waiting` edge before propagating. `end_session` purges every lock
+/// map except `waiting`, so a leaked edge is a permanent false "blocked" claim
+/// that `wait_cycle` traverses for other waiters.
+#[tokio::test]
+async fn wait_loop_db_failure_clears_waiting_edge() {
+    let tmp = TempDir::new().unwrap();
+    let p = touch(tmp.path(), "a.rs");
+    let (db, holder_sid) = setup().await;
+    let waiter = db.create_session("p", "/w", "builder").await.unwrap();
+    let waiter_sid = waiter.session_id;
+    let lm = Arc::new(LockManager::in_memory(db.clone()));
+    lm.acquire(&p, "builder", holder_sid).await.unwrap();
+
+    let cancel = CancellationToken::new();
+    let waiter_lm = lm.clone();
+    let waiter_path = p.clone();
+    let waiter_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        waiter_lm
+            .acquire_wait(
+                &waiter_path,
+                "builder",
+                waiter_sid,
+                &waiter_cancel,
+                noop_on_wait,
+            )
+            .await
+    });
+
+    // Let the waiter block and register its edge (waiter_sid -> holder_sid).
+    let key = (waiter_sid, "builder".to_string());
+    let mut registered = false;
+    for _ in 0..1000 {
+        tokio::task::yield_now().await;
+        if crate::sync::lock_or_recover(&lm.inner)
+            .waiting
+            .contains_key(&key)
+        {
+            registered = true;
+            break;
+        }
+    }
+    assert!(registered, "waiter never registered its wait edge");
+
+    // The next re-acquire in the wait loop will fail on the lock_state INSERT.
+    fail_lock_state_inserts(&db).await;
+    // Free the path so the woken waiter attempts (and fails) the acquire.
+    lm.release(&p, "builder", holder_sid).await.unwrap();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("waiter finishes")
+        .expect("join");
+    assert!(
+        result.is_err(),
+        "re-acquire DB failure should surface as an error"
+    );
+
+    assert!(
+        !crate::sync::lock_or_recover(&lm.inner)
+            .waiting
+            .contains_key(&key),
+        "waiting edge leaked after DB failure"
+    );
+}
+
+/// Regression: a holder merely `touch`ed (not re-acquired) during the persist
+/// await must be kept in memory AND have its already-deleted DB row restored,
+/// so memory and disk do not diverge. A `lock_touch` UPDATE alone finds no row
+/// (the sweep released it), so without the restore the lock would silently
+/// vanish on the next daemon restart.
+#[tokio::test]
+async fn sweep_restores_db_row_for_holder_touched_during_await() {
+    let tmp = TempDir::new().unwrap();
+    let p = touch(tmp.path(), "a.rs");
+    let canon = std::fs::canonicalize(&p).unwrap();
+    let (db, sid) = setup().await;
+    let lm = LockManager::in_memory(db.clone());
+    lm.acquire(&p, "builder", sid).await.unwrap();
+    let now = now_secs();
+    {
+        let mut state = crate::sync::lock_or_recover(&lm.inner);
+        *state.touched.get_mut(&canon).unwrap() = now - LOCK_IDLE_TIMEOUT.as_secs() as i64 - 1;
+    }
+
+    let reclaimed = lm
+        .sweep_expired_with_hook(now, || async {
+            // A bare touch: refreshes the in-memory deadline and issues a
+            // `lock_touch` UPDATE that finds no row (already released above).
+            lm.touch_holder("builder", sid).await;
+        })
+        .await
+        .unwrap();
+
+    assert!(reclaimed.is_empty());
+    assert_eq!(lm.holder(&p), Some((sid, "builder".to_string())));
+    // The row the sweep deleted must have been restored, not left missing.
+    let held = db.list_held_locks().await.unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].session_id, sid);
+    assert_eq!(held[0].agent_id, "builder");
 }
 
 #[tokio::test(start_paused = true)]

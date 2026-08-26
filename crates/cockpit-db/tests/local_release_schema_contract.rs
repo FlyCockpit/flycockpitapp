@@ -580,11 +580,20 @@ fn semantic_transition_guard_tables(sql: &str) -> BTreeSet<String> {
 }
 
 fn assert_production_image_mutations_use_validator(source: &str, table: &str, validator: &str) {
+    fn mutates_state(function: &str, table: &str) -> bool {
+        let normalized = function.split_whitespace().collect::<Vec<_>>().join(" ");
+        let marker = format!("UPDATE {table} SET ");
+        normalized.split(&marker).skip(1).any(|tail| {
+            tail.split(" WHERE ").next().is_some_and(|assignments| {
+                assignments.contains("state=") || assignments.contains("state =")
+            })
+        })
+    }
     let production = source
-        .split("#[cfg(test)]")
+        .split("\n#[cfg(test)]\nmod tests")
         .next()
         .expect("image-generation production source is present");
-    let mut starts = ["\nfn ", "\n    pub fn "]
+    let mut starts = ["\nfn ", "\n    fn ", "\n    pub fn "]
         .into_iter()
         .flat_map(|marker| production.match_indices(marker).map(|(index, _)| index))
         .collect::<Vec<_>>();
@@ -592,8 +601,16 @@ fn assert_production_image_mutations_use_validator(source: &str, table: &str, va
     starts.dedup();
     starts.push(production.len());
     for bounds in starts.windows(2) {
+        let prefix = &production[..bounds[0]];
+        if prefix
+            .lines()
+            .next_back()
+            .is_some_and(|line| line.trim() == "#[cfg(test)]")
+        {
+            continue;
+        }
         let function = &production[bounds[0]..bounds[1]];
-        if function.contains(&format!("UPDATE {table} SET state")) {
+        if mutates_state(function, table) {
             assert!(
                 function.contains(validator),
                 "production state mutation for {table} bypasses {validator}"
@@ -805,6 +822,21 @@ fn ownership() -> BTreeMap<String, Ownership> {
         image_source,
         "image_generation_artifact_components",
         "artifact_component_transition_allowed",
+    );
+    assert_production_image_mutations_use_validator(
+        image_source,
+        "image_generation_jobs",
+        "job_transition_allowed",
+    );
+    assert_production_image_mutations_use_validator(
+        image_source,
+        "image_generation_slots",
+        "slot_transition_allowed",
+    );
+    assert_production_image_mutations_use_validator(
+        image_source,
+        "image_generation_attempts",
+        "attempt_transition_allowed",
     );
     let families = parsed
         .get("state_machine_family")

@@ -549,27 +549,6 @@ fn terminal_slot_vector_valid(slot: ImageGenerationSlotTerminalFact) -> bool {
     }
 }
 
-fn terminal_projection_allowed(
-    current: ImageGenerationJobState,
-    terminal: ImageGenerationJobState,
-) -> bool {
-    !matches!(
-        current,
-        ImageGenerationJobState::Completed
-            | ImageGenerationJobState::CompletedAfterCancel
-            | ImageGenerationJobState::PartiallyFailed
-            | ImageGenerationJobState::Failed
-            | ImageGenerationJobState::Cancelled
-    ) && matches!(
-        terminal,
-        ImageGenerationJobState::Completed
-            | ImageGenerationJobState::CompletedAfterCancel
-            | ImageGenerationJobState::PartiallyFailed
-            | ImageGenerationJobState::Failed
-            | ImageGenerationJobState::Cancelled
-    )
-}
-
 fn commit_terminal_job_projection_conn(
     conn: &Connection,
     job_id: Uuid,
@@ -618,7 +597,7 @@ fn commit_terminal_job_projection_conn(
     let current = ImageGenerationJobState::parse(&current_state)
         .context("terminal projection current job state is unknown")?;
     ensure!(
-        terminal_projection_allowed(current, terminal),
+        job_transition_allowed(current, terminal),
         "terminal job transition is forbidden"
     );
     let next_version = current_version
@@ -1523,6 +1502,23 @@ impl Db {
         media: &[ImageGenerationMediaPlanSnapshot<'_>],
         at_unix_ms: i64,
     ) -> Result<()> {
+        ensure!(
+            job_transition_allowed(
+                ImageGenerationJobState::Created,
+                ImageGenerationJobState::Validating
+            ) && job_transition_allowed(
+                ImageGenerationJobState::Validating,
+                ImageGenerationJobState::Queued
+            ),
+            "image generation queue job transitions are not canonical"
+        );
+        ensure!(
+            slot_transition_allowed(
+                ImageGenerationSlotState::Planned,
+                ImageGenerationSlotState::Queued
+            ),
+            "image generation queue slot transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_queue", || {
             let (canonical_plan, plan_digest): (Vec<u8>, String) = conn.query_row(
                 "SELECT canonical_plan,plan_digest FROM image_generation_plans WHERE job_id=?1",
@@ -1581,6 +1577,30 @@ impl Db {
         conn: &Connection,
         input: &PrepareImageGenerationDispatch<'_>,
     ) -> Result<PreparedImageGenerationDispatch> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::Planned,
+                ImageGenerationAttemptState::Preparing
+            ) && attempt_transition_allowed(
+                ImageGenerationAttemptState::Preparing,
+                ImageGenerationAttemptState::Prepared
+            ),
+            "image generation preparation attempt transitions are not canonical"
+        );
+        ensure!(
+            slot_transition_allowed(
+                ImageGenerationSlotState::Queued,
+                ImageGenerationSlotState::Dispatching
+            ),
+            "image generation dispatch slot transition is not canonical"
+        );
+        ensure!(
+            job_transition_allowed(
+                ImageGenerationJobState::Queued,
+                ImageGenerationJobState::Dispatching
+            ),
+            "image generation dispatch job transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_prepare_dispatch", || {
             let database_now = database_now_unix_ms(conn)?;
             ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=?1 AND c.slot_id=?2 AND c.attempt_number=?3 AND c.worker_boot_id=?4 AND c.claim_generation=?5 AND c.expires_at_unix_ms>?6 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claim_consumptions x WHERE x.job_id=c.job_id AND x.slot_id=c.slot_id AND x.attempt_number=c.attempt_number AND x.claim_generation=c.claim_generation))",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.worker_boot_id.to_string(),i64::try_from(input.claim_generation)?,database_now],|row|row.get::<_,bool>(0))?,"image generation scheduler claim is absent, consumed, or stale");
@@ -1693,6 +1713,13 @@ impl Db {
         at_unix_ms: i64,
         deadline_observation: DeadlineObservationV1,
     ) -> Result<DispatchingImageGenerationAttempt> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::Prepared,
+                ImageGenerationAttemptState::Dispatching
+            ),
+            "image generation handoff transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_begin_handoff", || {
             let (deadline_boot_id,deadline):(String,i64) = conn.query_row("SELECT p.deadline_boot_id,p.operation_deadline_monotonic_ms FROM image_generation_plans p JOIN image_generation_jobs j ON j.job_id=p.job_id JOIN image_generation_slots s ON s.job_id=j.job_id WHERE j.job_id=?1 AND j.state='dispatching' AND j.version=?2 AND s.slot_id=?3 AND s.state='dispatching' AND s.version=?4 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",params![prepared.job_id.to_string(),i64::try_from(prepared.job_version)?,prepared.slot_id.to_string(),i64::try_from(prepared.slot_version)?],|row|Ok((row.get(0)?,row.get(1)?))).context("image generation handoff authority is unavailable")?;
             ensure!(
@@ -1782,6 +1809,26 @@ impl Db {
                     "submission_unknown",
                 ),
             };
+            let attempt_state = ImageGenerationAttemptState::parse(attempt)
+                .context("handoff produced an unknown attempt state")?;
+            ensure!(
+                attempt_transition_allowed(ImageGenerationAttemptState::Dispatching, attempt_state),
+                "image generation handoff attempt transition is not canonical"
+            );
+            let slot_state = ImageGenerationSlotState::parse(slot)
+                .context("handoff produced an unknown slot state")?;
+            let job_state = ImageGenerationJobState::parse(job)
+                .context("handoff produced an unknown job state")?;
+            if retry.is_none() {
+                ensure!(
+                    slot_transition_allowed(ImageGenerationSlotState::Dispatching, slot_state),
+                    "image generation handoff slot transition is not canonical"
+                );
+                ensure!(
+                    job_transition_allowed(ImageGenerationJobState::Dispatching, job_state),
+                    "image generation handoff job transition is not canonical"
+                );
+            }
             ensure!(
                 outcome.record().state.as_str()
                     == match evidence.outcome {
@@ -1831,6 +1878,13 @@ impl Db {
         conn: &Connection,
         input: &ClaimImageGenerationReconciliation,
     ) -> Result<SealedImageGenerationRecoveryAuthority> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::SubmissionUnknown,
+                ImageGenerationAttemptState::Reconciling
+            ),
+            "image generation reconciliation claim transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_reconciliation_claim", || {
             ensure!(
                 !input.worker_boot_id.is_nil() && input.claim_generation > 0,
@@ -2355,6 +2409,27 @@ impl Db {
         conn: &Connection,
         input: &BeginImageGenerationDownload,
     ) -> Result<()> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::Accepted,
+                ImageGenerationAttemptState::Downloading
+            ),
+            "image generation download attempt transition is not canonical"
+        );
+        ensure!(
+            slot_transition_allowed(
+                ImageGenerationSlotState::Running,
+                ImageGenerationSlotState::Downloading
+            ),
+            "image generation download slot transition is not canonical"
+        );
+        ensure!(
+            job_transition_allowed(
+                ImageGenerationJobState::Running,
+                ImageGenerationJobState::Downloading
+            ),
+            "image generation download job transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_begin_download", || {
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='accepted' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt download compare-and-set lost");
             ensure!(conn.execute("UPDATE image_generation_slots SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='running' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot download compare-and-set lost");
@@ -2367,6 +2442,29 @@ impl Db {
         conn: &Connection,
         input: &CommitAcceptedImageResponseFailure<'_>,
     ) -> Result<()> {
+        for from in [
+            ImageGenerationAttemptState::Accepted,
+            ImageGenerationAttemptState::Downloading,
+            ImageGenerationAttemptState::CancellationRequested,
+        ] {
+            ensure!(
+                attempt_transition_allowed(
+                    from,
+                    ImageGenerationAttemptState::FailedAfterAcceptance
+                ),
+                "accepted response failure attempt transition is not canonical"
+            );
+        }
+        for from in [
+            ImageGenerationSlotState::Running,
+            ImageGenerationSlotState::Downloading,
+            ImageGenerationSlotState::CancellationRequested,
+        ] {
+            ensure!(
+                slot_transition_allowed(from, ImageGenerationSlotState::Failed),
+                "accepted response failure slot transition is not canonical"
+            );
+        }
         atomic_conn(conn, "image_generation_accepted_response_failure", || {
             let bound: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_response_fetch_outcomes WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4) OR EXISTS(SELECT 1 FROM image_generation_response_reconciliations WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.safe_reason],|row|row.get(0))?;
             ensure!(bound, "accepted response failure evidence is absent");
@@ -2444,6 +2542,10 @@ impl Db {
             } else {
                 ImageGenerationSlotState::ReadyToPublish
             };
+            ensure!(
+                slot_transition_allowed(ImageGenerationSlotState::Validating, next),
+                "image generation validation transition is not canonical"
+            );
             ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1 WHERE job_id=?2 AND slot_id=?3 AND state='validating' AND version=?4",params![next.as_str(),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation validation compare-and-set lost");
             if after_cancel {
                 commit_terminal_job_projection_conn(conn, input.job_id, input.at_unix_ms)?;
@@ -2490,6 +2592,24 @@ impl Db {
         } else {
             ImageGenerationAttemptState::ResponseAdopted
         };
+        let attempt_sources: &[ImageGenerationAttemptState] = if cancellation.is_some() {
+            &[
+                ImageGenerationAttemptState::Accepted,
+                ImageGenerationAttemptState::Downloading,
+                ImageGenerationAttemptState::CancellationRequested,
+            ]
+        } else {
+            &[
+                ImageGenerationAttemptState::Accepted,
+                ImageGenerationAttemptState::Downloading,
+            ]
+        };
+        for &from in attempt_sources {
+            ensure!(
+                attempt_transition_allowed(from, attempt_next),
+                "image generation response adoption attempt transition is not canonical"
+            );
+        }
         let next_attempt_version = input
             .expected_attempt_version
             .checked_add(1)
@@ -2509,6 +2629,19 @@ impl Db {
             "attempt response adoption lost its compare-and-set"
         );
         let slot_next = ImageGenerationSlotState::Validating;
+        ensure!(
+            slot_transition_allowed(ImageGenerationSlotState::Downloading, slot_next),
+            "image generation response adoption slot transition is not canonical"
+        );
+        if cancellation.is_some() {
+            ensure!(
+                slot_transition_allowed(
+                    ImageGenerationSlotState::CancellationRequested,
+                    ImageGenerationSlotState::Downloading
+                ),
+                "image generation cancelled response transition is not canonical"
+            );
+        }
         let mut slot_expected_version = input.expected_slot_version;
         if cancellation.is_some() {
             let changed=conn.execute(
@@ -2543,6 +2676,20 @@ impl Db {
         conn: &Connection,
         input: &CommitImageGenerationPublication,
     ) -> Result<ImageGenerationCasOutcome> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::ResponseAdopted,
+                ImageGenerationAttemptState::Succeeded
+            ),
+            "image generation publication attempt transition is not canonical"
+        );
+        ensure!(
+            slot_transition_allowed(
+                ImageGenerationSlotState::ReadyToPublish,
+                ImageGenerationSlotState::Published
+            ),
+            "image generation publication slot transition is not canonical"
+        );
         conn.execute(
             "INSERT INTO image_generation_publication_right_facts(job_id,slot_id,attempt_number,slot_version,artifact_generation,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",
             params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_slot_version)?,i64::try_from(input.artifact_generation)?,input.now_unix_ms],

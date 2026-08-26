@@ -265,21 +265,96 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
         };
         (path.path.segments.len() == 1).then(|| path.path.segments[0].ident.to_string())
     }
-    struct SqlBinding {
-        line: usize,
-        connections: std::collections::BTreeSet<String>,
-        variables: std::collections::BTreeSet<String>,
-        consumed: bool,
-    }
-    impl<'ast> syn::visit::Visit<'ast> for SqlBinding {
-        fn visit_local(&mut self, local: &'ast syn::Local) {
-            if let Some(initializer) = &local.init
-                && contains_literal(&initializer.expr, self.line)
-                && let syn::Pat::Ident(binding) = &local.pat
-            {
-                self.variables.insert(binding.ident.to_string());
+    fn canonical_connection_imports(syntax: &syn::File) -> std::collections::BTreeSet<String> {
+        fn inspect(
+            tree: &syn::UseTree,
+            prefix: &mut Vec<String>,
+            output: &mut std::collections::BTreeSet<String>,
+        ) {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    prefix.push(path.ident.to_string());
+                    inspect(&path.tree, prefix, output);
+                    prefix.pop();
+                }
+                syn::UseTree::Name(name)
+                    if prefix.len() == 1
+                        && prefix[0] == "rusqlite"
+                        && name.ident == "Connection" =>
+                {
+                    output.insert("Connection".to_owned());
+                }
+                syn::UseTree::Rename(rename)
+                    if prefix.len() == 1
+                        && prefix[0] == "rusqlite"
+                        && rename.ident == "Connection" =>
+                {
+                    output.insert(rename.rename.to_string());
+                }
+                syn::UseTree::Group(group) => {
+                    for item in &group.items {
+                        inspect(item, prefix, output);
+                    }
+                }
+                syn::UseTree::Name(_) | syn::UseTree::Rename(_) | syn::UseTree::Glob(_) => {}
             }
-            syn::visit::visit_local(self, local);
+        }
+        let mut output = std::collections::BTreeSet::new();
+        for item in &syntax.items {
+            if let syn::Item::Use(item) = item {
+                inspect(&item.tree, &mut Vec::new(), &mut output);
+            }
+        }
+        for item in &syntax.items {
+            let shadow = match item {
+                syn::Item::Type(item) => Some(item.ident.to_string()),
+                syn::Item::Struct(item) => Some(item.ident.to_string()),
+                syn::Item::Enum(item) => Some(item.ident.to_string()),
+                syn::Item::Union(item) => Some(item.ident.to_string()),
+                syn::Item::Mod(item) => Some(item.ident.to_string()),
+                _ => None,
+            };
+            assert!(
+                !shadow.as_ref().is_some_and(|name| output.contains(name)),
+                "canonical rusqlite::Connection import is shadowed by a local item"
+            );
+        }
+        output
+    }
+    struct SqlBinding<'a> {
+        line: usize,
+        connections: &'a std::collections::BTreeSet<String>,
+        variable: Option<&'a str>,
+        direct_only: bool,
+        nested_depth: usize,
+        uses: usize,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for SqlBinding<'_> {
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            self.nested_depth += 1;
+            syn::visit::visit_block(self, block);
+            self.nested_depth -= 1;
+        }
+
+        fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+            self.nested_depth += 1;
+            syn::visit::visit_expr_closure(self, closure);
+            self.nested_depth -= 1;
+        }
+
+        fn visit_expr_async(&mut self, block: &'ast syn::ExprAsync) {
+            self.nested_depth += 1;
+            syn::visit::visit_expr_async(self, block);
+            self.nested_depth -= 1;
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if self.variable.is_some_and(|variable| {
+                path.path.segments.len() == 1 && path.path.is_ident(variable)
+            }) {
+                self.uses += 1;
+            }
+            syn::visit::visit_expr_path(self, path);
         }
 
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
@@ -291,9 +366,13 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
                 .is_some_and(|identifier| self.connections.contains(&identifier))
                 && let Some(sql) = call.args.first()
             {
-                self.consumed |= contains_literal(sql, self.line)
-                    || path_identifier(sql)
-                        .is_some_and(|identifier| self.variables.contains(&identifier));
+                let exact_argument = contains_literal(sql, self.line)
+                    || self
+                        .variable
+                        .is_some_and(|variable| path_identifier(sql).as_deref() == Some(variable));
+                if exact_argument && (!self.direct_only || self.nested_depth == 0) {
+                    self.uses += 1;
+                }
             }
             syn::visit::visit_expr_method_call(self, call);
         }
@@ -301,22 +380,29 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
     struct BindingScope {
         line: usize,
         consumed: bool,
+        imported_connections: std::collections::BTreeSet<String>,
     }
     impl BindingScope {
+        fn is_connection_type(&self, ty: &syn::Type) -> bool {
+            match ty {
+                syn::Type::Reference(reference) => self.is_connection_type(&reference.elem),
+                syn::Type::Path(path) => {
+                    let segments = path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>();
+                    segments == ["rusqlite", "Connection"]
+                        || segments.len() == 1 && self.imported_connections.contains(&segments[0])
+                }
+                _ => false,
+            }
+        }
+
         fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
             if !block_contains_literal(block, self.line) {
                 return;
-            }
-            fn is_connection_type(ty: &syn::Type) -> bool {
-                match ty {
-                    syn::Type::Reference(reference) => is_connection_type(&reference.elem),
-                    syn::Type::Path(path) => path
-                        .path
-                        .segments
-                        .last()
-                        .is_some_and(|segment| segment.ident == "Connection"),
-                    _ => false,
-                }
             }
             let connections = signature
                 .inputs
@@ -328,17 +414,117 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
                     let syn::Pat::Ident(binding) = argument.pat.as_ref() else {
                         return None;
                     };
-                    is_connection_type(&argument.ty).then(|| binding.ident.to_string())
+                    self.is_connection_type(&argument.ty)
+                        .then(|| binding.ident.to_string())
                 })
-                .collect();
+                .collect::<std::collections::BTreeSet<_>>();
+            if connections.is_empty() {
+                return;
+            }
+            struct ConnectionMutation<'a> {
+                names: &'a std::collections::BTreeSet<String>,
+                found: bool,
+            }
+            impl<'ast> syn::visit::Visit<'ast> for ConnectionMutation<'_> {
+                fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+                    self.found |= self.names.contains(&pattern.ident.to_string());
+                    syn::visit::visit_pat_ident(self, pattern);
+                }
+
+                fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+                    self.found |= path_identifier(&assignment.left)
+                        .is_some_and(|identifier| self.names.contains(&identifier));
+                    syn::visit::visit_expr_assign(self, assignment);
+                }
+            }
+            let mut connection_mutation = ConnectionMutation {
+                names: &connections,
+                found: false,
+            };
+            syn::visit::Visit::visit_block(&mut connection_mutation, block);
+            if connection_mutation.found {
+                return;
+            }
+
+            let reviewed_locals = block
+                .stmts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, statement)| match statement {
+                    syn::Stmt::Local(local)
+                        if local
+                            .init
+                            .as_ref()
+                            .is_some_and(|init| contains_literal(&init.expr, self.line)) =>
+                    {
+                        Some((index, local))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if reviewed_locals.is_empty() {
+                let mut binding = SqlBinding {
+                    line: self.line,
+                    connections: &connections,
+                    variable: None,
+                    direct_only: true,
+                    nested_depth: 0,
+                    uses: 0,
+                };
+                for statement in &block.stmts {
+                    syn::visit::Visit::visit_stmt(&mut binding, statement);
+                }
+                self.consumed |= binding.uses == 1;
+                return;
+            }
+            if reviewed_locals.len() != 1 {
+                return;
+            }
+            let (definition, local) = reviewed_locals[0];
+            let syn::Pat::Ident(pattern) = &local.pat else {
+                return;
+            };
+            if pattern.by_ref.is_some() || pattern.mutability.is_some() || pattern.subpat.is_some()
+            {
+                return;
+            }
+            let variable = pattern.ident.to_string();
+            let pattern_count = {
+                struct Patterns<'a> {
+                    name: &'a str,
+                    count: usize,
+                }
+                impl<'ast> syn::visit::Visit<'ast> for Patterns<'_> {
+                    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+                        self.count += usize::from(pattern.ident == self.name);
+                        syn::visit::visit_pat_ident(self, pattern);
+                    }
+                }
+                let mut patterns = Patterns {
+                    name: &variable,
+                    count: 0,
+                };
+                syn::visit::Visit::visit_block(&mut patterns, block);
+                patterns.count
+            };
+            if pattern_count != 1 {
+                return;
+            }
             let mut binding = SqlBinding {
                 line: self.line,
-                connections,
-                variables: std::collections::BTreeSet::new(),
-                consumed: false,
+                connections: &connections,
+                variable: Some(&variable),
+                direct_only: true,
+                nested_depth: 0,
+                uses: 0,
             };
-            syn::visit::Visit::visit_block(&mut binding, block);
-            self.consumed |= binding.consumed;
+            for statement in &block.stmts[definition + 1..] {
+                syn::visit::Visit::visit_stmt(&mut binding, statement);
+            }
+            // One path occurrence plus one exact SQL-argument recognition.
+            // Any shadow, reassignment, alias, wrapper, or second use changes
+            // this count and fails closed.
+            self.consumed |= binding.uses == 2;
         }
     }
     impl<'ast> syn::visit::Visit<'ast> for BindingScope {
@@ -353,6 +539,7 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
     let mut sql_binding = BindingScope {
         line: marker_lines[0] + 1,
         consumed: false,
+        imported_connections: canonical_connection_imports(&syntax),
     };
     syn::visit::Visit::visit_file(&mut sql_binding, &syntax);
     assert!(
@@ -369,6 +556,7 @@ fn normalized_sql(sql: &str) -> String {
 #[test]
 fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
     let stale = r#"
+        use rusqlite::Connection;
         fn owner(conn: &Connection) {
             let unrelated = "SELECT stale FROM elsewhere";
             conn.prepare(
@@ -393,6 +581,7 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
         std::panic::catch_unwind(|| annotated_sql_literal(duplicate, "reviewed.shape")).is_err()
     );
     let dead = r#"
+        use rusqlite::Connection;
         fn owner(conn: &Connection) {
             // schema-hot-query: reviewed.shape
             let reviewed = "SELECT exact FROM owned WHERE id=?1";
@@ -416,7 +605,102 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
             .is_err(),
         "non-rusqlite prepare-like method was mistaken for a database query"
     );
+    let imported_alias = r#"
+        use rusqlite::Connection as DbConnection;
+        fn owner(conn: &DbConnection) {
+            conn.prepare(
+                // schema-hot-query: reviewed.shape
+                "SELECT exact FROM owned WHERE id=?1"
+            );
+        }
+    "#;
+    assert_eq!(
+        annotated_sql_literal(imported_alias, "reviewed.shape"),
+        "SELECT exact FROM owned WHERE id=?1"
+    );
+    for adversarial in [
+        r#"
+            struct Connection;
+            fn owner(conn: &Connection) {
+                conn.prepare(
+                    // schema-hot-query: reviewed.shape
+                    "SELECT exact FROM owned WHERE id=?1"
+                );
+            }
+        "#,
+        r#"
+            use rusqlite::Connection as DbConnection;
+            type DbConnection = FakeConnection;
+            fn owner(conn: &DbConnection) {
+                conn.prepare(
+                    // schema-hot-query: reviewed.shape
+                    "SELECT exact FROM owned WHERE id=?1"
+                );
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = "SELECT exact FROM owned WHERE id=?1";
+                let sql = "SELECT drifted FROM owned";
+                conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let mut sql = "SELECT exact FROM owned WHERE id=?1";
+                sql = "SELECT drifted FROM owned";
+                conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = "SELECT exact FROM owned WHERE id=?1";
+                { let sql = "SELECT drifted FROM owned"; conn.prepare(sql); }
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = "SELECT exact FROM owned WHERE id=?1";
+                let moved = sql;
+                conn.prepare(moved);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = "SELECT exact FROM owned WHERE id=?1";
+                let deferred = || conn.prepare(sql);
+                deferred();
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                let conn = FakeConnection;
+                conn.prepare(
+                    // schema-hot-query: reviewed.shape
+                    "SELECT exact FROM owned WHERE id=?1"
+                );
+            }
+        "#,
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| annotated_sql_literal(adversarial, "reviewed.shape"))
+                .is_err(),
+            "accepted spoofed, shadowed, reassigned, or moved SQL binding: {adversarial}"
+        );
+    }
     let spoofed = r###"
+        use rusqlite::Connection;
         fn owner(conn: &Connection) {
             let raw = r#"
                 // schema-hot-query: reviewed.shape

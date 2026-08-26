@@ -263,7 +263,7 @@ fn file_paths_for_load(cwd: &Path, filename: &str) -> Vec<PathBuf> {
 /// nearest-project selection used by the gitignore write path
 /// (`nearest_project_config_path`): the deepest ancestor that already holds a
 /// `.cockpit/` project layer wins.
-fn config_dirs_most_specific_first(cwd: &Path) -> Vec<ConfigDir> {
+pub fn config_dirs_most_specific_first(cwd: &Path) -> Vec<ConfigDir> {
     let mut project = Vec::new();
     let mut home_and_local = Vec::new();
     for dir in discover_config_dirs(cwd) {

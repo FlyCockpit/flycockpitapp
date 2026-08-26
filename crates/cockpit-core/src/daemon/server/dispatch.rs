@@ -3920,9 +3920,7 @@ async fn handle_serialized_request_impl(
         }
     };
     #[cfg(not(feature = "remote"))]
-    if let Err(error) = authorize_request_context(&request, state, ctx).await {
-        return Err(error);
-    }
+    authorize_request_context(&request, state, ctx).await?;
     #[cfg(feature = "remote")]
     if audit_remote {
         audit_remote_request(
@@ -7580,9 +7578,7 @@ async fn handle_serialized_request_impl(
             crate::daemon::fs_api::git_repo_status(project_root).await
         }
 
-        Request::FindWorktreeRoot { path } => {
-            crate::daemon::fs_api::find_worktree_root(path).await
-        }
+        Request::FindWorktreeRoot { path } => crate::daemon::fs_api::find_worktree_root(path).await,
 
         Request::OpenTerminal { cwd, cols, rows } => {
             let session_id = state
@@ -9556,51 +9552,18 @@ async fn handle_serialized_request_impl(
             #[cfg(not(feature = "remote"))]
             let _ = &receipt;
             let result = match {
-                #[cfg(feature = "remote")]
-                match remote_operation {
-                    Some(operation) => {
-                        mutate_owner_vault_item_with_remote_ledger(
-                            ctx,
-                            operation,
-                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                            &provider_id,
-                            Some(&record_bytes),
-                            "put_provider_credential",
-                            receipt,
-                            None,
-                        )
-                        .await
-                    }
-                    None => {
-                        commit_local_provider_credential(
-                            ctx,
-                            settlement_owner.clone(),
-                            client_operation_id.clone(),
-                            request_hash,
-                            fencing_generation,
-                            provider_id.clone(),
-                            None,
-                            provider_id.clone(),
-                            Some(record_bytes),
-                        )
-                        .await
-                    }
-                }
-                #[cfg(not(feature = "remote"))]
-                {
-                    commit_local_provider_credential(
-                        ctx,
-                        settlement_owner.clone(),
-                        client_operation_id.clone(),
-                        request_hash,
-                        fencing_generation,
-                        provider_id.clone(),
-                        None,
-                        provider_id.clone(),
-                        Some(record_bytes),
-                    )
-                    .await
-                }
+                commit_local_provider_credential(
+                    ctx,
+                    settlement_owner.clone(),
+                    client_operation_id.clone(),
+                    request_hash,
+                    fencing_generation,
+                    provider_id.clone(),
+                    None,
+                    provider_id.clone(),
+                    Some(record_bytes),
+                )
+                .await
             } {
                 Ok(result) => result,
                 Err(error) => {
@@ -11529,51 +11492,18 @@ async fn handle_serialized_request_impl(
             #[cfg(not(feature = "remote"))]
             let _ = (&response, changed, consumed_vault_generation);
             let result = match {
-                #[cfg(feature = "remote")]
-                match remote_operation {
-                    Some(operation) => {
-                        mutate_owner_vault_item_with_remote_ledger(
-                            ctx,
-                            operation,
-                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                            &credential_record_id,
-                            None,
-                            "delete_provider_credential",
-                            response,
-                            None,
-                        )
-                        .await
-                    }
-                    None => {
-                        commit_local_provider_credential(
-                            ctx,
-                            settlement_owner.clone(),
-                            client_operation_id.clone(),
-                            request_hash,
-                            fencing_generation,
-                            provider_id.clone(),
-                            project_root.clone(),
-                            credential_record_id.clone(),
-                            None,
-                        )
-                        .await
-                    }
-                }
-                #[cfg(not(feature = "remote"))]
-                {
-                    commit_local_provider_credential(
-                        ctx,
-                        settlement_owner.clone(),
-                        client_operation_id.clone(),
-                        request_hash,
-                        fencing_generation,
-                        provider_id.clone(),
-                        project_root.clone(),
-                        credential_record_id.clone(),
-                        None,
-                    )
-                    .await
-                }
+                commit_local_provider_credential(
+                    ctx,
+                    settlement_owner.clone(),
+                    client_operation_id.clone(),
+                    request_hash,
+                    fencing_generation,
+                    provider_id.clone(),
+                    project_root.clone(),
+                    credential_record_id.clone(),
+                    None,
+                )
+                .await
             } {
                 Ok(result) => result,
                 Err(error) => {
@@ -13340,21 +13270,7 @@ async fn handle_concurrent_request_impl(
     let audit_path = request_audit_path(&request);
     #[cfg(feature = "remote")]
     let audit_remote = !shared.principal.is_owner() && is_remote_mutating_request(&request);
-    if let Err(error) = authorize_request_shared(&request, &shared, &ctx).await {
-        #[cfg(feature = "remote")]
-        if audit_remote {
-            audit_remote_request(
-                &ctx,
-                &shared.principal,
-                request_kind,
-                None,
-                audit_path.as_deref(),
-                "denied",
-            )
-            .await;
-        }
-        return Err(error);
-    }
+    authorize_request_shared(&request, &shared, &ctx).await?;
     #[cfg(feature = "remote")]
     if audit_remote {
         audit_remote_request(
@@ -13619,9 +13535,7 @@ async fn handle_concurrent_request_impl(
         Request::GitRepoStatus { project_root } => {
             crate::daemon::fs_api::git_repo_status(project_root).await
         }
-        Request::FindWorktreeRoot { path } => {
-            crate::daemon::fs_api::find_worktree_root(path).await
-        }
+        Request::FindWorktreeRoot { path } => crate::daemon::fs_api::find_worktree_root(path).await,
         Request::ListSessions {
             project_id,
             parent_session_id,
@@ -18744,7 +18658,7 @@ async fn save_mcp_config(
                     serde_json::from_str(set_fields_json).map_err(|error| {
                         bad_request(format!("invalid MCP server patch `{name}`: {error}"))
                     })?;
-                let mut candidate = raw_servers
+                let candidate = raw_servers
                     .get(name)
                     .and_then(serde_json::Value::as_object)
                     .cloned()
@@ -19070,7 +18984,7 @@ async fn save_mcp_config(
             let static_nonstaged_refs = static_nonstaged_refs.clone();
             move |conn| {
                 let intended_config_generation =
-                    inventory_generation_conn(conn)?.saturating_add(1);
+                    cockpit_db::secret_vault::inventory_generation_conn(conn)?.saturating_add(1);
                 let mut terminal_response: Response =
                     serde_json::from_str(&terminal_response_json)?;
                 let Response::McpConfigCommitted {
@@ -19101,7 +19015,7 @@ async fn save_mcp_config(
                         patch_intent_json,
                         consumed_revision_for_tx,
                         result_revision_for_tx,
-                        intended_config_generation,
+                        i64::try_from(intended_config_generation).unwrap_or(i64::MAX),
                         cleanup_json,
                         chrono::Utc::now().timestamp_millis()
                     ],
@@ -19282,7 +19196,7 @@ async fn publish_mcp_journal_generation(
                 "SELECT terminal_response_json,intended_config_generation
                    FROM mcp_config_journals WHERE journal_id = ?1",
                 rusqlite::params![journal_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
             )?;
             let response: Response = serde_json::from_str(&response_json)?;
             let Response::McpConfigCommitted {
@@ -21559,7 +21473,7 @@ pub(super) fn assistant_to_proto(
     proto::AssistantSummary {
         registration_revision: crate::assistants::registration_revision(&row),
         name: row.name,
-        created_at: row.created_at,
+        created_at: row.created_at_unix_ms,
         home_dir: row.home_dir,
         config_json: row.config_json,
         definition_presentation_hash: None,
@@ -22396,16 +22310,16 @@ async fn ensure_project_note_member(
 /// Daemon-owned durable identity for project notes. Request paths are only
 /// locators: canonicalization and Git worktree grouping happen here, after
 /// request authorization, so spelling/symlink aliases cannot fork storage.
-struct CanonicalProjectNoteIdentity(String);
+pub(super) struct CanonicalProjectNoteIdentity(pub(super) String);
 
-fn canonical_project_note_identity(
+pub(super) fn canonical_project_note_identity(
     requested_root: &str,
 ) -> std::result::Result<CanonicalProjectNoteIdentity, ErrorPayload> {
     let canonical = crate::daemon::fs_api::canonical_project_root(requested_root)?;
-    canonical_project_note_identity_with_metadata(canonical, std::fs::symlink_metadata)
+    canonical_project_note_identity_with_metadata(canonical, |p| std::fs::symlink_metadata(p))
 }
 
-fn canonical_project_note_identity_with_metadata(
+pub(super) fn canonical_project_note_identity_with_metadata(
     canonical: std::path::PathBuf,
     mut metadata: impl FnMut(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
 ) -> std::result::Result<CanonicalProjectNoteIdentity, ErrorPayload> {

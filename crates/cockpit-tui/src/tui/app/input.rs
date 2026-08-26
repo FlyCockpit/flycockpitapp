@@ -20,7 +20,7 @@ use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPo
 use crate::tui::settings::Dialog;
 use cockpit_proto::QueueItem as QueuedUserMessage;
 use cockpit_proto::QueueItemStatus;
-use cockpit_proto::{self, Request, Response};
+use cockpit_proto::{self as proto, Request, Response};
 
 async fn admit_image_ingress_via_daemon(
     daemon: crate::tui::agent_runner::AttachedRequestBinding,
@@ -3571,7 +3571,10 @@ impl App {
                         let admission = if let (Some(png), Some(daemon)) = (png, daemon) {
                             use base64::Engine as _;
                             use sha2::{Digest as _, Sha256};
-                            let sha256 = format!("{:x}", Sha256::digest(&png));
+                            let sha256: String = Sha256::digest(&png)
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
                             let byte_length = png.len() as u64;
                             admit_image_ingress_via_daemon(
                                 daemon,

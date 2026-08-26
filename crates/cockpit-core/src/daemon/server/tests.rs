@@ -144,9 +144,7 @@ fn oversized_response_is_replaced_before_the_ndjson_writer() {
         },
     );
     assert!(matches!(&envelope.body, proto::Body::Error { .. }));
-    assert!(
-        serde_json::to_vec(&envelope).unwrap().len() + 1 <= proto::MAX_SERIALIZED_RESPONSE_BYTES
-    );
+    assert!(serde_json::to_vec(&envelope).unwrap().len() < proto::MAX_SERIALIZED_RESPONSE_BYTES);
 }
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
@@ -25778,6 +25776,11 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         FsDelete,
         GitStatus,
         GitDiffFile,
+        GitDiff,
+        GitReviewSources,
+        GitRepoStatus,
+        FindWorktreeRoot,
+        DiscardImageIngressDraft,
         OpenTerminal,
         AttachTerminal,
         TerminalInput,
@@ -25863,10 +25866,14 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ApplyProviderMutation,
         FetchProviderModels,
         GetProviderUsageSnapshot,
+        #[cfg(feature = "remote")]
         UpsertProviderConfig,
+        #[cfg(feature = "remote")]
         SaveProviderConfig,
         SaveMcpConfig,
+        #[cfg(feature = "remote")]
         DeleteProviderConfig,
+        #[cfg(feature = "remote")]
         SetProviderLayerMetadata,
         DaemonStatus,
         RefreshEnv,
@@ -25882,6 +25889,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         RefreshHostCapabilities,
         MigrateKekPlacement,
         SetupCopilotAuth,
+        #[cfg(feature = "remote")]
         ApplySetupWizard,
         SaveExtendedConfig,
         ExportPolicy,

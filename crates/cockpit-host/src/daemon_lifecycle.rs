@@ -345,6 +345,7 @@ fn open_lifecycle_lock(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .mode(0o600)
@@ -423,7 +424,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     value
@@ -721,13 +722,13 @@ fn process_exists(pid: u32) -> bool {
 }
 
 #[cfg(all(unix, target_os = "linux"))]
-fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
+pub fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline"))?;
     Ok(split_proc_cmdline(&bytes))
 }
 
 #[cfg(all(unix, target_os = "macos"))]
-fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
+pub fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
     let mut argmax: libc::c_int = 0;
     let mut argmax_len = std::mem::size_of_val(&argmax);
     let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
@@ -773,7 +774,7 @@ fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn read_process_cmdline(_pid: u32) -> std::io::Result<Vec<String>> {
+pub fn read_process_cmdline(_pid: u32) -> std::io::Result<Vec<String>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "pid identity verification is unsupported on this platform",
@@ -1211,7 +1212,8 @@ mod tests {
         std::fs::write(&socket, b"socket metadata").expect("socket metadata");
         std::fs::write(
             &endpoint,
-            serde_json::json!({"socket": socket, "receipt": receipt.clone()}),
+            serde_json::to_vec(&serde_json::json!({"socket": socket, "receipt": receipt.clone()}))
+                .expect("serialize endpoint"),
         )
         .expect("endpoint record");
 
@@ -1238,7 +1240,8 @@ mod tests {
         let receipt = write_pid_file(&pid_file, std::process::id(), &executable).expect("pid file");
         std::fs::write(
             &endpoint,
-            serde_json::json!({"socket": temp.path().join("other.sock"), "receipt": receipt.clone()}),
+            serde_json::to_vec(&serde_json::json!({"socket": temp.path().join("other.sock"), "receipt": receipt.clone()}))
+                .expect("serialize endpoint"),
         )
         .expect("endpoint record");
 

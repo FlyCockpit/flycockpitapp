@@ -1827,11 +1827,11 @@ async fn complete_editor_lease_inner(
         crate::db::agent_editor_leases::AgentEditorCompletionClaim::Terminal(lease) => lease,
     };
     if let Some(json) = lease.terminal_result_json.as_deref() {
-        let result: AgentEditorCompletion = serde_json::from_str(&json).map_err(internal)?;
+        let result: AgentEditorCompletion = serde_json::from_str(json).map_err(internal)?;
         return Ok(Response::AgentEditorLeaseCompleted(result));
     }
     if let Some(json) = lease.terminal_error_json.as_deref() {
-        let result: AgentEditorCompletion = serde_json::from_str(&json).map_err(internal)?;
+        let result: AgentEditorCompletion = serde_json::from_str(json).map_err(internal)?;
         return Ok(Response::AgentEditorLeaseCompleted(result));
     }
     let completed_lease_id = lease_id.clone();
@@ -1946,13 +1946,15 @@ async fn complete_editor_lease_inner(
                                 consumed_generation
                             };
                             publication_db.prepare_agent_editor_publication_under_publication_lock(
-                                publication_lease_id.clone(),
-                                completion_identity,
-                                publication_operation_id.clone(),
-                                plan.consumed_projection_identity.clone(),
-                                plan.intended_projection_identity.clone(),
-                                consumed_generation,
-                                result_generation,
+                                crate::db::agent_editor_leases::AgentEditorPublicationIntent {
+                                    lease_id: publication_lease_id.clone(),
+                                    completion_identity,
+                                    completion_operation_id: publication_operation_id.clone(),
+                                    consumed_projection_identity: plan.consumed_projection_identity.clone(),
+                                    intended_projection_identity: plan.intended_projection_identity.clone(),
+                                    consumed_config_generation: consumed_generation,
+                                    result_config_generation: result_generation,
+                                },
                             )
                             .map_err(internal)?;
                             (
@@ -2885,7 +2887,7 @@ fn mutate_sync_locked(
         AgentMutation::ResetAllBuiltins => {
             let current_inventory_revision = current_inventory_revision(root)?;
             ensure_revision(&current_inventory_revision, expected_revision.as_deref())?;
-            let affected = reset_all_builtins_atomic_locked(root, &guard)?;
+            let affected = reset_all_builtins_atomic_locked(root, guard)?;
             (affected != 0, affected, None)
         }
         AgentMutation::SaveGoalSupervision { name, patch } => {

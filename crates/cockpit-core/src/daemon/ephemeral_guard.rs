@@ -708,7 +708,7 @@ impl ProvisionalEphemeralChild {
             .context("ephemeral child already transferred")
     }
 
-    pub(crate) fn into_child(mut self) -> anyhow::Result<std::process::Child> {
+    pub(crate) fn into_child(self) -> anyhow::Result<std::process::Child> {
         let child = self
             .cleanup
             .child
@@ -736,12 +736,11 @@ impl Drop for ProvisionalEphemeralChild {
         };
         match process_reaper() {
             Ok(reaper) => {
-                if let Err(error) = reaper.send(reap) {
-                    if let Err(cleanup_error) =
+                if let Err(error) = reaper.send(reap)
+                    && let Err(cleanup_error) =
                         run_cleanup_fallback_until_released(&error.0.cleanup)
-                    {
-                        tracing::error!(%cleanup_error, "provisional child cleanup failed");
-                    }
+                {
+                    tracing::error!(%cleanup_error, "provisional child cleanup failed");
                 }
             }
             Err(error) => {
@@ -1010,12 +1009,15 @@ mod tests {
 
     async fn receive_stop(stream: &mut ProtoStream<tokio::net::UnixStream>) -> uuid::Uuid {
         match stream.recv().await.unwrap().unwrap() {
-            RecvFrame::Envelope(Envelope {
-                body: Body::Request { id, request },
-                ..
-            }) => {
-                assert!(matches!(request, Request::StopDaemon { grace_secs: None }));
-                id
+            RecvFrame::Envelope(envelope) => {
+                let Envelope { body, .. } = *envelope;
+                match body {
+                    Body::Request { id, request } => {
+                        assert!(matches!(request, Request::StopDaemon { grace_secs: None }));
+                        id
+                    }
+                    _ => panic!("expected StopDaemon request"),
+                }
             }
             frame => panic!("expected StopDaemon request, got {frame:?}"),
         }
@@ -1503,13 +1505,11 @@ mod tests {
                 tokio::time::timeout(std::time::Duration::from_millis(100), stream.recv()).await;
             let received_stop = matches!(
                 request,
-                Ok(Ok(Some(RecvFrame::Envelope(Envelope {
-                    body: Body::Request {
-                        request: Request::StopDaemon { .. },
-                        ..
-                    },
-                    ..
-                }))))
+                Ok(Ok(Some(RecvFrame::Envelope(envelope))))
+                    if matches!(
+                        &envelope.body,
+                        Body::Request { request: Request::StopDaemon { .. }, .. }
+                    )
             );
             observed.send(received_stop).unwrap();
         });

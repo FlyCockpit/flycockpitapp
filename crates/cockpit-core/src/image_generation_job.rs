@@ -33,8 +33,7 @@ use cockpit_db::db::image_generation::{
     CommitImageGenerationSecurityCleanup, CommitImageGenerationSecurityPublication,
     CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
     DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
-    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
-    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
+    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
     ImageGenerationDispatchCandidate, ImageGenerationHandoffFinishDisposition,
     ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
     PreparedImageGenerationDispatch, RecoverImageGenerationArtifactComponent,
@@ -59,8 +58,8 @@ pub use cockpit_db::image_generation_plan::{
     TypedParameterV1, VectorSanitizerProvenanceV1,
 };
 use cockpit_host::private_fs::held_directory::{
-    HeldArtifactEvidence, HeldDirectoryEffectEvidence, HeldDirectoryEffectOutcome,
-    HeldDirectoryRecovery, HeldSealOutcome, HeldSealedArtifact, HeldTemporaryArtifact,
+    HeldArtifactEvidence, HeldDirectoryEffectOutcome, HeldDirectoryRecovery, HeldSealOutcome,
+    HeldSealedArtifact, HeldTemporaryArtifact,
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
@@ -1811,6 +1810,13 @@ impl OutputPathAuthorityId {
     /// The redacted authority digest, for display at the authz boundary.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Test-only raw constructor. `#[cfg(test)]`-gated so production code
+    /// cannot bypass the verified-output-directory constructor.
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 
     /// Test-only raw constructor. `#[cfg(test)]`-gated so production cannot

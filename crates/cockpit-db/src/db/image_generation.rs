@@ -822,45 +822,55 @@ fn execute_deadline_attempt_journal_binding_conn(
     Ok(())
 }
 
+struct CancellationAttemptTransition {
+    from: ImageGenerationAttemptState,
+    expected_version: u64,
+    to: ImageGenerationAttemptState,
+    cancellation_version: u64,
+}
+
 fn execute_cancellation_attempt_transition_conn(
     conn: &Connection,
     job_id: Uuid,
     slot_id: Uuid,
     attempt_number: u32,
-    from: ImageGenerationAttemptState,
-    expected_version: u64,
-    to: ImageGenerationAttemptState,
-    cancellation_version: u64,
+    t: CancellationAttemptTransition,
 ) -> Result<u64> {
     ensure!(
-        attempt_transition_allowed(from, to),
+        attempt_transition_allowed(t.from, t.to),
         "attempt cannot accept cancellation"
     );
-    let next = expected_version
+    let next = t
+        .expected_version
         .checked_add(1)
         .context("cancellation attempt version overflow")?;
-    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,applied_cancellation_version=?3 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=?6 AND state=?7 AND version=?8",params![to.as_str(),i64::try_from(next)?,i64::try_from(cancellation_version)?,job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),from.as_str(),i64::try_from(expected_version)?])?==1,"cancellation lost attempt compare-and-set");
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,applied_cancellation_version=?3 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=?6 AND state=?7 AND version=?8",params![t.to.as_str(),i64::try_from(next)?,i64::try_from(t.cancellation_version)?,job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),t.from.as_str(),i64::try_from(t.expected_version)?])?==1,"cancellation lost attempt compare-and-set");
     Ok(next)
+}
+
+struct CancellationSlotTransition {
+    from: ImageGenerationSlotState,
+    expected_version: u64,
+    to: ImageGenerationSlotState,
+    cancellation_version: u64,
+    result_after_cancel: bool,
 }
 
 fn execute_cancellation_slot_transition_conn(
     conn: &Connection,
     job_id: Uuid,
     slot_id: Uuid,
-    from: ImageGenerationSlotState,
-    expected_version: u64,
-    to: ImageGenerationSlotState,
-    cancellation_version: u64,
-    result_after_cancel: bool,
+    t: CancellationSlotTransition,
 ) -> Result<u64> {
     ensure!(
-        slot_transition_allowed(from, to),
+        slot_transition_allowed(t.from, t.to),
         "slot cannot accept cancellation"
     );
-    let next = expected_version
+    let next = t
+        .expected_version
         .checked_add(1)
         .context("cancellation slot version overflow")?;
-    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state=?7 AND version=?8",params![to.as_str(),i64::try_from(next)?,i64::try_from(cancellation_version)?,i64::from(result_after_cancel),job_id.to_string(),slot_id.to_string(),from.as_str(),i64::try_from(expected_version)?])?==1,"cancellation lost slot compare-and-set");
+    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state=?7 AND version=?8",params![t.to.as_str(),i64::try_from(next)?,i64::try_from(t.cancellation_version)?,i64::from(t.result_after_cancel),job_id.to_string(),slot_id.to_string(),t.from.as_str(),i64::try_from(t.expected_version)?])?==1,"cancellation lost slot compare-and-set");
     Ok(next)
 }
 
@@ -1780,6 +1790,8 @@ pub struct DispatchingImageGenerationAttempt {
     provider_request_identity: String,
     media_reservation_id: String,
     media_reservation_version: u64,
+    slot_version: u64,
+    job_version: u64,
 }
 
 pub struct ImageGenerationProviderHandoffEvidence<'a> {
@@ -2258,6 +2270,8 @@ impl Db {
                     .media_reservation_version
                     .checked_add(1)
                     .context("image generation media reservation version overflow")?,
+                slot_version: prepared.slot_version,
+                job_version: prepared.job_version,
             })
         })
     }
@@ -3744,10 +3758,12 @@ impl Db {
                         input.job_id,
                         Uuid::parse_str(&slot_id)?,
                         u32::try_from(attempt_number)?,
-                        ImageGenerationAttemptState::ResponseAdopted,
-                        u64::try_from(version)?,
-                        ImageGenerationAttemptState::CompletedAfterCancel,
-                        input.cancellation_version,
+                        CancellationAttemptTransition {
+                            from: ImageGenerationAttemptState::ResponseAdopted,
+                            expected_version: u64::try_from(version)?,
+                            to: ImageGenerationAttemptState::CompletedAfterCancel,
+                            cancellation_version: input.cancellation_version,
+                        },
                     )?;
                     continue;
                 }
@@ -3803,11 +3819,13 @@ impl Db {
                     input.job_id,
                     Uuid::parse_str(&slot_id)?,
                     u32::try_from(attempt_number)?,
-                    ImageGenerationAttemptState::parse(&state)
-                        .ok_or_else(|| anyhow::anyhow!("unknown attempt state"))?,
-                    u64::try_from(version)?,
-                    next,
-                    input.cancellation_version,
+                    CancellationAttemptTransition {
+                        from: ImageGenerationAttemptState::parse(&state)
+                            .ok_or_else(|| anyhow::anyhow!("unknown attempt state"))?,
+                        expected_version: u64::try_from(version)?,
+                        to: next,
+                        cancellation_version: input.cancellation_version,
+                    },
                 )?;
             }
             let current = ImageGenerationSlotState::parse(&slot_state)
@@ -3833,11 +3851,13 @@ impl Db {
                 conn,
                 input.job_id,
                 Uuid::parse_str(&slot_id)?,
-                current,
-                u64::try_from(slot_version)?,
-                next,
-                input.cancellation_version,
-                response_adopted,
+                CancellationSlotTransition {
+                    from: current,
+                    expected_version: u64::try_from(slot_version)?,
+                    to: next,
+                    cancellation_version: input.cancellation_version,
+                    result_after_cancel: response_adopted,
+                },
             )?;
         }
         let (job_state, job_version): (String, i64) = conn.query_row(

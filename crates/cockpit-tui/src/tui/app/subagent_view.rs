@@ -407,7 +407,7 @@ impl App {
             session_id,
             task_call_id: view.task_call_id,
             label: view.label,
-            message,
+            message: message.clone(),
         };
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("subagent.steer"),

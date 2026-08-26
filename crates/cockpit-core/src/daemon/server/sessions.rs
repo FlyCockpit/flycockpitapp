@@ -261,7 +261,7 @@ pub(super) fn btw_info_to_proto(info: crate::db::sessions::BtwForkInfo) -> proto
         parent_session_id: info.parent_session_id,
         short_id: info.short_id,
         tangent: info.tangent,
-        created_at: info.created_at,
+        created_at: info.created_at_unix_ms,
         message_count: info.message_count,
     }
 }

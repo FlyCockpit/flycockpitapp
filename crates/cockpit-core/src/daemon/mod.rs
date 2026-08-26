@@ -88,10 +88,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use cockpit_host::daemon_lifecycle::parse_macos_procargs2;
 #[cfg(unix)]
 use cockpit_host::daemon_lifecycle::reclaim_stale_and_reserve;
 #[cfg(unix)]
 use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
+#[cfg(test)]
+use cockpit_host::daemon_lifecycle::split_proc_cmdline;
 #[cfg(test)]
 use cockpit_host::daemon_lifecycle::write_pid_file;
 #[cfg(any(unix, test))]
@@ -104,8 +108,6 @@ use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record, re
 use cockpit_host::daemon_lifecycle::{VerifiedProcessOutcome, acquire_verified_daemon_process};
 #[cfg(unix)]
 use cockpit_host::daemon_lifecycle::{legacy_pid_identity, verify_cockpit_daemon_receipt_identity};
-#[cfg(all(test, unix))]
-use cockpit_host::daemon_lifecycle::{parse_macos_procargs2, split_proc_cmdline};
 use cockpit_host::private_fs::ensure_private_dir;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -942,7 +944,7 @@ pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool)
         let Some(pid) = read_pid_file(&paths.pid_file) else {
             return false;
         };
-        read_process_cmdline(pid)
+        cockpit_host::daemon_lifecycle::read_process_cmdline(pid)
             .map(|args| restart_no_sandbox_from_argv(&args, false))
             .unwrap_or(false)
     }
@@ -1484,7 +1486,7 @@ fn spawn_owned_in_process_daemon(
                             }
                         };
                         #[cfg(not(test))]
-                        let mut tasks = {
+                        let tasks = {
                             let mut tasks = Vec::new();
                             tasks.push(server::spawn_lock_sweeper(ctx.clone()));
                             #[cfg(feature = "remote")]
@@ -2182,6 +2184,7 @@ fn cleanup_receipt_metadata(paths: &DaemonPaths, receipt: &DaemonPidReceipt) -> 
 
 #[cfg(all(test, unix))]
 mod tests {
+    use super::client::temp_ephemeral_paths;
     use super::*;
     use crate::daemon::test_harness::{
         CleanupReport, DaemonTestHarness, TEST_OWNER_ENV, TestDaemonManifest,
@@ -3135,7 +3138,7 @@ mod tests {
         ]));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn kern_procargs2_fixture(exec_path: &str, args: &[&str]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(args.len() as libc::c_int).to_ne_bytes());
@@ -3149,7 +3152,7 @@ mod tests {
         bytes
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_procargs2_daemon_start_verifies_through_shared_identity_rule() {
         let bytes = kern_procargs2_fixture(
@@ -3169,7 +3172,7 @@ mod tests {
         assert!(argv_requests_daemon_start(&args));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_procargs2_rejects_truncated_or_malformed_data() {
         assert!(parse_macos_procargs2(&[1, 0]).is_err());

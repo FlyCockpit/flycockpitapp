@@ -7,6 +7,10 @@ use super::Db;
 
 const EXECUTION_LEASE_MS: i64 = 60_000;
 
+/// Row shape for an existing local-operation receipt read back during
+/// idempotent dispatch.
+type ExistingReceiptRow = (String, Vec<u8>, String, Option<String>, i64, Option<i64>);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalOperationBegin {
     Dispatch { fencing_generation: i64 },
@@ -63,7 +67,7 @@ impl Db {
     ) -> Result<LocalOperationBegin> {
         self.transaction(move |conn| {
             let now = chrono::Utc::now().timestamp_millis();
-            let existing: Option<(String, Vec<u8>, String, Option<String>, i64, Option<i64>)> = conn.query_row(
+            let existing: Option<ExistingReceiptRow> = conn.query_row(
                 "SELECT operation_kind,request_hash,state,terminal_outcome_json,fencing_generation,execution_expires_at_unix_ms FROM local_operation_receipts WHERE owner_digest=?1 AND client_operation_id=?2",
                 params![owner_digest, client_operation_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),

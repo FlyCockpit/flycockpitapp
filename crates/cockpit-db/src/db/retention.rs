@@ -121,9 +121,9 @@ impl Db {
                 [],
                 |row| {
                     Ok(RetentionProtectionReport {
-                        total_session_rows: row.get(0)?,
-                        directly_pinned_sessions: row.get(1)?,
-                        pin_protected_root_sessions: row.get(2)?,
+                        total_session_rows: row.get::<_, i64>(0)? as u64,
+                        directly_pinned_sessions: row.get::<_, i64>(1)? as u64,
+                        pin_protected_root_sessions: row.get::<_, i64>(2)? as u64,
                     })
                 },
             )

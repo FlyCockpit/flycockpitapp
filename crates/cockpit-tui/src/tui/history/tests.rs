@@ -2776,7 +2776,13 @@ fn agent_with_perf(
 fn response_performance_chip_renders_and_expands_independently() {
     let perf = sample_perf();
     let closed = render_entry(
-        &agent_with_perf("hello world", "secret think", Some(perf), false, false),
+        &agent_with_perf(
+            "hello world",
+            "secret think",
+            Some(perf.clone()),
+            false,
+            false,
+        ),
         120,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2810,7 +2816,13 @@ fn response_performance_chip_renders_and_expands_independently() {
     assert!(closed.chip_row.is_some());
 
     let open = render_entry(
-        &agent_with_perf("hello world", "secret think", Some(perf), false, true),
+        &agent_with_perf(
+            "hello world",
+            "secret think",
+            Some(perf.clone()),
+            false,
+            true,
+        ),
         120,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2882,7 +2894,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
 
     // Width 120: inline metric with controls/timestamp.
     let wide = render_entry(
-        &agent_with_perf("ok", "", Some(perf), false, false),
+        &agent_with_perf("ok", "", Some(perf.clone()), false, false),
         120,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2899,7 +2911,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
 
     // Width 48: dedicated metric row, controls preserved.
     let mid = render_entry(
-        &agent_with_perf("ok", "", Some(perf), false, false),
+        &agent_with_perf("ok", "", Some(perf.clone()), false, false),
         48,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2914,7 +2926,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
 
     // Width 24: accessible header returns (floor).
     let floor = render_entry(
-        &agent_with_perf("ok", "", Some(perf), false, false),
+        &agent_with_perf("ok", "", Some(perf.clone()), false, false),
         24,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
@@ -2933,7 +2945,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
     // Below 24: ↔ resize state, no metric hit target.
     for w in [23u16, 12, 1] {
         let narrow = render_entry(
-            &agent_with_perf("ok", "", Some(perf), false, false),
+            &agent_with_perf("ok", "", Some(perf.clone()), false, false),
             w,
             ThinkingDisplay::Condensed,
             MarkdownOpts::default(),

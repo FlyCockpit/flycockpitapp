@@ -1278,7 +1278,6 @@ impl AgentsPage {
                                 cwd,
                                 mutation,
                                 expected_revision,
-                                expected_config_generation,
                                 purpose,
                                 querying,
                             }));
@@ -2737,13 +2736,15 @@ pub(crate) fn validate_agent_mutation_result(
     use cockpit_proto::{AgentEntryKind as K, AgentMutation as M, AgentSourceLayer as L};
     cockpit_proto::validate_agent_mutation_envelope(
         result,
-        client_operation_id,
-        mutation_intent_hash,
-        cwd.to_string_lossy().as_ref(),
-        cockpit_proto::agent_mutation_name(mutation),
-        prior_revision,
-        completed_lease_id,
-        matches!(mutation, M::ResetAllBuiltins),
+        &cockpit_proto::AgentMutationExpectations {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root: cwd.to_string_lossy().as_ref(),
+            agent_name: cockpit_proto::agent_mutation_name(mutation),
+            consumed_revision: prior_revision,
+            completed_lease_id,
+            inventory_wide: matches!(mutation, M::ResetAllBuiltins),
+        },
     )
     .map_err(str::to_string)?;
     if matches!(

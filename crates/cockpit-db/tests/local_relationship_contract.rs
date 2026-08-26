@@ -249,11 +249,6 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
             self.found |= literal.span().start().line == self.line;
         }
     }
-    fn contains_literal(expression: &syn::Expr, line: usize) -> bool {
-        let mut visitor = ContainsLiteral { line, found: false };
-        syn::visit::Visit::visit_expr(&mut visitor, expression);
-        visitor.found
-    }
     fn exact_literal_value(expression: &syn::Expr, line: usize) -> bool {
         matches!(
             expression,
@@ -1039,7 +1034,10 @@ fn effective_profiles() -> [(&'static str, schema_parser::Schema); 2] {
 }
 
 fn schema_digest(schema: &str) -> String {
-    format!("{:x}", Sha256::digest(schema.as_bytes()))
+    Sha256::digest(schema.as_bytes())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 #[test]

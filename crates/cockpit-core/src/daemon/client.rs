@@ -723,10 +723,18 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
 }
 
 #[cfg(test)]
+pub(super) fn temp_ephemeral_paths(root: &std::path::Path, stem: &str) -> super::DaemonPaths {
+    super::DaemonPaths {
+        socket: root.join(format!("{stem}.sock")),
+        pid_file: root.join(format!("{stem}.pid")),
+        ephemeral: true,
+    }
+}
+
+#[cfg(test)]
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::daemon::DaemonPaths;
     use crate::daemon::proto::Response;
 
     #[tokio::test]
@@ -804,14 +812,6 @@ mod tests {
             spawn < arm && arm < wait,
             "no cancellation window before RAII"
         );
-    }
-
-    fn temp_ephemeral_paths(root: &std::path::Path, stem: &str) -> DaemonPaths {
-        DaemonPaths {
-            socket: root.join(format!("{stem}.sock")),
-            pid_file: root.join(format!("{stem}.pid")),
-            ephemeral: true,
-        }
     }
 
     /// Daemonless = own ephemeral daemon (`daemonless-tui-ephemeral-lifecycle.md`

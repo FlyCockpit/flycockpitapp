@@ -1599,9 +1599,6 @@ fn mutate_agent(
     client_operation_id: String,
     mutation_intent_hash: String,
     root: &Path,
-    project_root: &str,
-    client_operation_id: String,
-    mutation_intent_hash: String,
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<AgentMutationResult, String> {
@@ -1818,7 +1815,6 @@ fn begin_editor_lease(
     root: &Path,
     name: &str,
     expected_revision: String,
-    client_operation_id: String,
 ) -> Result<Response, String> {
     let snapshot = agent_edit_snapshot(root, name)?;
     ensure_revision(&snapshot.revision, Some(&expected_revision))?;

@@ -416,7 +416,11 @@ fn wizard_payload_key(control: &WizardControlId) -> WizardPayloadControlKey {
 
 pub(super) fn all_payload_keys() -> Vec<PayloadFixtureKey> {
     let mut all = Vec::new();
-    all.extend(RootNodeId::ALL.into_iter().map(PayloadFixtureKey::Root));
+    all.extend(
+        RootNodeId::ALL
+            .into_iter()
+            .map(|root| PayloadFixtureKey::Root(*root)),
+    );
     all.extend(
         super::category::ALL_SETTING_IDS
             .iter()

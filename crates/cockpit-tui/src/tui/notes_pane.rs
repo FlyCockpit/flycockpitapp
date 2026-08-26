@@ -219,6 +219,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    instance_id,
                     project_root: response_project_root,
                     notes,
                     selection: keep.map_or(SelectionAfterRpc::Preserve, SelectionAfterRpc::Keep),
@@ -238,6 +239,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    instance_id,
                     project_root: response_project_root,
                     notes,
                     selection: SelectionAfterRpc::Keep(id),
@@ -257,6 +259,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    instance_id,
                     project_root: response_project_root,
                     notes,
                     selection: SelectionAfterRpc::Keep(id),
@@ -278,6 +281,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    instance_id,
                     project_root: response_project_root,
                     notes,
                     selection: SelectionAfterRpc::Keep(note.id),
@@ -296,6 +300,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    instance_id,
                     project_root: response_project_root,
                     notes,
                     selection: SelectionAfterRpc::Deleted { fallback_index },

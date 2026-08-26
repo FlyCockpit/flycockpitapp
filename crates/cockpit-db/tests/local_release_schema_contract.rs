@@ -515,11 +515,11 @@ fn quoted_literals(value: &str) -> Vec<String> {
     value
         .split('\'')
         .enumerate()
-        .filter_map(|(index, value)| (index % 2 == 1).then(|| value.to_owned()))
+        .filter_map(|(index, value)| (index % 2 == 1).then_some(value.to_owned()))
         .collect()
 }
 
-fn rust_constant(source: &str, symbol: &str) -> &str {
+fn rust_constant<'a>(source: &'a str, symbol: &str) -> &'a str {
     source
         .split(&format!(" {symbol}:"))
         .nth(1)

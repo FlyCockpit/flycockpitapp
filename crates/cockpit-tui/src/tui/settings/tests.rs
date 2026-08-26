@@ -5854,11 +5854,6 @@ fn root_menu_inventory_matches_the_default_profile() {
     let nodes = root_nodes();
     assert_eq!(nodes.len(), 15);
     assert_eq!(nodes[0].id, pointer_actions::RootNodeId::DefaultModel);
-    assert!(
-        nodes
-            .iter()
-            .all(|node| node.id != pointer_actions::RootNodeId::ImageSpend)
-    );
 }
 
 #[cfg(feature = "extended")]

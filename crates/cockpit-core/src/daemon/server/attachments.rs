@@ -1,3 +1,4 @@
+use super::authz::session_access_for_row;
 use super::sessions::*;
 use super::*;
 
@@ -1433,6 +1434,36 @@ fn validate_message_attachment(
 mod decode_cleanup_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct AdmittedLocalImage {
+        admission_id: Uuid,
+        width: u32,
+        height: u32,
+        normalized_png_base64: String,
+        normalized_byte_length: u64,
+        normalized_sha256: String,
+    }
+
+    fn normalize_project_image_path(
+        _root: &std::path::Path,
+        path: &std::path::Path,
+        admission_id: Uuid,
+    ) -> anyhow::Result<AdmittedLocalImage> {
+        use base64::Engine as _;
+        let bytes = std::fs::read(path)?;
+        let format = image::guess_format(&bytes)?;
+        let normalized = normalize_ingress_image(bytes, format)?;
+        let png_base64 = base64::engine::general_purpose::STANDARD.encode(&normalized.png);
+        Ok(AdmittedLocalImage {
+            admission_id,
+            width: normalized.width,
+            height: normalized.height,
+            normalized_byte_length: normalized.png.len() as u64,
+            normalized_sha256: normalized.sha256,
+            normalized_png_base64: png_base64,
+        })
+    }
 
     struct TestClock;
     impl crate::media_reservation::MonotonicClock for TestClock {

@@ -1449,7 +1449,10 @@ fn permanent_publication_bridges_have_closed_typed_signatures() {
                 format!("[{};{}]", type_shape(&array.elem), length.base10_digits())
             }
             syn::Type::Reference(reference) => format!("&{}", type_shape(&reference.elem)),
-            other => panic!("unsupported permanent publication parameter type: {other:?}"),
+            other => panic!(
+                "unsupported permanent publication parameter type at {:?}",
+                other.span()
+            ),
         }
     }
     struct CallableTypeVisitor {
@@ -1484,7 +1487,7 @@ fn permanent_publication_bridges_have_closed_typed_signatures() {
             "insert_agent_mutation_journal_under_publication_lock",
             2_usize,
         ),
-        ("prepare_agent_editor_publication_under_publication_lock", 8),
+        ("prepare_agent_editor_publication_under_publication_lock", 2),
         ("record_agent_editor_publication_under_publication_lock", 5),
     ]);
     let expected_types = BTreeMap::from([
@@ -1494,9 +1497,7 @@ fn permanent_publication_bridges_have_closed_typed_signatures() {
         ),
         (
             "prepare_agent_editor_publication_under_publication_lock",
-            vec![
-                "String", "[u8;32]", "String", "String", "String", "u64", "u64",
-            ],
+            vec!["AgentEditorPublicationIntent"],
         ),
         (
             "record_agent_editor_publication_under_publication_lock",

@@ -3,6 +3,7 @@
 
 struct Db;
 struct AgentMutationJournalFence;
+struct AgentEditorPublicationIntent;
 type Result<T> = std::result::Result<T, ()>;
 
 impl Db {
@@ -50,13 +51,7 @@ impl Db {
     /// Permanent typed editor-intent publication bridge.
     pub fn prepare_agent_editor_publication_under_publication_lock(
         &self,
-        _lease_id: String,
-        _completion_identity: [u8; 32],
-        _completion_operation_id: String,
-        _consumed_projection_identity: String,
-        _intended_projection_identity: String,
-        _consumed_config_generation: u64,
-        _result_config_generation: u64,
+        _intent: AgentEditorPublicationIntent,
     ) -> Result<()> {
         self.write_blocking_unguarded(|| Ok(()))
     }

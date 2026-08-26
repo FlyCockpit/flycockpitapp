@@ -1255,7 +1255,6 @@ impl PasteRegistry {
             .match_indices(PASTED_IMAGE_PREFIX)
             .filter_map(|(start, _)| Self::parse_image_placeholder_at(&editor_text[start..]))
             .map(|(number, _)| number)
-            .max()
             .max();
         registry.next_block_id = snapshot.next_block_id;
         registry.next_text_number = snapshot.next_text_number;

@@ -40,7 +40,6 @@ pub mod gitignore;
 pub mod harness;
 pub mod host_capabilities;
 pub mod image_generation;
-#[cfg(feature = "extended")]
 pub mod image_generation_agent_tools;
 pub mod image_generation_artifact_routes;
 pub mod image_generation_comfyui;

@@ -145,6 +145,18 @@ pub fn insert_agent_editor_lease_conn(conn: &Connection, row: &AgentEditorLeaseR
 /// Record the exact before/after projection identities while the caller owns
 /// the filesystem publication lock. This is the durable pre-publication
 /// boundary used to classify a crash between atomic replace and receipt.
+/// Typed editor-intent publication parameters persisted under the
+/// cross-process agent publication lock.
+pub struct AgentEditorPublicationIntent {
+    pub lease_id: String,
+    pub completion_identity: [u8; 32],
+    pub completion_operation_id: String,
+    pub consumed_projection_identity: String,
+    pub intended_projection_identity: String,
+    pub consumed_config_generation: u64,
+    pub result_config_generation: u64,
+}
+
 impl Db {
     /// Persist an editor intent while the caller owns the cross-process agent
     /// publication lock. This narrow synchronous exception keeps the SQLite
@@ -152,17 +164,11 @@ impl Db {
     /// deliberately does not expose an arbitrary database closure.
     pub fn prepare_agent_editor_publication_under_publication_lock(
         &self,
-        lease_id: String,
-        completion_identity: [u8; 32],
-        completion_operation_id: String,
-        consumed_projection_identity: String,
-        intended_projection_identity: String,
-        consumed_config_generation: u64,
-        result_config_generation: u64,
+        intent: AgentEditorPublicationIntent,
     ) -> Result<()> {
-        let consumed_config_generation = i64::try_from(consumed_config_generation)
+        let consumed_config_generation = i64::try_from(intent.consumed_config_generation)
             .context("agent editor consumed config generation overflow")?;
-        let result_config_generation = i64::try_from(result_config_generation)
+        let result_config_generation = i64::try_from(intent.result_config_generation)
             .context("agent editor result config generation overflow")?;
         self.write_blocking_unguarded(move |conn| {
             let changed = conn.execute(
@@ -173,11 +179,11 @@ impl Db {
               WHERE lease_id=?1 AND state='completing' AND completion_identity=?2
                 AND completion_operation_id=?3 AND publication_phase='none'",
                 params![
-                    lease_id,
-                    completion_identity.as_slice(),
-                    completion_operation_id,
-                    consumed_projection_identity,
-                    intended_projection_identity,
+                    intent.lease_id,
+                    intent.completion_identity.as_slice(),
+                    intent.completion_operation_id,
+                    intent.consumed_projection_identity,
+                    intent.intended_projection_identity,
                     consumed_config_generation,
                     result_config_generation,
                     now_ms()
@@ -289,7 +295,7 @@ pub fn reserve_agent_editor_completion_conn(
     completion_operation_id: &str,
     force_reclaim: bool,
 ) -> Result<AgentEditorCompletionClaim> {
-    let row = by_id(conn, &lease_id)?.context("agent editor lease is absent")?;
+    let row = by_id(conn, lease_id)?.context("agent editor lease is absent")?;
     if row.owner_digest != owner_digest {
         bail!("agent editor lease belongs to another owner");
     }
@@ -328,7 +334,7 @@ pub fn reserve_agent_editor_completion_conn(
                 return Ok(AgentEditorCompletionClaim::Pending);
             }
             return Ok(AgentEditorCompletionClaim::Execute(
-                by_id(conn, &lease_id)?.context("agent editor lease disappeared")?,
+                by_id(conn, lease_id)?.context("agent editor lease disappeared")?,
             ));
         }
         "open" => {}
@@ -339,7 +345,7 @@ pub fn reserve_agent_editor_completion_conn(
         return Ok(AgentEditorCompletionClaim::Pending);
     }
     Ok(AgentEditorCompletionClaim::Execute(
-        by_id(conn, &lease_id)?.context("agent editor lease disappeared")?,
+        by_id(conn, lease_id)?.context("agent editor lease disappeared")?,
     ))
 }
 

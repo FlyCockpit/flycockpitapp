@@ -70,7 +70,7 @@ pub(crate) struct PasteSpan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TestPasteKind {
     Text { full: String, tokens: Option<usize> },
-    Image,
+    Image { reference: bool },
     ImageHandle,
 }
 
@@ -167,7 +167,9 @@ impl RegisteredComposer {
                         full: full.clone(),
                         tokens: *tokens,
                     },
-                    PasteKind::Image { .. } => TestPasteKind::Image,
+                    PasteKind::Image { reference, .. } => TestPasteKind::Image {
+                        reference: *reference,
+                    },
                     PasteKind::ImageHandle { .. } => TestPasteKind::ImageHandle,
                 },
             })

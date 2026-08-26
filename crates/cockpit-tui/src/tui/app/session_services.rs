@@ -117,7 +117,7 @@ impl App {
                 record.probe_in_flight = false;
             }
         }
-        let Some(socket) = socket else {
+        let Some(endpoint) = endpoint else {
             for record in self
                 .delivery_unconfirmed_records
                 .values_mut()

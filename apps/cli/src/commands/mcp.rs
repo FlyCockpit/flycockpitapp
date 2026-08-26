@@ -175,8 +175,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
     }
     let client_operation_id = uuid::Uuid::new_v4().to_string();
     let patch_wire = serde_json::to_string(&patch).context("serializing MCP patch")?;
-    let mutation_intent_hash =
-        cockpit_proto::mcp_mutation_intent_hash(&project_root, &patch_wire);
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&project_root, &patch_wire);
     match daemon
         .client
         .request(Request::SaveMcpConfig {

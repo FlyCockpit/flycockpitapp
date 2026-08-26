@@ -94,11 +94,8 @@ impl Db {
             None => (None, None),
         };
         self.write(move |conn| {
-            let tx = conn
-                .transaction()
-                .context("starting guidance baseline transaction")?;
             if let Some(ref content_hash) = hash {
-                let exists: bool = tx
+                let exists: bool = conn
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM guidance_contents WHERE hash = ?1)",
                         [content_hash],
@@ -109,7 +106,7 @@ impl Db {
                     anyhow::bail!("guidance baseline content is not stored");
                 }
             }
-            let changed = tx
+            let changed = conn
                 .execute(
                     "UPDATE sessions
                  SET guidance_baseline_path = ?1, guidance_baseline_hash = ?2
@@ -120,8 +117,6 @@ impl Db {
             if changed != 1 {
                 anyhow::bail!("guidance baseline session does not exist");
             }
-            tx.commit()
-                .context("committing guidance baseline transaction")?;
             Ok(())
         })
         .await

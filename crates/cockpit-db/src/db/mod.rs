@@ -1303,20 +1303,20 @@ fn create_migration_backup_with_limit(
             untrusted.display()
         )
     });
-    if validation.is_err() && existing_quarantine_matches(&untrusted, &content_digest)? {
-        remove_backup_candidate(&candidate)?;
-        candidate_guard.disarm();
-        return Err(validation.unwrap_err()).context(format!(
-            "an exact content-identical backup is already durably quarantined at {}",
-            untrusted.display()
-        ));
-    }
-    // A mismatched, truncated, insecure, or symlink occupant must never make
-    // us discard the fresh candidate merely because it owns the digest-shaped
-    // pathname. Move it into the lock-owned candidate namespace; it remains
-    // recoverable until the replacement reaches its fsync boundary.
-    let displaced = handle_invalid_quarantine_occupant(path, &untrusted)?;
     if let Err(error) = validation {
+        if existing_quarantine_matches(&untrusted, &content_digest)? {
+            remove_backup_candidate(&candidate)?;
+            candidate_guard.disarm();
+            return Err(error).context(format!(
+                "an exact content-identical backup is already durably quarantined at {}",
+                untrusted.display()
+            ));
+        }
+        // A mismatched, truncated, insecure, or symlink occupant must never make
+        // us discard the fresh candidate merely because it owns the digest-shaped
+        // pathname. Move it into the lock-owned candidate namespace; it remains
+        // recoverable until the replacement reaches its fsync boundary.
+        let displaced = handle_invalid_quarantine_occupant(path, &untrusted)?;
         std::fs::rename(&candidate, &untrusted).with_context(|| {
             format!(
                 "publishing quarantined database backup {} at {}",
@@ -1332,6 +1332,7 @@ fn create_migration_backup_with_limit(
         prune_untrusted_migration_backups(path)?;
         return Err(error);
     }
+    let displaced = handle_invalid_quarantine_occupant(path, &untrusted)?;
     std::fs::rename(&candidate, &backup).with_context(|| {
         format!(
             "promoting trusted migration backup {} to {}",
@@ -2076,7 +2077,10 @@ fn open_stable_backup_lock_parent(path: &Path) -> Result<std::fs::File> {
     for component in components {
         match component {
             Component::Normal(name) => names.push(name.to_owned()),
-            _ => anyhow::bail!("backup lock parent {} is not a lexical path", path.display()),
+            _ => anyhow::bail!(
+                "backup lock parent {} is not a lexical path",
+                path.display()
+            ),
         }
     }
     anyhow::ensure!(
@@ -2463,8 +2467,9 @@ impl Drop for BackupArtifactLock {
 }
 
 fn sqlite_allocated_bytes(conn: &Connection) -> Result<u64> {
-    let page_count: u64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count: u64 =
+        conn.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))? as u64;
+    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))? as u64;
     page_count
         .checked_mul(page_size)
         .context("SQLite backup size estimate overflow")
@@ -2811,9 +2816,7 @@ fn filesystem_available_bytes(path: &Path) -> Result<Option<u64>> {
     }
     // SAFETY: statvfs returned success and initialized the output structure.
     let stats = unsafe { stats.assume_init() };
-    Ok(Some(
-        (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64),
-    ))
+    Ok(Some(stats.f_bavail.saturating_mul(stats.f_frsize)))
 }
 
 #[cfg(windows)]
@@ -3680,7 +3683,7 @@ mod tests {
         let forged_fingerprint = exact_ddl_fingerprint(&conn).unwrap();
         conn.execute(
             "UPDATE schema_version SET schema_fingerprint=?1 WHERE version=?2",
-            params![forged_fingerprint, EXPECTED_SCHEMA_VERSION],
+            rusqlite::params![forged_fingerprint, EXPECTED_SCHEMA_VERSION],
         )
         .unwrap();
         assert!(validate_compiled_migration_backup_ledger(&conn, EXPECTED_SCHEMA_VERSION).is_err());

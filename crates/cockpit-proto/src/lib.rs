@@ -41,8 +41,8 @@ pub use agent_installation::{
 pub use agent_management::{
     AgentEditSnapshot, AgentEditTarget, AgentEditorCompletion, AgentEditorLease,
     AgentEditorSettlementStatus, AgentEntryKind, AgentInventoryEntry, AgentMutation,
-    AgentMutationOutcome, AgentMutationResult, AgentSourceLayer, GoalSupervisionPatch,
-    MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
+    AgentMutationExpectations, AgentMutationOutcome, AgentMutationResult, AgentSourceLayer,
+    GoalSupervisionPatch, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
     agent_edit_projection_material, agent_inventory_entry_projection_material,
     agent_mutation_intent_hash, agent_mutation_name, assistant_mutation_intent_hash,
@@ -1620,8 +1620,8 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, RunInvocationOptions,
-    UsageKind,
+    ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,
+    RunInvocationOptions, UsageKind,
 };
 #[cfg(feature = "remote")]
 pub use request::{
@@ -1806,8 +1806,8 @@ impl DelegationSteerResult {
 
 mod response;
 pub use response::{
-    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, Response,
-    RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
+    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, ImageIngressAdmissionReceiptV1,
+    Response, RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
     RunInvocationStatusV1, RunInvocationTerminalReason,
 };
 #[cfg(feature = "remote")]

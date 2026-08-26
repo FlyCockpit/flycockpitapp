@@ -928,8 +928,8 @@ pub async fn apply_extended_config_patch(
                 None
             };
             drop(_publication_guard);
-            if let Some(published) = published_generation {
-                if published != config_generation {
+            if let Some(published) = published_generation
+                && published != config_generation {
                     if let Response::ExtendedConfigSaved { config_generation, .. } = &mut terminal_response {
                         *config_generation = published;
                     }
@@ -948,7 +948,6 @@ pub async fn apply_extended_config_patch(
                         Ok(())
                     })).map_err(internal)?;
                 }
-            }
             Ok(terminal_response)
         }),
     )

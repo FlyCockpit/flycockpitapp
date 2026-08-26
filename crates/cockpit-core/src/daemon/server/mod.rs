@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -2512,7 +2512,7 @@ impl DaemonContext {
             .start_with_callbacks(shutdown.clone(), callbacks)
         });
         #[cfg(not(feature = "extended"))]
-        let scheduler = None;
+        let scheduler: Option<crate::daemon::scheduler::DaemonSchedulerHandle> = None;
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
@@ -3346,7 +3346,8 @@ pub(crate) fn register_in_process_context(
 }
 
 pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::InProcessEndpoint {
-    let (connections, mut requests) = mpsc::channel(16);
+    let (connections, mut requests) =
+        mpsc::channel::<oneshot::Sender<Option<cockpit_client::InProcessConnection>>>(16);
     let (sensitive, mut sensitive_requests) =
         mpsc::channel::<cockpit_client::InProcessSensitiveRequest>(4);
     let weak = Arc::downgrade(ctx);

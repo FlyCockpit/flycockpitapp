@@ -308,7 +308,9 @@ mod tests {
         .unwrap();
     }
 
-    async fn identity_refusal_ctx(home: &std::path::Path) -> (ToolCtx, crate::test_env::TestEnvGuard) {
+    async fn identity_refusal_ctx(
+        home: &std::path::Path,
+    ) -> (ToolCtx, crate::test_env::TestEnvGuard) {
         let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home).await;
         let canonical = crate::assistants::default_home_dir("helper").unwrap();
         std::fs::create_dir_all(&canonical).unwrap();

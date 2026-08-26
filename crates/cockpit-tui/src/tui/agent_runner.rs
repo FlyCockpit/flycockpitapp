@@ -31,7 +31,7 @@ use cockpit_client::presentation::{
 use cockpit_client::submission::ClientUserSubmission;
 use cockpit_client::{ClientEndpoint, DaemonClient, LifecycleClient, LifecycleIntent};
 use cockpit_host::jitter::{JitterSource, SystemJitter};
-use cockpit_proto::{self, ErrorCode, ErrorPayload, Request, Response};
+use cockpit_proto::{self as proto, ErrorCode, ErrorPayload, Request, Response};
 
 /// The three 30-day autocomplete count maps fetched at session start.
 /// `models` and `slash` are global; `tags` is scoped to this session's

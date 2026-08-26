@@ -141,7 +141,7 @@ impl Instant {
 ///
 /// `AssistantText` remains the durable assistant payload and does **not**
 /// carry `attempt_id`.
-
+//
 /// The complete display event emitted by [`DisplayStreamClassifier`].
 /// Owns its durable [`AssistantTextPayload`].
 #[derive(Debug, Clone, PartialEq, Eq)]

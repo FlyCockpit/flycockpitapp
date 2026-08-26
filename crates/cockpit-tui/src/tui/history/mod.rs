@@ -1174,7 +1174,7 @@ pub fn render_entry(
                 width,
                 md.agent,
                 pin,
-                *performance,
+                performance.clone(),
                 *performance_expanded,
             )
         }

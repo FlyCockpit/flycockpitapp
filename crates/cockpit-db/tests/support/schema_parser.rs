@@ -1257,7 +1257,10 @@ mod tests {
         assert!(exact_target_keys(&schema, "parent").is_empty());
         let inherited = parse(&["CREATE TABLE parent(id TEXT COLLATE nocase); \
              CREATE UNIQUE INDEX parent_id_nocase ON parent(id);"]);
-        assert_eq!(exact_target_keys(&inherited, "parent"), [vec!["id".into()]]);
+        assert_eq!(
+            exact_target_keys(&inherited, "parent"),
+            [vec!["id".to_string()]]
+        );
     }
 
     #[test]

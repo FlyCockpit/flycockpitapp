@@ -993,7 +993,7 @@ pub(crate) async fn dispatch_image_control_mutation(
     let read_target = target.clone();
     let consumed = crate::daemon::config_publication_recovery::PreSocketConfigPublication::new()
         .with_target(&target, move |_| {
-            read_document(&read_target).map_err(|error| anyhow::anyhow!(error.message))
+            read_document(&read_target).map_err(|error| anyhow::anyhow!(error.to_string()))
         })
         .await
         .map_err(|error| {
@@ -1144,7 +1144,7 @@ pub(crate) async fn dispatch_image_control_mutation(
         crate::daemon::config_publication_recovery::PreSocketConfigPublication::new()
             .with_target(&target, move |_| {
                 let precommit = read_document(&commit_target)
-                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 if content_revision(&revision_ctx, &precommit) != commit_consumed_revision {
                     return Ok(None);
                 }
@@ -1426,7 +1426,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
-                        row.get(7)?,
+                        row.get::<_, i64>(7)? as u64,
                         row.get(8)?,
                         row.get(9)?,
                         row.get(10)?,
@@ -1542,7 +1542,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
                 let actual = publication
                     .with_target(&terminal_target, move |_| {
                         let actual_bytes = read_document(&observed_target)
-                            .map_err(|error| anyhow::anyhow!(error.message))?;
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                         Ok(content_revision(&revision_ctx, actual_bytes.as_slice()))
                     })
                     .await
@@ -1601,7 +1601,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
         let actual = publication
             .with_target(&target_path, move |_| {
                 let actual_bytes = read_document(&observed_target)
-                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 Ok(content_revision(&revision_ctx, actual_bytes.as_slice()))
             })
             .await

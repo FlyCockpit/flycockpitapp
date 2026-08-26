@@ -10,7 +10,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::banner::render_unconditional;
-use crate::git::{self, RepoStatus, repo_counts};
+use crate::git::{self, repo_counts};
 pub use cockpit_proto::{LaunchBundle, LaunchInfo};
 
 pub const APP_NAME: &str = "FlyCockpit";

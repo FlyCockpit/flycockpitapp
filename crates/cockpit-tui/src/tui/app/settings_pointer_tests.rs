@@ -290,9 +290,9 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         ),
         (
             OverlaySurface::Permissions,
-            Overlay::Permissions(crate::tui::permissions_pane::PermissionsPane::open(
-                Some(tmp.path()),
-            )),
+            Overlay::Permissions(crate::tui::permissions_pane::PermissionsPane::open(Some(
+                tmp.path(),
+            ))),
         ),
         (
             OverlaySurface::Resources,

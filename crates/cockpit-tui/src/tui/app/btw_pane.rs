@@ -11,7 +11,7 @@ use crate::tui::history::{HistoryEntry, PendingMsg};
 use cockpit_client::presentation::TurnEvent;
 use cockpit_client::submission::ClientUserSubmission as UserSubmission;
 use cockpit_proto::QueueItem as QueuedUserMessage;
-use cockpit_proto::{self, Request, Response};
+use cockpit_proto::{self as proto, Request, Response};
 use cockpit_proto::{QueueItemStatus, QueueTarget};
 
 use super::{

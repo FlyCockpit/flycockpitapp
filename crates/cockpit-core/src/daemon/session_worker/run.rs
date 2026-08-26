@@ -2531,19 +2531,18 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
-                        if let Some(durable) = durable {
-                            if durable.origin_principal != receipt.origin_principal
-                                || durable.fingerprint != receipt.fingerprint
-                            {
-                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                        if let Some(durable) = durable
+                            && (durable.origin_principal != receipt.origin_principal
+                                || durable.fingerprint != receipt.fingerprint)
+                        {
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
                                     code: proto::ErrorCode::BadRequest,
                                     message: format!(
                                         "client_submission_id {} was already used for a different payload",
                                         receipt.id
                                     ),
                                 }));
-                                continue;
-                            }
+                            continue;
                         }
                     }
                     if artifact_admission.is_none()

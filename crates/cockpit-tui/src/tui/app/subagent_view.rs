@@ -5,12 +5,12 @@ fn subagent_steer_message(
     buffer: &str,
     registry: &crate::tui::paste::PasteRegistry,
 ) -> Result<Option<String>, &'static str> {
-    if !registry.image_payloads_by_number().is_empty() {
+    let Some(message) = registry.expand_plain_payload(buffer) else {
         return Err(
             "Subagent steering does not accept image attachments; remove them before sending.",
         );
-    }
-    let message = registry.expand_display(buffer).trim().to_string();
+    };
+    let message = message.trim().to_string();
     Ok((!message.is_empty()).then_some(message))
 }
 

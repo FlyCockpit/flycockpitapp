@@ -753,6 +753,25 @@ impl PasteRegistry {
         })
     }
 
+    /// Expand condensed text blocks to their exact underlying payload with
+    /// no transcript or wire markers. Returns `None` when any image block is
+    /// present because a text-only consumer must choose an explicit image
+    /// attachment contract rather than leaking a placeholder literal.
+    pub fn expand_plain_payload(&self, buffer: &str) -> Option<String> {
+        if self.blocks.iter().any(|block| {
+            matches!(
+                block.kind,
+                PasteKind::Image { .. } | PasteKind::ImageHandle { .. }
+            )
+        }) {
+            return None;
+        }
+        Some(self.expand_blocks(buffer, |out, block| match &block.kind {
+            PasteKind::Text { full, .. } => out.push_str(full),
+            PasteKind::Image { .. } | PasteKind::ImageHandle { .. } => unreachable!(),
+        }))
+    }
+
     /// Build the text handed to `$EDITOR`. Text paste blocks are expanded
     /// with stable nonce tags so they can be rebuilt on return; images stay
     /// as visible placeholders because their bytes cannot live in the file.
@@ -1193,6 +1212,34 @@ VERY LONG TEXT
         );
         assert!(!display.contains("<user_paste"));
         assert!(!display.contains("[Pasted text #"));
+    }
+
+    #[test]
+    fn expand_plain_payload_preserves_surrounding_and_interleaved_text_exactly() {
+        let mut registry = PasteRegistry::new();
+        let mut buffer = String::from("before ");
+        let first = registry.register_text(buffer.len(), "alpha\nbeta".into(), 2);
+        buffer.push_str(&first);
+        buffer.push_str(" middle ");
+        let second = registry.register_text(buffer.len(), "γ🙂".into(), 2);
+        buffer.push_str(&second);
+        buffer.push_str(" after");
+
+        assert_eq!(
+            registry.expand_plain_payload(&buffer).as_deref(),
+            Some("before alpha\nbeta middle γ🙂 after")
+        );
+    }
+
+    #[test]
+    fn expand_plain_payload_fails_closed_for_interleaved_images() {
+        let mut registry = PasteRegistry::new();
+        let mut buffer = String::from("before ");
+        let text = registry.register_text(buffer.len(), "payload".into(), 1);
+        buffer.push_str(&text);
+        let image = registry.register_image(buffer.len(), vec![1, 2, 3]);
+        buffer.push_str(&image);
+        assert!(registry.expand_plain_payload(&buffer).is_none());
     }
 
     #[test]

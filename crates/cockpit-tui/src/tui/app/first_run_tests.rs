@@ -7,14 +7,6 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use tokio::sync::mpsc;
 
-fn daemon_paths(tmp: &tempfile::TempDir) -> cockpit_core::daemon::DaemonPaths {
-    cockpit_core::daemon::DaemonPaths {
-        pid_file: tmp.path().join("daemon.pid"),
-        socket: tmp.path().join("daemon.sock"),
-        ephemeral: false,
-    }
-}
-
 fn write_config(cwd: &std::path::Path, cfg: &ProvidersConfig) {
     let cockpit = cwd.join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
@@ -61,14 +53,7 @@ fn config_with_provider(provider_id: &str, model_id: &str) -> ProvidersConfig {
 
 #[test]
 fn daemon_autostart_ask_shows_modal() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = daemon_not_running_state_with_spawn(
-        cockpit_core::daemon::DaemonStatus::NotRunning,
-        daemon_paths(&tmp),
-        cockpit_config::extended::DaemonAutostart::Ask,
-        false,
-        || panic!("ask mode must not spawn"),
-    );
+    let state = startup_daemon_state(cockpit_config::extended::DaemonAutostart::Ask);
 
     assert!(state.prompt.is_some());
     assert!(!state.connected);
@@ -76,18 +61,11 @@ fn daemon_autostart_ask_shows_modal() {
 }
 
 #[test]
-fn daemon_autostart_failure_falls_back_to_modal() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = daemon_not_running_state_with_spawn(
-        cockpit_core::daemon::DaemonStatus::NotRunning,
-        daemon_paths(&tmp),
-        cockpit_config::extended::DaemonAutostart::Shared,
-        false,
-        || anyhow::bail!("boom"),
-    );
+fn daemon_autostart_shared_defers_resolution_to_composition() {
+    let state = startup_daemon_state(cockpit_config::extended::DaemonAutostart::Shared);
 
-    assert!(state.prompt.is_some());
-    assert!(!state.connected);
+    assert!(state.prompt.is_none());
+    assert!(state.connected);
     assert!(state.notice.is_none());
 }
 
@@ -235,11 +213,8 @@ fn no_provider_send_opens_provider_setup_preserves_input() {
     assert!(app.dialog.test_provider_is_add());
 }
 
-fn daemon_prompt(tmp: &tempfile::TempDir) -> crate::tui::daemon_prompt::DaemonPromptDialog {
-    crate::tui::daemon_prompt::DaemonPromptDialog::new(
-        cockpit_core::daemon::DaemonStatus::NotRunning,
-        daemon_paths(tmp),
-    )
+fn daemon_prompt(_tmp: &tempfile::TempDir) -> crate::tui::daemon_prompt::DaemonPromptDialog {
+    crate::tui::daemon_prompt::DaemonPromptDialog::new()
 }
 
 #[test]

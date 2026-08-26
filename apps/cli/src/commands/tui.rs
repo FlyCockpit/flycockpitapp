@@ -8,6 +8,14 @@ use uuid::Uuid;
 use crate::welcome;
 use cockpit_tui::tui::app::{App, StartupWorkspaceTrust};
 
+fn lifecycle_composition() -> (cockpit_client::LifecycleClient, tokio::task::JoinHandle<()>) {
+    let (client, requests) = cockpit_client::LifecycleClient::channel(16);
+    let task = tokio::spawn(cockpit_core::daemon::client::serve_lifecycle_requests(
+        requests,
+    ));
+    (client, task)
+}
+
 pub async fn run(
     project: Option<&Path>,
     no_sandbox: bool,
@@ -20,9 +28,13 @@ pub async fn run(
 
     let trust = prepare_tui_workspace_trust(project)?;
 
-    let mut app =
-        App::new_with_workspace_trust_and_launch_start(project, no_sandbox, trust, launch_start);
-    app.run().await
+    let (lifecycle, lifecycle_task) = lifecycle_composition();
+    let mut app = App::new_composed(project, no_sandbox, trust, launch_start, lifecycle);
+    let result = app.run().await;
+    drop(app);
+    lifecycle_task.abort();
+    let _ = lifecycle_task.await;
+    result
 }
 
 pub async fn run_with_session(
@@ -44,10 +56,20 @@ pub async fn run_with_session(
 
     let trust = prepare_tui_workspace_trust(project)?;
 
-    let mut app =
-        App::new_with_session_and_launch_start(project, no_sandbox, session_id, launch_start);
-    app.set_startup_workspace_trust(trust);
-    app.run().await
+    let (lifecycle, lifecycle_task) = lifecycle_composition();
+    let mut app = App::new_composed_with_session(
+        project,
+        no_sandbox,
+        trust,
+        session_id,
+        launch_start,
+        lifecycle,
+    );
+    let result = app.run().await;
+    drop(app);
+    lifecycle_task.abort();
+    let _ = lifecycle_task.await;
+    result
 }
 
 fn prepare_tui_workspace_trust(project: Option<&Path>) -> Result<StartupWorkspaceTrust> {

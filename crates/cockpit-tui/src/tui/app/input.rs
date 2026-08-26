@@ -719,28 +719,12 @@ impl App {
             let choice = prompt.take_choice();
             match choice {
                 Some(crate::tui::daemon_prompt::DaemonChoice::StartAndConnect) => {
-                    // The TUI promotes a *persistent* daemon here; the
-                    // client's `--no-sandbox` is a per-session default
-                    // applied at attach, not a daemon-level launch flag
-                    // (sandboxing part 2 precedence).
-                    match cockpit_core::daemon::DaemonPaths::resolve()
-                        .and_then(|_| cockpit_core::daemon::spawn_detached(false))
-                    {
-                        Ok(pid) => {
-                            self.push_plain(format!(
-                                "daemon: spawned (pid {pid}); stop later with `cockpit daemon stop`"
-                            ));
-                            self.daemon_connected = true;
-                            self.daemon_prompt = None;
-                            self.reset_display_attach_backoff();
-                            self.maybe_open_add_provider_wizard();
-                        }
-                        Err(e) => {
-                            if let Some(p) = self.daemon_prompt.as_mut() {
-                                p.set_error(format!("failed to spawn daemon: {e}"));
-                            }
-                        }
-                    }
+                    // Resolution and any required spawn occur asynchronously
+                    // in the CLI-owned lifecycle composition task.
+                    self.daemon_connected = true;
+                    self.daemon_prompt = None;
+                    self.reset_display_attach_backoff();
+                    self.maybe_open_add_provider_wizard();
                 }
                 Some(crate::tui::daemon_prompt::DaemonChoice::ContinueWithout) => {
                     // Daemonless mode: this TUI owns its own pid+nonce

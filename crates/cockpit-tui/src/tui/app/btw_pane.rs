@@ -1005,14 +1005,17 @@ impl App {
     ) -> crate::tui::async_action::AsyncActionId {
         let cwd = self.launch.cwd.clone();
         let no_sandbox = self.no_sandbox;
-        let mode = self.lifecycle_mode();
+        let intent = self.lifecycle_intent();
+        let lifecycle = self.lifecycle.clone();
         self.async_actions
             .start(
                 AsyncActionKind::Internal("btw.runner.attach"),
                 AsyncActionPolicy::Replace(AsyncActionKey::new("btw.runner.attach")),
                 async move {
-                    let runner =
-                        agent_runner::attach_to_session(&cwd, session_id, no_sandbox, mode).await?;
+                    let runner = agent_runner::attach_to_session(
+                        &cwd, session_id, no_sandbox, lifecycle, intent,
+                    )
+                    .await?;
                     Ok(AsyncActionPayload::BtwRunnerAttached {
                         session_id,
                         runner: Box::new(runner),

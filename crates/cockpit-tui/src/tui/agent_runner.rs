@@ -20,12 +20,11 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, mpsc, on
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
-use cockpit_client::DaemonClient;
+use cockpit_client::{ClientEndpoint, DaemonClient, LifecycleClient, LifecycleIntent};
 use cockpit_core::daemon::bulk_upload::{
     BulkUserMessageUploadError, INLINE_USER_MESSAGE_TEXT_BYTES, stage_opaque_user_text,
     user_message_needs_bulk,
 };
-use cockpit_core::daemon::client::{LifecycleMode, probe_or_spawn};
 use cockpit_core::daemon::image_upload::{ImageUploadError, upload_submission_images};
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
@@ -349,14 +348,13 @@ pub struct AgentRunner {
     pub usage: UsageCounts,
     /// `true` when this TUI *spawned* the daemon it's attached to (the
     /// daemonless `AlwaysEphemeral` path) and therefore owns its teardown
-    /// — the app builds an [`cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard`]
-    /// from this. `false` when it attached to a pre-existing (canonical or
+    /// — the CLI lifecycle composition retains its teardown guard. `false`
+    /// when it attached to a pre-existing (canonical or
     /// auto-promoted persistent) daemon, which it must never stop.
     pub owns_daemon: bool,
-    /// Armed while the runner is still a provisional async attach result.
-    /// Adoption transfers this guard to `App`; dropping a stale/replaced
-    /// result therefore cannot orphan the ephemeral daemon it spawned.
-    owned_daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    /// Capability used for every fresh connection to this exact daemon,
+    /// including session switches and reconnects.
+    endpoint: ClientEndpoint,
     /// The socket of the daemon this runner is attached to. Carried so an
     /// owned ephemeral daemon can be reaped on exit via the guard.
     pub socket: PathBuf,
@@ -549,7 +547,11 @@ impl AgentRunner {
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
             owns_daemon: false,
-            owned_daemon_guard: None,
+            endpoint: ClientEndpoint::Wire(
+                socket
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("/tmp/cockpit-test.sock")),
+            ),
             socket: socket.unwrap_or_else(|| PathBuf::from("/tmp/cockpit-test.sock")),
             history: Vec::new(),
             paused_work: Vec::new(),
@@ -572,12 +574,6 @@ impl AgentRunner {
     /// daemon-owned session.
     pub fn shutdown(&mut self) {
         self.client_tasks.shutdown();
-    }
-
-    pub(crate) fn take_owned_daemon_guard(
-        &mut self,
-    ) -> Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard> {
-        self.owned_daemon_guard.take()
     }
 
     pub fn event_notifier(&self) -> Arc<Notify> {
@@ -797,7 +793,7 @@ impl AgentRunner {
         let current_client = self.current_client.clone();
         let attach_context = self.attach_context.clone();
         let last_applied_seq = self.last_applied_seq.clone();
-        let socket = self.socket.clone();
+        let endpoint = self.endpoint.clone();
         let input_tx = self.input_tx.clone();
         async move {
             #[cfg(test)]
@@ -814,7 +810,7 @@ impl AgentRunner {
                     cancel_outgoing_turn_after_attach,
                     current_client,
                     last_applied_seq,
-                    socket,
+                    endpoint,
                     input_tx,
                 );
                 return Ok(outcome);
@@ -842,7 +838,7 @@ impl AgentRunner {
             let mut outcome = switch_session_inner(
                 current_client,
                 attach_context,
-                socket,
+                endpoint,
                 target,
                 cancel_outgoing_turn_after_attach,
             )
@@ -1500,12 +1496,12 @@ pub struct SessionSwitchOutcome {
 
 #[derive(Clone)]
 struct LocalReconnectDriver {
-    socket: PathBuf,
+    endpoint: ClientEndpoint,
 }
 
 impl LocalReconnectDriver {
     async fn connect(&self) -> Result<DaemonClient, anyhow::Error> {
-        DaemonClient::connect(&self.socket).await
+        DaemonClient::connect_endpoint(&self.endpoint).await
     }
 }
 
@@ -1867,7 +1863,7 @@ fn should_refresh_skill_inventory(event: &proto::Event) -> bool {
 async fn switch_session_inner(
     current_client: Arc<RwLock<DaemonClient>>,
     attach_context: Arc<RwLock<AttachRequestContext>>,
-    socket: PathBuf,
+    endpoint: ClientEndpoint,
     target: SessionTarget,
     cancel_outgoing_turn_after_attach: bool,
 ) -> Result<SessionSwitchOutcome, String> {
@@ -1875,7 +1871,7 @@ async fn switch_session_inner(
     // same session id. Adopt a fresh client so the old connection cannot feed
     // pre-Attach events into the new epoch.
     let outgoing_client = current_client.read().await.clone();
-    let replacement_client = DaemonClient::connect(&socket)
+    let replacement_client = DaemonClient::connect_endpoint(&endpoint)
         .await
         .map_err(|error| format!("connect replacement session client: {error:#}"))?;
     let client_protocol_version = replacement_client.negotiated().version;
@@ -2110,9 +2106,10 @@ impl Drop for AgentRunner {
 pub async fn try_spawn(
     cwd: &Path,
     no_sandbox: bool,
-    mode: LifecycleMode,
+    lifecycle: LifecycleClient,
+    intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, None, None, no_sandbox, mode).await
+    try_spawn_inner(cwd, None, None, no_sandbox, lifecycle, intent).await
 }
 
 /// Attach a fresh or model-less existing session seeded with the complete
@@ -2123,9 +2120,18 @@ pub async fn try_spawn_with_model(
     session_id: Option<uuid::Uuid>,
     initial_model: cockpit_config::providers::ActiveModelRef,
     no_sandbox: bool,
-    mode: LifecycleMode,
+    lifecycle: LifecycleClient,
+    intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, session_id, Some(initial_model), no_sandbox, mode).await
+    try_spawn_inner(
+        cwd,
+        session_id,
+        Some(initial_model),
+        no_sandbox,
+        lifecycle,
+        intent,
+    )
+    .await
 }
 
 /// Re-attach to an existing session by id (the `/compact` commit path,
@@ -2138,9 +2144,10 @@ pub async fn attach_to_session(
     cwd: &Path,
     session_id: uuid::Uuid,
     no_sandbox: bool,
-    mode: LifecycleMode,
+    lifecycle: LifecycleClient,
+    intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, mode).await
+    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, lifecycle, intent).await
 }
 
 async fn try_spawn_inner(
@@ -2148,22 +2155,23 @@ async fn try_spawn_inner(
     session_id: Option<uuid::Uuid>,
     initial_model: Option<cockpit_config::providers::ActiveModelRef>,
     no_sandbox: bool,
-    mode: LifecycleMode,
+    lifecycle: LifecycleClient,
+    intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
     let attached = {
         let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
-        let mut daemon = probe_or_spawn(mode)
-            .await
-            .map_err(|e| format!("daemon probe: {e}"))?;
-        timer.phase("probe_or_spawn");
+        let daemon = lifecycle.resolve(intent).await?;
+        timer.phase("resolve_lifecycle");
         let owns_daemon = daemon.owns_daemon;
-        let owned_daemon_guard = daemon.take_owned_daemon_guard();
         let socket = daemon.socket.clone();
         let startup_notice = daemon.startup_notice.clone();
+        let endpoint = daemon.endpoint;
+        let client = DaemonClient::connect_endpoint(&endpoint)
+            .await
+            .map_err(|error| format!("daemon connect: {error}"))?;
         let project_root = cwd.to_string_lossy().into_owned();
         let (env_snapshot, _env_diagnostic) = cockpit_core::env_snapshot::capture_tui_shell_env();
-        let attached = match daemon
-            .client
+        let attached = match client
             .request(Request::Attach {
                 session_id,
                 since_seq: None,
@@ -2178,7 +2186,7 @@ async fn try_spawn_inner(
                 // plan-level override is only for the headless plan-run
                 // path (`cockpit run --model`).
                 model_override: None,
-                client_protocol_version: daemon.client.negotiated().version,
+                client_protocol_version: client.negotiated().version,
                 env_snapshot: Some(env_snapshot.to_wire()),
                 env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
             })
@@ -2241,8 +2249,7 @@ async fn try_spawn_inner(
         // Fetch the autocomplete frequency maps for this session's
         // project. Best-effort: a daemon that doesn't speak
         // `GetUsageCounts` just leaves the maps empty (no ranking).
-        let usage = match daemon
-            .client
+        let usage = match client
             .request_ok(Request::GetUsageCounts {
                 project_id: Some(project_id.clone()),
             })
@@ -2259,8 +2266,7 @@ async fn try_spawn_inner(
             },
             _ => UsageCounts::default(),
         };
-        let skill_inventory_names = match daemon
-            .client
+        let skill_inventory_names = match client
             .request_ok(Request::GetInventoryBundle {
                 project_root: cwd.to_string_lossy().into_owned(),
                 session_id,
@@ -2279,7 +2285,8 @@ async fn try_spawn_inner(
         timer.phase("attach_and_usage");
         timer.done();
         Ok::<_, String>((
-            daemon.client,
+            client,
+            endpoint,
             session_id,
             short_id,
             active_agent_name,
@@ -2298,11 +2305,11 @@ async fn try_spawn_inner(
             btw_fork,
             daemon_version,
             daemon_compatible,
-            owned_daemon_guard,
         ))
     }?;
     let (
         client,
+        endpoint,
         session_id,
         short_id,
         initial_active_agent,
@@ -2321,7 +2328,6 @@ async fn try_spawn_inner(
         btw_fork,
         daemon_version,
         daemon_compatible,
-        owned_daemon_guard,
     ) = attached;
 
     let (input_tx, input_rx) = mpsc::channel::<RunnerInput>(32);
@@ -2588,7 +2594,7 @@ async fn try_spawn_inner(
         let attachment_ready_tx = attachment_ready_tx.clone();
         let transition_gate = transition_gate.clone();
         let driver = LocalReconnectDriver {
-            socket: socket.clone(),
+            endpoint: endpoint.clone(),
         };
         // The current primary (root-frame) agent, tracked so a subagent pop
         // returns the active-agent slot to the right primary after a `/plan`
@@ -2791,7 +2797,7 @@ async fn try_spawn_inner(
         project_id,
         usage,
         owns_daemon,
-        owned_daemon_guard,
+        endpoint,
         socket,
         history,
         paused_work,

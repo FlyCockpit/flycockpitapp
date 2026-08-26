@@ -547,64 +547,9 @@ fn resolve_tui_llm_mode(
 fn startup_daemon_state(
     autostart: cockpit_config::extended::DaemonAutostart,
 ) -> StartupDaemonState {
-    let notice_seen = false;
-    match cockpit_core::daemon::DaemonPaths::resolve() {
-        Ok(paths) if paths.ephemeral => match cockpit_core::daemon::probe_blocking(&paths) {
-            cockpit_core::daemon::DaemonStatus::Running => StartupDaemonState {
-                prompt: None,
-                connected: true,
-                socket: Some(paths.socket.clone()),
-                daemonless: false,
-                notice: None,
-            },
-            status => daemon_not_running_state(status, paths, autostart, notice_seen),
-        },
-        Ok(_) => {
-            let probe = cockpit_core::daemon::discover_blocking();
-            match probe.status {
-                cockpit_core::daemon::DaemonStatus::Running => StartupDaemonState {
-                    prompt: None,
-                    connected: true,
-                    socket: Some(probe.paths.socket.clone()),
-                    daemonless: false,
-                    notice: None,
-                },
-                status => daemon_not_running_state(status, probe.paths, autostart, notice_seen),
-            }
-        }
-        Err(_) => StartupDaemonState {
-            prompt: None,
-            connected: false,
-            socket: None,
-            daemonless: false,
-            notice: None,
-        },
-    }
-}
-
-fn daemon_not_running_state(
-    status: cockpit_core::daemon::DaemonStatus,
-    paths: cockpit_core::daemon::DaemonPaths,
-    autostart: cockpit_config::extended::DaemonAutostart,
-    notice_seen: bool,
-) -> StartupDaemonState {
-    daemon_not_running_state_with_spawn(status, paths, autostart, notice_seen, || {
-        cockpit_core::daemon::spawn_detached(false)
-    })
-}
-
-fn daemon_not_running_state_with_spawn(
-    status: cockpit_core::daemon::DaemonStatus,
-    paths: cockpit_core::daemon::DaemonPaths,
-    autostart: cockpit_config::extended::DaemonAutostart,
-    notice_seen: bool,
-    spawn_shared: impl FnOnce() -> anyhow::Result<u32>,
-) -> StartupDaemonState {
     match autostart {
         cockpit_config::extended::DaemonAutostart::Ask => StartupDaemonState {
-            prompt: Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
-                status, paths,
-            )),
+            prompt: Some(crate::tui::daemon_prompt::DaemonPromptDialog::new()),
             connected: false,
             socket: None,
             daemonless: false,
@@ -616,34 +561,16 @@ fn daemon_not_running_state_with_spawn(
             socket: None,
             daemonless: true,
             notice: daemon_autostart_notice(
-                notice_seen,
+                false,
                 "started a private cockpit daemon for this window only",
             ),
         },
-        cockpit_config::extended::DaemonAutostart::Shared => match spawn_shared() {
-            Ok(pid) => StartupDaemonState {
-                prompt: None,
-                connected: true,
-                socket: Some(paths.socket.clone()),
-                daemonless: false,
-                notice: daemon_autostart_notice(
-                    notice_seen,
-                    &format!(
-                        "started the cockpit daemon (pid {pid}) — persists across windows; `cockpit daemon stop` to stop"
-                    ),
-                ),
-            },
-            Err(error) => {
-                let mut prompt = crate::tui::daemon_prompt::DaemonPromptDialog::new(status, paths);
-                prompt.set_error(format!("failed to spawn daemon: {error}"));
-                StartupDaemonState {
-                    prompt: Some(prompt),
-                    connected: false,
-                    socket: None,
-                    daemonless: false,
-                    notice: None,
-                }
-            }
+        cockpit_config::extended::DaemonAutostart::Shared => StartupDaemonState {
+            prompt: None,
+            connected: true,
+            socket: None,
+            daemonless: false,
+            notice: None,
         },
     }
 }
@@ -1935,6 +1862,8 @@ fn providers_from_view(
 
 #[allow(private_interfaces)]
 pub struct App {
+    /// Typed channel to the CLI-owned lifecycle composition task.
+    pub(super) lifecycle: cockpit_client::LifecycleClient,
     pub(super) monotonic_origin: Instant,
     pub(super) paste_client_instance_id: uuid::Uuid,
     pub(super) launch: LaunchInfo,
@@ -2146,15 +2075,6 @@ pub struct App {
     /// flips the agent-runner lifecycle to `AlwaysEphemeral` so we spawn (and
     /// own) a fresh daemon rather than auto-promoting the canonical one.
     pub(super) daemonless: bool,
-    /// RAII guard that reaps the owned ephemeral daemon on every exit path
-    /// (clean quit, error, panic/unwind, SIGINT/SIGTERM) — the same
-    /// ownership contract `cockpit run` uses. `Some` only in daemonless mode
-    /// once the runner has spawned the owned daemon; `None` when attached to
-    /// a daemon we don't own.
-    pub(super) daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
-    /// Signal task that fires the guard's shutdown on SIGINT/SIGTERM. Held so
-    /// it can be aborted once the happy-path teardown has run.
-    pub(super) daemon_signal_task: Option<tokio::task::JoinHandle<()>>,
     /// Lines emitted by an in-flight `/fetch-models` task. The event
     /// loop drains this each tick and appends to history.
     pub(super) fetch_models_progress: Arc<Mutex<Vec<String>>>,
@@ -3444,7 +3364,13 @@ pub(crate) fn startup_first_paint_log_count() -> usize {
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
-        Self::new_inner(project, no_sandbox, StartupWorkspaceTrust::Decided, None)
+        Self::new_inner(
+            project,
+            no_sandbox,
+            StartupWorkspaceTrust::Decided,
+            None,
+            None,
+        )
     }
 
     pub fn new_with_workspace_trust(
@@ -3461,7 +3387,30 @@ impl App {
         trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
     ) -> Self {
-        Self::new_inner(project, no_sandbox, trust, launch_start)
+        Self::new_inner(project, no_sandbox, trust, launch_start, None)
+    }
+
+    pub fn new_composed(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        trust: StartupWorkspaceTrust,
+        launch_start: Option<Instant>,
+        lifecycle: cockpit_client::LifecycleClient,
+    ) -> Self {
+        Self::new_inner(project, no_sandbox, trust, launch_start, Some(lifecycle))
+    }
+
+    pub fn new_composed_with_session(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        trust: StartupWorkspaceTrust,
+        session_id: uuid::Uuid,
+        launch_start: Option<Instant>,
+        lifecycle: cockpit_client::LifecycleClient,
+    ) -> Self {
+        let mut app = Self::new_inner(project, no_sandbox, trust, launch_start, Some(lifecycle));
+        app.launch.session_id = Some(session_id);
+        app
     }
 
     pub fn new_with_session(
@@ -3483,6 +3432,7 @@ impl App {
             no_sandbox,
             StartupWorkspaceTrust::Decided,
             launch_start,
+            None,
         );
         app.launch.session_id = Some(session_id);
         app
@@ -3499,6 +3449,7 @@ impl App {
         no_sandbox: bool,
         startup_trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
+        lifecycle: Option<cockpit_client::LifecycleClient>,
     ) -> Self {
         let mut timer = cockpit_core::startup::PhaseTimer::start("App::new");
         // Skip the synchronous `git status` here — it can take seconds in a
@@ -3612,6 +3563,7 @@ impl App {
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
+            lifecycle: lifecycle.unwrap_or_else(|| cockpit_client::LifecycleClient::channel(1).0),
             monotonic_origin: Instant::now(),
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,
@@ -3678,8 +3630,6 @@ impl App {
             pending_local_choice: None,
             daemon_connected: daemon_state.connected,
             daemonless: daemon_state.daemonless,
-            daemon_guard: None,
-            daemon_signal_task: None,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
             pending_runner_attach: None,
@@ -4098,12 +4048,6 @@ impl App {
         // for an uncatchable death (SIGKILL). Reaping here is independent of
         // whether a message was sent — a persisted session never keeps an
         // owned ephemeral daemon alive past its owner's exit.
-        if let Some(task) = self.daemon_signal_task.take() {
-            task.abort();
-        }
-        if let Some(guard) = &self.daemon_guard {
-            guard.shutdown();
-        }
 
         // Build the exit-tail text while we still own the alt screen
         // (history is in memory; rendering is irrelevant — we want

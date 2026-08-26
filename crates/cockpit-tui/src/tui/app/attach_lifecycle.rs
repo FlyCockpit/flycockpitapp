@@ -35,9 +35,7 @@ impl App {
             || true,
         );
         if should_probe && self.display_attach_backoff.can_attempt(Instant::now()) {
-            self.start_display_daemon_probe_action(|| {
-                cockpit_core::daemon::discover_blocking().status
-            });
+            self.try_attach_for_display();
         }
     }
 
@@ -85,39 +83,15 @@ impl App {
     /// fresh pid+nonce ephemeral daemon (`AlwaysEphemeral`); otherwise the TUI
     /// attaches to the canonical daemon, auto-promoting a persistent one if
     /// none is running.
-    pub(super) fn lifecycle_mode(&self) -> cockpit_core::daemon::client::LifecycleMode {
+    pub(super) fn lifecycle_intent(&self) -> cockpit_client::LifecycleIntent {
         if self.daemonless {
             // First attach spawns our owned pid+nonce ephemeral daemon; later
             // re-attaches (`/compact`, `/sessions` resume, `/new`) reconnect
             // to that same daemon instead of spawning a second one.
-            cockpit_core::daemon::client::LifecycleMode::AttachOwnEphemeral
+            cockpit_client::LifecycleIntent::AttachOwnEphemeral
         } else {
-            cockpit_core::daemon::client::LifecycleMode::AttachOrAutoPromote
+            cockpit_client::LifecycleIntent::AttachOrAutoPromote
         }
-    }
-
-    /// Build the ephemeral-daemon ownership guard (and arm its signal
-    /// handler) for a runner that just spawned an owned daemon. No-op when
-    /// the runner attached to a daemon we don't own or a guard already
-    /// exists. The signal handler hands control back to the TUI's own
-    /// restore path on SIGINT/SIGTERM rather than `exit`ing outright, so the
-    /// alt-screen teardown still runs.
-    pub(super) fn arm_daemon_guard(&mut self, runner: &mut AgentRunner) {
-        if !runner.owns_daemon {
-            return;
-        }
-        let Some(guard) = runner.take_owned_daemon_guard() else {
-            return;
-        };
-        if self.daemon_guard.is_some() {
-            // A reconnect to the already-owned daemon must not stop it when
-            // this runner is later dropped.
-            guard.disarm();
-            return;
-        }
-        self.daemon_signal_task =
-            cockpit_core::daemon::ephemeral_guard::spawn_signal_shutdown(Some(&guard), false);
-        self.daemon_guard = Some(guard);
     }
 
     /// Spawn (or attach to) the daemon and **latch** the result —
@@ -185,7 +159,8 @@ impl App {
         };
         let cwd = self.launch.cwd.clone();
         let no_sandbox = self.no_sandbox;
-        let mode = self.lifecycle_mode();
+        let intent = self.lifecycle_intent();
+        let lifecycle = self.lifecycle.clone();
         let worker_cwd = cwd.clone();
         let action_id = self
             .async_actions
@@ -200,11 +175,15 @@ impl App {
                                 requested_session_id,
                                 model,
                                 no_sandbox,
-                                mode,
+                                lifecycle,
+                                intent,
                             )
                             .await
                         }
-                        None => agent_runner::try_spawn(&worker_cwd, no_sandbox, mode).await,
+                        None => {
+                            agent_runner::try_spawn(&worker_cwd, no_sandbox, lifecycle, intent)
+                                .await
+                        }
                     }?;
                     Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner)))
                 },
@@ -345,7 +324,6 @@ impl App {
             self.reset_display_attach_backoff();
             // In daemonless mode this runner spawned our own ephemeral
             // daemon; arm the ownership guard so it's reaped on exit.
-            self.arm_daemon_guard(r);
             // Record the daemon-assigned session id so the startup graphic
             // shows it and `/new` re-renders with the fresh one
             // (session-id-display-and-lazy-persist).

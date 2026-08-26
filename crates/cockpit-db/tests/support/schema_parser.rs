@@ -279,6 +279,34 @@ fn normalized_tokens(tokens: &[Token]) -> String {
 }
 
 fn reject_unsupported_schema_forms(tokens: &[Token]) {
+    fn comma_introduces_from_relation(tokens: &[Token], dot: usize) -> bool {
+        if dot < 3 || tokens.get(dot - 2) != Some(&Token::Mark(',')) {
+            return false;
+        }
+        // Walk backward at the schema qualifier's parenthesis depth. Commas
+        // inside SELECT lists, function arguments, subqueries, and VALUES
+        // therefore resolve to their own scope instead of the outer FROM.
+        let mut nested = 0_u32;
+        for token in tokens[..dot - 2].iter().rev() {
+            match token {
+                Token::Mark(')') => nested = nested.checked_add(1).expect("SQL nesting overflow"),
+                Token::Mark('(') if nested > 0 => nested -= 1,
+                Token::Mark('(') => return false,
+                Token::Mark(';') if nested == 0 => return false,
+                Token::Word(keyword) if nested == 0 => match keyword.as_str() {
+                    "from" | "join" => return true,
+                    "select" | "where" | "group" | "having" | "order" | "limit" | "union"
+                    | "intersect" | "except" | "values" | "returning" => {
+                        return false;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        false
+    }
+
     for (index, token) in tokens.iter().enumerate() {
         let statement_start =
             index == 0 || tokens.get(index.wrapping_sub(1)) == Some(&Token::Mark(';'));
@@ -343,7 +371,9 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
                     Some("rollback" | "abort" | "fail" | "ignore" | "replace")
                 );
             assert!(
-                !direct_schema_context && !update_conflict_schema_context,
+                !direct_schema_context
+                    && !update_conflict_schema_context
+                    && !comma_introduces_from_relation(tokens, index),
                 "schema-qualified object names are unsupported"
             );
         }
@@ -1143,12 +1173,35 @@ mod tests {
             "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER INSERT ON child BEGIN INSERT OR UNSUPPORTED INTO child(id) VALUES (1); END;",
             "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT id FROM main.child; END;",
             "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT child.id FROM child JOIN main.other ON other.id=child.id; END;",
+            "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT child.id FROM child, main.other; END;",
+            "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT child.id FROM child, (SELECT other.id FROM other, main.child); END;",
         ] {
             assert!(
                 std::panic::catch_unwind(|| parse(&[sql])).is_err(),
                 "accepted {sql}"
             );
         }
+    }
+
+    #[test]
+    fn trigger_from_commas_are_distinct_from_expression_and_nested_scope_commas() {
+        let schema = parse(&[r#"
+            CREATE TABLE child(id TEXT);
+            CREATE TABLE other(id TEXT);
+            CREATE TRIGGER child_comma_sources AFTER UPDATE ON child BEGIN
+                SELECT child.id, other.id FROM child, other
+                 WHERE coalesce(child.id, other.id) IN (
+                    SELECT coalesce(child.id, other.id) FROM child, other
+                 );
+                INSERT INTO child(id) VALUES (coalesce(NEW.id, OLD.id));
+            END;
+        "#]);
+        assert!(
+            schema
+                .objects
+                .iter()
+                .any(|object| object.name == "child_comma_sources")
+        );
     }
 
     #[test]

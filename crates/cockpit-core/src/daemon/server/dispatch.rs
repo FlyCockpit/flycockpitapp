@@ -20987,7 +20987,7 @@ pub(super) const LOCK_SWEEP_POLL: std::time::Duration = std::time::Duration::fro
 /// §3c read-record, persisting the release, and waking blocked `read`
 /// waiters so they proceed. Modeled on [`spawn_until_idle_watcher`]; runs
 /// for the daemon's lifetime and exits when the daemon drains.
-pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) {
+pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> {
     let locks = ctx.registry.locks();
     tokio::spawn(async move {
         loop {
@@ -21004,7 +21004,7 @@ pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) {
                 Err(e) => tracing::warn!(error = %e, "idle-lock sweep failed"),
             }
         }
-    });
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

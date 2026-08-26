@@ -16,6 +16,16 @@ fn lifecycle_composition() -> (cockpit_client::LifecycleClient, tokio::task::Joi
     (client, task)
 }
 
+async fn finish_lifecycle(mut task: tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(std::time::Duration::from_secs(35), &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 pub async fn run(
     project: Option<&Path>,
     no_sandbox: bool,
@@ -32,8 +42,7 @@ pub async fn run(
     let mut app = App::new_composed(project, no_sandbox, trust, launch_start, lifecycle);
     let result = app.run().await;
     drop(app);
-    lifecycle_task.abort();
-    let _ = lifecycle_task.await;
+    finish_lifecycle(lifecycle_task).await;
     result
 }
 
@@ -67,8 +76,7 @@ pub async fn run_with_session(
     );
     let result = app.run().await;
     drop(app);
-    lifecycle_task.abort();
-    let _ = lifecycle_task.await;
+    finish_lifecycle(lifecycle_task).await;
     result
 }
 

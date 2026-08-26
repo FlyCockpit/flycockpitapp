@@ -83,6 +83,21 @@ pub struct ConnectedDaemon {
     /// when publishing a longer-lived owner; every abandoned/error path drops
     /// it and reaps the child.
     owned_daemon_guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    owned_in_process_guard: Option<crate::daemon::InProcessDaemonGuard>,
+}
+
+pub enum OwnedDaemonGuard {
+    Process(crate::daemon::ephemeral_guard::EphemeralDaemonGuard),
+    InProcess(crate::daemon::InProcessDaemonGuard),
+}
+
+impl OwnedDaemonGuard {
+    async fn shutdown(self) {
+        match self {
+            Self::Process(guard) => drop(guard),
+            Self::InProcess(guard) => guard.shutdown().await,
+        }
+    }
 }
 
 impl ConnectedDaemon {
@@ -90,6 +105,17 @@ impl ConnectedDaemon {
         &mut self,
     ) -> Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard> {
         self.owned_daemon_guard.take()
+    }
+
+    fn take_lifecycle_guard(&mut self) -> Option<OwnedDaemonGuard> {
+        self.owned_daemon_guard
+            .take()
+            .map(OwnedDaemonGuard::Process)
+            .or_else(|| {
+                self.owned_in_process_guard
+                    .take()
+                    .map(OwnedDaemonGuard::InProcess)
+            })
     }
 }
 
@@ -129,7 +155,7 @@ pub async fn serve_lifecycle_requests(
             {
                 anyhow::bail!("persistent lifecycle request resolved to an ephemeral daemon");
             }
-            let guard = connected.take_owned_daemon_guard();
+            let guard = connected.take_lifecycle_guard();
             Ok((
                 cockpit_client::LifecycleResolution {
                     endpoint: connected.endpoint,
@@ -153,6 +179,9 @@ pub async fn serve_lifecycle_requests(
                 let _ = request.reply.send(Err(error.to_string()));
             }
         }
+    }
+    for guard in owned_daemons {
+        guard.shutdown().await;
     }
 }
 
@@ -203,6 +232,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                                         .to_string(),
                                 }),
                                 owned_daemon_guard: None,
+                                owned_in_process_guard: None,
                             });
                         }
                         Ok(crate::daemon::skew_restart::SkewRestartOutcome::Refused {
@@ -227,6 +257,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                                 socket: discovered.paths.socket,
                                 startup_notice,
                                 owned_daemon_guard: None,
+                                owned_in_process_guard: None,
                             });
                         }
                         Ok(crate::daemon::skew_restart::SkewRestartOutcome::NoticeOnly {
@@ -244,6 +275,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                                 startup_notice: reason
                                     .map(|reason| format!("daemon version skew: {reason}")),
                                 owned_daemon_guard: None,
+                                owned_in_process_guard: None,
                             });
                         }
                         Ok(
@@ -263,6 +295,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                     socket: discovered.paths.socket,
                     startup_notice: None,
                     owned_daemon_guard: None,
+                    owned_in_process_guard: None,
                 });
             }
             if matches!(
@@ -290,7 +323,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             // key, but `DaemonClient::connect` resolves it to the registered
             // in-process context instead of opening a Unix socket.
             let own = own_ephemeral_paths()?;
-            let ctx = crate::daemon::boot_in_process(
+            let (ctx, guard) = crate::daemon::boot_in_process(
                 own.clone(),
                 crate::daemon::terminal::default_host_factory(),
             )
@@ -301,10 +334,11 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             return Ok(ConnectedDaemon {
                 client: DaemonClient::connect_endpoint(&endpoint).await?,
                 endpoint,
-                owns_daemon: false,
+                owns_daemon: guard.is_some(),
                 socket: own.socket,
                 startup_notice: None,
                 owned_daemon_guard: None,
+                owned_in_process_guard: guard,
             });
         }
         LifecycleMode::AlwaysEphemeral => {
@@ -371,6 +405,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         socket: paths.socket,
         startup_notice: None,
         owned_daemon_guard,
+        owned_in_process_guard: None,
     })
 }
 
@@ -640,6 +675,10 @@ mod tests {
 
     #[test]
     fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
+        assert_eq!(
+            mode_for_intent(cockpit_client::LifecycleIntent::AttachOrAutoPromote),
+            LifecycleMode::AttachOrAutoPromote
+        );
         assert_eq!(
             mode_for_intent(cockpit_client::LifecycleIntent::EnsurePersistent),
             LifecycleMode::AttachOrAutoPromote

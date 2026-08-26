@@ -6024,6 +6024,6 @@ mod tests;
 
 pub use attachments::validate_png_attachment_blocking;
 pub use dispatch::request_shutdown;
-pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) {
-    dispatch::spawn_lock_sweeper(ctx);
+pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> {
+    dispatch::spawn_lock_sweeper(ctx)
 }

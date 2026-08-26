@@ -1103,29 +1103,88 @@ pub async fn run_foreground_with_resume(
     .await
 }
 
+pub struct InProcessDaemonGuard {
+    ctx: Option<std::sync::Arc<server::DaemonContext>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl InProcessDaemonGuard {
+    pub async fn shutdown(mut self) {
+        let Some(ctx) = self.ctx.take() else {
+            return;
+        };
+        server::request_shutdown(&ctx);
+        let grace = ctx
+            .take_shutdown_grace_override()
+            .unwrap_or(shutdown::SHUTDOWN_DRAIN_GRACE);
+        let _ = ctx.registry.drain_all(grace).await;
+        if let Some(containment) = ctx.process_containment.as_ref() {
+            let _ = containment.begin_shutdown().await;
+        }
+        if let Some(write_scope) = ctx.write_scope.as_ref() {
+            let _ = write_scope.begin_shutdown().await;
+        }
+        if let Some(containment) = ctx.process_containment.as_ref() {
+            let _ = containment.await_all_empty(Some(grace)).await;
+        }
+        if let Some(write_scope) = ctx.write_scope.as_ref() {
+            let _ = write_scope.assert_shutdown_clean().await;
+        }
+        for task in self.tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(ctx);
+    }
+}
+
+impl Drop for InProcessDaemonGuard {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.ctx.take() {
+            server::request_shutdown(&ctx);
+        }
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
 pub(crate) async fn boot_in_process(
     paths: DaemonPaths,
     terminal_factory: terminal::TerminalHostFactory,
-) -> Result<std::sync::Arc<server::DaemonContext>> {
+) -> Result<(
+    std::sync::Arc<server::DaemonContext>,
+    Option<InProcessDaemonGuard>,
+)> {
     if let Some(ctx) = server::in_process_context(&paths.socket) {
-        return Ok(ctx);
+        return Ok((ctx, None));
     }
 
     let ctx = std::sync::Arc::new(server::boot(paths, terminal_factory).await?);
     #[cfg(not(test))]
-    {
-        server::spawn_lock_sweeper(ctx.clone());
+    let tasks = {
+        let mut tasks = Vec::new();
+        tasks.push(server::spawn_lock_sweeper(ctx.clone()));
         #[cfg(feature = "remote")]
-        let _org_sync_task = org_sync::spawn_background(ctx.clone());
+        tasks.push(org_sync::spawn_background(ctx.clone()));
         #[cfg(feature = "remote")]
-        let _remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());
+        tasks.push(remote_audit_upload::spawn_background(ctx.clone()));
         #[cfg(feature = "remote")]
-        let _connector_task = connector::spawn_background(ctx.clone());
+        tasks.push(connector::spawn_background(ctx.clone()));
         #[cfg(feature = "remote")]
-        let _remote_outbox_task = remote_outbox_worker::spawn_background(ctx.clone());
-    }
+        tasks.push(remote_outbox_worker::spawn_background(ctx.clone()));
+        tasks
+    };
+    #[cfg(test)]
+    let tasks = Vec::new();
     server::register_in_process_context(ctx.clone());
-    Ok(ctx)
+    Ok((
+        ctx.clone(),
+        Some(InProcessDaemonGuard {
+            ctx: Some(ctx),
+            tasks,
+        }),
+    ))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1439,7 +1498,7 @@ async fn run_foreground_inner_with_boot_db(
     // daemon-internal periodic task that reclaims locks whose holder has
     // gone idle past the 5-minute threshold, so a hung/abandoned holder
     // can't block a waiting `read` forever.
-    server::spawn_lock_sweeper(ctx.clone());
+    let _lock_sweeper = server::spawn_lock_sweeper(ctx.clone());
     #[cfg(feature = "remote")]
     let org_sync_task = org_sync::spawn_background(ctx.clone());
     #[cfg(feature = "remote")]
@@ -2858,6 +2917,24 @@ mod tests {
             split_proc_cmdline(b"/bin/cockpit\0daemon\0start\0\0"),
             vec!["/bin/cockpit", "daemon", "start"]
         );
+    }
+
+    #[tokio::test]
+    async fn in_process_owner_drop_begins_drain_and_releases_context() {
+        let root = tempfile::tempdir().expect("daemon owner tempdir");
+        let paths = temp_ephemeral_paths(root.path(), "in-process-owner-drop");
+        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
+        let ctx = boot_in_process_with_db(paths.clone(), db)
+            .await
+            .expect("in-process daemon context");
+        let shutdown = ctx.shutdown_signal().clone();
+        let guard = InProcessDaemonGuard {
+            ctx: Some(ctx),
+            tasks: Vec::new(),
+        };
+        drop(guard);
+        assert!(shutdown.is_draining());
+        assert!(server::in_process_context(&paths.socket).is_none());
     }
 
     async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {

@@ -579,15 +579,39 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
         }
     }
 
-    struct AliasCollector(HashMap<String, String>);
+    struct AliasCollector {
+        aliases: HashMap<String, String>,
+        findings: Vec<String>,
+    }
     impl<'ast> Visit<'ast> for AliasCollector {
+        fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+            let local = item
+                .rename
+                .as_ref()
+                .map_or_else(|| item.ident.to_string(), |(_, rename)| rename.to_string());
+            self.aliases.insert(local, item.ident.to_string());
+        }
+
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-            collect_use(&item.tree, &mut Vec::new(), &mut self.0);
+            let paths = flattened_use_paths(&item.tree);
+            for path in paths.iter().filter(|path| path.ends_with("::*")) {
+                if path == "cockpit_client::*"
+                    || path == "cockpit_core::daemon::*"
+                    || path == "std::os::unix::net::*"
+                    || path == "tokio::net::*"
+                {
+                    self.findings.push(format!(
+                        "line {}: forbidden authority glob `{path}`",
+                        item.span().start().line
+                    ));
+                }
+            }
+            collect_use(&item.tree, &mut Vec::new(), &mut self.aliases);
         }
 
         fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
             if let syn::Type::Path(path) = item.ty.as_ref() {
-                self.0.insert(
+                self.aliases.insert(
                     item.ident.to_string(),
                     path.path.to_token_stream().to_string().replace(' ', ""),
                 );
@@ -697,11 +721,14 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
     }
 
     let file = syn::parse_file(source).expect("production lifecycle source remains parseable");
-    let mut aliases = AliasCollector(HashMap::new());
+    let mut aliases = AliasCollector {
+        aliases: HashMap::new(),
+        findings: Vec::new(),
+    };
     aliases.visit_file(&file);
     let mut calls = AuthorityCalls {
-        aliases: &aliases.0,
-        findings: Vec::new(),
+        aliases: &aliases.aliases,
+        findings: aliases.findings,
     };
     calls.visit_file(&file);
     calls.findings
@@ -2047,8 +2074,42 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         constructor: bool,
         channel: bool,
         responder: bool,
+        lifecycle_binding: Option<String>,
+        lifecycle_reassigned: bool,
     }
     impl<'ast> Visit<'ast> for CompositionCalls {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            let initializes_lifecycle = local.init.as_ref().is_some_and(|init| {
+                matches!(init.expr.as_ref(), syn::Expr::Call(call)
+                    if call_name(call).as_deref() == Some("lifecycle_composition"))
+            });
+            if initializes_lifecycle
+                && let syn::Pat::Tuple(tuple) = &local.pat
+                && let Some(syn::Pat::Ident(binding)) = tuple.elems.first()
+            {
+                self.lifecycle_binding = Some(binding.ident.to_string());
+            }
+            if !initializes_lifecycle
+                && let syn::Pat::Ident(binding) = &local.pat
+                && self
+                    .lifecycle_binding
+                    .as_deref()
+                    .is_some_and(|current| current == binding.ident.to_string())
+            {
+                self.lifecycle_reassigned = true;
+            }
+            syn::visit::visit_local(self, local);
+        }
+
+        fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+            if matches!(assignment.left.as_ref(), syn::Expr::Path(path)
+                if self.lifecycle_binding.as_deref().is_some_and(|binding| path.path.is_ident(binding)))
+            {
+                self.lifecycle_reassigned = true;
+            }
+            syn::visit::visit_expr_assign(self, assignment);
+        }
+
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
             let name = call_name(call);
             self.lifecycle |= name.as_deref() == Some("lifecycle_composition");
@@ -2058,9 +2119,11 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
                 name.as_deref(),
                 Some("new_composed" | "new_composed_with_session")
             ) {
-                self.constructor |= call.args.last().is_some_and(
-                    |argument| matches!(argument, syn::Expr::Path(path) if path.path.is_ident("lifecycle")),
-                );
+                self.constructor |= !self.lifecycle_reassigned
+                    && call.args.last().is_some_and(|argument| {
+                        matches!(argument, syn::Expr::Path(path)
+                            if self.lifecycle_binding.as_deref().is_some_and(|binding| path.path.is_ident(binding)))
+                    });
             }
             syn::visit::visit_expr_call(self, call);
         }
@@ -2081,12 +2144,46 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
             constructor: false,
             channel: false,
             responder: false,
+            lifecycle_binding: None,
+            lifecycle_reassigned: false,
         };
         calls.visit_block(&function.block);
         assert!(calls.lifecycle, "{entrypoint} does not compose lifecycle");
         assert!(
             calls.constructor,
             "{entrypoint} does not inject lifecycle into App"
+        );
+        struct StatementCalls {
+            drop_app: bool,
+            finish_lifecycle: bool,
+        }
+        impl<'ast> Visit<'ast> for StatementCalls {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                match call_name(call).as_deref() {
+                    Some("drop")
+                        if call.args.first().is_some_and(
+                            |argument| matches!(argument, syn::Expr::Path(path) if path.path.is_ident("app")),
+                        ) => self.drop_app = true,
+                    Some("finish_lifecycle") => self.finish_lifecycle = true,
+                    _ => {}
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+        }
+        let mut drop_index = None;
+        let mut finish_index = None;
+        for (index, statement) in function.block.stmts.iter().enumerate() {
+            let mut calls = StatementCalls {
+                drop_app: false,
+                finish_lifecycle: false,
+            };
+            calls.visit_stmt(statement);
+            drop_index = drop_index.or(calls.drop_app.then_some(index));
+            finish_index = finish_index.or(calls.finish_lifecycle.then_some(index));
+        }
+        assert!(
+            matches!((drop_index, finish_index), (Some(drop), Some(finish)) if drop < finish),
+            "{entrypoint} must drop every lifecycle client before awaiting actor teardown"
         );
     }
     let composition = app
@@ -2104,9 +2201,39 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         constructor: false,
         channel: false,
         responder: false,
+        lifecycle_binding: None,
+        lifecycle_reassigned: false,
     };
     calls.visit_block(&composition.block);
     assert!(calls.channel && calls.responder);
+    let finish = app
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "finish_lifecycle" => Some(function),
+            _ => None,
+        })
+        .expect("missing bounded CLI lifecycle teardown");
+    struct FinishCalls {
+        timeout: bool,
+        abort: bool,
+    }
+    impl<'ast> Visit<'ast> for FinishCalls {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            self.timeout |= call_name(call).as_deref() == Some("timeout");
+            syn::visit::visit_expr_call(self, call);
+        }
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.abort |= call.method == "abort";
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut finish_calls = FinishCalls {
+        timeout: false,
+        abort: false,
+    };
+    finish_calls.visit_block(&finish.block);
+    assert!(finish_calls.timeout && finish_calls.abort);
     let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
     assert!(!settings.contains("serve_lifecycle_requests"));
     assert!(!settings.contains("LifecycleClient::channel"));
@@ -2150,6 +2277,8 @@ fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
         "use std::os::unix::net::UnixStream as S; fn f() { let _ = S::connect; }",
         "type S = std::os::unix::net::UnixStream; fn f() { let _connect = S::connect; }",
         "type S = std::os::unix::net::UnixStream; type T = S; fn f() { let _ = T::connect; }",
+        "extern crate cockpit_client as cc; fn f() { let _ = cc::DaemonClient::connect; }",
+        "use cockpit_core::daemon::*; fn f() { let _ = discover; }",
     ] {
         assert!(
             !lifecycle_authority_findings(source).is_empty(),

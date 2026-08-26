@@ -288,13 +288,7 @@ fn retire_incumbent_locked(
         anyhow::bail!("daemon lifecycle reservation changed during locked retirement");
     }
     if let (Some(endpoint), DaemonPidRecord::Receipt(receipt)) = (endpoint, incumbent) {
-        if let Ok(bytes) = std::fs::read(endpoint)
-            && let Ok(record) = serde_json::from_slice::<EndpointRecord>(&bytes)
-            && record.receipt == *receipt
-            && record.socket == socket
-        {
-            std::fs::remove_file(endpoint)?;
-        }
+        retire_matching_endpoint(endpoint, socket, receipt)?;
     }
     match std::fs::remove_file(socket) {
         Ok(()) => {}
@@ -447,13 +441,7 @@ pub fn retire_metadata_if_receipt_matches(
             return Ok(false);
         }
         if let Some(endpoint) = endpoint {
-            if let Ok(bytes) = std::fs::read(endpoint)
-                && let Ok(record) = serde_json::from_slice::<EndpointRecord>(&bytes)
-                && record.receipt == *expected
-                && record.socket == socket
-            {
-                std::fs::remove_file(endpoint)?;
-            }
+            retire_matching_endpoint(endpoint, socket, expected)?;
         }
         match std::fs::remove_file(socket) {
             Ok(()) => {}
@@ -463,6 +451,28 @@ pub fn retire_metadata_if_receipt_matches(
         std::fs::remove_file(pid_file)?;
         Ok(true)
     })
+}
+
+fn retire_matching_endpoint(
+    endpoint: &Path,
+    socket: &Path,
+    expected: &DaemonPidReceipt,
+) -> anyhow::Result<()> {
+    let bytes = match std::fs::read(endpoint) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    // A readable malformed or deliberately mismatching record is not ours and
+    // is preserved. An unreadable authoritative path is different: callers
+    // must fail before retiring PID/socket ownership.
+    let Ok(record) = serde_json::from_slice::<EndpointRecord>(&bytes) else {
+        return Ok(());
+    };
+    if record.receipt == *expected && record.socket == socket {
+        std::fs::remove_file(endpoint)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1059,6 +1069,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stale_reclaim_preserves_incumbent_when_endpoint_is_unreadable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("daemon.sock");
+        let endpoint = temp.path().join("daemon-endpoint.json");
+        let executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let stale = DaemonPidReceipt {
+            pid: i32::MAX as u32,
+            executable: executable.clone(),
+            process_start: ProcessStartIdentity {
+                primary: 1,
+                secondary: 0,
+            },
+            publication_nonce: [9; 32],
+        };
+        write_receipt_fixture(&pid_file, &stale);
+        std::fs::write(&socket, b"stale socket").expect("stale socket");
+        std::fs::create_dir(&endpoint).expect("endpoint directory fixture");
+
+        reclaim_stale_and_reserve(
+            &pid_file,
+            &socket,
+            Some(&endpoint),
+            std::process::id(),
+            &executable,
+        )
+        .expect_err("unreadable endpoint must abort stale reclaim");
+
+        assert_eq!(
+            read_daemon_pid_record(&pid_file),
+            Some(DaemonPidRecord::Receipt(stale))
+        );
+        assert!(socket.exists());
+        assert!(endpoint.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn pid_receipt_round_trips_non_utf8_and_newline_path_bytes() {
         use std::os::unix::ffi::OsStringExt as _;
 
@@ -1225,5 +1273,30 @@ mod tests {
         assert!(!pid_file.exists());
         assert!(!socket.exists());
         assert!(!endpoint.exists());
+    }
+
+    #[test]
+    fn unreadable_endpoint_aborts_before_owned_pid_and_socket_retirement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("daemon.sock");
+        let endpoint = temp.path().join("daemon-endpoint.json");
+        let executable = std::env::current_exe().expect("test executable");
+        let receipt = write_pid_file(&pid_file, std::process::id(), &executable).expect("pid file");
+        std::fs::write(&socket, b"owned socket").expect("socket fixture");
+        std::fs::create_dir(&endpoint).expect("endpoint directory fixture");
+
+        let error =
+            retire_metadata_if_receipt_matches(&pid_file, &socket, Some(&endpoint), &receipt)
+                .expect_err("directory endpoint must be an authoritative read error");
+
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+        );
+        assert!(pid_file.exists(), "PID receipt must remain on read error");
+        assert!(socket.exists(), "socket must remain on read error");
+        assert!(endpoint.is_dir(), "unreadable endpoint must remain");
     }
 }

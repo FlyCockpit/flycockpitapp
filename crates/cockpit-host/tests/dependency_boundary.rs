@@ -112,6 +112,8 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
         "with_lifecycle_lock",
         "reclaim_stale_and_reserve",
         "retire_incumbent_locked",
+        "retire_matching_endpoint",
+        "error.kind() == std::io::ErrorKind::NotFound",
         "retire_metadata_if_receipt_matches",
         "SYS_pidfd_open",
         "SYS_pidfd_send_signal",

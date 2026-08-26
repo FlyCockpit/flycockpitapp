@@ -381,10 +381,15 @@ impl App {
                 }
                 return;
             }
-            Overlay::ModelPicker(_)
-            | Overlay::Multireview(_)
-            | Overlay::Usage(_)
-            | Overlay::Quick(_) => return,
+            Overlay::Usage(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
+            }
+            Overlay::ModelPicker(_) | Overlay::Multireview(_) | Overlay::Quick(_) => return,
             Overlay::None => {}
         }
         if self.mouse_capture && self.handle_suggestion_box_mouse(&mouse) {
@@ -2984,6 +2989,118 @@ mod resource_button_dispatch_tests {
             })
             .unwrap();
         assert!(registry.targets().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod usage_completion_and_wheel_tests {
+    use super::{App, Overlay};
+    use crate::tui::async_action::{
+        AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult,
+    };
+    use crate::tui::usage_pane::UsagePane;
+    use cockpit_core::providers::usage::{ProviderUsageSnapshot, UsageAvailability};
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    fn rows(count: usize) -> Vec<ProviderUsageSnapshot> {
+        (0..count)
+            .map(|index| ProviderUsageSnapshot {
+                provider_id: format!("provider-{index}"),
+                display_name: format!("Provider {index}"),
+                fetched_at: chrono::Utc::now(),
+                availability: UsageAvailability::Error {
+                    message: "offline".to_string(),
+                },
+            })
+            .collect()
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn stale_usage_success_and_error_cannot_reopen_or_replace_overlay() {
+        let mut app = App::new(None, false);
+        let old = UsagePane::loading();
+        let old_generation = old.generation();
+        app.overlay = Overlay::Usage(old);
+        app.overlay = Overlay::Usage(UsagePane::loading());
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: AsyncActionId::from_raw_for_test(301),
+            kind: AsyncActionKind::Refresh("provider.usage"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ProviderUsage {
+                pane_generation: old_generation,
+                result: Ok(rows(2)),
+            }),
+        });
+        assert!(
+            matches!(&app.overlay, Overlay::Usage(pane) if pane.status_text() == Some("Fetching provider usage..."))
+        );
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: AsyncActionId::from_raw_for_test(302),
+            kind: AsyncActionKind::Refresh("provider.usage"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ProviderUsage {
+                pane_generation: old_generation,
+                result: Err("old failure".to_string()),
+            }),
+        });
+        assert!(
+            matches!(&app.overlay, Overlay::Usage(pane) if pane.status_text() == Some("Fetching provider usage..."))
+        );
+
+        app.overlay = Overlay::None;
+        app.apply_async_action_result(AsyncActionResult {
+            id: AsyncActionId::from_raw_for_test(303),
+            kind: AsyncActionKind::Refresh("provider.usage"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ProviderUsage {
+                pane_generation: old_generation,
+                result: Ok(rows(1)),
+            }),
+        });
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn usage_mouse_wheel_scrolls_with_bounds_and_survives_rerender() {
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Usage(UsagePane::open(rows(20)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        let Overlay::Usage(pane) = &mut app.overlay else {
+            unreachable!()
+        };
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 80, 8)))
+            .unwrap();
+
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert!(matches!(&app.overlay, Overlay::Usage(pane) if pane.offset() == 1));
+        for _ in 0..100 {
+            app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        }
+        let Overlay::Usage(pane) = &mut app.overlay else {
+            unreachable!()
+        };
+        let bounded = pane.offset();
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 80, 8)))
+            .unwrap();
+        assert_eq!(pane.offset(), bounded);
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert!(
+            matches!(&app.overlay, Overlay::Usage(pane) if pane.offset() == bounded.saturating_sub(1))
+        );
     }
 }
 

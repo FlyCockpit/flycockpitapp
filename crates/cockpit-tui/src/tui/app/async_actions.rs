@@ -1602,19 +1602,19 @@ impl App {
                     );
                 }
             }
-            AsyncActionKind::Refresh("provider.usage") => match result.payload {
-                Ok(AsyncActionPayload::ProviderUsage(rows)) => {
-                    self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::open(rows));
+            AsyncActionKind::Refresh("provider.usage") => {
+                if let Overlay::Usage(pane) = &mut self.overlay {
+                    match result.payload {
+                        Ok(AsyncActionPayload::ProviderUsage {
+                            pane_generation,
+                            result,
+                        }) if pane_generation == pane.generation() => pane.apply_result(result),
+                        Ok(AsyncActionPayload::ProviderUsage { .. }) => {}
+                        Ok(_) => pane.apply_result(Err("unexpected usage response".to_string())),
+                        Err(e) => pane.apply_result(Err(e)),
+                    }
                 }
-                Ok(_) => {
-                    self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::error(
-                        "unexpected usage response".to_string(),
-                    ));
-                }
-                Err(e) => {
-                    self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::error(e));
-                }
-            },
+            }
             AsyncActionKind::Internal("paste.token_count") => match result.payload {
                 Ok(AsyncActionPayload::PasteTokenCount { block_id, tokens }) => {
                     self.apply_paste_token_count(block_id, tokens);
@@ -3064,34 +3064,43 @@ impl App {
         let cwd = self.launch.cwd.clone();
         let lifecycle = self.lifecycle.clone();
         self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::loading());
+        let pane_generation = match &self.overlay {
+            Overlay::Usage(pane) => pane.generation(),
+            _ => unreachable!(),
+        };
         self.async_actions.start(
             AsyncActionKind::Refresh("provider.usage"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("provider.usage")),
             async move {
-                let client = crate::tui::settings::settings_daemon_client(&lifecycle)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                match client
-                    .request(cockpit_proto::Request::GetProviderUsageSnapshot {
-                        project_root: cwd.display().to_string(),
-                        provider_id: filter,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    Ok(cockpit_proto::Response::ProviderUsageSnapshot { snapshots }) => {
-                        Ok(AsyncActionPayload::ProviderUsage(
-                            snapshots
+                let result = async {
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    match client
+                        .request(cockpit_proto::Request::GetProviderUsageSnapshot {
+                            project_root: cwd.display().to_string(),
+                            provider_id: filter,
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        Ok(cockpit_proto::Response::ProviderUsageSnapshot { snapshots }) => {
+                            Ok(snapshots
                                 .into_iter()
                                 .map(provider_usage_from_wire)
-                                .collect(),
-                        ))
+                                .collect())
+                        }
+                        Ok(other) => Err(format!(
+                            "unexpected provider usage daemon response: {other:?}"
+                        )),
+                        Err(error) => Err(error.to_string()),
                     }
-                    Ok(other) => Err(format!(
-                        "unexpected provider usage daemon response: {other:?}"
-                    )),
-                    Err(error) => Err(error.to_string()),
                 }
+                .await;
+                Ok(AsyncActionPayload::ProviderUsage {
+                    pane_generation,
+                    result,
+                })
             },
         );
     }

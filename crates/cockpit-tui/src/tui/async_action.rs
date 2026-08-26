@@ -303,7 +303,10 @@ pub enum AsyncActionPayload {
         label: String,
         message: String,
     },
-    ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),
+    ProviderUsage {
+        pane_generation: u64,
+        result: Result<Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>, String>,
+    },
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
     InventoryBundle(cockpit_proto::Response),
     NotesRpc(crate::tui::notes_pane::NotesRpcResult),

@@ -15,9 +15,93 @@ fn schema_inventory(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
         .unwrap()
     {
         let (kind, name) = row.unwrap();
+        if kind == "table" && is_runtime_managed_table(&name) {
+            continue;
+        }
         inventory.entry(kind).or_default().insert(name);
     }
     inventory
+}
+
+fn is_runtime_managed_table(name: &str) -> bool {
+    name == "schema_version"
+        || name == "session_fts"
+        || (name.starts_with("session_fts_") && name != "session_fts_docs")
+}
+
+fn sql_table_objects(sql: &str) -> Vec<String> {
+    sql.lines()
+        .filter_map(|line| {
+            let tokens = line.split_whitespace().collect::<Vec<_>>();
+            let name = match tokens.as_slice() {
+                [create, table, name, ..]
+                    if create.eq_ignore_ascii_case("CREATE")
+                        && table.eq_ignore_ascii_case("TABLE") =>
+                {
+                    *name
+                }
+                [create, virtual_token, table, name, ..]
+                    if create.eq_ignore_ascii_case("CREATE")
+                        && virtual_token.eq_ignore_ascii_case("VIRTUAL")
+                        && table.eq_ignore_ascii_case("TABLE") =>
+                {
+                    *name
+                }
+                _ => return None,
+            };
+            let name =
+                name.trim_matches(|character| matches!(character, '(' | '`' | '"' | '[' | ']'));
+            (!is_runtime_managed_table(name)).then(|| name.to_owned())
+        })
+        .collect()
+}
+
+fn assert_static_table_ownership(
+    ownership: &BTreeMap<String, Ownership>,
+    local_sql: &str,
+    remote_sql: &str,
+) {
+    let local = sql_table_objects(local_sql);
+    let remote = sql_table_objects(remote_sql);
+    let mut counts = BTreeMap::<String, usize>::new();
+    for table in local.iter().chain(&remote) {
+        *counts.entry(table.clone()).or_default() += 1;
+    }
+    let duplicates = counts
+        .iter()
+        .filter_map(|(name, count)| (*count > 1).then_some(name.clone()))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        duplicates.is_empty(),
+        "SQL profiles declare duplicate table ownership: {duplicates:?}"
+    );
+
+    let declared = counts.into_keys().collect::<BTreeSet<_>>();
+    let classified = ownership.keys().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        classified, declared,
+        "ownership manifest and static SQL table declarations must match exactly"
+    );
+
+    let local = local.into_iter().collect::<BTreeSet<_>>();
+    let remote = remote.into_iter().collect::<BTreeSet<_>>();
+    assert!(
+        local.is_disjoint(&remote),
+        "local and remote SQL profiles must not declare the same table"
+    );
+    let classified_remote = ownership
+        .iter()
+        .filter_map(|(name, owner)| (owner.status == "remove-from-v0.1").then_some(name.clone()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        classified_remote, remote,
+        "remote-profile SQL tables must be exactly the remove-from-v0.1 classifications"
+    );
+    assert!(local.iter().all(|table| {
+        ownership
+            .get(table)
+            .is_some_and(|owner| owner.status != "remove-from-v0.1")
+    }));
 }
 
 #[test]
@@ -249,6 +333,11 @@ fn ownership() -> BTreeMap<String, Ownership> {
 #[test]
 fn local_base_and_remote_extension_have_exact_physical_ownership() {
     let local_sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let remote_sql = include_str!("../src/db/migrations/0001_remote_profile.sql");
+    let ownership = ownership();
+    // Keep this source-level gate before either migration is handed to SQLite:
+    // malformed or unavailable extensions must not hide ownership drift.
+    assert_static_table_ownership(&ownership, local_sql, remote_sql);
     for remote_vocabulary in ["remote_device", "public_remote"] {
         assert!(
             !local_sql.contains(remote_vocabulary),
@@ -264,11 +353,10 @@ fn local_base_and_remote_extension_have_exact_physical_ownership() {
     let full = Connection::open_in_memory().unwrap();
     full.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
         .expect("local base must execute before the remote extension");
-    full.execute_batch(include_str!("../src/db/migrations/0001_remote_profile.sql"))
+    full.execute_batch(remote_sql)
         .expect("remote profile extension must execute after the local base");
     let full_inventory = schema_inventory(&full);
     let full_tables = full_inventory.get("table").cloned().unwrap_or_default();
-    let ownership = ownership();
     assert_eq!(
         ownership.keys().cloned().collect::<BTreeSet<_>>(),
         full_tables,

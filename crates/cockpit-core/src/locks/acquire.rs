@@ -278,10 +278,20 @@ impl LockManager {
 
             // Re-check under the lock: a release may have landed since the
             // last attempt (or since `enable()`). If acquired, we're done.
-            match self
-                .try_acquire(&canon, agent, session, record_read)
-                .await?
-            {
+            let holder = match self.try_acquire(&canon, agent, session, record_read).await {
+                Ok(holder) => holder,
+                Err(e) => {
+                    // A DB failure here must not leak the `waiting` edge this
+                    // task registered on a prior iteration: `end_session` purges
+                    // every lock map except `waiting`, so a stale edge is a
+                    // permanent false "blocked" claim that `wait_cycle` will
+                    // traverse for other waiters and can surface as a spurious
+                    // "lock wait cycle detected" refusal.
+                    self.clear_waiter(&waiter_key);
+                    return Err(e);
+                }
+            };
+            match holder {
                 None => {
                     self.clear_waiter(&waiter_key);
                     return Ok(AcquireWait::Acquired);
@@ -391,16 +401,41 @@ impl LockManager {
 
         hook().await;
 
-        let actually_reclaimed = {
+        // Re-check liveness under the lock. A holder touched or re-acquired
+        // during the persist `.await` above must NOT be reclaimed — but its
+        // `lock_state`/`lock_reads` rows were already deleted by the release, so
+        // keeping it only in memory would diverge from disk (a later
+        // `lock_touch` updates 0 rows; a daemon restart loses the lock and its
+        // read grant). Each such still-held-but-refreshed holder is collected
+        // into `to_restore` so its deleted rows are re-persisted below.
+        let (actually_reclaimed, to_restore) = {
             let mut state = crate::sync::lock_or_recover(&self.inner);
             let mut actually_reclaimed = Vec::new();
+            let mut to_restore: Vec<(PathBuf, Uuid, AgentId, Option<Option<u64>>)> = Vec::new();
             for (p, s, a) in &reclaimed {
                 let still_held_by_snapshot = matches!(
                     state.held.get(p),
                     Some((live_s, live_a)) if live_s == s && live_a == a
                 );
+                if !still_held_by_snapshot {
+                    // Identity changed under us (released + re-acquired by a
+                    // different owner during the await): our
+                    // `(path, session, agent)`-keyed delete only removed the old
+                    // owner's rows, so the new owner's state is intact — nothing
+                    // to reclaim or restore.
+                    continue;
+                }
                 let still_idle = state.touched.get(p).copied().unwrap_or(now) <= cutoff;
-                if !still_held_by_snapshot || !still_idle {
+                if !still_idle {
+                    // Refreshed during the await: keep the lock and restore the
+                    // rows we already deleted for it, carrying the read grant (if
+                    // any) so §3c survives.
+                    let read_grant = state
+                        .read_tracker
+                        .get(&(*s, a.clone()))
+                        .and_then(|reads| reads.get(p))
+                        .copied();
+                    to_restore.push((p.clone(), *s, a.clone(), read_grant));
                     continue;
                 }
 
@@ -414,8 +449,28 @@ impl LockManager {
                 }
                 actually_reclaimed.push(p.clone());
             }
-            actually_reclaimed
+            (actually_reclaimed, to_restore)
         };
+
+        // Re-persist rows for holders we kept but had already released on disk.
+        // `guarded_lock_acquire` upserts for the same owner, so this is
+        // idempotent when the holder re-acquired during the await and repairs
+        // the divergence when it merely `touch`ed. Best-effort: a failure only
+        // leaves the pre-existing divergence (no worse than before), so it is
+        // logged rather than aborting the sweep.
+        for (p, s, a, read_grant) in to_restore {
+            let restored = match read_grant {
+                Some(read_hash) => self.db.lock_acquire_with_read(&p, &a, s, read_hash).await,
+                None => self.db.lock_acquire(&p, &a, s).await,
+            };
+            if let Err(e) = restored {
+                tracing::warn!(
+                    error = %e,
+                    path = %p.display(),
+                    "restoring lock row for a holder refreshed during idle sweep failed",
+                );
+            }
+        }
 
         if !actually_reclaimed.is_empty() {
             // A blocked `read` on a reclaimed path now proceeds.

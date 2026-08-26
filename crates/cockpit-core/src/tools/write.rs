@@ -366,32 +366,35 @@ mod tests {
         .unwrap();
     }
 
-    async fn identity_refusal_ctx(home: &std::path::Path) -> ToolCtx {
-        crate::assistants::identity::seed_identity_files(home).unwrap();
+    async fn identity_refusal_ctx(home: &std::path::Path) -> (ToolCtx, crate::test_env::TestEnvGuard) {
+        let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home).await;
+        let canonical = crate::assistants::default_home_dir("helper").unwrap();
+        std::fs::create_dir_all(&canonical).unwrap();
+        crate::assistants::identity::seed_identity_files(&canonical).unwrap();
         let db = Db::open_in_memory().unwrap();
         let cfg = crate::assistants::AssistantConfig {
-            agent_source: home.join("assistant.md").display().to_string(),
+            agent_source: canonical.join("assistant.md").display().to_string(),
             soul_edit_mode: crate::assistants::identity::SoulEditMode::HumanOnly,
             soul_hash: crate::assistants::identity::hash_optional_file(
-                &crate::assistants::identity::soul_path(home),
+                &crate::assistants::identity::soul_path(&canonical),
             )
             .unwrap(),
             user_hash: crate::assistants::identity::hash_optional_file(
-                &crate::assistants::identity::user_path(home),
+                &crate::assistants::identity::user_path(&canonical),
             )
             .unwrap(),
             ..crate::assistants::AssistantConfig::default()
         };
         db.upsert_assistant(
             "helper",
-            &home.display().to_string(),
+            &canonical.display().to_string(),
             &serde_json::to_string(&cfg).unwrap(),
-            "hash",
+            &"a".repeat(64),
         )
         .await
         .unwrap();
-        let project_id = crate::session::project_id_for(home);
-        let project_root = home.display().to_string();
+        let project_id = crate::session::project_id_for(&canonical);
+        let project_root = canonical.display().to_string();
         let session_row = db
             .write(move |conn| {
                 crate::db::Db::insert_session_row_conn(
@@ -418,43 +421,27 @@ mod tests {
         let redact = Arc::new(
             crate::redact::RedactionTable::build(
                 &crate::config::extended::RedactConfig::default(),
-                home,
+                &canonical,
             )
             .unwrap(),
         );
-        ToolCtx {
+        let ctx = ToolCtx {
             agent_id: "helper".to_string(),
             agent_instance_id: None,
-            lock_identity: "helper".to_string().clone(),
+            lock_identity: "helper".to_string(),
             write_scope: None,
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks,
             session: Arc::new(session),
-            cwd: home.to_path_buf(),
+            cwd: canonical.clone(),
             redact,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             cancel: tokio_util::sync::CancellationToken::new(),
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
-            approver: None,
-            image_generation_dispatch: None,
-            deferred_log: crate::engine::deferred::DeferredLog::new(),
-            root_agent_frame: true,
-            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
-            review_cage: None,
-            context_usage: None,
-            available_tools: Arc::new(std::collections::HashSet::new()),
-            mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
-                Vec::new(),
-            )),
-            has_tree: false,
-            has_bash: false,
-            events: None,
-            lsp: None,
-            resource_scheduler: None,
-            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(home),
-            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-        }
+            ..crate::tools::common::test_ctx(&canonical)
+        };
+        (ctx, env)
     }
 
     fn skill_manifest(name: &str, description: &str, body: &str) -> String {
@@ -1229,8 +1216,8 @@ mod tests {
         assert!(ctx.locks.holder(&outside).is_none());
 
         let identity_home = tempfile::tempdir().unwrap();
-        let identity_ctx = identity_refusal_ctx(identity_home.path()).await;
-        let soul = crate::assistants::identity::soul_path(identity_home.path());
+        let (identity_ctx, _identity_env) = identity_refusal_ctx(identity_home.path()).await;
+        let soul = crate::assistants::identity::soul_path(&identity_ctx.cwd);
         let out = WriteTool
             .call(
                 serde_json::json!({

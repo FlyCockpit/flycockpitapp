@@ -29,6 +29,7 @@ const ALLOWED: &[(&str, &str, usize)] = &[
     ("secure_key/resolve.rs", "vault_for_db", 1),
     ("secure_key/resolve.rs", "open_for_db", 2),
     ("assistants/self_improvement.rs", "open_for_db", 1),
+    ("assistants/mod.rs", "open_for_db", 1),
 ];
 
 fn repo_src() -> PathBuf {

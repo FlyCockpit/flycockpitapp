@@ -346,18 +346,13 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
         "cockpit/history",
         "cockpit/deepthink",
         "cockpit/scout",
-        "authored/explore",
-        "authored/probe",
-        "authored/readonly-probe",
-        "authored/custom-writer",
-        "authored/reviewer",
-        "authored/active-frame-helper",
-        "authored/model-failure-helper",
     ];
     let definition = VnextAgentDef {
         schema_version: crate::agents::SCHEMA_VERSION,
         agent_id: "cockpit/build".to_string(),
-        execution_kind: ExecutionKind::Coding,
+        // Build is a chat-ownable primary → Assistant execution kind (see
+        // `builtin_vnext` for Primary-mode names).
+        execution_kind: ExecutionKind::Assistant,
         model_slots: std::collections::BTreeMap::from([(
             "primary".to_string(),
             ModelSlot {
@@ -1715,7 +1710,7 @@ fn two_model_providers_config() -> crate::config::providers::ProvidersConfig {
 /// the driver rooted on a real `Build` primary built through the same
 /// factory production uses.
 fn model_switch_driver() -> (Driver, tempfile::TempDir) {
-    let (mut driver, tmp) = test_driver(1);
+    let (mut driver, tmp) = test_driver_vnext(1);
     let cfg = two_model_providers_config();
     // Build model A and root a genuine `Build` primary on it.
     let model_a = Arc::new(
@@ -1734,6 +1729,41 @@ fn model_switch_driver() -> (Driver, tempfile::TempDir) {
     driver.test_providers_override = Some((cfg, "provider-a".into(), "model-a".into()));
     let mut args = driver.spawn_args(true);
     args.model = model_a;
-    driver.stack[0].agent = Arc::new(crate::engine::builtin::load("Build", &args).unwrap());
+    // Resolve Build under host policy (embedded children only), then reattach
+    // the test driver's grant snapshot so later refresh can extend it with
+    // workspace-authored portable children after those files exist.
+    let grant = driver.stack[0].agent.vnext_grant.clone();
+    args.vnext_host_policy = grant.as_ref().map(|g| std::sync::Arc::new(g.host_policy.clone()));
+    let mut agent = crate::engine::builtin::load("Build", &args).unwrap();
+    agent.vnext_grant = grant;
+    driver.stack[0].agent = Arc::new(agent);
     (driver, tmp)
+}
+
+/// Admit a workspace-authored portable child into the active frames' vNext
+/// grants after its on-disk definition exists (portable refs fail closed when
+/// unresolved at Build construction).
+fn admit_authored_child_to_test_grants(driver: &mut Driver, portable_agent_ref: &str) {
+    use crate::agents::AllowedChild;
+    for frame in &mut driver.stack {
+        let agent = Arc::make_mut(&mut frame.agent);
+        let Some(grant) = agent.vnext_grant.as_mut() else {
+            continue;
+        };
+        let Some(delegation) = grant.delegation.as_mut() else {
+            continue;
+        };
+        let already = delegation.allowed_children.iter().any(|child| {
+            matches!(
+                child,
+                AllowedChild::PortableRef { portable_agent_ref: existing }
+                    if existing == portable_agent_ref
+            )
+        });
+        if !already {
+            delegation.allowed_children.push(AllowedChild::PortableRef {
+                portable_agent_ref: portable_agent_ref.to_string(),
+            });
+        }
+    }
 }

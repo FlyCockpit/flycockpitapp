@@ -5,8 +5,8 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 ## Machine-checked inventory
 
 <!-- scrub-inventory:start -->
-- Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/mod.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/engine/model_roles.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`, `crates/cockpit-core/src/mcp/builtin.rs`, `crates/cockpit-core/src/skills/auto_select/mod.rs`, `crates/cockpit-core/src/tools/skill.rs`, `crates/cockpit-core/src/tools/read.rs`, `crates/cockpit-core/src/tools/artifact_read.rs`, `crates/cockpit-core/src/tools/artifact_search.rs`
-- Client boundary: `apps/cli/src/commands/debug.rs`, `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`
+- Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/mod.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/engine/model_roles.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`, `crates/cockpit-core/src/mcp/builtin.rs`, `crates/cockpit-core/src/skills/auto_select/mod.rs`, `crates/cockpit-core/src/tools/skill.rs`, `crates/cockpit-core/src/tools/read.rs`, `crates/cockpit-core/src/tools/artifact_read.rs`, `crates/cockpit-core/src/tools/artifact_search.rs`, `crates/cockpit-core/src/engine/agent/tool_dispatch.rs`
+- Client boundary: `apps/cli/src/commands/debug.rs`, `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`, `crates/cockpit-core/src/daemon/fs_api.rs`
 - Off machine: `crates/cockpit-core/src/session/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
 - Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`, `crates/cockpit-core/src/engine/driver/mod.rs`, `crates/cockpit-core/src/engine/rehydrate.rs`, `crates/cockpit-core/src/session/recording.rs`
 - Core scrub entry points: `crates/cockpit-core/src/redact/mod.rs`
@@ -28,12 +28,14 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 - `crates/cockpit-core/src/tools/read.rs`: approved reads that add persisted environment-derived redaction metadata re-scrub the returned tool output with the updated table before it reaches model context.
 - `crates/cockpit-core/src/tools/artifact_read.rs`: archived artifact reads re-scrub content through the session redaction table before returning tool output, because archive imports validate structure, not the importing workspace's current sensitive-literal inventory.
 - `crates/cockpit-core/src/tools/artifact_search.rs`: artifact search scrubs content through the session redaction table so matched lines and literal-existence obey the same local egress policy as ordinary tool output.
+- `crates/cockpit-core/src/engine/agent/tool_dispatch.rs`: durable text-artifact captures scrub through the session redaction table before admission so persisted/retrievable tool bodies never store pre-safety secret bytes.
 
 ## Client Boundary
 
 - `apps/cli/src/commands/debug.rs`: assembled-context diagnostics are scrubbed and bounded before they are printed to the local client.
 - `crates/cockpit-core/src/daemon/server/mod.rs`: recursively scrubs event JSON strings for non-owner principals at socket forwarding and attach-history egress.
 - `crates/cockpit-core/src/daemon/server/dispatch.rs`: applies the server scrub helpers when returning attach/list history to non-owner clients.
+- `crates/cockpit-core/src/daemon/fs_api.rs`: owner settings projections scrub secret literals to opaque per-occurrence placeholders before typed config leaves the daemon.
 
 ## Off Machine
 

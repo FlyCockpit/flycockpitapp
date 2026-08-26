@@ -60,11 +60,21 @@ async fn intermediate_noninteractive_continue_checkpoint_survives_cancel_or_fail
 
 /// Workspace-authored v2 coding definition used by positive on-disk fixtures.
 /// Tool authority deliberately stays out of these documents; tests that need a
-/// constrained host surface build it directly instead of reviving `tools:`.
+/// constrained host surface write a `.tools.json` sidecar (see
+/// [`write_host_tool_surface`]) instead of reviving `tools:`.
 fn vnext_coding_agent_document(agent_id: &str, description: &str, body: &str) -> String {
     format!(
         "---\ndescription: {description}\nschemaVersion: 2\nagentId: authored/{agent_id}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
     )
+}
+
+/// Host-projected tool grant for a workspace agent (test-only sidecar).
+fn write_host_tool_surface(agents_dir: &std::path::Path, name: &str, tools: &[&str]) {
+    std::fs::write(
+        agents_dir.join(format!("{name}.tools.json")),
+        serde_json::to_string(tools).unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -2035,7 +2045,7 @@ fn batch_read_only_child_fails_closed_if_def_gains_write_before_build() {
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let (mut driver, _tmp) = test_driver_with_url_vnext(8, url.clone());
                     let config_dir = driver.cwd.join(".cockpit");
                     let providers_dir = config_dir.join("providers");
                     std::fs::create_dir_all(&providers_dir).unwrap();
@@ -2069,6 +2079,8 @@ fn batch_read_only_child_fails_closed_if_def_gains_write_before_build() {
                         ),
                     )
                     .unwrap();
+                    write_host_tool_surface(&agents_dir, "probe", &["read"]);
+                    admit_authored_child_to_test_grants(&mut driver, "authored/probe");
                     driver.refresh_config_from_disk_for_tests();
                     let trust_cwd = driver.cwd.clone();
                     let _trust = crate::config::trust::enter_workspace_trust_policy(
@@ -2086,17 +2098,13 @@ fn batch_read_only_child_fails_closed_if_def_gains_write_before_build() {
                     seed_task_payload(&driver, "task-def-race", "probe", "probe").await;
                     // Def-mutator: on its first poll — during the batch's first await,
                     // AFTER the synchronous admission loop already read the read-only
-                    // def, BEFORE the child future's dispatch `load` — rewrite the def
-                    // to expose a `write` tool (a concurrent def edit).
-                    let mutate_path = probe_path.clone();
+                    // def, BEFORE the child future's dispatch `load` — rewrite the host
+                    // tool surface to expose a `write` tool (a concurrent def edit).
+                    let mutate_tools = agents_dir.join("probe.tools.json");
                     tokio::spawn(async move {
                         std::fs::write(
-                            &mutate_path,
-                            vnext_coding_agent_document(
-                                "probe",
-                                "now writes",
-                                "Investigate.",
-                            ),
+                            &mutate_tools,
+                            serde_json::to_string(&["read", "write"]).unwrap(),
                         )
                         .unwrap();
                     });
@@ -4059,6 +4067,7 @@ async fn delegated_failover_reposture_fires_on_model_change() {
 #[tokio::test]
 async fn delegated_failover_reposture_resolves_db_backed_agent() {
     use crate::config::extended::LlmMode;
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let (mut driver, _tmp) = test_driver(8);
     dmh_install_config(
         &mut driver,
@@ -4072,14 +4081,14 @@ async fn delegated_failover_reposture_resolves_db_backed_agent() {
     // Seed a DB-only assistant agent whose home is OUTSIDE the workspace agent
     // search path, so it is resolvable ONLY through the assistant DB (never the
     // on-disk/embedded resolver).
-    let home = tempfile::tempdir().unwrap();
+    let home = crate::assistants::default_home_dir("dbonly-helper").unwrap();
     crate::assistants::create_assistant(
         &driver.session.db,
         crate::assistants::CreateAssistantSpec {
             name: "dbonly-helper".to_string(),
             description: "db-backed helper".to_string(),
             prompt: "DB-ONLY-ROLE-MARKER investigate.".to_string(),
-            home_dir: home.path().to_path_buf(),
+            home_dir: home,
         },
     )
     .await
@@ -4254,7 +4263,7 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
                             .turn(cockpit_test_support::provider::Turn::Text("done".into()))
                             .repeat_last()
                             .start_blocking();
-                        let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+                        let (mut driver, _tmp) = test_driver_with_url_vnext(8, provider.base_url());
                         let cwd = driver.cwd.clone();
                         let _trust = crate::config::trust::enter_workspace_trust_policy(
                             crate::config::trust::WorkspaceTrustPolicy {
@@ -4293,11 +4302,7 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
                         std::fs::create_dir_all(&agents_dir).unwrap();
                         std::fs::write(
                             agents_dir.join("explore.md"),
-                            vnext_coding_agent_document(
-                                "explore",
-                                "probe",
-                                "Investigate read-only.",
-                            ),
+                            "---\ndescription: probe\nschemaVersion: 2\nagentId: cockpit/explore\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nInvestigate read-only.\n",
                         )
                         .unwrap();
                         driver.refresh_config_from_disk_for_tests();
@@ -4308,7 +4313,9 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
                         // not put a selector back into v2 markdown: the
                         // driver's model override is propagated into the child
                         // SpawnArgs and preserves the provider's trusted-vs-
-                        // untrusted custody classification.
+                        // untrusted custody classification. Carry the session
+                        // redaction table so an untrusted probe still scrubs.
+                        let session_table = driver.stack[0].agent.model.session_redact_table();
                         let mut host_selected = driver.config.providers();
                         host_selected.active_model = Some(
                             crate::config::providers::ActiveModelRef {
@@ -4322,7 +4329,7 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
                         driver.set_model_override(Some(std::sync::Arc::new(
                             crate::engine::model::Model::from_config(
                                 &host_selected,
-                                std::sync::Arc::new(crate::redact::RedactionTable::empty()),
+                                session_table,
                             )
                             .unwrap(),
                         )));
@@ -4333,7 +4340,7 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
                         let mut task = single_task(&driver, "explore", "task-wire-egress", None, None);
                         // The delegation brief carries the sentinel.
                         task.brief = format!("investigate {DMH_WIRE_SECRET} in the codebase");
-                        let _ = driver
+                        let completion = driver
                             .execute_single_noninteractive_task(
                                 task,
                                 &tx,
@@ -4344,6 +4351,7 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
 
                         let captured = provider.captured();
                         assert!(!captured.is_empty(), "the child dispatched a request");
+                        let _ = completion;
                         captured
                             .iter()
                             .any(|r| r.body.to_string().contains(DMH_WIRE_SECRET))
@@ -4812,6 +4820,7 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
             ),
         )
         .unwrap();
+        write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
         let cwd = driver.cwd.clone();
         let args = driver.spawn_args_delegated_in_cwd(
             &cwd,
@@ -4855,6 +4864,7 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
             ),
         )
         .unwrap();
+        write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
         let cwd = driver.cwd.clone();
         let args = driver.spawn_args_delegated_in_cwd(
             &cwd,
@@ -4934,8 +4944,9 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
         assert!(!surface.parallel_read_only_eligible);
     }
 
-    // False: a child exposing nested task-control / scheduling capability.
-    //     `scout` holds `spawn` (recursive fan-out, Dynamic).
+    // False: a write-capable child (holds lock/write tools) is never a
+    // parallel read-only admission candidate — regardless of nested
+    // delegation. `builder` is the structural writer surface.
     {
         let (mut driver, _tmp) = test_driver(8);
         dmh_install_config(
@@ -4952,17 +4963,17 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
             crate::engine::builtin::DelegationRecursionContext::default(),
         );
         let surface = dmh_trusted(&cwd, || {
-            crate::engine::builtin::resolve_child_execution_surface("scout", &args)
+            crate::engine::builtin::resolve_child_execution_surface("builder", &args)
         })
         .unwrap();
         assert!(
-            surface.tools.contains(&"spawn".to_string()),
-            "scout exposes a nested-delegation capability: {:?}",
+            surface.write_authority,
+            "builder is write-capable: {:?}",
             surface.tools
         );
         assert!(
             !surface.parallel_read_only_eligible,
-            "nested task/scheduling capability forecloses eligibility"
+            "write authority forecloses parallel read-only eligibility"
         );
     }
 
@@ -4990,6 +5001,7 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
             ),
         )
         .unwrap();
+        write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
         let cwd = driver.cwd.clone();
         let args = driver.spawn_args_delegated_in_cwd(
             &cwd,
@@ -5262,7 +5274,7 @@ fn dmh_batch_in_flight_while_first_delayed(child_agent: &str, custom_read_only: 
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let (mut driver, _tmp) = test_driver_with_url_vnext(8, url.clone());
                     let config_dir = driver.cwd.join(".cockpit");
                     let providers_dir = config_dir.join("providers");
                     std::fs::create_dir_all(&providers_dir).unwrap();
@@ -5295,6 +5307,8 @@ fn dmh_batch_in_flight_while_first_delayed(child_agent: &str, custom_read_only: 
                             ),
                         )
                         .unwrap();
+                        write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
+                        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
                     }
                     driver.refresh_config_from_disk_for_tests();
                     let trust_cwd = driver.cwd.clone();

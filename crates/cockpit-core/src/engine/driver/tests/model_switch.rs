@@ -2182,6 +2182,7 @@ async fn active_frame_refresh_picks_up_new_custom_agent_in_subagent_frame() {
         );
 
         write_custom_agent(tmp.path(), custom);
+        admit_authored_child_to_test_grants(&mut driver, &format!("authored/{custom}"));
         driver.refresh_active_frame_for_turn(&tx).await;
 
         assert!(
@@ -2224,6 +2225,7 @@ async fn active_frame_tool_surface_refresh_survives_model_build_failure() {
         push_test_child(&mut driver, Vec::new());
         let custom = "model-failure-helper";
         write_custom_agent(tmp.path(), custom);
+        admit_authored_child_to_test_grants(&mut driver, &format!("authored/{custom}"));
         driver.test_providers_override = Some((
             crate::config::providers::ProvidersConfig::default(),
             "provider-a".into(),

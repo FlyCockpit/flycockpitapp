@@ -13,186 +13,21 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, Notify, watch};
 use uuid::Uuid;
 
 pub use crate::daemon::proto::{QueueItemStatus, QueueTarget};
 pub use cockpit_client::image_upload::SubmissionImage;
+pub use cockpit_client::submission::{
+    ClientSubmissionReceipt, ClientUserSubmission as UserSubmission,
+    PendingSubmissionTerminalDisposition, SubmissionOrigin, UserSubmissionKind,
+};
 
 /// Sentinel emitted in wire text by
 /// the TUI paste registry at each real-image
 /// position. We split on it here to interleave text and image content
 /// parts in order when assembling the outbound user [`Message`].
 pub use crate::daemon::proto::IMAGE_PART_SENTINEL;
-
-/// A user submission destined for the agent: scrubbed wire text plus the
-/// ordered PNG payloads for any pasted images sent as real image parts
-/// (vision models only — non-vision callers fold images into the text and
-/// pass an empty `images`). Travels the daemon→driver path so image bytes
-/// reach the prompt-assembly point without being mangled by the
-/// text-only redaction/queue-folding plumbing.
-///
-/// `text` may contain [`IMAGE_PART_SENTINEL`] markers; there must be
-/// exactly `images.len()` of them, in the same left-to-right order as
-/// `images`. [`build_user_message`] consumes both.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct UserSubmission {
-    #[serde(default)]
-    pub kind: UserSubmissionKind,
-    /// Trustworthy construction-site classification for compaction activity
-    /// gating. Transport retries preserve this value; they never reclassify
-    /// retained work as fresh user activity.
-    #[serde(default)]
-    pub origin: SubmissionOrigin,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_model_state_generation: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
-    pub text: String,
-    /// User-facing transcript form. `None` means the wire text is also the
-    /// display text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_text: Option<String>,
-    /// Structured `@`-tag expansion rows displayed after the user message.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tag_expansions: Vec<crate::daemon::proto::TagExpansionMeta>,
-    /// Typed image sources, one per real image part, in source order. A
-    /// retained reference can never be mistaken for attacker-controlled PNG
-    /// bytes; the daemon dispatcher resolves it before prompt assembly.
-    #[serde(default)]
-    pub images: Vec<SubmissionImage>,
-    /// A user-issued skill slash command (`/<skill-name>` or
-    /// `/skill <name>`): the exact skill name to invoke deterministically
-    /// before this turn's inference (implementation note).
-    /// The driver synthesizes a real `skill` tool call for it — reusing the
-    /// one skill-tool loading path — so the body loads regardless of whether
-    /// the model would have called the tool. `text` carries any trailing
-    /// args as the accompanying task input. `None` for an ordinary message.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forced_skill: Option<String>,
-    /// Principal that originated this submission (`flycockpit:<user_id>` for
-    /// remote sharees). `None` is the local owner / legacy path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_principal: Option<String>,
-    /// Originating async-job id when this submission is a late-arriving
-    /// async-result delivery (`loop`/`timer`/`background`/`swarm` —
-    /// implementation note). Carried so the recorded
-    /// `user_message` event can stamp `data.job_id`, attributing the
-    /// delivery to the job it came from. `None` for ordinary input.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job_id: Option<String>,
-    /// The request-preflight **cleaned** (rewritten) text, when preflight
-    /// rewrote this submission (implementation note). UI/DB-only
-    /// — the cleaned text is already in [`Self::text`] (the model-facing
-    /// body); this copy rides to the TUI via `UserMessageRecorded` so the
-    /// transcript can show the cleaned form + `⚙ preflighted` chip while the
-    /// reveal shows the user's original typed input (the wire-vs-user split,
-    /// GOALS §14). `None` when preflight didn't run / was a no-op / fell back.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preflight_cleaned: Option<String>,
-    /// Queue item ids that were drained to produce this submission. A v6
-    /// `SendUserMessage` seeds this with its required client submission id;
-    /// the queue preserves that UUID as its canonical item/idempotency key.
-    /// Empty for direct, non-queued driver calls. Folded submissions keep every
-    /// id in FIFO order for exact UI/export correlation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queue_item_ids: Vec<Uuid>,
-    /// Client idempotency receipts carried unchanged from daemon acceptance to
-    /// the durable user event. Empty for internal/system submissions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub client_submissions: Vec<ClientSubmissionReceipt>,
-    /// Queue target captured when the daemon accepted the queued message. All
-    /// items in one fold are drained for the same target, so the folded
-    /// submission carries the first target.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queue_target: Option<QueueTarget>,
-    /// Internal retry phase for an accepted submission whose terminal
-    /// preflight disposition could not yet be made durable. This is queue
-    /// state, not wire state: on retry the driver must persist the disposition
-    /// without re-running injection detection or request preflight.
-    #[serde(skip)]
-    pub pending_terminal_disposition: Option<PendingSubmissionTerminalDisposition>,
-    /// When set, this submission is an independently addressable run
-    /// invocation and must never be folded/coalesced with another
-    /// `client_submission_id` or with unbounded interactive work.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_invocation_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingSubmissionTerminalDisposition {
-    PreflightRejected,
-    /// This queued turn owns a phase-one FCM2 text-artifact reservation. It
-    /// is not a terminal disposition; the driver uses the durable flag to
-    /// ensure a lost/expired lease can never silently fall back to the legacy
-    /// inline user-message path after preprocessing.
-    OversizedTextArtifact,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ClientSubmissionReceipt {
-    pub id: Uuid,
-    /// Canonical fingerprint of consumed content, including image bytes.
-    pub fingerprint: String,
-    /// Canonical fingerprint of the original wire request, including ordered
-    /// image-ref ids. This permits an exact retry to be acknowledged after
-    /// attachment bytes expire or the daemon restarts.
-    pub wire_fingerprint: String,
-    /// Stable principal scope for the idempotency key (`None` for owner).
-    pub origin_principal: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UserSubmissionKind {
-    #[default]
-    User,
-    Compact,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubmissionOrigin {
-    ExternalRoot,
-    GoalContinuation,
-    ScheduledJob,
-    AutoContinue,
-    RetryRecovery,
-    ToolResult,
-    CompactNotice,
-    #[default]
-    Internal,
-}
-
-impl SubmissionOrigin {
-    pub fn advances_activity_epoch(self) -> bool {
-        matches!(self, Self::ExternalRoot)
-    }
-
-    /// The `userPromptSubmit` hook `promptSource` for a root turn driven by a
-    /// submission of this origin, or `None` when the origin is a host / goal /
-    /// scheduled / system-driven turn that must NOT fire the "a user submitted a
-    /// prompt" event. Only a genuine external user submission
-    /// ([`Self::ExternalRoot`]) is a real user prompt; every host-driven
-    /// auto-turn (goal supervision, scheduled jobs, auto-continue, retry
-    /// recovery, tool-result / compact continuations, and internal directives)
-    /// reuses the same `run_user_input` entry point but is NOT a user prompt.
-    /// Exhaustive so a new origin variant is a compile error here, forcing an
-    /// explicit fire-or-suppress decision.
-    pub fn user_prompt_submit_source(self) -> Option<&'static str> {
-        match self {
-            Self::ExternalRoot => Some("user"),
-            Self::GoalContinuation
-            | Self::ScheduledJob
-            | Self::AutoContinue
-            | Self::RetryRecovery
-            | Self::ToolResult
-            | Self::CompactNotice
-            | Self::Internal => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct QueuedUserMessage {
@@ -1088,83 +923,6 @@ fn queued_message_from_submission(item: &QueuedSubmission) -> QueuedUserMessage 
         text: item.submission.text.clone(),
         display_text: item.submission.display_text.clone(),
         target: item.target.clone(),
-    }
-}
-
-impl UserSubmission {
-    /// Text-only submission (no images). Used everywhere the legacy
-    /// string path fed a bare message.
-    pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            ..Self::default()
-        }
-    }
-
-    pub fn compact_notice() -> Self {
-        Self {
-            kind: UserSubmissionKind::Compact,
-            origin: SubmissionOrigin::CompactNotice,
-            text: "/compact: assembling handoff (prune-first, model brief, deterministic appendix, context tags)...".to_string(),
-            ..Self::default()
-        }
-    }
-
-    /// Fingerprint the canonical consumed payload, including image bytes, but
-    /// excluding transport/queue metadata. Re-uploaded copies therefore match
-    /// while UUID reuse with changed text/display/tags/images/skill conflicts.
-    pub fn client_fingerprint(&self) -> String {
-        fn part(hasher: &mut Sha256, bytes: &[u8]) {
-            hasher.update((bytes.len() as u64).to_be_bytes());
-            hasher.update(bytes);
-        }
-
-        fn optional_part(hasher: &mut Sha256, value: Option<&str>) {
-            match value {
-                None => part(hasher, b"none"),
-                Some(value) => {
-                    part(hasher, b"some");
-                    part(hasher, value.as_bytes());
-                }
-            }
-        }
-
-        let mut hasher = Sha256::new();
-        part(
-            &mut hasher,
-            match self.kind {
-                UserSubmissionKind::User => b"user",
-                UserSubmissionKind::Compact => b"compact",
-            },
-        );
-        part(
-            &mut hasher,
-            &self.expected_model_state_generation.map_or_else(
-                || b"none".to_vec(),
-                |generation| generation.to_be_bytes().to_vec(),
-            ),
-        );
-        part(
-            &mut hasher,
-            &serde_json::to_vec(&self.expected_model).unwrap_or_default(),
-        );
-        part(&mut hasher, self.text.as_bytes());
-        optional_part(&mut hasher, self.display_text.as_deref());
-        part(
-            &mut hasher,
-            &serde_json::to_vec(&self.tag_expansions).unwrap_or_default(),
-        );
-        for image in &self.images {
-            part(&mut hasher, &serde_json::to_vec(image).unwrap_or_default());
-        }
-        optional_part(&mut hasher, self.forced_skill.as_deref());
-        crate::intel::hex_lower(&hasher.finalize())
-    }
-
-    /// True when there are no image parts — the common case, letting the
-    /// driver keep the cheap `Message::user(text)` path.
-    pub fn is_text_only(&self) -> bool {
-        self.images.is_empty()
     }
 }
 

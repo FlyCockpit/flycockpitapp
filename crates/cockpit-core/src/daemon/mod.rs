@@ -1017,15 +1017,24 @@ impl DetachedEphemeralChild {
 
 pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<DetachedEphemeralChild> {
     ephemeral_guard::initialize_process_reaper()?;
-    let mut child = spawn_detached_child(Some(paths), false, false)?;
-    let process_start = match cockpit_host::daemon_lifecycle::process_start_identity(child.id()) {
+    let provisional = ephemeral_guard::ProvisionalEphemeralChild::new(
+        paths.clone(),
+        spawn_detached_child(Some(paths), false, false)?,
+    );
+    let process_start = match cockpit_host::daemon_lifecycle::process_start_identity(
+        provisional.id()?,
+    ) {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error).context("capturing ephemeral child start identity");
+            return match provisional.shutdown() {
+                Ok(()) => Err(error).context("capturing ephemeral child start identity"),
+                Err(cleanup) => Err(anyhow::anyhow!(
+                    "capturing ephemeral child start identity: {error}; exact child cleanup failed: {cleanup}"
+                )),
+            };
         }
     };
+    let child = provisional.into_child()?;
     Ok(DetachedEphemeralChild {
         child,
         process_start,

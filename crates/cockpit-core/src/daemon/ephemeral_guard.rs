@@ -34,7 +34,7 @@ struct ProcessCleanup {
     paths: crate::daemon::DaemonPaths,
     child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
     receipt: Arc<std::sync::Mutex<Option<DaemonPidReceipt>>>,
-    launch_start: cockpit_host::daemon_lifecycle::ProcessStartIdentity,
+    launch_start: Option<cockpit_host::daemon_lifecycle::ProcessStartIdentity>,
 }
 
 struct ProcessReap {
@@ -348,7 +348,11 @@ fn retire_late_exact_metadata(
         return Ok(());
     };
     let exact = bound_expected.map_or_else(
-        || receipt.pid == expected_pid && receipt.process_start == cleanup.launch_start,
+        || {
+            cleanup.launch_start.as_ref().is_some_and(|launch_start| {
+                receipt.pid == expected_pid && &receipt.process_start == launch_start
+            })
+        },
         |expected| &receipt == expected,
     );
     if !exact {
@@ -394,7 +398,7 @@ impl EphemeralDaemonGuard {
                 paths,
                 child: Arc::new(std::sync::Mutex::new(Some(child.into_child()))),
                 receipt: Arc::new(std::sync::Mutex::new(None)),
-                launch_start,
+                launch_start: Some(launch_start),
             }),
             armed: Arc::new(AtomicBool::new(true)),
         }
@@ -468,6 +472,81 @@ impl EphemeralDaemonGuard {
     /// fail-safe and reaps the daemon it spawned.
     pub fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Owns a newly spawned child before its OS start identity can be captured.
+/// Dropping this value transfers the exact child handle to the process reaper;
+/// consequently no identity-read error can orphan or detach the child.
+pub(crate) struct ProvisionalEphemeralChild {
+    cleanup: ProcessCleanup,
+}
+
+impl ProvisionalEphemeralChild {
+    pub(crate) fn new(paths: crate::daemon::DaemonPaths, child: std::process::Child) -> Self {
+        Self {
+            cleanup: ProcessCleanup {
+                paths,
+                child: Arc::new(std::sync::Mutex::new(Some(child))),
+                receipt: Arc::new(std::sync::Mutex::new(None)),
+                launch_start: None,
+            },
+        }
+    }
+
+    pub(crate) fn id(&self) -> anyhow::Result<u32> {
+        self.cleanup
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ephemeral child handle poisoned"))?
+            .as_ref()
+            .map(std::process::Child::id)
+            .context("ephemeral child already transferred")
+    }
+
+    pub(crate) fn into_child(mut self) -> anyhow::Result<std::process::Child> {
+        let child = self
+            .cleanup
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ephemeral child handle poisoned"))?
+            .take()
+            .context("ephemeral child already transferred")?;
+        Ok(child)
+    }
+
+    pub(crate) fn shutdown(self) -> anyhow::Result<()> {
+        run_cleanup_fallback_until_released(&self.cleanup)
+    }
+}
+
+impl Drop for ProvisionalEphemeralChild {
+    fn drop(&mut self) {
+        if !process_child_retained(&self.cleanup) {
+            return;
+        }
+        let reap = ProcessReap {
+            cleanup: self.cleanup.clone(),
+            completed: None,
+            attempts: 0,
+        };
+        match process_reaper() {
+            Ok(reaper) => {
+                if let Err(error) = reaper.send(reap) {
+                    if let Err(cleanup_error) =
+                        run_cleanup_fallback_until_released(&error.0.cleanup)
+                    {
+                        tracing::error!(%cleanup_error, "provisional child cleanup failed");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "process reaper unavailable for provisional child");
+                if let Err(cleanup_error) = run_cleanup_fallback_until_released(&reap.cleanup) {
+                    tracing::error!(%cleanup_error, "provisional child cleanup failed");
+                }
+            }
+        }
     }
 }
 
@@ -562,19 +641,9 @@ pub fn spawn_signal_shutdown(
     let socket = guard.socket.clone();
     let process = guard.process.clone();
     Some(tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut int = signal(SignalKind::interrupt()).ok();
-            let mut term = signal(SignalKind::terminate()).ok();
-            tokio::select! {
-                _ = async { if let Some(s) = int.as_mut() { s.recv().await; } } => {}
-                _ = async { if let Some(s) = term.as_mut() { s.recv().await; } } => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await.ok();
+        if let Err(error) = wait_for_shutdown_signal().await {
+            tracing::error!(%error, "foreground signal watcher stopped without a signal");
+            return;
         }
         if armed.swap(false, Ordering::SeqCst) {
             if let Some(cleanup) = process {
@@ -645,6 +714,46 @@ pub fn spawn_signal_shutdown(
             std::process::exit(130);
         }
     }))
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let interrupt = signal(SignalKind::interrupt())
+        .ok()
+        .map(|mut signal| Box::pin(async move { signal.recv().await }) as RegisteredSignal);
+    let terminate = signal(SignalKind::terminate())
+        .ok()
+        .map(|mut signal| Box::pin(async move { signal.recv().await }) as RegisteredSignal);
+    wait_for_registered_unix_signal(interrupt, terminate).await
+}
+
+#[cfg(unix)]
+type RegisteredSignal =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<()>> + Send + 'static>>;
+
+#[cfg(unix)]
+async fn wait_for_registered_unix_signal(
+    mut interrupt: Option<RegisteredSignal>,
+    mut terminate: Option<RegisteredSignal>,
+) -> anyhow::Result<()> {
+    match (&mut interrupt, &mut terminate) {
+        (Some(interrupt), Some(terminate)) => tokio::select! {
+            signal = interrupt => signal.context("SIGINT stream ended"),
+            signal = terminate => signal.context("SIGTERM stream ended"),
+        },
+        (Some(interrupt), None) => interrupt.await.context("SIGINT stream ended"),
+        (None, Some(terminate)) => terminate.await.context("SIGTERM stream ended"),
+        (None, None) => anyhow::bail!("neither SIGINT nor SIGTERM handler could be installed"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for console shutdown signal")
 }
 
 #[cfg(test)]

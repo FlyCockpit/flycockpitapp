@@ -5437,7 +5437,7 @@ CREATE TABLE assistant_mutation_journals (
     PRIMARY KEY (owner_digest, client_operation_id),
     FOREIGN KEY (owner_digest, client_operation_id)
         REFERENCES local_operation_receipts(owner_digest, client_operation_id)
-        ON UPDATE RESTRICT ON DELETE CASCADE ON UPDATE RESTRICT,
+        ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK (length(trim(owner_digest)) > 0),
     CHECK (length(trim(client_operation_id)) > 0),
     CHECK (length(trim(requested_project_root)) > 0),

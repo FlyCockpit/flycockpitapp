@@ -18,7 +18,7 @@ pub struct RetentionConfig {
     #[serde(default = "default_terminal_evidence_window_days")]
     pub terminal_evidence_window_days: u32,
     /// Whole-session retention window in days.
-    #[serde(default)]
+    #[serde(default = "default_session_window_days")]
     pub session_window_days: u32,
     /// Periodic retention sweep interval in hours.
     #[serde(default = "default_retention_sweep_interval_hours")]
@@ -37,7 +37,7 @@ impl Default for RetentionConfig {
             transcript_window_days: default_transcript_window_days(),
             raw_wire_window_days: default_raw_wire_window_days(),
             terminal_evidence_window_days: default_terminal_evidence_window_days(),
-            session_window_days: 0,
+            session_window_days: default_session_window_days(),
             sweep_interval_hours: default_retention_sweep_interval_hours(),
             vacuum_min_deletions: default_retention_vacuum_min_deletions(),
             vacuum_interval_days: default_retention_vacuum_interval_days(),
@@ -55,6 +55,10 @@ fn default_raw_wire_window_days() -> u32 {
 
 fn default_terminal_evidence_window_days() -> u32 {
     90
+}
+
+fn default_session_window_days() -> u32 {
+    365
 }
 
 fn default_retention_sweep_interval_hours() -> u32 {
@@ -88,11 +92,6 @@ impl Db {
     /// inspectable until their owning recovery path reaches a terminal state.
     pub async fn prune_local_authority_receipts(&self, cutoff_unix_ms: i64) -> Result<u64> {
         self.transaction(move |conn| {
-            let receipts = conn.execute(
-                "DELETE FROM local_operation_receipts
-                 WHERE state LIKE 'terminal_%' AND updated_at_unix_ms < ?1",
-                params![cutoff_unix_ms],
-            )? as u64;
             let editor = conn.execute(
                 "DELETE FROM agent_editor_leases
                  WHERE state = 'terminal' AND updated_at_unix_ms < ?1",
@@ -144,6 +143,14 @@ impl Db {
                     )",
                 params![cutoff_unix_ms],
             )? as u64;
+            // Delete journal children before terminal receipts so SQLite's
+            // cascade does not hide deleted-row accounting from `changes()`.
+            // Prepared/executing receipts continue to protect every journal.
+            let receipts = conn.execute(
+                "DELETE FROM local_operation_receipts
+                 WHERE state LIKE 'terminal_%' AND updated_at_unix_ms < ?1",
+                params![cutoff_unix_ms],
+            )? as u64;
             Ok(receipts
                 .saturating_add(editor)
                 .saturating_add(patch_journals)
@@ -178,7 +185,8 @@ impl Db {
         .await
     }
 
-    /// Delete old closed, non-ephemeral root sessions whose subtrees are closed.
+    /// Delete old closed, non-ephemeral root sessions whose entire subtrees are
+    /// closed and older than the cutoff.
     pub async fn expire_old_sessions(&self, session_cutoff_secs: i64) -> Result<u64> {
         if session_cutoff_secs <= 0 {
             return Ok(0);
@@ -417,14 +425,16 @@ fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
                 AND root.ephemeral = 0
                 AND root.last_active_at_unix_ms < ?1
                 AND NOT EXISTS (
-                    WITH RECURSIVE subtree(session_id, ended_at_unix_ms) AS (
-                        SELECT session_id, ended_at_unix_ms FROM sessions WHERE session_id = root.session_id
+                    WITH RECURSIVE subtree(session_id, ended_at_unix_ms, last_active_at_unix_ms) AS (
+                        SELECT session_id, ended_at_unix_ms, last_active_at_unix_ms
+                          FROM sessions WHERE session_id = root.session_id
                         UNION ALL
-                        SELECT child.session_id, child.ended_at_unix_ms
+                        SELECT child.session_id, child.ended_at_unix_ms, child.last_active_at_unix_ms
                           FROM sessions child
                           JOIN subtree parent ON child.parent_session_id = parent.session_id
                     )
-                    SELECT 1 FROM subtree WHERE ended_at_unix_ms IS NULL
+                    SELECT 1 FROM subtree
+                     WHERE ended_at_unix_ms IS NULL OR last_active_at_unix_ms >= ?1
                 )
                 AND NOT EXISTS (
                     WITH RECURSIVE subtree(session_id) AS (
@@ -657,6 +667,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_age_out_skips_recently_active_closed_descendant() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let child = db.create_fork(root.session_id, None).await.unwrap();
+        close_session(&db, root.session_id, 10).await;
+        close_session(&db, child.session_id, 20).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
+        assert!(db.get_session(root.session_id).await.unwrap().is_some());
+        assert!(db.get_session(child.session_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn session_age_out_skips_ephemeral() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
@@ -717,12 +740,12 @@ mod tests {
     }
 
     #[test]
-    fn launch_retention_defaults_are_bounded_but_whole_sessions_are_preserved() {
+    fn launch_retention_defaults_bound_payloads_and_whole_sessions() {
         let cfg = RetentionConfig::default();
         assert_eq!(cfg.transcript_window_days, 90);
         assert_eq!(cfg.raw_wire_window_days, 30);
         assert_eq!(cfg.terminal_evidence_window_days, 90);
-        assert_eq!(cfg.session_window_days, 0);
+        assert_eq!(cfg.session_window_days, 365);
     }
 
     #[tokio::test]

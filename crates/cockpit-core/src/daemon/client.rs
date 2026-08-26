@@ -446,11 +446,12 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             LifecycleMode::AttachOwnEphemeral => own_ephemeral_paths()?,
             _ => DaemonPaths::allocate_ephemeral()?,
         };
-        let pid = spawn_detached_ephemeral(&paths)?;
+        let child = spawn_detached_ephemeral(&paths)?;
+        let pid = child.id();
         // Arm ownership before any await or other cancellation point. From
         // here onward every early return owns a guard whose Drop stops exactly
         // this pid+nonce daemon.
-        let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.clone(), pid);
+        let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.clone(), child);
         (paths, pid, Some(guard))
     } else {
         // Auto-promoted persistent daemon: never `--no-sandbox` from a
@@ -472,6 +473,9 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
 
     // Wait for the socket + a successful handshake.
     let client = wait_for_daemon(&paths.socket).await?;
+    if let Some(guard) = owned_daemon_guard.as_ref() {
+        guard.bind_published_receipt()?;
+    }
 
     Ok(ConnectedDaemon {
         endpoint: cockpit_client::ClientEndpoint::Wire(paths.socket.clone()),
@@ -566,7 +570,7 @@ mod tests {
     fn ephemeral_spawn_arms_raii_before_the_first_wait() {
         let source = include_str!("client.rs");
         let spawn = source
-            .find("let pid = spawn_detached_ephemeral(&paths)?;")
+            .find("let child = spawn_detached_ephemeral(&paths)?;")
             .expect("ephemeral spawn funnel");
         let arm = source[spawn..]
             .find("EphemeralDaemonGuard::new")

@@ -21,7 +21,152 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Context as _;
+use cockpit_host::daemon_lifecycle::{
+    DaemonPidReceipt, DaemonPidRecord, PidIdentity, read_daemon_pid_record,
+    verify_cockpit_daemon_receipt_identity,
+};
+
 use crate::daemon::proto::{Envelope, Request};
+
+#[derive(Clone)]
+struct ProcessCleanup {
+    paths: crate::daemon::DaemonPaths,
+    child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    receipt: Arc<std::sync::Mutex<Option<DaemonPidReceipt>>>,
+}
+
+struct ProcessReap {
+    cleanup: ProcessCleanup,
+    completed: Option<std::sync::mpsc::Sender<anyhow::Result<()>>>,
+}
+
+static PROCESS_REAPER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<ProcessReap>>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn initialize_process_reaper() -> anyhow::Result<()> {
+    PROCESS_REAPER
+        .get_or_init(|| {
+            let (send, receive) = std::sync::mpsc::channel::<ProcessReap>();
+            std::thread::Builder::new()
+                .name("cockpit-ephemeral-process-reaper".to_string())
+                .spawn(move || {
+                    while let Ok(reap) = receive.recv() {
+                        let result = cleanup_exact_process(&reap.cleanup);
+                        if let Some(completed) = reap.completed {
+                            let _ = completed.send(result);
+                        } else if let Err(error) = result {
+                            tracing::error!(%error, "ephemeral process reaper failed");
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| send)
+        })
+        .as_ref()
+        .map(|_| ())
+        .ok_or_else(|| anyhow::anyhow!("starting ephemeral process reaper"))
+}
+
+fn process_reaper() -> anyhow::Result<&'static std::sync::mpsc::Sender<ProcessReap>> {
+    initialize_process_reaper()?;
+    PROCESS_REAPER
+        .get()
+        .and_then(Option::as_ref)
+        .context("ephemeral process reaper unavailable")
+}
+
+fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut child_slot = cleanup
+        .child
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ephemeral child handle poisoned"))?;
+    let Some(child) = child_slot.as_mut() else {
+        return Ok(());
+    };
+    let expected_pid = child.id();
+    let mut expected = cleanup
+        .receipt
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ephemeral receipt lock poisoned"))?
+        .clone();
+    while expected.is_none() && std::time::Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if let Some(DaemonPidRecord::Receipt(receipt)) =
+            read_daemon_pid_record(&cleanup.paths.pid_file)
+            && receipt.pid == expected_pid
+        {
+            *cleanup
+                .receipt
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ephemeral receipt lock poisoned"))? =
+                Some(receipt.clone());
+            expected = Some(receipt);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let result = if let Some(expected) = expected {
+        if read_daemon_pid_record(&cleanup.paths.pid_file)
+            != Some(DaemonPidRecord::Receipt(expected.clone()))
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "ephemeral daemon receipt changed before teardown; exact child was terminated without touching replacement metadata"
+            );
+        }
+        match crate::daemon::stop_exact(&cleanup.paths, &expected) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "exact receipt no longer named a verified live daemon; exact child was reaped"
+                )
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        child
+            .kill()
+            .context("terminating unpublished ephemeral child")?;
+        child
+            .wait()
+            .context("reaping unpublished ephemeral child")?;
+        anyhow::bail!(
+            "ephemeral child never published an exact v2 PID receipt; terminated exact child"
+        )
+    };
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        *child_slot = None;
+        return result;
+    }
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut forced_exit = false;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= exit_deadline {
+            child.kill().context("forcing exact ephemeral child exit")?;
+            child.wait().context("reaping forced ephemeral child")?;
+            forced_exit = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    *child_slot = None;
+    if forced_exit && result.is_ok() {
+        anyhow::bail!("ephemeral daemon did not exit after verified stop; exact child was forced")
+    }
+    result
+}
 
 /// RAII backstop that shuts down an ephemeral daemon the current process
 /// owns, on **every** exit path — early `?` returns, panics/unwinds, and
@@ -36,19 +181,24 @@ use crate::daemon::proto::{Envelope, Request};
 /// graceful drain (see `server::handle_request` / `server::request_shutdown`).
 pub struct EphemeralDaemonGuard {
     socket: PathBuf,
-    paths: Option<crate::daemon::DaemonPaths>,
-    expected_pid: Option<u32>,
+    process: Option<ProcessCleanup>,
     /// Cleared once shutdown has been requested (happy path) so the drop
     /// doesn't fire a redundant second request.
     armed: Arc<AtomicBool>,
 }
 
 impl EphemeralDaemonGuard {
-    pub fn new(paths: crate::daemon::DaemonPaths, expected_pid: u32) -> Self {
+    pub fn new(
+        paths: crate::daemon::DaemonPaths,
+        child: crate::daemon::DetachedEphemeralChild,
+    ) -> Self {
         Self {
             socket: paths.socket.clone(),
-            paths: Some(paths),
-            expected_pid: Some(expected_pid),
+            process: Some(ProcessCleanup {
+                paths,
+                child: Arc::new(std::sync::Mutex::new(Some(child.into_child()))),
+                receipt: Arc::new(std::sync::Mutex::new(None)),
+            }),
             armed: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -57,8 +207,7 @@ impl EphemeralDaemonGuard {
     fn new_for_socket(socket: PathBuf) -> Self {
         Self {
             socket,
-            paths: None,
-            expected_pid: None,
+            process: None,
             armed: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -67,24 +216,52 @@ impl EphemeralDaemonGuard {
     /// caller wins, later calls (including the drop) are no-ops.
     pub fn shutdown(&self) -> anyhow::Result<()> {
         if self.armed.swap(false, Ordering::SeqCst) {
-            if let (Some(paths), Some(expected_pid)) = (&self.paths, self.expected_pid) {
-                if let Some(recorded_pid) = crate::daemon::daemon_pid(paths)
-                    && recorded_pid != expected_pid
-                {
-                    anyhow::bail!(
-                        "owned daemon incarnation changed from PID {expected_pid} to {recorded_pid}; refusing teardown"
-                    );
+            if let Some(cleanup) = self.process.clone() {
+                let (completed, completion) = std::sync::mpsc::channel();
+                let reap = ProcessReap {
+                    cleanup,
+                    completed: Some(completed),
+                };
+                if let Err(error) = process_reaper()?.send(reap) {
+                    // Explicit shutdown runs on the lifecycle-owned OS thread.
+                    // If the process-lifetime reaper unexpectedly retired,
+                    // retain exact ownership and perform the same bounded
+                    // cleanup synchronously while surfacing its result.
+                    return cleanup_exact_process(&error.0.cleanup);
                 }
-                let stopped = crate::daemon::stop(paths)?;
-                if !stopped && (paths.pid_file.exists() || paths.socket.exists()) {
-                    anyhow::bail!(
-                        "owned daemon PID {expected_pid} did not publish verifiable exit evidence"
-                    );
-                }
+                completion
+                    .recv()
+                    .context("ephemeral process reaper dropped completion")??;
             } else {
                 stop_daemon_blocking(&self.socket);
             }
         }
+        Ok(())
+    }
+
+    pub fn bind_published_receipt(&self) -> anyhow::Result<()> {
+        let Some(process) = &self.process else {
+            return Ok(());
+        };
+        let pid = process
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ephemeral child handle poisoned"))?
+            .as_ref()
+            .context("ephemeral child already reaped")?
+            .id();
+        let receipt = match read_daemon_pid_record(&process.paths.pid_file) {
+            Some(DaemonPidRecord::Receipt(receipt)) if receipt.pid == pid => receipt,
+            Some(_) => anyhow::bail!("ephemeral daemon published a mismatching PID receipt"),
+            None => anyhow::bail!("ephemeral daemon did not publish its v2 PID receipt"),
+        };
+        if verify_cockpit_daemon_receipt_identity(&receipt) != PidIdentity::VerifiedDaemon {
+            anyhow::bail!("ephemeral daemon v2 receipt did not verify its exact process identity");
+        }
+        *process
+            .receipt
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ephemeral receipt lock poisoned"))? = Some(receipt);
         Ok(())
     }
 
@@ -101,21 +278,18 @@ impl Drop for EphemeralDaemonGuard {
         if !self.armed.swap(false, Ordering::SeqCst) {
             return;
         }
-        if let (Some(paths), Some(expected_pid)) = (self.paths.clone(), self.expected_pid) {
-            let _ = std::thread::Builder::new()
-                .name("cockpit-ephemeral-daemon-reaper".to_string())
-                .spawn(move || {
-                    if crate::daemon::daemon_pid(&paths).is_some_and(|pid| pid != expected_pid) {
-                        tracing::error!(
-                            expected_pid,
-                            "refusing to reap changed daemon incarnation"
-                        );
-                        return;
-                    }
-                    if let Err(error) = crate::daemon::stop(&paths) {
-                        tracing::error!(%error, expected_pid, "ephemeral daemon reaper failed");
-                    }
-                });
+        if let Some(cleanup) = self.process.clone() {
+            match process_reaper().and_then(|reaper| {
+                reaper
+                    .send(ProcessReap {
+                        cleanup,
+                        completed: None,
+                    })
+                    .map_err(|_| anyhow::anyhow!("ephemeral process reaper stopped"))
+            }) {
+                Ok(()) => {}
+                Err(error) => tracing::error!(%error, "failed to enqueue ephemeral process reap"),
+            }
         } else {
             stop_daemon_blocking(&self.socket);
         }
@@ -177,8 +351,7 @@ pub fn spawn_signal_shutdown(
     let guard = guard?;
     let armed = guard.armed.clone();
     let socket = guard.socket.clone();
-    let paths = guard.paths.clone();
-    let expected_pid = guard.expected_pid;
+    let process = guard.process.clone();
     Some(tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -195,17 +368,29 @@ pub fn spawn_signal_shutdown(
             tokio::signal::ctrl_c().await.ok();
         }
         if armed.swap(false, Ordering::SeqCst) {
-            if let (Some(paths), Some(expected_pid)) = (paths, expected_pid) {
-                let _ = tokio::task::spawn_blocking(move || {
-                    if crate::daemon::daemon_pid(&paths).is_some_and(|pid| pid != expected_pid) {
-                        tracing::error!(expected_pid, "refusing to stop changed daemon incarnation");
-                        return;
+            if let Some(cleanup) = process {
+                let (completed, completion) = std::sync::mpsc::channel();
+                let reap = ProcessReap {
+                    cleanup,
+                    completed: Some(completed),
+                };
+                match process_reaper() {
+                    Ok(reaper) => match reaper.send(reap) {
+                        Ok(()) => {
+                            let _ = tokio::task::spawn_blocking(move || completion.recv()).await;
+                        }
+                        Err(error) => {
+                            let cleanup = error.0.cleanup;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                cleanup_exact_process(&cleanup)
+                            })
+                            .await;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::error!(%error, "signal-triggered daemon reaper unavailable");
                     }
-                    if let Err(error) = crate::daemon::stop(&paths) {
-                        tracing::error!(%error, expected_pid, "signal-triggered daemon stop failed");
-                    }
-                })
-                .await;
+                }
             } else {
                 stop_daemon_blocking(&socket);
             }
@@ -225,6 +410,27 @@ mod tests {
     use crate::daemon::proto::Body;
     use tokio::io::AsyncBufReadExt;
     use tokio::net::UnixListener;
+
+    fn child_guard(
+        root: &Path,
+        name: &str,
+    ) -> (EphemeralDaemonGuard, crate::daemon::DaemonPaths, u32) {
+        let paths = crate::daemon::DaemonPaths {
+            socket: root.join(format!("{name}.sock")),
+            pid_file: root.join(format!("{name}.pid")),
+            ephemeral: true,
+        };
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn fixture child");
+        let pid = child.id();
+        let guard = EphemeralDaemonGuard::new(
+            paths.clone(),
+            crate::daemon::DetachedEphemeralChild { child },
+        );
+        (guard, paths, pid)
+    }
 
     /// Accept one connection on `socket`, read the first NDJSON line, and
     /// return it. Models the daemon's read side closely enough to assert
@@ -310,5 +516,73 @@ mod tests {
             parse_request(&line),
             Request::StopDaemon { grace_secs: None }
         ));
+    }
+
+    #[test]
+    fn replacement_receipt_with_same_pid_is_preserved() {
+        initialize_process_reaper().expect("process reaper");
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "replacement");
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let expected =
+            cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
+                .unwrap();
+        *guard.process.as_ref().unwrap().receipt.lock().unwrap() = Some(expected);
+        std::fs::remove_file(&paths.pid_file).unwrap();
+        let replacement =
+            cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
+                .unwrap();
+
+        assert!(guard.shutdown().is_err());
+        assert_eq!(
+            read_daemon_pid_record(&paths.pid_file),
+            Some(DaemonPidRecord::Receipt(replacement))
+        );
+    }
+
+    #[test]
+    fn provisional_drop_reaps_child_without_publication() {
+        initialize_process_reaper().expect("process reaper");
+        let root = tempfile::tempdir().unwrap();
+        let (guard, _paths, _pid) = child_guard(root.path(), "unpublished");
+        let child = guard.process.as_ref().unwrap().child.clone();
+        drop(guard);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            let reaped = child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .is_none_or(|child| child.try_wait().unwrap().is_some());
+            if reaped {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "child was orphaned");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn late_receipt_is_captured_before_exact_teardown() {
+        initialize_process_reaper().expect("process reaper");
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "late-publication");
+        let receipt = guard.process.as_ref().unwrap().receipt.clone();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+            cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
+                .unwrap()
+        });
+        drop(guard);
+        let published = publisher.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while receipt.lock().unwrap().as_ref() != Some(&published) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reaper missed late receipt"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 }

@@ -990,13 +990,29 @@ fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> 
 /// `cockpit-eph-<pid>-<nonce>` path set).
 /// The child binds the exact path the parent chose by reading the
 /// internal env vars (Layer B); never via the user-facing CLI surface.
-/// Returns the child PID.
+/// Returns the live child handle. The owning guard retains it until verified
+/// shutdown, so PID reuse is impossible even before the v2 receipt publishes.
 ///
 /// An auto-promoted ephemeral daemon is never launched `--no-sandbox`:
 /// the client's `--no-sandbox` is a *per-session* default passed at
 /// attach time, not a daemon-level one (sandboxing part 2 precedence).
-pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<u32> {
-    spawn_detached_inner(Some(paths), false, false)
+pub struct DetachedEphemeralChild {
+    child: std::process::Child,
+}
+
+impl DetachedEphemeralChild {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn into_child(self) -> std::process::Child {
+        self.child
+    }
+}
+
+pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<DetachedEphemeralChild> {
+    ephemeral_guard::initialize_process_reaper()?;
+    spawn_detached_child(Some(paths), false, false).map(|child| DetachedEphemeralChild { child })
 }
 
 #[cfg(unix)]
@@ -1005,6 +1021,15 @@ fn spawn_detached_inner(
     no_sandbox: bool,
     resume_all_sessions: bool,
 ) -> Result<u32> {
+    Ok(spawn_detached_child(ephemeral, no_sandbox, resume_all_sessions)?.id())
+}
+
+#[cfg(unix)]
+fn spawn_detached_child(
+    ephemeral: Option<&DaemonPaths>,
+    no_sandbox: bool,
+    resume_all_sessions: bool,
+) -> Result<std::process::Child> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1037,8 +1062,7 @@ fn spawn_detached_inner(
     }
     #[cfg(unix)]
     command.process_group(0);
-    let child = command.spawn().context("spawning daemon child")?;
-    Ok(child.id())
+    command.spawn().context("spawning daemon child")
 }
 
 #[cfg(unix)]
@@ -1058,6 +1082,15 @@ fn spawn_detached_inner(
     _no_sandbox: bool,
     _resume_all_sessions: bool,
 ) -> Result<u32> {
+    anyhow::bail!("daemon socket transport is not supported on this platform")
+}
+
+#[cfg(not(unix))]
+fn spawn_detached_child(
+    _ephemeral: Option<&DaemonPaths>,
+    _no_sandbox: bool,
+    _resume_all_sessions: bool,
+) -> Result<std::process::Child> {
     anyhow::bail!("daemon socket transport is not supported on this platform")
 }
 
@@ -1988,6 +2021,24 @@ pub fn stop(paths: &DaemonPaths) -> Result<bool> {
     }
 }
 
+pub(crate) fn stop_exact(paths: &DaemonPaths, expected: &DaemonPidReceipt) -> Result<bool> {
+    let current = read_daemon_pid_record(&paths.pid_file);
+    if current != Some(DaemonPidRecord::Receipt(expected.clone())) {
+        anyhow::bail!(
+            "daemon PID receipt changed; refusing to signal or clean a replacement incarnation"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    return stop_linux(paths, DaemonPidRecord::Receipt(expected.clone()));
+    #[cfg(all(unix, not(target_os = "linux")))]
+    return stop_unix_without_stable_handle(paths, DaemonPidRecord::Receipt(expected.clone()));
+    #[cfg(not(unix))]
+    {
+        let _ = (paths, expected);
+        anyhow::bail!("exact daemon process teardown is unsupported on this platform")
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
     let receipt = match record {
@@ -2005,6 +2056,11 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
         }
         VerifiedProcessOutcome::Identity(PidIdentity::VerifiedDaemon) => unreachable!(),
     };
+    if read_daemon_pid_record(&paths.pid_file) != Some(DaemonPidRecord::Receipt(receipt.clone())) {
+        anyhow::bail!(
+            "daemon PID receipt changed after stable process acquisition; refusing signal"
+        );
+    }
     if let Err(error) = process.send_sigterm() {
         if error.raw_os_error() == Some(libc::ESRCH) {
             cleanup_receipt_metadata(paths, &receipt)?;

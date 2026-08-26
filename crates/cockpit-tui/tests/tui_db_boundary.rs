@@ -616,6 +616,25 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
 
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
             let paths = flattened_use_paths(&item.tree);
+            if !matches!(item.vis, syn::Visibility::Inherited) {
+                for path in &paths {
+                    let parts = path
+                        .trim_end_matches("::*")
+                        .split("::")
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    let resolved = resolve(&parts, &self.aliases);
+                    if FORBIDDEN_AUTHORITY_NAMES
+                        .iter()
+                        .any(|name| resolved.ends_with(name))
+                    {
+                        self.findings.push(format!(
+                            "line {}: public re-export retains lifecycle authority `{resolved}`",
+                            item.span().start().line
+                        ));
+                    }
+                }
+            }
             for path in paths.iter().filter(|path| path.ends_with("::*")) {
                 let raw_prefix = path.trim_end_matches("::*");
                 let resolved_prefix = resolve(
@@ -641,10 +660,25 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
 
         fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
             if let syn::Type::Path(path) = item.ty.as_ref() {
-                self.aliases.insert(
-                    item.ident.to_string(),
-                    path.path.to_token_stream().to_string().replace(' ', ""),
+                let target = resolve(
+                    &path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>(),
+                    &self.aliases,
                 );
+                if FORBIDDEN_AUTHORITY_NAMES
+                    .iter()
+                    .any(|name| target.ends_with(name))
+                {
+                    self.findings.push(format!(
+                        "line {}: type alias retains lifecycle authority `{target}`",
+                        item.span().start().line
+                    ));
+                }
+                self.aliases.insert(item.ident.to_string(), target);
             }
         }
     }
@@ -2374,6 +2408,8 @@ fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
         "extern crate cockpit_client as cc; fn f() { let _ = cc::DaemonClient::connect; }",
         "use cockpit_core::daemon::*; fn f() { let _ = discover; }",
         "use cockpit_core as cc; use cc::daemon::*; fn f() { let _ = discover; }",
+        "pub type Hidden = cockpit_client::DaemonClient;",
+        "pub use cockpit_core::daemon::OwnedDaemonGuard as Hidden;",
         "use cockpit_core::daemon::probe_or_spawn as p; fn f() { p(); }",
         "use cockpit_core::daemon::client::serve_lifecycle_requests as serve; fn f() { serve(rx); }",
         "macro_rules! hidden { () => { cockpit_client::DaemonClient::connect(path) } }",
@@ -2408,4 +2444,12 @@ fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
             "macro inventory missed {name}"
         );
     }
+    let cross_file_alias =
+        lifecycle_authority_findings("pub type Hidden = cockpit_client::DaemonClient;");
+    let cross_file_use =
+        lifecycle_authority_findings("fn reconnect() { let _ = crate::Hidden::connect; }");
+    assert!(
+        !cross_file_alias.is_empty() && cross_file_use.is_empty(),
+        "authority alias declarations must be rejected at their defining file so cross-file use cannot hide provenance"
+    );
 }

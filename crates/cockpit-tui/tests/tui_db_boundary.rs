@@ -491,6 +491,7 @@ fn production_uses_cockpit_proto_directly() {
                 "cockpit_core::engine::DisplayErrorKind",
                 "cockpit_core::engine::response_performance::ResponsePerformance",
                 "cockpit_core::engine::ToolProgress",
+                "cockpit_core::engine::TurnEvent",
                 "cockpit_core::tokens::TokenUsage",
                 "cockpit_core::engine::model::InferenceErrorClass",
                 "cockpit_core::engine::message::QueueItemStatus",
@@ -585,6 +586,7 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::engine::DisplayErrorKind"
                     || imported == "cockpit_core::engine::response_performance::ResponsePerformance"
                     || imported == "cockpit_core::engine::ToolProgress"
+                    || imported == "cockpit_core::engine::TurnEvent"
                     || imported == "cockpit_core::tokens::TokenUsage"
                     || imported == "cockpit_core::engine::model::InferenceErrorClass"
                     || imported == "cockpit_core::engine::message::QueueItemStatus"

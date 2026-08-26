@@ -25,11 +25,11 @@ use cockpit_client::bulk_upload::{
     user_message_needs_bulk,
 };
 use cockpit_client::image_upload::{ImageUploadError, upload_submission_images};
-use cockpit_client::submission::ClientUserSubmission;
-use cockpit_client::{ClientEndpoint, DaemonClient, LifecycleClient, LifecycleIntent};
-use cockpit_core::engine::{
+use cockpit_client::presentation::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
+use cockpit_client::submission::ClientUserSubmission;
+use cockpit_client::{ClientEndpoint, DaemonClient, LifecycleClient, LifecycleIntent};
 use cockpit_core::jitter::{JitterSource, SystemJitter};
 use cockpit_proto::{self, ErrorCode, ErrorPayload, Request, Response};
 

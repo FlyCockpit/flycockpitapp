@@ -847,7 +847,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
         })
         .expect("reconciliation reducer source is present");
     for evidence in [
-        "SELECT a.state,s.state,j.state,a.applied_cancellation_version",
+        "SELECT a.state,s.state,s.version,j.state,j.version,a.applied_cancellation_version",
         "attempt_transition_allowed(attempt_state, attempt_next)",
         "slot_transition_allowed(slot_state, slot_next)",
         "job_transition_allowed(job_state, ImageGenerationJobState::Running)",
@@ -855,6 +855,9 @@ fn ownership() -> BTreeMap<String, Ownership> {
         ".contains(&(slot_state.as_str(), slot_next.as_str()))",
         "state=?9 AND version=?10",
         "state=?6 AND version=?7",
+        "slot_state == ImageGenerationSlotState::CancellationRequested",
+        "slot_version == i64::try_from(input.slot_version)?",
+        "state=?3 AND version=?4",
     ] {
         assert!(
             reconciliation.contains(evidence),

@@ -89,8 +89,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 #[cfg(unix)]
+use cockpit_host::daemon_lifecycle::reclaim_stale_and_reserve;
+#[cfg(unix)]
 use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
-#[cfg(any(unix, test))]
+#[cfg(test)]
 use cockpit_host::daemon_lifecycle::write_pid_file;
 #[cfg(any(unix, test))]
 use cockpit_host::daemon_lifecycle::{
@@ -1305,11 +1307,6 @@ async fn run_foreground_inner_with_boot_db(
         }
     }
     let executable = std::env::current_exe().context("resolving daemon executable identity")?;
-    // The exclusive PID receipt is the starting reservation. Acquire it before
-    // touching the shared socket so a losing concurrent starter cannot unlink
-    // the winner's newly bound endpoint.
-    let pid_receipt = write_pid_file(&paths.pid_file, std::process::id(), &executable)
-        .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
     let endpoint_record = if !paths.ephemeral
         && DaemonPaths::resolve_canonical()
             .as_ref()
@@ -1319,6 +1316,17 @@ async fn run_foreground_inner_with_boot_db(
     } else {
         None
     };
+    // The exclusive PID receipt is the starting reservation. Acquire it before
+    // touching the shared socket so a losing concurrent starter cannot unlink
+    // the winner's newly bound endpoint.
+    let pid_receipt = reclaim_stale_and_reserve(
+        &paths.pid_file,
+        &paths.socket,
+        endpoint_record.as_deref(),
+        std::process::id(),
+        &executable,
+    )
+    .with_context(|| format!("reserving pid file {}", paths.pid_file.display()))?;
     let mut metadata_guard = ForegroundMetadataGuard::new(
         paths.pid_file.clone(),
         paths.socket.clone(),

@@ -236,6 +236,75 @@ pub fn write_pid_file(
     })
 }
 
+/// Atomically reclaim demonstrably stale lifecycle ownership and reserve it
+/// for a new daemon incarnation. Live or unverifiable incumbents are never
+/// replaced. The create-new write occurs before releasing the lifecycle lock.
+#[cfg(unix)]
+pub fn reclaim_stale_and_reserve(
+    pid_file: &Path,
+    socket: &Path,
+    endpoint: Option<&Path>,
+    pid: u32,
+    executable: &Path,
+) -> anyhow::Result<DaemonPidReceipt> {
+    with_lifecycle_lock(pid_file, || {
+        if pid_file.exists() {
+            let incumbent = read_daemon_pid_record(pid_file)
+                .ok_or_else(|| anyhow::anyhow!("existing daemon PID reservation is malformed"))?;
+            let reclaimable = match &incumbent {
+                DaemonPidRecord::Receipt(receipt) => {
+                    match verify_cockpit_daemon_receipt_identity(receipt) {
+                        PidIdentity::Missing => true,
+                        // A recycled PID has a different kernel start identity
+                        // and cannot own this reservation. A live matching
+                        // incarnation remains protected even if argv probing
+                        // observes it mid-transition.
+                        PidIdentity::NotDaemon => read_process_start_identity(receipt.pid)
+                            .is_ok_and(|start| start != receipt.process_start),
+                        PidIdentity::VerifiedDaemon | PidIdentity::Unverified => false,
+                    }
+                }
+                DaemonPidRecord::LegacyNumeric(pid) => {
+                    legacy_pid_identity(*pid) == PidIdentity::Missing
+                }
+            };
+            if !reclaimable {
+                anyhow::bail!("existing daemon lifecycle reservation is live or unverifiable");
+            }
+            retire_incumbent_locked(pid_file, socket, endpoint, &incumbent)?;
+        }
+        write_pid_file_locked(pid_file, pid, executable)
+    })
+}
+
+#[cfg(unix)]
+fn retire_incumbent_locked(
+    pid_file: &Path,
+    socket: &Path,
+    endpoint: Option<&Path>,
+    incumbent: &DaemonPidRecord,
+) -> anyhow::Result<()> {
+    if read_daemon_pid_record(pid_file) != Some(incumbent.clone()) {
+        anyhow::bail!("daemon lifecycle reservation changed during locked retirement");
+    }
+    if let (Some(endpoint), DaemonPidRecord::Receipt(receipt)) = (endpoint, incumbent) {
+        if let Ok(bytes) = std::fs::read(endpoint)
+            && let Ok(record) = serde_json::from_slice::<EndpointRecord>(&bytes)
+            && record.receipt == *receipt
+            && record.socket == socket
+        {
+            std::fs::remove_file(endpoint)?;
+        }
+    }
+    match std::fs::remove_file(socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::remove_file(pid_file)?;
+    Ok(())
+}
+
 fn write_pid_file_locked(
     pid_file: &Path,
     pid: u32,
@@ -378,16 +447,12 @@ pub fn retire_metadata_if_receipt_matches(
             return Ok(false);
         }
         if let Some(endpoint) = endpoint {
-            match std::fs::read(endpoint) {
-                Ok(bytes) => {
-                    let record: EndpointRecord = serde_json::from_slice(&bytes)?;
-                    if record.receipt != *expected || record.socket != socket {
-                        return Ok(false);
-                    }
-                    std::fs::remove_file(endpoint)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+            if let Ok(bytes) = std::fs::read(endpoint)
+                && let Ok(record) = serde_json::from_slice::<EndpointRecord>(&bytes)
+                && record.receipt == *expected
+                && record.socket == socket
+            {
+                std::fs::remove_file(endpoint)?;
             }
         }
         match std::fs::remove_file(socket) {
@@ -842,6 +907,19 @@ impl Drop for ForegroundMetadataGuard {
 mod tests {
     use super::*;
 
+    fn write_receipt_fixture(path: &Path, receipt: &DaemonPidReceipt) {
+        let body = format!(
+            "cockpit-daemon-pid-v2\n{}\n{}\nstart:{:016x}:{:016x}\nnonce:{}\n",
+            receipt.pid,
+            encode_executable_identity(&receipt.executable),
+            receipt.process_start.primary,
+            receipt.process_start.secondary,
+            hex_encode(&receipt.publication_nonce),
+        );
+        crate::private_fs::write_private_file_exclusive(path, body.as_bytes())
+            .expect("receipt fixture");
+    }
+
     #[test]
     fn daemon_cmdline_requires_exact_approved_executable() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -910,6 +988,72 @@ mod tests {
         assert_eq!(
             read_daemon_pid_record(&pid_file),
             Some(DaemonPidRecord::Receipt(first))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_starting_reservations_have_exactly_one_winner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("daemon.sock");
+        let executable = std::env::current_exe().expect("test executable");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let attempts: Vec<_> = (0..2)
+            .map(|_| {
+                let pid_file = pid_file.clone();
+                let socket = socket.clone();
+                let executable = executable.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reclaim_stale_and_reserve(
+                        &pid_file,
+                        &socket,
+                        None,
+                        std::process::id(),
+                        &executable,
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().expect("starter thread"))
+            .collect();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_incarnation_is_reclaimed_inside_reservation_transaction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("daemon.sock");
+        let executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let stale = DaemonPidReceipt {
+            pid: i32::MAX as u32,
+            executable: executable.clone(),
+            process_start: ProcessStartIdentity {
+                primary: 1,
+                secondary: 0,
+            },
+            publication_nonce: [3; 32],
+        };
+        write_receipt_fixture(&pid_file, &stale);
+        std::fs::write(&socket, b"stale socket").expect("stale socket");
+
+        let reserved =
+            reclaim_stale_and_reserve(&pid_file, &socket, None, std::process::id(), &executable)
+                .expect("reclaim and reserve");
+
+        assert_ne!(reserved.publication_nonce, stale.publication_nonce);
+        assert!(!socket.exists());
+        assert_eq!(
+            read_daemon_pid_record(&pid_file),
+            Some(DaemonPidRecord::Receipt(reserved))
         );
     }
 
@@ -1043,13 +1187,43 @@ mod tests {
         )
         .expect("endpoint record");
 
-        ForegroundMetadataGuard::new(pid_file, socket, Some(endpoint.clone()), receipt)
-            .cleanup()
-            .expect("guard cleanup");
+        ForegroundMetadataGuard::new(
+            pid_file.clone(),
+            socket.clone(),
+            Some(endpoint.clone()),
+            receipt,
+        )
+        .cleanup()
+        .expect("guard cleanup");
 
         assert!(
             endpoint.exists(),
             "foreign endpoint receipt must survive cleanup"
         );
+        assert!(!pid_file.exists(), "owned PID receipt must still retire");
+        assert!(!socket.exists(), "owned socket must still retire");
+    }
+
+    #[test]
+    fn boot_failure_guard_releases_reservation_without_endpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("daemon.sock");
+        let endpoint = temp.path().join("daemon-endpoint.json");
+        let executable = std::env::current_exe().expect("test executable");
+        let receipt = write_pid_file(&pid_file, std::process::id(), &executable).expect("pid file");
+
+        ForegroundMetadataGuard::new(
+            pid_file.clone(),
+            socket.clone(),
+            Some(endpoint.clone()),
+            receipt,
+        )
+        .cleanup()
+        .expect("boot failure cleanup");
+
+        assert!(!pid_file.exists());
+        assert!(!socket.exists());
+        assert!(!endpoint.exists());
     }
 }

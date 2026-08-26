@@ -85,6 +85,7 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
         "fn process_exists",
         "libc::kill(pid as libc::pid_t, libc::SIGTERM)",
         "remove_metadata_if_pid_matches",
+        "let pid_receipt = write_pid_file",
     ] {
         assert!(
             !daemon.contains(forbidden),
@@ -109,6 +110,8 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
         "offset_of!(ProcBsdInfo, start_sec) == 120",
         "let error = (ok == 0).then(std::io::Error::last_os_error)",
         "with_lifecycle_lock",
+        "reclaim_stale_and_reserve",
+        "retire_incumbent_locked",
         "retire_metadata_if_receipt_matches",
         "SYS_pidfd_open",
         "SYS_pidfd_send_signal",
@@ -121,6 +124,7 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
     }
     for required in [
         "fn read_bound_endpoint_record_from",
+        "reclaim_stale_and_reserve(",
         "record.socket != canonical.socket",
         "DaemonPidRecord::Receipt(receipt)",
         "preserving metadata and refusing numeric signaling",

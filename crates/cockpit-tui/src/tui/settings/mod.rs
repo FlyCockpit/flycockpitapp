@@ -96,10 +96,23 @@ use providers::initial_list_cursor;
 /// daemon.  Keeping this tiny helper here makes accidental local vault opens
 /// in settings code both unnecessary and easy for the boundary ratchet to
 /// reject.
-pub(crate) async fn settings_daemon_client() -> anyhow::Result<cockpit_client::DaemonClient> {
-    Ok(cockpit_core::daemon::client::ensure_persistent_daemon()
-        .await?
-        .client)
+pub(crate) async fn settings_daemon_client(
+    lifecycle: &cockpit_client::LifecycleClient,
+) -> anyhow::Result<cockpit_client::DaemonClient> {
+    let resolved = lifecycle
+        .resolve(cockpit_client::LifecycleIntent::EnsurePersistent)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint).await
+}
+
+#[cfg(test)]
+pub(crate) fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
+    let (client, requests) = cockpit_client::LifecycleClient::channel(8);
+    tokio::spawn(cockpit_core::daemon::client::serve_lifecycle_requests(
+        requests,
+    ));
+    client
 }
 
 /// A transport captured on the reducer thread and then owned by an async
@@ -107,20 +120,23 @@ pub(crate) async fn settings_daemon_client() -> anyhow::Result<cockpit_client::D
 /// another runtime worker; production performs the request on the daemon's
 /// asynchronous client.
 pub(crate) struct CapturedSettingsDaemon {
+    lifecycle: cockpit_client::LifecycleClient,
     #[cfg(test)]
     effect: Arc<dyn SettingsDaemonEffect>,
 }
 
-pub(crate) fn capture_settings_daemon() -> CapturedSettingsDaemon {
+pub(crate) fn capture_settings_daemon(
+    lifecycle: cockpit_client::LifecycleClient,
+) -> CapturedSettingsDaemon {
     #[cfg(test)]
     {
         let effect = TEST_SETTINGS_DAEMON_EFFECT
             .with(|slot| slot.borrow().clone())
             .unwrap_or_else(disk_daemon_fake::default_effect);
-        return CapturedSettingsDaemon { effect };
+        return CapturedSettingsDaemon { lifecycle, effect };
     }
     #[cfg(not(test))]
-    CapturedSettingsDaemon {}
+    CapturedSettingsDaemon { lifecycle }
 }
 
 impl CapturedSettingsDaemon {
@@ -131,7 +147,7 @@ impl CapturedSettingsDaemon {
         }
         #[cfg(not(test))]
         {
-            let client = settings_daemon_client()
+            let client = settings_daemon_client(&self.lifecycle)
                 .await
                 .map_err(|error| error.to_string())?;
             tokio::time::timeout(std::time::Duration::from_secs(15), client.request(request))
@@ -563,8 +579,9 @@ pub(crate) struct CommittedRefreshNeeded {
 
 pub(crate) async fn execute_settings_daemon_work(
     work: SettingsDaemonEffectWork,
+    lifecycle: cockpit_client::LifecycleClient,
 ) -> Result<SettingsDaemonWorkOutcome, String> {
-    let client = settings_daemon_client()
+    let client = settings_daemon_client(&lifecycle)
         .await
         .map_err(|error| error.to_string())?;
     match work {
@@ -1022,25 +1039,6 @@ trait SettingsDaemonEffect: Send + Sync {
     fn request(&self, request: Request) -> Result<Response, String>;
 }
 
-#[cfg(not(test))]
-struct ProductionSettingsDaemonEffect;
-
-#[cfg(not(test))]
-impl SettingsDaemonEffect for ProductionSettingsDaemonEffect {
-    fn request(&self, request: Request) -> Result<Response, String> {
-        run_settings_daemon(async move {
-            let client = settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            client
-                .request(request)
-                .await
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string())
-        })
-    }
-}
-
 #[cfg(test)]
 thread_local! {
     static TEST_SETTINGS_DAEMON_EFFECT: std::cell::RefCell<Option<Arc<dyn SettingsDaemonEffect>>> =
@@ -1055,13 +1053,9 @@ pub(crate) fn test_daemon_request(request: Request) -> Result<Response, String> 
     disk_daemon_fake::default_effect().request(request)
 }
 
+#[cfg(test)]
 fn settings_daemon_request(request: Request) -> Result<Response, String> {
-    #[cfg(test)]
-    {
-        return test_daemon_request(request);
-    }
-    #[cfg(not(test))]
-    ProductionSettingsDaemonEffect.request(request)
+    test_daemon_request(request)
 }
 
 #[cfg(test)]
@@ -2822,6 +2816,7 @@ impl std::fmt::Debug for TestPageMut<'_> {
 }
 
 pub struct SettingsCx {
+    lifecycle: cockpit_client::LifecycleClient,
     dialog_id: uuid::Uuid,
     daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
     blocking_effects: VecDeque<SettingsBlockingEffectRequest>,
@@ -4633,43 +4628,7 @@ impl SettingsCx {
         {
             return Some(*value);
         }
-        self.refresh_secret_inventory_entry(name.to_string(), kind);
         None
-    }
-
-    pub(super) fn refresh_secret_inventory_entry(
-        &self,
-        name: String,
-        kind: Option<cockpit_proto::SecretInventoryKind>,
-    ) {
-        // Synchronous unit-render tests intentionally have no Tokio runtime;
-        // leave their cache miss as "checking" rather than panicking.
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let key = format!("{kind:?}:{name}");
-        let Ok(mut pending) = self.secret_inventory_pending.lock() else {
-            return;
-        };
-        if !pending.insert(key.clone()) {
-            return;
-        }
-        let cache = Arc::clone(&self.secret_inventory_cache);
-        let pending = Arc::clone(&self.secret_inventory_pending);
-        tokio::spawn(async move {
-            let present = match settings_daemon_client().await {
-                Ok(client) => secret_inventory_contains(&client, &name, kind).await,
-                Err(error) => Err(error.to_string()),
-            };
-            if let Ok(present) = present
-                && let Ok(mut cache) = cache.lock()
-            {
-                cache.insert(key.clone(), present);
-            }
-            if let Ok(mut pending) = pending.lock() {
-                pending.remove(&key);
-            }
-        });
     }
 
     pub(super) fn invalidate_secret_inventory_entry(
@@ -5027,6 +4986,11 @@ pub(super) enum Nav {
 // ── Dialog top-level ─────────────────────────────────────────────────────
 
 impl Dialog {
+    pub(crate) fn bind_lifecycle(&mut self, lifecycle: cockpit_client::LifecycleClient) {
+        if let Self::Settings(settings) = self {
+            settings.cx.lifecycle = lifecycle;
+        }
+    }
     pub(crate) fn has_unsettled_local_authority(&self) -> bool {
         matches!(self, Dialog::Settings(settings) if settings.authority_operation_pending())
     }
@@ -6548,6 +6512,7 @@ impl SettingsDialog {
             page: root_page(0),
             stack: Vec::new(),
             cx: SettingsCx {
+                lifecycle: cockpit_client::LifecycleClient::channel(1).0,
                 dialog_id: uuid::Uuid::new_v4(),
                 daemon_effects: VecDeque::new(),
                 blocking_effects: VecDeque::new(),

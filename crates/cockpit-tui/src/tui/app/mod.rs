@@ -658,12 +658,18 @@ impl App {
             project_root: project_root.clone(),
             expected_generation,
         });
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("workspace-trust.effect"),
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("workspace-trust.effect")),
             async move {
-                let result =
-                    set_workspace_trust_async(&project_root, rpc_mode, expected_generation).await;
+                let result = set_workspace_trust_async(
+                    lifecycle,
+                    &project_root,
+                    rpc_mode,
+                    expected_generation,
+                )
+                .await;
                 Ok(AsyncActionPayload::WorkspaceTrust(
                     WorkspaceTrustCompletion {
                         operation_id,
@@ -762,11 +768,12 @@ pub(crate) struct ImageIngressDraftDiscardCompletion {
 }
 
 async fn set_workspace_trust_async(
+    lifecycle: cockpit_client::LifecycleClient,
     project_root: &str,
     mode: cockpit_proto::WorkspaceTrustMode,
     mut expected_generation: u64,
 ) -> Result<u64, String> {
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|error| error.to_string())?;
     for attempt in 0..=1 {
@@ -3900,7 +3907,7 @@ impl App {
             // worker remains available to the daemon connection and terminal
             // event sources instead of synchronously re-entering it.
             let state = async {
-                let client = crate::tui::settings::settings_daemon_client()
+                let client = crate::tui::settings::settings_daemon_client(&self.lifecycle)
                     .await
                     .map_err(|error| error.to_string())?;
                 client
@@ -3918,7 +3925,7 @@ impl App {
                     ..
                 }) => {
                     let _ = async {
-                        let client = crate::tui::settings::settings_daemon_client()
+                        let client = crate::tui::settings::settings_daemon_client(&self.lifecycle)
                             .await
                             .map_err(|error| error.to_string())?;
                         client

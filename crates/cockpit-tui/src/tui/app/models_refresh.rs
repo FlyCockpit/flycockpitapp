@@ -8,6 +8,7 @@ impl App {
         use cockpit_proto::{ProviderModelFetchOutcome, Request, Response};
 
         let cwd = self.launch.cwd.clone();
+        let lifecycle = self.lifecycle.clone();
         let progress = Arc::clone(&self.fetch_models_progress);
         self.push_plain("/fetch-models: starting provider model refresh…".to_string());
         tokio::spawn(async move {
@@ -17,7 +18,7 @@ impl App {
                 }
             };
             let result = async {
-                let client = crate::tui::settings::settings_daemon_client().await?;
+                let client = crate::tui::settings::settings_daemon_client(&lifecycle).await?;
                 client
                     .request(Request::FetchProviderModels {
                         project_root: cwd.display().to_string(),

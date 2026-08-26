@@ -1028,7 +1028,7 @@ impl App {
         if let Some(pending) = self.pending_mcp_local.take() {
             self.async_actions.abort_id(pending.action_id);
         }
-        let transport = crate::tui::settings::capture_settings_daemon();
+        let transport = crate::tui::settings::capture_settings_daemon(self.lifecycle.clone());
         let completion_project_root = project_root.clone();
         let completion_intent = intent.clone();
         let completion_phase = phase.clone();

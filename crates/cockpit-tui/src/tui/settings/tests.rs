@@ -5759,7 +5759,8 @@ fn seed_workspace_trust(root: &std::path::Path) {
         .build()
         .expect("settings trust seed runtime");
     runtime.block_on(async {
-        let client = crate::tui::settings::settings_daemon_client()
+        let lifecycle = crate::tui::settings::test_lifecycle_client();
+        let client = crate::tui::settings::settings_daemon_client(&lifecycle)
             .await
             .expect("settings daemon client for trust seed");
         let project_root = root.display().to_string();
@@ -6336,6 +6337,7 @@ async fn fetch_all_in_flight_ignores_keys_except_esc() {
     // fast the spawned task completes (we never tick, so in_flight
     // stays populated).
     let state = ProvidersPage::FetchAll(FetchAllState::spawn(
+        crate::tui::settings::test_lifecycle_client(),
         &d.config,
         tmp.path().display().to_string(),
     ));
@@ -8742,7 +8744,8 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
     // `settings_daemon_client()`; without priming, that spawn can race the
     // owner-remoted save's own boot and split-brain into two in-memory daemon
     // DBs (the save lands in one, the verification reads the other, empty).
-    crate::tui::settings::settings_daemon_client()
+    let lifecycle = crate::tui::settings::test_lifecycle_client();
+    crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .expect("prime in-process settings daemon");
     let mut d = fresh_dialog(&tmp);
@@ -8766,7 +8769,8 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
         !tmp.path().join("credentials.json").exists(),
         "web-key save must persist through the owner vault, not credentials.json"
     );
-    let client = crate::tui::settings::settings_daemon_client()
+    let lifecycle = crate::tui::settings::test_lifecycle_client();
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .expect("settings daemon client");
     let response = client

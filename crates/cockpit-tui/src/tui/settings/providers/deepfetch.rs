@@ -88,7 +88,11 @@ impl DeepFetchState {
         })
     }
 
-    fn start(&mut self, project_root: std::path::PathBuf) {
+    fn start(
+        &mut self,
+        lifecycle: cockpit_client::LifecycleClient,
+        project_root: std::path::PathBuf,
+    ) {
         debug_assert_eq!(self.phase, DeepFetchPhase::Confirm);
         self.phase = DeepFetchPhase::Running;
         self.status = None;
@@ -98,6 +102,7 @@ impl DeepFetchState {
         let cancel = Arc::clone(&self.cancel);
         tokio::spawn(async move {
             let result = run_deep_fetch(
+                lifecycle,
                 project_root.display().to_string(),
                 provider_id,
                 targets,
@@ -157,6 +162,7 @@ impl DeepFetchState {
 }
 
 async fn run_deep_fetch(
+    lifecycle: cockpit_client::LifecycleClient,
     project_root: String,
     provider_id: String,
     targets: Vec<DeepfetchTarget>,
@@ -168,7 +174,7 @@ async fn run_deep_fetch(
     // A settings config path may be the global XDG layer rather than a
     // workspace `.cockpit/config.json`; it is not a project-root authority.
     // The caller supplies the active dialog/picker workspace explicitly.
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|error| format!("deep fetch failed: {error}"))?;
     // Use one daemon operation per model. This keeps probing and persistence
@@ -399,7 +405,7 @@ impl SettingsCx {
                             Some("deep fetch requires the active settings workspace".into());
                         return Nav::Stay;
                     };
-                    state.start(project_root);
+                    state.start(self.lifecycle.clone(), project_root);
                 }
                 KeyCode::Enter => return deep_fetch_back(parent, "deep fetch cancelled".into()),
                 _ => {}

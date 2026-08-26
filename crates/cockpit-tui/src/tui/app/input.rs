@@ -378,6 +378,7 @@ impl App {
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.dialog.bind_lifecycle(self.lifecycle.clone());
         let composer_before = self.composer.text().to_string();
         let exit = self.handle_key_inner(key);
         let clears_or_recalls_without_editing =

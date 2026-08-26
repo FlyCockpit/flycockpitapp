@@ -1472,7 +1472,12 @@ impl SettingsCx {
                 Some(notice) => format!("saved. {notice} Fetching /models…"),
                 None => "saved. Fetching /models…".into(),
             });
-            s.fetch = Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
+            s.fetch = Some(FetchHandle::spawn(
+                self.lifecycle.clone(),
+                id,
+                entry,
+                self.provider_fetch_root(),
+            ));
             let _ = s.run.submit(WizardAnswer::Acknowledged);
         } else if s.is_step("test-key-choice") {
             s.error = Some(match notice {
@@ -1779,8 +1784,12 @@ impl SettingsCx {
                         } else if let Some(id) = s.saved_provider_id.clone() {
                             if let Some(entry) = self.config.providers.get(&id).cloned() {
                                 s.error = Some("Testing key via /models…".into());
-                                s.fetch =
-                                    Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
+                                s.fetch = Some(FetchHandle::spawn(
+                                    self.lifecycle.clone(),
+                                    id,
+                                    entry,
+                                    self.provider_fetch_root(),
+                                ));
                             }
                             let _ = s.run.submit(WizardAnswer::Acknowledged);
                         }
@@ -1987,6 +1996,7 @@ impl SettingsCx {
                     s.status = status;
                 } else {
                     s.fetch = Some(FetchHandle::spawn(
+                        self.lifecycle.clone(),
                         s.provider_id.clone(),
                         (*s.entry).clone(),
                         self.provider_fetch_root(),
@@ -2154,6 +2164,7 @@ impl SettingsCx {
                     s.status = status;
                 } else {
                     s.fetch = Some(FetchHandle::spawn(
+                        self.lifecycle.clone(),
                         s.provider_id.clone(),
                         (*s.entry).clone(),
                         self.provider_fetch_root(),
@@ -2774,6 +2785,7 @@ impl SettingsCx {
                     let mut edit = EditState::new(s.provider_id.clone(), entry.clone());
                     edit.status = Some("retrying live model fetch...".into());
                     edit.fetch = Some(FetchHandle::spawn(
+                        self.lifecycle.clone(),
                         s.provider_id.clone(),
                         entry,
                         self.provider_fetch_root(),

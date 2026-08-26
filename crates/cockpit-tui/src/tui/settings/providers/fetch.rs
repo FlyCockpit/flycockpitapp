@@ -22,6 +22,7 @@ impl FetchAllState {
     /// bad provider never blocks the rest — `tick` drains the live
     /// handles as they complete.
     pub(in crate::tui::settings) fn spawn(
+        lifecycle: cockpit_client::LifecycleClient,
         providers: &cockpit_config::providers::ProvidersConfig,
         project_root: String,
     ) -> Self {
@@ -36,6 +37,7 @@ impl FetchAllState {
             };
             pre_fetch_models.insert(id.clone(), entry.models.clone());
             in_flight.push(FetchHandle::spawn(
+                lifecycle.clone(),
                 id.clone(),
                 entry.clone(),
                 project_root.clone(),
@@ -255,7 +257,11 @@ impl SettingsCx {
                 delete_pending: false,
             }));
         }
-        let state = FetchAllState::spawn(&self.config, self.provider_fetch_root());
+        let state = FetchAllState::spawn(
+            self.lifecycle.clone(),
+            &self.config,
+            self.provider_fetch_root(),
+        );
         Nav::Replace(super::super::providers_page(ProvidersPage::FetchAll(state)))
     }
 

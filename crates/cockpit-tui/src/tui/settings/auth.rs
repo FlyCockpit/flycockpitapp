@@ -28,13 +28,18 @@ pub enum FetchState {
 }
 
 impl FetchHandle {
-    pub fn spawn(provider_id: String, _entry: ProviderEntry, project_root: String) -> Self {
+    pub fn spawn(
+        lifecycle: cockpit_client::LifecycleClient,
+        provider_id: String,
+        _entry: ProviderEntry,
+        project_root: String,
+    ) -> Self {
         let state = Arc::new(Mutex::new(FetchState::Running));
         let state_w = Arc::clone(&state);
         let pid = provider_id.clone();
         tokio::spawn(async move {
             let result = async {
-                let client = crate::tui::settings::settings_daemon_client()
+                let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                     .await
                     .map_err(|error| error.to_string())?;
                 let response = client

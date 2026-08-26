@@ -93,7 +93,8 @@ fn provider_daemon_runtime() -> (ProviderDaemonFixture, tokio::runtime::Runtime)
 fn seed_oauth_credential_via_daemon(credential_ref: &str) {
     let credential_ref = credential_ref.to_string();
     let fut = async move {
-        let client = crate::tui::settings::settings_daemon_client()
+        let lifecycle = crate::tui::settings::test_lifecycle_client();
+        let client = crate::tui::settings::settings_daemon_client(&lifecycle)
             .await
             .expect("settings daemon client for oauth credential seed");
         let response = client
@@ -180,7 +181,8 @@ fn dialog_with_config(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDi
     if PROVIDER_DAEMON_FIXTURE_DEPTH.with(Cell::get) != 0 {
         let project_root = trust_root.root.display().to_string();
         let set_trust = async move {
-            let client = crate::tui::settings::settings_daemon_client()
+            let lifecycle = crate::tui::settings::test_lifecycle_client();
+            let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                 .await
                 .expect("provider fixture daemon client");
             let expected_config_generation = match client
@@ -5318,7 +5320,8 @@ fn provider_delete_removes_grok_oauth_provider_via_daemon() {
     // unshared-record cleanup, rather than only provider-file removal.
     let client = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            crate::tui::settings::settings_daemon_client()
+            let lifecycle = crate::tui::settings::test_lifecycle_client();
+            crate::tui::settings::settings_daemon_client(&lifecycle)
                 .await
                 .expect("provider-delete fixture daemon client")
         })

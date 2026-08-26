@@ -82,11 +82,12 @@ fn oauth_begin_operation_id(
 }
 
 async fn begin_provider_oauth(
+    lifecycle: cockpit_client::LifecycleClient,
     provider_id: &str,
     client_operation_id: String,
 ) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
     let expected_hash = oauth_request_hash(&("begin_provider_oauth", provider_id))?;
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|e| e.to_string())?;
     let response = tokio::time::timeout(
@@ -189,11 +190,12 @@ async fn begin_provider_oauth(
 }
 
 async fn complete_provider_oauth(
+    lifecycle: cockpit_client::LifecycleClient,
     client_operation_id: String,
     flow_id: String,
     input: Option<zeroize::Zeroizing<String>>,
 ) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|e| e.to_string())?;
     let expected_hash = oauth_request_hash(&(
@@ -296,6 +298,7 @@ async fn complete_provider_oauth(
 }
 
 async fn cancel_provider_oauth(
+    lifecycle: cockpit_client::LifecycleClient,
     client_operation_id: String,
     begin_client_operation_id: String,
     flow_id: Option<String>,
@@ -305,7 +308,7 @@ async fn cancel_provider_oauth(
         &begin_client_operation_id,
         &flow_id,
     ))?;
-    let client = crate::tui::settings::settings_daemon_client()
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|e| e.to_string())?;
     let response = tokio::time::timeout(
@@ -687,12 +690,13 @@ impl App {
                 admission_id: draft.admission_id,
                 local_operation_id: draft.local_operation_id,
             };
+            let lifecycle = self.lifecycle.clone();
             self.async_actions.start(
                 AsyncActionKind::DaemonRpc("paste.image_ingress_discard"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
                     let response = async {
-                        let client = crate::tui::settings::settings_daemon_client()
+                        let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                             .await
                             .map_err(|error| error.to_string())?;
                         client
@@ -723,12 +727,13 @@ impl App {
         let project_root = effect.project_root;
         let expected_revision = effect.expected_revision;
         let request = effect.request;
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("goal-settings.effect"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
                 let response = async {
-                    let client = crate::tui::settings::settings_daemon_client()
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                         .await
                         .map_err(|error| error.to_string())?;
                     client
@@ -764,12 +769,13 @@ impl App {
         let project_root = effect.project_root;
         let expected_revision = effect.expected_revision;
         let request = effect.request;
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("tools.effect"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
                 let response = async {
-                    let client = crate::tui::settings::settings_daemon_client()
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                         .await
                         .map_err(|error| error.to_string())?;
                     client
@@ -793,16 +799,19 @@ impl App {
     }
 
     fn start_pending_settings_daemon_effects(&mut self) {
+        self.dialog.bind_lifecycle(self.lifecycle.clone());
         while let Some(effect) = self.dialog.take_settings_daemon_effect() {
             let dialog_id = effect.dialog_id;
             let operation_id = effect.operation_id;
             let target = effect.target;
             let work = effect.work;
+            let lifecycle = self.lifecycle.clone();
             self.async_actions.start(
                 AsyncActionKind::DaemonRpc("settings.effect"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
-                    let outcome = crate::tui::settings::execute_settings_daemon_work(work).await;
+                    let outcome =
+                        crate::tui::settings::execute_settings_daemon_work(work, lifecycle).await;
                     let (response, authoritative_rejection, committed_refresh_needed) =
                         match outcome {
                             Ok(outcome) => (
@@ -869,12 +878,13 @@ impl App {
         let operation_id = effect.operation_id;
         let target = effect.target;
         let request = effect.request;
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("sessions.mutation"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
                 let response = async {
-                    let client = crate::tui::settings::settings_daemon_client()
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                         .await
                         .map_err(|error| error.to_string())?;
                     client
@@ -2620,6 +2630,7 @@ impl App {
             let provider = action.provider;
             let client_flow_id = action.client_flow_id;
             let operation_id = action.operation_id;
+            let lifecycle = self.lifecycle.clone();
             match (action.provider, action.op) {
                 (provider, OAuthFlowOp::Acknowledge) => {
                     self.async_actions.start(
@@ -2635,7 +2646,7 @@ impl App {
                                         cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER
                                     }
                                 };
-                                let client = crate::tui::settings::settings_daemon_client()
+                                let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                                     .await
                                     .map_err(|e| e.to_string())?;
                                 // Retrying acknowledgement for the same visible
@@ -2742,6 +2753,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 begin_provider_oauth(
+                                    lifecycle,
                                     "codex-oauth",
                                     oauth_begin_operation_id(client_flow_id),
                                 )
@@ -2759,6 +2771,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 complete_provider_oauth(
+                                    lifecycle,
                                     oauth_operation_id(client_flow_id, "complete"),
                                     flow_id,
                                     None,
@@ -2777,6 +2790,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 begin_provider_oauth(
+                                    lifecycle,
                                     "grok-oauth",
                                     oauth_begin_operation_id(client_flow_id),
                                 )
@@ -2794,6 +2808,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 complete_provider_oauth(
+                                    lifecycle,
                                     oauth_operation_id(client_flow_id, "complete"),
                                     flow_id,
                                     Some(input),
@@ -2854,6 +2869,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 cancel_provider_oauth(
+                                    lifecycle,
                                     oauth_operation_id(client_flow_id, "cancel"),
                                     oauth_begin_operation_id(client_flow_id),
                                     flow_id,
@@ -2990,12 +3006,13 @@ impl App {
     pub(super) fn start_provider_usage_action(&mut self, args: String) {
         let filter = args.split_whitespace().next().map(str::to_string);
         let cwd = self.launch.cwd.clone();
+        let lifecycle = self.lifecycle.clone();
         self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::loading());
         self.async_actions.start(
             AsyncActionKind::Refresh("provider.usage"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("provider.usage")),
             async move {
-                let client = crate::tui::settings::settings_daemon_client()
+                let client = crate::tui::settings::settings_daemon_client(&lifecycle)
                     .await
                     .map_err(|e| e.to_string())?;
                 match client

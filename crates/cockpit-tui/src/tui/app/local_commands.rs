@@ -1732,8 +1732,7 @@ impl App {
     pub(super) fn invoke_skill_slash(&mut self, name: &str) -> bool {
         let raw = self.composer.text().to_string();
         let args = slash_args(&raw);
-        self.composer.clear();
-        self.paste_registry.clear();
+        self.clear_composer_buffer();
         self.reset_slash_window();
         self.record_usage(cockpit_proto::UsageKind::Slash, "skill".to_string(), None);
         let display = if args.trim().is_empty() {

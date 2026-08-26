@@ -107,8 +107,7 @@ impl App {
                         &retained_images,
                         cockpit_core::tokens::count,
                     );
-                    self.composer.set(rebuilt.buffer);
-                    self.paste_registry = rebuilt.registry;
+                    self.rebuild_composer_buffer(rebuilt);
                     if let Err(restore) = &outcome.restore {
                         self.history.push(HistoryEntry::CommandError {
                             line: format!("editor: terminal restore: {restore}"),

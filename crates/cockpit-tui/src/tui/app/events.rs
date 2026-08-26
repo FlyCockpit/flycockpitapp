@@ -881,8 +881,7 @@ impl App {
                     );
                     let clear_held_draft = self.composer.text() == queued.composer_text;
                     if clear_held_draft {
-                        self.composer.clear();
-                        self.paste_registry.clear();
+                        self.clear_composer_buffer();
                         self.at_dismissed = false;
                         self.at_selected = 0;
                         self.at_scroll = 0;

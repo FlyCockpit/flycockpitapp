@@ -1377,8 +1377,7 @@ fn run_version(app: &mut App, _: &str) -> bool {
 impl App {
     pub(super) fn execute_slash(&mut self, cmd: SlashCommand) -> bool {
         let raw = self.composer.text().to_string();
-        self.composer.clear();
-        self.paste_registry.clear();
+        self.clear_composer_buffer();
         self.reset_slash_window();
         self.record_usage(cockpit_proto::UsageKind::Slash, cmd.name.to_string(), None);
         let args = slash_args(&raw);
@@ -1591,7 +1590,7 @@ impl App {
             }
             "clear" => self.clear_goal(),
             "edit" => {
-                self.composer.set("/goal ".to_string());
+                self.replace_composer_buffer("/goal ".to_string());
                 self.push_plain(
                     "/goal edit: update the objective in the composer and submit.".to_string(),
                 );

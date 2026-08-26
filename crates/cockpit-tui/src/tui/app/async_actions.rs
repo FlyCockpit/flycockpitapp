@@ -1417,7 +1417,7 @@ impl App {
                     self.flush_pending_session_switch_submissions();
                     self.push_plain(format!("/fork: switched to fork {fork_short_id}."));
                     if let Some(seed) = seed_composer {
-                        self.composer.set(seed);
+                        self.replace_composer_buffer(seed);
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                 }

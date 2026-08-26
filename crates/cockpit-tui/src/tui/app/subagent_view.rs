@@ -1,6 +1,46 @@
 use super::history_window::{HISTORY_WINDOW_TARGET_ENTRIES, HistoryWindow};
 use super::*;
 
+fn subagent_steer_message(
+    buffer: &str,
+    registry: &crate::tui::paste::PasteRegistry,
+) -> Result<Option<String>, &'static str> {
+    if !registry.image_payloads_by_number().is_empty() {
+        return Err(
+            "Subagent steering does not accept image attachments; remove them before sending.",
+        );
+    }
+    let message = registry.expand_display(buffer).trim().to_string();
+    Ok((!message.is_empty()).then_some(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subagent_steer_message;
+    use crate::tui::paste::PasteRegistry;
+
+    #[test]
+    fn condensed_text_steer_expands_payload_instead_of_sending_placeholder() {
+        let mut registry = PasteRegistry::new();
+        let placeholder = registry.register_text(0, "actual steering text".to_string(), 3);
+        let message = subagent_steer_message(&placeholder, &registry)
+            .expect("text paste is supported")
+            .expect("message is non-empty");
+        assert_eq!(message, "actual steering text");
+        assert!(!message.contains("[Pasted text"));
+    }
+
+    #[test]
+    fn image_steer_fails_closed_without_losing_registry_authority() {
+        let mut registry = PasteRegistry::new();
+        let placeholder = registry.register_image(0, vec![1, 2, 3]);
+        let error =
+            subagent_steer_message(&placeholder, &registry).expect_err("images unsupported");
+        assert!(error.contains("does not accept image attachments"));
+        assert_eq!(registry.blocks().len(), 1);
+    }
+}
+
 fn subagent_view_notice(read_only: bool, truncated: bool) -> Option<String> {
     let mut parts = Vec::new();
     if read_only {
@@ -338,10 +378,16 @@ impl App {
         let Some(view) = self.active_subagent_view().cloned() else {
             return false;
         };
-        let message = self.composer.text().trim().to_string();
-        if message.is_empty() {
-            return true;
-        }
+        let message = match subagent_steer_message(self.composer.text(), &self.paste_registry) {
+            Ok(Some(message)) => message,
+            Ok(None) => return true,
+            Err(error) => {
+                if let Some(active) = self.active_subagent_view_mut() {
+                    active.notice = Some(error.to_string());
+                }
+                return true;
+            }
+        };
         if view.read_only || view.finished {
             if let Some(active) = self.active_subagent_view_mut() {
                 active.notice =
@@ -355,27 +401,15 @@ impl App {
             }
             return true;
         };
-        self.composer.clear();
-        self.history.push(HistoryEntry::User {
-            text: message.clone(),
-            cleaned: None,
-            expanded: false,
-            timestamp: chrono::Local::now(),
-            seq: None,
-            optimistic_submission_id: None,
-            preflight_pending: false,
-            persist_failed: false,
-        });
-        self.push_plain("steer queued for next turn boundary".to_string());
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            self.push_plain("Subagent steering unavailable — daemon is not attached".to_string());
+            return true;
+        };
         let req = cockpit_proto::Request::SteerDelegation {
             session_id,
             task_call_id: view.task_call_id,
             label: view.label,
             message,
-        };
-        let Some(endpoint) = self.attached_daemon_endpoint() else {
-            self.push_plain("Subagent steering unavailable — daemon is not attached".to_string());
-            return true;
         };
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("subagent.steer"),
@@ -387,6 +421,18 @@ impl App {
                 other => Err(format!("unexpected steer response: {other:?}")),
             },
         );
+        self.clear_composer_buffer();
+        self.history.push(HistoryEntry::User {
+            text: message,
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            optimistic_submission_id: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        self.push_plain("steer queued for next turn boundary".to_string());
         true
     }
 

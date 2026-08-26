@@ -1500,8 +1500,7 @@ impl App {
                 // (deliberate — too easy to hit accidentally for an
                 // exit path; `/exit`, Ctrl+C, Ctrl+D cover that).
                 if self.slash_query().is_some() {
-                    self.composer.clear();
-                    self.paste_registry.clear();
+                    self.clear_composer_buffer();
                     self.reset_slash_window();
                 } else if self.composer.vim_enabled() {
                     self.composer.set_vim_mode(VimMode::Normal);
@@ -1677,14 +1676,12 @@ impl App {
             self.staged_draft = if draft.is_empty() { None } else { Some(draft) };
             self.prompt_history_cursor = 1;
             let idx = self.prompt_history.len() - 1;
-            self.composer.set(self.prompt_history[idx].clone());
-            self.paste_registry.clear();
+            self.replace_composer_buffer(self.prompt_history[idx].clone());
             self.invalidate_primary_paste();
         } else if self.prompt_history_cursor < self.prompt_history.len() {
             self.prompt_history_cursor += 1;
             let idx = self.prompt_history.len() - self.prompt_history_cursor;
-            self.composer.set(self.prompt_history[idx].clone());
-            self.paste_registry.clear();
+            self.replace_composer_buffer(self.prompt_history[idx].clone());
             self.invalidate_primary_paste();
         }
     }
@@ -1727,16 +1724,15 @@ impl App {
         if self.prompt_history_cursor == 0 {
             // Out of history — restore the saved draft, if any.
             match self.staged_draft.take() {
-                Some(draft) => self.composer.set(draft),
-                None => self.composer.clear(),
+                Some(draft) => self.replace_composer_buffer(draft),
+                None => self.clear_composer_buffer(),
             }
         } else {
             let idx = self.prompt_history.len() - self.prompt_history_cursor;
-            self.composer.set(self.prompt_history[idx].clone());
+            self.replace_composer_buffer(self.prompt_history[idx].clone());
         }
-        // History navigation always lands on plain recalled text — no
-        // paste blocks survive.
-        self.paste_registry.clear();
+        // History navigation always lands on plain recalled text; the
+        // whole-buffer helper retired the old paste authority atomically.
     }
 
     /// If the composer no longer has an active `@partial` token, clear
@@ -1946,7 +1942,7 @@ impl App {
         let chosen = self.slash_selected.min(n - 1);
         // `set` resets the cursor to the end — exactly after the inserted
         // command (and its trailing space, if any).
-        self.composer.set(completions[chosen].clone());
+        self.replace_composer_buffer(completions[chosen].clone());
         true
     }
 
@@ -2492,8 +2488,7 @@ impl App {
         // command (GOALS §1k). Never reaches the agent or the wire.
         if self.composer.text().starts_with('!') {
             let cmd = self.composer.text()[1..].to_string();
-            self.composer.clear();
-            self.paste_registry.clear();
+            self.clear_composer_buffer();
             self.run_shell_command(&cmd);
             self.at_dismissed = false;
             self.at_selected = 0;
@@ -2881,8 +2876,7 @@ impl App {
                     parked_fence_sequence: None,
                 },
             );
-            self.composer.clear();
-            self.paste_registry.clear();
+            self.clear_composer_buffer();
             self.draft_generation = self.draft_generation.saturating_add(1);
             self.at_dismissed = false;
             self.at_selected = 0;
@@ -3022,10 +3016,9 @@ impl App {
                 outcome
             }
         };
-        self.composer.clear();
+        self.clear_composer_buffer();
         self.draft_generation = self.draft_generation.saturating_add(1);
         // The buffer is gone — its paste blocks go with it.
-        self.paste_registry.clear();
         self.at_dismissed = false;
         self.at_selected = 0;
         self.at_scroll = 0;
@@ -3301,8 +3294,7 @@ impl App {
     pub(super) fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
         match outcome {
             QueueEditOutcome::Edited { text, partial } => {
-                self.composer.set(text);
-                self.paste_registry.clear();
+                self.replace_composer_buffer(text);
                 if partial {
                     if self.toast.is_none() || self.has_owned_queue_edit_pending_notice() {
                         self.push_queue_edit_notice("some queued messages already started");
@@ -4142,8 +4134,7 @@ impl App {
                 // (full) stage off the ghost.
             }
             GhostAccept::Fill(text) => {
-                self.composer.set(text);
-                self.paste_registry.clear();
+                self.replace_composer_buffer(text);
                 // Consume the ghost + its cache: the text is real now, and
                 // clearing the box later must not restore this prediction
                 // (the user has acted on it).

@@ -1683,11 +1683,20 @@ fn sync_backup_parent(parent: &Path) -> Result<()> {
         .with_context(|| format!("fsyncing backup directory {}", parent.display()))
 }
 
-/// Cross-process serialization for recovery-artifact admission. The sibling
-/// lock file is persistent; its kernel lock, not file existence, is authority.
+/// Cross-process serialization for recovery-artifact admission.
+///
+/// The stable authority is a held, privately owned parent-directory handle;
+/// the persistent sibling file only carries the kernel lock. On Unix the
+/// ancestor walk proves that no different OS principal can replace the parent
+/// directory entry. On Windows the held parent handle denies delete/rename and
+/// both parent and lock carry a verified protected current-user+SYSTEM DACL.
+/// A process running as this same user (or root/SYSTEM) is inside Cockpit's
+/// local trust boundary and can always sabotage its own files; this protocol
+/// intentionally does not claim protection from that principal.
 #[derive(Debug)]
 struct BackupArtifactLock {
     file: std::fs::File,
+    _parent: std::fs::File,
 }
 
 #[cfg(test)]
@@ -1711,60 +1720,275 @@ fn run_backup_artifact_lock_after_kernel_lock_hook() {}
 impl BackupArtifactLock {
     fn acquire(path: &Path) -> Result<Self> {
         let lock_path = path.with_extension("backup-artifacts.lock");
-        let file = open_backup_artifact_lock_nofollow(&lock_path)
+        let parent_path = lock_path
+            .parent()
+            .context("backup artifact lock has no parent directory")?;
+        let parent = open_stable_backup_lock_parent(parent_path)?;
+        let (file, created) = open_backup_artifact_lock_in_parent(&parent, &lock_path)
             .with_context(|| format!("opening backup artifact lock {}", lock_path.display()))?;
-        validate_and_repair_backup_artifact_lock_handle(&file, &lock_path)?;
+        validate_and_repair_backup_artifact_lock_handle(&file, &lock_path, created)?;
         file.lock()
             .with_context(|| format!("locking backup artifacts for {}", path.display()))?;
         run_backup_artifact_lock_after_kernel_lock_hook();
-        validate_and_repair_backup_artifact_lock_handle(&file, &lock_path)?;
-        anyhow::ensure!(
-            path_still_names_open_backup_artifact_lock(&lock_path, &file)?,
-            "backup artifact lock pathname {} changed identity after its kernel lock was acquired",
-            lock_path.display()
-        );
-        Ok(Self { file })
+        validate_and_repair_backup_artifact_lock_handle(&file, &lock_path, false)?;
+        validate_stable_backup_lock_parent(&parent, parent_path)?;
+        Ok(Self {
+            file,
+            _parent: parent,
+        })
     }
 }
 
 #[cfg(unix)]
-fn open_backup_artifact_lock_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+fn open_stable_backup_lock_parent(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
-    std::fs::OpenOptions::new()
+    files::ensure_private_dir(path)?;
+    validate_unix_backup_lock_ancestry(path)?;
+    let parent = std::fs::OpenOptions::new()
         .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
+        .with_context(|| format!("opening stable backup lock parent {}", path.display()))?;
+    let metadata = parent.metadata()?;
+    let effective_uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.is_dir()
+            && metadata.uid() == effective_uid
+            && metadata.permissions().mode() & 0o777 == 0o700,
+        "backup lock parent {} is not a private current-user directory",
+        path.display()
+    );
+    Ok(parent)
+}
+
+#[cfg(unix)]
+fn validate_unix_backup_lock_ancestry(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let effective_uid = unsafe { libc::geteuid() };
+    let mut child = absolute.as_path();
+    loop {
+        let child_metadata = std::fs::symlink_metadata(child)
+            .with_context(|| format!("inspecting backup lock ancestor {}", child.display()))?;
+        anyhow::ensure!(
+            child_metadata.is_dir() && !child_metadata.file_type().is_symlink(),
+            "backup lock ancestry contains a symlink or non-directory at {}",
+            child.display()
+        );
+        let Some(ancestor) = child.parent() else {
+            break;
+        };
+        if ancestor == child {
+            break;
+        }
+        let ancestor_metadata = std::fs::symlink_metadata(ancestor)
+            .with_context(|| format!("inspecting backup lock ancestor {}", ancestor.display()))?;
+        anyhow::ensure!(
+            ancestor_metadata.is_dir() && !ancestor_metadata.file_type().is_symlink(),
+            "backup lock ancestry contains a symlink or non-directory at {}",
+            ancestor.display()
+        );
+        let mode = ancestor_metadata.permissions().mode();
+        let outsiders_can_write = mode & 0o022 != 0;
+        let sticky_protects_child = mode & libc::S_ISVTX != 0
+            && (child_metadata.uid() == effective_uid || ancestor_metadata.uid() == effective_uid);
+        anyhow::ensure!(
+            !outsiders_can_write || sticky_protects_child,
+            "backup lock parent identity is replaceable through untrusted writable ancestor {}",
+            ancestor.display()
+        );
+        child = ancestor;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn open_backup_artifact_lock_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt as _;
+fn open_stable_backup_lock_parent(path: &Path) -> Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    std::fs::OpenOptions::new()
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const DIRECTORY_SECURITY_ACCESS: u32 = 0x0002_0000 | 0x0004_0000 | 0x0010_0000 | 0x0000_0080;
+
+    files::ensure_private_dir(path)?;
+    let parent = std::fs::OpenOptions::new()
         .read(true)
-        .write(true)
-        .create(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        // READ_CONTROL | WRITE_DAC | SYNCHRONIZE | FILE_READ_ATTRIBUTES.
+        .access_mode(DIRECTORY_SECURITY_ACCESS)
+        // The missing FILE_SHARE_DELETE is the lifetime rename/delete lease.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
+        .with_context(|| format!("opening stable backup lock parent {}", path.display()))?;
+    let metadata = parent.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "backup lock parent {} is a reparse point or non-directory",
+        path.display()
+    );
+    files::set_private_windows_dacl_handle(&parent)?;
+    files::verify_private_windows_dacl_handle(&parent)?;
+    Ok(parent)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_backup_artifact_lock_nofollow(_path: &Path) -> std::io::Result<std::fs::File> {
+fn open_stable_backup_lock_parent(path: &Path) -> Result<std::fs::File> {
+    anyhow::bail!(
+        "stable backup artifact lock parents are unavailable on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn validate_stable_backup_lock_parent(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = file.metadata()?;
+    let effective_uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.is_dir()
+            && metadata.uid() == effective_uid
+            && metadata.permissions().mode() & 0o777 == 0o700,
+        "held backup lock parent {} lost its private-directory invariant",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_stable_backup_lock_parent(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "held backup lock parent {} became a reparse point or non-directory",
+        path.display()
+    );
+    files::verify_private_windows_dacl_handle(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_stable_backup_lock_parent(_file: &std::fs::File, path: &Path) -> Result<()> {
+    anyhow::bail!(
+        "stable backup artifact lock parent validation is unavailable on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn open_backup_artifact_lock_in_parent(
+    parent: &std::fs::File,
+    path: &Path,
+) -> std::io::Result<(std::fs::File, bool)> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock path has no filename",
+        )
+    })?;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock filename contains NUL",
+        )
+    })?;
+    let mut fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    let created = fd >= 0;
+    if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+        fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+    }
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((unsafe { std::fs::File::from_raw_fd(fd) }, created))
+}
+
+#[cfg(windows)]
+fn open_backup_artifact_lock_in_parent(
+    _parent: &std::fs::File,
+    path: &Path,
+) -> std::io::Result<(std::fs::File, bool)> {
+    // The held parent handle denies delete/rename, and its protected DACL
+    // excludes every principal except the current user and SYSTEM. Resolving
+    // this child by path is therefore stable against principals outside the
+    // documented local trust boundary.
+    open_backup_artifact_lock_nofollow(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_backup_artifact_lock_in_parent(
+    _parent: &std::fs::File,
+    _path: &Path,
+) -> std::io::Result<(std::fs::File, bool)> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "no-follow backup artifact locking is unavailable on this platform",
+        "stable backup artifact locking is unavailable on this platform",
     ))
+}
+
+#[cfg(windows)]
+fn open_backup_artifact_lock_nofollow(path: &Path) -> std::io::Result<(std::fs::File, bool)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const LOCK_SECURITY_ACCESS: u32 = 0xC000_0000 | 0x0002_0000 | 0x0004_0000;
+    let open = |create_new| {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            // GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC.
+            .access_mode(LOCK_SECURITY_ACCESS)
+            .create_new(create_new)
+            // Prevent replacement of this exact authority while its lock lives.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.open(path)
+    };
+    match open(true) {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open(false).map(|file| (file, false))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
 fn validate_and_repair_backup_artifact_lock_handle(
     file: &std::fs::File,
     path: &Path,
+    _created: bool,
 ) -> Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -1819,6 +2043,7 @@ fn validate_and_repair_backup_artifact_lock_handle(
 fn validate_and_repair_backup_artifact_lock_handle(
     file: &std::fs::File,
     path: &Path,
+    created: bool,
 ) -> Result<()> {
     use std::os::windows::fs::MetadataExt as _;
 
@@ -1836,83 +2061,24 @@ fn validate_and_repair_backup_artifact_lock_handle(
         "backup artifact lock {} does not have exactly one hard link",
         path.display()
     );
-    // Windows privacy is inherited from the already-private database data
-    // directory. `cockpit-db` deliberately has no dependency on the host ACL
-    // layer, but all properties the standard library exposes are verified
-    // through this held handle rather than by resolving the pathname again.
-    Ok(())
+    if created {
+        files::set_private_windows_dacl_handle(file)
+            .with_context(|| format!("securing backup artifact lock handle {}", path.display()))?;
+    }
+    files::verify_private_windows_dacl_handle(file)
+        .with_context(|| format!("verifying backup artifact lock handle {}", path.display()))
 }
 
 #[cfg(not(any(unix, windows)))]
 fn validate_and_repair_backup_artifact_lock_handle(
     _file: &std::fs::File,
     path: &Path,
+    _created: bool,
 ) -> Result<()> {
     anyhow::bail!(
         "safe backup artifact lock handle validation is unavailable for {}",
         path.display()
     )
-}
-
-#[cfg(unix)]
-fn path_still_names_open_backup_artifact_lock(path: &Path, file: &std::fs::File) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let opened = file
-        .metadata()
-        .with_context(|| format!("inspecting opened backup artifact lock {}", path.display()))?;
-    let current = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "rechecking backup artifact lock pathname {}",
-                    path.display()
-                )
-            });
-        }
-    };
-    Ok(current.file_type().is_file()
-        && !current.file_type().is_symlink()
-        && opened.dev() == current.dev()
-        && opened.ino() == current.ino())
-}
-
-#[cfg(windows)]
-fn path_still_names_open_backup_artifact_lock(path: &Path, file: &std::fs::File) -> Result<bool> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    let opened = file
-        .metadata()
-        .with_context(|| format!("inspecting opened backup artifact lock {}", path.display()))?;
-    let current_file = match open_backup_artifact_lock_nofollow(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("reopening backup artifact lock pathname {}", path.display())
-            });
-        }
-    };
-    let current = current_file.metadata().with_context(|| {
-        format!(
-            "rechecking backup artifact lock pathname {}",
-            path.display()
-        )
-    })?;
-    Ok(current.is_file()
-        && current.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-        && opened.volume_serial_number().is_some()
-        && opened.volume_serial_number() == current.volume_serial_number()
-        && opened.file_index().is_some()
-        && opened.file_index() == current.file_index())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn path_still_names_open_backup_artifact_lock(_path: &Path, _file: &std::fs::File) -> Result<bool> {
-    Ok(false)
 }
 
 impl Drop for BackupArtifactLock {
@@ -3632,24 +3798,76 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn backup_artifact_lock_refuses_post_open_pathname_swap() {
+    fn backup_artifact_lock_refuses_replaceable_parent_identity() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let replaceable = temp.path().join("replaceable");
+        let private = replaceable.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::set_permissions(&replaceable, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let database = private.join("cockpit.db");
+
+        let error = BackupArtifactLock::acquire(&database).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("replaceable through untrusted writable ancestor"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_artifact_lock_refuses_parent_privacy_loss_during_acquire() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("cockpit.db");
-        let lock_path = database.with_extension("backup-artifacts.lock");
-        let displaced = temp.path().join("displaced-backup-artifacts.lock");
-        let replacement = lock_path.clone();
-        let displaced_for_hook = displaced.clone();
+        let parent = temp.path().to_path_buf();
+        let parent_for_hook = parent.clone();
         BACKUP_ARTIFACT_LOCK_AFTER_KERNEL_LOCK_HOOK.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
-                std::fs::rename(&replacement, &displaced_for_hook).unwrap();
-                std::fs::write(&replacement, b"replacement inode").unwrap();
+                std::fs::set_permissions(&parent_for_hook, std::fs::Permissions::from_mode(0o777))
+                    .unwrap();
             }));
         });
 
         let error = BackupArtifactLock::acquire(&database).unwrap_err();
-        assert!(format!("{error:#}").contains("changed identity"));
-        assert!(displaced.is_file());
+        assert!(
+            format!("{error:#}").contains("lost its private-directory invariant"),
+            "unexpected error: {error:#}"
+        );
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn backup_artifact_lock_establishes_private_parent_and_file_dacls() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let lock_path = database.with_extension("backup-artifacts.lock");
+
+        let lock = BackupArtifactLock::acquire(&database).unwrap();
+        files::verify_private_windows_dacl_handle(&lock._parent).unwrap();
+        files::verify_private_windows_dacl_handle(&lock.file).unwrap();
         assert!(lock_path.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn backup_artifact_lock_refuses_hardlinked_occupant() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let lock_path = database.with_extension("backup-artifacts.lock");
+        let other_name = temp.path().join("other-lock-name");
+        std::fs::write(&lock_path, b"occupant").unwrap();
+        std::fs::hard_link(&lock_path, &other_name).unwrap();
+
+        let error = BackupArtifactLock::acquire(&database).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not have exactly one hard link"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(std::fs::read(&other_name).unwrap(), b"occupant");
     }
 
     #[test]

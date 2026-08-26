@@ -83,10 +83,28 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
         "fn verify_daemon_pid_identity",
         "fn read_process_cmdline",
         "fn process_exists",
+        "libc::kill(pid as libc::pid_t, libc::SIGTERM)",
+        "remove_metadata_if_pid_matches",
     ] {
         assert!(
             !daemon.contains(forbidden),
             "daemon lifecycle host primitive leaked back into core: {forbidden}"
+        );
+    }
+    let host = std::fs::read_to_string(
+        workspace_root().join("crates/cockpit-host/src/daemon_lifecycle.rs"),
+    )
+    .expect("read host daemon lifecycle");
+    for required in [
+        "struct DaemonPidReceipt",
+        "fn read_daemon_pid_record",
+        "SYS_pidfd_open",
+        "SYS_pidfd_send_signal",
+        "remove_metadata_if_receipt_matches",
+    ] {
+        assert!(
+            host.contains(required),
+            "stable receipt-bound lifecycle primitive is missing: {required}"
         );
     }
 }

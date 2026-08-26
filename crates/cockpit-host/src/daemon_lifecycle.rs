@@ -8,6 +8,18 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonPidReceipt {
+    pub pid: u32,
+    pub executable: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonPidRecord {
+    Receipt(DaemonPidReceipt),
+    LegacyNumeric(u32),
+}
+
 /// Result of checking whether a PID still names a Cockpit daemon process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PidIdentity {
@@ -17,35 +29,164 @@ pub enum PidIdentity {
     Unverified,
 }
 
-/// Read a decimal PID from a daemon metadata file.
-pub fn read_pid_file(pid_file: &Path) -> Option<u32> {
-    let value = std::fs::read_to_string(pid_file).ok()?;
-    value.lines().next()?.trim().parse().ok()
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct VerifiedDaemonProcess {
+    receipt: DaemonPidReceipt,
+    pidfd: std::os::fd::OwnedFd,
 }
 
-/// Read the canonical executable identity bound to PID publication. Legacy
-/// numeric-only PID files deliberately return `None` and therefore cannot
-/// authorize a signal.
-pub fn read_pid_executable(pid_file: &Path) -> Option<PathBuf> {
+#[cfg(target_os = "linux")]
+impl VerifiedDaemonProcess {
+    pub fn receipt(&self) -> &DaemonPidReceipt {
+        &self.receipt
+    }
+
+    pub fn send_sigterm(&self) -> std::io::Result<()> {
+        pidfd_send_signal(&self.pidfd, libc::SIGTERM)
+    }
+
+    pub fn is_alive(&self) -> bool {
+        pidfd_send_signal(&self.pidfd, 0).is_ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum VerifiedProcessOutcome {
+    Verified(VerifiedDaemonProcess),
+    Identity(PidIdentity),
+}
+
+/// Acquire a stable kernel handle before validating the receipt. The returned
+/// pidfd continues to identify that exact process even if the numeric PID is
+/// later recycled.
+#[cfg(target_os = "linux")]
+pub fn acquire_verified_daemon_process(receipt: &DaemonPidReceipt) -> VerifiedProcessOutcome {
+    if i32::try_from(receipt.pid).is_err() {
+        return VerifiedProcessOutcome::Identity(PidIdentity::Unverified);
+    }
+    let pidfd = match pidfd_open(receipt.pid) {
+        Ok(pidfd) => pidfd,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+            return VerifiedProcessOutcome::Identity(PidIdentity::Missing);
+        }
+        Err(_) => return VerifiedProcessOutcome::Identity(PidIdentity::Unverified),
+    };
+    let identity = verify_cockpit_daemon_pid_identity(receipt.pid, &receipt.executable);
+    if identity != PidIdentity::VerifiedDaemon {
+        return VerifiedProcessOutcome::Identity(identity);
+    }
+    if pidfd_send_signal(&pidfd, 0).is_err() {
+        return VerifiedProcessOutcome::Identity(PidIdentity::Missing);
+    }
+    VerifiedProcessOutcome::Verified(VerifiedDaemonProcess {
+        receipt: receipt.clone(),
+        pidfd,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: pidfd_open returns a new owned descriptor on success.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as libc::c_int;
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, signal: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: the descriptor is a live pidfd; null siginfo and zero flags are
+    // the documented pidfd_send_signal contract.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+pub fn legacy_pid_identity(pid: u32) -> PidIdentity {
+    if process_exists(pid) {
+        PidIdentity::Unverified
+    } else {
+        PidIdentity::Missing
+    }
+}
+
+/// Read a decimal PID from a daemon metadata file.
+pub fn read_pid_file(pid_file: &Path) -> Option<u32> {
+    match read_daemon_pid_record(pid_file)? {
+        DaemonPidRecord::Receipt(receipt) => Some(receipt.pid),
+        DaemonPidRecord::LegacyNumeric(pid) => Some(pid),
+    }
+}
+
+/// Parse PID and executable identity from one immutable file snapshot.
+pub fn read_daemon_pid_record(pid_file: &Path) -> Option<DaemonPidRecord> {
     let value = std::fs::read_to_string(pid_file).ok()?;
     let mut lines = value.lines();
-    lines.next()?.trim().parse::<u32>().ok()?;
-    let executable = PathBuf::from(lines.next()?.trim());
-    (!executable.as_os_str().is_empty()).then_some(executable)
+    let pid = lines.next()?.trim().parse::<u32>().ok()?;
+    let Some(executable) = lines.next() else {
+        return Some(DaemonPidRecord::LegacyNumeric(pid));
+    };
+    let executable = PathBuf::from(executable.trim());
+    if executable.as_os_str().is_empty() || lines.any(|line| !line.trim().is_empty()) {
+        return None;
+    }
+    Some(DaemonPidRecord::Receipt(DaemonPidReceipt {
+        pid,
+        executable,
+    }))
 }
 
 /// Atomically publish a PID together with the exact canonical executable that
 /// owns it. This receipt is the authority later used before signaling.
-pub fn write_pid_file(pid_file: &Path, pid: u32, executable: &Path) -> anyhow::Result<()> {
+pub fn write_pid_file(
+    pid_file: &Path,
+    pid: u32,
+    executable: &Path,
+) -> anyhow::Result<DaemonPidReceipt> {
     let executable = std::fs::canonicalize(executable)?;
     let body = format!("{pid}\n{}\n", executable.display());
-    crate::private_fs::write_private_file(pid_file, body.as_bytes())
+    crate::private_fs::write_private_file(pid_file, body.as_bytes())?;
+    Ok(DaemonPidReceipt { pid, executable })
 }
 
 /// Remove PID and socket metadata only while the PID file still binds the
 /// caller's expected process identity.
-pub fn remove_metadata_if_pid_matches(pid_file: &Path, socket: &Path, expected_pid: u32) -> bool {
-    if read_pid_file(pid_file) != Some(expected_pid) {
+pub fn remove_metadata_if_receipt_matches(
+    pid_file: &Path,
+    socket: &Path,
+    expected: &DaemonPidReceipt,
+) -> bool {
+    if read_daemon_pid_record(pid_file) != Some(DaemonPidRecord::Receipt(expected.clone())) {
+        return false;
+    }
+    let _ = std::fs::remove_file(pid_file);
+    let _ = std::fs::remove_file(socket);
+    true
+}
+
+#[cfg(unix)]
+pub fn remove_dead_legacy_metadata(pid_file: &Path, socket: &Path, expected_pid: u32) -> bool {
+    if read_daemon_pid_record(pid_file) != Some(DaemonPidRecord::LegacyNumeric(expected_pid))
+        || legacy_pid_identity(expected_pid) != PidIdentity::Missing
+    {
         return false;
     }
     let _ = std::fs::remove_file(pid_file);
@@ -93,6 +234,7 @@ fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
 #[cfg(target_os = "macos")]
 fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
+    #[link(name = "proc")]
     unsafe extern "C" {
         fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, size: u32) -> libc::c_int;
     }
@@ -122,8 +264,11 @@ fn read_process_executable(_pid: u32) -> std::io::Result<PathBuf> {
 
 #[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
     // SAFETY: signal 0 performs an existence/permission probe only.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
@@ -277,6 +422,7 @@ fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
 struct EndpointRecord {
     pid: u32,
     socket: PathBuf,
+    executable: PathBuf,
 }
 
 /// Drop guard for foreground-owned PID/socket/endpoint metadata.
@@ -285,23 +431,30 @@ pub struct ForegroundMetadataGuard {
     pid_file: PathBuf,
     socket: PathBuf,
     endpoint_record: Option<PathBuf>,
-    pid: u32,
+    receipt: DaemonPidReceipt,
     armed: bool,
 }
 
 impl ForegroundMetadataGuard {
-    pub fn new(pid_file: PathBuf, socket: PathBuf, endpoint_record: Option<PathBuf>) -> Self {
+    pub fn new(
+        pid_file: PathBuf,
+        socket: PathBuf,
+        endpoint_record: Option<PathBuf>,
+        receipt: DaemonPidReceipt,
+    ) -> Self {
         Self {
             pid_file,
             socket,
             endpoint_record,
-            pid: std::process::id(),
+            receipt,
             armed: true,
         }
     }
 
     pub fn cleanup(&mut self) {
-        if self.armed && remove_metadata_if_pid_matches(&self.pid_file, &self.socket, self.pid) {
+        if self.armed
+            && remove_metadata_if_receipt_matches(&self.pid_file, &self.socket, &self.receipt)
+        {
             self.remove_owned_endpoint_record();
         }
         self.armed = false;
@@ -317,7 +470,10 @@ impl ForegroundMetadataGuard {
         let Ok(record) = serde_json::from_slice::<EndpointRecord>(&bytes) else {
             return;
         };
-        if record.pid == self.pid && record.socket == self.socket {
+        if record.pid == self.receipt.pid
+            && record.socket == self.socket
+            && record.executable == self.receipt.executable
+        {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -377,13 +533,29 @@ mod tests {
         let pid_file = temp.path().join("daemon.pid");
         std::fs::write(&executable, b"executable fixture").expect("executable fixture");
 
-        write_pid_file(&pid_file, 42, &executable).expect("publish pid identity");
+        let receipt = write_pid_file(&pid_file, 42, &executable).expect("publish pid identity");
 
         assert_eq!(read_pid_file(&pid_file), Some(42));
         assert_eq!(
-            read_pid_executable(&pid_file),
-            std::fs::canonicalize(executable).ok()
+            read_daemon_pid_record(&pid_file),
+            Some(DaemonPidRecord::Receipt(receipt))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_legacy_receipt_allows_stale_metadata_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("daemon.sock");
+        let dead_pid = i32::MAX as u32;
+        std::fs::write(&pid_file, dead_pid.to_string()).expect("legacy pid receipt");
+        std::fs::write(&socket, b"stale socket").expect("stale socket");
+
+        assert_eq!(legacy_pid_identity(dead_pid), PidIdentity::Missing);
+        assert!(remove_dead_legacy_metadata(&pid_file, &socket, dead_pid));
+        assert!(!pid_file.exists());
+        assert!(!socket.exists());
     }
 
     #[test]
@@ -392,16 +564,21 @@ mod tests {
         let pid_file = temp.path().join("daemon.pid");
         let socket = temp.path().join("daemon.sock");
         let endpoint = temp.path().join("daemon-endpoint.json");
-        std::fs::write(&pid_file, std::process::id().to_string()).expect("pid file");
+        let executable = std::env::current_exe().expect("test executable");
+        let receipt = write_pid_file(&pid_file, std::process::id(), &executable).expect("pid file");
         std::fs::write(&socket, b"socket metadata").expect("socket metadata");
         std::fs::write(
             &endpoint,
-            serde_json::json!({"pid": std::process::id(), "socket": socket}),
+            serde_json::json!({"pid": receipt.pid, "socket": socket, "executable": receipt.executable.clone()}),
         )
         .expect("endpoint record");
 
-        let mut guard =
-            ForegroundMetadataGuard::new(pid_file.clone(), socket.clone(), Some(endpoint.clone()));
+        let mut guard = ForegroundMetadataGuard::new(
+            pid_file.clone(),
+            socket.clone(),
+            Some(endpoint.clone()),
+            receipt,
+        );
         guard.cleanup();
 
         assert!(!pid_file.exists());
@@ -415,14 +592,15 @@ mod tests {
         let pid_file = temp.path().join("daemon.pid");
         let socket = temp.path().join("daemon.sock");
         let endpoint = temp.path().join("daemon-endpoint.json");
-        std::fs::write(&pid_file, std::process::id().to_string()).expect("pid file");
+        let executable = std::env::current_exe().expect("test executable");
+        let receipt = write_pid_file(&pid_file, std::process::id(), &executable).expect("pid file");
         std::fs::write(
             &endpoint,
-            serde_json::json!({"pid": std::process::id(), "socket": temp.path().join("other.sock")}),
+            serde_json::json!({"pid": receipt.pid, "socket": temp.path().join("other.sock"), "executable": receipt.executable.clone()}),
         )
         .expect("endpoint record");
 
-        ForegroundMetadataGuard::new(pid_file, socket, Some(endpoint.clone())).cleanup();
+        ForegroundMetadataGuard::new(pid_file, socket, Some(endpoint.clone()), receipt).cleanup();
 
         assert!(
             endpoint.exists(),

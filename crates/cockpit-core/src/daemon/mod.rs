@@ -89,16 +89,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 #[cfg(unix)]
-use cockpit_host::daemon_lifecycle::read_pid_executable;
-use cockpit_host::daemon_lifecycle::read_pid_file;
-#[cfg(unix)]
-use cockpit_host::daemon_lifecycle::verify_cockpit_daemon_pid_identity;
+use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
 #[cfg(any(unix, test))]
 use cockpit_host::daemon_lifecycle::write_pid_file;
 #[cfg(any(unix, test))]
 use cockpit_host::daemon_lifecycle::{
-    ForegroundMetadataGuard, PidIdentity, remove_metadata_if_pid_matches,
+    DaemonPidReceipt, ForegroundMetadataGuard, PidIdentity, remove_metadata_if_receipt_matches,
 };
+use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record, read_pid_file};
+#[cfg(target_os = "linux")]
+use cockpit_host::daemon_lifecycle::{VerifiedProcessOutcome, acquire_verified_daemon_process};
+#[cfg(unix)]
+use cockpit_host::daemon_lifecycle::{legacy_pid_identity, verify_cockpit_daemon_pid_identity};
 #[cfg(all(test, unix))]
 use cockpit_host::daemon_lifecycle::{parse_macos_procargs2, split_proc_cmdline};
 use cockpit_host::private_fs::ensure_private_dir;
@@ -177,6 +179,7 @@ struct DaemonEndpointRecord {
     version: u8,
     pid: u32,
     socket: PathBuf,
+    executable: PathBuf,
     kind: DaemonEndpointKind,
 }
 
@@ -237,21 +240,19 @@ fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
 
 #[cfg(any(unix, test))]
 fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
-    write_endpoint_record_with_pid(paths, std::process::id())
-}
-
-#[cfg(any(unix, test))]
-fn write_endpoint_record_with_pid(paths: &DaemonPaths, pid: u32) -> Result<()> {
+    let Some(DaemonPidRecord::Receipt(receipt)) = read_daemon_pid_record(&paths.pid_file) else {
+        anyhow::bail!("daemon PID receipt is missing before endpoint publication");
+    };
     let canonical = DaemonPaths::resolve_canonical()
         .context("resolving canonical daemon paths for endpoint publication")?;
-    write_endpoint_record_with_pid_and_canonical(paths, &canonical, pid)
+    write_endpoint_record_with_receipt_and_canonical(paths, &canonical, &receipt)
 }
 
 #[cfg(any(unix, test))]
-fn write_endpoint_record_with_pid_and_canonical(
+fn write_endpoint_record_with_receipt_and_canonical(
     paths: &DaemonPaths,
     canonical: &DaemonPaths,
-    pid: u32,
+    receipt: &DaemonPidReceipt,
 ) -> Result<()> {
     if paths.ephemeral {
         return Ok(());
@@ -265,8 +266,9 @@ fn write_endpoint_record_with_pid_and_canonical(
     }
     let record = DaemonEndpointRecord {
         version: 1,
-        pid,
+        pid: receipt.pid,
         socket: paths.socket.clone(),
+        executable: receipt.executable.clone(),
         kind: DaemonEndpointKind::Persistent,
     };
     let Some(state) = paths.pid_file.parent() else {
@@ -278,13 +280,6 @@ fn write_endpoint_record_with_pid_and_canonical(
     let path = endpoint_file_for_state(state);
     let data = serde_json::to_vec_pretty(&record).context("serializing daemon endpoint")?;
     std::fs::write(&path, data).with_context(|| format!("writing {}", path.display()))
-}
-
-#[cfg(any(unix, test))]
-fn remove_endpoint_record_unverified() {
-    if let Ok(path) = endpoint_file() {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 impl DaemonPaths {
@@ -663,36 +658,23 @@ fn socket_responds_blocking(_socket: &Path) -> Option<SocketHelloResponse> {
 
 #[cfg(unix)]
 fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
-    status_for_unreachable_pid_with_cleanup(paths, remove_endpoint_record_unverified)
-}
-
-#[cfg(unix)]
-fn status_for_unreachable_pid_with_cleanup(
-    paths: &DaemonPaths,
-    cleanup: impl FnOnce(),
-) -> DaemonStatus {
-    let Some(pid) = read_pid_file(&paths.pid_file) else {
+    let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
         return DaemonStatus::Stale;
     };
-    status_for_pid_identity(published_executable_pid_identity(paths, pid), cleanup)
-}
-
-#[cfg(unix)]
-fn published_executable_pid_identity(paths: &DaemonPaths, pid: u32) -> PidIdentity {
-    let Some(approved_executable) = read_pid_executable(&paths.pid_file) else {
-        return PidIdentity::Unverified;
+    let identity = match record {
+        DaemonPidRecord::Receipt(receipt) => {
+            verify_cockpit_daemon_pid_identity(receipt.pid, &receipt.executable)
+        }
+        DaemonPidRecord::LegacyNumeric(pid) => legacy_pid_identity(pid),
     };
-    verify_cockpit_daemon_pid_identity(pid, &approved_executable)
+    status_for_pid_identity(identity)
 }
 
 #[cfg(unix)]
-fn status_for_pid_identity(identity: PidIdentity, cleanup: impl FnOnce()) -> DaemonStatus {
+fn status_for_pid_identity(identity: PidIdentity) -> DaemonStatus {
     match identity {
         PidIdentity::VerifiedDaemon => DaemonStatus::LivePidSocketUnreachable,
-        PidIdentity::Missing | PidIdentity::NotDaemon => {
-            cleanup();
-            DaemonStatus::Stale
-        }
+        PidIdentity::Missing | PidIdentity::NotDaemon => DaemonStatus::Stale,
         PidIdentity::Unverified => DaemonStatus::UnverifiedPid,
     }
 }
@@ -824,11 +806,6 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
                 );
             }
             if !canonical.socket.exists() && canonical.pid_file.exists() {
-                #[cfg(unix)]
-                let status = status_for_unreachable_pid_with_cleanup(&canonical, || {
-                    let _ = std::fs::remove_file(&endpoint);
-                });
-                #[cfg(not(unix))]
                 let status = status_for_unreachable_pid(&canonical);
                 return DaemonProbe::new(status, recorded);
             }
@@ -1301,7 +1278,7 @@ async fn run_foreground_inner_with_boot_db(
     // Clear any stale leftover.
     let _ = std::fs::remove_file(&paths.socket);
     let executable = std::env::current_exe().context("resolving daemon executable identity")?;
-    write_pid_file(&paths.pid_file, std::process::id(), &executable)
+    let pid_receipt = write_pid_file(&paths.pid_file, std::process::id(), &executable)
         .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
     let endpoint_record = if !paths.ephemeral
         && DaemonPaths::resolve_canonical()
@@ -1316,6 +1293,7 @@ async fn run_foreground_inner_with_boot_db(
         paths.pid_file.clone(),
         paths.socket.clone(),
         endpoint_record,
+        pid_receipt.clone(),
     );
 
     let uses_supplied_boot_db = boot_db.is_some();
@@ -1346,7 +1324,7 @@ async fn run_foreground_inner_with_boot_db(
     // before database/config initialization creates a startup handshake race.
     let listener = bind_private_socket(&paths.socket)?;
     if uses_supplied_boot_db {
-        write_endpoint_record_with_pid_and_canonical(&paths, &paths, std::process::id())?;
+        write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
     } else {
         write_endpoint_record(&paths)?;
     }
@@ -1694,74 +1672,50 @@ async fn idle_watchdog(
 
 /// Kill the running daemon (if any) and clean up its pid + socket files.
 pub fn stop(paths: &DaemonPaths) -> Result<bool> {
-    let Some(pid) = read_pid_file(&paths.pid_file) else {
+    let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
         return Ok(false);
     };
-    #[cfg(unix)]
-    return stop_unix_with(
-        paths,
-        pid,
-        |pid| published_executable_pid_identity(paths, pid),
-        send_sigterm,
-        || paths.pid_file.exists(),
-    );
+    #[cfg(target_os = "linux")]
+    return stop_linux(paths, record);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    return stop_unix_without_stable_handle(paths, record);
     #[cfg(not(unix))]
     {
-        let _ = pid;
+        let _ = record;
         let _ = std::fs::remove_file(&paths.pid_file);
         let _ = std::fs::remove_file(&paths.socket);
         Ok(true)
     }
 }
 
-#[cfg(unix)]
-fn stop_unix_with(
-    paths: &DaemonPaths,
-    pid: u32,
-    verify: impl Fn(u32) -> PidIdentity,
-    signal: impl Fn(u32) -> Result<()>,
-    pid_file_exists: impl Fn() -> bool,
-) -> Result<bool> {
-    stop_unix_with_timeout(
-        paths,
-        pid,
-        verify,
-        signal,
-        pid_file_exists,
-        restart_release_timeout(None),
-    )
-}
-
-#[cfg(unix)]
-fn stop_unix_with_timeout(
-    paths: &DaemonPaths,
-    pid: u32,
-    verify: impl Fn(u32) -> PidIdentity,
-    signal: impl Fn(u32) -> Result<()>,
-    pid_file_exists: impl Fn() -> bool,
-    timeout: Duration,
-) -> Result<bool> {
-    match verify(pid) {
-        PidIdentity::VerifiedDaemon => {}
-        PidIdentity::Missing | PidIdentity::NotDaemon => {
-            remove_metadata_if_pid_matches(&paths.pid_file, &paths.socket, pid);
+#[cfg(target_os = "linux")]
+fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
+    let receipt = match record {
+        DaemonPidRecord::LegacyNumeric(pid) => return settle_legacy_stop(paths, pid),
+        DaemonPidRecord::Receipt(receipt) => receipt,
+    };
+    let process = match acquire_verified_daemon_process(&receipt) {
+        VerifiedProcessOutcome::Verified(process) => process,
+        VerifiedProcessOutcome::Identity(PidIdentity::Missing | PidIdentity::NotDaemon) => {
+            cleanup_receipt_metadata(paths, &receipt);
             return Ok(false);
         }
-        PidIdentity::Unverified => {
-            anyhow::bail!(
-                "refusing to signal pid {pid}: daemon process identity could not be verified"
-            );
+        VerifiedProcessOutcome::Identity(PidIdentity::Unverified) => {
+            anyhow::bail!("refusing to signal daemon: PID receipt could not be verified");
         }
-    }
-
-    // SIGTERM is graceful — the daemon may legitimately need the full drain
-    // window before its metadata guard removes the pid/socket files. Never
-    // unlink matching metadata while that verified process remains alive:
-    // doing so would let a replacement start against the same database.
-    signal(pid)?;
-    let deadline = std::time::Instant::now() + timeout;
+        VerifiedProcessOutcome::Identity(PidIdentity::VerifiedDaemon) => unreachable!(),
+    };
+    process.send_sigterm().with_context(|| {
+        format!(
+            "signaling daemon PID {} through its stable pidfd",
+            receipt.pid
+        )
+    })?;
+    let deadline = std::time::Instant::now() + restart_release_timeout(None);
     loop {
-        if !pid_file_exists() || read_pid_file(&paths.pid_file) != Some(pid) {
+        if read_daemon_pid_record(&paths.pid_file)
+            != Some(DaemonPidRecord::Receipt(receipt.clone()))
+        {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -1772,27 +1726,70 @@ fn stop_unix_with_timeout(
                 .min(deadline.saturating_duration_since(std::time::Instant::now())),
         );
     }
-    match verify(pid) {
-        PidIdentity::Missing | PidIdentity::NotDaemon => {
-            remove_metadata_if_pid_matches(&paths.pid_file, &paths.socket, pid);
-            Ok(true)
+    if process.is_alive() {
+        anyhow::bail!(
+            "timed out waiting for daemon PID {} to stop; preserving its receipt and socket metadata",
+            receipt.pid
+        );
+    }
+    cleanup_receipt_metadata(paths, &receipt);
+    Ok(true)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stop_unix_without_stable_handle(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
+    match record {
+        DaemonPidRecord::LegacyNumeric(pid) => settle_legacy_stop(paths, pid),
+        DaemonPidRecord::Receipt(receipt) => {
+            match verify_cockpit_daemon_pid_identity(receipt.pid, &receipt.executable) {
+                PidIdentity::Missing | PidIdentity::NotDaemon => {
+                    cleanup_receipt_metadata(paths, &receipt);
+                    Ok(false)
+                }
+                PidIdentity::VerifiedDaemon | PidIdentity::Unverified => anyhow::bail!(
+                    "daemon PID {} is live but this platform has no stable process handle; refusing numeric signaling",
+                    receipt.pid
+                ),
+            }
         }
-        PidIdentity::VerifiedDaemon => anyhow::bail!(
-            "timed out waiting for daemon pid {pid} to stop; preserving its pid and socket metadata"
-        ),
-        PidIdentity::Unverified => anyhow::bail!(
-            "daemon pid {pid} did not stop and its identity can no longer be verified; preserving metadata"
-        ),
     }
 }
 
 #[cfg(unix)]
-fn send_sigterm(pid: u32) -> Result<()> {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error()).with_context(|| format!("signaling pid {pid}"))
+fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
+    match legacy_pid_identity(pid) {
+        PidIdentity::Missing => {
+            remove_dead_legacy_metadata(&paths.pid_file, &paths.socket, pid);
+            Ok(false)
+        }
+        PidIdentity::VerifiedDaemon | PidIdentity::NotDaemon | PidIdentity::Unverified => {
+            anyhow::bail!(
+                "legacy numeric-only daemon PID {pid} is live; refusing unbound numeric signaling"
+            )
+        }
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_receipt_metadata(paths: &DaemonPaths, receipt: &DaemonPidReceipt) {
+    if !remove_metadata_if_receipt_matches(&paths.pid_file, &paths.socket, receipt) {
+        return;
+    }
+    if paths.ephemeral {
+        return;
+    }
+    let Some(state) = paths.pid_file.parent() else {
+        return;
+    };
+    let endpoint = endpoint_file_for_state(state);
+    let Some(record) = read_endpoint_record_from(&endpoint) else {
+        return;
+    };
+    if record.pid == receipt.pid
+        && record.socket == paths.socket
+        && record.executable == receipt.executable
+    {
+        let _ = std::fs::remove_file(endpoint);
     }
 }
 
@@ -1954,7 +1951,8 @@ mod tests {
         let paths = canonical_in(&state_home, &runtime_a);
         assert_eq!(paths.socket, socket_a);
         std::fs::write(&paths.pid_file, std::process::id().to_string()).expect("pid file");
-        write_endpoint_record_with_pid_and_canonical(&paths, &paths, std::process::id())
+        let receipt = test_pid_receipt(std::process::id());
+        write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &receipt)
             .expect("endpoint record");
 
         let canonical_b = canonical_in(&state_home, &runtime_b);
@@ -2021,7 +2019,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stale_endpoint_with_missing_pid_is_removed_without_signaling() {
+    fn stale_endpoint_without_bound_receipt_is_preserved_without_signaling() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
@@ -2031,6 +2029,7 @@ mod tests {
             version: 1,
             pid: 999999999,
             socket: runtime_dir.join("other/cockpit.sock"),
+            executable: test_pid_receipt(999999999).executable,
             kind: DaemonEndpointKind::Persistent,
         };
         let endpoint = endpoint_file_for_state(paths.pid_file.parent().unwrap());
@@ -2038,7 +2037,10 @@ mod tests {
 
         let probe = discover_blocking_with_canonical(paths);
         assert_eq!(probe.status, DaemonStatus::Stale);
-        assert!(!endpoint.exists());
+        assert!(
+            endpoint.exists(),
+            "unbound endpoint cleanup must fail closed"
+        );
     }
 
     #[test]
@@ -2049,8 +2051,12 @@ mod tests {
         let eph = DaemonPaths::allocate_ephemeral_for_test_in(111, &state_home, Some(&runtime_dir))
             .expect("ephemeral");
         let canonical = canonical_in(&state_home, &runtime_dir);
-        write_endpoint_record_with_pid_and_canonical(&eph, &canonical, std::process::id())
-            .expect("skip endpoint");
+        write_endpoint_record_with_receipt_and_canonical(
+            &eph,
+            &canonical,
+            &test_pid_receipt(std::process::id()),
+        )
+        .expect("skip endpoint");
         assert!(!endpoint_file_for_state(canonical.pid_file.parent().unwrap()).exists());
     }
 
@@ -2066,10 +2072,10 @@ mod tests {
         };
         let canonical = canonical_in(&state_home, &runtime_dir);
 
-        let err = write_endpoint_record_with_pid_and_canonical(
+        let err = write_endpoint_record_with_receipt_and_canonical(
             &noncanonical,
             &canonical,
-            std::process::id(),
+            &test_pid_receipt(std::process::id()),
         )
         .expect_err("noncanonical write rejected");
         assert!(
@@ -2085,7 +2091,8 @@ mod tests {
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
         let canonical = canonical_in(&state_home, &runtime_dir);
-        write_endpoint_record_with_pid_and_canonical(&canonical, &canonical, std::process::id())
+        let receipt = test_pid_receipt(std::process::id());
+        write_endpoint_record_with_receipt_and_canonical(&canonical, &canonical, &receipt)
             .expect("endpoint record");
         let endpoint = endpoint_file_for_state(canonical.pid_file.parent().unwrap());
         assert!(endpoint.exists());
@@ -2095,10 +2102,14 @@ mod tests {
             socket: canonical.socket.clone(),
             ephemeral: false,
         };
-        std::fs::write(&noncanonical.pid_file, std::process::id().to_string())
-            .expect("noncanonical pid file");
+        let receipt = write_pid_file(
+            &noncanonical.pid_file,
+            std::process::id(),
+            &std::env::current_exe().unwrap(),
+        )
+        .expect("noncanonical pid file");
         let mut guard =
-            ForegroundMetadataGuard::new(noncanonical.pid_file, noncanonical.socket, None);
+            ForegroundMetadataGuard::new(noncanonical.pid_file, noncanonical.socket, None, receipt);
         guard.cleanup();
 
         assert!(
@@ -2121,8 +2132,12 @@ mod tests {
         wait_for_socket(&socket_a);
 
         let paths_a = canonical_in(&state_home, &runtime_a);
-        write_endpoint_record_with_pid_and_canonical(&paths_a, &paths_a, std::process::id())
-            .expect("endpoint record");
+        write_endpoint_record_with_receipt_and_canonical(
+            &paths_a,
+            &paths_a,
+            &test_pid_receipt(std::process::id()),
+        )
+        .expect("endpoint record");
 
         let paths_b = canonical_in(&state_home, &runtime_b);
         assert_ne!(paths_b.socket, socket_a);
@@ -2572,174 +2587,56 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn stop_verified_daemon_sends_sigterm() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-        let signaled = std::cell::Cell::new(false);
-
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::VerifiedDaemon,
-            |_| {
-                signaled.set(true);
-                Ok(())
-            },
-            || false,
-        )
-        .unwrap();
-
-        assert!(stopped);
-        assert!(signaled.get());
+    fn test_pid_receipt(pid: u32) -> DaemonPidReceipt {
+        DaemonPidReceipt {
+            pid,
+            executable: std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn stop_reused_pid_cleans_metadata_without_signal() {
+    fn live_legacy_numeric_pid_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-        std::fs::write(&paths.socket, "").unwrap();
+        std::fs::write(&paths.pid_file, std::process::id().to_string()).unwrap();
 
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::NotDaemon,
-            |_| panic!("must not signal an unrelated process"),
-            || true,
-        )
-        .unwrap();
+        let error = settle_legacy_stop(&paths, std::process::id()).unwrap_err();
 
-        assert!(!stopped);
-        assert!(!paths.pid_file.exists());
-        assert!(!paths.socket.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_missing_pid_cleans_metadata_without_signal() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::Missing,
-            |_| panic!("must not signal a missing process"),
-            || true,
-        )
-        .unwrap();
-
-        assert!(!stopped);
-        assert!(!paths.pid_file.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_cleanup_does_not_remove_replaced_pid_or_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "456").unwrap();
-        std::fs::write(&paths.socket, "new socket").unwrap();
-
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::NotDaemon,
-            |_| panic!("must not signal an unrelated process"),
-            || true,
-        )
-        .unwrap();
-
-        assert!(!stopped);
-        assert_eq!(std::fs::read_to_string(&paths.pid_file).unwrap(), "456");
-        assert_eq!(
-            std::fs::read_to_string(&paths.socket).unwrap(),
-            "new socket"
+        assert!(
+            error
+                .to_string()
+                .contains("refusing unbound numeric signaling")
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_timeout_cleanup_does_not_remove_new_daemon_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "456").unwrap();
-        std::fs::write(&paths.socket, "new socket").unwrap();
-
-        let stopped = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::VerifiedDaemon,
-            |_| Ok(()),
-            || true,
-        )
-        .unwrap();
-
-        assert!(stopped);
-        assert_eq!(std::fs::read_to_string(&paths.pid_file).unwrap(), "456");
-        assert_eq!(
-            std::fs::read_to_string(&paths.socket).unwrap(),
-            "new socket"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_timeout_preserves_matching_live_daemon_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-        std::fs::write(&paths.socket, "live socket").unwrap();
-
-        let error = stop_unix_with_timeout(
-            &paths,
-            123,
-            |_| PidIdentity::VerifiedDaemon,
-            |_| Ok(()),
-            || true,
-            Duration::ZERO,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("preserving"));
-        assert_eq!(std::fs::read_to_string(&paths.pid_file).unwrap(), "123");
-        assert_eq!(
-            std::fs::read_to_string(&paths.socket).unwrap(),
-            "live socket"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_unverified_pid_fails_closed_without_cleanup_or_signal() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        std::fs::write(&paths.pid_file, "123").unwrap();
-
-        let err = stop_unix_with(
-            &paths,
-            123,
-            |_| PidIdentity::Unverified,
-            |_| panic!("must not signal an unverified process"),
-            || true,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("could not be verified"));
         assert!(paths.pid_file.exists());
     }
 
     #[cfg(unix)]
     #[test]
+    fn receipt_cleanup_rejects_replaced_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let executable = std::env::current_exe().unwrap();
+        let old = write_pid_file(&paths.pid_file, 123, &executable).unwrap();
+        let replacement = write_pid_file(&paths.pid_file, 456, &executable).unwrap();
+        std::fs::write(&paths.socket, "replacement socket").unwrap();
+
+        cleanup_receipt_metadata(&paths, &old);
+
+        assert_eq!(
+            read_daemon_pid_record(&paths.pid_file),
+            Some(DaemonPidRecord::Receipt(replacement))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths.socket).unwrap(),
+            "replacement socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unreachable_unverified_pid_is_not_reported_stale() {
-        let status = status_for_pid_identity(PidIdentity::Unverified, || {
-            panic!("unverified live pid must not be cleaned up as stale")
-        });
+        let status = status_for_pid_identity(PidIdentity::Unverified);
 
         assert_eq!(status, DaemonStatus::UnverifiedPid);
     }

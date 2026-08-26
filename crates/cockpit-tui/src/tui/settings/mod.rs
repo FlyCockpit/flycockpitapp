@@ -8,7 +8,8 @@
 //!   - `Dialog::CreateConfig`    no config yet — pick a location to scaffold
 //!   - `Dialog::Settings`        navigate the settings tree
 //!
-//! The Settings page tree (root has 16 nodes; see `root_nodes()`):
+//! The Settings page tree has 15 default-profile nodes and one additional
+//! extended-profile node; see `root_nodes()`:
 //!
 //! ```text
 //! Root
@@ -7672,9 +7673,13 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 /// `Default model for new sessions` leads, then the locked scheme in order;
 /// MCP/LSP are kept as extra nodes so integration settings stay reachable
 /// from the menu.
-fn root_nodes() -> [NavNode; 16] {
+#[cfg(feature = "extended")]
+const ROOT_NODE_COUNT: usize = 16;
+#[cfg(not(feature = "extended"))]
+const ROOT_NODE_COUNT: usize = 15;
+
+fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
     [
-        #[cfg(feature = "extended")]
         NavNode {
             id: pointer_actions::RootNodeId::DefaultModel,
             title: pointer_actions::RootNodeId::DefaultModel.title(),
@@ -7705,6 +7710,7 @@ fn root_nodes() -> [NavNode; 16] {
             title: "Behavior",
             description: "Session & agent behavior: default agent, llm mode, approval mode, plan isolation, prediction, shell compression, the utility model, instructions files, and (Advanced) tuning + plan-execution knobs.",
         },
+        #[cfg(feature = "extended")]
         NavNode {
             id: pointer_actions::RootNodeId::ImageSpend,
             title: "Image spend budgets",

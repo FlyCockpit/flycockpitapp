@@ -5848,6 +5848,32 @@ fn root_menu_exposes_the_default_model_row_first() {
     assert!(matches!(d.test_page(), TestPageRef::Root { cursor: 0 }));
 }
 
+#[cfg(not(feature = "extended"))]
+#[test]
+fn root_menu_inventory_matches_the_default_profile() {
+    let nodes = root_nodes();
+    assert_eq!(nodes.len(), 15);
+    assert_eq!(nodes[0].id, pointer_actions::RootNodeId::DefaultModel);
+    assert!(
+        nodes
+            .iter()
+            .all(|node| node.id != pointer_actions::RootNodeId::ImageSpend)
+    );
+}
+
+#[cfg(feature = "extended")]
+#[test]
+fn root_menu_inventory_adds_image_spend_in_extended_profile() {
+    let nodes = root_nodes();
+    assert_eq!(nodes.len(), 16);
+    assert_eq!(nodes[0].id, pointer_actions::RootNodeId::DefaultModel);
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.id == pointer_actions::RootNodeId::ImageSpend)
+    );
+}
+
 #[test]
 fn default_model_row_shows_the_effective_default_and_opens_the_shared_picker() {
     let tmp = TempDir::new().unwrap();

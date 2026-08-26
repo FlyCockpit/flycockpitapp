@@ -2044,9 +2044,9 @@ fn button_row(choice: ConfirmChoice) -> Line<'static> {
 }
 
 /// Absolute, human-readable local timestamp for `last_active_at`.
-fn fmt_time(epoch: i64) -> String {
+fn fmt_time(epoch_unix_ms: i64) -> String {
     use chrono::{Local, TimeZone};
-    match Local.timestamp_opt(epoch, 0).single() {
+    match Local.timestamp_millis_opt(epoch_unix_ms).single() {
         Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
         None => "—".to_string(),
     }
@@ -2054,9 +2054,15 @@ fn fmt_time(epoch: i64) -> String {
 
 /// `<relative> · <absolute>` for `last_active_at`, computed against the
 /// current wall clock.
-fn fmt_time_with_relative(epoch: i64) -> String {
-    let elapsed = chrono::Utc::now().timestamp() - epoch;
-    format!("{} · {}", relative_time(elapsed), fmt_time(epoch))
+fn fmt_time_with_relative(epoch_unix_ms: i64) -> String {
+    let elapsed_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_sub(epoch_unix_ms);
+    format!(
+        "{} · {}",
+        relative_time(elapsed_ms / 1_000),
+        fmt_time(epoch_unix_ms)
+    )
 }
 
 /// Hand-rolled coarse "time ago" string from an elapsed duration in seconds
@@ -2432,7 +2438,7 @@ mod tests {
         use chrono::{Local, TimeZone};
 
         const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
-        let now_ms = 1_700_000_000_000;
+        let now_ms = 1_700_000_000_000_000;
         let older_ms = now_ms - 7 * DAY_MS - 1;
         let mut pane = preview_with_messages(vec![
             SessionMessage {
@@ -2686,7 +2692,7 @@ mod tests {
 
     #[test]
     fn card_fields_assemble() {
-        let mut s = summary(Uuid::new_v4(), 1_700_000_000);
+        let mut s = summary(Uuid::new_v4(), 1_700_000_000_000);
         s.title = Some("fix the parser".into());
         s.fork_count = 2;
         let text: String = card_lines(&s, Tier::Unread, true, true, 60, true)
@@ -2711,7 +2717,7 @@ mod tests {
 
     #[test]
     fn pending_card_renders_interrupt_count() {
-        let mut s = summary(Uuid::new_v4(), 1_700_000_000);
+        let mut s = summary(Uuid::new_v4(), 1_700_000_000_000);
         s.open_interrupts = 3;
         let text: String = card_lines(&s, Tier::PendingQuestion, false, false, 60, false)
             .iter()
@@ -2742,7 +2748,7 @@ mod tests {
     #[test]
     fn card_shows_pin_count_only_when_nonzero() {
         let render = |n: u32| -> String {
-            let mut s = summary(Uuid::new_v4(), 1_700_000_000);
+            let mut s = summary(Uuid::new_v4(), 1_700_000_000_000);
             s.pin_count = n;
             card_lines(&s, Tier::Idle, false, false, 60, true)
                 .iter()
@@ -2765,7 +2771,7 @@ mod tests {
 
     #[test]
     fn card_pin_count_honors_emoji_setting() {
-        let mut s = summary(Uuid::new_v4(), 1_700_000_000);
+        let mut s = summary(Uuid::new_v4(), 1_700_000_000_000);
         s.pin_count = 3;
         let render = |use_emojis: bool| -> String {
             card_lines(&s, Tier::Idle, false, false, 60, use_emojis)
@@ -3388,7 +3394,7 @@ mod tests {
             last_preview_height: 0,
             last_preview_rows: 0,
             last_preview_reached_top: false,
-            preview_clock_ms: || 1_700_000_000_000,
+            preview_clock_ms: || 1_700_000_000_000_000,
             last_card_click: None,
             confirm_buttons: crate::tui::button::ButtonRegistry::default(),
             pointer_capture: false,

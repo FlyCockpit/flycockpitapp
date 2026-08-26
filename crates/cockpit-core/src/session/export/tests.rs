@@ -102,7 +102,7 @@ async fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> Sessio
             None,
             false,
             Uuid::new_v4(),
-            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp_millis(),
         )
     })
     .await

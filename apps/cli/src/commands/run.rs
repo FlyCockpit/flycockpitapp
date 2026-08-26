@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
-use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, run_owned_daemon};
+use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient};
 use crate::daemon::proto::{self, Request, Response};
 
 #[derive(Debug, thiserror::Error)]
@@ -65,7 +65,7 @@ impl RunPreflightFailure {
     }
 }
 
-async fn emit_org_logging_indicator_via_daemon(client: &cockpit_client::DaemonClient, cwd: &Path) {
+async fn emit_org_logging_indicator_via_daemon(client: &ScopedDaemonClient<'_>, cwd: &Path) {
     let project_root = cwd.display().to_string();
     let response = client
         .request(crate::daemon::proto::Request::GetStartupDisclosures { project_root })
@@ -84,7 +84,7 @@ async fn emit_org_logging_indicator_via_daemon(client: &cockpit_client::DaemonCl
 }
 
 async fn enforce_noninteractive_workspace_trust_via_daemon(
-    client: &cockpit_client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     cwd: &Path,
 ) -> Result<()> {
     let trust_root = crate::config::trust::resolve_trust_root(cwd)?;
@@ -123,7 +123,7 @@ async fn enforce_noninteractive_workspace_trust_via_daemon(
 
 async fn resolve_requested_session_via_daemon(
     args: &RunArgs,
-    client: &cockpit_client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     root: &Path,
 ) -> Result<Option<Uuid>> {
     if let Some(session) = &args.session {
@@ -237,14 +237,14 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         OwnedSessionMode::AttachOrEphemeral
     };
 
-    let result = run_owned_daemon(mode, |client| {
+    let result = crate::daemon::client::run_owned_daemon(mode, |client| {
         Box::pin(async move {
             // Preflight via daemon RPCs — the CLI never opens SQLite.
-            emit_org_logging_indicator_via_daemon(client, &cwd).await;
-            enforce_noninteractive_workspace_trust_via_daemon(client, &cwd)
+            emit_org_logging_indicator_via_daemon(&client, &cwd).await;
+            enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd)
                 .await
                 .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
-            let requested_session = resolve_requested_session_via_daemon(&args, client, &cwd)
+            let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
                 .await
                 .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
             let image_files = resolve_attachment_paths(&cwd, &args.file)
@@ -254,7 +254,7 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
             })?;
 
             run_turn(
-                client,
+                &client,
                 &args,
                 prompt,
                 no_sandbox,
@@ -373,7 +373,7 @@ fn finish_owned_run<T>(
 /// Attach, send the prompt, pump events. Split out so the `?` operators
 /// unwind through [`run`]'s guard rather than skipping it.
 async fn run_turn(
-    client: &cockpit_client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     args: &RunArgs,
     prompt: String,
     no_sandbox: bool,
@@ -407,7 +407,7 @@ async fn run_turn(
 /// the daemon. The caller owns the daemon lifecycle (probe/spawn +
 /// ephemeral guard).
 pub(crate) async fn attach_send_pump(
-    client: &cockpit_client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     prompt: String,
     no_sandbox: bool,
     format: OutputFormat,
@@ -751,7 +751,7 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
 }
 
 async fn load_and_upload_images(
-    client: &cockpit_client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     images: &[Vec<u8>],
 ) -> Result<Vec<proto::ImageAttachmentRef>> {
     let typed = images
@@ -873,7 +873,7 @@ fn validate_ephemeral_continuation(args: &RunArgs) -> Result<()> {
 }
 
 pub(crate) async fn pump_events(
-    client: &cockpit_client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     session_id: Uuid,
     format: OutputFormat,
     verbose_json: bool,
@@ -1052,7 +1052,7 @@ fn disconnect_status_guidance(id: Uuid) -> String {
 
 /// First-SIGINT reconciliation: cancel then status on the same identity.
 async fn reconcile_after_interrupt(
-    client: &cockpit_client::DaemonClient,
+    client: &ScopedDaemonClient<'_>,
     id: Uuid,
     format: OutputFormat,
     stderr: &mut impl Write,
@@ -1442,7 +1442,7 @@ fn sanitize_terminal_text(input: &str) -> String {
     out
 }
 
-async fn is_processing(client: &cockpit_client::DaemonClient, session_id: Uuid) -> Result<bool> {
+async fn is_processing(client: &ScopedDaemonClient<'_>, session_id: Uuid) -> Result<bool> {
     match client
         .request_ok(Request::SessionLiveStatus {
             session_ids: vec![session_id],

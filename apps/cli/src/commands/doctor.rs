@@ -26,7 +26,7 @@ pub struct DoctorChecksFailed;
 pub struct DoctorCouldNotRun(#[source] pub anyhow::Error);
 
 use crate::cli::DoctorArgs;
-use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, run_owned_daemon};
+use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode};
 use crate::daemon::proto::{Request, Response};
 
 const DIAGNOSTIC_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,18 +73,23 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
             })?;
         return finish_snapshot(worker.rendered, worker.has_failures);
     }
-    let response = match run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
-        Box::pin(async {
-            client
-                .request(build_doctor_request(&args, no_sandbox))
-                .await
-                .map_err(DoctorCouldNotRun)?
-                .map_err(|error| {
-                    DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
-                })
-                .map_err(anyhow::Error::from)
-        })
-    })
+    let response = match crate::daemon::client::run_owned_daemon(
+        OwnedSessionMode::AttachOrEphemeral,
+        |client| {
+            Box::pin(async {
+                client
+                    .request(build_doctor_request(&args, no_sandbox))
+                    .await
+                    .map_err(DoctorCouldNotRun)?
+                    .map_err(|error| {
+                        DoctorCouldNotRun(anyhow::anyhow!(
+                            "daemon rejected doctor snapshot: {error}"
+                        ))
+                    })
+                    .map_err(anyhow::Error::from)
+            })
+        },
+    )
     .await
     {
         Ok(response) => response,

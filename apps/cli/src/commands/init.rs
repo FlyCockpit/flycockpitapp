@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use cockpit_core::init::{InitMode, build_init_prompt, display_target, resolve_target};
 
 use crate::cli::InitArgs;
-use crate::daemon::client::{OwnedSessionMode, run_owned_daemon};
+use crate::daemon::client::OwnedSessionMode;
 
 /// `cockpit init [path]` — headless. Resolves the target, refuses to
 /// clobber an existing file unless `--force` (no interactive prompt in
@@ -58,9 +58,9 @@ pub async fn run(args: InitArgs, no_sandbox: bool) -> Result<()> {
         OwnedSessionMode::AttachOrEphemeral
     };
     eprintln!("Exploring the project and writing `{shown}`…");
-    let exit_code = run_owned_daemon(mode_lc, |client| {
+    let exit_code = crate::daemon::client::run_owned_daemon(mode_lc, |client| {
         Box::pin(crate::commands::run::attach_send_pump(
-            client,
+            &client,
             prompt,
             no_sandbox,
             crate::cli::OutputFormat::Default,

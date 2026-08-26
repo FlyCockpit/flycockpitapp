@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::cli::{InvocationCancelArgs, InvocationCommand, InvocationStatusArgs, OutputFormat};
-use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, run_owned_daemon};
+use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode};
 use crate::daemon::proto::{self, Request, Response};
 
 pub async fn run(cmd: InvocationCommand) -> Result<()> {
@@ -18,31 +18,32 @@ async fn status(args: InvocationStatusArgs) -> Result<()> {
     let id = parse_canonical_uuid(&args.client_submission_id).map_err(|e| {
         exit_usage(2, &e);
     })?;
-    let result = run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
-        Box::pin(async move {
-            match client
-                .request(Request::GetRunInvocationStatus {
-                    client_submission_id: id,
-                })
-                .await
-            {
-                Ok(Ok(Response::RunInvocationStatus { status })) => {
-                    print_status(args.format, &status)
+    let result =
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
+            Box::pin(async move {
+                match client
+                    .request(Request::GetRunInvocationStatus {
+                        client_submission_id: id,
+                    })
+                    .await
+                {
+                    Ok(Ok(Response::RunInvocationStatus { status })) => {
+                        print_status(args.format, &status)
+                    }
+                    Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
+                        "unexpected response: {other:?}"
+                    ))
+                    .into()),
+                    Ok(Err(error)) => Err(map_daemon_error(&error).into()),
+                    Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
                 }
-                Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
-                    "unexpected response: {other:?}"
-                ))
-                .into()),
-                Ok(Err(error)) => Err(map_daemon_error(&error).into()),
-                Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
-            }
+            })
         })
-    })
-    .await
-    .map_err(|error| match error {
-        OwnedDaemonRunError::Connect(error) => exit_transport(4, &format!("{error:#}")),
-        error => error.into_inner(),
-    });
+        .await
+        .map_err(|error| match error {
+            OwnedDaemonRunError::Connect(error) => exit_transport(4, &format!("{error:#}")),
+            error => error.into_inner(),
+        });
     finish_invocation_result(result)
 }
 
@@ -50,31 +51,32 @@ async fn cancel(args: InvocationCancelArgs) -> Result<()> {
     let id = parse_canonical_uuid(&args.client_submission_id).map_err(|e| {
         exit_usage(2, &e);
     })?;
-    let result = run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
-        Box::pin(async move {
-            match client
-                .request(Request::CancelRunInvocation {
-                    client_submission_id: id,
-                })
-                .await
-            {
-                Ok(Ok(Response::RunInvocationCancelResult { result })) => {
-                    print_cancel(args.format, &result)
+    let result =
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
+            Box::pin(async move {
+                match client
+                    .request(Request::CancelRunInvocation {
+                        client_submission_id: id,
+                    })
+                    .await
+                {
+                    Ok(Ok(Response::RunInvocationCancelResult { result })) => {
+                        print_cancel(args.format, &result)
+                    }
+                    Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
+                        "unexpected response: {other:?}"
+                    ))
+                    .into()),
+                    Ok(Err(error)) => Err(map_daemon_error(&error).into()),
+                    Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
                 }
-                Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
-                    "unexpected response: {other:?}"
-                ))
-                .into()),
-                Ok(Err(error)) => Err(map_daemon_error(&error).into()),
-                Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
-            }
+            })
         })
-    })
-    .await
-    .map_err(|error| match error {
-        OwnedDaemonRunError::Connect(error) => exit_transport(4, &format!("{error:#}")),
-        error => error.into_inner(),
-    });
+        .await
+        .map_err(|error| match error {
+            OwnedDaemonRunError::Connect(error) => exit_transport(4, &format!("{error:#}")),
+            error => error.into_inner(),
+        });
     finish_invocation_result(result)
 }
 

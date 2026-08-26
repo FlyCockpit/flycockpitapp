@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 
 use crate::cli::LearnArgs;
-use crate::daemon::client::{OwnedSessionMode, run_owned_daemon};
+use crate::daemon::client::OwnedSessionMode;
 pub use crate::skills::{build_learn_prompt, subject_from_parts};
 
 pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
@@ -20,10 +20,10 @@ pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
         OwnedSessionMode::AttachOrEphemeral
     };
     eprintln!("Authoring a reusable skill from the supplied sources…");
-    let exit_code = run_owned_daemon(mode, |client| {
+    let exit_code = crate::daemon::client::run_owned_daemon(mode, |client| {
         Box::pin(async move {
             crate::commands::run::attach_send_pump(
-                client,
+                &client,
                 prompt,
                 no_sandbox,
                 crate::cli::OutputFormat::Default,

@@ -229,6 +229,36 @@ pub enum OwnedDaemonRunError {
     OperationOrCleanup(#[from] anyhow::Error),
 }
 
+/// A lifetime-bound view of a daemon client for one owned foreground run.
+///
+/// This capability deliberately cannot be cloned or converted back into a
+/// [`DaemonClient`]. Its lifetime is tied to the runner callback, so neither
+/// it nor a borrow derived from it can escape the operation.
+pub struct ScopedDaemonClient<'session> {
+    client: &'session DaemonClient,
+}
+
+impl ScopedDaemonClient<'_> {
+    pub async fn request(
+        &self,
+        request: proto::Request,
+    ) -> Result<std::result::Result<proto::Response, proto::ErrorPayload>> {
+        self.client.request(request).await
+    }
+
+    pub async fn request_ok(&self, request: proto::Request) -> Result<proto::Response> {
+        self.client.request_ok(request).await
+    }
+
+    pub async fn next_event(&self) -> Option<proto::Event> {
+        self.client.next_event().await
+    }
+
+    pub fn negotiated(&self) -> &proto::NegotiatedProtocol {
+        self.client.negotiated()
+    }
+}
+
 impl OwnedDaemonRunError {
     pub fn into_inner(self) -> anyhow::Error {
         match self {
@@ -243,7 +273,7 @@ pub async fn run_owned_daemon<T, F>(
 ) -> std::result::Result<T, OwnedDaemonRunError>
 where
     F: for<'client> FnOnce(
-        &'client DaemonClient,
+        ScopedDaemonClient<'client>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<T>> + 'client>,
     >,
@@ -251,7 +281,10 @@ where
     let session = OwnedDaemonSession::connect(mode)
         .await
         .map_err(OwnedDaemonRunError::Connect)?;
-    let result = operation(session.client()).await;
+    let result = operation(ScopedDaemonClient {
+        client: session.client(),
+    })
+    .await;
     session
         .finish(result)
         .await

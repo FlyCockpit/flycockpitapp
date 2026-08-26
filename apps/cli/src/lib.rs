@@ -31,7 +31,8 @@ pub(crate) mod daemon {
     };
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{
-            OwnedDaemonRunError, OwnedSessionMode, ensure_persistent_daemon, run_owned_daemon,
+            OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient, ensure_persistent_daemon,
+            run_owned_daemon,
         };
     }
     #[cfg(test)]

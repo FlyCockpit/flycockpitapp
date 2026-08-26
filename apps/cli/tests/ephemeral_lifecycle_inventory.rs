@@ -97,6 +97,9 @@ impl Inventory<'_> {
 
 impl<'ast> Visit<'ast> for Inventory<'_> {
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if self.test_depth == 0 && item.sig.ident == "run_owned_daemon" {
+            self.violation("runner name may not be defined locally");
+        }
         let previous = self.function.replace(item.sig.ident.to_string());
         let test_only = usize::from(is_test_only(&item.attrs));
         self.test_depth += test_only;
@@ -106,10 +109,53 @@ impl<'ast> Visit<'ast> for Inventory<'_> {
     }
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if self.test_depth == 0 && item.ident == "run_owned_daemon" {
+            self.violation("runner name may not be used by a local module");
+        }
         let test_only = usize::from(is_test_only(&item.attrs));
         self.test_depth += test_only;
         visit::visit_item_mod(self, item);
         self.test_depth -= test_only;
+    }
+
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        if self.test_depth == 0 && item.ident == "run_owned_daemon" {
+            self.violation("runner name may not be used by a type alias");
+        }
+        visit::visit_item_type(self, item);
+    }
+
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        if self.test_depth == 0 && item.ident == "run_owned_daemon" {
+            self.violation("runner name may not be shadowed by a const binding");
+        }
+        visit::visit_item_const(self, item);
+    }
+
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        if self.test_depth == 0 && item.ident == "run_owned_daemon" {
+            self.violation("runner name may not be shadowed by a static binding");
+        }
+        visit::visit_item_static(self, item);
+    }
+
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        if self.test_depth == 0
+            && item
+                .ident
+                .as_ref()
+                .is_some_and(|ident| ident == "run_owned_daemon")
+        {
+            self.violation("runner name may not be used by a local macro");
+        }
+        visit::visit_item_macro(self, item);
+    }
+
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        if self.test_depth == 0 && pattern.ident == "run_owned_daemon" {
+            self.violation("runner name may not be shadowed by a binding or parameter");
+        }
+        visit::visit_pat_ident(self, pattern);
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
@@ -156,7 +202,8 @@ impl<'ast> Visit<'ast> for Inventory<'_> {
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         let is_runner = matches!(&*call.func, syn::Expr::Path(path)
-            if path.path.segments.last().is_some_and(|segment| segment.ident == "run_owned_daemon"));
+            if path.path.segments.iter().map(|segment| segment.ident.to_string()).collect::<Vec<_>>()
+                == ["crate", "daemon", "client", "run_owned_daemon"]);
         if is_runner && self.test_depth == 0 {
             if let Some(function) = self.function.clone() {
                 self.runners.push((self.relative.to_owned(), function));
@@ -180,7 +227,7 @@ impl<'ast> Visit<'ast> for Inventory<'_> {
                     self.violation(format!("raw lifecycle authority `{name}`"));
                 }
                 if name == "run_owned_daemon" && self.runner_callee_depth == 0 {
-                    self.violation("runner may only be used as a direct call");
+                    self.violation("runner may only be used as a fully qualified direct call");
                 }
             }
         }
@@ -305,7 +352,7 @@ fn core_runner_is_the_only_raw_owner() {
         .unwrap();
     assert!(matches!(runner.vis, syn::Visibility::Public(_)));
     assert!(source.contains("let session = OwnedDaemonSession::connect(mode)"));
-    assert!(source.contains("let result = operation(session.client()).await;"));
+    assert!(source.contains("let result = operation(ScopedDaemonClient"));
     assert!(source.contains(".finish(result)"));
     assert!(source.contains("impl Drop for OwnedDaemonSession"));
 }
@@ -317,6 +364,14 @@ fn inventory_rejects_unlisted_alias_function_item_and_macro() {
         "async fn extra() { let run = run_owned_daemon; run(mode, op).await; }",
         "macro_rules! hidden { () => { run_owned_daemon(mode, op).await } }",
         "async fn extra() { OwnedDaemonSession::connect(mode).await; }",
+        "async fn run_owned_daemon() {}",
+        "async fn extra(run_owned_daemon: usize) { let _ = run_owned_daemon; }",
+        "async fn extra() { let run_owned_daemon = fake; run_owned_daemon(); }",
+        "mod run_owned_daemon {}",
+        "type run_owned_daemon = usize;",
+        "const run_owned_daemon: usize = 0;",
+        "static run_owned_daemon: usize = 0;",
+        "macro_rules! run_owned_daemon { () => {} }",
     ] {
         let inventory = inspect(source, "fixture.rs");
         assert!(
@@ -326,7 +381,7 @@ fn inventory_rejects_unlisted_alias_function_item_and_macro() {
     }
 
     let inventory = inspect(
-        "async fn surprise() { run_owned_daemon(mode, op).await; }",
+        "async fn surprise() { crate::daemon::client::run_owned_daemon(mode, op).await; }",
         "commands/surprise.rs",
     );
     assert_eq!(inventory.runners.len(), 1);

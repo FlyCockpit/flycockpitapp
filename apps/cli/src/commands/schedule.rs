@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 
 use crate::cli::{ScheduleCommand, ScheduleCreateArgs, ScheduleListArgs};
-use crate::daemon::client::{OwnedSessionMode, run_owned_daemon};
+use crate::daemon::client::OwnedSessionMode;
 use crate::daemon::proto::{
     MissedRunPolicy, Request, Response, ScheduledJobCreate, ScheduledJobPayload,
     ScheduledJobSchedule, ScheduledJobSummary,
@@ -20,10 +20,11 @@ pub async fn run(cmd: ScheduleCommand) -> Result<()> {
 }
 
 async fn list(args: ScheduleListArgs) -> Result<()> {
-    let response = run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
-        Box::pin(client.request_ok(Request::ListScheduledJobs { owner: args.owner }))
-    })
-    .await?;
+    let response =
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
+            Box::pin(client.request_ok(Request::ListScheduledJobs { owner: args.owner }))
+        })
+        .await?;
     let Response::ScheduledJobs { jobs } = response else {
         bail!("unexpected schedule list response: {response:?}");
     };
@@ -39,10 +40,11 @@ async fn list(args: ScheduleListArgs) -> Result<()> {
 
 async fn create(args: ScheduleCreateArgs) -> Result<()> {
     let job = build_create(args)?;
-    let response = run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
-        Box::pin(client.request_ok(Request::CreateScheduledJob { job }))
-    })
-    .await?;
+    let response =
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
+            Box::pin(client.request_ok(Request::CreateScheduledJob { job }))
+        })
+        .await?;
     let Response::ScheduledJob { job } = response else {
         bail!("unexpected schedule create response: {response:?}");
     };
@@ -72,13 +74,14 @@ fn parse_missed_run_policy(raw: &str) -> Result<MissedRunPolicy> {
 }
 
 async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
-    let response = run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
-        Box::pin(client.request_ok(Request::SetScheduledJobEnabled {
-            id: id.to_string(),
-            enabled,
-        }))
-    })
-    .await?;
+    let response =
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
+            Box::pin(client.request_ok(Request::SetScheduledJobEnabled {
+                id: id.to_string(),
+                enabled,
+            }))
+        })
+        .await?;
     let Response::ScheduledJob { job } = response else {
         bail!("unexpected schedule enable response: {response:?}");
     };
@@ -87,10 +90,11 @@ async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
 }
 
 async fn run_now(id: &str) -> Result<()> {
-    let response = run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
-        Box::pin(client.request_ok(Request::RunScheduledJob { id: id.to_string() }))
-    })
-    .await?;
+    let response =
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
+            Box::pin(client.request_ok(Request::RunScheduledJob { id: id.to_string() }))
+        })
+        .await?;
     let Response::ScheduledJobRunQueued { id } = response else {
         bail!("unexpected schedule run response: {response:?}");
     };

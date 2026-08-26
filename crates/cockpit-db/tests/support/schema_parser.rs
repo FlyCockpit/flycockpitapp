@@ -320,7 +320,7 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
             }
         }
         if matches!(token, Token::Mark('.')) {
-            let schema_context = index >= 2
+            let direct_schema_context = index >= 2
                 && [
                     "table",
                     "index",
@@ -335,9 +335,27 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
                 ]
                 .iter()
                 .any(|keyword| is(tokens.get(index - 2), keyword));
+            let update_conflict_schema_context = index >= 4
+                && is(tokens.get(index - 4), "update")
+                && is(tokens.get(index - 3), "or")
+                && matches!(
+                    word(tokens.get(index - 2)).as_deref(),
+                    Some("rollback" | "abort" | "fail" | "ignore" | "replace")
+                );
             assert!(
-                !schema_context,
+                !direct_schema_context && !update_conflict_schema_context,
                 "schema-qualified object names are unsupported"
+            );
+        }
+        if matches!(word(Some(token)).as_deref(), Some("update" | "insert"))
+            && is(tokens.get(index + 1), "or")
+        {
+            assert!(
+                matches!(
+                    word(tokens.get(index + 2)).as_deref(),
+                    Some("rollback" | "abort" | "fail" | "ignore" | "replace")
+                ),
+                "unsupported SQLite conflict action"
             );
         }
     }
@@ -1114,7 +1132,15 @@ mod tests {
             "CREATE TABLE child(id TEXT); CREATE TRIGGER main.child_guard BEFORE UPDATE ON child BEGIN SELECT 1; END;",
             "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER DELETE ON child BEGIN DELETE FROM main.child; END;",
             "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER INSERT ON child BEGIN INSERT INTO main.child(id) VALUES (1); END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER INSERT ON child BEGIN INSERT OR REPLACE INTO main.child(id) VALUES (1); END;",
             "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN UPDATE main.child SET id=1; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN UPDATE OR ROLLBACK main.child SET id=1; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN UPDATE OR ABORT main.child SET id=1; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN UPDATE OR FAIL main.child SET id=1; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN UPDATE OR IGNORE main.child SET id=1; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN UPDATE OR REPLACE main.child SET id=1; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN UPDATE OR UNSUPPORTED child SET id=1; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER INSERT ON child BEGIN INSERT OR UNSUPPORTED INTO child(id) VALUES (1); END;",
             "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT id FROM main.child; END;",
             "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT child.id FROM child JOIN main.other ON other.id=child.id; END;",
         ] {

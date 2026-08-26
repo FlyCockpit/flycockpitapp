@@ -255,38 +255,13 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
         visitor.found
     }
     fn exact_literal_value(expression: &syn::Expr, line: usize) -> bool {
-        match expression {
+        matches!(
+            expression,
             syn::Expr::Lit(syn::ExprLit {
                 lit: syn::Lit::Str(literal),
                 ..
-            }) => literal.span().start().line == line,
-            syn::Expr::Group(group) => exact_literal_value(&group.expr, line),
-            syn::Expr::Paren(paren) => exact_literal_value(&paren.expr, line),
-            _ => false,
-        }
-    }
-    fn exact_block_value(block: &syn::Block, line: usize) -> bool {
-        matches!(block.stmts.as_slice(), [syn::Stmt::Expr(expression, None)] if exact_literal_value(expression, line))
-    }
-    fn reviewed_branch_value(expression: &syn::Expr, line: usize) -> bool {
-        match expression {
-            expression if exact_literal_value(expression, line) => true,
-            syn::Expr::If(branch) => {
-                exact_block_value(&branch.then_branch, line)
-                    || branch
-                        .else_branch
-                        .as_ref()
-                        .is_some_and(|(_, expression)| reviewed_branch_value(expression, line))
-            }
-            syn::Expr::Match(branch) => branch
-                .arms
-                .iter()
-                .any(|arm| reviewed_branch_value(&arm.body, line)),
-            syn::Expr::Block(block) => exact_block_value(&block.block, line),
-            syn::Expr::Group(group) => reviewed_branch_value(&group.expr, line),
-            syn::Expr::Paren(paren) => reviewed_branch_value(&paren.expr, line),
-            _ => false,
-        }
+            }) if literal.span().start().line == line
+        )
     }
     fn block_contains_literal(block: &syn::Block, line: usize) -> bool {
         let mut visitor = ContainsLiteral { line, found: false };
@@ -463,6 +438,7 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
         line: usize,
         consumed: bool,
         imported_connections: std::collections::BTreeSet<String>,
+        enclosing_generic_shadow: bool,
     }
     impl BindingScope {
         fn is_connection_type(&self, ty: &syn::Type) -> bool {
@@ -486,11 +462,13 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
             if !block_contains_literal(block, self.line) {
                 return;
             }
-            if signature.generics.params.iter().any(|parameter| {
-                matches!(parameter, syn::GenericParam::Type(parameter)
+            if self.enclosing_generic_shadow
+                || signature.generics.params.iter().any(|parameter| {
+                    matches!(parameter, syn::GenericParam::Type(parameter)
                     if parameter.ident == "rusqlite"
                         || self.imported_connections.contains(&parameter.ident.to_string()))
-            }) {
+                })
+            {
                 return;
             }
             let connections = signature
@@ -549,7 +527,7 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
                         if local
                             .init
                             .as_ref()
-                            .is_some_and(|init| reviewed_branch_value(&init.expr, self.line)) =>
+                            .is_some_and(|init| exact_literal_value(&init.expr, self.line)) =>
                     {
                         Some((index, local))
                     }
@@ -629,12 +607,40 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
         }
     }
     impl<'ast> syn::visit::Visit<'ast> for BindingScope {
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let prior = self.enclosing_generic_shadow;
+            self.enclosing_generic_shadow |= item.generics.params.iter().any(|parameter| {
+                matches!(parameter, syn::GenericParam::Type(parameter)
+                    if parameter.ident == "rusqlite"
+                        || self.imported_connections.contains(&parameter.ident.to_string()))
+            });
+            syn::visit::visit_item_impl(self, item);
+            self.enclosing_generic_shadow = prior;
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            let prior = self.enclosing_generic_shadow;
+            self.enclosing_generic_shadow |= item.generics.params.iter().any(|parameter| {
+                matches!(parameter, syn::GenericParam::Type(parameter)
+                    if parameter.ident == "rusqlite"
+                        || self.imported_connections.contains(&parameter.ident.to_string()))
+            });
+            syn::visit::visit_item_trait(self, item);
+            self.enclosing_generic_shadow = prior;
+        }
+
         fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
             self.inspect(&function.sig, &function.block);
         }
 
         fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
             self.inspect(&function.sig, &function.block);
+        }
+
+        fn visit_trait_item_fn(&mut self, function: &'ast syn::TraitItemFn) {
+            if let Some(block) = &function.default {
+                self.inspect(&function.sig, block);
+            }
         }
 
         fn visit_item_mod(&mut self, _module: &'ast syn::ItemMod) {
@@ -646,6 +652,7 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
         line: marker_lines[0] + 1,
         consumed: false,
         imported_connections: canonical_connection_imports(&syntax),
+        enclosing_generic_shadow: false,
     };
     syn::visit::Visit::visit_file(&mut sql_binding, &syntax);
     assert!(
@@ -751,6 +758,53 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
                 let sql = "SELECT exact FROM owned WHERE id=?1";
                 let sql = "SELECT drifted FROM owned";
                 conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection, choose_reviewed: bool) {
+                // schema-hot-query: reviewed.shape
+                let sql = if choose_reviewed { "SELECT exact FROM owned WHERE id=?1" } else { "SELECT drifted FROM owned" };
+                conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection, choice: u8) {
+                // schema-hot-query: reviewed.shape
+                let sql = match choice { 0 => "SELECT exact FROM owned WHERE id=?1", _ => "SELECT drifted FROM owned" };
+                conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = ("SELECT exact FROM owned WHERE id=?1");
+                conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            struct Owner<T>(T);
+            impl<Connection> Owner<Connection> {
+                fn owner(conn: &Connection) {
+                    conn.prepare(
+                        // schema-hot-query: reviewed.shape
+                        "SELECT exact FROM owned WHERE id=?1"
+                    );
+                }
+            }
+        "#,
+        r#"
+            use rusqlite::Connection as DbConnection;
+            trait Owner<DbConnection> {
+                fn owner(conn: &DbConnection) {
+                    conn.prepare(
+                        // schema-hot-query: reviewed.shape
+                        "SELECT exact FROM owned WHERE id=?1"
+                    );
+                }
             }
         "#,
         r#"

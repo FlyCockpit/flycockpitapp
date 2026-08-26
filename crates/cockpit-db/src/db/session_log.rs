@@ -1462,7 +1462,7 @@ impl Db {
                     Ok(DefaultModelUpdateReceipt {
                         outcome_json: row.get(0)?,
                         authority_revision: row.get(1)?,
-                        config_generation: row.get(2)?,
+                        config_generation: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
                     })
                 },
             )
@@ -1491,7 +1491,7 @@ impl Db {
                     Ok(DefaultModelUpdateReceipt {
                         outcome_json: row.get(0)?,
                         authority_revision: row.get(1)?,
-                        config_generation: row.get(2)?,
+                        config_generation: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
                     })
                 },
             )

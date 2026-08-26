@@ -744,13 +744,13 @@ pub enum LateUserDecisionSteerExecutionState {
 }
 
 impl LateUserDecisionSteerExecutionState {
-    fn parse(raw: &str) -> Result<Self> {
+    fn parse(raw: &str) -> rusqlite::Result<Self> {
         match raw {
             "pending" => Ok(Self::Pending),
             "accepted" => Ok(Self::Accepted),
             "completed" => Ok(Self::Completed),
             "rejected" => Ok(Self::Rejected),
-            _ => bail!("unknown late user steer execution state `{raw}`"),
+            _ => Err(invalid_persisted_value("late user steer execution state")),
         }
     }
 }
@@ -2252,11 +2252,11 @@ impl Db {
         snapshot_json: Option<String>,
         receipt_json: String,
         now_unix_ms: i64,
-        /// A successful interactive child can be the exact owner of an
-        /// already-accepted late user steer.  Its continuation receipt and
-        /// the child/task terminal receipt must share this transaction: the
-        /// ordinary terminalization path otherwise rejects the accepted steer
-        /// while popping the very child that completed it.
+        // A successful interactive child can be the exact owner of an
+        // already-accepted late user steer.  Its continuation receipt and
+        // the child/task terminal receipt must share this transaction: the
+        // ordinary terminalization path otherwise rejects the accepted steer
+        // while popping the very child that completed it.
         late_user_steer_completion: Option<(Uuid, Uuid)>,
     ) -> Result<bool> {
         let receipt_json = redact_receipt_json(&receipt_json)?;
@@ -3642,6 +3642,7 @@ impl Db {
             )?;
             statement
                 .query_map([session_id.to_string()], host_capability_refresh_operation_from_row)?
+                .map(|result| result.map_err(anyhow::Error::from))
                 .collect()
         })
         .await
@@ -3674,6 +3675,7 @@ impl Db {
                 .query_map([session_id.to_string()], |row| {
                     parse_uuid(row.get::<_, String>(0)?)
                 })?
+                .map(|result| result.map_err(anyhow::Error::from))
                 .collect()
         })
         .await
@@ -5077,7 +5079,7 @@ impl Db {
             }
             _ => false,
         };
-        let host_capability_refresh = match creation_kind {
+        let host_capability_refresh: Option<(Uuid, Uuid, bool)> = match creation_kind {
             DecisionCreationKind::Generic => None,
             #[cfg(feature = "host-approval-composition")]
             DecisionCreationKind::HostApproval { .. } => None,
@@ -5620,7 +5622,7 @@ impl Db {
                     |row| row.get(0),
                 )
                 .optional()?;
-            interrupt_id.map(parse_uuid).transpose()
+            Ok(interrupt_id.map(parse_uuid).transpose()?)
         })
         .await
     }
@@ -6710,7 +6712,7 @@ impl Db {
                     "only trusted host settlement may supply a final interrupt"
                 );
                 None
-            }
+            };
             let next_revision = current.revision + 1;
             let terminal = next_state.is_terminal();
             let event_seq = insert_control_event(
@@ -7048,6 +7050,7 @@ fn validate_daemon_opaque_reference(value: &str, field: &str) -> Result<()> {
 /// consume/claim/terminal boundary calls this inside its own DB closure; a
 /// forged operation-shaped row cannot be attached to an unrelated attention
 /// record merely by matching UUID-looking inputs.
+#[cfg(feature = "host-approval-composition")]
 fn host_approval_operation_has_exact_interrupt(
     conn: &Connection,
     authority: HostApprovalAuthority,
@@ -8357,7 +8360,7 @@ fn validate_host_operation_canonical_input(canonical_input_json: &str, input_dig
     digest.update(b"flycockpit.host-approval-input.v1\0");
     digest.update(canonical.as_bytes());
     ensure!(
-        format!("{:x}", digest.finalize()) == input_digest,
+        digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>() == input_digest,
         "host approval canonical input does not match its digest"
     );
     Ok(())
@@ -12356,12 +12359,12 @@ mod tests {
         );
         let rejected = db
             .read(move |conn| {
-                conn.query_row(
+                Ok(conn.query_row(
                     "SELECT execution_state, rejection_reason, claimed_recovery_epoch
                      FROM agent_decision_steers WHERE steer_id = ?1",
                     [steer.steer_id.to_string()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
-                )
+                )?)
             })
             .await
             .unwrap();
@@ -12651,7 +12654,7 @@ mod tests {
                     child.agent_instance_id,
                     child.revision,
                     state,
-                    r#"{"source":"restart_waiting_child_fixture"}"#.to_string(),
+                    r#"{"source":"restart_waiting_child_fixture"}"#,
                     152 + offset,
                 )
                 .await
@@ -12723,7 +12726,7 @@ mod tests {
                 agent.agent_instance_id,
                 running.revision,
                 AgentInstanceState::WaitingForUser,
-                r#"{"source":"later_question_after_accepted_steer"}"#.to_string(),
+                r#"{"source":"later_question_after_accepted_steer"}"#,
                 173,
             )
             .await
@@ -15392,8 +15395,18 @@ mod tests {
         let decision_id = decision.decision_request_id;
         let session_id = session.session_id;
         let approval_question = InterruptQuestion::Single {
+            prompt: "Continue?".into(),
+            options: vec![InterruptOption {
+                id: "continue".into(),
+                label: "Continue".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: false,
+            command_detail: None,
             permission: true,
-            ..ordinary_question.clone()
+            approval_class: None,
+            sandbox_escalation: None,
         };
         let approval_interrupt_id = db
             .raise_interrupt_with_agent_instance(
@@ -15450,10 +15463,12 @@ mod tests {
         let mut digest = Sha256::new();
         digest.update(b"flycockpit.host-approval-input.v1\0");
         digest.update(operation_input.as_bytes());
-        let input_digest = format!("{:x}", digest.finalize());
+        let input_digest = digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let decision_id_for_bind = decision_id.to_string();
         let session_id_for_bind = session_id.to_string();
         let agent_id_for_bind = agent.agent_instance_id.to_string();
+        let operation_input_first = operation_input.clone();
+        let input_digest_first = input_digest.clone();
         db.write(move |conn| {
             conn.execute(
                 "INSERT INTO agent_host_approval_operations (
@@ -15465,8 +15480,8 @@ mod tests {
                     operation_id.to_string(),
                     session_id_for_bind,
                     agent_id_for_bind,
-                    operation_input.clone(),
-                    input_digest.clone(),
+                    operation_input_first,
+                    input_digest_first,
                 ],
             )?;
             conn.execute(

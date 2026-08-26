@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;

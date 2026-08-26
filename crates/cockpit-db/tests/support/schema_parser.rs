@@ -292,7 +292,32 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
             match token {
                 Token::Mark(')') => nested = nested.checked_add(1).expect("SQL nesting overflow"),
                 Token::Mark('(') if nested > 0 => nested -= 1,
-                Token::Mark('(') => return source_context_before(tokens, index),
+                Token::Mark('(') => {
+                    return match tokens.get(index.wrapping_sub(1)) {
+                        // A table-or-subquery group inherits the surrounding
+                        // FROM list only when a relation introducer (or an
+                        // already-inherited relation group) opened it.
+                        Some(Token::Word(keyword))
+                            if matches!(keyword.as_str(), "from" | "join") =>
+                        {
+                            true
+                        }
+                        Some(Token::Mark(',') | Token::Mark('(')) => {
+                            source_context_before(tokens, index)
+                        }
+                        // Identifier/path/call/expression tokens introduce a
+                        // function or scalar-expression scope. A comma inside
+                        // it must never become another FROM relation.
+                        Some(
+                            Token::Word(_)
+                            | Token::QuotedName(_)
+                            | Token::Literal(_)
+                            | Token::Mark(')'),
+                        )
+                        | None => false,
+                        Some(Token::Mark(_)) => false,
+                    };
+                }
                 Token::Mark(';') if nested == 0 => return false,
                 Token::Word(keyword) if nested == 0 => match keyword.as_str() {
                     "from" | "join" => return true,
@@ -1212,6 +1237,8 @@ mod tests {
                   FROM (child, other) AS grouped;
                 SELECT child.id FROM child JOIN other
                   ON coalesce(child.id, other.id) = coalesce(other.id, child.id);
+                SELECT * FROM json_each(coalesce(child.id, other.id));
+                SELECT * FROM json_each(lower(coalesce(child.id, other.id)));
                 INSERT INTO child(id) VALUES (coalesce(NEW.id, OLD.id));
             END;
         "#]);

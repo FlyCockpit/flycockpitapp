@@ -574,7 +574,16 @@ fn execute_image_dispatch_preparation_transitions_conn(
         ),
         "dispatch preparation attempt transitions are not canonical"
     );
-    execute_image_dispatch_preparation_transitions_conn(conn, input, &operation)?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1,dispatch_proof_endpoint_id=?5,dispatch_proof_config_generation=?6,dispatch_proof_refresh_epoch=?7,dispatch_proof_connected_ip=?8,dispatch_proof_location_class=?9,dispatch_proof_hops_digest=?10 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?,input.dispatch_proof.endpoint_id,i64::try_from(input.dispatch_proof.config_generation)?,i64::try_from(input.dispatch_proof.refresh_epoch)?,input.dispatch_proof.connected_ip,input.dispatch_proof.location_class,input.dispatch_proof.hops_digest])?==1,"image generation attempt preparation lost compare-and-set");
+    execute_basic_image_slot_transition_conn(
+        conn,
+        input.job_id,
+        input.slot_id,
+        ImageGenerationSlotState::Queued,
+        input.expected_slot_version,
+        ImageGenerationSlotState::Dispatching,
+    )?;
     Ok(())
 }
 
@@ -1911,16 +1920,7 @@ impl Db {
                     digest: &snapshot.1,
                 },
             )?;
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1,dispatch_proof_endpoint_id=?5,dispatch_proof_config_generation=?6,dispatch_proof_refresh_epoch=?7,dispatch_proof_connected_ip=?8,dispatch_proof_location_class=?9,dispatch_proof_hops_digest=?10 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?,input.dispatch_proof.endpoint_id,i64::try_from(input.dispatch_proof.config_generation)?,i64::try_from(input.dispatch_proof.refresh_epoch)?,input.dispatch_proof.connected_ip,input.dispatch_proof.location_class,input.dispatch_proof.hops_digest])?==1,"image generation attempt preparation lost compare-and-set");
-            execute_basic_image_slot_transition_conn(
-                conn,
-                input.job_id,
-                input.slot_id,
-                ImageGenerationSlotState::Queued,
-                input.expected_slot_version,
-                ImageGenerationSlotState::Dispatching,
-            )?;
+            execute_image_dispatch_preparation_transitions_conn(conn, input, &operation)?;
             execute_image_job_transition_conn(
                 conn,
                 input.job_id,

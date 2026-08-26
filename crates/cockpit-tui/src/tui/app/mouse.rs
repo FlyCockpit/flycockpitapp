@@ -359,11 +359,7 @@ impl App {
                 return;
             }
             Overlay::Diff(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
+                pane.handle_mouse(mouse);
                 return;
             }
             Overlay::Help(pane) => {

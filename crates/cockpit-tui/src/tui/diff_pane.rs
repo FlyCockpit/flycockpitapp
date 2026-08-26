@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 #[cfg(test)]
 use ratatui::Terminal;
@@ -38,12 +38,15 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::diff::SIDE_BY_SIDE_MIN_WIDTH;
 use crate::tui::history::HistoryEntry;
-use crate::tui::pane::{Pane, ScrollList};
+use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_config::extended::DiffStyle;
 
@@ -156,6 +159,18 @@ enum Loaded {
     State(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSelectionIdentity {
+    source: DiffSource,
+    path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileHit {
+    index: usize,
+    rect: Rect,
+}
+
 pub struct DiffPane {
     /// Sources in `Tab`-cycle order. Always all three.
     sources: Vec<DiffSource>,
@@ -163,8 +178,9 @@ pub struct DiffPane {
     active: usize,
     /// Parsed content for the active source.
     loaded: Loaded,
-    /// File selector cursor and top visible row of the left file-list window.
-    file_list: ScrollList,
+    /// Durable ratatui selection and item offset for the one-row file list.
+    file_list: ListState,
+    selected_file: Option<FileSelectionIdentity>,
     /// Vertical scroll of the diff body (in rendered rows).
     scroll: usize,
     /// Wrap toggle (`w`).
@@ -180,6 +196,8 @@ pub struct DiffPane {
     last_body_height: usize,
     /// Body content rows at last render — drives scroll clamping.
     last_content_rows: usize,
+    file_list_area: Option<Rect>,
+    file_hits: Vec<FileHit>,
 }
 
 impl DiffPane {
@@ -252,7 +270,8 @@ impl DiffPane {
             sources,
             active,
             loaded: Loaded::State(String::new()),
-            file_list: ScrollList::new(),
+            file_list: ListState::default(),
+            selected_file: None,
             scroll: 0,
             wrap: false,
             side_by_side: matches!(diff_style, DiffStyle::SideBySide),
@@ -260,6 +279,8 @@ impl DiffPane {
             last,
             last_body_height: 0,
             last_content_rows: 0,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
         pane.reload_active();
         pane
@@ -293,13 +314,48 @@ impl DiffPane {
         }
     }
 
+    fn selected_file_index(&self) -> usize {
+        self.file_list.selected().unwrap_or(0)
+    }
+
+    fn select_file(&mut self, index: usize) {
+        let selected = (self.file_count() > 0).then_some(index);
+        self.file_list.select(selected);
+        self.selected_file = selected.and_then(|index| match &self.loaded {
+            Loaded::Files(files) => files.get(index).map(|file| FileSelectionIdentity {
+                source: self.sources[self.active],
+                path: file.path.clone(),
+            }),
+            Loaded::State(_) => None,
+        });
+    }
+
+    fn restore_file_selection(&mut self, previous: Option<FileSelectionIdentity>) {
+        let source = self.sources[self.active];
+        let index = previous
+            .filter(|identity| identity.source == source)
+            .and_then(|identity| match &self.loaded {
+                Loaded::Files(files) => files.iter().position(|file| file.path == identity.path),
+                Loaded::State(_) => None,
+            })
+            .unwrap_or(0)
+            .min(self.file_count().saturating_sub(1));
+        self.select_file(index);
+    }
+
     /// Move the file cursor by `delta` (wrapping), resetting the diff scroll.
     fn move_file(&mut self, delta: i32) {
         let n = self.file_count();
         if n == 0 {
             return;
         }
-        self.file_list.move_by(delta as isize, n);
+        let current = self.selected_file_index();
+        let next = if delta < 0 {
+            crate::tui::nav::wrap_prev(current, n)
+        } else {
+            crate::tui::nav::wrap_next(current, n)
+        };
+        self.select_file(next);
         self.scroll = 0;
     }
 
@@ -325,6 +381,40 @@ impl DiffPane {
         self.scroll = (self.scroll + 1).min(self.max_scroll());
     }
 
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp
+                if self
+                    .file_list_area
+                    .is_some_and(|area| point_in_rect(area, mouse.column, mouse.row)) =>
+            {
+                self.move_file(-1);
+            }
+            MouseEventKind::ScrollDown
+                if self
+                    .file_list_area
+                    .is_some_and(|area| point_in_rect(area, mouse.column, mouse.row)) =>
+            {
+                self.move_file(1);
+            }
+            MouseEventKind::ScrollUp => self.scroll_up(),
+            MouseEventKind::ScrollDown => self.scroll_down(),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(hit) = self
+                    .file_hits
+                    .iter()
+                    .find(|hit| point_in_rect(hit.rect, mouse.column, mouse.row))
+                    .copied()
+                else {
+                    return;
+                };
+                self.select_file(hit.index);
+                self.scroll = 0;
+            }
+            _ => {}
+        }
+    }
+
     /// Cycle to the next source and load it.
     fn cycle_source(&mut self) {
         if self.sources.len() <= 1 {
@@ -337,18 +427,27 @@ impl DiffPane {
     /// (Re)load the active source.
     fn reload_active(&mut self) {
         let source = self.sources[self.active];
-        self.loaded = match source {
+        let loaded = match source {
             DiffSource::Last => self.last.clone(),
             DiffSource::Worktree => {
                 load_git(cockpit_core::git::diff_worktree(&self.cwd), &self.cwd)
             }
             DiffSource::Staged => load_git(cockpit_core::git::diff_staged(&self.cwd), &self.cwd),
         };
-        self.file_list.reset();
+        self.replace_loaded(loaded);
+    }
+
+    fn replace_loaded(&mut self, loaded: Loaded) {
+        let previous = self.selected_file.clone();
+        self.loaded = loaded;
+        self.file_list = ListState::default();
+        self.restore_file_selection(previous);
         self.scroll = 0;
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.file_hits.clear();
+        self.file_list_area = None;
         let title = self.title();
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
@@ -368,14 +467,19 @@ impl DiffPane {
         };
 
         if let Some(list_area) = list_area {
-            let list_lines =
-                self.visible_file_list_lines(list_area.width as usize, list_area.height as usize);
-            frame.render_widget(Paragraph::new(list_lines), list_area);
+            self.render_file_list(frame, list_area);
         }
 
-        let diff_lines = self.diff_body_lines(diff_area.width, narrow);
-        self.last_content_rows = content_rows_for_scroll(&diff_lines, diff_area.width, self.wrap);
-        self.last_body_height = diff_area.height as usize;
+        let diff_content = Rect {
+            width: diff_area
+                .width
+                .saturating_sub(if diff_area.width > 1 { 1 } else { 0 }),
+            ..diff_area
+        };
+        let diff_lines = self.diff_body_lines(diff_content.width, narrow);
+        self.last_content_rows =
+            content_rows_for_scroll(&diff_lines, diff_content.width, self.wrap);
+        self.last_body_height = diff_content.height as usize;
         let max_scroll = self.max_scroll();
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
@@ -387,7 +491,7 @@ impl DiffPane {
                 diff_lines
                     .into_iter()
                     .skip(self.scroll)
-                    .take(diff_area.height as usize)
+                    .take(diff_content.height as usize)
                     .collect(),
                 0,
             )
@@ -396,7 +500,14 @@ impl DiffPane {
         if self.wrap {
             para = para.wrap(ratatui::widgets::Wrap { trim: false });
         }
-        frame.render_widget(para, diff_area);
+        frame.render_widget(para, diff_content);
+        render_vertical_scrollbar(
+            frame,
+            diff_area,
+            self.last_content_rows,
+            self.last_body_height,
+            self.scroll,
+        );
 
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         frame.render_widget(
@@ -429,31 +540,36 @@ impl DiffPane {
             Loaded::Files(files) => files
                 .iter()
                 .enumerate()
-                .map(|(i, f)| file_list_row(f, i == self.file_list.cursor(), width))
+                .map(|(i, f)| file_list_row(f, i == self.selected_file_index(), width))
                 .collect(),
         }
     }
 
-    /// Visible left file-list rows, maintaining a scroll window that keeps
-    /// the selected file on-screen independently of the diff body scroll.
-    fn visible_file_list_lines(&mut self, width: usize, height: usize) -> Vec<Line<'static>> {
-        match &self.loaded {
-            Loaded::State(_) => {
-                self.file_list.set_scroll(0);
-                self.file_list_lines(width)
-            }
-            Loaded::Files(files) => {
-                if height == 0 {
-                    return Vec::new();
-                }
-                self.file_list.clamp_windowed(files.len(), height);
-                self.file_list_lines(width)
-                    .into_iter()
-                    .skip(self.file_list.scroll())
-                    .take(height)
-                    .collect()
-            }
-        }
+    fn render_file_list(&mut self, frame: &mut Frame, area: Rect) {
+        let content = Rect {
+            width: area
+                .width
+                .saturating_sub(if area.width > 1 { 1 } else { 0 }),
+            ..area
+        };
+        self.file_list_area = Some(content);
+        let items = self
+            .file_list_lines(content.width as usize)
+            .into_iter()
+            .map(ListItem::new)
+            .collect::<Vec<_>>();
+        frame.render_stateful_widget(List::new(items), content, &mut self.file_list);
+
+        let count = self.file_count();
+        let offset = self.file_list.offset().min(count.saturating_sub(1));
+        let visible = count.saturating_sub(offset).min(content.height as usize);
+        self.file_hits = (0..visible)
+            .map(|row| FileHit {
+                index: offset + row,
+                rect: Rect::new(content.x, content.y + row as u16, content.width, 1),
+            })
+            .collect();
+        render_vertical_scrollbar(frame, area, count, content.height as usize, offset);
     }
 
     /// The right diff-body rows for the selected file (or the inline-state
@@ -468,7 +584,7 @@ impl DiffPane {
             }
             Loaded::Files(files) => files,
         };
-        let Some(file) = files.get(self.file_list.cursor()) else {
+        let Some(file) = files.get(self.selected_file_index()) else {
             return vec![Line::from(Span::styled(
                 "no file selected".to_string(),
                 Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
@@ -695,66 +811,39 @@ fn help_text(width: u16) -> &'static str {
     }
 }
 
+fn point_in_rect(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+}
+
+fn render_vertical_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_rows: usize,
+    viewport_rows: usize,
+    position: usize,
+) {
+    if content_rows <= viewport_rows || viewport_rows == 0 || area.width <= 1 {
+        return;
+    }
+    let scrollbar_area = Rect::new(area.right().saturating_sub(1), area.y, 1, area.height);
+    let mut state = ScrollbarState::new(content_rows)
+        .position(position)
+        .viewport_content_length(viewport_rows);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)))
+        .thumb_style(Style::default().fg(Color::Cyan));
+    frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+}
+
 fn content_rows_for_scroll(lines: &[Line<'_>], width: u16, wrap: bool) -> usize {
     if !wrap || width == 0 {
         return lines.len();
     }
-    lines
-        .iter()
-        .map(|line| line_wrapped_rows(line, width))
-        .sum()
-}
-
-/// Rows one logical line wraps to at `width` (at least one). Mirrors the
-/// question dialog's greedy word-wrap accounting closely enough for scroll
-/// limits while preserving the actual Paragraph rendering path.
-fn line_wrapped_rows(line: &Line<'_>, width: u16) -> usize {
-    let width = width as usize;
-    if width == 0 {
-        return 1;
-    }
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    if text.is_empty() {
-        return 1;
-    }
-    let mut rows = 1usize;
-    let mut col = 0usize;
-    for word in split_keep_spaces(&text) {
-        let w = UnicodeWidthStr::width(word.as_str());
-        if w > width {
-            if col > 0 {
-                rows += 1;
-            }
-            rows += (w - 1) / width;
-            col = w % width;
-            if col == 0 {
-                col = width;
-            }
-        } else if col + w > width {
-            rows += 1;
-            col = w;
-        } else {
-            col += w;
-        }
-    }
-    rows
-}
-
-fn split_keep_spaces(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for ch in s.chars() {
-        if ch == ' ' {
-            cur.push(ch);
-            out.push(std::mem::take(&mut cur));
-        } else {
-            cur.push(ch);
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
+    Paragraph::new(lines.to_vec())
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .line_count(width)
 }
 
 // ---- rendering helpers -----------------------------------------------------
@@ -997,6 +1086,144 @@ fn truncate_path(path: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn list_state(selected: usize, offset: usize) -> ListState {
+        let mut state = ListState::default();
+        state.select(Some(selected));
+        *state.offset_mut() = offset;
+        state
+    }
+
+    fn render_list_text(pane: &mut DiffPane, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| pane.render_file_list(frame, Rect::new(0, 0, width, height)))
+            .expect("render file list");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn test_pane_with_loaded(loaded: Loaded) -> DiffPane {
+        let mut pane = DiffPane {
+            sources: vec![DiffSource::Worktree],
+            active: 0,
+            loaded,
+            file_list: ListState::default(),
+            selected_file: None,
+            scroll: 0,
+            wrap: false,
+            side_by_side: false,
+            cwd: PathBuf::from("."),
+            last: Loaded::State(String::new()),
+            last_body_height: 0,
+            last_content_rows: 0,
+            file_list_area: None,
+            file_hits: Vec::new(),
+        };
+        pane.restore_file_selection(None);
+        pane
+    }
+
+    fn render_pane_text(pane: &mut DiffPane, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, width, height)))
+            .expect("render diff pane");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn liststate_preserves_file_identity_through_refresh_and_reorder() {
+        let files = many_file_diffs(4);
+        let selected_path = files[2].path.clone();
+        let mut pane = test_pane_with_loaded(Loaded::Files(files.clone()));
+        pane.select_file(2);
+        let mut reordered = files;
+        reordered.rotate_left(2);
+
+        pane.replace_loaded(Loaded::Files(reordered));
+
+        assert_eq!(
+            pane.selected_file.as_ref().map(|identity| &identity.path),
+            Some(&selected_path)
+        );
+        assert_eq!(
+            pane.diff_body_lines(80, false)[0].spans[0].content.as_ref(),
+            selected_path
+        );
+    }
+
+    #[test]
+    fn testbackend_viewport_matrix_aligns_unicode_scrollbars_wrap_and_hits() {
+        let files = (0..10)
+            .map(|index| {
+                let mut rows = vec![Row::Hunk("@@ -1 +1 @@".into())];
+                for _ in 0..16 {
+                    rows.push(Row::Remove(
+                        "old wide 界 text with a long wrapped suffix".into(),
+                    ));
+                    rows.push(Row::Add(
+                        "new Cafe\u{301} 🚀 text with a long wrapped suffix".into(),
+                    ));
+                }
+                FileDiff {
+                    path: format!("src/界/Cafe\u{301}-🚀-{index}.rs"),
+                    kind: ChangeKind::Modified,
+                    added: 16,
+                    removed: 16,
+                    rows,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for width in [50, 62, 90, 140] {
+            for wrap in [false, true] {
+                let mut pane = test_pane_with_loaded(Loaded::Files(files.clone()));
+                pane.wrap = wrap;
+                pane.select_file(files.len() - 1);
+                pane.scroll = 1;
+                let text = render_pane_text(&mut pane, width, 12);
+                assert!(!text.contains('\u{fffd}'), "{width}/{wrap}: {text}");
+                assert_eq!(pane.selected_file_index(), files.len() - 1);
+                if pane.file_list_area.is_some() {
+                    assert!(pane.file_list.offset() > 0, "{width}/{wrap}: {text}");
+                    let list_area = pane.file_list_area.expect("file list area");
+                    for hit in &pane.file_hits {
+                        assert!(point_in_rect(hit.rect, hit.rect.x, hit.rect.y));
+                        assert!(point_in_rect(list_area, hit.rect.x, hit.rect.y));
+                    }
+                    assert!(pane.file_hits.windows(2).all(|hits| {
+                        hits[0].rect.bottom() <= hits[1].rect.y
+                            && hits[0].index + 1 == hits[1].index
+                    }));
+                } else {
+                    assert!(pane.file_hits.is_empty());
+                }
+            }
+        }
+
+        for state in ["no changes", "could not read git diff", "loading diff..."] {
+            let mut pane = test_pane_with_loaded(Loaded::State(state.into()));
+            assert!(render_pane_text(&mut pane, 60, 8).contains(state));
+        }
+    }
 
     fn texts(lines: &[Line<'static>]) -> Vec<String> {
         lines
@@ -1262,7 +1489,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Worktree, DiffSource::Staged, DiffSource::Last],
             active: 0,
             loaded: Loaded::Files(files),
-            file_list: ScrollList::new(),
+            file_list: ListState::default(),
+            selected_file: None,
             scroll: 0,
             wrap: false,
             side_by_side: false,
@@ -1270,6 +1498,8 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::State(String::new()),
             last_body_height: 100,
             last_content_rows: 0,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
 
         // File list shows both files with counts and a cursor marker.
@@ -1301,7 +1531,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::Files(files),
-            file_list: ScrollList::new(),
+            file_list: ListState::default(),
+            selected_file: None,
             scroll: 0,
             wrap: false,
             side_by_side: false,
@@ -1309,6 +1540,8 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::State(String::new()),
             last_body_height: 100,
             last_content_rows: 0,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
         let body = texts(&pane.diff_body_lines(120, false)).join("\n");
         assert!(body.contains("binary file changed"), "{body}");
@@ -1320,7 +1553,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::State("no changes".to_string()),
-            file_list: ScrollList::new(),
+            file_list: ListState::default(),
+            selected_file: None,
             scroll: 0,
             wrap: false,
             side_by_side: false,
@@ -1328,6 +1562,8 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::State(String::new()),
             last_body_height: 100,
             last_content_rows: 0,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
         let list = texts(&pane.file_list_lines(LIST_WIDTH as usize)).join("\n");
         let body = texts(&pane.diff_body_lines(120, false)).join("\n");
@@ -1344,7 +1580,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::Files(files),
-            file_list: ScrollList::new(),
+            file_list: ListState::default(),
+            selected_file: None,
             scroll: 0,
             wrap: false,
             side_by_side: true,
@@ -1352,6 +1589,8 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::State(String::new()),
             last_body_height: 100,
             last_content_rows: 0,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
         // Wide + side-by-side toggle on → column separator present.
         let wide = texts(&pane.diff_body_lines(120, false)).join("\n");
@@ -1398,7 +1637,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::State("no changes".into()),
-            file_list: ScrollList::new(),
+            file_list: ListState::default(),
+            selected_file: None,
             scroll: 0,
             wrap: true,
             side_by_side: false,
@@ -1406,6 +1646,8 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::State(String::new()),
             last_body_height: 3,
             last_content_rows: 8,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
 
         assert!(!pane.handle_key(press(KeyCode::PageDown)));
@@ -1438,7 +1680,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::Files(vec![file]),
-            file_list: ScrollList::at(0, 0),
+            file_list: list_state(0, 0),
+            selected_file: None,
             scroll: 65_537,
             wrap: false,
             side_by_side: false,
@@ -1446,6 +1689,8 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::State(String::new()),
             last_body_height: 3,
             last_content_rows: 70_001,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
         let backend = TestBackend::new(80, 5);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1501,7 +1746,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::Files(many_file_diffs(8)),
-            file_list: ScrollList::at(0, 0),
+            file_list: list_state(0, 0),
+            selected_file: None,
             scroll: 7,
             wrap: false,
             side_by_side: false,
@@ -1509,14 +1755,16 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::State(String::new()),
             last_body_height: 10,
             last_content_rows: 20,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
 
         for _ in 0..5 {
             pane.move_file(1);
         }
-        let list = texts(&pane.visible_file_list_lines(LIST_WIDTH as usize, 3)).join("\n");
-        assert_eq!(pane.file_list.cursor(), 5);
-        assert_eq!(pane.file_list.scroll(), 4);
+        let list = render_list_text(&mut pane, LIST_WIDTH, 3);
+        assert_eq!(pane.selected_file_index(), 5);
+        assert_eq!(pane.file_list.offset(), 3);
         assert!(list.contains("file-5.rs"), "{list}");
         assert!(!list.contains("file-0.rs"), "{list}");
         assert_eq!(pane.scroll, 0, "body scroll still resets on file change");
@@ -1528,7 +1776,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::Files(many_file_diffs(8)),
-            file_list: ScrollList::at(6, 5),
+            file_list: list_state(6, 5),
+            selected_file: None,
             scroll: 0,
             wrap: false,
             side_by_side: false,
@@ -1536,14 +1785,16 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::State(String::new()),
             last_body_height: 10,
             last_content_rows: 20,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
 
         for _ in 0..4 {
             pane.move_file(-1);
         }
-        let list = texts(&pane.visible_file_list_lines(LIST_WIDTH as usize, 3)).join("\n");
-        assert_eq!(pane.file_list.cursor(), 2);
-        assert_eq!(pane.file_list.scroll(), 1);
+        let list = render_list_text(&mut pane, LIST_WIDTH, 3);
+        assert_eq!(pane.selected_file_index(), 2);
+        assert_eq!(pane.file_list.offset(), 2);
         assert!(list.contains("file-2.rs"), "{list}");
         assert!(!list.contains("file-6.rs"), "{list}");
     }
@@ -1554,7 +1805,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::Files(many_file_diffs(8)),
-            file_list: ScrollList::new(),
+            file_list: ListState::default(),
+            selected_file: None,
             scroll: 0,
             wrap: false,
             side_by_side: false,
@@ -1562,18 +1814,20 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::State(String::new()),
             last_body_height: 10,
             last_content_rows: 20,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
 
         pane.move_file(-1);
-        let bottom = texts(&pane.visible_file_list_lines(LIST_WIDTH as usize, 3)).join("\n");
-        assert_eq!(pane.file_list.cursor(), 7);
-        assert_eq!(pane.file_list.scroll(), 5);
+        let bottom = render_list_text(&mut pane, LIST_WIDTH, 3);
+        assert_eq!(pane.selected_file_index(), 7);
+        assert_eq!(pane.file_list.offset(), 5);
         assert!(bottom.contains("file-7.rs"), "{bottom}");
 
         pane.move_file(1);
-        let top = texts(&pane.visible_file_list_lines(LIST_WIDTH as usize, 3)).join("\n");
-        assert_eq!(pane.file_list.cursor(), 0);
-        assert_eq!(pane.file_list.scroll(), 0);
+        let top = render_list_text(&mut pane, LIST_WIDTH, 3);
+        assert_eq!(pane.selected_file_index(), 0);
+        assert_eq!(pane.file_list.offset(), 0);
         assert!(top.contains("file-0.rs"), "{top}");
     }
 
@@ -1584,7 +1838,8 @@ diff --git a/b.rs b/b.rs\n\
             sources: vec![DiffSource::Last, DiffSource::Last],
             active: 0,
             loaded: Loaded::Files(files.clone()),
-            file_list: ScrollList::at(4, 3),
+            file_list: list_state(4, 3),
+            selected_file: None,
             scroll: 9,
             wrap: false,
             side_by_side: false,
@@ -1592,12 +1847,14 @@ diff --git a/b.rs b/b.rs\n\
             last: Loaded::Files(files),
             last_body_height: 10,
             last_content_rows: 20,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
 
         pane.cycle_source();
-        assert_eq!(pane.file_list.cursor(), 0);
+        assert_eq!(pane.selected_file_index(), 0);
         assert_eq!(pane.scroll, 0);
-        assert_eq!(pane.file_list.scroll(), 0);
+        assert_eq!(pane.file_list.offset(), 0);
     }
 
     #[test]
@@ -1610,7 +1867,8 @@ diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1,1 +1,1 @@\n-p\n+q\n",
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::Files(files),
-            file_list: ScrollList::at(0, 0),
+            file_list: list_state(0, 0),
+            selected_file: None,
             scroll: 5,
             wrap: false,
             side_by_side: false,
@@ -1618,12 +1876,14 @@ diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1,1 +1,1 @@\n-p\n+q\n",
             last: Loaded::State(String::new()),
             last_body_height: 10,
             last_content_rows: 0,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
         pane.move_file(1);
-        assert_eq!(pane.file_list.cursor(), 1);
+        assert_eq!(pane.selected_file_index(), 1);
         assert_eq!(pane.scroll, 0); // selection reset the scroll
         pane.move_file(1); // wrap last → first
-        assert_eq!(pane.file_list.cursor(), 0);
+        assert_eq!(pane.selected_file_index(), 0);
     }
 
     #[test]
@@ -1639,7 +1899,8 @@ diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1,1 +1,1 @@\n-p\n+q\n",
             sources: vec![DiffSource::Worktree],
             active: 0,
             loaded: Loaded::State("no changes".into()),
-            file_list: ScrollList::new(),
+            file_list: ListState::default(),
+            selected_file: None,
             scroll: 0,
             wrap: false,
             side_by_side: false,
@@ -1647,6 +1908,8 @@ diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1,1 +1,1 @@\n-p\n+q\n",
             last: Loaded::State(String::new()),
             last_body_height: 0,
             last_content_rows: 0,
+            file_list_area: None,
+            file_hits: Vec::new(),
         };
         assert!(pane.handle_key(mk(KeyCode::Esc)));
         assert!(pane.handle_key(mk(KeyCode::Char('q'))));

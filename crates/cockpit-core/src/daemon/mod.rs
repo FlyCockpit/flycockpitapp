@@ -1304,9 +1304,10 @@ async fn run_foreground_inner_with_boot_db(
             );
         }
     }
-    // Clear any stale leftover.
-    let _ = std::fs::remove_file(&paths.socket);
     let executable = std::env::current_exe().context("resolving daemon executable identity")?;
+    // The exclusive PID receipt is the starting reservation. Acquire it before
+    // touching the shared socket so a losing concurrent starter cannot unlink
+    // the winner's newly bound endpoint.
     let pid_receipt = write_pid_file(&paths.pid_file, std::process::id(), &executable)
         .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
     let endpoint_record = if !paths.ephemeral
@@ -1324,6 +1325,11 @@ async fn run_foreground_inner_with_boot_db(
         endpoint_record,
         pid_receipt.clone(),
     );
+    match std::fs::remove_file(&paths.socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("removing stale daemon socket after reservation"),
+    }
 
     let uses_supplied_boot_db = boot_db.is_some();
     let ctx = std::sync::Arc::new(match boot_db {
@@ -2675,6 +2681,7 @@ mod tests {
         let paths = test_paths(&dir);
         let executable = std::env::current_exe().unwrap();
         let old = write_pid_file(&paths.pid_file, std::process::id(), &executable).unwrap();
+        cleanup_receipt_metadata(&paths, &old).unwrap();
         let replacement = write_pid_file(&paths.pid_file, std::process::id(), &executable).unwrap();
         std::fs::write(&paths.socket, "replacement socket").unwrap();
 

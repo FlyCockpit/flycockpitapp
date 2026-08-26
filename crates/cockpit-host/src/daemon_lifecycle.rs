@@ -8,12 +8,56 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPidReceipt {
     pub pid: u32,
     pub executable: PathBuf,
     pub process_start: ProcessStartIdentity,
     pub publication_nonce: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializedDaemonPidReceipt {
+    version: u8,
+    pid: u32,
+    executable_identity: String,
+    process_start: ProcessStartIdentity,
+    publication_nonce_hex: String,
+}
+
+impl Serialize for DaemonPidReceipt {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        SerializedDaemonPidReceipt {
+            version: 2,
+            pid: self.pid,
+            executable_identity: encode_executable_identity(&self.executable),
+            process_start: self.process_start,
+            publication_nonce_hex: hex_encode(&self.publication_nonce),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DaemonPidReceipt {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = SerializedDaemonPidReceipt::deserialize(deserializer)?;
+        if value.version != 2 {
+            return Err(serde::de::Error::custom(
+                "unsupported daemon receipt version",
+            ));
+        }
+        let executable = decode_executable_identity(&value.executable_identity)
+            .ok_or_else(|| serde::de::Error::custom("invalid executable identity"))?;
+        let nonce = hex_decode(&value.publication_nonce_hex)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| serde::de::Error::custom("invalid publication nonce"))?;
+        Ok(Self {
+            pid: value.pid,
+            executable,
+            process_start: value.process_start,
+            publication_nonce: nonce,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,7 +201,7 @@ pub fn read_daemon_pid_record(pid_file: &Path) -> Option<DaemonPidRecord> {
     let value = std::fs::read_to_string(pid_file).ok()?;
     let mut lines = value.lines();
     let first = lines.next()?.trim();
-    if first != "cockpit-daemon-pid-v1" {
+    if first != "cockpit-daemon-pid-v2" {
         let pid = first.parse::<u32>().ok()?;
         if lines.next().is_some() {
             return None;
@@ -201,13 +245,13 @@ fn write_pid_file_locked(
     let process_start = read_process_start_identity(pid)?;
     let publication_nonce = rand::random::<[u8; 32]>();
     let body = format!(
-        "cockpit-daemon-pid-v1\n{pid}\n{}\nstart:{:016x}:{:016x}\nnonce:{}\n",
+        "cockpit-daemon-pid-v2\n{pid}\n{}\nstart:{:016x}:{:016x}\nnonce:{}\n",
         encode_executable_identity(&executable),
         process_start.primary,
         process_start.secondary,
         hex_encode(&publication_nonce),
     );
-    crate::private_fs::write_private_file(pid_file, body.as_bytes())?;
+    crate::private_fs::write_private_file_exclusive(pid_file, body.as_bytes())?;
     Ok(DaemonPidReceipt {
         pid,
         executable,
@@ -443,10 +487,32 @@ fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity
 fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
     #[repr(C)]
     struct ProcBsdInfo {
-        prefix: [u8; 128],
+        flags: u32,
+        status: u32,
+        xstatus: u32,
+        pid: u32,
+        ppid: u32,
+        uid: u32,
+        gid: u32,
+        ruid: u32,
+        rgid: u32,
+        svuid: u32,
+        svgid: u32,
+        rfu_1: u32,
+        comm: [libc::c_char; 16],
+        name: [libc::c_char; 32],
+        nfiles: u32,
+        pgid: u32,
+        pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        nice: i32,
         start_sec: u64,
         start_usec: u64,
     }
+    const _: () = assert!(std::mem::size_of::<ProcBsdInfo>() == 136);
+    const _: () = assert!(std::mem::offset_of!(ProcBsdInfo, start_sec) == 120);
+    const _: () = assert!(std::mem::offset_of!(ProcBsdInfo, start_usec) == 128);
     #[link(name = "proc")]
     unsafe extern "C" {
         fn proc_pidinfo(
@@ -461,7 +527,14 @@ fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity
     let size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
     let read = unsafe { proc_pidinfo(pid as libc::c_int, 3, 0, info.as_mut_ptr().cast(), size) };
     if read != size {
-        return Err(std::io::Error::last_os_error());
+        return if read <= 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("proc_pidinfo returned {read} bytes; expected {size}"),
+            ))
+        };
     }
     let info = unsafe { info.assume_init() };
     Ok(ProcessStartIdentity {
@@ -498,11 +571,12 @@ fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity
     let mut kernel = FileTime { low: 0, high: 0 };
     let mut user = FileTime { low: 0, high: 0 };
     let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let error = (ok == 0).then(std::io::Error::last_os_error);
     unsafe {
         CloseHandle(handle);
     }
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
+    if let Some(error) = error {
+        return Err(error);
     }
     Ok(ProcessStartIdentity {
         primary: ((creation.high as u64) << 32) | creation.low as u64,
@@ -710,7 +784,7 @@ fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
     observed == approved
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct EndpointRecord {
     socket: PathBuf,
     receipt: DaemonPidReceipt,
@@ -822,6 +896,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pid_publication_is_an_exclusive_starting_reservation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let executable = std::env::current_exe().expect("test executable");
+        let pid_file = temp.path().join("daemon.pid");
+        let first =
+            write_pid_file(&pid_file, std::process::id(), &executable).expect("first reservation");
+
+        write_pid_file(&pid_file, std::process::id(), &executable)
+            .expect_err("second starter must not replace reservation");
+
+        assert_eq!(
+            read_daemon_pid_record(&pid_file),
+            Some(DaemonPidRecord::Receipt(first))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn pid_receipt_round_trips_non_utf8_and_newline_path_bytes() {
@@ -838,8 +929,15 @@ mod tests {
 
         assert_eq!(
             read_daemon_pid_record(&pid_file),
-            Some(DaemonPidRecord::Receipt(receipt))
+            Some(DaemonPidRecord::Receipt(receipt.clone()))
         );
+        let endpoint = EndpointRecord {
+            socket: temp.path().join("daemon.sock"),
+            receipt,
+        };
+        let encoded = serde_json::to_vec(&endpoint).expect("serialize endpoint");
+        let decoded: EndpointRecord = serde_json::from_slice(&encoded).expect("decode endpoint");
+        assert_eq!(decoded.receipt, endpoint.receipt);
     }
 
     #[test]
@@ -868,8 +966,23 @@ mod tests {
 
         assert_eq!(
             decode_executable_identity(&encode_executable_identity(&path)),
-            Some(path)
+            Some(path.clone())
         );
+        let endpoint = EndpointRecord {
+            socket: PathBuf::from("daemon.sock"),
+            receipt: DaemonPidReceipt {
+                pid: 42,
+                executable: path,
+                process_start: ProcessStartIdentity {
+                    primary: 1,
+                    secondary: 0,
+                },
+                publication_nonce: [7; 32],
+            },
+        };
+        let encoded = serde_json::to_vec(&endpoint).expect("serialize endpoint");
+        let decoded: EndpointRecord = serde_json::from_slice(&encoded).expect("decode endpoint");
+        assert_eq!(decoded.receipt, endpoint.receipt);
     }
 
     #[cfg(unix)]

@@ -138,7 +138,7 @@ impl Tool for TranscribeAudioTool {
     }
 
     fn description(&self) -> &str {
-        "Transcribe one authorized audio source to text via an external transcription provider. First call uses source: {attachment_id|path|url}; later calls reuse source: {attachment_id}. Optional prompt, keywords, languages, timestamps, and diarization select the model."
+        "Transcribe one authorized audio source (attachment_id|path|url) via an external provider; later calls reuse attachment_id."
     }
 
     fn defensive_description(&self) -> Option<String> {

@@ -6117,6 +6117,10 @@ impl Driver {
         args.model = new_model;
         args.model_override = None;
         args.delegation_model = None;
+        // Preserve the frame's already-resolved vNext grant across rebuilds so
+        // portable child refs (including workspace-authored agents admitted at
+        // session start) stay reachable in the task schema after refresh.
+        args.vnext_grant = self.stack[frame_idx].agent.vnext_grant.clone();
         args.params = crate::engine::model::ModelParams {
             additional_params,
             endpoint_recovery_additional_params,
@@ -6435,7 +6439,8 @@ impl Driver {
             return;
         }
         let name = self.stack[0].agent.name.clone();
-        let args = self.spawn_args(true);
+        let mut args = self.spawn_args(true);
+        args.vnext_grant = self.stack[0].agent.vnext_grant.clone();
         match crate::agents::resolve(&self.cwd, &name) {
             Ok(Some(mut def)) => {
                 match crate::agents::apply_tool_surface_override(&mut def, &selection)

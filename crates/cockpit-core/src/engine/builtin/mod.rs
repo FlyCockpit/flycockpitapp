@@ -2371,9 +2371,22 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     let grant: Vec<String> = match &def.tools {
         Some(t) => t.clone(),
         None if is_assistant => default_assistant_tools(),
-        None => crate::agents::embedded_default(&def.name)
-            .and_then(|d| d.tools)
-            .unwrap_or_else(default_custom_tools),
+        None => {
+            #[cfg(test)]
+            if let Some(tools) = test_host_tool_surface(&args.cwd, &def.name) {
+                tools
+            } else {
+                crate::agents::embedded_default(&def.name)
+                    .and_then(|d| d.tools)
+                    .unwrap_or_else(default_custom_tools)
+            }
+            #[cfg(not(test))]
+            {
+                crate::agents::embedded_default(&def.name)
+                    .and_then(|d| d.tools)
+                    .unwrap_or_else(default_custom_tools)
+            }
+        }
     };
 
     let mut tb = ToolBox::new();
@@ -2548,6 +2561,21 @@ fn default_custom_tools() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Test-only host tool-surface sidecar (`.cockpit/agents/<name>.tools.json`).
+/// v2 markdown cannot declare `tools:`; concurrent-admission tests that need a
+/// constrained host surface write this sidecar beside the agent document so
+/// admission/build re-reads pick up the projected grant without reviving the
+/// author-facing field.
+#[cfg(test)]
+fn test_host_tool_surface(cwd: &Path, name: &str) -> Option<Vec<String>> {
+    let path = cwd
+        .join(".cockpit")
+        .join("agents")
+        .join(format!("{name}.tools.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 fn default_assistant_tools() -> Vec<String> {

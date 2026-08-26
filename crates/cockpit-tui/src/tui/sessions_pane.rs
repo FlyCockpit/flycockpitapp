@@ -35,11 +35,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 use uuid::Uuid;
 
 use crate::tui::message_block::{MessageBlock, MessageBlockRole, render_markdown_message_block};
-use crate::tui::pane::{Pane, ScrollList};
+use crate::tui::pane::Pane;
 use crate::tui::pane_shared::{boxed_row, resolve_project_id, short_id};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 use cockpit_proto::{MessageRole, SessionMessage, SessionSummary};
@@ -192,7 +195,58 @@ struct Level {
     /// `None` at the root level; `Some` once we've drilled into a fork.
     parent: Option<SessionSummary>,
     cards: Vec<(SessionSummary, Tier)>,
-    list: ScrollList,
+    selection: ListState,
+    /// Durable identity anchor retained while a refresh temporarily clears
+    /// the cards, then resolved back to the new sorted index.
+    selected_session_id: Option<Uuid>,
+    /// Visual-row offset for variable-height cards. `ListState::offset` is
+    /// item-based, so it cannot represent a viewport that begins inside a
+    /// wrapped card.
+    row_offset: usize,
+}
+
+impl Level {
+    fn empty(parent: Option<SessionSummary>) -> Self {
+        Self {
+            parent,
+            cards: Vec::new(),
+            selection: ListState::default(),
+            selected_session_id: None,
+            row_offset: 0,
+        }
+    }
+
+    fn with_cards(parent: Option<SessionSummary>, cards: Vec<(SessionSummary, Tier)>) -> Self {
+        let mut level = Self::empty(parent);
+        level.cards = cards;
+        level.restore_selection(None);
+        level
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selection.selected().unwrap_or(0)
+    }
+
+    fn select(&mut self, index: usize) {
+        let selected = (!self.cards.is_empty()).then_some(index);
+        self.selection.select(selected);
+        self.selected_session_id = selected
+            .and_then(|index| self.cards.get(index))
+            .map(|(summary, _)| summary.session_id);
+    }
+
+    fn restore_selection(&mut self, session_id: Option<Uuid>) {
+        let requested_id = session_id.or(self.selected_session_id);
+        let index = requested_id
+            .and_then(|id| {
+                self.cards
+                    .iter()
+                    .position(|(summary, _)| summary.session_id == id)
+            })
+            .unwrap_or(0)
+            .min(self.cards.len().saturating_sub(1));
+        self.select(index);
+    }
 }
 
 /// Current archive/delete confirm sub-step (modelled like the model
@@ -510,18 +564,10 @@ impl SessionsPane {
         };
         if daemon_connected {
             pane.loading = Some("Loading sessions...");
-            pane.levels = vec![Level {
-                parent: None,
-                cards: Vec::new(),
-                list: ScrollList::new(),
-            }];
+            pane.levels = vec![Level::empty(None)];
         } else {
             pane.error = Some("Unavailable — reconnect to the daemon, then Retry".to_string());
-            pane.levels = vec![Level {
-                parent: None,
-                cards: Vec::new(),
-                list: ScrollList::new(),
-            }];
+            pane.levels = vec![Level::empty(None)];
         }
         pane
     }
@@ -531,19 +577,11 @@ impl SessionsPane {
     fn load_root(&mut self) {
         if self.daemon_connected {
             self.loading = Some("Loading sessions...");
-            self.levels = vec![Level {
-                parent: None,
-                cards: Vec::new(),
-                list: ScrollList::new(),
-            }];
+            self.levels = vec![Level::empty(None)];
             return;
         }
         self.mark_disconnected_unavailable();
-        self.levels = vec![Level {
-            parent: None,
-            cards: Vec::new(),
-            list: ScrollList::new(),
-        }];
+        self.levels = vec![Level::empty(None)];
     }
 
     pub fn root_request(&self) -> (Option<String>, Option<Uuid>) {
@@ -569,6 +607,7 @@ impl SessionsPane {
         self.loading = None;
         match result {
             Ok(mut sessions) => {
+                let selected_id = self.selected_id();
                 self.error = None;
                 if !self.show_archived {
                     sessions.retain(|s| s.archived_at.is_none());
@@ -577,8 +616,8 @@ impl SessionsPane {
                 let cards = tier_sort(sessions.into_iter().map(|s| (s, None)).collect());
                 if let Some(level) = self.levels.last_mut() {
                     level.cards = cards;
-                    level.list.clamp_cursor(level.cards.len());
-                    level.list.set_scroll(0);
+                    level.restore_selection(selected_id);
+                    level.row_offset = 0;
                 }
                 if self.selected_id().is_some() && self.preview_enabled {
                     self.preview = None;
@@ -598,6 +637,7 @@ impl SessionsPane {
     }
 
     pub fn apply_live_status(&mut self, live: std::collections::HashMap<Uuid, (bool, bool)>) {
+        let selected_id = self.selected_id();
         if let Some(level) = self.levels.last_mut() {
             let cards = level
                 .cards
@@ -608,7 +648,7 @@ impl SessionsPane {
                 })
                 .collect();
             level.cards = tier_sort(cards);
-            level.list.clamp_cursor(level.cards.len());
+            level.restore_selection(selected_id);
         }
     }
 
@@ -626,8 +666,8 @@ impl SessionsPane {
         self.mark_disconnected_unavailable();
         if let Some(level) = self.levels.last_mut() {
             level.cards.clear();
-            level.list.clamp_cursor(level.cards.len());
-            level.list.set_scroll(0);
+            level.selection.select(None);
+            level.row_offset = 0;
         }
     }
 
@@ -635,7 +675,8 @@ impl SessionsPane {
         self.loading = Some("Loading sessions...");
         if let Some(level) = self.levels.last_mut() {
             level.cards.clear();
-            level.list.reset();
+            level.selection.select(None);
+            level.row_offset = 0;
         }
     }
 
@@ -650,7 +691,7 @@ impl SessionsPane {
     /// The highlighted card's summary, if any.
     fn selected(&self) -> Option<&SessionSummary> {
         let level = self.current();
-        level.cards.get(level.list.cursor()).map(|(s, _)| s)
+        level.cards.get(level.selected_index()).map(|(s, _)| s)
     }
 
     fn selected_id(&self) -> Option<Uuid> {
@@ -893,28 +934,31 @@ impl SessionsPane {
             return false;
         }
         let level = self.current_mut();
-        let prev = level.list.cursor();
+        let prev = level.selected_index();
         // Wrap at both ends, consistent with every other selectable list.
-        level.list.move_by(delta, len);
+        let next = if delta < 0 {
+            crate::tui::nav::wrap_prev(prev, len)
+        } else {
+            crate::tui::nav::wrap_next(prev, len)
+        };
+        level.select(next);
         // Keep the cursor inside the visible window (rough: each card is
         // ~4 rows). The render pass does the precise clamp.
         if delta < 0 {
-            if level.list.cursor() > prev {
+            if next > prev {
                 // Wrapped first → last: scroll toward the bottom; render
                 // clamps to the precise floor.
-                level
-                    .list
-                    .set_scroll(level.list.scroll().saturating_add(len));
+                level.row_offset = level.row_offset.saturating_add(len);
             } else {
-                level.list.set_scroll(level.list.scroll().saturating_sub(1));
+                level.row_offset = level.row_offset.saturating_sub(1);
             }
-        } else if level.list.cursor() < prev {
+        } else if next < prev {
             // Wrapped last → first: jump back to the top.
-            level.list.set_scroll(0);
+            level.row_offset = 0;
         } else {
-            level.list.set_scroll(level.list.scroll() + 1);
+            level.row_offset = level.row_offset.saturating_add(1);
         }
-        level.list.cursor() != prev
+        next != prev
     }
 
     /// Drill into the highlighted session's direct forks (unbounded
@@ -928,19 +972,11 @@ impl SessionsPane {
         }
         if self.daemon_connected {
             self.loading = Some("Loading sessions...");
-            self.levels.push(Level {
-                parent: Some(parent),
-                cards: Vec::new(),
-                list: ScrollList::new(),
-            });
+            self.levels.push(Level::empty(Some(parent)));
             return true;
         }
         self.mark_disconnected_unavailable();
-        self.levels.push(Level {
-            parent: Some(parent),
-            cards: Vec::new(),
-            list: ScrollList::new(),
-        });
+        self.levels.push(Level::empty(Some(parent)));
         false
     }
 
@@ -970,7 +1006,7 @@ impl SessionsPane {
         let live = self
             .current()
             .cards
-            .get(self.current().list.cursor())
+            .get(self.current().selected_index())
             .is_some_and(|(_, status)| {
                 matches!(
                     status,
@@ -1145,13 +1181,13 @@ impl SessionsPane {
     /// Mouse-wheel scroll (one row).
     pub fn scroll_up(&mut self) {
         let level = self.current_mut();
-        level.list.set_scroll(level.list.scroll().saturating_sub(1));
+        level.row_offset = level.row_offset.saturating_sub(1);
     }
 
     pub fn scroll_down(&mut self) {
         let max = self.last_content_rows.saturating_sub(self.last_body_height);
         let level = self.current_mut();
-        level.list.set_scroll((level.list.scroll() + 1).min(max));
+        level.row_offset = level.row_offset.saturating_add(1).min(max);
     }
 
     fn scroll_preview_up(&mut self) -> Option<SessionsOutcome> {
@@ -1280,7 +1316,7 @@ impl SessionsPane {
                 let now = std::time::Instant::now();
                 let double_click = is_double_click(self.last_card_click, index, now);
                 self.last_card_click = Some((index, now));
-                let selected = self.current().list.cursor();
+                let selected = self.current().selected_index();
                 if click_resumes(selected, index, double_click) {
                     if !self.daemon_connected {
                         self.notice = Some(DAEMONLESS_HINT.to_string());
@@ -1292,7 +1328,7 @@ impl SessionsPane {
                     return None;
                 }
                 if let Some(level) = self.levels.last_mut() {
-                    level.list.set_cursor(index);
+                    level.select(index);
                 }
                 self.ensure_preview_for_selection()
             }
@@ -1335,7 +1371,8 @@ impl SessionsPane {
             SessionsLayout::Single { body } => {
                 self.preview_enabled = false;
                 self.focus = Focus::List;
-                self.render_list_body(frame, body, body.width as usize, false);
+                self.list_area = Some(body);
+                self.render_list_body(frame, body, true);
             }
             SessionsLayout::Split { list, preview, .. } => {
                 self.preview_enabled = true;
@@ -1352,7 +1389,7 @@ impl SessionsPane {
                     .title(" sessions ");
                 let list_inner = list_block.inner(list);
                 frame.render_widget(list_block, list);
-                self.render_list_body(frame, list_inner, list_inner.width as usize, true);
+                self.render_list_body(frame, list_inner, true);
 
                 let preview_block = Block::default()
                     .borders(Borders::ALL)
@@ -1376,14 +1413,19 @@ impl SessionsPane {
         }
     }
 
-    fn render_list_body(&mut self, frame: &mut Frame, body: Rect, width: usize, record_hits: bool) {
-        let (lines, selected_span) = self.body_lines_with_selected_span(width);
+    fn render_list_body(&mut self, frame: &mut Frame, body: Rect, record_hits: bool) {
+        let content = Rect {
+            width: body
+                .width
+                .saturating_sub(if body.width > 1 { 1 } else { 0 }),
+            ..body
+        };
+        let (lines, selected_span) = self.body_lines_with_selected_span(content.width as usize);
         self.last_content_rows = lines.len();
-        self.last_body_height = body.height as usize;
+        self.last_body_height = content.height as usize;
         let mut scroll = self
             .current()
-            .list
-            .scroll()
+            .row_offset
             .min(self.last_content_rows.saturating_sub(self.last_body_height));
         if let Some((start, end)) = selected_span {
             scroll = crate::tui::pane_shared::clamp_scroll_to_visible_span(
@@ -1395,12 +1437,24 @@ impl SessionsPane {
             );
         }
         if let Some(level) = self.levels.last_mut() {
-            level.list.set_scroll(scroll);
+            level.row_offset = scroll;
         }
         if record_hits {
-            self.record_card_hits(body, scroll);
+            self.record_card_hits(content, scroll);
         }
-        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), content);
+        if self.last_content_rows > self.last_body_height && body.width > 1 && body.height > 0 {
+            let scrollbar_area = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
+            let mut state = ScrollbarState::new(self.last_content_rows)
+                .position(scroll)
+                .viewport_content_length(self.last_body_height);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)))
+                .thumb_style(Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX)));
+            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+        }
     }
 
     fn render_preview_body(&mut self, frame: &mut Frame, area: Rect) {
@@ -1526,13 +1580,13 @@ impl SessionsPane {
             let card = card_lines(
                 summary,
                 *tier,
-                i == level.list.cursor(),
+                i == level.selected_index(),
                 show_project,
                 width,
                 self.use_emojis,
             );
             let end = start + card.len();
-            if i == level.list.cursor() {
+            if i == level.selected_index() {
                 selected_span = Some((start, end));
             }
             lines.extend(card);
@@ -1548,7 +1602,7 @@ impl SessionsPane {
             let height = card_lines(
                 summary,
                 *tier,
-                index == self.current().list.cursor(),
+                index == self.current().selected_index(),
                 show_project,
                 body.width as usize,
                 self.use_emojis,
@@ -2828,11 +2882,7 @@ mod tests {
         let mut pane = test_pane(vec![(parent.clone(), Tier::Idle)]);
         // Simulate a drill-in by pushing a level (the real drill-in fetches
         // from the daemon, which isn't available under test).
-        pane.levels.push(Level {
-            parent: Some(parent),
-            cards: vec![],
-            list: ScrollList::new(),
-        });
+        pane.levels.push(Level::empty(Some(parent)));
         let crumb: String = pane
             .breadcrumb_line()
             .spans
@@ -2992,18 +3042,18 @@ mod tests {
             (summary(Uuid::new_v4(), 100), Tier::Unread),
         ];
         let mut pane = test_pane(cards);
-        assert_eq!(pane.current().list.cursor(), 0);
+        assert_eq!(pane.current().selected_index(), 0);
         // Up from the first card wraps to the last.
         pane.handle_key(press(KeyCode::Up));
-        assert_eq!(pane.current().list.cursor(), 2);
+        assert_eq!(pane.current().selected_index(), 2);
         // Down from the last card wraps to the first.
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.current().list.cursor(), 0);
+        assert_eq!(pane.current().selected_index(), 0);
         // `j`/`k` navigate the same (non-typing list).
         pane.handle_key(press(KeyCode::Char('k')));
-        assert_eq!(pane.current().list.cursor(), 2);
+        assert_eq!(pane.current().selected_index(), 2);
         pane.handle_key(press(KeyCode::Char('j')));
-        assert_eq!(pane.current().list.cursor(), 0);
+        assert_eq!(pane.current().selected_index(), 0);
     }
 
     #[test]
@@ -3011,9 +3061,94 @@ mod tests {
         let cards = vec![(summary(Uuid::new_v4(), 100), Tier::Unread)];
         let mut pane = test_pane(cards);
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.current().list.cursor(), 0);
+        assert_eq!(pane.current().selected_index(), 0);
         pane.handle_key(press(KeyCode::Up));
-        assert_eq!(pane.current().list.cursor(), 0);
+        assert_eq!(pane.current().selected_index(), 0);
+    }
+
+    #[test]
+    fn refresh_and_live_reorder_preserve_selected_session_id() {
+        let first = Uuid::new_v4();
+        let selected = Uuid::new_v4();
+        let last = Uuid::new_v4();
+        let mut pane = test_pane(vec![
+            (summary(first, 300), Tier::Idle),
+            (summary(selected, 200), Tier::Idle),
+            (summary(last, 100), Tier::Idle),
+        ]);
+        pane.current_mut().select(1);
+
+        pane.mark_current_level_loading();
+        pane.apply_sessions_result(Ok(vec![
+            summary(selected, 500),
+            summary(last, 400),
+            summary(first, 300),
+        ]));
+        assert_eq!(pane.selected_id(), Some(selected));
+
+        pane.apply_live_status(std::collections::HashMap::from([(last, (true, false))]));
+        assert_eq!(pane.selected_id(), Some(selected));
+    }
+
+    fn rendered_text(pane: &mut SessionsPane, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, width, height)))
+            .expect("draw sessions pane");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn testbackend_viewport_matrix_handles_width_unicode_states_and_hit_geometry() {
+        let mut cards = Vec::new();
+        for index in 0..8 {
+            let mut card = summary(Uuid::new_v4(), 100 - index);
+            card.short_id = Some(format!("会話-{index}"));
+            card.title = Some(format!(
+                "Cafe\u{301} 🚀 session {index} with wrapped context"
+            ));
+            card.fork_count = u32::from(index % 2 == 0);
+            cards.push((card, Tier::Idle));
+        }
+
+        for width in [48, 100, 140] {
+            let mut pane = test_pane(cards.clone());
+            pane.current_mut().select(cards.len() - 1);
+            let text = rendered_text(&mut pane, width, 16);
+            assert!(!text.contains('\u{fffd}'), "width {width}: {text}");
+            assert_eq!(pane.selected_id(), Some(cards.last().unwrap().0.session_id));
+            assert!(pane.current().row_offset > 0, "width {width}: {text}");
+            let list_area = pane.list_area.expect("list geometry");
+            for hit in &pane.card_hits {
+                assert!(point_in_rect(list_area, hit.rect.x, hit.rect.y));
+                assert_eq!(
+                    hit_card(&pane.card_hits, hit.rect.x, hit.rect.y),
+                    Some(hit.index)
+                );
+            }
+            assert!(
+                pane.card_hits
+                    .windows(2)
+                    .all(|pair| pair[0].rect.bottom() <= pair[1].rect.y)
+            );
+        }
+
+        let mut empty = test_pane(Vec::new());
+        assert!(rendered_text(&mut empty, 48, 10).contains("no sessions"));
+        empty.loading = Some("Loading sessions...");
+        assert!(rendered_text(&mut empty, 100, 10).contains("Loading sessions"));
+        empty.loading = None;
+        empty.error = Some("network unavailable".into());
+        assert!(rendered_text(&mut empty, 140, 10).contains("network unavailable"));
     }
 
     #[test]
@@ -3030,7 +3165,7 @@ mod tests {
             (selected, Tier::Idle),
             (last, Tier::Idle),
         ]);
-        pane.current_mut().list.set_cursor(1);
+        pane.current_mut().select(1);
 
         let (lines, span) = pane.body_lines_with_selected_span(80);
 
@@ -3090,11 +3225,10 @@ mod tests {
     fn nested_escape_backs_out_but_q_closes() {
         let parent = summary(Uuid::new_v4(), 100);
         let mut pane = test_pane(vec![(parent.clone(), Tier::Idle)]);
-        pane.levels.push(Level {
-            parent: Some(parent),
-            cards: vec![(summary(Uuid::new_v4(), 101), Tier::Idle)],
-            list: ScrollList::new(),
-        });
+        pane.levels.push(Level::with_cards(
+            Some(parent),
+            vec![(summary(Uuid::new_v4(), 101), Tier::Idle)],
+        ));
 
         assert!(matches!(
             pane.handle_key(press(KeyCode::Esc)),
@@ -3102,11 +3236,8 @@ mod tests {
         ));
         assert_eq!(pane.levels.len(), 1, "Esc backs out one fork level");
 
-        pane.levels.push(Level {
-            parent: Some(summary(Uuid::new_v4(), 102)),
-            cards: Vec::new(),
-            list: ScrollList::new(),
-        });
+        pane.levels
+            .push(Level::empty(Some(summary(Uuid::new_v4(), 102))));
         assert!(matches!(
             pane.handle_key(press(KeyCode::Char('q'))),
             Some(SessionsOutcome::Close)
@@ -3143,11 +3274,7 @@ mod tests {
     fn daemon_nested_escape_and_back_schedule_current_level_reload() {
         let parent = summary(Uuid::new_v4(), 100);
         let mut pane = test_pane(vec![(parent.clone(), Tier::Idle)]);
-        pane.levels.push(Level {
-            parent: Some(parent),
-            cards: vec![],
-            list: ScrollList::new(),
-        });
+        pane.levels.push(Level::empty(Some(parent)));
         pane.loading = Some("Loading sessions...");
 
         assert!(matches!(
@@ -3159,11 +3286,10 @@ mod tests {
         assert!(pane.current().cards.is_empty());
 
         let parent = summary(Uuid::new_v4(), 200);
-        pane.levels.push(Level {
-            parent: Some(parent),
-            cards: vec![(summary(Uuid::new_v4(), 201), Tier::Idle)],
-            list: ScrollList::new(),
-        });
+        pane.levels.push(Level::with_cards(
+            Some(parent),
+            vec![(summary(Uuid::new_v4(), 201), Tier::Idle)],
+        ));
         pane.loading = None;
 
         assert!(matches!(
@@ -3242,11 +3368,7 @@ mod tests {
             project_id: Some("pid".into()),
             scope: Scope::Project,
             show_archived: false,
-            levels: vec![Level {
-                parent: None,
-                cards,
-                list: ScrollList::new(),
-            }],
+            levels: vec![Level::with_cards(None, cards)],
             step: Step::Browse,
             error: None,
             notice: None,

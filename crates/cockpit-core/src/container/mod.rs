@@ -460,12 +460,7 @@ pub fn container_manager() -> &'static OnceCell<ContainerManager> {
 }
 
 pub fn initial_availability_unknown() -> ContainerAvailability {
-    ContainerAvailability {
-        runtime: None,
-        harness_in_container: false,
-        available: false,
-        reason: Some(ContainerUnavailableReason::NoRuntime),
-    }
+    ContainerAvailability::unpublished()
 }
 
 pub fn availability_snapshot() -> ContainerAvailability {

@@ -142,16 +142,6 @@ impl App {
             },
         );
 
-        self.async_actions.start_blocking(
-            AsyncActionKind::Refresh("container.availability"),
-            AsyncActionPolicy::Dedupe(AsyncActionKey::new("container.availability")),
-            || {
-                Ok(AsyncActionPayload::ContainerAvailability(
-                    cockpit_core::container::availability_snapshot(),
-                ))
-            },
-        );
-
         // Pre-daemon / in-process doctor snapshot for Settings before attach.
         // This is not the daemon capability authority. After the daemon is
         // up, clients must consult `GetHostCapabilities` /

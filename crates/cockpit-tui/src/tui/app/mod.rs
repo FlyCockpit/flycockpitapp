@@ -3832,7 +3832,7 @@ impl App {
                 !no_sandbox,
             ),
             container_network_enabled: false,
-            container_availability: cockpit_core::container::initial_availability_unknown(),
+            container_availability: cockpit_proto::ContainerAvailability::unpublished(),
             host_capabilities: crate::tui::capability_gate::empty_capability_snapshot(),
             capability_refresh_queue: Vec::new(),
             capability_refresh_calls: 0,

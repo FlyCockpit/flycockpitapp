@@ -521,6 +521,18 @@ fn production_uses_cockpit_proto_directly() {
                     path.display()
                 ));
             }
+            for frontend_probe in [
+                "cockpit_core::container::availability_snapshot",
+                "cockpit_core::container::initial_availability_unknown",
+                "cockpit_core::tools::shell_sandbox::shell_sandbox_supported",
+            ] {
+                if compact.contains(frontend_probe) {
+                    findings.push(format!(
+                        "{}: host capability discovery belongs to the daemon: {frontend_probe}",
+                        path.display()
+                    ));
+                }
+            }
             if compact.contains("externcratecockpit_core") {
                 findings.push(format!(
                     "{}: whole-crate cockpit_core extern aliases obscure protocol ownership",

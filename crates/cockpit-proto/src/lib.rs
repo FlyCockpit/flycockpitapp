@@ -679,6 +679,17 @@ pub struct ContainerAvailability {
     pub reason: Option<ContainerUnavailableReason>,
 }
 
+impl ContainerAvailability {
+    pub fn unpublished() -> Self {
+        Self {
+            runtime: None,
+            harness_in_container: false,
+            available: false,
+            reason: Some(ContainerUnavailableReason::NoRuntime),
+        }
+    }
+}
+
 impl Default for ContainerAvailability {
     fn default() -> Self {
         Self {

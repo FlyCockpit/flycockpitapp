@@ -208,9 +208,7 @@ impl App {
                 crate::tui::app::ControlApplied::None,
             );
         } else {
-            self.apply_host_capabilities(
-                crate::tui::capability_gate::local_host_capability_snapshot(),
-            );
+            self.apply_host_capabilities(cockpit_proto::HostCapabilitySnapshot::unpublished());
         }
         self.host_capabilities.clone()
     }

@@ -35,6 +35,7 @@ struct ProcessCleanup {
     child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
     receipt: Arc<std::sync::Mutex<Option<DaemonPidReceipt>>>,
     launch_start: Option<cockpit_host::daemon_lifecycle::ProcessStartIdentity>,
+    launch_executable: Option<PathBuf>,
 }
 
 struct ProcessReap {
@@ -250,7 +251,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
         }
         if let Some(DaemonPidRecord::Receipt(receipt)) =
             read_daemon_pid_record(&cleanup.paths.pid_file)
-            && receipt.pid == expected_pid
+            && receipt_matches_owned_launch(cleanup, expected_pid, &receipt)
         {
             *cleanup
                 .receipt
@@ -338,6 +339,32 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
     result
 }
 
+fn receipt_matches_owned_launch(
+    cleanup: &ProcessCleanup,
+    expected_pid: u32,
+    receipt: &DaemonPidReceipt,
+) -> bool {
+    receipt_matches_launch_fence(cleanup, expected_pid, receipt)
+        && verify_cockpit_daemon_receipt_identity(receipt) == PidIdentity::VerifiedDaemon
+}
+
+fn receipt_matches_launch_fence(
+    cleanup: &ProcessCleanup,
+    expected_pid: u32,
+    receipt: &DaemonPidReceipt,
+) -> bool {
+    cleanup.launch_start.as_ref().is_some_and(|launch_start| {
+        let executable_matches = cleanup
+            .launch_executable
+            .as_ref()
+            .is_some_and(|executable| executable == &receipt.executable);
+        receipt.pid == expected_pid
+            && &receipt.process_start == launch_start
+            && receipt.publication_nonce != [0; 32]
+            && executable_matches
+    })
+}
+
 fn retire_late_exact_metadata(
     cleanup: &ProcessCleanup,
     expected_pid: u32,
@@ -348,11 +375,7 @@ fn retire_late_exact_metadata(
         return Ok(());
     };
     let exact = bound_expected.map_or_else(
-        || {
-            cleanup.launch_start.as_ref().is_some_and(|launch_start| {
-                receipt.pid == expected_pid && &receipt.process_start == launch_start
-            })
-        },
+        || receipt_matches_launch_fence(cleanup, expected_pid, &receipt),
         |expected| &receipt == expected,
     );
     if !exact {
@@ -392,6 +415,7 @@ impl EphemeralDaemonGuard {
         child: crate::daemon::DetachedEphemeralChild,
     ) -> Self {
         let launch_start = child.process_start();
+        let launch_executable = child.executable().to_path_buf();
         Self {
             socket: paths.socket.clone(),
             process: Some(ProcessCleanup {
@@ -399,6 +423,7 @@ impl EphemeralDaemonGuard {
                 child: Arc::new(std::sync::Mutex::new(Some(child.into_child()))),
                 receipt: Arc::new(std::sync::Mutex::new(None)),
                 launch_start: Some(launch_start),
+                launch_executable: Some(launch_executable),
             }),
             armed: Arc::new(AtomicBool::new(true)),
         }
@@ -453,7 +478,11 @@ impl EphemeralDaemonGuard {
             .context("ephemeral child already reaped")?
             .id();
         let receipt = match read_daemon_pid_record(&process.paths.pid_file) {
-            Some(DaemonPidRecord::Receipt(receipt)) if receipt.pid == pid => receipt,
+            Some(DaemonPidRecord::Receipt(receipt))
+                if receipt_matches_owned_launch(process, pid, &receipt) =>
+            {
+                receipt
+            }
             Some(_) => anyhow::bail!("ephemeral daemon published a mismatching PID receipt"),
             None => anyhow::bail!("ephemeral daemon did not publish its v2 PID receipt"),
         };
@@ -490,6 +519,7 @@ impl ProvisionalEphemeralChild {
                 child: Arc::new(std::sync::Mutex::new(Some(child))),
                 receipt: Arc::new(std::sync::Mutex::new(None)),
                 launch_start: None,
+                launch_executable: None,
             },
         }
     }
@@ -785,6 +815,7 @@ mod tests {
             crate::daemon::DetachedEphemeralChild {
                 child,
                 process_start,
+                executable: std::fs::canonicalize("/bin/sleep").unwrap(),
             },
         );
         (guard, paths, pid)
@@ -1042,5 +1073,53 @@ mod tests {
         assert!(!process_child_retained(&cleanup));
         assert!(!paths.pid_file.exists());
         assert!(!paths.socket.exists());
+    }
+
+    #[tokio::test]
+    async fn one_failed_signal_registration_waits_for_remaining_handler() {
+        let delivered: RegisteredSignal = Box::pin(async { Some(()) });
+        wait_for_registered_unix_signal(None, Some(delivered))
+            .await
+            .expect("remaining handler delivers signal");
+    }
+
+    #[tokio::test]
+    async fn both_failed_signal_registrations_are_not_a_signal() {
+        assert!(wait_for_registered_unix_signal(None, None).await.is_err());
+    }
+
+    #[test]
+    fn identity_less_owner_reaps_child_but_preserves_same_pid_receipt() {
+        initialize_process_reaper().expect("process reaper");
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::daemon::DaemonPaths {
+            socket: root.path().join("identity-less.sock"),
+            pid_file: root.path().join("identity-less.pid"),
+            ephemeral: true,
+        };
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn fixture child");
+        let pid = child.id();
+        let provisional = ProvisionalEphemeralChild::new(paths.clone(), child);
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let mut replacement =
+            cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
+                .unwrap();
+        replacement.process_start.primary ^= 1;
+        replacement.publication_nonce[0] ^= 1;
+        std::fs::write(&paths.pid_file, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        std::fs::write(&paths.socket, b"replacement socket").unwrap();
+
+        provisional
+            .shutdown()
+            .expect_err("identity-less cleanup reports forced unpublished-child teardown");
+
+        assert_eq!(
+            read_daemon_pid_record(&paths.pid_file),
+            Some(DaemonPidRecord::Receipt(replacement))
+        );
+        assert!(paths.socket.exists());
     }
 }

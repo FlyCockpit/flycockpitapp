@@ -999,6 +999,7 @@ fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> 
 pub struct DetachedEphemeralChild {
     child: std::process::Child,
     process_start: cockpit_host::daemon_lifecycle::ProcessStartIdentity,
+    executable: PathBuf,
 }
 
 impl DetachedEphemeralChild {
@@ -1012,6 +1013,10 @@ impl DetachedEphemeralChild {
 
     fn process_start(&self) -> cockpit_host::daemon_lifecycle::ProcessStartIdentity {
         self.process_start
+    }
+
+    fn executable(&self) -> &Path {
+        &self.executable
     }
 }
 
@@ -1034,10 +1039,14 @@ pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<DetachedEphemeral
             };
         }
     };
+    let executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .context("capturing ephemeral child executable identity")?;
     let child = provisional.into_child()?;
     Ok(DetachedEphemeralChild {
         child,
         process_start,
+        executable,
     })
 }
 

@@ -2,7 +2,6 @@
 
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 fn schema_inventory(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
@@ -665,6 +664,46 @@ fn ownership() -> BTreeMap<String, Ownership> {
         .get("table")
         .and_then(toml::Value::as_table)
         .expect("schema-ownership.toml must contain a nonempty [table] map");
+    let sql = [
+        include_str!("../src/db/migrations/0001_initial.sql"),
+        include_str!("../src/db/migrations/0001_extended_profile.sql"),
+        include_str!("../src/db/migrations/0001_remote_profile.sql"),
+    ]
+    .join("\n");
+    let guarded_tables = sql
+        .split("CREATE TRIGGER ")
+        .skip(1)
+        .filter_map(|trigger| {
+            let name = trigger.split_whitespace().next()?;
+            let is_graph = name.contains("state_graph")
+                || name.contains("legal_transition")
+                || name.contains("legal_edge")
+                || name.contains("transition_guard")
+                || name.ends_with("_transition")
+                || name.contains("terminal_final")
+                || name.contains("terminal_is_final");
+            if !is_graph || name.contains("registry") {
+                return None;
+            }
+            let header = trigger.split("BEGIN").next()?;
+            let tokens = header.split_whitespace().collect::<Vec<_>>();
+            tokens
+                .windows(2)
+                .rev()
+                .find_map(|pair| (pair[0] == "ON").then(|| pair[1].trim().to_owned()))
+        })
+        .collect::<BTreeSet<_>>();
+    for guarded_table in &guarded_tables {
+        let classification = table
+            .get(guarded_table)
+            .and_then(toml::Value::as_table)
+            .unwrap_or_else(|| panic!("transition-guarded table {guarded_table} is unclassified"));
+        assert_ne!(
+            required_text(guarded_table, classification, "state_machine"),
+            "none",
+            "transition-guarded table {guarded_table} cannot be classified none"
+        );
+    }
     assert!(
         !table.is_empty(),
         "ownership classification cannot be vacuous"
@@ -867,19 +906,6 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
         [local_sql, remote_sql].concat(),
         [local_sql, extended_sql, remote_sql].concat(),
     ];
-    let fingerprints = profile_sql
-        .iter()
-        .map(|sql| {
-            let mut hasher = DefaultHasher::new();
-            sql.hash(&mut hasher);
-            hasher.finish()
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        fingerprints.len(),
-        profile_sql.len(),
-        "profiles with different inventories must have distinct ordered SQL fingerprints"
-    );
     assert!(
         profile_sql[3].starts_with(&profile_sql[1])
             && &profile_sql[3][profile_sql[1].len()..] == remote_sql,

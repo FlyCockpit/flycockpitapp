@@ -77,6 +77,18 @@ pub enum WorkspaceLeaseState {
     Cleaned,
     Uncertain,
 }
+pub const WORKSPACE_LEASE_STATES: &[&str] = &["active", "grace", "cleaned", "uncertain"];
+pub const WORKSPACE_LEASE_TERMINAL_STATES: &[&str] = &["cleaned"];
+pub const WORKSPACE_LEASE_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("active", "grace"),
+    ("active", "uncertain"),
+    ("grace", "cleaned"),
+    ("grace", "uncertain"),
+    ("uncertain", "cleaned"),
+];
+fn workspace_lease_transition_allowed(from: WorkspaceLeaseState, to: WorkspaceLeaseState) -> bool {
+    WORKSPACE_LEASE_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
+}
 impl WorkspaceLeaseState {
     fn as_str(self) -> &'static str {
         match self {
@@ -138,6 +150,30 @@ pub enum TaskArtifactState {
     Conflict,
     Cancelled,
     Failed,
+}
+pub const TASK_ARTIFACT_STATES: &[&str] = &[
+    "produced",
+    "integrating",
+    "integrated",
+    "stale",
+    "conflict",
+    "cancelled",
+    "failed",
+];
+pub const TASK_ARTIFACT_TERMINAL_STATES: &[&str] =
+    &["integrated", "stale", "conflict", "cancelled", "failed"];
+pub const TASK_ARTIFACT_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("produced", "integrating"),
+    ("produced", "cancelled"),
+    ("integrating", "produced"),
+    ("integrating", "integrated"),
+    ("integrating", "stale"),
+    ("integrating", "conflict"),
+    ("integrating", "cancelled"),
+    ("integrating", "failed"),
+];
+fn task_artifact_transition_allowed(from: TaskArtifactState, to: TaskArtifactState) -> bool {
+    TASK_ARTIFACT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 impl TaskArtifactState {
     fn as_str(self) -> &'static str {
@@ -629,6 +665,12 @@ impl Db {
         now: i64,
         allow_uncertain: bool,
     ) -> Result<LeaseCasOutcome> {
+        ensure!(
+            workspace_lease_transition_allowed(from, to)
+                || allow_uncertain
+                    && workspace_lease_transition_allowed(WorkspaceLeaseState::Uncertain, to),
+            "illegal workspace lease transition"
+        );
         self.transaction(move |c| { let Some(current)=lease_for_owner(c,session,agent,id)? else{return Ok(LeaseCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(LeaseCasOutcome::AlreadyTerminal(current))}; if current.revision != expected || !(current.state == from || allow_uncertain && current.state == WorkspaceLeaseState::Uncertain) || (from == WorkspaceLeaseState::Active && current.expires_at_unix_ms > now) {return Ok(LeaseCasOutcome::RevisionConflict)}; c.execute("UPDATE workspace_leases SET state=?1,terminal_reason=?2,uncertain_reason=COALESCE(?3, uncertain_reason),revision=revision+1,updated_at_unix_ms=?4 WHERE workspace_lease_id=?5 AND revision=?6",params![to.as_str(),reason.map(|v|v.as_str()),uncertain_reason.map(|v|v.as_str()),now,id.to_string(),expected])?; Ok(LeaseCasOutcome::Transitioned(lease_for_owner(c,session,agent,id)?.context("transitioned workspace lease missing")?)) }).await
     }
 
@@ -758,6 +800,10 @@ impl Db {
         to: TaskArtifactState,
         now: i64,
     ) -> Result<ArtifactCasOutcome> {
+        ensure!(
+            task_artifact_transition_allowed(from, to),
+            "illegal task artifact transition"
+        );
         self.transaction(move |c| { let Some(current)=artifact_for_owner(c,session,agent,id)? else{return Ok(ArtifactCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(ArtifactCasOutcome::AlreadyTerminal(current))}; if current.revision != expected || current.state != from{return Ok(ArtifactCasOutcome::RevisionConflict)}; c.execute("UPDATE task_artifacts SET state=?1,revision=revision+1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND revision=?4 AND state=?5",params![to.as_str(),now,id.to_string(),expected,from.as_str()])?; Ok(ArtifactCasOutcome::Transitioned(artifact_for_owner(c,session,agent,id)?.context("transitioned artifact missing")?)) }).await
     }
     /// Commits the target-generation proof, immutable integration receipt, and

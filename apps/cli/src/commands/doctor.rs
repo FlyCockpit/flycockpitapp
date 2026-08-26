@@ -88,13 +88,23 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
         .client
         .request(build_doctor_request(&args, no_sandbox))
         .await
-        .map_err(DoctorCouldNotRun)?
-        .map_err(|error| {
-            DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
+        .map_err(DoctorCouldNotRun)
+        .and_then(|response| {
+            response.map_err(|error| {
+                DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
+            })
         });
-    if let Some(guard) = &guard {
-        guard.shutdown();
-    }
+    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
+    let response = match (response, shutdown) {
+        (Ok(response), Ok(())) => Ok(response),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(shutdown)) => Err(DoctorCouldNotRun(
+            shutdown.context("shutting down diagnostic daemon"),
+        )),
+        (Err(command), Err(shutdown)) => Err(DoctorCouldNotRun(anyhow::anyhow!(
+            "{command:#}; diagnostic daemon shutdown also failed: {shutdown:#}"
+        ))),
+    };
     let Response::DoctorSnapshot {
         rendered,
         has_failures,

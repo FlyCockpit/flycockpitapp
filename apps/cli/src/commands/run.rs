@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::spawn_signal_shutdown;
+use crate::daemon::ephemeral_guard::{aggregate_shutdown_result, spawn_signal_shutdown};
 use crate::daemon::proto::{self, Request, Response};
 
 #[derive(Debug, thiserror::Error)]
@@ -271,13 +271,12 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     if let Some(task) = signal_task {
         task.abort();
     }
-    if let Some(guard) = &guard {
-        guard.shutdown();
-    }
+    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
     // Drop the guard explicitly here so its (now-disarmed) drop is a
     // no-op and we don't carry it past `process::exit`.
     drop(guard);
 
+    let result = aggregate_shutdown_result(result, shutdown);
     let exit_code = match result {
         Ok(code) => code,
         Err(error) if error.downcast_ref::<RunWorkspaceTrustError>().is_some() => {

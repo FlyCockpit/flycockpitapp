@@ -19,7 +19,7 @@ use cockpit_core::init::{InitMode, build_init_prompt, display_target, resolve_ta
 
 use crate::cli::InitArgs;
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::spawn_signal_shutdown;
+use crate::daemon::ephemeral_guard::{aggregate_shutdown_result, spawn_signal_shutdown};
 
 /// `cockpit init [path]` — headless. Resolves the target, refuses to
 /// clobber an existing file unless `--force` (no interactive prompt in
@@ -77,12 +77,10 @@ pub async fn run(args: InitArgs, no_sandbox: bool) -> Result<()> {
     if let Some(task) = signal_task {
         task.abort();
     }
-    if let Some(guard) = &guard {
-        guard.shutdown();
-    }
+    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
     drop(guard);
 
-    let exit_code = result?;
+    let exit_code = aggregate_shutdown_result(result, shutdown)?;
     if exit_code != 0 {
         anyhow::bail!("`cockpit init` ran but the agent reported an error");
     }

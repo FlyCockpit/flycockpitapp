@@ -52,6 +52,8 @@ thread_local! {
     static INJECT_PROCESS_CLEANUP_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INJECT_CHILD_KILL_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INJECT_CHILD_WAIT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INJECT_OWNER_GRACEFUL_STOP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static INJECT_OWNER_EXIT_TIMEOUT_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn initialize_process_reaper() -> anyhow::Result<()> {
@@ -273,16 +275,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
                 "ephemeral daemon receipt changed before teardown; exact child was terminated without touching replacement metadata"
             );
         }
-        match crate::daemon::stop_exact(&cleanup.paths, &expected) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                kill_and_wait_exact_child(child)?;
-                anyhow::bail!(
-                    "exact receipt no longer named a verified live daemon; exact child was reaped"
-                )
-            }
-            Err(error) => Err(error),
-        }
+        request_owned_graceful_stop(cleanup, &expected)
     } else {
         kill_and_wait_exact_child(child)?;
         retire_late_exact_metadata(cleanup, expected_pid, None)?;
@@ -317,7 +310,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
         }
         return result;
     }
-    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let exit_deadline = std::time::Instant::now() + owner_exit_timeout();
     let mut forced_exit = false;
     loop {
         if child_try_wait(child)?.is_some() {
@@ -337,6 +330,58 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
         anyhow::bail!("ephemeral daemon did not exit after verified stop; exact child was forced")
     }
     result
+}
+
+fn owner_exit_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(milliseconds) = INJECT_OWNER_EXIT_TIMEOUT_MS.with(|value| value.replace(None)) {
+        return std::time::Duration::from_millis(milliseconds);
+    }
+    std::time::Duration::from_secs(5)
+}
+
+fn request_owned_graceful_stop(
+    cleanup: &ProcessCleanup,
+    expected: &DaemonPidReceipt,
+) -> anyhow::Result<()> {
+    if read_daemon_pid_record(&cleanup.paths.pid_file)
+        != Some(DaemonPidRecord::Receipt(expected.clone()))
+    {
+        anyhow::bail!("daemon receipt changed before owner graceful-stop request");
+    }
+    #[cfg(unix)]
+    {
+        #[cfg(test)]
+        if let Some(succeed) = INJECT_OWNER_GRACEFUL_STOP.with(|value| value.replace(None)) {
+            return if succeed {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("injected owner graceful-stop failure"))
+            };
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building owner graceful-stop runtime")?;
+        runtime.block_on(async {
+            let client = cockpit_client::DaemonClient::connect(&cleanup.paths.socket)
+                .await
+                .context("connecting exact owned daemon")?;
+            match client
+                .request_ok(Request::StopDaemon { grace_secs: None })
+                .await
+                .context("requesting exact owned daemon shutdown")?
+            {
+                crate::daemon::proto::Response::Ack => Ok(()),
+                response => anyhow::bail!("unexpected owner shutdown response: {response:?}"),
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cleanup, expected);
+        anyhow::bail!("owner graceful-stop transport is unavailable on this platform")
+    }
 }
 
 fn receipt_matches_owned_launch(
@@ -577,6 +622,20 @@ impl Drop for ProvisionalEphemeralChild {
                 }
             }
         }
+    }
+}
+
+pub fn aggregate_shutdown_result<T>(
+    command: anyhow::Result<T>,
+    shutdown: anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    match (command, shutdown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(shutdown)) => Err(shutdown).context("shutting down owned daemon"),
+        (Err(command), Err(shutdown)) => Err(anyhow::anyhow!(
+            "command failed: {command:#}; owned daemon shutdown also failed: {shutdown:#}"
+        )),
     }
 }
 
@@ -1104,12 +1163,14 @@ mod tests {
         let pid = child.id();
         let provisional = ProvisionalEphemeralChild::new(paths.clone(), child);
         let executable = std::fs::canonicalize("/bin/sleep").unwrap();
-        let mut replacement =
+        let first =
             cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
                 .unwrap();
-        replacement.process_start.primary ^= 1;
-        replacement.publication_nonce[0] ^= 1;
-        std::fs::write(&paths.pid_file, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        std::fs::remove_file(&paths.pid_file).unwrap();
+        let replacement =
+            cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
+                .unwrap();
+        assert_ne!(first.publication_nonce, replacement.publication_nonce);
         std::fs::write(&paths.socket, b"replacement socket").unwrap();
 
         provisional
@@ -1121,5 +1182,46 @@ mod tests {
             Some(DaemonPidRecord::Receipt(replacement))
         );
         assert!(paths.socket.exists());
+    }
+
+    #[test]
+    fn owned_graceful_ack_and_exit_is_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "owner-graceful");
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        guard.armed.store(false, Ordering::SeqCst);
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let receipt =
+            cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
+                .unwrap();
+        *cleanup.receipt.lock().unwrap() = Some(receipt);
+        {
+            let mut child = cleanup.child.lock().unwrap();
+            kill_and_wait_exact_child(child.as_mut().unwrap()).unwrap();
+        }
+        INJECT_OWNER_GRACEFUL_STOP.with(|value| value.set(Some(true)));
+
+        cleanup_exact_process(&cleanup).expect("graceful owner exit is terminal success");
+        assert!(!process_child_retained(&cleanup));
+        assert!(!paths.pid_file.exists());
+    }
+
+    #[test]
+    fn owned_graceful_timeout_forces_exact_child_and_reports_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "owner-timeout");
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        guard.armed.store(false, Ordering::SeqCst);
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let receipt =
+            cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
+                .unwrap();
+        *cleanup.receipt.lock().unwrap() = Some(receipt);
+        INJECT_OWNER_GRACEFUL_STOP.with(|value| value.set(Some(true)));
+        INJECT_OWNER_EXIT_TIMEOUT_MS.with(|value| value.set(Some(1)));
+
+        assert!(cleanup_exact_process(&cleanup).is_err());
+        assert!(!process_child_retained(&cleanup));
+        assert!(!paths.pid_file.exists());
     }
 }

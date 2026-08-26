@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::LearnArgs;
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::spawn_signal_shutdown;
+use crate::daemon::ephemeral_guard::{aggregate_shutdown_result, spawn_signal_shutdown};
 pub use crate::skills::{build_learn_prompt, subject_from_parts};
 
 pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
@@ -38,12 +38,10 @@ pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
     if let Some(task) = signal_task {
         task.abort();
     }
-    if let Some(guard) = &guard {
-        guard.shutdown();
-    }
+    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
     drop(guard);
 
-    let exit_code = result.context("running learn turn")?;
+    let exit_code = aggregate_shutdown_result(result.context("running learn turn"), shutdown)?;
     if exit_code != 0 {
         anyhow::bail!("`cockpit assistant learn` ran but the agent reported an error");
     }

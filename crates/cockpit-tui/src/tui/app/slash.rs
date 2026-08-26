@@ -1109,12 +1109,17 @@ fn run_context(app: &mut App, _: &str) -> bool {
 
 fn run_diff(app: &mut App, args: &str) -> bool {
     let source = crate::tui::diff_pane::parse_source_arg(args);
-    app.overlay = Overlay::Diff(crate::tui::diff_pane::DiffPane::open(
+    let mut pane = crate::tui::diff_pane::DiffPane::open(
         source,
         &app.launch.cwd,
         &app.history,
         app.diff_style,
-    ));
+    );
+    let fetch = pane.take_pending_fetch();
+    app.overlay = Overlay::Diff(pane);
+    if let Some((operation_id, source)) = fetch {
+        app.start_git_diff_action(operation_id, source);
+    }
     false
 }
 

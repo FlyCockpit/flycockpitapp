@@ -997,6 +997,19 @@ pub enum Request {
         path: String,
     },
 
+    /// Read a complete worktree/index projection through daemon-owned Git
+    /// authority. The response is capped before crossing the wire.
+    GitDiff {
+        project_root: String,
+        source: crate::GitReadSource,
+    },
+
+    /// Resolve the selected `/multireview` sources in one daemon operation.
+    GitReviewSources {
+        project_root: String,
+        sources: Vec<crate::GitReadSource>,
+    },
+
     OpenTerminal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
@@ -3642,6 +3655,8 @@ macro_rules! request_variants {
             (Request::FsDelete { .. }, "fs_delete");
             (Request::GitStatus { .. }, "git_status");
             (Request::GitDiffFile { .. }, "git_diff_file");
+            (Request::GitDiff { .. }, "git_diff");
+            (Request::GitReviewSources { .. }, "git_review_sources");
             (Request::OpenTerminal { .. }, "open_terminal");
             (Request::AttachTerminal { .. }, "attach_terminal");
             (Request::TerminalInput { .. }, "terminal_input");
@@ -3937,6 +3952,8 @@ macro_rules! command {
             (Request::FsDelete { project_root, path }, "fs_delete", owner_only, none, true, local_only, none, serialized, path(path), "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
             (Request::GitStatus { project_root }, "git_status", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String", [project_root: String => project_root]);
             (Request::GitDiffFile { project_root, path }, "git_diff_file", project_files(project_root), none, false, read_only, none, concurrent, path(path), "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
+            (Request::GitDiff { project_root, source }, "git_diff", owner_only, none, false, local_only, none, concurrent, none, "project_root:String|source:crate::GitReadSource", [project_root: String => project_root, source: $crate::GitReadSource => param]);
+            (Request::GitReviewSources { project_root, sources }, "git_review_sources", owner_only, none, false, local_only, none, concurrent, none, "project_root:String|sources:Vec<crate::GitReadSource>", [project_root: String => project_root, sources: Vec<$crate::GitReadSource> => param]);
             (Request::OpenTerminal { cwd, cols, rows }, "open_terminal", terminal, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "cwd:Option<String>|cols:u16|rows:u16", [cwd: Option<String> => param, cols: u16 => param, rows: u16 => param]);
             (Request::AttachTerminal { terminal_id, cols, rows }, "attach_terminal", terminal, none, false, read_only, none, serialized, none, "terminal_id:Uuid|cols:u16|rows:u16", [terminal_id: Uuid => terminal, cols: u16 => param, rows: u16 => param]);
             (Request::TerminalInput { terminal_id, bytes }, "terminal_input", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|bytes:Vec<u8>", [terminal_id: Uuid => terminal, bytes: Vec<u8> => param]);

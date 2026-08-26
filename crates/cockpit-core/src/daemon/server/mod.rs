@@ -521,6 +521,22 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::GitDiffFile { diff, truncated: _ } => scrub_string(diff, redact),
+        proto::Response::GitDiff {
+            source: _,
+            diff,
+            truncated: _,
+        } => scrub_string(diff, redact),
+        proto::Response::GitReviewSources { sources } => {
+            for source in sources {
+                scrub_string(&mut source.label, redact);
+                if let Some(command) = &mut source.command {
+                    scrub_string(command, redact);
+                }
+                if let Some(error) = &mut source.error {
+                    scrub_string(error, redact);
+                }
+            }
+        }
         proto::Response::LspControlResult { message } => scrub_string(message, redact),
         proto::Response::DaemonStatus {
             pid: _,

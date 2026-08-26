@@ -1539,6 +1539,24 @@ impl App {
                     pane.apply_fetch_result(result);
                 }
             }
+            AsyncActionKind::DaemonRpc("git.diff") => {
+                if let Overlay::Diff(pane) = &mut self.overlay
+                    && let Ok(AsyncActionPayload::GitDiff(result)) = result.payload
+                {
+                    pane.apply_fetch_result(result);
+                }
+            }
+            AsyncActionKind::DaemonRpc("git.review_sources") => {
+                if let Overlay::Multireview(dialog) = &mut self.overlay
+                    && let Ok(AsyncActionPayload::GitReviewSources(completion)) = result.payload
+                {
+                    dialog.apply_git_sources(completion);
+                    if let Some(kickoff) = dialog.take_done() {
+                        self.overlay = Overlay::None;
+                        self.start_multireview(kickoff.prompt);
+                    }
+                }
+            }
             AsyncActionKind::Internal("subagent.history") => {
                 if let Ok(AsyncActionPayload::SubagentHistory {
                     session_id,
@@ -3079,6 +3097,114 @@ impl App {
             move || {
                 Ok(AsyncActionPayload::StatsRollup(
                     crate::tui::stats_pane::fetch_stats_rollup(endpoint.as_ref(), key),
+                ))
+            },
+        );
+    }
+
+    pub(super) fn start_git_diff_action(
+        &mut self,
+        operation_id: uuid::Uuid,
+        source: crate::tui::diff_pane::DiffSource,
+    ) {
+        let (project_root, source_wire) = match &self.overlay {
+            Overlay::Diff(pane) => (
+                pane.project_root().display().to_string(),
+                match source {
+                    crate::tui::diff_pane::DiffSource::Worktree => {
+                        cockpit_proto::GitReadSource::Worktree
+                    }
+                    crate::tui::diff_pane::DiffSource::Staged => {
+                        cockpit_proto::GitReadSource::Staged
+                    }
+                    crate::tui::diff_pane::DiffSource::Last => return,
+                },
+            ),
+            _ => return,
+        };
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("git.diff"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("git.diff")),
+            async move {
+                let result = async {
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    match client
+                        .request(cockpit_proto::Request::GitDiff {
+                            project_root,
+                            source: source_wire.clone(),
+                        })
+                        .await
+                        .map_err(|error| format!("daemon request: {error}"))?
+                    {
+                        Ok(cockpit_proto::Response::GitDiff {
+                            source: returned_source,
+                            diff,
+                            truncated,
+                        }) if returned_source == source_wire => {
+                            if truncated {
+                                Err("git diff exceeded the daemon response limit".to_string())
+                            } else {
+                                Ok(diff)
+                            }
+                        }
+                        Ok(other) => Err(format!("unexpected git_diff response: {other:?}")),
+                        Err(error) => Err(error.message),
+                    }
+                }
+                .await;
+                Ok(AsyncActionPayload::GitDiff(
+                    crate::tui::diff_pane::DiffPaneFetchResult {
+                        operation_id,
+                        source,
+                        result,
+                    },
+                ))
+            },
+        );
+    }
+
+    pub(super) fn start_git_review_sources_action(
+        &mut self,
+        operation_id: uuid::Uuid,
+        sources: Vec<cockpit_proto::GitReadSource>,
+    ) {
+        let project_root = match &self.overlay {
+            Overlay::Multireview(dialog) => dialog.project_root().display().to_string(),
+            _ => return,
+        };
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("git.review_sources"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("git.review_sources")),
+            async move {
+                let result = async {
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    match client
+                        .request(cockpit_proto::Request::GitReviewSources {
+                            project_root,
+                            sources,
+                        })
+                        .await
+                        .map_err(|error| format!("daemon request: {error}"))?
+                    {
+                        Ok(cockpit_proto::Response::GitReviewSources { sources }) => Ok(sources),
+                        Ok(other) => {
+                            Err(format!("unexpected git_review_sources response: {other:?}"))
+                        }
+                        Err(error) => Err(error.message),
+                    }
+                }
+                .await;
+                Ok(AsyncActionPayload::GitReviewSources(
+                    crate::tui::multireview_dialog::GitReviewSourcesCompletion {
+                        operation_id,
+                        result,
+                    },
                 ))
             },
         );

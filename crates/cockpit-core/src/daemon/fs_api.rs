@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use crate::daemon::principal::ClientPrincipal;
 use crate::daemon::proto::{
-    ErrorCode, ErrorPayload, FsEntry, FsEntryKind, FsReadKind, GitStatusEntry, Response,
+    ErrorCode, ErrorPayload, FsEntry, FsEntryKind, FsReadKind, GitReadSource,
+    GitReviewSourceResult, GitStatusEntry, Response,
 };
 use crate::daemon::server::DaemonContext;
 
@@ -1778,6 +1779,110 @@ pub(crate) fn git_diff_file_blocking(
         diff: outcome.stdout[..cap].to_string(),
         truncated: outcome.stdout.len() > cap,
     })
+}
+
+pub async fn git_diff(
+    project_root: String,
+    source: GitReadSource,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "git_diff",
+        tokio::task::spawn_blocking(move || git_diff_blocking(&project_root, source)),
+    )
+    .await
+}
+
+pub(crate) fn git_diff_blocking(
+    project_root: &str,
+    source: GitReadSource,
+) -> Result<Response, ErrorPayload> {
+    let root = canonical_project_root(project_root)?;
+    let diff = match &source {
+        GitReadSource::Worktree => crate::git::diff_worktree(&root),
+        GitReadSource::Staged => crate::git::diff_staged(&root),
+        _ => return Err(bad_request("unsupported source for git_diff")),
+    }
+    .map_err(internal)?;
+    let cap = crate::text::floor_char_boundary(&diff, FS_TEXT_READ_BYTE_CAP.min(diff.len()));
+    Ok(Response::GitDiff {
+        source,
+        diff: diff[..cap].to_string(),
+        truncated: diff.len() > cap,
+    })
+}
+
+pub async fn git_review_sources(
+    project_root: String,
+    sources: Vec<GitReadSource>,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "git_review_sources",
+        tokio::task::spawn_blocking(move || git_review_sources_blocking(&project_root, sources)),
+    )
+    .await
+}
+
+pub(crate) fn git_review_sources_blocking(
+    project_root: &str,
+    sources: Vec<GitReadSource>,
+) -> Result<Response, ErrorPayload> {
+    const MAX_REVIEW_SOURCES: usize = 4;
+    const MAX_PR_REFERENCE_BYTES: usize = 256;
+
+    if sources.is_empty() || sources.len() > MAX_REVIEW_SOURCES {
+        return Err(bad_request(
+            "git review source count must be between 1 and 4",
+        ));
+    }
+    let root = canonical_project_root(project_root)?;
+    let mut results = Vec::with_capacity(sources.len());
+    for source in sources {
+        let projection = match &source {
+            GitReadSource::Worktree => crate::git::review_source_uncommitted(&root),
+            GitReadSource::Unstaged => crate::git::review_source_unstaged(&root),
+            GitReadSource::Unpushed => crate::git::review_source_unpushed(&root),
+            GitReadSource::PullRequest(pr)
+                if !pr.trim().is_empty()
+                    && pr.len() <= MAX_PR_REFERENCE_BYTES
+                    && pr.chars().all(|ch| !ch.is_control() && ch != '`') =>
+            {
+                crate::git::review_source_pr(&root, pr)
+            }
+            GitReadSource::PullRequest(_) => Err(anyhow::anyhow!(
+                "PR source requires a non-empty, single-line reference of at most 256 bytes"
+            )),
+            GitReadSource::Staged => Err(anyhow::anyhow!(
+                "staged is a diff-pane source, not a multireview source"
+            )),
+        };
+        results.push(match projection {
+            Ok(projection) => GitReviewSourceResult {
+                source,
+                label: projection.label,
+                command: Some(projection.command),
+                has_changes: !projection.diff.trim().is_empty(),
+                error: None,
+            },
+            Err(error) => GitReviewSourceResult {
+                label: review_source_label(&source),
+                source,
+                command: None,
+                has_changes: false,
+                error: Some(format!("{error:#}")),
+            },
+        });
+    }
+    Ok(Response::GitReviewSources { sources: results })
+}
+
+fn review_source_label(source: &GitReadSource) -> String {
+    match source {
+        GitReadSource::Worktree => "Uncommitted changes".into(),
+        GitReadSource::Staged => "Staged changes".into(),
+        GitReadSource::Unstaged => "Unstaged changes".into(),
+        GitReadSource::Unpushed => "Unpushed changes".into(),
+        GitReadSource::PullRequest(pr) => format!("PR {}", pr.trim()),
+    }
 }
 
 async fn join_fs_handler(

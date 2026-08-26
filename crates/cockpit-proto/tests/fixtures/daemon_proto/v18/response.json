@@ -570,6 +570,31 @@
     },
     "response": "git_diff_file"
   },
+  "git_diff": {
+    "data": {
+      "diff": "diff-fixture",
+      "source": {
+        "kind": "worktree"
+      },
+      "truncated": false
+    },
+    "response": "git_diff"
+  },
+  "git_review_sources": {
+    "data": {
+      "sources": [
+        {
+          "command": "git diff HEAD",
+          "has_changes": true,
+          "label": "Uncommitted changes",
+          "source": {
+            "kind": "worktree"
+          }
+        }
+      ]
+    },
+    "response": "git_review_sources"
+  },
   "git_status": {
     "data": {
       "entries": [

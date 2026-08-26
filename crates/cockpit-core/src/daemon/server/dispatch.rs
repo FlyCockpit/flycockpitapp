@@ -7566,6 +7566,16 @@ async fn handle_serialized_request_impl(
             crate::daemon::fs_api::git_diff_file(project_root, path).await
         }
 
+        Request::GitDiff {
+            project_root,
+            source,
+        } => crate::daemon::fs_api::git_diff(project_root, source).await,
+
+        Request::GitReviewSources {
+            project_root,
+            sources,
+        } => crate::daemon::fs_api::git_review_sources(project_root, sources).await,
+
         Request::OpenTerminal { cwd, cols, rows } => {
             let session_id = state
                 .attached
@@ -13590,6 +13600,14 @@ async fn handle_concurrent_request_impl(
         Request::GitDiffFile { project_root, path } => {
             crate::daemon::fs_api::git_diff_file(project_root, path).await
         }
+        Request::GitDiff {
+            project_root,
+            source,
+        } => crate::daemon::fs_api::git_diff(project_root, source).await,
+        Request::GitReviewSources {
+            project_root,
+            sources,
+        } => crate::daemon::fs_api::git_review_sources(project_root, sources).await,
         Request::ListSessions {
             project_id,
             parent_session_id,

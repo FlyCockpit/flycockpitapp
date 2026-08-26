@@ -832,6 +832,16 @@ pub enum Response {
         truncated: bool,
     },
 
+    GitDiff {
+        source: crate::GitReadSource,
+        diff: String,
+        truncated: bool,
+    },
+
+    GitReviewSources {
+        sources: Vec<crate::GitReviewSourceResult>,
+    },
+
     TerminalOpened {
         terminal_id: Uuid,
         viewer_count: usize,
@@ -1422,6 +1432,8 @@ macro_rules! response_variants {
             (Response::ImageControlMutated(..), "image_control_mutated");
             (Response::GitStatus { .. }, "git_status");
             (Response::GitDiffFile { .. }, "git_diff_file");
+            (Response::GitDiff { .. }, "git_diff");
+            (Response::GitReviewSources { .. }, "git_review_sources");
             (Response::TerminalOpened { .. }, "terminal_opened");
             (Response::LspControlResult { .. }, "lsp_control_result");
             (Response::DaemonStatus { .. }, "daemon_status");

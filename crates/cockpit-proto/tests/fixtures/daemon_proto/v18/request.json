@@ -446,6 +446,26 @@
     },
     "request": "git_diff_file"
   },
+  "git_diff": {
+    "params": {
+      "project_root": "project_root-fixture",
+      "source": {
+        "kind": "worktree"
+      }
+    },
+    "request": "git_diff"
+  },
+  "git_review_sources": {
+    "params": {
+      "project_root": "project_root-fixture",
+      "sources": [
+        {
+          "kind": "worktree"
+        }
+      ]
+    },
+    "request": "git_review_sources"
+  },
   "git_status": {
     "params": {
       "project_root": "project_root-fixture"

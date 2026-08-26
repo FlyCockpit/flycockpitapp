@@ -377,9 +377,13 @@ pub fn review_source_pr(dir: &Path, pr: &str) -> Result<ReviewSourceCommand> {
     let pr = pr.trim();
     Ok(ReviewSourceCommand {
         label: format!("PR {pr}"),
-        command: format!("gh pr diff {pr}"),
+        command: format!("gh pr diff -- {}", shell_single_quote(pr)),
         diff: gh_pr_diff(dir, pr)?,
     })
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// The unified diff of the index against `HEAD` — staged changes only

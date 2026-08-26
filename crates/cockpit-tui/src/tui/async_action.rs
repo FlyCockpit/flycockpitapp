@@ -92,6 +92,8 @@ impl AsyncActionKind {
             },
             Self::DaemonRpc(label) => match *label {
                 "guidance.estimate"
+                | "git.diff"
+                | "git.review_sources"
                 | "history.page"
                 | "inventory.bundle"
                 | "leaks-list"
@@ -271,6 +273,8 @@ pub enum AsyncActionPayload {
         source_session_id: Option<uuid::Uuid>,
     },
     StatsRollup(crate::tui::stats_pane::StatsPaneFetchResult),
+    GitDiff(crate::tui::diff_pane::DiffPaneFetchResult),
+    GitReviewSources(crate::tui::multireview_dialog::GitReviewSourcesCompletion),
     SubagentHistory {
         session_id: uuid::Uuid,
         task_call_id: String,

@@ -1410,6 +1410,35 @@ fn notes_project_identity_resolution_is_daemon_owned() {
 }
 
 #[test]
+fn git_diff_and_review_source_authority_is_daemon_owned() {
+    for path in [
+        "crates/cockpit-tui/src/tui/diff_pane.rs",
+        "crates/cockpit-tui/src/tui/multireview_dialog.rs",
+    ] {
+        let source = production_source(&read(path));
+        for forbidden in [
+            "cockpit_core::git",
+            "diff_worktree",
+            "diff_staged",
+            "review_source_uncommitted",
+            "review_source_unstaged",
+            "review_source_unpushed",
+            "review_source_pr",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{path} retains direct Git authority: {forbidden}"
+            );
+        }
+    }
+    let tui = tui_sources();
+    assert!(tui.contains("Request::GitDiff"));
+    assert!(tui.contains("Request::GitReviewSources"));
+    assert!(tui.contains("AsyncActionKind::DaemonRpc(\"git.diff\")"));
+    assert!(tui.contains("AsyncActionKind::DaemonRpc(\"git.review_sources\")"));
+}
+
+#[test]
 fn tui_agent_authority_is_daemon_owned() {
     let agents = production_source(&read("crates/cockpit-tui/src/tui/settings/agents_page.rs"));
     let goals = production_source(&read("crates/cockpit-tui/src/tui/goal_settings_pane.rs"));

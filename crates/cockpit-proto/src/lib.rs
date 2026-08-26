@@ -1668,6 +1668,29 @@ pub struct GitStatusEntry {
     pub raw: String,
 }
 
+/// Read-only Git projection requested by a daemon client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum GitReadSource {
+    Worktree,
+    Staged,
+    Unstaged,
+    Unpushed,
+    PullRequest(String),
+}
+
+/// Display-safe result for one independently requested review source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitReviewSourceResult {
+    pub source: GitReadSource,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    pub has_changes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageAttachmentRef {
     pub id: Uuid,

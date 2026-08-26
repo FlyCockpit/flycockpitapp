@@ -879,8 +879,12 @@ impl App {
             Overlay::Multireview(mut dialog) => {
                 let should_close = dialog.handle_key(key);
                 let kickoff = dialog.take_done();
+                let request = dialog.take_pending_git_request();
                 if !should_close && kickoff.is_none() {
                     self.overlay = Overlay::Multireview(dialog);
+                }
+                if let Some((operation_id, sources)) = request {
+                    self.start_git_review_sources_action(operation_id, sources);
                 }
                 if let Some(kickoff) = kickoff {
                     self.start_multireview(kickoff.prompt);
@@ -1075,7 +1079,11 @@ impl App {
             }
             Overlay::Diff(mut pane) => {
                 if !pane.handle_key(key) {
+                    let fetch = pane.take_pending_fetch();
                     self.overlay = Overlay::Diff(pane);
+                    if let Some((operation_id, source)) = fetch {
+                        self.start_git_diff_action(operation_id, source);
+                    }
                 }
                 return false;
             }

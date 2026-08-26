@@ -13,9 +13,9 @@
 //!   diff so it parses the same way the git sources do.
 //!
 //! The pane is **read-only**: it never stages, applies, reverts, or edits,
-//! and it never invokes a destructive git command — only `git diff`, through
-//! the existing the `cockpit_core::git` helpers. Its state is user-facing TUI state
-//! only and never enters any outbound model prompt.
+//! and it never invokes Git itself. Worktree/index projections are loaded
+//! asynchronously through the daemon; its state is user-facing TUI state only
+//! and never enters any outbound model prompt.
 //!
 //! Diff bodies are parsed **once** at load into per-file sections
 //! ([`parse_unified_diff`]); rendering only formats the already-parsed rows
@@ -198,6 +198,15 @@ pub struct DiffPane {
     last_content_rows: usize,
     file_list_area: Option<Rect>,
     file_hits: Vec<FileHit>,
+    operation_id: uuid::Uuid,
+    pending_fetch: Option<(uuid::Uuid, DiffSource)>,
+}
+
+#[derive(Debug)]
+pub struct DiffPaneFetchResult {
+    pub operation_id: uuid::Uuid,
+    pub source: DiffSource,
+    pub result: Result<String, String>,
 }
 
 impl DiffPane {
@@ -281,6 +290,8 @@ impl DiffPane {
             last_content_rows: 0,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
         pane.reload_active();
         pane
@@ -427,14 +438,29 @@ impl DiffPane {
     /// (Re)load the active source.
     fn reload_active(&mut self) {
         let source = self.sources[self.active];
-        let loaded = match source {
-            DiffSource::Last => self.last.clone(),
-            DiffSource::Worktree => {
-                load_git(cockpit_core::git::diff_worktree(&self.cwd), &self.cwd)
-            }
-            DiffSource::Staged => load_git(cockpit_core::git::diff_staged(&self.cwd), &self.cwd),
-        };
-        self.replace_loaded(loaded);
+        if source == DiffSource::Last {
+            self.pending_fetch = None;
+            self.replace_loaded(self.last.clone());
+            return;
+        }
+        self.operation_id = uuid::Uuid::new_v4();
+        self.pending_fetch = Some((self.operation_id, source));
+        self.replace_loaded(Loaded::State("loading git diff…".to_string()));
+    }
+
+    pub fn take_pending_fetch(&mut self) -> Option<(uuid::Uuid, DiffSource)> {
+        self.pending_fetch.take()
+    }
+
+    pub fn project_root(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
+    pub fn apply_fetch_result(&mut self, result: DiffPaneFetchResult) {
+        if result.operation_id != self.operation_id || self.sources[self.active] != result.source {
+            return;
+        }
+        self.replace_loaded(load_git(result.result));
     }
 
     fn replace_loaded(&mut self, loaded: Loaded) {
@@ -626,7 +652,7 @@ impl Pane for DiffPane {
 
 /// Convert a `git diff` result into a `Loaded`: a parsed file list, a
 /// "no changes" empty state, or an inline error (e.g. not a git worktree).
-fn load_git(result: anyhow::Result<String>, cwd: &std::path::Path) -> Loaded {
+fn load_git(result: Result<String, String>) -> Loaded {
     match result {
         Ok(raw) => {
             let files = parse_unified_diff(&raw);
@@ -636,15 +662,7 @@ fn load_git(result: anyhow::Result<String>, cwd: &std::path::Path) -> Loaded {
                 Loaded::Files(files)
             }
         }
-        Err(_) => {
-            // Distinguish "not a worktree" from a generic git error so the
-            // message is actionable, without surfacing raw git stderr.
-            if cockpit_core::git::find_worktree_root(cwd).is_none() {
-                Loaded::State("not a git worktree".to_string())
-            } else {
-                Loaded::State("could not read git diff".to_string())
-            }
-        }
+        Err(error) => Loaded::State(error),
     }
 }
 
@@ -1127,6 +1145,8 @@ mod tests {
             last_content_rows: 0,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
         pane.restore_file_selection(None);
         pane
@@ -1420,17 +1440,14 @@ Binary files a/logo.png and b/logo.png differ\n";
 
     #[test]
     fn load_git_maps_empty_to_no_changes_state() {
-        let loaded = load_git(Ok(String::new()), std::path::Path::new("."));
+        let loaded = load_git(Ok(String::new()));
         assert_eq!(loaded, Loaded::State("no changes".to_string()));
     }
 
     #[test]
     fn load_git_error_in_nonexistent_dir_is_not_a_worktree_state() {
         // A path that isn't a git worktree → inline state, never a panic.
-        let loaded = load_git(
-            Err(anyhow::anyhow!("boom")),
-            std::path::Path::new("/nonexistent-xyzzy"),
-        );
+        let loaded = load_git(Err("not a git worktree".to_string()));
         assert_eq!(loaded, Loaded::State("not a git worktree".to_string()));
     }
 
@@ -1500,6 +1517,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 0,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
 
         // File list shows both files with counts and a cursor marker.
@@ -1542,6 +1561,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 0,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
         let body = texts(&pane.diff_body_lines(120, false)).join("\n");
         assert!(body.contains("binary file changed"), "{body}");
@@ -1564,6 +1585,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 0,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
         let list = texts(&pane.file_list_lines(LIST_WIDTH as usize)).join("\n");
         let body = texts(&pane.diff_body_lines(120, false)).join("\n");
@@ -1591,6 +1614,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 0,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
         // Wide + side-by-side toggle on → column separator present.
         let wide = texts(&pane.diff_body_lines(120, false)).join("\n");
@@ -1648,6 +1673,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 8,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
 
         assert!(!pane.handle_key(press(KeyCode::PageDown)));
@@ -1691,6 +1718,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 70_001,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
         let backend = TestBackend::new(80, 5);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1757,6 +1786,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 20,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
 
         for _ in 0..5 {
@@ -1787,6 +1818,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 20,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
 
         for _ in 0..4 {
@@ -1816,6 +1849,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 20,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
 
         pane.move_file(-1);
@@ -1849,6 +1884,8 @@ diff --git a/b.rs b/b.rs\n\
             last_content_rows: 20,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
 
         pane.cycle_source();
@@ -1878,6 +1915,8 @@ diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1,1 +1,1 @@\n-p\n+q\n",
             last_content_rows: 0,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
         pane.move_file(1);
         assert_eq!(pane.selected_file_index(), 1);
@@ -1910,6 +1949,8 @@ diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1,1 +1,1 @@\n-p\n+q\n",
             last_content_rows: 0,
             file_list_area: None,
             file_hits: Vec::new(),
+            operation_id: uuid::Uuid::nil(),
+            pending_fetch: None,
         };
         assert!(pane.handle_key(mk(KeyCode::Esc)));
         assert!(pane.handle_key(mk(KeyCode::Char('q'))));

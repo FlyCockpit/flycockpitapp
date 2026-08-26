@@ -25,3 +25,36 @@ pub enum DisplayErrorKind {
     Cancelled,
     Failed,
 }
+
+/// Provider-reported token usage attached to a presented inference result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Freshly processed input plus output, excluding cached input reads.
+    pub fn blended_total(&self) -> u64 {
+        self.input_tokens
+            .saturating_sub(self.cached_input_tokens)
+            .saturating_add(self.output_tokens)
+    }
+
+    pub fn hit_rate(&self) -> Option<f64> {
+        if self.input_tokens == 0 {
+            None
+        } else {
+            Some(self.cached_input_tokens as f64 / self.input_tokens as f64)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cached_input_tokens == 0
+            && self.cache_creation_input_tokens == 0
+    }
+}

@@ -4223,7 +4223,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::Usage {
             agent,
-            usage: cockpit_core::tokens::TokenUsage {
+            usage: cockpit_client::presentation::TokenUsage {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,

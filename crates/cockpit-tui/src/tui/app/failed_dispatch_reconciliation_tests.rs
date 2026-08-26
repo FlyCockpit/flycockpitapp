@@ -216,7 +216,7 @@ fn seed_new_session_reset_state(app: &mut App) -> mpsc::Receiver<ControlRequest>
     app.usage_tags.insert("src/lib.rs".to_string(), 1);
     app.project_id = Some("project-old".to_string());
     app.pending_usage.push(cockpit_proto::Request::CancelTurn);
-    app.last_usage = Some(cockpit_core::tokens::TokenUsage {
+    app.last_usage = Some(cockpit_client::presentation::TokenUsage {
         input_tokens: 10,
         output_tokens: 2,
         cached_input_tokens: 3,

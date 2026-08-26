@@ -2391,7 +2391,7 @@ pub struct App {
     /// the live context counter (see `context_tokens`): the displayed
     /// value is this total plus a local estimate of everything streamed
     /// since it arrived. `None` until the first call returns.
-    pub(super) last_usage: Option<cockpit_core::tokens::TokenUsage>,
+    pub(super) last_usage: Option<cockpit_client::presentation::TokenUsage>,
     /// Local cl100k_base estimate captured the instant `last_usage` was
     /// set — the baseline the live counter measures streamed tokens
     /// against, so the number climbs per token and re-snaps to the

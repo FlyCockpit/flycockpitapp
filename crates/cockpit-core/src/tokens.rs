@@ -13,6 +13,7 @@
 //! The user-facing contract for any token-budget enforcement remains
 //! "≈" — exactness is not promised across providers.
 
+pub use cockpit_client::presentation::TokenUsage;
 pub use cockpit_tokenizer::TiktokenEncoding as TokenizerStrategy;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -87,60 +88,12 @@ pub fn scaled_estimate(text: &str, strategy: TokenizerStrategy, scale: f64) -> u
 /// The TUI's blended context total subtracts the cached subset
 /// ([`Self::blended_total`]) so cached reads don't inflate the headline
 /// number (codex precedent, prompt `prompt-caching-strategy.md`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_input_tokens: u64,
-    /// Input tokens written *into* the prompt cache on a miss (the write
-    /// cost of the cached prefix). Mapped from `rig`'s normalized
-    /// `cache_creation_input_tokens` (Anthropic `cache_creation`). Zero on
-    /// providers/turns with no cache write.
-    pub cache_creation_input_tokens: u64,
-}
-
-impl TokenUsage {
-    /// The displayed context total with cached reads excluded
-    /// (`non_cached_input + output`, codex precedent — prompt
-    /// `prompt-caching-strategy.md`). `cached_input_tokens` is a subset of
-    /// `input_tokens`, so subtracting it yields the freshly-processed input
-    /// plus output; cached tokens are surfaced separately rather than folded
-    /// into the headline number.
-    pub fn blended_total(&self) -> u64 {
-        self.input_tokens
-            .saturating_sub(self.cached_input_tokens)
-            .saturating_add(self.output_tokens)
-    }
-
-    /// Cache hit rate over input: `cached_input_tokens / input_tokens`, in
-    /// `0.0..=1.0`. `None` when there were no input tokens (nothing to rate).
-    pub fn hit_rate(&self) -> Option<f64> {
-        if self.input_tokens == 0 {
-            None
-        } else {
-            Some(self.cached_input_tokens as f64 / self.input_tokens as f64)
-        }
-    }
-
-    /// `true` if the provider reported nothing meaningful (rig signals
-    /// this by leaving every field at 0 — see `rig::completion::Usage`
-    /// docs).
-    pub fn is_empty(&self) -> bool {
-        self.input_tokens == 0
-            && self.output_tokens == 0
-            && self.cached_input_tokens == 0
-            && self.cache_creation_input_tokens == 0
-    }
-}
-
-impl From<rig::completion::Usage> for TokenUsage {
-    fn from(u: rig::completion::Usage) -> Self {
-        Self {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            cached_input_tokens: u.cached_input_tokens,
-            cache_creation_input_tokens: u.cache_creation_input_tokens,
-        }
+pub(crate) fn token_usage_from_rig(usage: rig::completion::Usage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
     }
 }
 
@@ -327,7 +280,7 @@ mod tests {
             tool_use_prompt_tokens: 0,
             reasoning_tokens: 0,
         };
-        let usage = TokenUsage::from(rig);
+        let usage = token_usage_from_rig(rig);
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 20);
         assert_eq!(usage.cached_input_tokens, 80);

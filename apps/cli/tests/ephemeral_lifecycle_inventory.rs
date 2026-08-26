@@ -72,6 +72,7 @@ fn inspect_items(items: &[syn::Item], violations: &mut Vec<String>) {
                     if path == "cockpit_core::daemon"
                         || path.ends_with("daemon::client::*")
                         || (public && path.ends_with("daemon::client::OwnedDaemonSession"))
+                        || (public && path.contains("daemon::client"))
                     {
                         violations.push(path);
                     }
@@ -198,6 +199,7 @@ struct OwnedFlow {
     function: String,
     closure_depth: usize,
     branch_depth: usize,
+    dead_depth: usize,
     connect_calls: usize,
 }
 
@@ -229,7 +231,17 @@ impl<'ast> Visit<'ast> for OwnedFlow {
 
     fn visit_block(&mut self, block: &'ast syn::Block) {
         self.scopes.push(HashMap::new());
-        visit::visit_block(self, block);
+        let mut terminated = false;
+        for statement in &block.stmts {
+            if terminated {
+                self.dead_depth += 1;
+            }
+            self.visit_stmt(statement);
+            if terminated {
+                self.dead_depth -= 1;
+            }
+            terminated |= statement_terminates(statement);
+        }
         self.scopes.pop();
     }
 
@@ -340,9 +352,10 @@ impl<'ast> Visit<'ast> for OwnedFlow {
         {
             let name = ident.to_string();
             if let Some(id) = self.resolve(&name) {
-                if self.closure_depth > 0 || self.branch_depth > 0 {
+                if self.closure_depth > 0 || self.branch_depth > 0 || self.dead_depth > 0 {
                     self.violations.push(
-                        "owned session finished in deferred or conditional control flow".into(),
+                        "owned session finished in deferred, conditional, or dead control flow"
+                            .into(),
                     );
                 } else {
                     self.finishes.push((id, self.position));
@@ -352,6 +365,35 @@ impl<'ast> Visit<'ast> for OwnedFlow {
             }
         }
         visit::visit_expr_method_call(self, call);
+    }
+}
+
+fn statement_terminates(statement: &syn::Stmt) -> bool {
+    let syn::Stmt::Expr(expression, _) = statement else {
+        return false;
+    };
+    match expression {
+        syn::Expr::Return(_) | syn::Expr::Break(_) | syn::Expr::Continue(_) => true,
+        syn::Expr::Loop(loop_expression) => !loop_expression
+            .body
+            .stmts
+            .iter()
+            .any(|statement| matches!(statement, syn::Stmt::Expr(syn::Expr::Break(_), _))),
+        syn::Expr::Macro(invocation) => {
+            invocation.mac.path.segments.last().is_some_and(|segment| {
+                matches!(
+                    segment.ident.to_string().as_str(),
+                    "panic" | "unreachable" | "todo"
+                )
+            })
+        }
+        syn::Expr::Call(call) => match call.func.as_ref() {
+            syn::Expr::Path(path) => path.path.segments.last().is_some_and(|segment| {
+                matches!(segment.ident.to_string().as_str(), "exit" | "abort")
+            }),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -499,11 +541,45 @@ fn adversarial_raw_alias_reexport_glob_and_helper_are_rejected() {
         "use crate::daemon::client::OwnedDaemonSession as Session;",
         "use crate::daemon::client as lifecycle;",
         "pub use crate::daemon::client::OwnedDaemonSession;",
+        "pub use crate::daemon::client;",
+        "pub use cockpit_core::daemon::client as lifecycle;",
+        "pub use crate::daemon::{self, client as lifecycle};",
         "type Session = crate::daemon::client::OwnedDaemonSession;",
         "macro_rules! extra_owned { () => { OwnedDaemonSession::connect(mode).await } }",
     ] {
         assert!(!source_violations(source).is_empty(), "accepted: {source}");
     }
+}
+
+#[test]
+fn adversarial_finish_after_unconditional_termination_is_rejected() {
+    for source in [
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; return; daemon.finish(result).await; }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; loop { break; daemon.finish(result).await; } }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; loop { continue; daemon.finish(result).await; } }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; panic!(); daemon.finish(result).await; }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; std::process::exit(1); daemon.finish(result).await; }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; loop {}; daemon.finish(result).await; }",
+    ] {
+        let mut flow = OwnedFlow::default();
+        flow.visit_file(&syn::parse_file(source).unwrap());
+        assert!(!flow.validate().is_empty(), "accepted: {source}");
+    }
+}
+
+#[test]
+fn ordinary_try_before_finish_remains_reachable() {
+    let source = "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; operation()?; daemon.finish(result).await; }";
+    let mut flow = OwnedFlow::default();
+    flow.visit_file(&syn::parse_file(source).unwrap());
+    assert!(flow.validate().is_empty(), "{:?}", flow.validate());
+}
+
+#[test]
+fn run_finish_helper_is_test_only_and_uniquely_inventoried() {
+    let source = include_str!("../src/commands/run.rs");
+    assert_eq!(source.matches("fn finish_owned_run<").count(), 1);
+    assert!(source.contains("#[cfg(test)]\nfn finish_owned_run<"));
 }
 
 #[test]

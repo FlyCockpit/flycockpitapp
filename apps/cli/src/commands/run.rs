@@ -351,6 +351,7 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     Ok(())
 }
 
+#[cfg(test)]
 fn finish_owned_run<T>(
     command: anyhow::Result<T>,
     shutdown: impl FnOnce() -> anyhow::Result<()>,

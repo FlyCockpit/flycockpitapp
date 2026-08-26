@@ -578,6 +578,50 @@ fn execute_image_dispatch_preparation_transitions_conn(
     Ok(())
 }
 
+fn execute_image_attempt_handoff_transition_conn(
+    conn: &Connection,
+    prepared: &PreparedImageGenerationDispatch,
+) -> Result<()> {
+    ensure!(
+        attempt_transition_allowed(
+            ImageGenerationAttemptState::Prepared,
+            ImageGenerationAttemptState::Dispatching
+        ),
+        "handoff attempt transition is not canonical"
+    );
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='dispatching',version=version+1,observed_journal_version=observed_journal_version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='prepared' AND version=?4 AND external_operation_id=?5",params![prepared.job_id.to_string(),prepared.slot_id.to_string(),i64::from(prepared.attempt_number),i64::try_from(prepared.attempt_version)?,prepared.operation.operation_id.to_string()])?==1,"image generation attempt handoff lost compare-and-set");
+    Ok(())
+}
+
+fn execute_image_handoff_outcome_transitions_conn(
+    conn: &Connection,
+    dispatching: &DispatchingImageGenerationAttempt,
+    attempt_to: ImageGenerationAttemptState,
+    slot_to: ImageGenerationSlotState,
+    observed_journal_version: u64,
+    retry: bool,
+) -> Result<()> {
+    ensure!(
+        attempt_transition_allowed(ImageGenerationAttemptState::Dispatching, attempt_to),
+        "handoff outcome attempt transition is not canonical"
+    );
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=version+1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='dispatching' AND version=?6 AND external_operation_id=?7",params![attempt_to.as_str(),i64::try_from(observed_journal_version)?,dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),i64::try_from(dispatching.attempt_version)?,dispatching.operation.operation_id.to_string()])?==1,"image generation handoff attempt compare-and-set lost");
+    let slot_allowed = if retry {
+        IMAGE_SLOT_CONDITIONAL_EDGES.contains(&(
+            ImageGenerationSlotState::Dispatching.as_str(),
+            slot_to.as_str(),
+        ))
+    } else {
+        slot_transition_allowed(ImageGenerationSlotState::Dispatching, slot_to)
+    };
+    ensure!(
+        slot_allowed,
+        "handoff outcome slot transition is not canonical"
+    );
+    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1,failure_reason=CASE WHEN ?1='failed' THEN 'definitively_rejected' ELSE NULL END WHERE job_id=?2 AND slot_id=?3 AND state='dispatching' AND version=?4",params![slot_to.as_str(),dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::try_from(dispatching.slot_version)?])?==1,"image generation handoff slot compare-and-set lost");
+    Ok(())
+}
+
 pub const fn slot_is_job_settled(state: ImageGenerationSlotState) -> bool {
     use ImageGenerationSlotState as S;
     matches!(
@@ -1932,7 +1976,7 @@ impl Db {
                 ExternalTransitionOutcome::Committed(record) => record,
                 _ => anyhow::bail!("image generation journal handoff lost compare-and-set"),
             };
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='dispatching',version=version+1,observed_journal_version=observed_journal_version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='prepared' AND version=?4 AND external_operation_id=?5",params![prepared.job_id.to_string(),prepared.slot_id.to_string(),i64::from(prepared.attempt_number),i64::try_from(prepared.attempt_version)?,prepared.operation.operation_id.to_string()])?==1,"image generation attempt handoff lost compare-and-set");
+            execute_image_attempt_handoff_transition_conn(conn, &prepared)?;
             Ok(DispatchingImageGenerationAttempt {
                 operation,
                 job_id: prepared.job_id,
@@ -2034,7 +2078,6 @@ impl Db {
                     },
                 "image generation handoff evidence differs"
             );
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=version+1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='dispatching' AND version=?6 AND external_operation_id=?7",params![attempt,outcome.record().version,dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),i64::try_from(dispatching.attempt_version)?,dispatching.operation.operation_id.to_string()])?==1,"image generation handoff attempt compare-and-set lost");
             if let Some((next_attempt, _, _)) = &retry {
                 ensure!(
                     IMAGE_JOB_CONDITIONAL_EDGES.contains(&("dispatching", "queued"))
@@ -2043,7 +2086,14 @@ impl Db {
                 );
                 ensure!(conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) VALUES(?1,?2,?3,'authoritative_retry',?4,?5)",params![dispatching.job_id.to_string(),dispatching.slot_id.to_string(),next_attempt,i64::from(dispatching.attempt_number),at_unix_ms])?==1,"image generation retry activation was not recorded");
             }
-            ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1,failure_reason=CASE WHEN ?1='failed' THEN 'definitively_rejected' ELSE NULL END WHERE job_id=?2 AND slot_id=?3 AND state='dispatching'",params![slot,dispatching.job_id.to_string(),dispatching.slot_id.to_string()])?==1,"image generation handoff slot compare-and-set lost");
+            execute_image_handoff_outcome_transitions_conn(
+                conn,
+                &dispatching,
+                attempt_state,
+                slot_state,
+                u64::try_from(outcome.record().version)?,
+                retry.is_some(),
+            )?;
             if job == "failed" {
                 commit_terminal_job_projection_conn(conn, dispatching.job_id, at_unix_ms)?;
             } else {

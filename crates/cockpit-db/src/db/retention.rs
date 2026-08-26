@@ -337,19 +337,24 @@ fn prune_session_payloads_conn(
     let tx = conn
         .unchecked_transaction()
         .context("begin prune_session_payloads tx")?;
-    let closed =
-        "session_id IN (SELECT session_id FROM sessions WHERE ended_at_unix_ms IS NOT NULL)";
+    // A pin is a whole-session preservation hold. Several raw/wire/evidence
+    // ledgers intentionally have no turn sequence, so preserving only the
+    // pinned event would silently delete evidence that cannot be mapped back
+    // to that turn. Release the hold by removing all session pins first.
+    let closed = "session_id IN (
+        SELECT session_id FROM sessions
+         WHERE ended_at_unix_ms IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM pins
+                WHERE pins.session_id=sessions.session_id
+           )
+    )";
     let mut transcripts = 0_u64;
     if transcript_cutoff_secs > 0 {
         transcripts = tx.execute(
             &format!(
                 "DELETE FROM session_events
                   WHERE ts_ms < ?1 AND {closed}
-                    AND NOT EXISTS (
-                        SELECT 1 FROM pins
-                         WHERE pins.session_id=session_events.session_id
-                           AND pins.seq=session_events.seq
-                    )
                     AND NOT EXISTS (
                         SELECT 1 FROM sessions child
                          WHERE child.parent_session_id=session_events.session_id
@@ -757,6 +762,34 @@ mod tests {
         assert_eq!(outcome.payload_rows_deleted, 4);
         assert_eq!(outcome.sessions_expired, 0);
         assert!(!outcome.vacuumed);
+    }
+
+    #[tokio::test]
+    async fn pinned_session_is_exempt_from_every_payload_window() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        close_session(&db, session.session_id, 10).await;
+        insert_payload_rows(&db, session.session_id, "preserved", 10).await;
+        assert!(db.pin_message(session.session_id, 1).await.unwrap());
+        let cfg = RetentionConfig {
+            transcript_window_days: 1,
+            raw_wire_window_days: 1,
+            terminal_evidence_window_days: 1,
+            vacuum_interval_days: 0,
+            ..RetentionConfig::default()
+        };
+
+        let outcome = db.run_retention_pass(&cfg, 100_000).await.unwrap();
+
+        assert_eq!(outcome.payload_rows_deleted, 0);
+        for table in [
+            "session_events",
+            "inference_requests",
+            "tool_call_events",
+            "inference_calls",
+        ] {
+            assert_eq!(payload_count(&db, table, session.session_id).await, 1);
+        }
     }
 
     #[tokio::test]

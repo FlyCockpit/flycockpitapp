@@ -2768,14 +2768,14 @@ impl App {
 }
 
 fn inference_failure_reason(
-    error_class: &cockpit_core::engine::model::InferenceErrorClass,
+    error_class: &cockpit_proto::InferenceErrorClass,
     detail: &str,
 ) -> String {
     match error_class {
-        cockpit_core::engine::model::InferenceErrorClass::TimeoutTtft => {
+        cockpit_proto::InferenceErrorClass::TimeoutTtft => {
             "no first token within the timeout".to_string()
         }
-        cockpit_core::engine::model::InferenceErrorClass::TimeoutIdle => {
+        cockpit_proto::InferenceErrorClass::TimeoutIdle => {
             "stream stalled past the idle timeout".to_string()
         }
         other if detail.is_empty() => other.to_string(),
@@ -2783,11 +2783,11 @@ fn inference_failure_reason(
     }
 }
 
-fn backup_failure_reason(error_class: &cockpit_core::engine::model::InferenceErrorClass) -> String {
+fn backup_failure_reason(error_class: &cockpit_proto::InferenceErrorClass) -> String {
     match error_class {
-        cockpit_core::engine::model::InferenceErrorClass::TimeoutTtft
-        | cockpit_core::engine::model::InferenceErrorClass::TimeoutIdle => "timeout".to_string(),
-        cockpit_core::engine::model::InferenceErrorClass::Network => "connection error".to_string(),
+        cockpit_proto::InferenceErrorClass::TimeoutTtft
+        | cockpit_proto::InferenceErrorClass::TimeoutIdle => "timeout".to_string(),
+        cockpit_proto::InferenceErrorClass::Network => "connection error".to_string(),
         other => other.to_string(),
     }
 }

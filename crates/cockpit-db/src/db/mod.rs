@@ -1688,11 +1688,16 @@ fn sync_backup_parent(parent: &Path) -> Result<()> {
 /// The stable authority is a held, privately owned parent-directory handle;
 /// the persistent sibling file only carries the kernel lock. On Unix the
 /// ancestor walk proves that no different OS principal can replace the parent
-/// directory entry. On Windows the held parent handle denies delete/rename and
-/// both parent and lock carry a verified protected current-user+SYSTEM DACL.
-/// A process running as this same user (or root/SYSTEM) is inside Cockpit's
-/// local trust boundary and can always sabotage its own files; this protocol
-/// intentionally does not claim protection from that principal.
+/// directory entry. On Windows the parent is reached by a handle-relative,
+/// per-component no-reparse walk from the volume root (each hop opened with
+/// `OBJ_DONT_REPARSE`, so an intermediate junction fails closed instead of
+/// redirecting resolution), giving the same retained-authority guarantee as the
+/// Unix ancestry walk; the retained final handle additionally denies
+/// delete/rename and both parent and lock carry a verified protected
+/// current-user+SYSTEM DACL. A process running as this same user (or
+/// root/SYSTEM) is inside Cockpit's local trust boundary and can always
+/// sabotage its own files; this protocol intentionally does not claim
+/// protection from that principal.
 #[derive(Debug)]
 struct BackupArtifactLock {
     file: std::fs::File,
@@ -1794,50 +1799,366 @@ fn validate_unix_backup_lock_ancestry(path: &Path) -> Result<()> {
             "backup lock ancestry contains a symlink or non-directory at {}",
             ancestor.display()
         );
+        // Every ancestor `A` that directly contains child `C` must not let any
+        // principal outside the trust boundary (the current user or root)
+        // replace `C`'s directory entry. Such a replacement would split the
+        // lock namespace: two processes resolving the same path could lock
+        // different inodes, defeating cross-process mutual exclusion and
+        // corrupting a concurrent backup. Only the current user and root are
+        // inside Cockpit's local trust boundary.
         let mode = ancestor_metadata.permissions().mode();
-        let outsiders_can_write = mode & 0o022 != 0;
-        let sticky_protects_child = mode & libc::S_ISVTX != 0
-            && (child_metadata.uid() == effective_uid || ancestor_metadata.uid() == effective_uid);
-        anyhow::ensure!(
-            !outsiders_can_write || sticky_protects_child,
-            "backup lock parent identity is replaceable through untrusted writable ancestor {}",
-            ancestor.display()
-        );
+        let owner_trusted =
+            ancestor_metadata.uid() == effective_uid || ancestor_metadata.uid() == 0;
+        let child_trusted = child_metadata.uid() == effective_uid || child_metadata.uid() == 0;
+        if mode & libc::S_ISVTX != 0 {
+            // Sticky ancestor: only `C`'s owner, `A`'s owner, and root may
+            // replace the entry `C`, so all three must be trusted. This is the
+            // sole justified sticky exception (e.g. a root-owned `1777 /tmp`
+            // holding our own current-user child directory).
+            anyhow::ensure!(
+                owner_trusted && child_trusted,
+                "backup lock parent identity is replaceable through sticky ancestor {} whose owner or child owner is outside the trust boundary",
+                ancestor.display()
+            );
+        } else {
+            // Non-sticky ancestor: `A`'s owner can replace `C` outright, and
+            // any group/other-writable ancestor lets an outsider replace `C`.
+            anyhow::ensure!(
+                owner_trusted && mode & 0o022 == 0,
+                "backup lock parent identity is replaceable through untrusted or group/other-writable ancestor {}",
+                ancestor.display()
+            );
+        }
         child = ancestor;
     }
     Ok(())
 }
 
+/// Shared Windows FFI for the handle-relative, no-reparse authority pattern.
+///
+/// cockpit-db is the base of the crate graph and must not depend on
+/// cockpit-host, so the pattern proven in
+/// `cockpit-host/src/private_fs/held_directory.rs` (whose shapes/constants
+/// these mirror exactly) is duplicated here. Both the parent walk in
+/// `open_stable_backup_lock_parent` and the child open in
+/// `open_backup_artifact_lock_in_parent` resolve every component through
+/// [`backup_lock_win::open_relative`].
+#[cfg(windows)]
+mod backup_lock_win {
+    use std::ffi::c_void;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+
+    pub(super) type Handle = *mut c_void;
+    pub(super) const INVALID_HANDLE_VALUE: Handle = -1_isize as Handle;
+
+    // NTSTATUS sentinels.
+    pub(super) const STATUS_SUCCESS_MIN: i32 = 0;
+    pub(super) const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+    pub(super) const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
+
+    // Object-attribute flags.
+    pub(super) const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+    pub(super) const OBJ_DONT_REPARSE: u32 = 0x1000;
+
+    // Access rights.
+    pub(super) const GENERIC_READ: u32 = 0x8000_0000;
+    pub(super) const GENERIC_WRITE: u32 = 0x4000_0000;
+    pub(super) const READ_CONTROL: u32 = 0x0002_0000;
+    pub(super) const WRITE_DAC: u32 = 0x0004_0000;
+    pub(super) const SYNCHRONIZE: u32 = 0x0010_0000;
+    pub(super) const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    pub(super) const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+
+    // Share modes.
+    pub(super) const FILE_SHARE_READ: u32 = 0x0000_0001;
+    pub(super) const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    pub(super) const FILE_SHARE_ALL: u32 = 0x7;
+
+    // Dispositions.
+    pub(super) const FILE_OPEN: u32 = 1;
+    pub(super) const FILE_CREATE: u32 = 2;
+
+    // Create options.
+    pub(super) const FILE_DIRECTORY_FILE: u32 = 0x1;
+    pub(super) const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+    pub(super) const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+    pub(super) const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // File attributes.
+    pub(super) const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    pub(super) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    // Win32 CreateFileW parameters for the volume-root anchor open.
+    pub(super) const OPEN_EXISTING: u32 = 3;
+    pub(super) const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    pub(super) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: Handle,
+        object_name: *const UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut c_void,
+        security_quality_of_service: *mut c_void,
+    }
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: isize,
+        information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file: *mut Handle,
+            access: u32,
+            attributes: *const ObjectAttributes,
+            io: *mut IoStatusBlock,
+            allocation: *const i64,
+            file_attributes: u32,
+            share: u32,
+            disposition: u32,
+            options: u32,
+            ea: *const c_void,
+            ea_len: u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub(super) fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            creation: u32,
+            flags: u32,
+            template: Handle,
+        ) -> Handle;
+    }
+
+    /// Handle-relative, no-reparse open of a single leaf `name` beneath
+    /// `parent`. `OBJ_DONT_REPARSE` + `FILE_OPEN_REPARSE_POINT` make any reparse
+    /// point at the leaf fail closed rather than be followed, so no intermediate
+    /// junction can redirect resolution and no component can be swapped between
+    /// validation and use. `STATUS_OBJECT_NAME_COLLISION` and
+    /// `STATUS_OBJECT_NAME_NOT_FOUND` are surfaced as `AlreadyExists`/`NotFound`
+    /// so callers can drive create-then-open fallback without re-deriving the
+    /// raw NTSTATUS. Both the per-component parent walk and the child-lock open
+    /// share this routine.
+    pub(super) fn open_relative(
+        parent: &std::fs::File,
+        name: &[u16],
+        disposition: u32,
+        kind: u32,
+        access: u32,
+        share: u32,
+    ) -> std::io::Result<std::fs::File> {
+        if name.is_empty() || name.len() > (u16::MAX as usize / 2) || name.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid Windows relative name",
+            ));
+        }
+        let mut owned = name.to_vec();
+        let unicode = UnicodeString {
+            length: (owned.len() * 2) as u16,
+            maximum_length: (owned.len() * 2) as u16,
+            buffer: owned.as_mut_ptr(),
+        };
+        let attributes = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: parent.as_raw_handle(),
+            object_name: &unicode,
+            attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut io = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let mut raw: Handle = std::ptr::null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                access,
+                &attributes,
+                &mut io,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share,
+                disposition,
+                kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status >= STATUS_SUCCESS_MIN && !raw.is_null() {
+            return Ok(unsafe { std::fs::File::from_raw_handle(raw) });
+        }
+        let error_kind = match status {
+            STATUS_OBJECT_NAME_COLLISION => std::io::ErrorKind::AlreadyExists,
+            STATUS_OBJECT_NAME_NOT_FOUND => std::io::ErrorKind::NotFound,
+            _ => std::io::ErrorKind::Other,
+        };
+        Err(std::io::Error::new(
+            error_kind,
+            format!("Windows handle-relative open failed with NTSTATUS {status:#x}"),
+        ))
+    }
+}
+
+/// Open the stable backup-lock parent by a handle-relative, per-component
+/// no-reparse walk from the volume root.
+///
+/// The parent tree is created first, then re-derived hop by hop from `C:\` with
+/// [`backup_lock_win::open_relative`]: every ancestor is opened with
+/// `OBJ_DONT_REPARSE`, so an intermediate junction/reparse point fails the walk
+/// closed instead of redirecting the parent to a different (even current-user
+/// owned) inode. This is the retained-authority equivalent of the Unix ancestry
+/// walk; a final pathname check would not suffice. The retained final handle is
+/// opened shared READ|WRITE but never DELETE (its lifetime rename/delete lease)
+/// and carries a set-then-verified private current-user+SYSTEM DACL.
 #[cfg(windows)]
 fn open_stable_backup_lock_parent(path: &Path) -> Result<std::fs::File> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::MetadataExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use std::path::{Component, Prefix};
 
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const DIRECTORY_SECURITY_ACCESS: u32 = 0x0002_0000 | 0x0004_0000 | 0x0010_0000 | 0x0000_0080;
+    use backup_lock_win as win;
 
+    // Create the private directory tree first. The no-reparse walk below then
+    // re-derives the same tree handle-relative from the volume root: if any
+    // ancestor create was redirected through a junction/reparse point, the walk
+    // fails closed instead of yielding a locked inode.
     files::ensure_private_dir(path)?;
-    let parent = std::fs::OpenOptions::new()
-        .read(true)
-        // READ_CONTROL | WRITE_DAC | SYNCHRONIZE | FILE_READ_ATTRIBUTES.
-        .access_mode(DIRECTORY_SECURITY_ACCESS)
-        // The missing FILE_SHARE_DELETE is the lifetime rename/delete lease.
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .with_context(|| format!("opening stable backup lock parent {}", path.display()))?;
-    let metadata = parent.metadata()?;
+
+    // Resolve a relative parent against the current directory, mirroring the
+    // Unix ancestry walk, so the per-component descent always starts from a
+    // drive-rooted volume anchor.
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut components = absolute.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+            _ => anyhow::bail!(
+                "backup lock parent {} is not on a local drive volume",
+                path.display()
+            ),
+        },
+        _ => anyhow::bail!(
+            "backup lock parent {} requires an absolute drive path",
+            path.display()
+        ),
+    };
     anyhow::ensure!(
-        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
-        "backup lock parent {} is a reparse point or non-directory",
+        matches!(components.next(), Some(Component::RootDir)),
+        "backup lock parent {} requires a rooted drive path",
         path.display()
     );
-    files::set_private_windows_dacl_handle(&parent)?;
-    files::verify_private_windows_dacl_handle(&parent)?;
-    Ok(parent)
+
+    // Reject any non-`Normal` component (lexical `.`/`..` or a second prefix):
+    // the walk admits only concrete directory names.
+    let mut names = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => names.push(name.to_owned()),
+            _ => anyhow::bail!("backup lock parent {} is not a lexical path", path.display()),
+        }
+    }
+    anyhow::ensure!(
+        !names.is_empty(),
+        "backup lock parent {} resolves to the volume root",
+        path.display()
+    );
+
+    // Open the volume root (`C:\`) with no-reparse backup semantics; this is the
+    // fixed anchor the per-component walk descends from.
+    let root = format!("{}:\\", char::from(drive));
+    let root_wide = OsStr::new(&root)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<u16>>();
+    let raw = unsafe {
+        win::CreateFileW(
+            root_wide.as_ptr(),
+            win::GENERIC_READ | win::FILE_READ_ATTRIBUTES | win::SYNCHRONIZE,
+            win::FILE_SHARE_ALL,
+            std::ptr::null_mut(),
+            win::OPEN_EXISTING,
+            win::FILE_FLAG_BACKUP_SEMANTICS | win::FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    anyhow::ensure!(
+        raw != win::INVALID_HANDLE_VALUE,
+        "opening backup lock volume root {} failed: {}",
+        root,
+        std::io::Error::last_os_error()
+    );
+    let mut dir = unsafe { std::fs::File::from_raw_handle(raw) };
+
+    // The FINAL parent needs READ_CONTROL|WRITE_DAC to set/verify its private
+    // DACL and shares READ|WRITE but never DELETE so the retained handle denies
+    // rename/delete of the parent for its lifetime. Intermediate ancestors are
+    // only traversed, so they take read access and may share ALL.
+    const DIRECTORY_SECURITY_ACCESS: u32 =
+        win::READ_CONTROL | win::WRITE_DAC | win::SYNCHRONIZE | win::FILE_READ_ATTRIBUTES;
+    let last = names.len() - 1;
+    for (index, name) in names.iter().enumerate() {
+        let is_final = index == last;
+        let wide = name.encode_wide().collect::<Vec<u16>>();
+        let access = if is_final {
+            DIRECTORY_SECURITY_ACCESS
+        } else {
+            win::GENERIC_READ | win::FILE_READ_ATTRIBUTES | win::SYNCHRONIZE
+        };
+        let share = if is_final {
+            win::FILE_SHARE_READ | win::FILE_SHARE_WRITE
+        } else {
+            win::FILE_SHARE_ALL
+        };
+        dir = win::open_relative(
+            &dir,
+            &wide,
+            win::FILE_OPEN,
+            win::FILE_DIRECTORY_FILE,
+            access,
+            share,
+        )
+        .with_context(|| {
+            format!(
+                "opening backup lock parent component {:?} of {}",
+                name,
+                path.display()
+            )
+        })?;
+        let metadata = dir.metadata()?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.file_attributes() & win::FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "backup lock parent component {:?} of {} is a reparse point or non-directory",
+            name,
+            path.display()
+        );
+    }
+
+    files::set_private_windows_dacl_handle(&dir)?;
+    files::verify_private_windows_dacl_handle(&dir)?;
+    Ok(dir)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1933,14 +2254,98 @@ fn open_backup_artifact_lock_in_parent(
 
 #[cfg(windows)]
 fn open_backup_artifact_lock_in_parent(
-    _parent: &std::fs::File,
+    parent: &std::fs::File,
     path: &Path,
 ) -> std::io::Result<(std::fs::File, bool)> {
-    // The held parent handle denies delete/rename, and its protected DACL
-    // excludes every principal except the current user and SYSTEM. Resolving
-    // this child by path is therefore stable against principals outside the
-    // documented local trust boundary.
-    open_backup_artifact_lock_nofollow(path)
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use backup_lock_win as win;
+
+    // Bind the open to the already-validated, held parent inode: the child is
+    // named only by its leaf and resolved via `RootDirectory` = the held parent
+    // handle, so no ancestor is re-traversed and no component can be swapped
+    // between the parent walk and this open. `OBJ_DONT_REPARSE` +
+    // `FILE_OPEN_REPARSE_POINT` (inside `open_relative`) fail closed if the leaf
+    // itself is a reparse point, and `FILE_NON_DIRECTORY_FILE` rejects a
+    // directory occupying the name.
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock path has no filename",
+        )
+    })?;
+    // Defense in depth: the leaf must be exactly one path component with no
+    // separators, since NtCreateFile would otherwise treat separators as a
+    // relative traversal and defeat the held-handle binding.
+    if std::path::Path::new(name).components().count() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock filename is not a single path component",
+        ));
+    }
+    // Defense in depth: reject a `:` in the leaf. NTFS treats `name:stream` as
+    // an alternate data stream and `X:` as a drive-relative qualifier, either of
+    // which NtCreateFile would resolve specially instead of as our lock file.
+    // Unreachable for the fixed `.backup-artifacts.lock` leaf, but cheap
+    // insurance on a security-sensitive lock.
+    if name.encode_wide().any(|unit| unit == u16::from(b':')) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lock filename contains a colon",
+        ));
+    }
+    let wide = name.encode_wide().collect::<Vec<u16>>();
+    if wide.is_empty() || wide.len() > (u16::MAX as usize / 2) || wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Windows lock leaf name",
+        ));
+    }
+
+    let access = win::GENERIC_READ
+        | win::GENERIC_WRITE
+        | win::READ_CONTROL
+        | win::WRITE_DAC
+        | win::SYNCHRONIZE
+        | win::FILE_READ_ATTRIBUTES
+        | win::FILE_WRITE_ATTRIBUTES;
+    // Share READ|WRITE but never DELETE: while this handle is held the child
+    // cannot be renamed or deleted out from under the lock. This preserves the
+    // previous lock semantics, which also shared READ|WRITE and omitted DELETE.
+    let share = win::FILE_SHARE_READ | win::FILE_SHARE_WRITE;
+
+    // Exclusive-create first; on an existing lock fall back to open. `created`
+    // drives the one-time DACL set in the caller's validate/repair step. The
+    // collision is surfaced by `open_relative` as `AlreadyExists`.
+    match win::open_relative(
+        parent,
+        &wide,
+        win::FILE_CREATE,
+        win::FILE_NON_DIRECTORY_FILE,
+        access,
+        share,
+    ) {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = win::open_relative(
+                parent,
+                &wide,
+                win::FILE_OPEN,
+                win::FILE_NON_DIRECTORY_FILE,
+                access,
+                share,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "opening existing backup artifact lock relative to held parent failed: {error}"
+                ))
+            })?;
+            Ok((file, false))
+        }
+        Err(error) => Err(std::io::Error::other(format!(
+            "creating backup artifact lock relative to held parent failed: {error}"
+        ))),
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1952,36 +2357,6 @@ fn open_backup_artifact_lock_in_parent(
         std::io::ErrorKind::Unsupported,
         "stable backup artifact locking is unavailable on this platform",
     ))
-}
-
-#[cfg(windows)]
-fn open_backup_artifact_lock_nofollow(path: &Path) -> std::io::Result<(std::fs::File, bool)> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const LOCK_SECURITY_ACCESS: u32 = 0xC000_0000 | 0x0002_0000 | 0x0004_0000;
-    let open = |create_new| {
-        let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            // GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC.
-            .access_mode(LOCK_SECURITY_ACCESS)
-            .create_new(create_new)
-            // Prevent replacement of this exact authority while its lock lives.
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        options.open(path)
-    };
-    match open(true) {
-        Ok(file) => Ok((file, true)),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            open(false).map(|file| (file, false))
-        }
-        Err(error) => Err(error),
-    }
 }
 
 #[cfg(unix)]
@@ -3810,7 +4185,8 @@ mod tests {
 
         let error = BackupArtifactLock::acquire(&database).unwrap_err();
         assert!(
-            format!("{error:#}").contains("replaceable through untrusted writable ancestor"),
+            format!("{error:#}")
+                .contains("replaceable through untrusted or group/other-writable ancestor"),
             "unexpected error: {error:#}"
         );
     }

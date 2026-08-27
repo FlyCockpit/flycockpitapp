@@ -1856,6 +1856,20 @@ impl ImageGenerationDispatchService {
         }
     }
 
+    /// Safe, redacted, model-facing discovery projections for every configured
+    /// image-generation target, for `list_image_generation_targets`. Delegates
+    /// to the live runtime registry: disabled targets are excluded by default
+    /// (`include_disabled = false`); secrets, headers, raw workflow JSON,
+    /// endpoint origins, connected IPs, credential digests, and target
+    /// immutable identities are never surfaced. An empty configuration yields
+    /// an empty list (not an error).
+    pub fn list_targets(
+        &self,
+        include_disabled: bool,
+    ) -> Vec<crate::image_generation_agent_tools::ImageGenerationTargetProjection> {
+        self.registry.list_target_projections(include_disabled)
+    }
+
     /// Authorize and (on `Allow`) commit a `generate_image` request.
     pub async fn dispatch_generate_image(
         &self,

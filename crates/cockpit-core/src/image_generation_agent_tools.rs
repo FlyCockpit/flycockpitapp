@@ -162,6 +162,17 @@ pub enum LocationClass {
     PublicCloud,
 }
 
+impl LocationClass {
+    /// Stable lowercase label used in model-facing discovery copy.
+    pub fn label(self) -> &'static str {
+        match self {
+            LocationClass::Local => "local",
+            LocationClass::PrivateNetwork => "private_network",
+            LocationClass::PublicCloud => "public_cloud",
+        }
+    }
+}
+
 /// Risk tier for a generate-image request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -200,6 +211,31 @@ pub struct ProjectionDestination {
     pub target_id: String,
     pub location_class: LocationClass,
     pub adapter_kind: String,
+}
+
+/// Safe, redacted, model-facing projection of one image-generation target for
+/// discovery (`list_image_generation_targets`). Mirrors the redaction contract
+/// of [`ProjectionDestination`] and the `generate_image`/`get_image_generation_job`
+/// outcomes: it carries only non-identifying facts — the target id, adapter
+/// kind, connected location class, enabled flag, health state code, and (when a
+/// capability snapshot backs it) the supported formats, maximum dimensions,
+/// and allowed parameter names plus a freshness flag. It NEVER carries the
+/// endpoint id/origin, connected IPs, credential identity digest, target
+/// immutable identity, model/workflow digest, raw workflow JSON, or headers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageGenerationTargetProjection {
+    pub target_id: String,
+    pub adapter_kind: String,
+    pub location_class: LocationClass,
+    pub enabled: bool,
+    pub health_state: String,
+    pub supported_formats: Vec<String>,
+    pub maximum_width: Option<u32>,
+    pub maximum_height: Option<u32>,
+    pub allowed_parameters: Vec<String>,
+    /// `true` when a dispatchable capability snapshot backs this projection.
+    pub capability_fresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,26 +851,76 @@ impl Tool for ListImageGenerationTargetsTool {
         Some(image_generation_tool_schema(self.name()))
     }
 
-    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let include_disabled = args
             .get("include_disabled")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // The image generation runtime registry is owned by the daemon
-        // session worker. The safe discovery projection is produced by the
-        // runtime registry and surfaced through the daemon. In contexts
-        // without a registered registry (tool tests, headless), return
-        // the discovery guidance so the model knows to call
-        // `generate_image` with a target_id. Discovery never grants
-        // generation authority.
-        let _ = include_disabled;
-        Ok(ToolOutput::text(
-            "Image-generation target discovery is available through the configured runtime \
-             registry. Call `generate_image` with a `target_id` to generate images; omitting \
-             targets uses the configured default with one sample. Discovery never grants \
-             generation authority."
-                .to_string(),
-        ))
+        // Route through the session-scoped dispatch service, which owns the
+        // live image runtime registry. The safe discovery projection is
+        // produced by the registry: disabled targets are excluded by default
+        // (`include_disabled = false`), and secrets, headers, raw workflow
+        // JSON, endpoint origins, connected IPs, credential digests, and target
+        // immutable identities are never surfaced. An empty configuration yields
+        // an empty list (not an error). Discovery never grants generation
+        // authority.
+        let Some(service) = ctx.image_generation_dispatch.as_ref() else {
+            return Ok(ToolOutput::text(
+                "Image-generation target discovery is not available in this session. No \
+                 provider was contacted."
+                    .to_string(),
+            ));
+        };
+        let projections = service.list_targets(include_disabled);
+        if projections.is_empty() {
+            return Ok(ToolOutput::text(
+                "No image-generation targets are currently configured. Configure an image \
+                 endpoint and target before calling `generate_image`."
+                    .to_string(),
+            ));
+        }
+        let mut text = String::from("Image-generation targets:\n");
+        for projection in &projections {
+            text.push_str(&format!(
+                "- `{}` (adapter `{}`, location `{}`, {}): health `{}`",
+                projection.target_id,
+                projection.adapter_kind,
+                projection.location_class.label(),
+                if projection.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                projection.health_state,
+            ));
+            if projection.capability_fresh {
+                text.push_str(", capability fresh");
+            }
+            if !projection.supported_formats.is_empty() {
+                text.push_str(&format!(
+                    ", formats [{}]",
+                    projection.supported_formats.join(", ")
+                ));
+            }
+            if let Some(max_w) = projection.maximum_width {
+                if let Some(max_h) = projection.maximum_height {
+                    text.push_str(&format!(", max {max_w}x{max_h}"));
+                }
+            }
+            if !projection.allowed_parameters.is_empty() {
+                text.push_str(&format!(
+                    ", parameters [{}]",
+                    projection.allowed_parameters.join(", ")
+                ));
+            }
+            text.push('.');
+            text.push('\n');
+        }
+        text.push_str(
+            "Call `generate_image` with a `target_id` to generate images. Discovery never \
+             grants generation authority.",
+        );
+        Ok(ToolOutput::text(text))
     }
 }
 

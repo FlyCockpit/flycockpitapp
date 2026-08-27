@@ -1265,3 +1265,89 @@ fn resolve_ephemeral_headers_fail_closed_without_store() {
         .expect_err("missing credential_ref must fail closed");
     assert_eq!(err.code, RuntimeErrorCode::Authentication);
 }
+
+#[tokio::test]
+async fn list_target_projections_redacts_and_filters_disabled() {
+    use super::dispatch_proof_support::{FixedClock, dispatchable_registry, loopback_endpoint};
+    use crate::image_generation_agent_tools::LocationClass;
+
+    let clock = Arc::new(FixedClock(AtomicU64::new(0)));
+    let endpoint = loopback_endpoint();
+    let registry = dispatchable_registry(
+        clock.clone(),
+        &endpoint,
+        "target-primary",
+        1,
+        1,
+        credential_digest(1),
+    )
+    .await;
+
+    // Default: only the enabled, refreshed target is listed.
+    let default = registry.list_target_projections(false);
+    assert_eq!(default.len(), 1);
+    let proj = &default[0];
+    assert_eq!(proj.target_id, "target-primary");
+    assert_eq!(proj.adapter_kind, "openai_images");
+    assert_eq!(proj.location_class, LocationClass::Local);
+    assert!(proj.enabled);
+    assert_eq!(proj.health_state, "healthy");
+    assert!(proj.capability_fresh);
+    // No secret/origin/identity bytes leak into the projection.
+    let encoded = serde_json::to_string(&default).unwrap();
+    assert!(!encoded.contains("loopback.test"));
+    assert!(!encoded.contains("endpoint-loopback"));
+    assert!(!encoded.contains("127.0.0.1"));
+    assert!(!encoded.contains("test-target-identity"));
+    assert!(!encoded.contains("\"digest\""));
+
+    // Add a disabled target bound to a disabled endpoint (no snapshot).
+    let mut disabled_endpoint = loopback_endpoint();
+    disabled_endpoint.id = "endpoint-disabled".into();
+    disabled_endpoint.enabled = false;
+    registry.apply_endpoint(&disabled_endpoint, 1, 1);
+    registry.apply_test_target("target-disabled", &disabled_endpoint.id, 1, 1, "digest");
+
+    // Default still excludes the disabled target.
+    let default = registry.list_target_projections(false);
+    assert_eq!(default.len(), 1);
+    assert!(default.iter().all(|p| p.enabled));
+
+    // include_disabled lists it too, still without secrets/identities.
+    let all = registry.list_target_projections(true);
+    assert_eq!(all.len(), 2);
+    let disabled = all
+        .iter()
+        .find(|p| p.target_id == "target-disabled")
+        .unwrap();
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.health_state, "unknown");
+    assert!(!disabled.capability_fresh);
+    let encoded_all = serde_json::to_string(&all).unwrap();
+    assert!(!encoded_all.contains("loopback.test"));
+    assert!(!encoded_all.contains("127.0.0.1"));
+    assert!(!encoded_all.contains("endpoint-disabled"));
+}
+
+#[tokio::test]
+async fn list_target_projections_empty_when_unconfigured() {
+    use super::dispatch_proof_support::{FixedClock, dispatchable_registry, loopback_endpoint};
+
+    let clock = Arc::new(FixedClock(AtomicU64::new(0)));
+    // Build a registry then drop every endpoint so nothing is current.
+    let endpoint = loopback_endpoint();
+    let registry = dispatchable_registry(
+        clock.clone(),
+        &endpoint,
+        "target-solo",
+        1,
+        1,
+        credential_digest(2),
+    )
+    .await;
+    registry.remove_endpoint(&endpoint.id);
+
+    // An empty configuration yields an empty list, not an error.
+    assert!(registry.list_target_projections(false).is_empty());
+    assert!(registry.list_target_projections(true).is_empty());
+}

@@ -965,6 +965,7 @@ struct CurrentIdentity {
     epoch: u64,
     immutable: String,
     location: ImageLocationClass,
+    adapter_kind: ImageAdapterKind,
     enabled: bool,
     refresh_authority: Option<RefreshAuthority>,
 }
@@ -1015,6 +1016,19 @@ pub struct ImageRuntimeRegistry {
     dns: Arc<dyn DnsResolver>,
     connector: Arc<dyn BoundConnector>,
     store: Option<crate::credentials::CredentialStore>,
+}
+
+/// Stable, redacted string label for an [`ImageAdapterKind`], mirroring the
+/// `destination.adapter_kind` field produced by the dispatch authority. Used
+/// for discovery projections so the model sees the same adapter vocabulary it
+/// passes to `generate_image`.
+fn adapter_kind_str(kind: ImageAdapterKind) -> &'static str {
+    match kind {
+        ImageAdapterKind::OpenaiImages => "openai_images",
+        ImageAdapterKind::OpenrouterImages => "openrouter_images",
+        ImageAdapterKind::GeminiImages => "gemini_images",
+        ImageAdapterKind::Comfyui => "comfyui",
+    }
 }
 
 impl ImageRuntimeRegistry {
@@ -1177,6 +1191,7 @@ impl ImageRuntimeRegistry {
             epoch,
             immutable: endpoint.immutable_identity(),
             location: endpoint.location,
+            adapter_kind: endpoint.adapter,
             enabled: endpoint.enabled,
             refresh_authority: None,
         };
@@ -1341,6 +1356,153 @@ impl ImageRuntimeRegistry {
                 }
                 Some(value)
             })
+    }
+
+    /// Safe, redacted, model-facing discovery projections for every configured
+    /// target, mirroring the redaction contract of [`ProjectionDestination`]
+    /// and the `generate_image`/`get_image_generation_job` outcomes.
+    ///
+    /// By default disabled targets are excluded; `include_disabled` lists them
+    /// too (still without secrets, headers, raw workflow JSON, endpoint
+    /// origins, connected IPs, credential digests, or target immutable
+    /// identities). A target is `enabled` only when both the target and its
+    /// bound endpoint are enabled. Health and capability facts come from the
+    /// cached [`ImageHealthSnapshot`] when one is available; otherwise the
+    /// health state is `unknown` and the capability fields are empty. An empty
+    /// configuration yields an empty list (not an error).
+    pub fn list_target_projections(
+        &self,
+        include_disabled: bool,
+    ) -> Vec<crate::image_generation_agent_tools::ImageGenerationTargetProjection> {
+        use crate::image_generation_agent_tools::{ImageGenerationTargetProjection, LocationClass};
+
+        let now = self.clock.now_millis();
+        // Snapshot the current target/endpoint identities under one short lock
+        // each, then read cached health per target outside the identity locks.
+        let targets: Vec<(String, CurrentTargetIdentity)> = {
+            self.inner
+                .current_targets
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, identity)| (id.clone(), identity.clone()))
+                .collect()
+        };
+        let endpoints: HashMap<String, CurrentIdentity> =
+            self.inner.current.lock().unwrap().clone();
+
+        let mut out = Vec::new();
+        for (target_id, target) in targets {
+            let Some(endpoint) = endpoints.get(&target.endpoint) else {
+                // Target references an endpoint that is no longer current; skip
+                // it rather than emit a half-resolved projection.
+                continue;
+            };
+            let enabled = target.enabled && endpoint.enabled;
+            if !enabled && !include_disabled {
+                continue;
+            }
+
+            // Prefer the cached snapshot for adapter kind / health / capability;
+            // fall back to the endpoint identity for adapter kind when no
+            // snapshot has been taken yet.
+            let snapshot = self.snapshot(&target.endpoint, &target_id);
+            let adapter_kind = snapshot
+                .as_ref()
+                .map(|s| adapter_kind_str(s.adapter_kind))
+                .unwrap_or_else(|| adapter_kind_str(endpoint.adapter_kind));
+            let location_class = match endpoint.location {
+                ImageLocationClass::Local => LocationClass::Local,
+                ImageLocationClass::PrivateNetwork => LocationClass::PrivateNetwork,
+                ImageLocationClass::PublicCloud => LocationClass::PublicCloud,
+            };
+
+            let (
+                health_state,
+                supported_formats,
+                maximum_width,
+                maximum_height,
+                allowed_parameters,
+                capability_fresh,
+            ) = match snapshot.as_ref() {
+                Some(s) => {
+                    let fresh = s
+                        .capability
+                        .as_ref()
+                        .is_some_and(|c| c.dispatchable_at(now));
+                    let (formats, max_w, max_h, params) = s
+                        .capability
+                        .as_ref()
+                        .map(|c| {
+                            let formats = c
+                                .constraints
+                                .get("formats")
+                                .map(|v| {
+                                    v.split(',')
+                                        .filter(|f| !f.is_empty())
+                                        .map(str::to_owned)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let max_w = c
+                                .constraints
+                                .get("max_width")
+                                .and_then(|v| v.parse::<u32>().ok());
+                            let max_h = c
+                                .constraints
+                                .get("max_height")
+                                .and_then(|v| v.parse::<u32>().ok());
+                            let params = c
+                                .constraints
+                                .get("parameters")
+                                .map(|v| {
+                                    v.split(',')
+                                        .filter(|p| {
+                                            let name = p.split(':').next().unwrap_or("");
+                                            !name.is_empty()
+                                        })
+                                        .map(|p| p.split(':').next().unwrap_or("").to_owned())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            (formats, max_w, max_h, params)
+                        })
+                        .unwrap_or_default();
+                    (
+                        s.state.code().to_owned(),
+                        formats,
+                        max_w,
+                        max_h,
+                        params,
+                        fresh,
+                    )
+                }
+                None => (
+                    "unknown".to_owned(),
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                    false,
+                ),
+            };
+
+            out.push(ImageGenerationTargetProjection {
+                target_id,
+                adapter_kind: adapter_kind.to_owned(),
+                location_class,
+                enabled,
+                health_state,
+                supported_formats,
+                maximum_width,
+                maximum_height,
+                allowed_parameters,
+                capability_fresh,
+            });
+        }
+        // Stable ordering by target_id so discovery output is deterministic.
+        out.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        out
     }
     pub async fn refresh(
         &self,

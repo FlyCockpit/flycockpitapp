@@ -1299,7 +1299,10 @@ impl Approver {
         // request short-circuits the prompt. Best-effort: a persistence failure
         // is logged but does not strand the already-authorized turn — the next
         // matching request simply re-prompts (fail-closed on the match seam).
-        if let Decision::Allow { scope: scope @ (Scope::Session | Scope::Project) } = decision {
+        if let Decision::Allow {
+            scope: scope @ (Scope::Session | Scope::Project),
+        } = decision
+        {
             if let Some(session) = self.session.as_deref() {
                 if let Err(error) = self
                     .store

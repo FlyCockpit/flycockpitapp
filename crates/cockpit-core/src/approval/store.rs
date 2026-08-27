@@ -903,11 +903,15 @@ impl GrantStore {
         match scope {
             Scope::Once => Err(StoreError::OnceNotPersistable),
             Scope::Global => Err(StoreError::ImageGenerationNoGlobalScope),
-            Scope::Session | Scope::Project => {
-                self.image_generation_grant_upsert(scope, project_id, plan_digest, output_path_authority)
-                    .await
-                    .map_err(StoreError::Io)
-            }
+            Scope::Session | Scope::Project => self
+                .image_generation_grant_upsert(
+                    scope,
+                    project_id,
+                    plan_digest,
+                    output_path_authority,
+                )
+                .await
+                .map_err(StoreError::Io),
         }
     }
 
@@ -923,14 +927,13 @@ impl GrantStore {
     ) -> usize {
         match scope {
             Scope::Once | Scope::Global => 0,
-            Scope::Session | Scope::Project => {
-                self.image_generation_grant_revoke(scope, project_id, plan_digest)
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(?error, "image generation grant revoke failed");
-                        0
-                    })
-            }
+            Scope::Session | Scope::Project => self
+                .image_generation_grant_revoke(scope, project_id, plan_digest)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(?error, "image generation grant revoke failed");
+                    0
+                }),
         }
     }
 
@@ -978,8 +981,9 @@ impl GrantStore {
             .unwrap_or(false)
     }
 
-    /// Insert (or replace) an image-generation grant row, first clearing the
-    /// opposite verdict for the same key so a key never carries both.
+    /// Insert (or replace) an image-generation allow grant row. `INSERT OR
+    /// REPLACE` on the unique match index refreshes a stale allow in place
+    /// (resetting `granted_at` and clearing any prior `revoked_at`).
     async fn image_generation_grant_upsert(
         &self,
         scope: Scope,
@@ -995,28 +999,14 @@ impl GrantStore {
         let session_param: Option<String> = match scope {
             Scope::Session => Some(session_id.clone()),
             Scope::Project => None,
-            _ => unreachable!("image_generation_grant_upsert guards Once/Global upstream"),
+            Scope::Once | Scope::Global => {
+                unreachable!("image_generation_grant_upsert guards Once/Global upstream")
+            }
         };
         self.db
             .write(move |conn| {
                 let now = now_epoch_seconds() * 1000;
                 let grant_id = uuid::Uuid::new_v4().to_string();
-                // Clear any prior opposite-verdict row for this exact key.
-                conn.execute(
-                    "DELETE FROM image_generation_grants \
-                     WHERE scope = ?1 AND ifnull(session_id, '') = ifnull(?2, '') \
-                       AND project_id = ?3 AND plan_digest = ?4 \
-                       AND verdict <> 'allow'",
-                    rusqlite::params![
-                        &scope_str,
-                        session_param.as_ref(),
-                        &project_id,
-                        &plan_digest,
-                    ],
-                )
-                .context("clearing prior image-generation reject grant")?;
-                // Insert the allow row. `INSERT OR REPLACE` on the unique match
-                // index flips a stale allow in place (refreshing granted_at).
                 conn.execute(
                     "INSERT OR REPLACE INTO image_generation_grants \
                      (grant_id, scope, session_id, project_id, plan_digest, \
@@ -1053,25 +1043,28 @@ impl GrantStore {
         let session_param: Option<String> = match scope {
             Scope::Session => Some(session_id.clone()),
             Scope::Project => None,
-            _ => unreachable!("image_generation_grant_revoke guards Once/Global upstream"),
+            Scope::Once | Scope::Global => {
+                unreachable!("image_generation_grant_revoke guards Once/Global upstream")
+            }
         };
         self.db
             .write(move |conn| {
                 let now = now_epoch_seconds() * 1000;
-                let n = conn.execute(
-                    "UPDATE image_generation_grants SET revoked_at_unix_ms = ?1 \
+                let n = conn
+                    .execute(
+                        "UPDATE image_generation_grants SET revoked_at_unix_ms = ?1 \
                      WHERE scope = ?2 AND ifnull(session_id, '') = ifnull(?3, '') \
                        AND project_id = ?4 AND plan_digest = ?5 \
                        AND revoked_at_unix_ms IS NULL",
-                    rusqlite::params![
-                        now,
-                        &scope_str,
-                        session_param.as_ref(),
-                        &project_id,
-                        &plan_digest,
-                    ],
-                )
-                .context("revoking image-generation grant")?;
+                        rusqlite::params![
+                            now,
+                            &scope_str,
+                            session_param.as_ref(),
+                            &project_id,
+                            &plan_digest,
+                        ],
+                    )
+                    .context("revoking image-generation grant")?;
                 Ok(n)
             })
             .await
@@ -3831,5 +3824,118 @@ mod mcp_server_connect_grant_tests {
         );
         // A server-connect grant cannot become an external tool grant.
         assert_eq!(store.mcp_tool_grant_scope("server", original).await, None);
+    }
+
+    // ---- image-generation grants (issue #66) ----
+
+    /// Like [`test_store`] but also returns the session's machine-local
+    /// `project_id` so image-generation grant scopes can be exercised.
+    async fn ig_test_store(project: &Path, global: PathBuf) -> (GrantStore, uuid::Uuid, String) {
+        let db = Db::open_in_memory().unwrap();
+        let session = crate::session::Session::create_for_test(
+            db.clone(),
+            project.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let sid = session.id;
+        let project_id = session.project_id.clone();
+        let mut store = GrantStore::new(
+            db,
+            sid,
+            project.to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(project),
+        );
+        point_project_scope(&mut store, project, &global);
+        store.global_dir = Some(global);
+        (store, sid, project_id)
+    }
+
+    #[tokio::test]
+    async fn image_generation_grant_once_and_global_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            ig_test_store(tmp.path(), global.path().to_path_buf()).await;
+        let plan = "a".repeat(64);
+        let authority = "out-authority-digest";
+        assert_eq!(
+            store
+                .record_image_generation_grant(Scope::Once, &project_id, &plan, authority)
+                .await,
+            Err(StoreError::OnceNotPersistable)
+        );
+        assert_eq!(
+            store
+                .record_image_generation_grant(Scope::Global, &project_id, &plan, authority)
+                .await,
+            Err(StoreError::ImageGenerationNoGlobalScope)
+        );
+    }
+
+    #[tokio::test]
+    async fn image_generation_grant_session_project_round_trip_and_revoke() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            ig_test_store(tmp.path(), global.path().to_path_buf()).await;
+        let plan = "b".repeat(64);
+        let authority = "out-authority-digest";
+
+        // No grant initially.
+        assert_eq!(
+            store.image_generation_grant_scope(&project_id, &plan).await,
+            None
+        );
+
+        // Session-scope grant round-trips and matches the current session.
+        store
+            .record_image_generation_grant(Scope::Session, &project_id, &plan, authority)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.image_generation_grant_scope(&project_id, &plan).await,
+            Some(Scope::Session)
+        );
+        // Revoking the session grant prevents reuse.
+        assert_eq!(
+            store
+                .revoke_image_generation_grant(Scope::Session, &project_id, &plan)
+                .await,
+            1
+        );
+        assert_eq!(
+            store.image_generation_grant_scope(&project_id, &plan).await,
+            None
+        );
+
+        // Project-scope grant round-trips and matches via project_id.
+        store
+            .record_image_generation_grant(Scope::Project, &project_id, &plan, authority)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.image_generation_grant_scope(&project_id, &plan).await,
+            Some(Scope::Project)
+        );
+        // Membership audit: a foreign project_id never matches a project grant.
+        assert_eq!(
+            store
+                .image_generation_grant_scope("other-project", &plan)
+                .await,
+            None
+        );
+        // Revoking the project grant prevents reuse.
+        assert_eq!(
+            store
+                .revoke_image_generation_grant(Scope::Project, &project_id, &plan)
+                .await,
+            1
+        );
+        assert_eq!(
+            store.image_generation_grant_scope(&project_id, &plan).await,
+            None
+        );
     }
 }

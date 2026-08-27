@@ -2228,6 +2228,7 @@ mod tests {
             params: ModelParams::default(),
             scan_tool_results: false,
             llm_mode: crate::config::extended::LlmMode::Normal,
+            context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
             delegated: false,

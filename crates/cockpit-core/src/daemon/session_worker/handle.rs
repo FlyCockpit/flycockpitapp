@@ -2335,10 +2335,9 @@ pub fn spawn(
             if crate::agents::is_builtin_primary(&active)
                 || crate::agents::is_removed_primary(&active)
             {
-                crate::agents::resolve_primary_for_llm_mode(
+                crate::agents::resolve_primary(
                     Some(&active),
                     initial_active_agent(extended_cfg),
-                    extended_cfg.llm_mode,
                 )
             } else {
                 initial_active_agent(extended_cfg).to_string()

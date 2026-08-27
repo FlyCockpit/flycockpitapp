@@ -222,6 +222,10 @@ pub struct Agent {
     /// (implementation note). Drives tool-description
     /// verbosity at [`ToolBox::definitions`] time — the one rendering seam.
     pub llm_mode: crate::config::extended::LlmMode,
+    /// The agent def's resolved context policy (issue #75): the auto-compact
+    /// floor and inline-caps profile that previously came from the mode.
+    /// `None` = not declared (use the default 80 / standard).
+    pub context_policy: Option<crate::agents::ContextPolicy>,
     pub lock_identity: String,
     pub write_scope: Option<std::path::PathBuf>,
     pub delegated: bool,

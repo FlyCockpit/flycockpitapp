@@ -73,6 +73,37 @@ impl TagInlineCaps {
             },
         }
     }
+
+    /// Resolve caps from an agent def's `contextPolicy.inlineCaps` (issue #75).
+    /// Falls back to the mode-derived caps when the def does not declare a
+    /// profile.
+    pub fn for_def(
+        def: &crate::agents::AgentDef,
+        mode: LlmMode,
+    ) -> Self {
+        match def
+            .context_policy
+            .as_ref()
+            .and_then(|p| p.inline_caps)
+        {
+            Some(crate::agents::InlineCapsProfile::Conservative) => Self {
+                max_bytes: OUTPUT_BYTE_CAP,
+                max_lines: 500,
+                max_dir_entries: 30,
+            },
+            Some(crate::agents::InlineCapsProfile::Standard) => Self {
+                max_bytes: 48 * 1024,
+                max_lines: READ_LINE_CAP,
+                max_dir_entries: DIR_ENTRY_CAP,
+            },
+            Some(crate::agents::InlineCapsProfile::Large) => Self {
+                max_bytes: 256 * 1024,
+                max_lines: 10_000,
+                max_dir_entries: 500,
+            },
+            None => Self::for_mode(mode),
+        }
+    }
 }
 
 /// One file/directory suggestion the popup renders.

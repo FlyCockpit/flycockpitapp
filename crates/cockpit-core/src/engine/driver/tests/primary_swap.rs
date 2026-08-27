@@ -952,6 +952,7 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: true,
         llm_mode: crate::config::extended::LlmMode::default(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
         delegated: false,

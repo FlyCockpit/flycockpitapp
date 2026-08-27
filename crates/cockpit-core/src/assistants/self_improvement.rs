@@ -243,6 +243,7 @@ fn review_agent_from(root_agent: Agent) -> Agent {
         params: root_agent.params,
         scan_tool_results: false,
         llm_mode: root_agent.llm_mode,
+        context_policy: None,
         lock_identity: root_agent.lock_identity,
         assistant_identity_prefix: root_agent.assistant_identity_prefix,
         write_scope: root_agent.write_scope,

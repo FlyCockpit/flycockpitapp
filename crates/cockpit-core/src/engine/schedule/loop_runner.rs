@@ -302,6 +302,7 @@ fn build_fork_agent(
         // The fork inherits the parent's LLM mode so its tool descriptions
         // render identically (implementation note).
         llm_mode: parent.llm_mode,
+        context_policy: None,
         lock_identity: parent.lock_identity.clone(),
         assistant_identity_prefix: parent.assistant_identity_prefix.clone(),
         write_scope: parent.write_scope.clone(),
@@ -412,6 +413,7 @@ mod tests {
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: false,
             llm_mode: crate::config::extended::LlmMode::default(),
+            context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
             delegated: false,

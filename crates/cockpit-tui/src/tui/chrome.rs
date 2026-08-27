@@ -17,7 +17,7 @@ use crate::tui::theme::{
     FAVORITE_MODEL, MUTED_COLOR_INDEX, STATUS_BRANCH_BADGE, WARNING_TEXT, button_focus_style,
     button_hover_style, button_idle_style,
 };
-use cockpit_config::{extended::LlmMode, sandbox_mode::SandboxMode};
+use cockpit_config::sandbox_mode::SandboxMode;
 #[cfg(feature = "remote")]
 use cockpit_proto::{ConnectorDisclosure, OrgSyncDisclosure};
 use cockpit_proto::{LaunchInfo, RepoStatus};
@@ -70,7 +70,6 @@ fn repo_counts(repo: &RepoStatus) -> String {
 pub enum FooterControl {
     Agent,
     Model,
-    Mode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +97,7 @@ impl LongcacheStatus {
     }
 }
 
-/// Bottom-left status: `agent path · provider/model · mode`.
+/// Bottom-left status: `agent path · provider/model`.
 ///
 ///   - The model glyph is green when trusted, dark yellow when marked
 ///     favorite, light grey otherwise.
@@ -106,7 +105,6 @@ impl LongcacheStatus {
 ///     the history view.
 pub fn left_status(
     info: &LaunchInfo,
-    llm_mode: LlmMode,
     agent_path: &[String],
     selected: Option<FooterControl>,
     sandbox_mode: SandboxMode,
@@ -177,22 +175,6 @@ pub fn left_status(
             end: col,
         });
     }
-
-    push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
-    let start = col;
-    push_span(
-        &mut spans,
-        &mut col,
-        Span::styled(
-            format!("[{}]", llm_mode.as_str()),
-            footer_button_style(muted, selected == Some(FooterControl::Mode)),
-        ),
-    );
-    hits.push(FooterHit {
-        control: FooterControl::Mode,
-        start,
-        end: col,
-    });
 
     if longcache_enabled {
         push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
@@ -446,7 +428,6 @@ mod tests {
 
         let spans = left_status(
             &info,
-            LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             None,
             SandboxMode::Sandbox,
@@ -471,7 +452,6 @@ mod tests {
         info.active_model_is_trusted = true;
         let spans = left_status(
             &info,
-            LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             None,
             SandboxMode::Sandbox,
@@ -492,7 +472,6 @@ mod tests {
         info.active_model_diverged = true;
         let text = left_status(
             &info,
-            LlmMode::Normal,
             std::slice::from_ref(&info.agent_name),
             None,
             SandboxMode::Sandbox,
@@ -508,14 +487,13 @@ mod tests {
     }
 
     #[test]
-    fn left_status_renders_agent_path_model_and_mode_with_hits() {
+    fn left_status_renders_agent_path_and_model_with_hits() {
         let info = launch_info("Build");
         let path = vec!["Build".to_string(), "explore".to_string()];
         let status = left_status(
             &info,
-            LlmMode::Frontier,
             &path,
-            Some(FooterControl::Mode),
+            None,
             SandboxMode::Sandbox,
             true,
             LongcacheStatus::new(false, true),
@@ -528,7 +506,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "[Build › explore] · [openai/gpt-test] · [frontier] · sandbox"
+            "[Build › explore] · [openai/gpt-test] · sandbox"
         );
         assert_eq!(
             status
@@ -536,24 +514,8 @@ mod tests {
                 .iter()
                 .map(|hit| hit.control)
                 .collect::<Vec<_>>(),
-            vec![
-                FooterControl::Agent,
-                FooterControl::Model,
-                FooterControl::Mode
-            ]
+            vec![FooterControl::Agent, FooterControl::Model]
         );
-        let mode = status
-            .spans
-            .iter()
-            .find(|span| span.content == "[frontier]")
-            .expect("mode segment present");
-        assert!(
-            !mode
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::UNDERLINED)
-        );
-        assert_eq!(mode.style.bg, Some(crate::tui::theme::BUTTON_FOCUS_BG));
         for hit in &status.hits {
             let fragment: String = status
                 .spans
@@ -575,7 +537,7 @@ mod tests {
 
     #[test]
     fn footer_control_selected_style() {
-        left_status_renders_agent_path_model_and_mode_with_hits();
+        left_status_renders_agent_path_and_model_with_hits();
     }
 
     #[test]
@@ -585,7 +547,6 @@ mod tests {
 
         let off = left_status(
             &info,
-            LlmMode::Normal,
             &path,
             None,
             SandboxMode::Sandbox,
@@ -601,7 +562,6 @@ mod tests {
 
         let supported = left_status(
             &info,
-            LlmMode::Normal,
             &path,
             None,
             SandboxMode::Sandbox,
@@ -618,7 +578,6 @@ mod tests {
 
         let unsupported = left_status(
             &info,
-            LlmMode::Normal,
             &path,
             None,
             SandboxMode::Sandbox,
@@ -640,7 +599,6 @@ mod tests {
         let info = launch_info("Build");
         left_status(
             &info,
-            LlmMode::Normal,
             std::slice::from_ref(&info.agent_name),
             None,
             mode,

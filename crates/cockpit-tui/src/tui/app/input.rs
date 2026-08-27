@@ -1373,9 +1373,6 @@ impl App {
                 match selected {
                     crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
                     crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(false),
-                    crate::tui::chrome::FooterControl::Mode => {
-                        self.set_footer_llm_mode(App::previous_llm_mode(self.llm_mode));
-                    }
                 }
                 true
             }
@@ -1383,9 +1380,6 @@ impl App {
                 match selected {
                     crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
                     crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(true),
-                    crate::tui::chrome::FooterControl::Mode => {
-                        self.set_footer_llm_mode(self.llm_mode.cycled());
-                    }
                 }
                 true
             }
@@ -1395,9 +1389,6 @@ impl App {
                     crate::tui::chrome::FooterControl::Model => {
                         self.footer_selection = None;
                         self.open_model_picker();
-                    }
-                    crate::tui::chrome::FooterControl::Mode => {
-                        self.open_footer_mode_picker();
                     }
                 }
                 true

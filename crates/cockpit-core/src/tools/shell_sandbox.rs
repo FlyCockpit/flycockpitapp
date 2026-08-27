@@ -106,7 +106,9 @@ pub fn sandbox_policy(
     let mut allow_write_roots = Vec::new();
     push_unique_path(&mut allow_read_roots, cwd.to_path_buf());
     if let Some(scope) = write_scope {
-        push_unique_path(&mut allow_write_roots, scope.to_path_buf());
+        if cockpit_host::path_containment::contained_under(cwd, scope) {
+            push_unique_path(&mut allow_write_roots, scope.to_path_buf());
+        }
     } else {
         push_unique_path(&mut allow_write_roots, cwd.to_path_buf());
     }
@@ -212,7 +214,41 @@ pub async fn build_sandboxed_command(
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
 ) -> Result<tokio::process::Command> {
-    let policy = sandbox_policy(cwd, tmp_dir, session_env, extra_paths, write_scope);
+    build_sandboxed_command_with_visibility_root(
+        command,
+        cwd,
+        cwd,
+        tmp_dir,
+        extra_env,
+        session_env,
+        extra_paths,
+        write_scope,
+    )
+    .await
+}
+
+/// Build a confined command whose process cwd may be below a stricter
+/// workspace visibility root. This keeps normal relative-path semantics while
+/// ensuring a leased child cannot make its requested cwd the sandbox's wider
+/// read boundary.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_sandboxed_command_with_visibility_root(
+    command: &str,
+    cwd: &std::path::Path,
+    visibility_root: &std::path::Path,
+    tmp_dir: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+    session_env: &std::collections::HashMap<String, String>,
+    extra_paths: &[ExtraSandboxPath],
+    write_scope: Option<&std::path::Path>,
+) -> Result<tokio::process::Command> {
+    let policy = sandbox_policy(
+        visibility_root,
+        tmp_dir,
+        session_env,
+        extra_paths,
+        write_scope,
+    );
     let mut sandbox = zerobox::Sandbox::command("sh")
         .arg("-c")
         .arg(command)
@@ -227,7 +263,7 @@ pub async fn build_sandboxed_command(
         .allow_net_all()
         // cwd is always readable; write roots come from `sandbox_policy` so a
         // scoped child can drop cwd write access.
-        .allow_read(cwd.to_path_buf());
+        .allow_read(visibility_root.to_path_buf());
 
     for (key, value) in session_env {
         // Sealed child-environment injection is retired: never forward SEALED_*.

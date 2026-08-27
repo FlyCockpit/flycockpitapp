@@ -265,6 +265,12 @@ pub(crate) fn host_approval_filesystem_write_effects(
 
 pub(crate) fn enforce_write_scope(ctx: &ToolCtx, path: &std::path::Path, tool: &str) -> Result<()> {
     if let Some(lease) = ctx.workspace_lease.as_ref() {
+        if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+            return Err(crate::engine::tool::invalid_input(format!(
+                "refused: `{tool}` workspace lease `{}` is expired or revoked",
+                lease.id
+            )));
+        }
         if !lease.allows_write() {
             return Err(crate::engine::tool::invalid_input(format!(
                 "refused: `{tool}` is not permitted by workspace lease `{}`",

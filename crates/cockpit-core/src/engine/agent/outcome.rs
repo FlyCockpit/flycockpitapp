@@ -79,8 +79,7 @@ pub enum TurnOutcome {
         cwd: Option<String>,
         /// Optional hard write-confined subtree for this child.
         write_scope: Option<String>,
-        /// Optional host-issued workspace lease id or kind (`same_root`,
-        /// `subdirectory`, `managed_worktree`). Intersected with the parent
+        /// Optional host-issued workspace lease UUID. Intersected with the parent
         /// grant; cannot widen cwd, visibility, tools, model, depth, or
         /// concurrency.
         workspace_lease: Option<String>,

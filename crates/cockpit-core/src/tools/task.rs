@@ -170,7 +170,7 @@ impl TaskTool {
                 },
                 "workspace_lease": {
                     "type": "string",
-                    "description": "Host-issued workspace lease id, or kind `same_root`/`subdirectory`/`managed_worktree`. Intersected with the parent grant; cannot widen cwd, visibility, tools, model, depth, or concurrency. Managed worktrees require a live lease."
+                    "description": "Live host-issued workspace lease UUID. Intersected with the parent grant; cannot widen cwd, visibility, tools, model, depth, or concurrency."
                 },
                 "grant_tools": {
                     "type": "array",
@@ -233,7 +233,7 @@ impl TaskTool {
                 },
                 "workspace_lease": {
                     "type": "string",
-                    "description": "Host-issued workspace lease id or kind; intersected with the parent grant"
+                    "description": "Live host-issued workspace lease UUID; intersected with the parent grant"
                 },
                 "remaining_depth": {
                     "type": "integer",

@@ -2695,12 +2695,14 @@ impl Driver {
             .stack
             .last()
             .and_then(|frame| frame.agent.vnext_grant.clone());
-        let resolved_workspace_lease = match crate::workspace_lease::lease_from_task_argument(
+        let resolved_workspace_lease = match crate::workspace_lease::load_lease_from_task_argument(
+            &self.session.db,
+            self.session.id,
+            self.stack.last().and_then(|frame| frame.agent_instance_id),
             workspace_lease.as_deref(),
-            &self.cwd,
-            &child_cwd.resolved,
-            None,
-        ) {
+        )
+        .await
+        {
             Ok(lease) => lease,
             Err(err) => {
                 return Ok(SingleNoninteractiveCompletion {
@@ -7442,6 +7444,16 @@ async fn prepare_recovered_recursive_noninteractive_executor(
         .as_ref()
         .context("recovered recursive executor parent has no vNext grant")?
         .clone();
+    let recovered_workspace_lease = crate::workspace_lease::load_lease_from_task_argument(
+        &session.db,
+        session.id,
+        Some(descriptor.parent_agent_instance_id),
+        launch
+            .get("workspace_lease")
+            .and_then(serde_json::Value::as_str),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
     if let Some(error) =
         super::delegation_helpers::grant_rejection(super::delegation_helpers::GrantRejectionInput {
             parent_cwd,
@@ -7455,7 +7467,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             local_installations,
             parent_write_scope: parent_agent.write_scope.as_deref(),
             parent_workspace_lease: parent_agent.workspace_lease.as_deref(),
-            workspace_lease: None,
+            workspace_lease: recovered_workspace_lease.as_ref(),
         })
         .await
     {
@@ -7499,6 +7511,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             granted_tools,
             lock_identity: None,
             write_scope,
+            workspace_lease: recovered_workspace_lease.map(Arc::new),
             credential_store: session.provider_credential_store(&config.providers()).ok(),
         },
     )
@@ -9460,12 +9473,14 @@ pub(crate) async fn run_noninteractive_resumable(
                         continue;
                     }
                 };
-                let live_lease = match crate::workspace_lease::lease_from_task_argument(
+                let live_lease = match crate::workspace_lease::load_lease_from_task_argument(
+                    &session.db,
+                    session.id,
+                    agent_instance_id,
                     requested_lease.as_deref(),
-                    &cwd,
-                    &child_cwd,
-                    None,
-                ) {
+                )
+                .await
+                {
                     Ok(lease) => lease,
                     Err(error) => {
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -9553,7 +9568,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     granted_tools,
                     lock_identity: None,
                     write_scope: resolved_write_scope,
-                    workspace_lease: None,
+                    workspace_lease: live_lease.clone().map(Arc::new),
                     credential_store: session.provider_credential_store(&config.providers()).ok(),
                 };
                 let nested_steer_target = match (agent_instance_id, steer_target.as_ref()) {
@@ -9586,6 +9601,7 @@ pub(crate) async fn run_noninteractive_resumable(
                                     "granted_tools": &recovery_granted_tools,
                                     "cwd": child_cwd.to_string_lossy(),
                                     "write_scope": &write_scope,
+                                    "workspace_lease": live_lease.as_ref().map(|lease| lease.id.to_string()),
                                 }));
                                 let snapshot_json = ready_noninteractive_recovery_snapshot(
                                     Vec::new(),
@@ -9851,12 +9867,14 @@ pub(crate) async fn run_noninteractive_resumable(
                             break;
                         }
                     };
-                    let live_lease = match crate::workspace_lease::lease_from_task_argument(
+                    let live_lease = match crate::workspace_lease::load_lease_from_task_argument(
+                        &session.db,
+                        session.id,
+                        agent_instance_id,
                         entry.workspace_lease.as_deref(),
-                        &cwd,
-                        &child_cwd,
-                        None,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(lease) => lease,
                         Err(error) => {
                             rejection = Some(format!("batch entry `{}`: {error}", entry.label));
@@ -9924,7 +9942,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         granted_tools: entry.granted_tools.clone(),
                         lock_identity: None,
                         write_scope: resolved_write_scope,
-                        workspace_lease: None,
+                        workspace_lease: live_lease.clone().map(Arc::new),
                         credential_store: session
                             .provider_credential_store(&config.providers())
                             .ok(),
@@ -10030,7 +10048,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         let children = prepared
                             .iter()
                             .zip(child_ids.iter().copied())
-                            .map(|((_, entry, _, child_cwd), agent_instance_id)| {
+                            .map(|((_, entry, child, child_cwd), agent_instance_id)| {
                                 Ok::<_, anyhow::Error>(
                                     crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
                                         agent_instance_id,
@@ -10045,6 +10063,7 @@ pub(crate) async fn run_noninteractive_resumable(
                                             "granted_tools": &entry.granted_tools,
                                             "cwd": child_cwd.to_string_lossy(),
                                             "write_scope": &entry.write_scope,
+                                            "workspace_lease": child.workspace_lease.as_ref().map(|lease| lease.id.to_string()),
                                         }))
                                         .context("serializing recursive batch child launch descriptor")?)?,
                                         snapshot: validated_recursive_noninteractive_snapshot(ready_noninteractive_recovery_snapshot(

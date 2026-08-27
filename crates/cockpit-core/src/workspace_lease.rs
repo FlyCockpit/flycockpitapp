@@ -356,11 +356,15 @@ pub fn lease_from_task_argument(
     };
     match WorkspaceLeaseSelection::parse(raw).map_err(|error| error.to_string())? {
         WorkspaceLeaseSelection::Kind(kind) => {
+            if kind == WorkspaceLeaseKind::ManagedWorktree {
+                return Err(
+                    "managed_worktree requires a live host-issued workspace lease UUID".into(),
+                );
+            }
             let root = match kind {
                 WorkspaceLeaseKind::SameRoot => parent_cwd.to_path_buf(),
-                WorkspaceLeaseKind::Subdirectory | WorkspaceLeaseKind::ManagedWorktree => {
-                    child_cwd.to_path_buf()
-                }
+                WorkspaceLeaseKind::Subdirectory => child_cwd.to_path_buf(),
+                WorkspaceLeaseKind::ManagedWorktree => unreachable!("rejected above"),
             };
             Ok(Some(WorkspaceLease::ephemeral(
                 kind,
@@ -383,6 +387,36 @@ pub fn lease_from_task_argument(
             Ok(Some(loaded))
         }
     }
+}
+
+/// Resolve a task-selected lease from the durable owner-scoped ledger. Task
+/// arguments never mint authority: kind spellings are documentation helpers,
+/// while an actual launch must name a live host-issued UUID.
+pub async fn load_lease_from_task_argument(
+    db: &crate::db::Db,
+    session_id: Uuid,
+    owner_agent_instance_id: Option<Uuid>,
+    raw: Option<&str>,
+) -> std::result::Result<Option<WorkspaceLease>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let selection = WorkspaceLeaseSelection::parse(raw).map_err(|error| error.to_string())?;
+    let WorkspaceLeaseSelection::Id(id) = selection else {
+        return Err(format!(
+            "workspace lease kind `{raw}` must be issued by the host before launch; pass its UUID"
+        ));
+    };
+    let owner = owner_agent_instance_id
+        .ok_or_else(|| "workspace lease selection requires a durable agent owner".to_string())?;
+    let row = db
+        .workspace_lease_for_tools(session_id, owner, id, now_unix_ms())
+        .await
+        .map_err(|error| format!("loading workspace lease `{id}`: {error:#}"))?
+        .ok_or_else(|| format!("workspace lease `{id}` is not live and owned by this agent"))?;
+    WorkspaceLease::from_row(&row, WorkspaceLeaseOps::for_coding())
+        .map(Some)
+        .map_err(|error| format!("loading workspace lease `{id}`: {error:#}"))
 }
 
 /// Result of intersecting a selected lease with the parent's live grant.

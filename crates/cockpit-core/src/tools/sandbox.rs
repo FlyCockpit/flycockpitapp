@@ -396,6 +396,9 @@ pub(crate) fn is_workspace_cockpit_path(cwd: &Path, path: &Path) -> bool {
 
 fn within_boundary(ctx: &ToolCtx, path: &Path) -> bool {
     if let Some(lease) = ctx.workspace_lease.as_ref() {
+        if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+            return false;
+        }
         if lease.covers_path(path) {
             return true;
         }

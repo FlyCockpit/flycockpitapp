@@ -355,6 +355,14 @@ async fn call_bash_inner(
     ctx: &ToolCtx,
     options: BashRunOptions,
 ) -> Result<ToolOutput> {
+    if let Some(lease) = ctx.workspace_lease.as_ref()
+        && (!lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_execute())
+    {
+        return Err(crate::engine::tool::invalid_input(format!(
+            "refused: bash workspace lease `{}` is expired, revoked, or lacks execute authority",
+            lease.id
+        )));
+    }
     let command = args
         .get("command")
         .and_then(Value::as_str)
@@ -371,13 +379,22 @@ async fn call_bash_inner(
     let timeout_note = timeout_note.as_deref();
     let declared_resources = parse_resource_requirements(args.get("resources"))?;
 
-    if let Some(outside) =
+    if let Some(lease) = ctx.workspace_lease.as_ref()
+        && !lease.covers_cwd(&cwd)
+    {
+        return Err(crate::engine::tool::invalid_input(format!(
+            "refused: bash cwd `{}` is outside workspace lease visibility `{}`",
+            cwd.display(),
+            lease.visibility_root.display()
+        )));
+    } else if let Some(outside) =
         outside_session_boundary(&cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
-    if let Some(outside) =
-        command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+    if ctx.workspace_lease.is_none()
+        && let Some(outside) =
+            command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
@@ -559,6 +576,11 @@ async fn call_bash_inner(
     }
 
     let confine = matches!(gate, crate::tools::shell_sandbox::SandboxGate::Confine);
+    if ctx.workspace_lease.is_some() && !confine {
+        return Err(crate::engine::tool::invalid_input(
+            "refused: a workspace-leased child may run bash only with filesystem confinement enabled and available",
+        ));
+    }
 
     // Part B: the sandbox-state sub-object for the tool_call event. We
     // accumulate the four-state record as the run proceeds and attach it
@@ -2546,9 +2568,15 @@ async fn run_shell(
     }
 
     let mut cmd = if confine {
-        match crate::tools::shell_sandbox::build_sandboxed_command(
+        let visibility_root = ctx
+            .workspace_lease
+            .as_ref()
+            .map(|lease| lease.visibility_root.as_path())
+            .unwrap_or(cwd);
+        match crate::tools::shell_sandbox::build_sandboxed_command_with_visibility_root(
             command,
             cwd,
+            visibility_root,
             tmp_dir,
             scrub,
             session_env,

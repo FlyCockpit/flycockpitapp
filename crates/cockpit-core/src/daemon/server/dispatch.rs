@@ -14159,6 +14159,7 @@ async fn handle_serialized_request_impl(
             mutation_intent_hash,
             patch,
             secret_values_json,
+            target_scope,
         } => {
             let settlement_owner = settings_capability_owner(state);
             let request_hash = local_operation_secret_request_hash(
@@ -14205,6 +14206,7 @@ async fn handle_serialized_request_impl(
                     mutation_intent_hash: mutation_intent_hash.clone(),
                     patch: patch.clone(),
                     secret_values_json: secret_values_json.clone(),
+                    target_scope: target_scope.clone(),
                 };
                 #[cfg(feature = "remote")]
                 if let Some(operation) = remote_operation
@@ -14228,6 +14230,7 @@ async fn handle_serialized_request_impl(
                     &mutation_intent_hash,
                     &patch,
                     &secret_values_json,
+                    target_scope.as_deref(),
                 );
                 let response = finish_provider_mutation_future!(
                     remote_operation,
@@ -20888,6 +20891,7 @@ async fn save_mcp_config(
     supplied_mutation_intent_hash: &str,
     patch_json: &str,
     secret_values_json: &str,
+    target_scope: Option<&str>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let requested_project_root = project_root.to_owned();
@@ -20925,7 +20929,8 @@ async fn save_mcp_config(
     if capability.owner != owner_digest
         || capability.project_root != project_root
         || owner_root != project_root
-        || capability.mcp_target_path != std::path::Path::new(config_path)
+        || (target_scope.is_none()
+            && capability.mcp_target_path != std::path::Path::new(config_path))
         || capability.mcp_revision != expected_revision
     {
         return Err(ErrorPayload {
@@ -20962,12 +20967,23 @@ async fn save_mcp_config(
     // can invoke this production path directly.  Normalize values supplied
     // alongside a staged secret, and reject every other literal before either
     // the vault transaction or config publication starts.
-    let target = mcp_paths.last().cloned().or_else(|| {
+    let target = if let Some(scope) = target_scope {
+        if scope == "agent" {
+            return Err(bad_request(
+                "MCP scope `agent` must be written through MutateAgent (one agent_mutation_journals CAS)",
+            ));
+        }
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-            cockpit_config::config::dirs::most_specific_config_write_target(&cwd)
-                .map(|path| path.with_file_name(cockpit_config::config::dirs::MCP_FILE))
+            cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope)
         })
-    });
+    } else {
+        mcp_paths.last().cloned().or_else(|| {
+            crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                cockpit_config::config::dirs::most_specific_config_write_target(&cwd)
+                    .map(|path| path.with_file_name(cockpit_config::config::dirs::MCP_FILE))
+            })
+        })
+    };
     let target =
         target.ok_or_else(|| bad_request("no Cockpit config layer is available for MCP save"))?;
     let path = target
@@ -20975,7 +20991,9 @@ async fn save_mcp_config(
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
     let path = canonical_mcp_target_path(&path)?;
-    if path != capability.mcp_target_path || path != std::path::Path::new(config_path) {
+    if target_scope.is_none()
+        && (path != capability.mcp_target_path || path != std::path::Path::new(config_path))
+    {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message:

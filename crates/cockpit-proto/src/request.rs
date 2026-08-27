@@ -1935,6 +1935,11 @@ pub enum Request {
         patch: SensitiveWirePayload,
         #[serde(deserialize_with = "deserialize_owner_mcp_secret_json")]
         secret_values_json: SensitiveWirePayload,
+        /// Client-chosen MCP layer. `global` or `workspace`. Absent keeps
+        /// the daemon's existing nearest-layer pick. `agent` is not valid
+        /// here — agent-scope writes go through `MutateAgent`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_scope: Option<String>,
     },
 
     /// Discover the effective daemon-owned agent inventory for a workspace.
@@ -3160,7 +3165,17 @@ impl Request {
                 mutation_intent_hash,
                 patch,
                 secret_values_json,
+                target_scope,
             } => {
+                if let Some(scope) = target_scope
+                    && scope != "global"
+                    && scope != "workspace"
+                {
+                    return Err(
+                        "MCP target_scope must be global or workspace (agent writes use MutateAgent)"
+                            .to_string(),
+                    );
+                }
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("MCP snapshot capability", snapshot_capability, 128)?;
@@ -4216,7 +4231,7 @@ macro_rules! command {
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.
-            (Request::SaveMcpConfig { client_operation_id, project_root, snapshot_capability, owner_root, config_path, expected_revision, mutation_intent_hash, patch, secret_values_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|patch:SensitiveWirePayload|secret_values_json:SensitiveWirePayload", [client_operation_id: String => param, project_root: String => project_root, snapshot_capability: String => param, owner_root: String => param, config_path: String => param, expected_revision: String => param, mutation_intent_hash: String => param, patch: SensitiveWirePayload => param, secret_values_json: SensitiveWirePayload => param]);
+            (Request::SaveMcpConfig { client_operation_id, project_root, snapshot_capability, owner_root, config_path, expected_revision, mutation_intent_hash, patch, secret_values_json, target_scope }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|patch:SensitiveWirePayload|secret_values_json:SensitiveWirePayload|target_scope:Option<String>", [client_operation_id: String => param, project_root: String => project_root, snapshot_capability: String => param, owner_root: String => param, config_path: String => param, expected_revision: String => param, mutation_intent_hash: String => param, patch: SensitiveWirePayload => param, secret_values_json: SensitiveWirePayload => param, target_scope: Option<String> => param]);
             (Request::GetAgentInventory { project_root }, "get_agent_inventory", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
             (Request::MutateAgent { client_operation_id, mutation_intent_hash, project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, mutation: cockpit_proto::AgentMutation => param, expected_revision: Option<String> => param]);

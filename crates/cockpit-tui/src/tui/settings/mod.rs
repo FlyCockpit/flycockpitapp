@@ -668,6 +668,7 @@ pub(crate) async fn execute_settings_daemon_work(
                     secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                         secret_values_json.take(),
                     ),
+                    target_scope: None,
                 })
                 .await
                 .map_err(|error| error.to_string())?

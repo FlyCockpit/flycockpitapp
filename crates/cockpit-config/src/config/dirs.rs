@@ -249,6 +249,20 @@ pub fn mcp_file_layers_for_load(cwd: &Path) -> Vec<(ConfigDirKind, PathBuf)> {
     file_layers_for_load(cwd, MCP_FILE)
 }
 
+/// Explicit MCP write target for a client-chosen scope. `global` is the
+/// home XDG layer; `workspace` is the nearest project `.cockpit/mcp.json`.
+pub fn mcp_write_target_for_scope(cwd: &Path, scope: &str) -> Option<PathBuf> {
+    match scope {
+        "global" => dirs::home_dir().map(|home| home.join(".config/cockpit").join(MCP_FILE)),
+        "workspace" => discover_config_dirs(cwd)
+            .into_iter()
+            .rev()
+            .find(|dir| dir.kind == ConfigDirKind::Project)
+            .map(|dir| dir.path.join(MCP_FILE)),
+        _ => None,
+    }
+}
+
 fn file_paths_for_load(cwd: &Path, filename: &str) -> Vec<PathBuf> {
     file_layers_for_load(cwd, filename)
         .into_iter()

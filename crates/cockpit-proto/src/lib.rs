@@ -7218,6 +7218,7 @@ mod tests {
                 mutation_intent_hash: "11".repeat(32),
                 patch: r#"{"operations":[]}"#.into(),
                 secret_values_json: SensitiveWirePayload::new("{}".into()),
+                target_scope: None,
             },
             Request::ApplyExtendedConfigPatch {
                 client_operation_id: "patch-config".into(),

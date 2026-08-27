@@ -129,6 +129,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 mutation_intent_hash,
                 patch,
                 secret_values_json,
+                target_scope: _,
             } => save_mcp_config(
                 &client_operation_id,
                 Path::new(&project_root),
@@ -1115,6 +1116,7 @@ fn save_mcp_config(
     supplied_mutation_intent_hash: &str,
     patch_wire: &str,
     secret_values_json: &str,
+    target_scope: None,
 ) -> Result<Response, String> {
     let path = mcp_target_path(root);
     let expected_path = path.display().to_string();

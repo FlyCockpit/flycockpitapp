@@ -62,6 +62,15 @@ fn build_auth(args: &McpAddArgs) -> Result<Auth> {
 async fn add(args: McpAddArgs) -> Result<()> {
     let transport = parse_transport(&args.transport)?;
     let auth = build_auth(&args)?;
+    if args.scope == "agent" || args.scope.starts_with("agent=") {
+        bail!(
+            "MCP scope `agent` writes the agent package through MutateAgent (one CAS); if the agent is being edited (8h non-renewable editor lease) settle or cancel that lease first"
+        );
+    }
+    let target_scope = match args.scope.as_str() {
+        "global" | "workspace" => Some(args.scope.clone()),
+        other => bail!("unknown MCP scope `{other}` (expected global|workspace|agent[=<name>])"),
+    };
 
     let cwd = std::env::current_dir()?;
     let daemon = ensure_persistent_daemon()
@@ -131,6 +140,12 @@ async fn add(args: McpAddArgs) -> Result<()> {
         timeout_secs: None,
         profiles: BTreeMap::new(),
     };
+    if let Some(profile) = args.profile.as_deref()
+        && profile != crate::mcp::config::DEFAULT_PROFILE
+    {
+        let selected = server.auth.clone();
+        server.profiles.insert(profile.to_string(), selected);
+    }
     // Validate required fields per transport up front.
     match transport {
         Transport::Stdio => {
@@ -189,6 +204,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
             mutation_intent_hash: mutation_intent_hash.clone(),
             patch: cockpit_proto::SensitiveWirePayload::new(patch_wire),
             secret_values_json: cockpit_proto::SensitiveWirePayload::new(secret_values_json),
+            target_scope,
         })
         .await?
     {
@@ -206,7 +222,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
         }) if returned_operation_id == client_operation_id
             && returned_root == project_root
             && returned_owner_root == owner_root
-            && returned_config_path == config_path
+            && (target_scope.is_some() || returned_config_path == config_path)
             && consumed_revision == expected_revision
             && cockpit_proto::is_opaque_authority_token(&request_hash)
             && returned_intent_hash == mutation_intent_hash
@@ -219,6 +235,9 @@ async fn add(args: McpAddArgs) -> Result<()> {
         "Added MCP server `{}` ({}) via the daemon.",
         args.name,
         transport.as_str(),
+    );
+    println!(
+        "MCP config changes apply on the next tool call; agent-binding changes apply when the agent is next rebuilt."
     );
     Ok(())
 }

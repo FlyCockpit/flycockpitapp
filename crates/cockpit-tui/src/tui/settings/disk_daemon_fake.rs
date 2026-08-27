@@ -1718,6 +1718,21 @@ fn mutate_agent(
             let affected = reset_all_builtins(root)?;
             (affected != 0, affected, None)
         }
+        AgentMutation::SavePackageMcp { name, mcp_json } => {
+            validate_agent_name(&name)?;
+            let current = agent_edit_snapshot(root, &name)?;
+            ensure_revision(&current.revision, expected_revision.as_deref())?;
+            let package_dir = root.join(".cockpit").join("agents").join(&name);
+            std::fs::create_dir_all(&package_dir).map_err(|error| error.to_string())?;
+            let mcp_path = package_dir.join("mcp.json");
+            let body = if mcp_json.contains("mcpServers") {
+                mcp_json
+            } else {
+                format!("{{\"mcpServers\":{mcp_json}}}")
+            };
+            std::fs::write(mcp_path, body).map_err(|error| error.to_string())?;
+            (true, 1, Some(agent_edit_snapshot(root, &name)?))
+        }
         AgentMutation::SaveGoalSupervision { name, patch } => {
             validate_agent_name(&name)?;
             let current = agent_edit_snapshot(root, &name)?;

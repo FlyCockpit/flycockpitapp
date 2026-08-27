@@ -3666,9 +3666,9 @@ impl App {
             worktree_root,
             dialog: Dialog::None,
             overlay: Overlay::None,
-            session_setup_inline: Some(crate::tui::session_setup::SessionSetupPane::loading_inline(
-                true,
-            )),
+            session_setup_inline: Some(
+                crate::tui::session_setup::SessionSetupPane::loading_inline(true),
+            ),
             session_setup_collapsed: false,
             session_setup_focused: true,
             session_setup_collapse_hint: None,

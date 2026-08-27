@@ -1728,6 +1728,10 @@ impl SessionWorkerHandle {
         )
     }
 
+    pub fn tool_surface_override_json(&self) -> Option<String> {
+        self.session.tool_surface_override_json()
+    }
+
     pub fn foreground_snapshot(&self) -> ForegroundSnapshot {
         self.foreground
             .lock()

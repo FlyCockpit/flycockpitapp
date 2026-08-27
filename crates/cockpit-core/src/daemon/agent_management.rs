@@ -1044,6 +1044,20 @@ fn prepare_mutation_plan_sync(
                 true,
             )
         }
+        AgentMutation::SavePackageMcp { name, mcp_json } => {
+            validate_name(name)?;
+            let current = snapshot_sync(root, name)?;
+            ensure_revision(&current.revision, expected_revision)?;
+            let _ = mcp_json;
+            (
+                "save_package_mcp",
+                Some(name.clone()),
+                target_projection_identity(root, name, vault)?,
+                projection_identity(vault, Some(mcp_json.as_bytes())),
+                1,
+                false,
+            )
+        }
         AgentMutation::SaveGoalSupervision { name, patch } => {
             validate_name(name)?;
             let current = snapshot_sync(root, name)?;
@@ -3414,6 +3428,40 @@ fn mutate_sync_locked(
                 u32::from(changed),
                 Some(snapshot_sync(root, &name)?),
             )
+        }
+        AgentMutation::SavePackageMcp { name, mcp_json } => {
+            validate_name(&name)?;
+            let current = snapshot_sync(root, &name)?;
+            ensure_revision(&current.revision, expected_revision.as_deref())?;
+            crate::mcp::config::McpConfig::parse(&format!("{{\"mcpServers\":{mcp_json}}}"))
+                .or_else(|_| crate::mcp::config::McpConfig::parse(&mcp_json))
+                .map_err(bad_config)?;
+            let package_rel = format!(".cockpit/agents/{name}");
+            let package_dir = crate::daemon::fs_api::resolve_authorized_canonical_path(
+                root.to_string_lossy().as_ref(),
+                &package_rel,
+                crate::daemon::fs_api::AuthorizedCanonicalPathMode::WriteTarget,
+            )
+            .map_err(internal)?;
+            std::fs::create_dir_all(&package_dir).map_err(internal)?;
+            let agent_md = package_dir.join("agent.md");
+            if !agent_md.exists() {
+                cockpit_config::config::write_config_bytes_atomic(
+                    &agent_md,
+                    current.markdown.as_bytes(),
+                )
+                .map_err(internal)?;
+            }
+            let mcp_path = package_dir.join("mcp.json");
+            let body = if mcp_json.trim_start().starts_with('{') && mcp_json.contains("mcpServers")
+            {
+                mcp_json
+            } else {
+                format!("{{\"mcpServers\":{mcp_json}}}")
+            };
+             cockpit_config::config::write_config_bytes_atomic(&mcp_path, body.as_bytes())
+                 .map_err(internal)?;
+             (true, 1, Some(snapshot_sync(root, &name)?))
         }
     };
     let generation = match durable_generation_pair {

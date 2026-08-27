@@ -71,6 +71,7 @@ pub mod scheduler;
 pub mod server;
 #[cfg(feature = "remote")]
 pub mod session_continuity;
+pub(crate) mod session_setup_projection;
 pub mod session_worker;
 pub mod shutdown;
 pub mod skew_restart;

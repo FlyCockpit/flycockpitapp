@@ -16,11 +16,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
+use crate::tui::textfield::TextField;
+use cockpit_core::agents::{ToolSurfaceSelection, ToolTier};
 use cockpit_proto::{
     AgentInstallationChoiceV1, AgentInstallationRecordV1, AgentInstallationScopeWire,
     AgentInstallationUnmatchedRecommendationV1, SessionSetupAgentCandidateV1,
-    SessionSetupLockedReasonV1, SessionSetupModelSlotV1, SessionSetupSnapshotV1,
-    SessionSetupUnavailableReasonV1,
+    SessionSetupLockedReasonV1, SessionSetupMcpV1, SessionSetupModelSlotV1, SessionSetupSnapshotV1,
+    SessionSetupToolV1, SessionSetupUnavailableReasonV1,
 };
 
 use crate::tui::pane::Pane;
@@ -103,6 +105,10 @@ pub(crate) struct SessionSetupPane {
     /// When `true`, render without the full-body title chrome so the panel
     /// can sit below the banner box.
     inline: bool,
+    /// Frozen tool order for this session (initial enabled → discoverable →
+    /// disabled, safety last). Never re-sorted after the first snapshot.
+    tool_order: Vec<String>,
+    interaction: Interaction,
 }
 
 /// One rendered line, pre-classified so colour is purely supplementary and the
@@ -120,15 +126,76 @@ struct DisplayRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RowPayload {
     None,
-    Agent {
+    Agent,
+    AgentChoice {
         name: String,
-        locked: bool,
     },
+    Model,
     ModelChoice {
         slot_id: String,
         choice_id: String,
+        out_of_set: bool,
     },
+    Tool {
+        name: String,
+        locked: bool,
+    },
+    Mcp {
+        name: String,
+    },
+    AddMcp,
 }
+
+#[derive(Debug, Clone)]
+enum Interaction {
+    List,
+    AgentPopover {
+        names: Vec<String>,
+        cursor: usize,
+    },
+    ModelPopover {
+        slot_id: String,
+        choices: Vec<ModelChoiceItem>,
+        cursor: usize,
+    },
+    AddMcp(AddMcpForm),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelChoiceItem {
+    choice_id: String,
+    label: String,
+    is_default: bool,
+    out_of_set: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AddMcpForm {
+    name: TextField,
+    endpoint: TextField,
+    command: TextField,
+    transport: usize,
+    auth: usize,
+    scope: SessionSetupMcpScope,
+    cursor: usize,
+}
+
+impl AddMcpForm {
+    fn new() -> Self {
+        Self {
+            name: TextField::new(""),
+            endpoint: TextField::new(""),
+            command: TextField::new(""),
+            transport: 0,
+            auth: 0,
+            scope: SessionSetupMcpScope::Workspace,
+            cursor: 0,
+        }
+    }
+}
+
+const MCP_TRANSPORTS: &[&str] = &["streamable", "stdio", "sse"];
+const MCP_AUTHS: &[&str] = &["none", "oauth", "header", "env"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowKind {
@@ -141,6 +208,8 @@ enum RowKind {
     ChoiceCompatible,
     Unmatched,
     Blank,
+    Section,
+    Locked,
 }
 
 impl SessionSetupPane {
@@ -163,6 +232,8 @@ impl SessionSetupPane {
             color,
             notice: None,
             inline,
+            tool_order: Vec::new(),
+            interaction: Interaction::List,
         }
     }
 
@@ -173,11 +244,16 @@ impl SessionSetupPane {
     /// Apply a daemon snapshot, rebuilding the flat rows and clamping the
     /// cursor to the first selectable row.
     pub(crate) fn apply_snapshot(&mut self, snapshot: SessionSetupSnapshotV1) {
-        self.rows = build_rows(&snapshot);
+        if self.tool_order.is_empty() {
+            self.tool_order = initial_tool_order(&snapshot.tools);
+        }
+        self.rows = build_rows(&snapshot, &self.tool_order);
         self.snapshot = Some(snapshot);
         self.status = Status::Ready;
-        let first = self.rows.iter().position(|row| row.selectable);
-        self.list.select(first);
+        if matches!(self.interaction, Interaction::List) {
+            let first = self.rows.iter().position(|row| row.selectable);
+            self.list.select(first);
+        }
     }
 
     /// Record a fixed, daemon-independent error message.
@@ -191,6 +267,10 @@ impl SessionSetupPane {
 
     pub(crate) fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<&SessionSetupSnapshotV1> {
+        self.snapshot.as_ref()
     }
 
     fn selectable_indices(&self) -> impl Iterator<Item = usize> + '_ {
@@ -224,26 +304,223 @@ impl SessionSetupPane {
 
     fn activate_selection(&mut self) -> SessionSetupOutcome {
         match self.selected_payload().cloned().unwrap_or(RowPayload::None) {
-            RowPayload::None => SessionSetupOutcome::Stay,
-            RowPayload::Agent { name, locked } => {
-                if locked {
-                    self.notice = Some(format!("Agent `{name}` is locked and cannot be selected."));
-                    SessionSetupOutcome::Stay
-                } else {
-                    SessionSetupOutcome::SelectAgent { name }
-                }
-            }
+            RowPayload::None | RowPayload::Mcp { .. } => SessionSetupOutcome::Stay,
+            RowPayload::Agent => self.open_agent_popover(),
+            RowPayload::AgentChoice { name } => SessionSetupOutcome::SelectAgent { name },
+            RowPayload::Model => self.open_model_popover(),
             RowPayload::ModelChoice {
                 slot_id,
                 choice_id,
-            } => SessionSetupOutcome::SelectModel {
-                slot_id,
-                choice_id,
-            },
+                out_of_set,
+            } => {
+                if out_of_set {
+                    self.notice = Some(
+                        "That model is outside the slot-allowed set; applying it as a derived-def override.".to_string(),
+                    );
+                }
+                SessionSetupOutcome::SelectModel { slot_id, choice_id }
+            }
+            RowPayload::Tool { name, locked } => {
+                if locked {
+                    self.notice = Some(format!("`{name}` is a safety tool and stays enabled."));
+                    SessionSetupOutcome::Stay
+                } else {
+                    self.cycle_tool(&name)
+                }
+            }
+            RowPayload::AddMcp => {
+                self.interaction = Interaction::AddMcp(AddMcpForm::new());
+                SessionSetupOutcome::Stay
+            }
+        }
+    }
+
+    fn open_agent_popover(&mut self) -> SessionSetupOutcome {
+        let names = self.agent_names();
+        if names.is_empty() {
+            self.notice = Some("No workspace agents are available.".to_string());
+            return SessionSetupOutcome::Stay;
+        }
+        self.interaction = Interaction::AgentPopover { names, cursor: 0 };
+        SessionSetupOutcome::Stay
+    }
+
+    fn open_model_popover(&mut self) -> SessionSetupOutcome {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return SessionSetupOutcome::Stay;
+        };
+        if let Some(reason) = snapshot.model.locked_reason {
+            self.notice = Some(format!("Model slot is locked ({reason:?})."));
+            return SessionSetupOutcome::Stay;
+        }
+        let choices = model_choice_items(snapshot);
+        if choices.is_empty() {
+            self.notice = Some("No models are available for this agent.".to_string());
+            return SessionSetupOutcome::Stay;
+        }
+        self.interaction = Interaction::ModelPopover {
+            slot_id: "primary".to_string(),
+            choices,
+            cursor: 0,
+        };
+        SessionSetupOutcome::Stay
+    }
+
+    fn agent_names(&self) -> Vec<String> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Vec::new();
+        };
+        if !snapshot.available_agents.is_empty() {
+            return snapshot.available_agents.clone();
+        }
+        snapshot
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.locked_reason.is_none())
+            .map(|candidate| agent_name(&candidate.installation))
+            .collect()
+    }
+
+    fn cycle_tool(&mut self, name: &str) -> SessionSetupOutcome {
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return SessionSetupOutcome::Stay;
+        };
+        if !snapshot.root_foreground {
+            self.notice = Some(
+                "Tool surface changes were refused because an interactive subagent holds the foreground."
+                    .to_string(),
+            );
+            return SessionSetupOutcome::Stay;
+        }
+        let Some(tool) = snapshot.tools.iter_mut().find(|tool| tool.name == name) else {
+            return SessionSetupOutcome::Stay;
+        };
+        if tool.locked {
+            self.notice = Some(format!("`{name}` is a safety tool and stays enabled."));
+            return SessionSetupOutcome::Stay;
+        }
+        let legal: Vec<ToolTier> = tool
+            .legal_tiers
+            .iter()
+            .filter_map(|label| ToolTier::from_label(label))
+            .collect();
+        let legal = if legal.is_empty() {
+            cockpit_core::agents::legal_tool_tiers(name).to_vec()
+        } else {
+            legal
+        };
+        let current = ToolTier::from_label(&tool.tier).unwrap_or(ToolTier::Enabled);
+        let index = legal.iter().position(|tier| *tier == current).unwrap_or(0);
+        let next = legal[(index + 1) % legal.len()];
+        tool.tier = next.label().to_string();
+        match serde_json::to_string(&tool_selection_from_snapshot(snapshot)) {
+            Ok(override_json) => {
+                self.rebuild_rows();
+                SessionSetupOutcome::SetToolSurface { override_json }
+            }
+            Err(error) => {
+                self.notice = Some(format!("Tool surface update failed — {error}."));
+                SessionSetupOutcome::Stay
+            }
+        }
+    }
+
+    fn rebuild_rows(&mut self) {
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            self.rows = build_rows(snapshot, &self.tool_order);
         }
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> SessionSetupOutcome {
+        if let Interaction::AddMcp(form) = &self.interaction {
+            let form = form.clone();
+            return self.handle_add_mcp_key(key, form);
+        }
+        if let Interaction::AgentPopover { names, cursor } = &self.interaction {
+            let names = names.clone();
+            let mut cursor = *cursor;
+            let outcome = match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.interaction = Interaction::List;
+                    SessionSetupOutcome::Stay
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !names.is_empty() {
+                        cursor = (cursor + 1).min(names.len() - 1);
+                    }
+                    self.interaction = Interaction::AgentPopover { names, cursor };
+                    SessionSetupOutcome::Stay
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    cursor = cursor.saturating_sub(1);
+                    self.interaction = Interaction::AgentPopover { names, cursor };
+                    SessionSetupOutcome::Stay
+                }
+                KeyCode::Enter => {
+                    let name = names.get(cursor).cloned();
+                    self.interaction = Interaction::List;
+                    name.map(|name| SessionSetupOutcome::SelectAgent { name })
+                        .unwrap_or(SessionSetupOutcome::Stay)
+                }
+                _ => SessionSetupOutcome::Stay,
+            };
+            return outcome;
+        }
+        if let Interaction::ModelPopover {
+            slot_id,
+            choices,
+            cursor,
+        } = &self.interaction
+        {
+            let slot_id = slot_id.clone();
+            let choices = choices.clone();
+            let mut cursor = *cursor;
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.interaction = Interaction::List;
+                    SessionSetupOutcome::Stay
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !choices.is_empty() {
+                        cursor = (cursor + 1).min(choices.len() - 1);
+                    }
+                    self.interaction = Interaction::ModelPopover {
+                        slot_id,
+                        choices,
+                        cursor,
+                    };
+                    SessionSetupOutcome::Stay
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    cursor = cursor.saturating_sub(1);
+                    self.interaction = Interaction::ModelPopover {
+                        slot_id,
+                        choices,
+                        cursor,
+                    };
+                    SessionSetupOutcome::Stay
+                }
+                KeyCode::Enter => {
+                    let picked = choices.get(cursor).cloned();
+                    self.interaction = Interaction::List;
+                    if let Some(choice) = picked {
+                        if choice.out_of_set {
+                            self.notice = Some(
+                                "That model is outside the slot-allowed set; applying it as a derived-def override."
+                                    .to_string(),
+                            );
+                        }
+                        SessionSetupOutcome::SelectModel {
+                            slot_id,
+                            choice_id: choice.choice_id,
+                        }
+                    } else {
+                        SessionSetupOutcome::Stay
+                    }
+                }
+                _ => SessionSetupOutcome::Stay,
+            };
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => SessionSetupOutcome::Close,
             KeyCode::Down | KeyCode::Char('j') => {
@@ -259,6 +536,89 @@ impl SessionSetupPane {
         }
     }
 
+    fn handle_add_mcp_key(&mut self, key: KeyEvent, mut form: AddMcpForm) -> SessionSetupOutcome {
+        match key.code {
+            KeyCode::Esc => {
+                self.interaction = Interaction::List;
+                SessionSetupOutcome::Stay
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                form.cursor = (form.cursor + 1) % 6;
+                self.interaction = Interaction::AddMcp(form);
+                SessionSetupOutcome::Stay
+            }
+            KeyCode::Up => {
+                form.cursor = form.cursor.saturating_sub(1);
+                self.interaction = Interaction::AddMcp(form);
+                SessionSetupOutcome::Stay
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.cursor == 3 => {
+                let dir = if matches!(key.code, KeyCode::Left) {
+                    form.transport.saturating_sub(1)
+                } else {
+                    (form.transport + 1) % MCP_TRANSPORTS.len()
+                };
+                form.transport = dir;
+                self.interaction = Interaction::AddMcp(form);
+                SessionSetupOutcome::Stay
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.cursor == 4 => {
+                form.auth = if matches!(key.code, KeyCode::Left) {
+                    form.auth.saturating_sub(1)
+                } else {
+                    (form.auth + 1) % MCP_AUTHS.len()
+                };
+                self.interaction = Interaction::AddMcp(form);
+                SessionSetupOutcome::Stay
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.cursor == 5 => {
+                form.scope = match form.scope {
+                    SessionSetupMcpScope::Global => SessionSetupMcpScope::Workspace,
+                    SessionSetupMcpScope::Workspace => SessionSetupMcpScope::Agent,
+                    SessionSetupMcpScope::Agent => SessionSetupMcpScope::Global,
+                };
+                self.interaction = Interaction::AddMcp(form);
+                SessionSetupOutcome::Stay
+            }
+            KeyCode::Enter
+                if form.cursor == 5 || form.cursor == 0 && !form.name.text().is_empty() =>
+            {
+                let transport = MCP_TRANSPORTS[form.transport].to_string();
+                let auth = MCP_AUTHS[form.auth].to_string();
+                let endpoint =
+                    Some(form.endpoint.text().to_string()).filter(|value| !value.is_empty());
+                let command =
+                    Some(form.command.text().to_string()).filter(|value| !value.is_empty());
+                let outcome = SessionSetupOutcome::AddMcp {
+                    scope: form.scope,
+                    name: form.name.text().to_string(),
+                    transport,
+                    endpoint,
+                    command,
+                    auth,
+                };
+                self.interaction = Interaction::List;
+                outcome
+            }
+            _ => {
+                match form.cursor {
+                    0 => {
+                        form.name.handle_key(key);
+                    }
+                    1 => {
+                        form.endpoint.handle_key(key);
+                    }
+                    2 => {
+                        form.command.handle_key(key);
+                    }
+                    _ => {}
+                }
+                self.interaction = Interaction::AddMcp(form);
+                SessionSetupOutcome::Stay
+            }
+        }
+    }
+
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
         let title = if self.inline {
             " Session setup (Tab: composer) "
@@ -269,18 +629,22 @@ impl SessionSetupPane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let mut lines: Vec<Line<'static>> = match &self.status {
-            Status::Loading => vec![Line::from(Span::raw("Loading session setup…"))],
-            Status::Error(message) => vec![Line::from(styled(
-                message.clone(),
-                RowKind::CandidateLocked,
-                self.color,
-            ))],
-            Status::Ready => self
-                .rows
-                .iter()
-                .map(|row| Line::from(styled(row.text.clone(), row.kind, self.color)))
-                .collect(),
+        let mut lines: Vec<Line<'static>> = if !matches!(self.interaction, Interaction::List) {
+            self.inline_lines()
+        } else {
+            match &self.status {
+                Status::Loading => vec![Line::from(Span::raw("Loading session setup…"))],
+                Status::Error(message) => vec![Line::from(styled(
+                    message.clone(),
+                    RowKind::CandidateLocked,
+                    self.color,
+                ))],
+                Status::Ready => self
+                    .rows
+                    .iter()
+                    .map(|row| Line::from(styled(row.text.clone(), row.kind, self.color)))
+                    .collect(),
+            }
         };
         if let Some(notice) = &self.notice {
             lines.insert(
@@ -318,13 +682,63 @@ impl SessionSetupPane {
             ))),
             Status::Ready => {
                 for row in &self.rows {
+                    lines.push(Line::from(styled(row.text.clone(), row.kind, self.color)));
+                }
+            }
+        }
+        match &self.interaction {
+            Interaction::AgentPopover { names, cursor } => {
+                lines.push(Line::from(styled(
+                    "Agents".to_string(),
+                    RowKind::Section,
+                    self.color,
+                )));
+                for (index, name) in names.iter().enumerate() {
+                    let marker = if index == *cursor { "› " } else { "  " };
                     lines.push(Line::from(styled(
-                        row.text.clone(),
-                        row.kind,
+                        format!("{marker}{name}"),
+                        RowKind::CandidateUnselected,
                         self.color,
                     )));
                 }
             }
+            Interaction::ModelPopover {
+                choices, cursor, ..
+            } => {
+                lines.push(Line::from(styled(
+                    "Models".to_string(),
+                    RowKind::Section,
+                    self.color,
+                )));
+                for (index, choice) in choices.iter().enumerate() {
+                    let marker = if index == *cursor { "› " } else { "  " };
+                    lines.push(Line::from(styled(
+                        format!("{marker}{}", choice.label),
+                        RowKind::ChoiceCompatible,
+                        self.color,
+                    )));
+                }
+            }
+            Interaction::AddMcp(form) => {
+                lines.push(Line::from(styled(
+                    "Add MCP".to_string(),
+                    RowKind::Section,
+                    self.color,
+                )));
+                lines.push(Line::from(Span::raw(format!(
+                    "  name: {}",
+                    form.name.text()
+                ))));
+                lines.push(Line::from(Span::raw(format!(
+                    "  transport: {}",
+                    MCP_TRANSPORTS[form.transport]
+                ))));
+                lines.push(Line::from(Span::raw(format!(
+                    "  scope: {}",
+                    form.scope.as_str()
+                ))));
+            }
+            Interaction::List => {}
         }
         lines.push(Line::from(styled(
             "Enter activates · j/k move · Tab composer".to_string(),
@@ -392,10 +806,9 @@ fn candidate_header(candidate: &SessionSetupAgentCandidateV1) -> DisplayRow {
     DisplayRow {
         kind,
         text,
-        selectable: true,
-        payload: RowPayload::Agent {
+        selectable: candidate.locked_reason.is_none(),
+        payload: RowPayload::AgentChoice {
             name: agent_name(record),
-            locked: candidate.locked_reason.is_some(),
         },
     }
 }
@@ -446,6 +859,7 @@ fn choice_row(choice: &AgentInstallationChoiceV1) -> DisplayRow {
         payload: RowPayload::ModelChoice {
             slot_id: choice.slot_id.clone(),
             choice_id: choice.choice_id.clone(),
+            out_of_set: false,
         },
     }
 }
@@ -505,21 +919,272 @@ fn slot_rows(slot: &SessionSetupModelSlotV1, out: &mut Vec<DisplayRow>) {
 /// Flatten a snapshot into ordered display rows. Pure and deterministic so
 /// tests can assert scope distinctness, choice ordering, unmatched display,
 /// and reason labels without a terminal.
-fn build_rows(snapshot: &SessionSetupSnapshotV1) -> Vec<DisplayRow> {
+fn build_rows(snapshot: &SessionSetupSnapshotV1, tool_order: &[String]) -> Vec<DisplayRow> {
     let mut rows = Vec::new();
-    for candidate in &snapshot.candidates {
-        rows.push(candidate_header(candidate));
-        for slot in &candidate.slots {
-            slot_rows(slot, &mut rows);
-        }
+    rows.push(section_row("Agent"));
+    rows.push(agent_summary_row(snapshot));
+    rows.push(section_row("Model"));
+    rows.push(model_summary_row(snapshot));
+    rows.push(section_row("Tools"));
+    rows.extend(tool_rows(snapshot, tool_order));
+    rows.push(section_row("MCPs"));
+    rows.extend(mcp_rows(snapshot));
+    rows.push(DisplayRow {
+        kind: RowKind::ChoiceSuggested,
+        text: "  [Add MCP]".to_string(),
+        selectable: true,
+        payload: RowPayload::AddMcp,
+    });
+    if !snapshot.candidates.is_empty() && snapshot.available_agents.is_empty() {
+        // Keep candidate identity rows so colliding scopes stay visible.
         rows.push(DisplayRow {
             kind: RowKind::Blank,
             text: String::new(),
             selectable: false,
             payload: RowPayload::None,
         });
+        for candidate in &snapshot.candidates {
+            rows.push(candidate_header(candidate));
+            for slot in &candidate.slots {
+                slot_rows(slot, &mut rows);
+            }
+        }
     }
     rows
+}
+
+fn section_row(title: &str) -> DisplayRow {
+    DisplayRow {
+        kind: RowKind::Section,
+        text: title.to_string(),
+        selectable: false,
+        payload: RowPayload::None,
+    }
+}
+
+fn agent_summary_row(snapshot: &SessionSetupSnapshotV1) -> DisplayRow {
+    let name = snapshot
+        .resolved_agent
+        .clone()
+        .or_else(|| snapshot.last_used_agent.clone())
+        .or_else(|| {
+            snapshot
+                .candidates
+                .iter()
+                .find(|candidate| candidate.selected)
+                .map(|candidate| agent_name(&candidate.installation))
+        })
+        .unwrap_or_else(|| "Build".to_string());
+    let locked = snapshot
+        .candidates
+        .iter()
+        .any(|candidate| candidate.selected && candidate.locked_reason.is_some());
+    DisplayRow {
+        kind: if locked {
+            RowKind::CandidateLocked
+        } else {
+            RowKind::CandidateSelected
+        },
+        text: format!("  {name}  (Enter to change)"),
+        selectable: true,
+        payload: RowPayload::Agent,
+    }
+}
+
+fn model_summary_row(snapshot: &SessionSetupSnapshotV1) -> DisplayRow {
+    if let Some(reason) = snapshot.model.locked_reason {
+        return DisplayRow {
+            kind: RowKind::Locked,
+            text: format!("  locked ({reason:?})"),
+            selectable: true,
+            payload: RowPayload::Model,
+        };
+    }
+    let label = snapshot
+        .model
+        .effective
+        .as_ref()
+        .map(|model| {
+            let badge = if model.is_default { "  <default>" } else { "" };
+            format!(
+                "  {}/{}{badge}  (Enter to change)",
+                model.provider_id, model.model_id
+            )
+        })
+        .unwrap_or_else(|| "  (no model)  (Enter to change)".to_string());
+    DisplayRow {
+        kind: RowKind::Slot,
+        text: label,
+        selectable: true,
+        payload: RowPayload::Model,
+    }
+}
+
+fn tool_rows(snapshot: &SessionSetupSnapshotV1, tool_order: &[String]) -> Vec<DisplayRow> {
+    let mut rows = Vec::new();
+    let order = if tool_order.is_empty() {
+        initial_tool_order(&snapshot.tools)
+    } else {
+        tool_order.to_vec()
+    };
+    for name in order {
+        let Some(tool) = snapshot.tools.iter().find(|tool| tool.name == name) else {
+            continue;
+        };
+        rows.push(DisplayRow {
+            kind: if tool.locked {
+                RowKind::Locked
+            } else {
+                match tool.tier.as_str() {
+                    "enabled" => RowKind::ChoiceSuggested,
+                    "discoverable" => RowKind::Slot,
+                    _ => RowKind::Unmatched,
+                }
+            },
+            text: if tool.locked {
+                format!("  {:<22} {}  (locked)", tool.name, tool.tier)
+            } else {
+                format!("  {:<22} {}  (Enter rotates)", tool.name, tool.tier)
+            },
+            selectable: true,
+            payload: RowPayload::Tool {
+                name: tool.name.clone(),
+                locked: tool.locked,
+            },
+        });
+    }
+    rows
+}
+
+fn mcp_rows(snapshot: &SessionSetupSnapshotV1) -> Vec<DisplayRow> {
+    snapshot.mcps.iter().map(|server| mcp_row(server)).collect()
+}
+
+fn mcp_row(server: &SessionSetupMcpV1) -> DisplayRow {
+    let state = if server.enabled { "on" } else { "off" };
+    let shadow = server
+        .shadowed_by
+        .as_deref()
+        .map(|scope| format!("  shadowed by {scope}"))
+        .unwrap_or_default();
+    let profile = server
+        .profile
+        .as_deref()
+        .map(|profile| format!("  profile:{profile}"))
+        .unwrap_or_default();
+    DisplayRow {
+        kind: if server.shadowed_by.is_some() {
+            RowKind::Unmatched
+        } else {
+            RowKind::ChoiceCompatible
+        },
+        text: format!(
+            "  [{scope}] {name}  {state}{profile}{shadow}",
+            scope = server.scope,
+            name = server.name
+        ),
+        selectable: true,
+        payload: RowPayload::Mcp {
+            name: server.name.clone(),
+        },
+    }
+}
+
+fn initial_tool_order(tools: &[SessionSetupToolV1]) -> Vec<String> {
+    let rank = |tool: &SessionSetupToolV1| {
+        if tool.locked {
+            return 3;
+        }
+        match tool.tier.as_str() {
+            "enabled" => 0,
+            "discoverable" => 1,
+            _ => 2,
+        }
+    };
+    let mut ordered: Vec<&SessionSetupToolV1> = tools.iter().collect();
+    ordered.sort_by(|left, right| {
+        rank(left)
+            .cmp(&rank(right))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    ordered.into_iter().map(|tool| tool.name.clone()).collect()
+}
+
+fn model_choice_items(snapshot: &SessionSetupSnapshotV1) -> Vec<ModelChoiceItem> {
+    let allowed = &snapshot.model.allowed;
+    let mut items: Vec<ModelChoiceItem> = allowed
+        .iter()
+        .map(|model| ModelChoiceItem {
+            choice_id: format!("{}/{}", model.provider_id, model.model_id),
+            label: {
+                let badge = if model.is_default { "  <default>" } else { "" };
+                format!("{}/{}{badge}", model.provider_id, model.model_id)
+            },
+            is_default: model.is_default,
+            out_of_set: false,
+        })
+        .collect();
+    let selected = snapshot
+        .candidates
+        .iter()
+        .find(|candidate| candidate.selected);
+    if let Some(candidate) = selected {
+        if let Some(slot) = candidate
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == "primary")
+            .or_else(|| candidate.slots.first())
+        {
+            for choice in &slot.choices {
+                let in_allowed = allowed.iter().any(|model| {
+                    model.provider_id == choice.provider_id && model.model_id == choice.model_id
+                });
+                if !in_allowed {
+                    items.push(ModelChoiceItem {
+                        choice_id: choice.choice_id.clone(),
+                        label: format!("{}/{}  (out of set)", choice.provider_id, choice.model_id),
+                        is_default: false,
+                        out_of_set: true,
+                    });
+                }
+            }
+        }
+    }
+    if items.is_empty() {
+        items = snapshot
+            .candidates
+            .iter()
+            .find(|candidate| candidate.selected)
+            .and_then(|candidate| candidate.slots.first())
+            .map(|slot| {
+                slot.choices
+                    .iter()
+                    .map(|choice| ModelChoiceItem {
+                        choice_id: choice.choice_id.clone(),
+                        label: format!("{}/{}", choice.provider_id, choice.model_id),
+                        is_default: slot.default_choice_id.as_deref()
+                            == Some(choice.choice_id.as_str()),
+                        out_of_set: false,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    items
+}
+
+fn tool_selection_from_snapshot(snapshot: &SessionSetupSnapshotV1) -> ToolSurfaceSelection {
+    let mut tools = Vec::new();
+    let mut tool_tiers = std::collections::BTreeMap::new();
+    for tool in &snapshot.tools {
+        tools.push(tool.name.clone());
+        if let Some(tier) = ToolTier::from_label(&tool.tier)
+            && tier != ToolTier::Enabled
+        {
+            tool_tiers.insert(tool.name.clone(), tier);
+        }
+    }
+    ToolSurfaceSelection { tools, tool_tiers }
 }
 
 /// Supplementary colour for a row. With `color = false` the style is default,
@@ -539,6 +1204,10 @@ fn styled(text: String, kind: RowKind, color: bool) -> Span<'static> {
         RowKind::ChoiceCompatible => Style::default(),
         RowKind::Unmatched => Style::default().fg(Color::DarkGray),
         RowKind::Blank => Style::default(),
+        RowKind::Section => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        RowKind::Locked => Style::default().fg(Color::DarkGray),
     };
     Span::styled(text, style)
 }
@@ -633,7 +1302,7 @@ mod tests {
                 None,
             ),
         ]);
-        let rows = build_rows(&snap);
+        let rows = build_rows(&snap, &[]);
         let headers: Vec<&str> = rows
             .iter()
             .filter(|row| {
@@ -679,7 +1348,7 @@ mod tests {
             vec![slot],
             None,
         )]);
-        let rows = build_rows(&snap);
+        let rows = build_rows(&snap, &[]);
         let choice_rows: Vec<&DisplayRow> = rows
             .iter()
             .filter(|row| {
@@ -722,7 +1391,7 @@ mod tests {
             vec![slot],
             Some(SessionSetupLockedReasonV1::RebindRequired),
         )]);
-        let rows = build_rows(&snap);
+        let rows = build_rows(&snap, &[]);
         assert!(rows.iter().any(|row| {
             row.kind == RowKind::CandidateLocked && row.text.contains("locked: rebind required")
         }));
@@ -751,7 +1420,7 @@ mod tests {
             }],
             None,
         )]);
-        for row in build_rows(&snap) {
+        for row in build_rows(&snap, &[]) {
             let colored = styled(row.text.clone(), row.kind, true);
             let plain = styled(row.text.clone(), row.kind, false);
             assert_eq!(
@@ -786,7 +1455,7 @@ mod tests {
             }],
             None,
         )]);
-        let text: String = build_rows(&snap)
+        let text: String = build_rows(&snap, &[])
             .iter()
             .map(|row| row.text.clone())
             .collect::<Vec<_>>()
@@ -820,6 +1489,8 @@ mod tests {
         let mut pane = SessionSetupPane::loading(false);
         pane.apply_snapshot(snap);
         let outcome = pane.handle_key(press(KeyCode::Enter));
+        assert_eq!(outcome, SessionSetupOutcome::Stay);
+        let outcome = pane.handle_key(press(KeyCode::Enter));
         assert_eq!(
             outcome,
             SessionSetupOutcome::SelectAgent {
@@ -842,8 +1513,9 @@ mod tests {
         let outcome = pane.handle_key(press(KeyCode::Enter));
         assert_eq!(outcome, SessionSetupOutcome::Stay);
         assert!(
-            pane.notice()
-                .is_some_and(|notice| notice.contains("locked")),
+            pane.notice().is_some_and(|notice| {
+                notice.contains("locked") || notice.contains("No workspace agents")
+            }),
             "locked agent must surface a notice, not a silent no-op"
         );
     }
@@ -857,16 +1529,15 @@ mod tests {
             Vec::new(),
             None,
         )]);
-        let rows = build_rows(&snap);
+        let rows = build_rows(&snap, &[]);
         let agent = rows
             .iter()
-            .find(|row| matches!(row.payload, RowPayload::Agent { .. }))
+            .find(|row| matches!(row.payload, RowPayload::AgentChoice { .. }))
             .expect("agent candidate row");
         assert!(agent.selectable);
         match &agent.payload {
-            RowPayload::Agent { name, locked } => {
+            RowPayload::AgentChoice { name } => {
                 assert_eq!(name, "reviewer");
-                assert!(!*locked);
             }
             other => panic!("expected agent payload, got {other:?}"),
         }
@@ -937,11 +1608,250 @@ mod tests {
         let before = pane.inline_lines();
         // Collapse is presentation-only on App; the pane snapshot stays.
         let after = pane.inline_lines();
-        assert_eq!(before, after, "pending applied snapshot must survive collapse");
+        assert_eq!(
+            before, after,
+            "pending applied snapshot must survive collapse"
+        );
         assert!(
             after
                 .iter()
                 .any(|line| line.to_string().contains("reviewer"))
+        );
+    }
+
+    fn tool(name: &str, tier: &str, locked: bool) -> SessionSetupToolV1 {
+        SessionSetupToolV1 {
+            name: name.to_string(),
+            tier: tier.to_string(),
+            locked,
+            legal_tiers: if locked {
+                vec!["enabled".to_string()]
+            } else {
+                vec![
+                    "enabled".to_string(),
+                    "discoverable".to_string(),
+                    "disabled".to_string(),
+                ]
+            },
+            family: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn modes_session_setup_tools_initial_order_and_safety_pin() {
+        let mut snap = snapshot(vec![]);
+        snap.tools = vec![
+            tool("bash", "disabled", false),
+            tool("read", "enabled", false),
+            tool("question", "enabled", true),
+            tool("mcp", "discoverable", false),
+        ];
+        let order = initial_tool_order(&snap.tools);
+        assert_eq!(order, vec!["read", "mcp", "bash", "question"]);
+        assert!(!order.iter().any(|name| name == "escalate"));
+    }
+
+    #[test]
+    fn modes_session_setup_tools_order_frozen_after_edit() {
+        let mut snap = snapshot(vec![]);
+        snap.tools = vec![
+            tool("read", "enabled", false),
+            tool("bash", "discoverable", false),
+        ];
+        snap.root_foreground = true;
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap);
+        let before = pane
+            .rows
+            .iter()
+            .filter_map(|row| match &row.payload {
+                RowPayload::Tool { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        pane.list.select(pane.rows.iter().position(
+            |row| matches!(row.payload, RowPayload::Tool { name, locked: false } if name == "read"),
+        ));
+        let _ = pane.handle_key(press(KeyCode::Enter));
+        let after = pane
+            .rows
+            .iter()
+            .filter_map(|row| match &row.payload {
+                RowPayload::Tool { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            before, after,
+            "tool order must not reshuffle after a tier edit"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_tools_rotate_legal_and_surface_foreground_refusal() {
+        let mut snap = snapshot(vec![]);
+        snap.tools = vec![tool("bash", "enabled", false)];
+        snap.root_foreground = false;
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap);
+        pane.list.select(pane.rows.iter().position(
+            |row| matches!(row.payload, RowPayload::Tool { name, .. } if name == "bash"),
+        ));
+        let outcome = pane.handle_key(press(KeyCode::Enter));
+        assert_eq!(outcome, SessionSetupOutcome::Stay);
+        assert!(
+            pane.notice()
+                .is_some_and(|notice| notice.contains("foreground")),
+            "foreground refusal must be an inline notice"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_mcp_groups_and_shadow() {
+        let mut snap = snapshot(vec![]);
+        snap.mcps = vec![
+            SessionSetupMcpV1 {
+                name: "g".into(),
+                scope: "global".into(),
+                enabled: true,
+                shadowed_by: Some("workspace".into()),
+                profile: Some("default".into()),
+            },
+            SessionSetupMcpV1 {
+                name: "w".into(),
+                scope: "workspace".into(),
+                enabled: true,
+                shadowed_by: None,
+                profile: None,
+            },
+        ];
+        let rows = build_rows(&snap, &[]);
+        let mcp_text: Vec<_> = rows
+            .iter()
+            .filter(|row| matches!(row.payload, RowPayload::Mcp { .. } | RowPayload::AddMcp))
+            .map(|row| row.text.as_str())
+            .collect();
+        assert!(
+            mcp_text
+                .iter()
+                .any(|text| text.contains("[global]") && text.contains("shadowed by workspace"))
+        );
+        assert!(mcp_text.iter().any(|text| text.contains("[workspace]")));
+        assert!(mcp_text.iter().any(|text| text.contains("[Add MCP]")));
+    }
+
+    #[test]
+    fn modes_session_setup_model_default_badge_and_locked() {
+        let mut snap = snapshot(vec![]);
+        snap.model.effective = Some(cockpit_proto::AgentModelRefV1 {
+            provider_id: "local".into(),
+            model_id: "first".into(),
+            is_default: true,
+        });
+        let rows = build_rows(&snap, &[]);
+        assert!(rows.iter().any(|row| {
+            matches!(row.payload, RowPayload::Model) && row.text.contains("<default>")
+        }));
+        snap.model.locked_reason =
+            Some(cockpit_proto::AgentControlLockedReasonV1::InheritedFromProfile);
+        let rows = build_rows(&snap, &[]);
+        assert!(rows.iter().any(|row| {
+            matches!(row.payload, RowPayload::Model) && row.text.contains("locked")
+        }));
+    }
+
+    #[test]
+    fn modes_session_setup_e2e_scripted_fresh_session_flow() {
+        let mut snap = snapshot(vec![candidate(
+            "authored/reviewer",
+            Global,
+            true,
+            vec![SessionSetupModelSlotV1 {
+                slot_id: "primary".to_string(),
+                choices: vec![choice("local", "first", true, true)],
+                unmatched_recommendations: Vec::new(),
+                default_choice_id: Some("local/first".to_string()),
+                unavailable_reason: None,
+            }],
+            None,
+        )]);
+        snap.resolved_agent = Some("reviewer".into());
+        snap.available_agents = vec!["Build".into(), "reviewer".into()];
+        snap.tools = vec![
+            tool("read", "enabled", false),
+            tool("bash", "discoverable", false),
+            tool("question", "enabled", true),
+        ];
+        snap.root_foreground = true;
+        snap.mcps = vec![SessionSetupMcpV1 {
+            name: "docs".into(),
+            scope: "workspace".into(),
+            enabled: true,
+            shadowed_by: None,
+            profile: None,
+        }];
+        let mut pane = SessionSetupPane::loading_inline(false);
+        pane.apply_snapshot(snap);
+        // Agent popover → select
+        assert_eq!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::Stay
+        );
+        let selected = pane.handle_key(press(KeyCode::Enter));
+        assert!(matches!(selected, SessionSetupOutcome::SelectAgent { .. }));
+        // Model popover
+        pane.list.select(
+            pane.rows
+                .iter()
+                .position(|row| matches!(row.payload, RowPayload::Model)),
+        );
+        assert_eq!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::Stay
+        );
+        let model = pane.handle_key(press(KeyCode::Enter));
+        assert!(matches!(model, SessionSetupOutcome::SelectModel { .. }));
+        // Two tool rotations
+        pane.list.select(pane.rows.iter().position(
+            |row| matches!(row.payload, RowPayload::Tool { name, locked: false } if name == "read"),
+        ));
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::SetToolSurface { .. }
+        ));
+        pane.list.select(pane.rows.iter().position(
+            |row| matches!(row.payload, RowPayload::Tool { name, locked: false } if name == "bash"),
+        ));
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::SetToolSurface { .. }
+        ));
+        // Add MCP
+        pane.list.select(
+            pane.rows
+                .iter()
+                .position(|row| matches!(row.payload, RowPayload::AddMcp)),
+        );
+        assert_eq!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::Stay
+        );
+        // type a name and submit from the add form
+        pane.handle_key(press(KeyCode::Char('w')));
+        pane.handle_key(press(KeyCode::Char('s')));
+        let add = pane.handle_key(press(KeyCode::Enter));
+        match add {
+            SessionSetupOutcome::AddMcp { name, scope, .. } => {
+                assert_eq!(name, "ws");
+                assert_eq!(scope, SessionSetupMcpScope::Workspace);
+            }
+            other => panic!("expected AddMcp, got {other:?}"),
+        }
+        let collapsed = pane.inline_lines();
+        assert!(
+            collapsed
+                .iter()
+                .any(|line| line.to_string().contains("Session setup"))
         );
     }
 }

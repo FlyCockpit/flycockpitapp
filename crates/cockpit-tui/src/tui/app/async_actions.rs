@@ -1090,7 +1090,9 @@ impl App {
                 }
                 _ => {}
             },
-            AsyncActionKind::DaemonRpc("session_setup.snapshot") => match result.payload {
+            AsyncActionKind::DaemonRpc("session_setup.snapshot")
+            | AsyncActionKind::DaemonRpc("session_setup.add_mcp")
+            | AsyncActionKind::DaemonRpc("session_setup.add_mcp_agent") => match result.payload {
                 Ok(AsyncActionPayload::SessionSetupSnapshot(response)) => {
                     self.apply_session_setup_snapshot_response(response);
                 }

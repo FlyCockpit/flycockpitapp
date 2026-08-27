@@ -91,10 +91,7 @@ impl App {
                 self.swap_primary_agent(&name);
                 self.request_session_setup_snapshot_refresh();
             }
-            SessionSetupOutcome::SelectModel {
-                slot_id,
-                choice_id,
-            } => {
+            SessionSetupOutcome::SelectModel { slot_id, choice_id } => {
                 if as_overlay {
                     self.overlay = Overlay::SessionSetup(pane);
                 } else {
@@ -123,9 +120,7 @@ impl App {
                 } else {
                     self.session_setup_inline = Some(pane);
                 }
-                self.submit_session_setup_add_mcp(
-                    scope, name, transport, endpoint, command, auth,
-                );
+                self.submit_session_setup_add_mcp(scope, name, transport, endpoint, command, auth);
             }
             SessionSetupOutcome::Notice { message } => {
                 pane.set_notice(message);
@@ -138,25 +133,202 @@ impl App {
         }
     }
 
-    fn submit_session_setup_model_override(&mut self, _slot_id: String, _choice_id: String) {
-        // Wired in the model-section stage; kept as a named seam so Enter on
-        // a choice row is never a silent no-op at the outcome layer.
+    fn submit_session_setup_model_override(&mut self, slot_id: String, choice_id: String) {
+        let snapshot = self
+            .session_setup_inline
+            .as_ref()
+            .and_then(|pane| pane.snapshot())
+            .cloned()
+            .or_else(|| {
+                if let Overlay::SessionSetup(pane) = &self.overlay {
+                    pane.snapshot().cloned()
+                } else {
+                    None
+                }
+            });
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let Some(id) = snapshot
+            .root_agent_instance_id
+            .as_deref()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        else {
+            if let Some(pane) = self.session_setup_inline.as_mut() {
+                pane.set_notice(
+                    "Model override needs the root agent node; open /tree if this persists."
+                        .to_string(),
+                );
+            }
+            return;
+        };
+        self.submit_agent_session_override(
+            id,
+            snapshot.override_revision,
+            cockpit_proto::AgentSessionOverrideFieldV1::Model { slot_id, choice_id },
+        );
+        self.request_session_setup_snapshot_refresh();
     }
 
-    fn submit_session_setup_tool_surface(&mut self, _override_json: String) {
-        // Wired in the tools-section stage.
+    fn submit_session_setup_tool_surface(&mut self, override_json: String) {
+        self.send_daemon_request(
+            "/session-setup",
+            cockpit_proto::Request::SetToolSurfaceOverride {
+                override_json,
+                persist_session: true,
+                prune_after_switch: false,
+                monty_nudge: None,
+            },
+            ControlApplied::None,
+        );
+        self.request_session_setup_snapshot_refresh();
     }
 
     fn submit_session_setup_add_mcp(
         &mut self,
-        _scope: crate::tui::session_setup::SessionSetupMcpScope,
-        _name: String,
-        _transport: String,
-        _endpoint: Option<String>,
-        _command: Option<String>,
-        _auth: String,
+        scope: crate::tui::session_setup::SessionSetupMcpScope,
+        name: String,
+        transport: String,
+        endpoint: Option<String>,
+        command: Option<String>,
+        auth: String,
     ) {
-        // Wired in the MCP-section stage.
+        match scope {
+            crate::tui::session_setup::SessionSetupMcpScope::Agent => {
+                // Agent-scope MCP writes the agent package (one MutateAgent journal).
+                self.start_session_setup_agent_mcp_save(name, transport, endpoint, command, auth);
+            }
+            crate::tui::session_setup::SessionSetupMcpScope::Global
+            | crate::tui::session_setup::SessionSetupMcpScope::Workspace => {
+                self.start_session_setup_scoped_mcp_save(
+                    scope.as_str().to_string(),
+                    name,
+                    transport,
+                    endpoint,
+                    command,
+                    auth,
+                );
+            }
+        }
+    }
+
+    fn start_session_setup_scoped_mcp_save(
+        &mut self,
+        target_scope: String,
+        name: String,
+        transport: String,
+        endpoint: Option<String>,
+        command: Option<String>,
+        auth: String,
+    ) {
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            return;
+        };
+        let attached = runner.attached_request_binding();
+        let project_root = self.launch.cwd.display().to_string();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("session_setup.add_mcp"),
+            crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+                let snapshot = attached
+                    .request(cockpit_proto::Request::GetProviderCatalogSnapshot {
+                        project_root: project_root.clone(),
+                        provider_id: None,
+                        snapshot_session_id: snapshot_session_id.clone(),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let cockpit_proto::Response::ProviderCatalogSnapshot { config, .. } = snapshot
+                else {
+                    return Err("unexpected MCP authority snapshot".to_string());
+                };
+                let server = session_setup_mcp_server_json(&transport, endpoint, command, &auth)?;
+                let patch = cockpit_proto::McpConfigPatch {
+                    operations: vec![cockpit_proto::McpConfigPatchOperation::AddServer {
+                        name,
+                        server_json: server.into(),
+                    }],
+                };
+                let patch_wire =
+                    serde_json::to_string(&patch).map_err(|error| error.to_string())?;
+                let mutation_intent_hash =
+                    cockpit_proto::mcp_mutation_intent_hash(&project_root, &patch_wire);
+                let response = attached
+                    .request(cockpit_proto::Request::SaveMcpConfig {
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        project_root: project_root.clone(),
+                        snapshot_capability: config.mcp_edit_capability.unwrap_or_default(),
+                        owner_root: config
+                            .mcp_owner_root
+                            .unwrap_or_else(|| project_root.clone()),
+                        config_path: config.mcp_config_path.unwrap_or_default(),
+                        expected_revision: config.mcp_revision.unwrap_or_default(),
+                        mutation_intent_hash,
+                        patch: cockpit_proto::SensitiveWirePayload::new(patch_wire),
+                        secret_values_json: cockpit_proto::SensitiveWirePayload::new("{}".into()),
+                        target_scope: Some(target_scope),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot(response))
+            },
+        );
+    }
+
+    fn start_session_setup_agent_mcp_save(
+        &mut self,
+        name: String,
+        transport: String,
+        endpoint: Option<String>,
+        command: Option<String>,
+        auth: String,
+    ) {
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            return;
+        };
+        let attached = runner.attached_request_binding();
+        let project_root = self.launch.cwd.display().to_string();
+        let agent_name = self.launch.agent_name.clone();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("session_setup.add_mcp_agent"),
+            crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let snapshot = attached
+                    .request(cockpit_proto::Request::GetAgentEditSnapshot {
+                        project_root: project_root.clone(),
+                        name: agent_name.clone(),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let expected_revision = match snapshot {
+                    cockpit_proto::Response::AgentEditSnapshot(snapshot) => Some(snapshot.revision),
+                    _ => None,
+                };
+                let server = session_setup_mcp_server_json(&transport, endpoint, command, &auth)?;
+                let mcp_json = format!("{{\"{name}\": {server}}}");
+                let mutation = cockpit_proto::AgentMutation::SavePackageMcp {
+                    name: agent_name.clone(),
+                    mcp_json,
+                };
+                let mutation_intent_hash = cockpit_proto::agent_mutation_intent_hash(
+                    &project_root,
+                    &mutation,
+                    expected_revision.as_deref(),
+                );
+                let response = attached
+                    .request(cockpit_proto::Request::MutateAgent {
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        mutation_intent_hash,
+                        project_root,
+                        mutation,
+                        expected_revision,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot(response))
+            },
+        );
     }
 
     /// Schedule an async `GetSessionSetupSnapshot` fetch for the attached
@@ -197,6 +369,7 @@ impl App {
         response: cockpit_proto::Response,
     ) {
         let cockpit_proto::Response::SessionSetupSnapshot { snapshot } = response else {
+            self.request_session_setup_snapshot_refresh();
             return;
         };
         self.prepared_slot_models.clear();
@@ -281,6 +454,28 @@ fn resolve_setup_config_model(
         .iter()
         .any(|model| model.id == choice.model_id)
         .then(|| (handle.clone(), choice.model_id.clone()))
+}
+
+fn session_setup_mcp_server_json(
+    transport: &str,
+    endpoint: Option<String>,
+    command: Option<String>,
+    auth: &str,
+) -> Result<String, String> {
+    let auth_block = match auth {
+        "oauth" => serde_json::json!({"kind": "oauth"}),
+        "header" => serde_json::json!({"kind": "header", "header": "Authorization", "value": ""}),
+        "env" => serde_json::json!({"kind": "env"}),
+        _ => serde_json::json!({"kind": "none"}),
+    };
+    let value = serde_json::json!({
+        "transport": transport,
+        "endpoint": endpoint,
+        "command": command,
+        "auth": auth_block,
+        "enabled": true,
+    });
+    serde_json::to_string(&value).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

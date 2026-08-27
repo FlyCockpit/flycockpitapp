@@ -23753,6 +23753,26 @@ async fn get_session_setup_snapshot_under_publication(
         )
         .is_ok();
         if workspace_stable {
+            let last_used = ctx
+                .db
+                .last_used_root_agent_for_project(&crate::session::project_id_for(
+                    &att.handle.project_root,
+                ))
+                .await
+                .ok()
+                .flatten();
+            let foreground = att.handle.foreground_snapshot();
+            let root_foreground = foreground.active_subagent.is_none();
+            let snapshot = crate::daemon::session_setup_projection::enrich_session_setup_snapshot(
+                snapshot,
+                &att.handle.project_root,
+                &att.handle.active_agent_name,
+                last_used,
+                att.handle.tool_surface_override_json().as_deref(),
+                root_foreground,
+                None,
+                0,
+            );
             return Ok(Response::SessionSetupSnapshot { snapshot });
         }
     }
@@ -24295,6 +24315,26 @@ async fn get_session_setup_snapshot_shared(
         )
         .is_ok();
         if workspace_stable {
+            let last_used = ctx
+                .db
+                .last_used_root_agent_for_project(&crate::session::project_id_for(
+                    &att.project_root,
+                ))
+                .await
+                .ok()
+                .flatten();
+            let foreground = att.handle.foreground_snapshot();
+            let root_foreground = foreground.active_subagent.is_none();
+            let snapshot = crate::daemon::session_setup_projection::enrich_session_setup_snapshot(
+                snapshot,
+                &att.project_root,
+                &att.handle.active_agent_name,
+                last_used,
+                att.handle.tool_surface_override_json().as_deref(),
+                root_foreground,
+                None,
+                0,
+            );
             return Ok(Response::SessionSetupSnapshot { snapshot });
         }
     }

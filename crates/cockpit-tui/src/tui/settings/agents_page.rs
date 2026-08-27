@@ -2495,7 +2495,8 @@ fn agent_mutation_owner(mutation: &cockpit_proto::AgentMutation) -> &str {
         | cockpit_proto::AgentMutation::DeleteCustom { name }
         | cockpit_proto::AgentMutation::ResetBuiltin { name }
         | cockpit_proto::AgentMutation::SaveGoalSupervision { name, .. }
-        | cockpit_proto::AgentMutation::AddMcpServer { name, .. } => name,
+        | cockpit_proto::AgentMutation::AddMcpServer { name, .. }
+        | cockpit_proto::AgentMutation::SavePackageMcp { name, .. } => name,
         cockpit_proto::AgentMutation::ResetAllBuiltins => "reset-all",
     }
 }
@@ -2905,6 +2906,12 @@ pub(crate) fn validate_agent_mutation_result(
             if result.changed && (!s.editable || s.source_layer != L::Workspace) {
                 return Err("agent MCP config was not published to the workspace package".into());
             }
+        }
+        M::SavePackageMcp { name, .. } => {
+            if !result.changed || result.affected != 1 {
+                return Err("agent package MCP write was not a single committed change".into());
+            }
+            let _ = require_snapshot(name, None)?;
         }
     }
     Ok(())

@@ -780,9 +780,10 @@ impl App {
             self.reset_session_live_state();
             self.history.extend(restored);
             self.history.extend(staged_history);
-            let has_user_history = self.history.iter().any(|entry| {
-                matches!(entry, crate::tui::history::HistoryEntry::User { .. })
-            });
+            let has_user_history = self
+                .history
+                .iter()
+                .any(|entry| matches!(entry, crate::tui::history::HistoryEntry::User { .. }));
             self.prepare_session_setup_for_resume(has_user_history);
             self.queue.extend(staged_queue);
             if owns_working_span {

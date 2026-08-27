@@ -52,6 +52,9 @@ pub const RATIONALE_MAX_BYTES: usize = 2048;
 /// The proposal expiry duration in seconds (10 minutes).
 pub const PROPOSAL_EXPIRY_SECS: i64 = 600;
 
+/// The proposal expiry duration in milliseconds (10 minutes).
+pub const PROPOSAL_EXPIRY_SECS_MILLIS: i64 = PROPOSAL_EXPIRY_SECS * 1000;
+
 /// The maximum number of proposals per delegation.
 pub const MAX_PROPOSALS_PER_DELEGATION: u32 = 3;
 
@@ -835,6 +838,12 @@ pub mod enablement;
 /// Daemon-memory custody for pending proposals (typed values + rationale live in
 /// memory only; the durable receipt/counter/audit half is separate).
 pub mod lifecycle;
+
+/// Production lifecycle orchestration: wires enablement, the memory store, the
+/// durable receipts/counters, audit emission, accepted-rule compilation, and
+/// startup `expired_on_restart` reconciliation together against real
+/// sessions/delegations.
+pub mod service;
 
 #[cfg(test)]
 mod tests;

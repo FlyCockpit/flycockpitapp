@@ -9,10 +9,17 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::engine::agent::TurnEvent;
+#[cfg(feature = "test-support")]
+use crate::engine::response_performance::DisplayComplete;
 use crate::engine::response_performance::{
     AssistantAttemptId, DisplayClassifierConfig, DisplayClock, DisplayEvent,
-    DisplayStreamClassifier, Instant, RealDisplayClock,
+    DisplayStreamClassifier, DisplayTokenizer, EncodingDisplayTokenizer, Instant, RealDisplayClock,
 };
+
+/// Crate-private clock factory. Production [`DisplayAttemptSlot::new`]
+/// supplies [`RealDisplayClock`]; the e2e driver injects a manual clock
+/// through the same seam.
+pub(crate) type DisplayClockFactory = Arc<dyn Fn() -> Box<dyn DisplayClock + Send> + Send + Sync>;
 
 /// Monotonic attempt-id allocator for live display correlation. Process-wide
 /// so concurrent sessions never collide; never persisted.
@@ -27,14 +34,38 @@ struct DisplayAttemptSlotInner {
     config: DisplayClassifierConfig,
     classifier: Option<DisplayStreamClassifier>,
     previous_failed_visible: Option<(AssistantAttemptId, String)>,
+    clock_factory: DisplayClockFactory,
+    tokenizer: Arc<dyn DisplayTokenizer>,
 }
 
 impl DisplayAttemptSlot {
     pub(crate) fn new(config: DisplayClassifierConfig) -> Self {
+        let tokenizer: Arc<dyn DisplayTokenizer> = Arc::new(EncodingDisplayTokenizer {
+            encoding: config.encoding,
+            force_failure: config.force_tokenization_failure,
+        });
+        Self::new_with_clock_and_tokenizer(
+            config,
+            Arc::new(|| Box::new(RealDisplayClock)),
+            tokenizer,
+        )
+    }
+
+    /// Test/e2e constructor: same dispatcher object as production, with an
+    /// injected clock factory and tokenizer. Production
+    /// [`new`](Self::new) supplies [`RealDisplayClock`] and
+    /// [`EncodingDisplayTokenizer`].
+    pub(crate) fn new_with_clock_and_tokenizer(
+        config: DisplayClassifierConfig,
+        clock_factory: DisplayClockFactory,
+        tokenizer: Arc<dyn DisplayTokenizer>,
+    ) -> Self {
         Self(Arc::new(Mutex::new(DisplayAttemptSlotInner {
             config,
             classifier: None,
             previous_failed_visible: None,
+            clock_factory,
+            tokenizer,
         })))
     }
 
@@ -66,12 +97,13 @@ impl DisplayAttemptSlot {
                 .take()
                 .or(from_open)
                 .map(|(failed, reason)| (failed, replacement, reason));
-            let clock: Box<dyn DisplayClock + Send> = Box::new(RealDisplayClock);
-            inner.classifier = Some(DisplayStreamClassifier::new(
+            let clock = (inner.clock_factory)();
+            inner.classifier = Some(DisplayStreamClassifier::new_with_tokenizer(
                 replacement,
                 Instant::from_std(dispatched_at),
                 clock,
                 inner.config.clone(),
+                Arc::clone(&inner.tokenizer),
             ));
             reset
         };
@@ -143,6 +175,31 @@ impl DisplayAttemptSlot {
             .expect("display attempt slot")
             .classifier
             .take()
+    }
+
+    /// Production finish path: take the open classifier, run
+    /// [`DisplayStreamClassifier::finish`], and emit the typed Complete.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn finish_successful_attempt(
+        &self,
+        agent_name: &str,
+        choice_text: &str,
+        channel_reasoning: &str,
+        translated_presentation: Option<String>,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+    ) -> Option<DisplayComplete> {
+        let complete = {
+            let mut inner = self.0.lock().expect("display attempt slot");
+            let mut classifier = inner.classifier.take()?;
+            classifier.finish(choice_text, channel_reasoning, translated_presentation)?
+        };
+        emit_display_events(
+            agent_name,
+            vec![DisplayEvent::Complete(complete.clone())],
+            event_tx,
+        )
+        .await;
+        Some(complete)
     }
 
     /// Terminal failure/cancel after visible provisional output: emit one
@@ -444,7 +501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_performance_e2e_stream_produces_clickable_chip() {
+    async fn response_performance_engine_dispatch_emits_typed_lifecycle() {
         use crate::config::providers::TimeoutConfig;
         use futures::stream;
         use rig::streaming::StreamedAssistantContent;

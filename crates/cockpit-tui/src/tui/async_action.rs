@@ -118,6 +118,7 @@ impl AsyncActionKind {
                 | "leaks-rotate"
                 | "mcp.local"
                 | "note"
+                | "queue.control"
                 | "paste.image_path_admission"
                 | "paste.image_ingress_discard"
                 | "rename"

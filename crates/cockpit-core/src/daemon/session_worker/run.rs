@@ -9376,8 +9376,10 @@ pub(super) async fn run_worker(
                 } => {
                     let (result, item, snapshot) =
                         driver_input_queue.mark_send_now(queue_item_id).await;
-                    if matches!(result, crate::engine::message::RemoveQueuedMessageResult::Removed)
-                    {
+                    if matches!(
+                        result,
+                        crate::engine::message::RemoveQueuedMessageResult::Removed
+                    ) {
                         // TODO: if the in-flight tool is backgroundable (`bash`),
                         // convert it to async completion so the boundary arrives
                         // immediately. Until then this control is observed at

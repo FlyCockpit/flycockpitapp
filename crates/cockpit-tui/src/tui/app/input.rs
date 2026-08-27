@@ -408,6 +408,9 @@ impl App {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> bool {
+        if self.handle_queue_key(key) {
+            return false;
+        }
         if is_btw_focus_toggle(&key)
             && let Some(pane) = self.btw_pane.as_mut()
         {
@@ -1669,6 +1672,20 @@ impl App {
         if self.prompt_history_cursor == 0
             && self.composer.is_empty()
             && !self.queue.is_empty()
+            && self.queue_focus.is_none()
+        {
+            let _ = self.focus_queue_from_composer();
+            return;
+        }
+        if self.queue_focus.is_some() {
+            if !self.queue_focus_move(-1) {
+                self.blur_queue_focus();
+            }
+            return;
+        }
+        if self.prompt_history_cursor == 0
+            && self.composer.is_empty()
+            && !self.queue.is_empty()
             && edit_queue(self)
         {
             return;
@@ -1710,12 +1727,7 @@ impl App {
         &mut self,
         response: Result<Response, String>,
     ) {
-        let mut response = Some(response);
-        self.history_up_with_queue_edit(|app| {
-            app.edit_queued_messages_result_for_test(
-                response.take().expect("queue edit response used once"),
-            )
-        });
+        let _ = self.edit_queued_messages_result_for_test(response);
     }
 
     /// Counterpart to [`Self::history_up`]. Down only steps history
@@ -2546,6 +2558,9 @@ impl App {
                 .unwrap_or_default()
         });
         if submitted.is_empty() && self.composer.paste_is_empty() && pending_probe_ids.is_empty() {
+            if !self.extended.queued_messages_as_steering && !self.queue.is_empty() {
+                self.queue_promote_all(proto::QueueDeliveryClass::Steering);
+            }
             return false;
         }
         // A selection in flight is deliberately *not* a missing-model state.
@@ -2787,9 +2802,11 @@ impl App {
             .into_iter()
             .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
-        let delivery_class = cockpit_proto::QueueDeliveryClass::from_steering_setting(
-            self.extended.queued_messages_as_steering,
-        );
+        let delivery_class = self.pending_queue_edit_class.take().unwrap_or_else(|| {
+            cockpit_proto::QueueDeliveryClass::from_steering_setting(
+                self.extended.queued_messages_as_steering,
+            )
+        });
         let queue_target = self
             .foreground_input_target
             .clone()
@@ -3228,7 +3245,7 @@ pub(super) enum QueueEditOutcome {
 const QUEUE_EDIT_PENDING_NOTICE: &str = "retrieving queued messages…";
 
 impl App {
-    fn edit_queued_messages(&mut self) -> bool {
+    pub(super) fn edit_queued_messages(&mut self) -> bool {
         let operation = self.queue_blocking_operation();
         #[cfg(test)]
         let barrier = self.take_owned_test_barrier(operation);
@@ -3323,6 +3340,15 @@ impl App {
                 removed_items,
                 queue,
             }) if !removed_items.is_empty() => {
+                let merge_class = if removed_items
+                    .iter()
+                    .any(|item| item.delivery_class.is_steering())
+                {
+                    proto::QueueDeliveryClass::Steering
+                } else {
+                    proto::QueueDeliveryClass::Held
+                };
+                self.pending_queue_edit_class = Some(merge_class);
                 let removed_text = removed_items
                     .into_iter()
                     .map(|item| {
@@ -3358,7 +3384,7 @@ impl App {
         }
     }
 
-    fn replace_queue_from_proto(&mut self, queue: Vec<proto::QueueItem>) {
+    pub(super) fn replace_queue_from_proto(&mut self, queue: Vec<proto::QueueItem>) {
         self.queue = queue.into_iter().map(queue_item_from_proto).collect();
     }
 
@@ -4754,6 +4780,27 @@ mod queued_message_edit_tests {
     }
 
     #[test]
+    fn edit_all_merged_class_is_steering_if_any_member_was_steering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut held = proto_item("held", QueueItemStatus::Queued);
+        held.delivery_class = proto::QueueDeliveryClass::Held;
+        let mut steering = proto_item("steer", QueueItemStatus::Queued);
+        steering.delivery_class = proto::QueueDeliveryClass::Steering;
+        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
+            applied: true,
+            reason: RemoveQueuedUserMessageReason::Removed,
+            removed_items: vec![held, steering],
+            queue: Vec::new(),
+        });
+        assert_eq!(app.composer.text(), "held\n\nsteer");
+        assert_eq!(
+            app.pending_queue_edit_class,
+            Some(proto::QueueDeliveryClass::Steering)
+        );
+    }
+
+    #[test]
     fn up_edit_mixed_queue_edits_foreground_and_keeps_other_target() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
@@ -4780,20 +4827,19 @@ mod queued_message_edit_tests {
     }
 
     #[test]
-    fn up_edit_without_runner_reports_not_connected_and_consumes() {
+    fn up_on_empty_composer_focuses_queue_instead_of_edit_all() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.prompt_history.push("previous prompt".to_string());
         app.queue.push(optimistic_queue_item("queued".to_string()));
+        let id = app.queue[0].id;
 
         app.history_up();
 
         assert!(app.composer.is_empty());
         assert_eq!(app.prompt_history_cursor, 0);
-        assert!(
-            matches!(&app.toast, Some(toast) if toast.text == "not connected to the session"),
-            "runner absence has a distinct queue-edit notice"
-        );
+        assert_eq!(app.queue_focus, Some(id));
+        assert!(app.toast.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4825,7 +4871,7 @@ mod queued_message_edit_tests {
                     }));
         });
 
-        app.history_up();
+        app.queue_action_edit(None);
         responder.await.unwrap();
         let kind = app.queue_blocking_operation().action_kind();
         while app.async_actions.has_pending_kind(&kind) {

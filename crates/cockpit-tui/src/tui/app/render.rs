@@ -1004,7 +1004,12 @@ impl App {
         lines
     }
 
-    fn queue_grouped(&self) -> (Vec<&cockpit_proto::QueueItem>, Vec<&cockpit_proto::QueueItem>) {
+    pub(super) fn queue_grouped(
+        &self,
+    ) -> (
+        Vec<&cockpit_proto::QueueItem>,
+        Vec<&cockpit_proto::QueueItem>,
+    ) {
         let mut steering = Vec::new();
         let mut held = Vec::new();
         for item in &self.queue {
@@ -1833,6 +1838,14 @@ impl App {
         let non_foreground_style = queue_text_style.add_modifier(Modifier::DIM);
         let inner_w = content_area.width.saturating_sub(2).max(1) as usize;
         let (steering, held) = self.queue_grouped();
+        let steering_meta: Vec<(uuid::Uuid, cockpit_proto::QueueDeliveryClass)> = steering
+            .iter()
+            .map(|item| (item.id, item.delivery_class))
+            .collect();
+        let held_meta: Vec<(uuid::Uuid, cockpit_proto::QueueDeliveryClass)> = held
+            .iter()
+            .map(|item| (item.id, item.delivery_class))
+            .collect();
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         let mut push_header = |label: &str| {
@@ -1897,6 +1910,119 @@ impl App {
         }
 
         frame.render_widget(Paragraph::new(lines), content_area);
+        self.queue_row_hits.clear();
+        self.paint_queue_box_buttons(frame, area);
+        let mut line = 0u16;
+        if !steering_meta.is_empty() {
+            line = line.saturating_add(1);
+            for (id, class) in steering_meta {
+                self.paint_queue_message_row(frame, content_area, line, id, class);
+                line = line.saturating_add(1);
+            }
+        }
+        if !held_meta.is_empty() {
+            line = line.saturating_add(1);
+            for (id, class) in held_meta {
+                self.paint_queue_message_row(frame, content_area, line, id, class);
+                line = line.saturating_add(1);
+            }
+        }
+    }
+
+    fn paint_queue_box_buttons(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
+        let y = area.y;
+        let mut x = area.x.saturating_add(area.width.saturating_sub(2));
+        let labels = [
+            (
+                "cancel",
+                ButtonId::QueueCancel { item_id: None },
+                ButtonDispatch::QueueCancel { item_id: None },
+            ),
+            (
+                "edit",
+                ButtonId::QueueEdit { item_id: None },
+                ButtonDispatch::QueueEdit { item_id: None },
+            ),
+            (
+                self.queue_box_toggle_label(),
+                ButtonId::QueueToggleClass { item_id: None },
+                ButtonDispatch::QueueToggleClass { item_id: None },
+            ),
+            (
+                "send now",
+                ButtonId::QueueSendNow { item_id: None },
+                ButtonDispatch::QueueSendNow { item_id: None },
+            ),
+        ];
+        for (label, id, dispatch) in labels {
+            let width = (label.len() as u16).saturating_add(2);
+            x = x.saturating_sub(width.saturating_add(1));
+            if x <= area.x.saturating_add(2) {
+                break;
+            }
+            let _ = self.button_registry.paint(
+                frame,
+                x,
+                y,
+                width,
+                ButtonSpec::new(id, label, dispatch),
+            );
+        }
+    }
+
+    fn paint_queue_message_row(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        content_area: Rect,
+        line: u16,
+        id: uuid::Uuid,
+        class: cockpit_proto::QueueDeliveryClass,
+    ) {
+        let y = content_area.y.saturating_add(line);
+        self.queue_row_hits
+            .push((id, Rect::new(content_area.x, y, content_area.width, 1)));
+        if !self.queue_message_revealed(id) {
+            return;
+        }
+        use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
+        let toggle = Self::queue_item_toggle_label(class);
+        let mut x = content_area.x.saturating_add(content_area.width);
+        for (label, button_id, dispatch) in [
+            (
+                "cancel",
+                ButtonId::QueueCancel { item_id: Some(id) },
+                ButtonDispatch::QueueCancel { item_id: Some(id) },
+            ),
+            (
+                "edit",
+                ButtonId::QueueEdit { item_id: Some(id) },
+                ButtonDispatch::QueueEdit { item_id: Some(id) },
+            ),
+            (
+                toggle,
+                ButtonId::QueueToggleClass { item_id: Some(id) },
+                ButtonDispatch::QueueToggleClass { item_id: Some(id) },
+            ),
+            (
+                "send now",
+                ButtonId::QueueSendNow { item_id: Some(id) },
+                ButtonDispatch::QueueSendNow { item_id: Some(id) },
+            ),
+        ] {
+            let width = (label.len() as u16).saturating_add(2);
+            x = x.saturating_sub(width.saturating_add(1));
+            if x <= content_area.x {
+                break;
+            }
+            let _ = self.button_registry.paint(
+                frame,
+                x,
+                y,
+                width,
+                ButtonSpec::new(button_id, label, dispatch),
+            );
+        }
     }
 
     /// Build the launch-banner box lines for the current pane, or an
@@ -10282,7 +10408,10 @@ mod prediction_ghost_context_indicator_tests {
         let bottom = row_text(&buf, height - 1, width);
 
         assert!(top.contains('╭') && top.contains('╮'), "{top:?}");
-        assert!(top.contains("Build"), "box labels the target agent: {top:?}");
+        assert!(
+            top.contains("Build"),
+            "box labels the target agent: {top:?}"
+        );
         assert_eq!(bottom, format!("╭┴{}┴╮", "─".repeat(width as usize - 4)));
     }
 

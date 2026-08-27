@@ -1846,6 +1846,12 @@ impl App {
                 };
                 self.apply_queue_edit_outcome(outcome);
             }
+            AsyncActionKind::DaemonRpc("queue.control") => match result.payload {
+                Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                    self.apply_queue_control_response(*response);
+                }
+                _ => {}
+            },
             AsyncActionKind::Blocking("btw.teardown") => match result.payload {
                 Ok(AsyncActionPayload::BtwTransition {
                     created,
@@ -3305,6 +3311,7 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "goal-settings.effect"
                 | "mcp.local"
                 | "paste.image_path_admission"
+                | "queue.control"
                 | "resources.promote"
                 | "sealed.effect"
                 | "sessions.mutation"

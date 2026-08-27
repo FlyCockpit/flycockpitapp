@@ -21,7 +21,22 @@ Open the in-TUI keybinding overlay with `Ctrl+K` or `/keys`. `Esc`, `q`, or `Ctr
 | `Ctrl+Y` | copy pick | pick a message or code block to copy |
 | `Shift+Tab` | cycle agent | switch the primary agent |
 | `@` | file tag | tag a file into the message |
-| `↑/↓` | history | recall previously sent messages |
+| `↑/↓` | history | recall previously sent messages; on an empty composer with queued messages, Up focuses the queue box |
+| `Esc` / `↓` | queue blur | return from a focused queued message to the composer |
+
+## Queued messages
+
+Messages submitted while a run is in flight sit in the queue box above the composer. `/settings` → **queued messages as steering** (default on) classes Enter-during-a-run as *steering* (next turn). Off classes them *held* (after completion); Enter on an empty composer then promotes the whole queue to steering.
+
+| Key (queue focused) | Action | Description |
+| --- | --- | --- |
+| `s` | send now | deliver this message at the next safe boundary (never kills an in-flight tool) |
+| `t` | toggle class | `[hold]` on a steering message, `[steer]` on a held one |
+| `e` | edit | edit this message in place |
+| `x` / `Delete` | cancel | drop this message; others stay queued |
+| `↑/↓` | move | move among queued messages (steering group, then held) |
+
+Box-level `[send now] [steer all\|hold all] [edit] [cancel]` sit on the top border (mouse). Per-message buttons appear on hover or when that row is focused. Action keys never fire while the composer has focus.
 | `PgUp/PgDn` | scroll | scroll the chat transcript; Shift+↑/↓ scrolls by line |
 | `End` | live tail | jump to the newest messages |
 | `Ctrl+N` | scratchpad | open the project scratchpad |

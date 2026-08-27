@@ -191,9 +191,13 @@ impl App {
             if let crate::tui::button::ButtonPointerOutcome::Activated(dispatch) = outcome {
                 self.dispatch_button(dispatch);
             }
+            self.update_queue_pointer(mouse);
             if consumed {
                 return;
             }
+        }
+        if self.mouse_capture {
+            self.update_queue_pointer(mouse);
         }
         if self.mouse_capture
             && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
@@ -658,7 +662,7 @@ impl App {
         self.dispatch_chat_gesture(mouse);
     }
 
-    fn dispatch_button(&mut self, dispatch: crate::tui::button::ButtonDispatch) {
+    pub(super) fn dispatch_button(&mut self, dispatch: crate::tui::button::ButtonDispatch) {
         match dispatch {
             crate::tui::button::ButtonDispatch::Footer(control) => {
                 self.cancel_mouse_gesture(self.event_loop_monotonic_now);
@@ -687,6 +691,18 @@ impl App {
             }
             crate::tui::button::ButtonDispatch::TranscriptFork { seq } => {
                 self.fork_for_seq(seq);
+            }
+            crate::tui::button::ButtonDispatch::QueueSendNow { item_id } => {
+                self.queue_action_send_now(item_id);
+            }
+            crate::tui::button::ButtonDispatch::QueueToggleClass { item_id } => {
+                self.queue_action_toggle(item_id);
+            }
+            crate::tui::button::ButtonDispatch::QueueEdit { item_id } => {
+                self.queue_action_edit(item_id);
+            }
+            crate::tui::button::ButtonDispatch::QueueCancel { item_id } => {
+                self.queue_action_cancel(item_id);
             }
             crate::tui::button::ButtonDispatch::SessionsConfirmArchive
             | crate::tui::button::ButtonDispatch::SessionsConfirmDelete

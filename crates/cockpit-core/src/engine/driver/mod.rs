@@ -11043,13 +11043,8 @@ impl Driver {
                         // Run completion is a delivery boundary: remaining
                         // steering then held items deliver in group order so
                         // nothing is stranded.
-                        drain_group_order_queue(
-                            input_rx,
-                            &mut queued,
-                            &target_id,
-                            usize::MAX,
-                        )
-                        .await;
+                        drain_group_order_queue(input_rx, &mut queued, &target_id, usize::MAX)
+                            .await;
                         if queued
                             .first()
                             .is_some_and(|item| item.kind == UserSubmissionKind::Compact)

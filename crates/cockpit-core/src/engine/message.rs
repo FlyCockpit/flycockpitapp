@@ -862,13 +862,8 @@ impl UserSubmissionQueue {
         max: usize,
         target_id: Option<&str>,
     ) {
-        self.drain_into_for_filtered(
-            into,
-            max,
-            target_id,
-            QueueDrainFilter::SteeringOrSendNow,
-        )
-        .await;
+        self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::SteeringOrSendNow)
+            .await;
         self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::Held)
             .await;
     }
@@ -939,7 +934,8 @@ impl UserSubmissionQueue {
     }
 
     async fn pop_one(&self, target_id: Option<&str>) -> QueuePop {
-        self.pop_one_filtered(target_id, QueueDrainFilter::Any).await
+        self.pop_one_filtered(target_id, QueueDrainFilter::Any)
+            .await
     }
 
     async fn pop_one_filtered(
@@ -2581,9 +2577,7 @@ mod tests {
                 .all(|item| item.delivery_class == QueueDeliveryClass::Steering)
         );
 
-        let snapshot = queue
-            .set_all_delivery_class(QueueDeliveryClass::Held)
-            .await;
+        let snapshot = queue.set_all_delivery_class(QueueDeliveryClass::Held).await;
         assert!(
             snapshot
                 .iter()
@@ -2709,12 +2703,7 @@ mod tests {
         );
         let mut rest = Vec::new();
         queue
-            .drain_into_for_filtered(
-                &mut rest,
-                16,
-                Some(&target.id),
-                QueueDrainFilter::Held,
-            )
+            .drain_into_for_filtered(&mut rest, 16, Some(&target.id), QueueDrainFilter::Held)
             .await;
         assert_eq!(
             rest.iter()

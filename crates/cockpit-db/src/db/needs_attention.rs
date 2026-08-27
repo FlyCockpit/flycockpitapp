@@ -95,6 +95,22 @@ pub struct InterruptGateMemo {
     pub recheck_result: bool,
 }
 
+/// Memoized ArtifactWrite verification outcome so park/replay does not
+/// re-collect generators.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterruptVerificationMemo {
+    pub operation_id: uuid::Uuid,
+    pub outcome: InterruptVerificationOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptVerificationOutcome {
+    DispatchOriginal,
+    Block { message: String },
+    Revise { args: Value, disclosure: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterruptParkPayload {
     pub tool: String,
@@ -103,6 +119,8 @@ pub struct InterruptParkPayload {
     pub resume: InterruptResumeAnchor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<InterruptGateMemo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<InterruptVerificationMemo>,
 }
 
 // Full hydrated mirror of the `needs_attention` row; its fields back the
@@ -942,6 +960,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
                 call_id,
                 resume,
                 gate,
+                verification: None,
             })
         }
         _ => None,
@@ -1055,6 +1074,7 @@ mod tests {
             gate: Some(InterruptGateMemo {
                 recheck_result: true,
             }),
+            verification: None,
         };
 
         let interrupt_id = db
@@ -1259,6 +1279,7 @@ mod tests {
             gate: Some(InterruptGateMemo {
                 recheck_result: true,
             }),
+            verification: None,
         };
         let iid = db
             .raise_interrupt_questions_with_payload(
@@ -1338,6 +1359,7 @@ mod tests {
                 call_origin: InterruptCallOrigin::Foreground,
             },
             gate: None,
+            verification: None,
         };
         let iid = db
             .raise_interrupt_questions_with_payload(

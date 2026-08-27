@@ -11,7 +11,9 @@
 pub(crate) mod budget;
 pub(crate) mod classify;
 pub(crate) mod estimate;
+pub(crate) mod generate;
 pub(crate) mod intercept;
+pub(crate) mod recipe;
 
 pub(crate) use classify::classify_tool;
 pub(crate) use intercept::{InterceptInput, VerificationOutcome, intercept_ordinary_call};

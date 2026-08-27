@@ -499,6 +499,7 @@ async fn execute_ordinary_call_unscoped(
             call_origin: env.ctx.skill_write_origin,
         },
         gate: replay_gate_memo,
+        verification: None,
     };
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
@@ -806,6 +807,7 @@ async fn execute_ordinary_call_unscoped(
                 call_origin: env.ctx.skill_write_origin,
             },
             gate: gate_memo,
+            verification: None,
         };
         // Pre-tool hook gate: runs after name/argument/path repair and after
         // existing loop/safety/review/btw decisions permit dispatch, but
@@ -845,8 +847,10 @@ async fn execute_ordinary_call_unscoped(
                 agent: env.agent,
                 model: env.model,
                 ctx: env.ctx,
+                history,
                 resolved_name,
                 args: &args,
+                call_id: tc.id.as_str(),
             },
         )
         .await;

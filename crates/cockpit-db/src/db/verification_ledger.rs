@@ -865,6 +865,30 @@ impl Db {
         .await
     }
 
+    pub async fn list_verification_candidates_for_operation(
+        &self,
+        session_id: Uuid,
+        operation_id: Uuid,
+    ) -> Result<Vec<VerificationCandidateRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT candidate_id FROM verification_candidates
+                 WHERE session_id = ?1 AND operation_id = ?2
+                 ORDER BY created_at_unix_ms ASC, candidate_id ASC",
+            )?;
+            let ids = stmt
+                .query_map(
+                    params![session_id.to_string(), operation_id.to_string()],
+                    |row| parse_uuid(row.get(0)?),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.into_iter()
+                .map(|candidate_id| required_candidate(conn, session_id, operation_id, candidate_id))
+                .collect()
+        })
+        .await
+    }
+
     pub async fn start_verification_collection(
         &self,
         session_id: Uuid,

@@ -553,6 +553,7 @@ mod tests {
                 call_origin: ctx.skill_write_origin,
             },
             gate: None,
+            verification: None,
         };
         let task_ctx = ctx.clone();
         let task = tokio::spawn(async move {
@@ -1340,6 +1341,7 @@ mod tests {
                     call_origin: ctx.skill_write_origin,
                 },
                 gate: None,
+            verification: None,
             };
             let task_ctx = ctx.clone();
             let task_args = args.clone();

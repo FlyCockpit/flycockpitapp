@@ -33,10 +33,10 @@ use crate::session::Session;
 use super::budget::budget_to_ledger;
 use super::classify_tool;
 use super::estimate::{CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set};
+use super::generate::{CollectionInput, collect_candidates};
 
-/// Outcome of the verification intercept. Stage 1 only produces [`Self::Skip`]
-/// and [`Self::DispatchOriginal`]; later stages add block/revise.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Outcome of the verification intercept.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum VerificationOutcome {
     /// No matching verify rule, no compiled policy, or no durable agent
     /// instance. Dispatch the original call and write no ledger row.
@@ -44,6 +44,17 @@ pub(crate) enum VerificationOutcome {
     /// Matching verify rule recorded as dispatch-original. Execute the
     /// original call unchanged.
     DispatchOriginal { operation_id: Uuid },
+    /// Gate mode blocked the call. Do not execute.
+    Block {
+        message: String,
+        operation_id: Uuid,
+    },
+    /// Revise mode: dispatch substituted args.
+    Revise {
+        args: Value,
+        disclosure: String,
+        operation_id: Uuid,
+    },
 }
 
 pub(crate) struct InterceptInput<'a> {
@@ -51,14 +62,43 @@ pub(crate) struct InterceptInput<'a> {
     pub agent: &'a Agent,
     pub model: &'a Model,
     pub ctx: &'a ToolCtx,
+    pub history: &'a [crate::engine::message::Message],
     pub resolved_name: &'a str,
     pub args: &'a Value,
+    pub call_id: &'a str,
 }
 
 /// Resolve the dispatching agent's compiled verification policy and, in
 /// shadow mode, record a dispatch-original operation for matching
 /// ArtifactWrite calls.
 pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> VerificationOutcome {
+    if let Some(payload) = crate::engine::interrupt::current_interrupt_park_payload()
+        && payload.tool == input.resolved_name
+        && payload.call_id == input.call_id
+        && let Some(memo) = payload.verification
+    {
+        return match memo.outcome {
+            crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal => {
+                VerificationOutcome::DispatchOriginal {
+                    operation_id: memo.operation_id,
+                }
+            }
+            crate::db::needs_attention::InterruptVerificationOutcome::Block { message } => {
+                VerificationOutcome::Block {
+                    message,
+                    operation_id: memo.operation_id,
+                }
+            }
+            crate::db::needs_attention::InterruptVerificationOutcome::Revise {
+                args,
+                disclosure,
+            } => VerificationOutcome::Revise {
+                args,
+                disclosure,
+                operation_id: memo.operation_id,
+            },
+        };
+    }
     let Some(tool_class) = classify_tool(input.resolved_name) else {
         return VerificationOutcome::Skip;
     };
@@ -118,7 +158,19 @@ async fn shadow_record(
         max_candidates: requested.max_candidates,
         max_collection_millis: requested.max_collection_millis,
     });
-    let estimate = pre.to_verification_estimate();
+    let estimate = match pre.to_verification_estimate() {
+        VerificationEstimate::UnknownPrice
+            if requested.max_estimated_cost_microusd == u64::MAX =>
+        {
+            VerificationEstimate::Known(crate::agents::VerificationBudget {
+                max_candidates: pre.candidates,
+                max_total_tokens: pre.tokens,
+                max_estimated_cost_microusd: 0,
+                max_collection_millis: pre.collection_millis,
+            })
+        }
+        other => other,
+    };
     let estimate_known = matches!(estimate, VerificationEstimate::Known(_));
     let dispatch = grant.resolve_verification(
         &subject,
@@ -135,6 +187,7 @@ async fn shadow_record(
     // No generators yet: never refuse the original (behavior delta: none).
     // Record the pre-candidate action when the estimate exceeded, otherwise
     // persist an available estimate and still dispatch the original.
+    let generators = rule.generators.clone();
     let recorded_action = match dispatch {
         VerificationDispatch::Verify { .. } => None,
         VerificationDispatch::Refuse | VerificationDispatch::DispatchOriginal => {
@@ -142,9 +195,14 @@ async fn shadow_record(
         }
         VerificationDispatch::Off => return Ok(VerificationOutcome::Skip),
     };
-
     let now = chrono::Utc::now().timestamp_millis();
     let ledger = budget_to_ledger(requested);
+    let generator_count = i64::try_from(generators.len()).unwrap_or(0);
+    let effective_candidate_count = if recorded_action.is_some() {
+        0
+    } else {
+        generator_count.min(ledger.candidate_count).max(0)
+    };
     let original_digest = VerificationDigest::of(assembled.as_bytes());
     let pretool_digest = VerificationDigest::of(
         format!(
@@ -160,8 +218,8 @@ async fn shadow_record(
             NewVerificationOperation {
                 session_id: input.session.id,
                 agent_instance_id,
-                requested_candidate_count: ledger.candidate_count,
-                effective_candidate_count: 0,
+                requested_candidate_count: ledger.candidate_count.max(effective_candidate_count),
+                effective_candidate_count,
                 total_token_ceiling: ledger.total_token_ceiling,
                 estimated_cost_ceiling_microunits: ledger.estimated_cost_ceiling_microunits,
                 collection_deadline_unix_ms: now.saturating_add(ledger.collection_duration_ms),
@@ -176,6 +234,22 @@ async fn shadow_record(
             now,
         )
         .await?;
+    if recorded_action.is_none() && !generators.is_empty() {
+        let _ = collect_candidates(CollectionInput {
+            session: input.session,
+            agent: input.agent,
+            model: input.model,
+            ctx: input.ctx,
+            history: input.history,
+            resolved_name: input.resolved_name,
+            args: input.args,
+            generators: &generators,
+            operation_id: created.operation_id,
+            expected_revision: created.revision,
+            workspace_root: input.ctx.cwd.as_path(),
+        })
+        .await;
+    }
     Ok(VerificationOutcome::DispatchOriginal {
         operation_id: created.operation_id,
     })
@@ -535,6 +609,96 @@ mod tests {
         assert!(
             rows.is_empty(),
             "dispatch without a verification policy must stay ledger-silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_generators_record_candidates_then_dispatch_original() {
+        crate::engine::verification::generate::set_generator_override(vec![
+            crate::engine::verification::generate::GeneratorAnswer {
+                kind: crate::engine::verification::generate::CandidateKind::Revision,
+                args: Some(serde_json::json!({"path": "a.rs", "content": "x"})),
+                critique: "x".into(),
+            },
+        ]);
+        let definition = VnextAgentDef {
+            schema_version: crate::agents::SCHEMA_VERSION,
+            agent_id: "authored/reviewer".to_string(),
+            execution_kind: ExecutionKind::Coding,
+            model_slots: BTreeMap::from([("primary".to_string(), slot())]),
+            delegation: crate::agents::DelegationPolicy::default(),
+            questions: None,
+            verification: Some(VerificationPolicy {
+                rules: vec![VerificationRule {
+                    selector: VerificationSelector {
+                        all_of: vec![SelectorPredicate::ToolClass {
+                            tool_class: ToolClass::ArtifactWrite,
+                        }],
+                        any_of: vec![],
+                    },
+                    action: VerificationAction::Verify,
+                    adjudicator_slot: Some("primary".into()),
+                    on_budget_exceeded: Some(OnBudgetExceeded::DispatchOriginal),
+                    generators: vec![crate::agents::GeneratorSpec {
+                        slot: "primary".into(),
+                        recipe: crate::agents::VerificationRecipe::Inherit,
+                        max_turns: 1,
+                    }],
+                    ..Default::default()
+                }],
+            }),
+        };
+        let grant = definition.resolve_grant(&host()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NamedFixtureTool {
+            name: "edit".into(),
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone(), Some(grant));
+        let (session, instance_id) = prepared_session(tmp.path()).await;
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx, instance_id);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call(
+            "edit",
+            serde_json::json!({ "path": "src/lib.rs", "content": "fn x() {}" }),
+        );
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(&env, &mut history, &call, "edit", Recovery::Clean, None)
+            .await
+            .unwrap();
+        crate::engine::verification::generate::clear_generator_override();
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(last_tool_result_text(&history), "applied");
+        let ops = session
+            .db
+            .list_verification_operations_for_session(session.id)
+            .await
+            .unwrap();
+        assert_eq!(ops.len(), 1);
+        let candidates = session
+            .db
+            .list_verification_candidates_for_operation(session.id, ops[0].operation_id)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].state,
+            crate::db::verification_ledger::VerificationCandidateState::Valid
         );
     }
 }

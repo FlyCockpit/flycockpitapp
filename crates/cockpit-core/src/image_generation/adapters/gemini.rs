@@ -46,7 +46,7 @@ pub const MAX_INTERACTIONS_RESPONSE_BYTES: usize = 4 * MAX_INLINE_IMAGE_BYTES + 
 /// The evidence-detail character bound (bytes are ASCII-derived, secret-free).
 const EVIDENCE_DETAIL_MAX_CHARS: usize = 512;
 
-mod gemini_adapter_sealed {
+pub(crate) mod gemini_adapter_sealed {
     pub trait Sealed {}
 }
 

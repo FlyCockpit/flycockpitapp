@@ -63,7 +63,7 @@ pub const MAX_CANCEL_RESPONSE_BYTES: usize = 64 * 1024;
 
 const EVIDENCE_DETAIL_MAX_CHARS: usize = 512;
 
-mod comfyui_adapter_sealed {
+pub(crate) mod comfyui_adapter_sealed {
     pub trait Sealed {}
 }
 

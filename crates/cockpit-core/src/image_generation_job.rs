@@ -130,6 +130,101 @@ pub struct ImageGenerationHandoffRequest {
     pub sealed_prompt: SealedImageGenerationPromptV1,
 }
 
+/// Immutable target material recovered by a daemon-owned provider plan source.
+/// The database remains the authority for the plan; callers must additionally
+/// bind this result to the live session configuration before constructing a
+/// credential-bearing transport.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedImageGenerationHandoffTarget {
+    pub target: TargetPlanV1,
+}
+
+pub(crate) async fn resolve_image_generation_handoff_target(
+    db: &cockpit_db::Db,
+    request: &ImageGenerationHandoffRequest,
+) -> Result<ResolvedImageGenerationHandoffTarget> {
+    let job_id = request.job_id;
+    let owner_session_id = request.owner_session_id;
+    let target_id = request.target_id.clone();
+    let slot_id = request.slot_id;
+    db.read(move |conn| {
+        let (canonical, digest): (Vec<u8>, String) = conn.query_row(
+            "SELECT canonical_plan,plan_digest FROM image_generation_plans WHERE job_id=?1",
+            [job_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let plan = ImageGenerationPlanV1::from_canonical(&canonical, &digest)?;
+        ensure!(
+            plan.owner_session_id == owner_session_id,
+            "image generation handoff owner differs from immutable plan"
+        );
+        let target = plan
+            .targets
+            .into_iter()
+            .find(|target| target.target_id == target_id)
+            .context("image generation handoff target is absent from immutable plan")?;
+        ensure!(
+            target.slots.iter().any(|slot| slot.slot_id == slot_id),
+            "image generation handoff slot is outside its target"
+        );
+        Ok(ResolvedImageGenerationHandoffTarget { target })
+    })
+    .await
+}
+
+/// Read every sealed input component through the media ledger's verified,
+/// short-lived Model lease. The query proves that the current ready component
+/// still equals the sealed attachment/component identity before the storage
+/// primitive opens it; a changed, removed, or unavailable attachment fails
+/// closed before a provider request is encoded.
+pub(crate) async fn read_image_generation_handoff_references(
+    db: &cockpit_db::Db,
+    storage: &crate::media_storage::MediaStorageRecovery,
+    target: &TargetPlanV1,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let mut output = Vec::with_capacity(target.reference_artifacts.len());
+    for reference in &target.reference_artifacts {
+        let attachment_id = reference.attachment_id;
+        let component_id = reference.component_id;
+        let attachment_version = reference.attachment_version;
+        let component_generation = reference.component_generation;
+        let identity_digest = reference.identity_digest.clone();
+        let checksum = reference.sha256.clone();
+        let byte_length = reference.byte_length;
+        let (availability_generation, capability_generation, mime): (u64, u64, String) = db
+            .read(move |conn| {
+                let row: (String, String, String, String, String, String, String) = conn.query_row(
+                    "SELECT a.availability_generation,a.captured_capability_generation,a.canonical_mime,c.component_generation,c.stable_identity_digest,c.sha256,c.byte_length FROM media_attachments a JOIN media_attachment_components c ON c.attachment_id=a.attachment_id WHERE a.attachment_id=?1 AND a.attachment_version=?2 AND a.availability='ready' AND c.component_id=?3 AND c.lifecycle_state='ready'",
+                    params![attachment_id.to_string(), i64::try_from(attachment_version)?, component_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+                )?;
+                ensure!(
+                    row.3.parse::<u64>()? == component_generation
+                        && row.4 == identity_digest
+                        && row.5 == checksum
+                        && row.6.parse::<u64>()? == byte_length,
+                    "image generation reference component differs from immutable plan"
+                );
+                Ok((row.0.parse()?, row.1.parse()?, row.2))
+            })
+            .await?;
+        let lease = storage
+            .acquire_component_lease(crate::media_storage::AcquireComponentLeaseInput {
+                lease_id: Uuid::now_v7(),
+                attachment_id,
+                attachment_version,
+                availability_generation,
+                capability_generation,
+                kind: MediaComponentLeaseKind::Model,
+                now_unix_ms,
+            })
+            .await?;
+        output.push((mime, lease.read_verified(now_unix_ms).await?));
+    }
+    Ok(output)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageGenerationHandoffResult {
     Accepted { evidence: Vec<u8> },
@@ -1992,6 +2087,7 @@ pub struct ImageGenerationDispatchService {
     image_config:
         std::sync::RwLock<cockpit_config::config::image_generation::ImageGenerationConfig>,
     media_storage_recovery: Option<std::sync::Arc<crate::media_storage::MediaStorageRecovery>>,
+    adapters: std::sync::RwLock<ImageGenerationAdapterMap>,
     config_gate: tokio::sync::RwLock<()>,
     clock: std::sync::Arc<dyn crate::media_reservation::MonotonicClock>,
 }
@@ -2008,6 +2104,7 @@ impl ImageGenerationDispatchService {
         clock: std::sync::Arc<dyn crate::media_reservation::MonotonicClock>,
         media_storage_recovery: Option<std::sync::Arc<crate::media_storage::MediaStorageRecovery>>,
         image_config: cockpit_config::config::image_generation::ImageGenerationConfig,
+        adapters: ImageGenerationAdapterMap,
     ) -> Self {
         Self {
             db,
@@ -2021,6 +2118,7 @@ impl ImageGenerationDispatchService {
             media_policy: std::sync::RwLock::new(media_policy),
             image_config: std::sync::RwLock::new(image_config),
             media_storage_recovery,
+            adapters: std::sync::RwLock::new(adapters),
             config_gate: tokio::sync::RwLock::new(()),
             clock,
         }
@@ -2046,10 +2144,26 @@ impl ImageGenerationDispatchService {
         self.registry
             .refresh_configured_targets(config, generation, refresh_epoch)
             .await;
+        let storage = self
+            .media_storage_recovery
+            .as_ref()
+            .context("image generation media storage is unavailable")?
+            .clone();
+        let adapters =
+            crate::daemon::image_generation_adapters::configured_image_generation_adapters(
+                self.db.clone(),
+                storage,
+                self.registry.clone(),
+                config,
+            )?;
         *self
             .image_config
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.clone();
+        *self
+            .adapters
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = adapters;
         self.base_tier_known_cost_threshold_usd_micros.store(
             config.base_tier_known_cost_threshold_usd_micros(),
             std::sync::atomic::Ordering::Release,
@@ -2141,6 +2255,29 @@ impl ImageGenerationDispatchService {
         self.registry
             .revalidate_dispatch_binding(&endpoint, request.target_id, credential)
             .await
+    }
+
+    /// Route a worker handoff through this owner's freshly reconciled target
+    /// registry. The daemon-global worker never holds endpoint credentials or
+    /// a session-default adapter itself.
+    pub(crate) async fn handoff_to_configured_adapter(
+        &self,
+        kind: ImageAdapterKind,
+        request: &ImageGenerationHandoffRequest,
+    ) -> ImageGenerationHandoffResult {
+        let _gate = self.config_gate.read().await;
+        let adapter = self
+            .adapters
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_target(kind, &request.target_id)
+            .cloned();
+        match adapter {
+            Some(adapter) => adapter.handoff(request).await,
+            None => ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"configured_target_adapter_unavailable".to_vec(),
+            },
+        }
     }
 
     /// Convert daemon-local paths that have already passed native read

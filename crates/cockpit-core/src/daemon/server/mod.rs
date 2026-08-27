@@ -2629,7 +2629,7 @@ impl DaemonContext {
                 db.clone(),
                 image_generation_boot_id,
                 started_at,
-                crate::image_generation_job::ImageGenerationAdapterMap::new(),
+                image_generation_dispatch_registry.adapter_map(),
                 Arc::new(image_generation_dispatch_registry.clone()),
                 shutdown.clone(),
             )

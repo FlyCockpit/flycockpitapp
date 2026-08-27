@@ -5308,6 +5308,7 @@ pub(super) async fn run_worker(
             )),
         ) {
             Ok(registry) => {
+                let registry = Arc::new(registry);
                 registry
                     .refresh_configured_targets(
                         &extended_cfg.image_generation,
@@ -5315,23 +5316,44 @@ pub(super) async fn run_worker(
                         1,
                     )
                     .await;
-                let service = crate::image_generation_job::ImageGenerationDispatchService::new(
-                    session.db.clone(),
-                    Arc::new(registry),
-                    image_generation_boot_id,
-                    crate::daemon::principal::ClientPrincipal::owner(),
-                    start_config.generation,
-                    extended_cfg
-                        .image_generation
-                        .base_tier_known_cost_threshold_usd_micros(),
-                    (*extended_cfg.media_resources).clone(),
-                    Arc::new(SessionImageClock(image_generation_started_at)),
-                    media_storage_recovery,
-                    extended_cfg.image_generation.clone(),
-                );
-                let service = Arc::new(service);
-                image_generation_dispatch_registry.install(session.id, &service);
-                session.set_image_generation_dispatch(service);
+                let adapters = match media_storage_recovery.as_ref() {
+                    Some(storage) => match crate::daemon::image_generation_adapters::configured_image_generation_adapters(
+                        session.db.clone(),
+                        storage.clone(),
+                        registry.clone(),
+                        &extended_cfg.image_generation,
+                    ) {
+                        Ok(adapters) => Some(adapters),
+                        Err(error) => {
+                            tracing::error!(%error, "image generation adapter construction failed; dispatch disabled");
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::error!("image generation media storage is unavailable; dispatch disabled");
+                        None
+                    }
+                };
+                if let Some(adapters) = adapters {
+                    let service = crate::image_generation_job::ImageGenerationDispatchService::new(
+                        session.db.clone(),
+                        registry,
+                        image_generation_boot_id,
+                        crate::daemon::principal::ClientPrincipal::owner(),
+                        start_config.generation,
+                        extended_cfg
+                            .image_generation
+                            .base_tier_known_cost_threshold_usd_micros(),
+                        (*extended_cfg.media_resources).clone(),
+                        Arc::new(SessionImageClock(image_generation_started_at)),
+                        media_storage_recovery,
+                        extended_cfg.image_generation.clone(),
+                        adapters,
+                    );
+                    let service = Arc::new(service);
+                    image_generation_dispatch_registry.install(session.id, &service);
+                    session.set_image_generation_dispatch(service);
+                }
             }
             Err(error) => {
                 tracing::error!(%error, "image generation dispatch service unavailable");

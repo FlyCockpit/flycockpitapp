@@ -1910,7 +1910,7 @@ use crate::image_generation_runtime::{AddressClass, DnsResolver};
 pub const MAX_SUBMIT_RESPONSE_BYTES: usize =
     MAX_OUTPUT_BASE64_BYTES + MAX_USAGE_METADATA_BYTES + 1024;
 
-mod openrouter_adapter_sealed {
+pub(crate) mod openrouter_adapter_sealed {
     pub trait Sealed {}
 }
 

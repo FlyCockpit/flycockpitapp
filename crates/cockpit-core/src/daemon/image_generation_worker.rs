@@ -13,11 +13,10 @@
 //!
 //! Dispatch is routed through a typed [`ImageGenerationAdapterMap`]: a candidate
 //! whose sealed destination kind has no registered adapter is a typed
-//! `adapter_missing` skip (never a panic). Production may ship with zero or
-//! partial kinds until `wire-image-generation-adapters-to-dispatch` installs the
-//! concrete provider adapters; the reconcile/cancel passes use a deferred
-//! reconciler until `image-generation-real-dispatch-and-chokepoint-integration`
-//! owns per-kind reconcile routing.
+//! `adapter_missing` skip (never a panic). Production installs a fixed
+//! owner-session router for every provider kind; it resolves a concrete,
+//! target-specific adapter only after scheduler revalidation against that
+//! owner's live configuration.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -357,9 +356,9 @@ impl ImageGenerationWorkerSleeper for TokioWorkerSleeper {
 /// non-ephemeral daemon start (same gating as the scheduler / media-ledger
 /// install). The `started_at` `Instant` must be the daemon's shared boot instant
 /// so the worker's monotonic clock matches the media ledger and sealed plan
-/// deadlines. In this increment production ships an empty adapter map (concrete
-/// provider adapters install with the wire-adapters prompt), so a queued job
-/// records a typed `adapter_missing` skip rather than dispatching.
+/// deadlines. The supplied map is the daemon's owner-session router; concrete
+/// endpoint transports and plan sources remain session-owned and are replaced
+/// atomically whenever that session's image configuration changes.
 pub(crate) fn spawn_image_generation_worker(
     db: cockpit_db::Db,
     boot_id: Uuid,

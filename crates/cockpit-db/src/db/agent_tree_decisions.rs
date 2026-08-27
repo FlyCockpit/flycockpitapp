@@ -4292,6 +4292,10 @@ impl Db {
     /// process. A local probe is read-only, but silently issuing it again
     /// would still violate this request's exactly-once state machine; callers
     /// receive a durable failed outcome and may make a new refresh request.
+    ///
+    /// The returned count is the number of rows this pass actually repaired:
+    /// still-initializing descriptors, pending operations that never bound a
+    /// decision, and executing claims the previous process left behind.
     pub async fn reconcile_host_capability_refresh_operations(
         &self,
         _authority: HostCapabilityRefreshAuthority,
@@ -4376,7 +4380,7 @@ impl Db {
             // whose option contract was never committed. A row whose
             // Attention already owns a decision is rejected above rather than
             // repaired.
-            conn.execute(
+            let pending_cancelled = conn.execute(
                 "UPDATE host_capability_refresh_operations
                     SET state = 'cancelled',
                         error_text = 'daemon stopped before host capability refresh decision was created',
@@ -4391,7 +4395,7 @@ impl Db {
                     )",
                 params![now_unix_ms, session_id.to_string()],
             )?;
-            conn.execute(
+            let executing_failed = conn.execute(
                 "UPDATE host_capability_refresh_operations
                     SET state = 'failed',
                         error_text = 'daemon stopped after host capability refresh probe began',
@@ -4399,7 +4403,7 @@ impl Db {
                   WHERE session_id = ?2 AND state = 'executing'",
                 params![now_unix_ms, session_id.to_string()],
             )?;
-            Ok(initializing.len())
+            Ok(initializing.len() + pending_cancelled + executing_failed)
         })
         .await
     }
@@ -7428,8 +7432,7 @@ fn load_decision(
     let public_option_ids = validate_durable_decision_answer_contract(
         &decision.options_contract_json,
         decision.free_text_contract_json.as_deref(),
-    )
-    .context("persisted decision answer contract is invalid")?;
+    )?;
     let has_question_tool_contract =
         durable_decision_has_question_tool_contract(&decision.options_contract_json)
             .context("persisted decision QuestionTool binding is invalid")?;
@@ -7468,6 +7471,11 @@ fn load_decision(
         attention_owner.as_deref() == Some(expected_owner.as_str()),
         "persisted decision Attention owner does not match its decision agent"
     );
+    let has_real_interrupt = question_json.is_some() || questions_json.is_some();
+    ensure!(
+        has_question_tool_contract == has_real_interrupt,
+        "persisted QuestionTool durable contract and existing question interrupt must be bound together"
+    );
     if has_question_tool_contract {
         validate_question_tool_contract_matches_interrupt(
             &decision.options_contract_json,
@@ -7486,13 +7494,7 @@ fn load_decision(
             decision.host_approval_operation_id,
             question_json.as_deref(),
             questions_json.as_deref(),
-        )
-        .context("persisted QuestionTool approval metadata does not match its decision class")?;
-    } else {
-        ensure!(
-            question_json.is_none() && questions_json.is_none(),
-            "persisted generic decision must not bind a real QuestionTool interrupt"
-        );
+        )?;
     }
     validate_persisted_host_approval_operation_binding(
         conn,
@@ -11681,6 +11683,11 @@ mod tests {
         agent: &AgentInstanceRow,
         now: i64,
     ) -> Uuid {
+        let agent = db
+            .agent_instance(session_id, agent.agent_instance_id)
+            .await
+            .unwrap()
+            .expect("refresh owner remains durable");
         let agent_instance_id = agent.agent_instance_id;
         let question = InterruptQuestion::Single {
             prompt: "Refresh host capability snapshot?".into(),
@@ -12511,8 +12518,8 @@ mod tests {
             )
             .await
             .unwrap(),
-            0,
-            "startup reconciliation only reports repaired pre-bind operations"
+            1,
+            "startup reconciliation reports the crashed executing claim it terminalized"
         );
         let second_generation = match db
             .claim_host_capability_refresh_execution(
@@ -14352,11 +14359,17 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(late, DecisionTransitionOutcome::Transitioned(_)));
+            let resumed = db
+                .agent_instance(session.session_id, agent.agent_instance_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(resumed.state, AgentInstanceState::Running);
             let terminal = db
                 .transition_agent_instance(
                     session.session_id,
                     agent.agent_instance_id,
-                    waiting_agent.revision,
+                    resumed.revision,
                     terminal_state,
                     "{}",
                     105 + offset,
@@ -15250,7 +15263,8 @@ mod tests {
                     conn.query_row(
                         "SELECT COUNT(*) FROM session_events
                          WHERE session_id = ?1 AND type = 'agent_tree'
-                           AND json_extract(data_json, '$.subject_id') = ?2",
+                           AND json_extract(data_json, '$.subject_id') = ?2
+                           AND json_extract(data_json, '$.kind') IN ('decision_pending', 'decision_transition')",
                         params![session_id.to_string(), decision_id.to_string()],
                         |row| row.get(0),
                     )?,

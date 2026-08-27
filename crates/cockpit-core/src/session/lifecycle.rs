@@ -228,8 +228,8 @@ impl Session {
             "entry mode may only be set before a new session is persisted"
         );
         self.session_entry_mode = mode;
-        let staged = self
-            .stage_pending_row(|row| row.session_entry_mode = mode.as_str().to_string());
+        let staged =
+            self.stage_pending_row(|row| row.session_entry_mode = mode.as_str().to_string());
         anyhow::ensure!(
             staged,
             "deferred session row disappeared while setting entry mode"
@@ -285,11 +285,12 @@ impl Session {
     /// which are persisted from the start.
     ///
     /// This is the **only** flush point, and it MUST be called before any
-    /// row that references the session (tool_calls, inference_calls, locks,
-    /// …) so the FK/ordering invariant holds. The session worker calls it on
-    /// the first user message, ahead of dispatching it to the driver. The
-    /// stored row carries the latest provider/model so a model picked before
-    /// the first message survives the deferred write.
+    /// row that references the session (agent-tree, write-scope, tool_calls,
+    /// inference_calls, locks, …) so the FK/ordering invariant holds. The
+    /// registry flushes it after worker construction succeeds and before
+    /// spawn; the worker repeats it before durable lifecycle setup and again
+    /// on the first user message (idempotent). The stored row carries the
+    /// latest provider/model so a model picked before the flush survives.
     pub fn persist_if_needed(&self) -> Result<bool> {
         // Model mutation and the deferred INSERT share this lock so a picker
         // update cannot be overwritten by an older selection snapshot.
@@ -319,7 +320,14 @@ impl Session {
         match self.db.blocking_write_for_sync_maintenance(move |conn| {
             crate::db::Db::insert_session_row_conn(conn, &row_for_db)
         }) {
-            Ok(_) => {}
+            Ok(persisted) => {
+                if let Some(short_id) = persisted.short_id {
+                    *self
+                        .short_id
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = short_id;
+                }
+            }
             Err(e) => {
                 // Restore the pending row so a transient failure can retry on
                 // the next user message rather than silently losing the session.
@@ -489,7 +497,7 @@ impl Session {
             redaction_key_resolver: resolver,
             allow_unjournaled_inference: std::sync::atomic::AtomicBool::new(false),
             unjournaled_inference_reason: Mutex::new(None),
-            short_id,
+            short_id: Mutex::new(short_id),
             parent_session_id: row.parent_session_id,
             fork_point_turn_id: row.fork_point_turn_id,
             btw_parent_session_id: row.btw_parent_session_id,

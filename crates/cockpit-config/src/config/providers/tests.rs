@@ -1725,9 +1725,8 @@ fn retained_model_favorite_target_writes_a_and_rejects_a_replaced_by_b() {
         Value::Bool(true),
         "the capability-relative normal update is visible in A",
     );
-    let observed_after_write = source_for(
-        std::fs::read(provider_file_path_for_config(&config, "p").unwrap()).unwrap(),
-    );
+    let observed_after_write =
+        source_for(std::fs::read(provider_file_path_for_config(&config, "p").unwrap()).unwrap());
     assert!(
         receipt.matches_committed_source(&observed_after_write),
         "the write receipt must bind the exact committed provider/model bytes"
@@ -1776,9 +1775,11 @@ fn retained_model_favorite_target_writes_a_and_rejects_a_replaced_by_b() {
         "a replaced source B must remain untouched",
     );
     assert!(
-        std::fs::read_dir(&live)
+        std::fs::read_dir(&live).unwrap().all(|entry| !entry
             .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("effective-default-lock")),
+            .file_name()
+            .to_string_lossy()
+            .contains("effective-default-lock")),
         "the rejected operation must not create B's shared lock sidecar",
     );
 }
@@ -1816,7 +1817,9 @@ fn retained_model_favorite_post_write_authority_failure_is_durable_but_unpublish
         source,
     )
     .unwrap()
-    .with_post_write_verifier(std::sync::Arc::new(|_| anyhow::bail!("forced post-write fence")));
+    .with_post_write_verifier(std::sync::Arc::new(|_| {
+        anyhow::bail!("forced post-write fence")
+    }));
 
     let error = target.write_model_favorite(true).unwrap_err();
     assert!(matches!(
@@ -1962,11 +1965,10 @@ fn retained_model_favorite_source_uses_the_observed_highest_precedence_layer() {
     // An already-dispatched request retains the lower snapshot proof. A
     // subsequently discovered higher file is not silently selected by the
     // source helper; the daemon must refresh first and obtain a new proof.
-    let observed_lower = retained_provider_model_source_from_workspace_layer_snapshots(
-        &[lower], "p", "m",
-    )
-    .unwrap()
-    .expect("lower source proof");
+    let observed_lower =
+        retained_provider_model_source_from_workspace_layer_snapshots(&[lower], "p", "m")
+            .unwrap()
+            .expect("lower source proof");
     assert_eq!(observed_lower.layer_index(), 0);
     assert!(!observed_lower.has_same_source_slot(&source));
 }

@@ -61,12 +61,10 @@ pub use backup::{
     BackupFallbackDecision, BackupTurnMetadata, FailoverAttempt, MAX_FAILOVER_CANDIDATES,
     suggested_action_for_failure_class, turn_with_backup,
 };
+pub(crate) use events::{AgentTreeEndpointGeneration, next_agent_tree_endpoint_generation};
 pub use events::{
     AgentTreeExecutorRequest, AgentTreeResolverRequest, ControlRequestId,
     ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress, TurnEvent,
-};
-pub(crate) use events::{
-    AgentTreeEndpointGeneration, next_agent_tree_endpoint_generation,
 };
 pub use outcome::{BatchTaskEntry, TaskControlAction, TurnOutcome};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};
@@ -191,7 +189,9 @@ pub(crate) async fn with_agent_instance_id<F>(
 where
     F: std::future::Future,
 {
-    CURRENT_AGENT_INSTANCE_ID.scope(agent_instance_id, future).await
+    CURRENT_AGENT_INSTANCE_ID
+        .scope(agent_instance_id, future)
+        .await
 }
 
 pub(crate) fn current_agent_instance_id() -> Option<uuid::Uuid> {

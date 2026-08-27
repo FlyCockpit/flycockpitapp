@@ -111,12 +111,7 @@ pub fn unlinkat(dir_fd: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()
 /// `renameat` relative to held directory descriptors.  Unlike a path based
 /// rename, both names are resolved from capabilities the caller already owns;
 /// callers that must refuse replacement use [`rename_noreplace`] instead.
-pub fn renameat(
-    from_dir_fd: RawFd,
-    from: &CStr,
-    to_dir_fd: RawFd,
-    to: &CStr,
-) -> io::Result<()> {
+pub fn renameat(from_dir_fd: RawFd, from: &CStr, to_dir_fd: RawFd, to: &CStr) -> io::Result<()> {
     // SAFETY: both directory descriptors are live and the one-component C
     // strings outlive this call.
     if unsafe { libc::renameat(from_dir_fd, from.as_ptr(), to_dir_fd, to.as_ptr()) } != 0 {

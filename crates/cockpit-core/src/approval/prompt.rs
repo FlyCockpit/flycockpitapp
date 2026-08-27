@@ -26,9 +26,7 @@ impl Approver {
             // actual host effect before this prompt is persisted. Its complete
             // input—not this display description—becomes the durable approval
             // capability and is revalidated at consume/replay time.
-            crate::agent_tree::HostDecisionSubject::HostApproval {
-                operation,
-            },
+            crate::agent_tree::HostDecisionSubject::HostApproval { operation },
             "approval prompt",
         )
         .await
@@ -179,7 +177,9 @@ impl Approver {
                         .await
                     {
                         tracing::warn!(error = %e, tool, ?scope, "recording loop-guard rule failed; rejecting selected capability");
-                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(
+                            false,
+                        );
                         RepeatDecision::Reject
                     } else {
                         match verdict {

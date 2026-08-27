@@ -3235,12 +3235,11 @@ mod tests {
                 shell_path_literal(&format!("/tmp/a{byte}b"), IngressShellDialect::Cmd).is_err()
             );
         }
-        let exact =
-            bracketed_paste_bytes(
-                shell_path_literal(path, IngressShellDialect::Posix)
-                    .unwrap()
-                    .as_bytes(),
-            );
+        let exact = bracketed_paste_bytes(
+            shell_path_literal(path, IngressShellDialect::Posix)
+                .unwrap()
+                .as_bytes(),
+        );
         assert!(exact.starts_with(BRACKETED_PASTE_START));
         assert!(exact.ends_with(BRACKETED_PASTE_END));
         assert!(!exact.ends_with(b"\n"));

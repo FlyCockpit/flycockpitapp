@@ -241,7 +241,7 @@ impl Tool for StartBuildTool {
             .await
             .context("recording Build kickoff message")?;
         let build_ref = row.short_id.as_deref().unwrap_or("unknown");
-        let plan_ref = ctx.session.short_id.clone();
+        let plan_ref = ctx.session.short_id();
         insert_note(
             &ctx.session.db,
             ctx.session.id,

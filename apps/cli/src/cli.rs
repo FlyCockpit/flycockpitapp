@@ -93,9 +93,20 @@ pub enum PublicCommand {
     Provider(ProvidersCommand),
     Setup(SetupArgs),
     Models(ModelsArgs),
+    /// Run the bundled jq-compatible JSON query applet.
+    #[command(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Jq(JqArgs),
     #[command(subcommand)]
     Daemon(DaemonCommand),
     Doctor(DoctorArgs),
+    /// Debug / introspection commands.
+    #[command(subcommand)]
+    Debug(DebugCommand),
     #[command(subcommand)]
     Session(SessionCommand),
     #[command(subcommand)]
@@ -122,8 +133,10 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Provider(args) => Command::Provider(args),
                 PublicCommand::Setup(args) => Command::Setup(args),
                 PublicCommand::Models(args) => Command::Models(args),
+                PublicCommand::Jq(args) => Command::Jq(args),
                 PublicCommand::Daemon(args) => Command::Daemon(args),
                 PublicCommand::Doctor(args) => Command::Doctor(args),
+                PublicCommand::Debug(args) => Command::Debug(args),
                 PublicCommand::Session(args) => Command::Session(args),
                 PublicCommand::Trust(args) => Command::Trust(args),
                 PublicCommand::Export(args) => Command::Export(args),
@@ -390,7 +403,8 @@ pub struct LearnArgs {
     /// Source request. Multiple words and sources are forwarded together.
     #[arg(required = true, num_args = 1..)]
     pub sources: Vec<String>,
-    /// Force a fresh ephemeral daemon instead of attaching to a long-running one.
+    /// Prefer a private ephemeral daemon. If a persistent daemon already
+    /// holds the exclusive ledger lock, attach to it instead.
     #[arg(long)]
     pub ephemeral: bool,
 }
@@ -715,9 +729,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub thinking: bool,
 
-    /// Force a fresh ephemeral daemon for this run instead of
-    /// attaching to a long-running one. The daemon stops as soon as
-    /// the run completes. Useful for CI and clean-state scripts.
+    /// Prefer a private ephemeral daemon that stops when this run
+    /// completes. If a persistent daemon already holds the exclusive
+    /// ledger lock, attach to it instead (and leave it running).
     #[arg(long)]
     pub ephemeral: bool,
 
@@ -1110,6 +1124,22 @@ pub enum DaemonCommand {
         offline: bool,
         #[arg(long)]
         no_sandbox: bool,
+    },
+    /// Internal one-shot failed-call reader. Does not boot the daemon server.
+    #[command(hide = true)]
+    DiagnosticFailedCalls {
+        #[arg(long)]
+        since_epoch: i64,
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        include_recovered: bool,
+        #[arg(long)]
+        limit: u32,
     },
 }
 
@@ -1548,8 +1578,8 @@ pub struct InitArgs {
     /// Regenerate (overwrite from scratch) an existing target file.
     #[arg(long)]
     pub force: bool,
-    /// Force a fresh ephemeral daemon for this run instead of attaching
-    /// to a long-running one.
+    /// Prefer a private ephemeral daemon. If a persistent daemon already
+    /// holds the exclusive ledger lock, attach to it instead.
     #[arg(long)]
     pub ephemeral: bool,
 }
@@ -1655,11 +1685,15 @@ mod tests {
             Some(Command::Code)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "assistant"]).unwrap().command,
+            Cli::try_parse_from(["cockpit", "assistant"])
+                .unwrap()
+                .command,
             Some(Command::Assistant)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "computer"]).unwrap().command,
+            Cli::try_parse_from(["cockpit", "computer"])
+                .unwrap()
+                .command,
             Some(Command::Computer)
         ));
         assert!(matches!(

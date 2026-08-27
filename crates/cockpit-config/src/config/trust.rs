@@ -209,9 +209,7 @@ pub fn with_workspace_trust_policy<T>(policy: WorkspaceTrustPolicy, f: impl FnOn
     f()
 }
 
-pub fn shared_workspace_trust_policy(
-    policy: WorkspaceTrustPolicy,
-) -> SharedWorkspaceTrustPolicy {
+pub fn shared_workspace_trust_policy(policy: WorkspaceTrustPolicy) -> SharedWorkspaceTrustPolicy {
     Arc::new(RwLock::new(policy))
 }
 
@@ -289,9 +287,11 @@ pub async fn resolve_workspace_trust_policy_from_db(
     db: &crate::db::Db,
     path: &Path,
 ) -> Result<WorkspaceTrustPolicy> {
-    Ok(resolve_workspace_trust_policy_with_revision_from_db(db, path)
-        .await?
-        .policy)
+    Ok(
+        resolve_workspace_trust_policy_with_revision_from_db(db, path)
+            .await?
+            .policy,
+    )
 }
 
 /// Resolve the policy and its durable generation in one database observation.

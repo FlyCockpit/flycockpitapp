@@ -225,7 +225,7 @@ impl Approver {
             label,
             input: &input,
         })
-            .await
+        .await
     }
 
     pub(super) async fn approve_tool_call_inner(
@@ -314,7 +314,7 @@ impl Approver {
             input,
             target,
         })
-            .await
+        .await
     }
 
     pub(super) async fn approve_mcp_tool_inner(
@@ -488,10 +488,7 @@ impl Approver {
 
         if self.yolo_mode()
             || self
-                .auto_allows(
-                    crate::agent_tree::HostEffectClass::ExternalAction,
-                    &target,
-                )
+                .auto_allows(crate::agent_tree::HostEffectClass::ExternalAction, &target)
                 .await
         {
             return Ok(Decision::Allow { scope: Scope::Once });
@@ -627,10 +624,7 @@ impl Approver {
         }
         if self.yolo_mode()
             || self
-                .auto_allows(
-                    crate::agent_tree::HostEffectClass::ExternalAction,
-                    &target,
-                )
+                .auto_allows(crate::agent_tree::HostEffectClass::ExternalAction, &target)
                 .await
         {
             return Ok(Decision::Allow { scope: Scope::Once });
@@ -1070,15 +1064,15 @@ impl Approver {
                 ],
             }),
             |response| {
-            // Dismissal (no selection) denies, fail closed.
-            let Some(id) = decode_option_response(response, &set)? else {
-                return Ok(Decision::Deny);
-            };
-            match id {
-                ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
-                ApprovalOptionId::Reject => Ok(Decision::Deny),
-                _ => Err(ForeignOptionId::new(&set, id.as_str())),
-            }
+                // Dismissal (no selection) denies, fail closed.
+                let Some(id) = decode_option_response(response, &set)? else {
+                    return Ok(Decision::Deny);
+                };
+                match id {
+                    ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
+                    ApprovalOptionId::Reject => Ok(Decision::Deny),
+                    _ => Err(ForeignOptionId::new(&set, id.as_str())),
+                }
             },
         )
         .await

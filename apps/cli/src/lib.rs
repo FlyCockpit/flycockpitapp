@@ -46,8 +46,8 @@ pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
     diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
     knowledge, locks, mcp, media_reservation, model_system_prompt, packages, providers, redact,
-    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools,
-    user_agent, welcome, wizard,
+    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools, user_agent, welcome,
+    wizard,
 };
 
 /// Narrow process-boundary fixtures used by the CLI's integration tests.
@@ -242,9 +242,9 @@ pub mod integration {
                     initial_model: None,
                     no_sandbox: false,
                     interactive,
-                    session_entry_mode: session_id.is_none().then_some(
-                        crate::daemon::proto::SessionEntryMode::Code,
-                    ),
+                    session_entry_mode: session_id
+                        .is_none()
+                        .then_some(crate::daemon::proto::SessionEntryMode::Code),
                     model_override: None,
                     client_protocol_version: self.inner.negotiated().version,
                     env_snapshot: None,
@@ -610,6 +610,7 @@ pub fn main_entry() -> ExitCode {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(cockpit_core::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
+        .max_blocking_threads(16)
         .build();
     let result = match runtime {
         Ok(runtime) => runtime.block_on(async_main(launch_start)),
@@ -710,9 +711,22 @@ async fn install_cli_trust_policy(project: Option<&Path>) -> anyhow::Result<()> 
 }
 
 fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
+    // These commands attach or spawn the daemon they actually use. Do not
+    // auto-promote a persistent instance here just to seed workspace trust;
+    // the owned-daemon path seeds IgnoreConfig on that daemon when no row
+    // exists.
+    if matches!(
+        command,
+        Some(Command::Run(args)) if args.ephemeral
+    ) || matches!(
+        command,
+        Some(Command::Init(_)) | Some(Command::Assistants(crate::cli::AssistantCommand::Learn(_)))
+    ) {
+        return false;
+    }
     !matches!(
         command,
-        Some(Command::Debug(crate::cli::DebugCommand::Paths))
+        Some(Command::Debug(_))
             | Some(Command::Doctor(_))
             | Some(Command::Invocation(_))
             | Some(Command::Daemon(
@@ -721,6 +735,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
                     | crate::cli::DaemonCommand::Stop { .. }
                     | crate::cli::DaemonCommand::Restart { .. }
                     | crate::cli::DaemonCommand::DiagnosticSnapshot { .. }
+                    | crate::cli::DaemonCommand::DiagnosticFailedCalls { .. }
             ))
             | Some(Command::Trust(_))
             | Some(Command::Jq(_))
@@ -1164,14 +1179,28 @@ mod tests {
     }
 
     #[test]
-    fn debug_paths_is_diagnostic_and_does_not_initialize_trust_storage() {
+    fn debug_commands_are_diagnostic_and_do_not_initialize_trust_storage() {
         assert!(!command_requires_workspace_trust(Some(&Command::Debug(
             crate::cli::DebugCommand::Paths,
         ))));
-        assert!(command_requires_workspace_trust(None));
-        assert!(command_requires_workspace_trust(Some(&Command::Debug(
+        assert!(!command_requires_workspace_trust(Some(&Command::Debug(
             crate::cli::DebugCommand::Config,
         ))));
+        assert!(!command_requires_workspace_trust(Some(&Command::Debug(
+            crate::cli::DebugCommand::Context,
+        ))));
+        assert!(!command_requires_workspace_trust(Some(&Command::Debug(
+            crate::cli::DebugCommand::FailedCalls(crate::cli::FailedCallsArgs {
+                days: 7,
+                tool: None,
+                model: None,
+                project: None,
+                limit: 50,
+                include_recovered: false,
+                json: false,
+            }),
+        ))));
+        assert!(command_requires_workspace_trust(None));
     }
 
     #[test]
@@ -1220,6 +1249,43 @@ mod tests {
                 path: None,
                 offline: false,
                 dependencies_json: false,
+            }
+        ))));
+        assert!(!command_requires_workspace_trust(Some(&Command::Init(
+            crate::cli::InitArgs {
+                path: None,
+                force: false,
+                ephemeral: false,
+            }
+        ))));
+        assert!(!command_requires_workspace_trust(Some(
+            &Command::Assistants(crate::cli::AssistantCommand::Learn(crate::cli::LearnArgs {
+                sources: vec!["https://example.test".into()],
+                ephemeral: false,
+            }))
+        )));
+        assert!(!command_requires_workspace_trust(Some(&Command::Run(
+            crate::cli::RunArgs {
+                message: Vec::new(),
+                prompt_file: None,
+                agent: None,
+                agent_file: None,
+                model: None,
+                continue_session: false,
+                session: None,
+                cwd: None,
+                approve: Vec::new(),
+                fork: false,
+                format: crate::cli::OutputFormat::Default,
+                json: false,
+                verbose: false,
+                follow: false,
+                file: Vec::new(),
+                thinking: false,
+                ephemeral: true,
+                max_turns: None,
+                timeout: None,
+                permission_mode: None,
             }
         ))));
     }

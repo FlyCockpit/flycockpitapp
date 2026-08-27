@@ -393,13 +393,14 @@ pub(crate) fn is_attempt_cancelled(err: &rig::completion::CompletionError) -> bo
     false
 }
 
-pub(crate) fn is_attempt_late_user_steer_deferred(
-    err: &rig::completion::CompletionError,
-) -> bool {
+pub(crate) fn is_attempt_late_user_steer_deferred(err: &rig::completion::CompletionError) -> bool {
     if let rig::completion::CompletionError::RequestError(inner) = err {
         let mut current: Option<&(dyn std::error::Error + 'static)> = Some(inner.as_ref());
         while let Some(error) = current {
-            if error.downcast_ref::<AttemptLateUserSteerDeferred>().is_some() {
+            if error
+                .downcast_ref::<AttemptLateUserSteerDeferred>()
+                .is_some()
+            {
                 return true;
             }
             current = error.source();

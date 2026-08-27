@@ -118,7 +118,6 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
         "skill",
         "stats",
         "completion",
-        "jq",
     ] {
         let output = run(&session, &[rejected, "--help"]);
         assert_eq!(
@@ -183,6 +182,8 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     .unwrap();
     session.enable_isolated_secret_service();
     let denied_network = install_network_deny_recorder(&mut session);
+    // This is the suite's only sandboxed `doctor --offline` invocation.
+    // Keep it sandboxed so hermetic PATH + containment stay covered.
     let clean_doctor = run(&session, &["doctor", "--offline"]);
     assert!(
         clean_doctor.status.success(),

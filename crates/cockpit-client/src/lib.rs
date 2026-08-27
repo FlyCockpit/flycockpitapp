@@ -295,9 +295,7 @@ pub trait DaemonRequestClient: Send + Sync {
     fn request(
         &self,
         request: Request,
-    ) -> impl std::future::Future<
-        Output = Result<std::result::Result<Response, ErrorPayload>>,
-    > + Send;
+    ) -> impl std::future::Future<Output = Result<std::result::Result<Response, ErrorPayload>>> + Send;
 }
 
 /// Public handle. Cheap to clone: every clone shares the same

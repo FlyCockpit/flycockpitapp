@@ -157,11 +157,10 @@ async fn checked_skill_preflight_config(
 
     let mut writable_only = skills.clone();
     writable_only.external_dirs.clear();
-    let writable_roots: HashSet<PathBuf> =
-        SkillMutationService::new(&ctx.cwd, &writable_only)
-            .preflight_scan_roots()
-            .into_iter()
-            .collect();
+    let writable_roots: HashSet<PathBuf> = SkillMutationService::new(&ctx.cwd, &writable_only)
+        .preflight_scan_roots()
+        .into_iter()
+        .collect();
 
     let mut effective = skills.clone();
     effective.scan_dirs.clear();
@@ -317,9 +316,7 @@ async fn approve_write(args: &SkillManageArgs, ctx: &ToolCtx) -> Result<bool> {
             InterruptQuestionSet {
                 questions: vec![question.clone()],
             },
-            crate::agent_tree::HostDecisionSubject::HostApproval {
-                operation,
-            },
+            crate::agent_tree::HostDecisionSubject::HostApproval { operation },
             "skill write approval",
         )
         .await
@@ -859,8 +856,7 @@ mod tests {
 
             assert_eq!(candidate.get("execute"), approved_effect.get("execute"));
             assert_eq!(
-                operation["payload_digest"],
-                candidate["execute"]["payload_digest"],
+                operation["payload_digest"], candidate["execute"]["payload_digest"],
                 "the selected candidate, not only surrounding operation metadata, binds {field}"
             );
             assert!(
@@ -882,8 +878,7 @@ mod tests {
     fn every_skill_mutation_action_fences_native_root_and_exact_payload_together() {
         let root = std::path::Path::new("/checked-skill-root");
         for action in SkillManageAction::ALL {
-            let args: SkillManageArgs =
-                serde_json::from_value(minimal_args_for(action)).unwrap();
+            let args: SkillManageArgs = serde_json::from_value(minimal_args_for(action)).unwrap();
             let effects = skill_mutation_final_effects(&args, root).unwrap();
             assert_eq!(
                 effects[0],

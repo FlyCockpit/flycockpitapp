@@ -10,9 +10,9 @@
 mod tests {
     use super::*;
     use crate::db::agent_installations::{
-        AgentBindingRevision, AgentBindingRevisionMap, AgentExecutionKind,
-        AgentInstallationInput, AgentInstallationScope, ProviderAlias,
-        RedactedAgentProfileSnapshot, RedactedBindingEvidence, RedactedQuestionPolicy,
+        AgentBindingRevision, AgentBindingRevisionMap, AgentExecutionKind, AgentInstallationInput,
+        AgentInstallationScope, ProviderAlias, RedactedAgentProfileSnapshot,
+        RedactedBindingEvidence, RedactedQuestionPolicy,
     };
     use crate::db::db::agent_tree_decisions::{AgentInstanceState, NewAgentInstance};
     use crate::db::wire::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
@@ -55,21 +55,29 @@ mod tests {
             interrupt_id,
         )
         .unwrap();
-        assert!(authority
-            .db_for_settlement(session_id, agent_instance_id, interrupt_id)
-            .is_ok());
-        assert!(authority
-            .db_for_settlement(session_id, agent_instance_id, Uuid::new_v4())
-            .is_err());
-        assert!(authority
-            .db_for_effect_handoff(session_id, Uuid::new_v4(), interrupt_id)
-            .is_err());
-        assert!(HostApprovalAuthority::for_registered_interrupt(
-            session_id,
-            agent_instance_id,
-            Uuid::nil(),
-        )
-        .is_err());
+        assert!(
+            authority
+                .db_for_settlement(session_id, agent_instance_id, interrupt_id)
+                .is_ok()
+        );
+        assert!(
+            authority
+                .db_for_settlement(session_id, agent_instance_id, Uuid::new_v4())
+                .is_err()
+        );
+        assert!(
+            authority
+                .db_for_effect_handoff(session_id, Uuid::new_v4(), interrupt_id)
+                .is_err()
+        );
+        assert!(
+            HostApprovalAuthority::for_registered_interrupt(
+                session_id,
+                agent_instance_id,
+                Uuid::nil(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -94,16 +102,20 @@ mod tests {
         ] {
             assert!(validate_bounded_free_text_contract(&contract).is_err());
         }
-        assert!(validate_bounded_free_text_contract(&FreeTextContract {
-            allowed: true,
-            max_chars: Some(1),
-        })
-        .is_ok());
-        assert!(validate_bounded_free_text_contract(&FreeTextContract {
-            allowed: false,
-            max_chars: None,
-        })
-        .is_ok());
+        assert!(
+            validate_bounded_free_text_contract(&FreeTextContract {
+                allowed: true,
+                max_chars: Some(1),
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_bounded_free_text_contract(&FreeTextContract {
+                allowed: false,
+                max_chars: None,
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -114,7 +126,8 @@ mod tests {
             session_id: Uuid::new_v4(),
             task_call_id: None,
             workspace_ref: None,
-            options_contract_json: r#"{"options":[{"id":"option:018f47a2-7b3c-7def-8123-000000000001"}]}"#.into(),
+            options_contract_json:
+                r#"{"options":[{"id":"option:018f47a2-7b3c-7def-8123-000000000001"}]}"#.into(),
             free_text_contract_json: Some(r#"{"allowed":false,"max_chars":null}"#.into()),
             recommendation_json: None,
             rationale_redaction_class: "public".into(),
@@ -166,19 +179,21 @@ mod tests {
             .is_err(),
             "a cancellation-only generic question is not answerable"
         );
-        assert!(NewDecisionContract::user_question(
-            Uuid::new_v4(),
-            0,
-            Vec::new(),
-            Some(FreeTextContract {
-                allowed: true,
-                max_chars: Some(120),
-            }),
-            None,
-            "public".into(),
-            presentation.clone(),
-        )
-        .is_ok());
+        assert!(
+            NewDecisionContract::user_question(
+                Uuid::new_v4(),
+                0,
+                Vec::new(),
+                Some(FreeTextContract {
+                    allowed: true,
+                    max_chars: Some(120),
+                }),
+                None,
+                "public".into(),
+                presentation.clone(),
+            )
+            .is_ok()
+        );
 
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
@@ -259,14 +274,18 @@ mod tests {
             .expect("generic lifecycle decision survives durable reload");
         let public: serde_json::Value =
             serde_json::from_str(&recovered.options_contract_json).unwrap();
-        assert_eq!(public["interrupt_response_contract"], serde_json::Value::Null);
+        assert_eq!(
+            public["interrupt_response_contract"],
+            serde_json::Value::Null
+        );
         assert_eq!(public["question"], "Decision required");
         assert_eq!(public["description"], "An agent decision is waiting");
         assert!(recovered.free_text_contract_json.is_some());
     }
 
     #[tokio::test]
-    async fn public_answer_boundary_requires_opaque_tokens_and_private_continuations_translate_exactly() {
+    async fn public_answer_boundary_requires_opaque_tokens_and_private_continuations_translate_exactly()
+     {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let lifecycle = AgentTreeLifecycle::new(db.clone());
@@ -279,15 +298,17 @@ mod tests {
 
         // The public AgentTree route cannot accept a caller/model-owned
         // continuation ID even when it is a real private mapping.
-        assert!(lifecycle
-            .resolve_user_answer(
-                session.session_id,
-                public_decision.decision_request_id,
-                PublicDecisionAnswer::option("refresh"),
-                101,
-            )
-            .await
-            .is_err());
+        assert!(
+            lifecycle
+                .resolve_user_answer(
+                    session.session_id,
+                    public_decision.decision_request_id,
+                    PublicDecisionAnswer::option("refresh"),
+                    101,
+                )
+                .await
+                .is_err()
+        );
         assert!(matches!(
             lifecycle
                 .resolve_user_answer(
@@ -341,13 +362,8 @@ mod tests {
             }],
         };
         assert!(
-            NewDecisionContract::user_question_interrupt(
-                Uuid::new_v4(),
-                0,
-                &empty_choice,
-                None,
-            )
-            .is_err(),
+            NewDecisionContract::user_question_interrupt(Uuid::new_v4(), 0, &empty_choice, None,)
+                .is_err(),
             "QuestionTool cancellation cannot be its only answer path"
         );
         let valid_choice = InterruptQuestionSet {
@@ -366,13 +382,10 @@ mod tests {
                 sandbox_escalation: None,
             }],
         };
-        assert!(NewDecisionContract::user_question_interrupt(
-            Uuid::new_v4(),
-            0,
-            &valid_choice,
-            None,
-        )
-        .is_ok());
+        assert!(
+            NewDecisionContract::user_question_interrupt(Uuid::new_v4(), 0, &valid_choice, None,)
+                .is_ok()
+        );
     }
 
     /// Tests exercise the same immutable snapshot reconstruction that
@@ -408,7 +421,8 @@ mod tests {
                 prohibited_classes: vec!["credential".into(), "destructive".into()],
                 required_decision_timeout_ms: 6,
                 host_resource_ceiling_ms: 6,
-                resolver_order: crate::db::agent_installations::QuestionResolverOrder::WarmParentThenUtility,
+                resolver_order:
+                    crate::db::agent_installations::QuestionResolverOrder::WarmParentThenUtility,
                 resolver_slot: "primary".into(),
             },
             verification_regions: Vec::new(),
@@ -604,11 +618,21 @@ mod tests {
             true
         }
 
-        fn parent_cache_resumable(&self, _session_id: Uuid, _parent_agent_instance_id: Uuid) -> bool {
+        fn parent_cache_resumable(
+            &self,
+            _session_id: Uuid,
+            _parent_agent_instance_id: Uuid,
+        ) -> bool {
             self.parent_warm
         }
 
-        fn utility_slot_is_compatible(&self, _session_id: Uuid, _agent_instance_id: Uuid, _profile_snapshot_id: Option<Uuid>, _resolver_slot: &str) -> bool {
+        fn utility_slot_is_compatible(
+            &self,
+            _session_id: Uuid,
+            _agent_instance_id: Uuid,
+            _profile_snapshot_id: Option<Uuid>,
+            _resolver_slot: &str,
+        ) -> bool {
             self.utility_compatible
         }
     }
@@ -634,7 +658,13 @@ mod tests {
             false
         }
 
-        fn utility_slot_is_compatible(&self, _session_id: Uuid, _agent_instance_id: Uuid, _profile_snapshot_id: Option<Uuid>, _resolver_slot: &str) -> bool {
+        fn utility_slot_is_compatible(
+            &self,
+            _session_id: Uuid,
+            _agent_instance_id: Uuid,
+            _profile_snapshot_id: Option<Uuid>,
+            _resolver_slot: &str,
+        ) -> bool {
             true
         }
     }
@@ -648,11 +678,7 @@ mod tests {
     }
 
     impl DecisionResolverDirectory for PerAgentAttachmentResolvers {
-        fn exact_owner_executor_is_live(
-            &self,
-            _session_id: Uuid,
-            agent_instance_id: Uuid,
-        ) -> bool {
+        fn exact_owner_executor_is_live(&self, _session_id: Uuid, agent_instance_id: Uuid) -> bool {
             self.live_agents
                 .lock()
                 .expect("per-agent attachment lock")
@@ -729,7 +755,13 @@ mod tests {
             self.parent_live.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        fn utility_slot_is_compatible(&self, _session_id: Uuid, _agent_instance_id: Uuid, _profile_snapshot_id: Option<Uuid>, _resolver_slot: &str) -> bool {
+        fn utility_slot_is_compatible(
+            &self,
+            _session_id: Uuid,
+            _agent_instance_id: Uuid,
+            _profile_snapshot_id: Option<Uuid>,
+            _resolver_slot: &str,
+        ) -> bool {
             true
         }
     }
@@ -773,7 +805,6 @@ mod tests {
                 succeeds: true,
             }
         }
-
     }
 
     impl DecisionResolverDelivery for RecordingResolverDelivery {
@@ -868,7 +899,9 @@ mod tests {
             db.set_agent_auto_answer_from_resolved_profile(
                 session_id,
                 created.agent_instance_id,
-                parent.resolved_profile_snapshot_id.expect("test parent has profile"),
+                parent
+                    .resolved_profile_snapshot_id
+                    .expect("test parent has profile"),
                 10,
             )
             .await
@@ -1050,14 +1083,8 @@ mod tests {
 
         let parent = running_agent(&db, session.session_id, false).await;
         let warm = running_child(&db, session.session_id, &parent, true).await;
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &warm,
-            20,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &warm, 20).await;
         let recommendation: serde_json::Value = serde_json::from_str(
             decision
                 .recommendation_json
@@ -1079,7 +1106,10 @@ mod tests {
             .begin_auto_resolution(
                 session.session_id,
                 decision.decision_request_id,
-                &TestResolvers { parent_warm: true, utility_compatible: true },
+                &TestResolvers {
+                    parent_warm: true,
+                    utility_compatible: true,
+                },
                 21,
             )
             .await
@@ -1102,19 +1132,16 @@ mod tests {
         );
 
         let cold = running_child(&db, session.session_id, &parent, true).await;
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &cold,
-            30,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &cold, 30).await;
         let outcome = lifecycle
             .begin_auto_resolution(
                 session.session_id,
                 decision.decision_request_id,
-                &TestResolvers { parent_warm: false, utility_compatible: true },
+                &TestResolvers {
+                    parent_warm: false,
+                    utility_compatible: true,
+                },
                 31,
             )
             .await
@@ -1137,19 +1164,17 @@ mod tests {
         );
 
         let unavailable = running_child(&db, session.session_id, &parent, true).await;
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &unavailable,
-            40,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &unavailable, 40)
+                .await;
         let outcome = lifecycle
             .begin_auto_resolution(
                 session.session_id,
                 decision.decision_request_id,
-                &TestResolvers { parent_warm: false, utility_compatible: false },
+                &TestResolvers {
+                    parent_warm: false,
+                    utility_compatible: false,
+                },
                 41,
             )
             .await
@@ -1187,27 +1212,16 @@ mod tests {
             root_snapshot_id,
             "a child profile must not replace the session/root profile lookup"
         );
-        let child = running_child_with_profile(
-            &db,
-            session.session_id,
-            &root,
-            child_snapshot_id,
-        )
-        .await;
+        let child =
+            running_child_with_profile(&db, session.session_id, &root, child_snapshot_id).await;
         let resolvers = ExactProfileSlotResolvers {
             expected_agent_instance_id: child.agent_instance_id,
             expected_profile_snapshot_id: child_snapshot_id,
             expected_slot: "child-utility".into(),
             observed: std::sync::Mutex::new(Vec::new()),
         };
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &child,
-            20,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &child, 20).await;
         let outcome = lifecycle
             .begin_auto_resolution(
                 session.session_id,
@@ -1327,21 +1341,22 @@ mod tests {
             Arc::new(NoopDeadlines),
         )
         .with_resolver_delivery(delivery.clone());
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &child,
-            20,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &child, 20).await;
         runtime
             .reconcile_pending_requests_limited(session.session_id, 1)
             .await
             .unwrap();
         assert_eq!(
-            delivery.accepted.lock().expect("test delivery lock").as_slice(),
-            &[DecisionResolverRoute::WarmParent, DecisionResolverRoute::Utility]
+            delivery
+                .accepted
+                .lock()
+                .expect("test delivery lock")
+                .as_slice(),
+            &[
+                DecisionResolverRoute::WarmParent,
+                DecisionResolverRoute::Utility
+            ]
         );
         let durable = db
             .decision_request(session.session_id, decision.decision_request_id)
@@ -1375,21 +1390,19 @@ mod tests {
         )
         .with_resolver_delivery(delivery.clone());
 
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &child,
-            20,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &child, 20).await;
         runtime
             .reconcile_pending_requests_limited(session.session_id, 1)
             .await
             .unwrap();
 
         assert_eq!(
-            delivery.accepted.lock().expect("test delivery lock").as_slice(),
+            delivery
+                .accepted
+                .lock()
+                .expect("test delivery lock")
+                .as_slice(),
             &[DecisionResolverRoute::WarmParent]
         );
         let durable = db
@@ -1473,19 +1486,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_returns_due_deadline_winners_once_for_live_and_recovered_questiontool_delivery() {
+    async fn runtime_returns_due_deadline_winners_once_for_live_and_recovered_questiontool_delivery()
+     {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let lifecycle = AgentTreeLifecycle::new(db.clone());
         let owner = running_agent(&db, session.session_id, true).await;
-        let live = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &owner,
-            20,
-        )
-        .await;
+        let live =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &owner, 20).await;
         let live_runtime = AgentTreeRuntime::new(
             lifecycle.clone(),
             Arc::new(FixedClock(30)),
@@ -1588,14 +1596,8 @@ mod tests {
         let lifecycle = AgentTreeLifecycle::new(db.clone());
         let parent = running_agent(&db, session.session_id, false).await;
         let child = running_child(&db, session.session_id, &parent, true).await;
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &child,
-            20,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &child, 20).await;
         let interrupt_id = db
             .interrupt_for_decision_request(session.session_id, decision.decision_request_id)
             .await
@@ -1611,7 +1613,10 @@ mod tests {
             .unwrap()
             .expect("host refresh decision has one typed operation binding");
         assert_eq!(operation.agent_instance_id, child.agent_instance_id);
-        assert_eq!(operation.decision_request_id, Some(decision.decision_request_id));
+        assert_eq!(
+            operation.decision_request_id,
+            Some(decision.decision_request_id)
+        );
 
         // The old worker has claimed utility routing but dies before its
         // resolver reports completion. This is the precise `pending ->
@@ -1653,7 +1658,9 @@ mod tests {
             "the daemon-owned refresh child requires an exact restart claim"
         );
         assert!(
-            recovery.pending_decisions.contains(&decision.decision_request_id),
+            recovery
+                .pending_decisions
+                .contains(&decision.decision_request_id),
             "the unresolved typed refresh decision is recoverable"
         );
         let child_after_claim = db
@@ -1765,14 +1772,8 @@ mod tests {
             }),
             Arc::new(NoopDeadlines),
         );
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &child,
-            20,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &child, 20).await;
         let (route, packet) = match runtime
             .begin_auto_resolution(session.session_id, decision.decision_request_id)
             .await
@@ -1781,7 +1782,8 @@ mod tests {
             AutoResolutionBegin::Claimed { route, packet } => (route, packet),
             other => panic!("expected automatic host refresh claim, got {other:?}"),
         };
-        let answer = PublicDecisionAnswer::option(only_public_option_id(&packet.options_contract_json));
+        let answer =
+            PublicDecisionAnswer::option(only_public_option_id(&packet.options_contract_json));
         assert!(matches!(
             runtime
                 .accept_resolver_result(
@@ -1825,7 +1827,9 @@ mod tests {
             crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Claimed {
                 lease,
             } => lease,
-            other => panic!("auto-resolved host operation must claim for completion, got {other:?}"),
+            other => {
+                panic!("auto-resolved host operation must claim for completion, got {other:?}")
+            }
         };
         let snapshot = cockpit_proto::HostCapabilitySnapshot {
             generation: lease.snapshot_generation(),
@@ -1838,8 +1842,8 @@ mod tests {
         )
         .unwrap();
         let snapshot_json = String::from_utf8(canonical_snapshot.clone()).unwrap();
-        assert!(db
-            .complete_host_capability_refresh_execution(
+        assert!(
+            db.complete_host_capability_refresh_execution(
                 crate::agent_tree::daemon_host_capability_refresh_authority(),
                 session.session_id,
                 operation.operation_id,
@@ -1850,7 +1854,8 @@ mod tests {
                 24,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let child_after_auto = db
             .agent_instance(session.session_id, child.agent_instance_id)
             .await
@@ -1873,10 +1878,12 @@ mod tests {
             .lock()
             .expect("per-agent attachment lock")
             .remove(&child.agent_instance_id);
-        assert!(live_agents
-            .lock()
-            .expect("per-agent attachment lock")
-            .contains(&parent.agent_instance_id));
+        assert!(
+            live_agents
+                .lock()
+                .expect("per-agent attachment lock")
+                .contains(&parent.agent_instance_id)
+        );
 
         for _ in 0..2 {
             assert!(matches!(
@@ -1896,8 +1903,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(claimed.len(), 1, "the detached child cannot create a second parent steer");
-        assert_eq!(claimed[0].requesting_agent_instance_id, child.agent_instance_id);
+        assert_eq!(
+            claimed.len(),
+            1,
+            "the detached child cannot create a second parent steer"
+        );
+        assert_eq!(
+            claimed[0].requesting_agent_instance_id,
+            child.agent_instance_id
+        );
         assert_eq!(claimed[0].agent_instance_id, parent.agent_instance_id);
     }
 
@@ -1977,30 +1991,34 @@ mod tests {
                 .unwrap(),
             AutoResolutionBegin::WaitingForUser
         ));
-        assert!(lifecycle
-            .resolve_user_answer(
-                session.session_id,
-                decision.decision_request_id,
-                PublicDecisionAnswer::Option {
-                    id: "continue".into()
-                },
-                22,
-            )
-            .await
-            .is_err());
-        assert!(lifecycle
-            .resolve_user_answer(
-                session.session_id,
-                decision.decision_request_id,
-                PublicDecisionAnswer::InterruptResponse {
-                    response: ResolveResponse::Single {
-                        selected_id: "foreign".into(),
+        assert!(
+            lifecycle
+                .resolve_user_answer(
+                    session.session_id,
+                    decision.decision_request_id,
+                    PublicDecisionAnswer::Option {
+                        id: "continue".into()
                     },
-                },
-                23,
-            )
-            .await
-            .is_err());
+                    22,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .resolve_user_answer(
+                    session.session_id,
+                    decision.decision_request_id,
+                    PublicDecisionAnswer::InterruptResponse {
+                        response: ResolveResponse::Single {
+                            selected_id: "foreign".into(),
+                        },
+                    },
+                    23,
+                )
+                .await
+                .is_err()
+        );
         assert!(matches!(
             lifecycle
                 .resolve_user_answer(
@@ -2025,7 +2043,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_refresh_uses_its_linked_questiontool_option_as_the_only_recommendation_authority() {
+    async fn host_refresh_uses_its_linked_questiontool_option_as_the_only_recommendation_authority()
+    {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let lifecycle = AgentTreeLifecycle::new(db.clone());
@@ -2076,9 +2095,7 @@ mod tests {
                     agent.workspace_ref.clone(),
                 )
                 .unwrap()
-                .with_host_subject(HostDecisionSubject::HostCapabilitiesRefresh {
-                    operation,
-                }),
+                .with_host_subject(HostDecisionSubject::HostCapabilitiesRefresh { operation }),
                 interrupt_id,
                 20,
             )
@@ -2149,7 +2166,10 @@ mod tests {
                 .begin_auto_resolution(
                     session.session_id,
                     disabled_decision.decision_request_id,
-                    &TestResolvers { parent_warm: true, utility_compatible: true },
+                    &TestResolvers {
+                        parent_warm: true,
+                        utility_compatible: true
+                    },
                     21,
                 )
                 .await
@@ -2158,8 +2178,9 @@ mod tests {
         );
 
         let prohibited = running_agent(&db, session.session_id, true).await;
-        let prohibited_contract = contract(&prohibited)
-            .with_host_subject(HostDecisionSubject::HostEffect(HostEffectClass::Destructive));
+        let prohibited_contract = contract(&prohibited).with_host_subject(
+            HostDecisionSubject::HostEffect(HostEffectClass::Destructive),
+        );
         let prohibited_decision = lifecycle
             .request_decision(session.session_id, prohibited_contract, 22)
             .await
@@ -2169,7 +2190,10 @@ mod tests {
                 .begin_auto_resolution(
                     session.session_id,
                     prohibited_decision.decision_request_id,
-                    &TestResolvers { parent_warm: true, utility_compatible: true },
+                    &TestResolvers {
+                        parent_warm: true,
+                        utility_compatible: true
+                    },
                     23,
                 )
                 .await
@@ -2182,11 +2206,13 @@ mod tests {
             .request_decision(session.session_id, contract(&deadline_agent), 24)
             .await
             .unwrap();
-        assert!(lifecycle
-            .expire_deadlines(session.session_id, 29)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            lifecycle
+                .expire_deadlines(session.session_id, 29)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             lifecycle
                 .expire_deadlines(session.session_id, 30)
@@ -2194,32 +2220,32 @@ mod tests {
                 .unwrap(),
             vec![deadline_decision.decision_request_id]
         );
-        assert!(lifecycle
-            .expire_deadlines(session.session_id, 31)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            lifecycle
+                .expire_deadlines(session.session_id, 31)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
-    async fn agent_tree_attention_lifecycle_restart_rehydrates_each_state_once_and_rejects_late_results() {
+    async fn agent_tree_attention_lifecycle_restart_rehydrates_each_state_once_and_rejects_late_results()
+     {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let lifecycle = AgentTreeLifecycle::new(db.clone());
         let agent = running_agent(&db, session.session_id, true).await;
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &agent,
-            20,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &agent, 20).await;
         let begin = lifecycle
             .begin_auto_resolution(
                 session.session_id,
                 decision.decision_request_id,
-                &TestResolvers { parent_warm: true, utility_compatible: true },
+                &TestResolvers {
+                    parent_warm: true,
+                    utility_compatible: true,
+                },
                 21,
             )
             .await
@@ -2273,12 +2299,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovery.claimed_agents, vec![agent.agent_instance_id]);
-        assert!(lifecycle
-            .recover_session(session.session_id, epoch, 26)
-            .await
-            .unwrap()
-            .claimed_agents
-            .is_empty());
+        assert!(
+            lifecycle
+                .recover_session(session.session_id, epoch, 26)
+                .await
+                .unwrap()
+                .claimed_agents
+                .is_empty()
+        );
         assert_eq!(
             lifecycle
                 .recover_session(session.session_id, Uuid::new_v4(), 27)
@@ -2296,14 +2324,8 @@ mod tests {
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let lifecycle = AgentTreeLifecycle::new(db.clone());
         let agent = running_agent(&db, session.session_id, true).await;
-        let decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &agent,
-            20,
-        )
-        .await;
+        let decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &agent, 20).await;
         let packet = match lifecycle
             .begin_auto_resolution(
                 session.session_id,
@@ -2362,7 +2384,10 @@ mod tests {
             .request_decision(session.session_id, contract(&waiting_root), 23)
             .await
             .unwrap();
-        assert_ne!(waiting_root_decision.decision_request_id, decision.decision_request_id);
+        assert_ne!(
+            waiting_root_decision.decision_request_id,
+            decision.decision_request_id
+        );
         assert_eq!(
             db.agent_instance(session.session_id, agent.agent_instance_id)
                 .await
@@ -2378,14 +2403,19 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            first_recovery.claimed_agents.contains(&agent.agent_instance_id),
+            first_recovery
+                .claimed_agents
+                .contains(&agent.agent_instance_id),
             "a waiting root needs the same exact activation claim as a running root"
         );
         let [first_steer] = first_recovery.claimed_late_user_steers.as_slice() else {
             panic!("expected exactly one recovered late user steer");
         };
         assert_eq!(first_steer.agent_instance_id, packet.agent_instance_id);
-        assert_eq!(first_steer.decision_request_id, decision.decision_request_id);
+        assert_eq!(
+            first_steer.decision_request_id,
+            decision.decision_request_id
+        );
         assert!(
             !lifecycle
                 .ack_late_user_steer_delivery(
@@ -2398,15 +2428,16 @@ mod tests {
                 .unwrap(),
             "a different executor epoch cannot acknowledge this owner's steer"
         );
-        assert!(db
-            .release_late_user_decision_steer_claim(
+        assert!(
+            db.release_late_user_decision_steer_claim(
                 session.session_id,
                 first_steer.steer_id,
                 first_epoch,
                 26,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         let retry_epoch = Uuid::new_v4();
         let retry_recovery = lifecycle
@@ -2429,24 +2460,26 @@ mod tests {
                 .unwrap(),
             "an executor cannot acknowledge a steer before its durable completion"
         );
-        assert!(db
-            .accept_late_user_decision_steer_execution(
+        assert!(
+            db.accept_late_user_decision_steer_execution(
                 session.session_id,
                 retry_steer.steer_id,
                 retry_epoch,
                 29,
             )
             .await
-            .unwrap());
-        assert!(db
-            .complete_late_user_decision_steer_execution(
+            .unwrap()
+        );
+        assert!(
+            db.complete_late_user_decision_steer_execution(
                 session.session_id,
                 retry_steer.steer_id,
                 retry_epoch,
                 30,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let receipt_epoch = Uuid::new_v4();
         let receipt_recovery = lifecycle
             .recover_session(session.session_id, receipt_epoch, 31)
@@ -2457,25 +2490,30 @@ mod tests {
         };
         assert_eq!(completed_steer.steer_id, retry_steer.steer_id);
         assert!(completed_steer.completed_at_unix_ms.is_some());
-        assert!(lifecycle
-            .ack_late_user_steer_delivery(
-                session.session_id,
-                completed_steer.steer_id,
-                receipt_epoch,
-                32,
-            )
-            .await
-            .unwrap());
-        assert!(lifecycle
-            .recover_session(session.session_id, Uuid::new_v4(), 33)
-            .await
-            .unwrap()
-            .claimed_late_user_steers
-            .is_empty());
+        assert!(
+            lifecycle
+                .ack_late_user_steer_delivery(
+                    session.session_id,
+                    completed_steer.steer_id,
+                    receipt_epoch,
+                    32,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            lifecycle
+                .recover_session(session.session_id, Uuid::new_v4(), 33)
+                .await
+                .unwrap()
+                .claimed_late_user_steers
+                .is_empty()
+        );
     }
 
     #[tokio::test]
-    async fn host_refresh_post_auto_user_answer_reroutes_to_requesting_parent_once_across_recovery() {
+    async fn host_refresh_post_auto_user_answer_reroutes_to_requesting_parent_once_across_recovery()
+    {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let lifecycle = AgentTreeLifecycle::new(db.clone());
@@ -2566,7 +2604,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].requesting_agent_instance_id, refresh_child.agent_instance_id);
+        assert_eq!(
+            claimed[0].requesting_agent_instance_id,
+            refresh_child.agent_instance_id
+        );
         assert_eq!(claimed[0].agent_instance_id, parent.agent_instance_id);
         let retry = db
             .claim_late_user_decision_steers(
@@ -2576,26 +2617,32 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(retry.is_empty(), "the daemon-only child must never receive a model steer");
-        assert!(db
-            .release_late_user_decision_steer_claim(
+        assert!(
+            retry.is_empty(),
+            "the daemon-only child must never receive a model steer"
+        );
+        assert!(
+            db.release_late_user_decision_steer_claim(
                 session.session_id,
                 claimed[0].steer_id,
                 recovery_epoch,
                 25,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let recovery = lifecycle
             .recover_session(session.session_id, Uuid::new_v4(), 26)
             .await
             .unwrap();
-        assert!(recovery
-            .claimed_late_user_steers
-            .iter()
-            .any(|steer| steer.steer_id == claimed[0].steer_id
-                && steer.agent_instance_id == parent.agent_instance_id
-                && steer.requesting_agent_instance_id == refresh_child.agent_instance_id));
+        assert!(
+            recovery
+                .claimed_late_user_steers
+                .iter()
+                .any(|steer| steer.steer_id == claimed[0].steer_id
+                    && steer.agent_instance_id == parent.agent_instance_id
+                    && steer.requesting_agent_instance_id == refresh_child.agent_instance_id)
+        );
     }
 
     #[tokio::test]
@@ -2625,7 +2672,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_completion_rejects_a_child_with_a_live_decision_without_checkpointing_parent() {
+    async fn recursive_completion_rejects_a_child_with_a_live_decision_without_checkpointing_parent()
+     {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let lifecycle = AgentTreeLifecycle::new(db.clone());
@@ -2667,7 +2715,10 @@ mod tests {
             .await
             .is_err());
         let descriptor = db
-            .recursive_noninteractive_recovery_descriptor(session.session_id, parent.agent_instance_id)
+            .recursive_noninteractive_recovery_descriptor(
+                session.session_id,
+                parent.agent_instance_id,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -2687,16 +2738,18 @@ mod tests {
                 .state,
             AgentInstanceState::WaitingForUser
         );
-        assert!(db
-            .agent_terminal_receipt(session.session_id, child.agent_instance_id)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(db
-            .decision_request(session.session_id, decision.decision_request_id)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            db.agent_terminal_receipt(session.session_id, child.agent_instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.decision_request(session.session_id, decision.decision_request_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
         let public_option_id = only_public_option_id(&decision.options_contract_json);
 
         assert!(matches!(
@@ -2784,14 +2837,9 @@ mod tests {
         };
 
         let resolving = running_child(&db, session.session_id, &parent, true).await;
-        let resolving_decision = host_capability_refresh_decision(
-            &lifecycle,
-            &db,
-            session.session_id,
-            &resolving,
-            23,
-        )
-        .await;
+        let resolving_decision =
+            host_capability_refresh_decision(&lifecycle, &db, session.session_id, &resolving, 23)
+                .await;
         assert!(matches!(
             lifecycle
                 .begin_auto_resolution(
@@ -2850,12 +2898,16 @@ mod tests {
                 "nonterminal state {agent_instance_id} must receive one executor reconciliation claim"
             );
         }
-        assert!(recovery
-            .pending_decisions
-            .contains(&waiting_user_decision.decision_request_id));
-        assert!(recovery
-            .pending_decisions
-            .contains(&resolving_decision.decision_request_id));
+        assert!(
+            recovery
+                .pending_decisions
+                .contains(&waiting_user_decision.decision_request_id)
+        );
+        assert!(
+            recovery
+                .pending_decisions
+                .contains(&resolving_decision.decision_request_id)
+        );
         let waiting_user_after = db
             .agent_instance(session.session_id, waiting_user.agent_instance_id)
             .await
@@ -2943,8 +2995,8 @@ mod tests {
                 started_rx.try_recv(),
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty)
             ));
-            assert!(db
-                .consume_agent_resume_claim(
+            assert!(
+                db.consume_agent_resume_claim(
                     session.session_id,
                     root.agent_instance_id,
                     root.revision,
@@ -2952,7 +3004,8 @@ mod tests {
                     22,
                 )
                 .await
-                .unwrap());
+                .unwrap()
+            );
             activation_gate.release();
             tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
                 .await
@@ -2969,8 +3022,8 @@ mod tests {
         let child = running_child(&db, session.session_id, &parent, false).await;
         let epoch = Uuid::new_v4();
 
-        assert!(db
-            .claim_agent_resume(
+        assert!(
+            db.claim_agent_resume(
                 session.session_id,
                 parent.agent_instance_id,
                 parent.revision,
@@ -2978,9 +3031,10 @@ mod tests {
                 20,
             )
             .await
-            .unwrap());
-        assert!(db
-            .claim_agent_resume(
+            .unwrap()
+        );
+        assert!(
+            db.claim_agent_resume(
                 session.session_id,
                 child.agent_instance_id,
                 child.revision,
@@ -2988,7 +3042,8 @@ mod tests {
                 20,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         assert!(
             !db.consume_agent_resume_claims_atomically(
@@ -3019,11 +3074,15 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(claimed_rows, 2, "partial subtree recovery acknowledgement is forbidden");
+        assert_eq!(
+            claimed_rows, 2,
+            "partial subtree recovery acknowledgement is forbidden"
+        );
     }
 
     #[tokio::test]
-    async fn agent_tree_attention_lifecycle_attention_packet_is_redacted_and_host_approval_is_bound() {
+    async fn agent_tree_attention_lifecycle_attention_packet_is_redacted_and_host_approval_is_bound()
+     {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let lifecycle = AgentTreeLifecycle::new(db.clone());
@@ -3128,38 +3187,44 @@ mod tests {
         assert!(!serialized.contains("secret-value"));
         assert!(serialized.contains("redacted"));
 
-        assert!(lifecycle
-            .resolve_user_answer(
-                session.session_id,
-                decision.decision_request_id,
-                PublicDecisionAnswer::option("continue"),
-                21,
-            )
-            .await
-            .is_err());
-        assert!(lifecycle
-            .resolve_host_approval(
-                session.session_id,
-                decision.decision_request_id,
-                interrupt_id,
-                r#"{"kind":"single","data":{"selected_id":"approve_once"}}"#,
-                HostApprovalAuthority::trusted_host(),
-                22,
-            )
-            .await
-            .is_err());
-        assert!(lifecycle
-            .resolve_host_approval(
-                session.session_id,
-                decision.decision_request_id,
-                interrupt_id,
-                r#"{"kind":"single","data":{"selected_id":"approve"}}"#,
-                HostApprovalAuthority::trusted_host(),
-                23,
-            )
-            .await
-            .unwrap()
-            .is_resolved());
+        assert!(
+            lifecycle
+                .resolve_user_answer(
+                    session.session_id,
+                    decision.decision_request_id,
+                    PublicDecisionAnswer::option("continue"),
+                    21,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .resolve_host_approval(
+                    session.session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    r#"{"kind":"single","data":{"selected_id":"approve_once"}}"#,
+                    HostApprovalAuthority::trusted_host(),
+                    22,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            lifecycle
+                .resolve_host_approval(
+                    session.session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    r#"{"kind":"single","data":{"selected_id":"approve"}}"#,
+                    HostApprovalAuthority::trusted_host(),
+                    23,
+                )
+                .await
+                .unwrap()
+                .is_resolved()
+        );
         let selected_operation_id = operation_id.to_string();
         let (selected_response, selected_candidate): (serde_json::Value, serde_json::Value) = db
             .read(move |conn| {
@@ -3178,17 +3243,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            selected_response.pointer("/data/selected_id").and_then(serde_json::Value::as_str),
+            selected_response
+                .pointer("/data/selected_id")
+                .and_then(serde_json::Value::as_str),
             Some("approve"),
             "the approved operation must retain the exact selected candidate"
         );
         assert_eq!(
-            selected_candidate.pointer("/selection").and_then(serde_json::Value::as_str),
+            selected_candidate
+                .pointer("/selection")
+                .and_then(serde_json::Value::as_str),
             Some("approve"),
             "the terminal host operation must persist the full selected candidate, not only its UI option id"
         );
         assert_eq!(
-            selected_candidate.pointer("/execute/operation").and_then(serde_json::Value::as_str),
+            selected_candidate
+                .pointer("/execute/operation")
+                .and_then(serde_json::Value::as_str),
             Some("test"),
             "the persisted candidate must retain the exact selected effect"
         );
@@ -3208,8 +3279,8 @@ mod tests {
             .unwrap(),
             "a matching operation id cannot consume approval for different immutable input"
         );
-        assert!(db
-            .consume_host_approval_final_operation(
+        assert!(
+            db.consume_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
                 session.session_id,
@@ -3221,7 +3292,8 @@ mod tests {
                 25,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let (operation_state, handoff_state, handoff_key): (String, String, String) = db
             .read(move |conn| {
                 conn.query_row(
@@ -3277,8 +3349,8 @@ mod tests {
             .unwrap(),
             "recovery must not redeliver an effect whose dispatch outcome is unknown"
         );
-        assert!(db
-            .complete_host_approval_final_operation(
+        assert!(
+            db.complete_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
                 session.session_id,
@@ -3292,7 +3364,8 @@ mod tests {
                 28,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert!(
             !db.consume_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
@@ -3385,16 +3458,18 @@ mod tests {
             selected_id: "not-an-offered-deny".to_string(),
         })
         .unwrap();
-        assert!(lifecycle
-            .cancel_host_approval(
-                session.session_id,
-                decision.decision_request_id,
-                interrupt_id,
-                &foreign_cancel,
-                11,
-            )
-            .await
-            .is_err());
+        assert!(
+            lifecycle
+                .cancel_host_approval(
+                    session.session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &foreign_cancel,
+                    11,
+                )
+                .await
+                .is_err()
+        );
         assert_eq!(
             db.decision_request(session.session_id, decision.decision_request_id)
                 .await
@@ -3405,7 +3480,10 @@ mod tests {
         );
 
         assert_eq!(
-            lifecycle.expire_deadlines(session.session_id, 16).await.unwrap(),
+            lifecycle
+                .expire_deadlines(session.session_id, 16)
+                .await
+                .unwrap(),
             vec![decision.decision_request_id]
         );
         let terminal = db
@@ -3415,7 +3493,10 @@ mod tests {
             .unwrap();
         assert_eq!(terminal.state, DecisionState::TimedOut);
         let interrupt = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
-        assert_eq!(interrupt.state, crate::db::needs_attention::InterruptState::Resolved);
+        assert_eq!(
+            interrupt.state,
+            crate::db::needs_attention::InterruptState::Resolved
+        );
         assert_eq!(
             interrupt.response,
             Some(ResolveResponse::Cancel),
@@ -3483,7 +3564,8 @@ mod tests {
         let operation_kind_for_scope_cleanup = operation_kind.clone();
         let canonical_input_for_scope_cleanup = canonical_input_json.clone();
         let input_digest_for_scope_cleanup = input_digest.clone();
-        let selected_response_json = r#"{"data":{"selected_id":"approve"},"kind":"single"}"#.to_owned();
+        let selected_response_json =
+            r#"{"data":{"selected_id":"approve"},"kind":"single"}"#.to_owned();
         let selected_candidate_json = String::from_utf8(
             canonical_json_bytes(&serde_json::json!({
                 "selection": "approve",
@@ -4003,10 +4085,7 @@ impl HostEffectClass {
     /// option mapping keeps the actual continuation option opaque.
     const fn resolver_recommendation(self) -> Option<(&'static str, &'static str)> {
         match self {
-            Self::LocalMetadataRefresh => Some((
-                "refresh",
-                "refresh_local_host_capabilities",
-            )),
+            Self::LocalMetadataRefresh => Some(("refresh", "refresh_local_host_capabilities")),
             Self::Credential
             | Self::Authorization
             | Self::Destructive
@@ -4186,7 +4265,9 @@ pub(crate) enum HostDecisionSubject {
     HostCapabilitiesRefresh {
         operation: HostCapabilitiesRefreshOperation,
     },
-    HostApproval { operation: HostApprovalOperation },
+    HostApproval {
+        operation: HostApprovalOperation,
+    },
 }
 
 impl HostDecisionSubject {
@@ -4286,7 +4367,9 @@ impl NewDecisionContract {
                 workspace_ref,
                 recommendation_rationale: None,
             },
-            interrupt_response_contract: Some(RedactedInterruptQuestionSet::from_questions(questions)?),
+            interrupt_response_contract: Some(RedactedInterruptQuestionSet::from_questions(
+                questions,
+            )?),
             decision_subject: HostDecisionSubject::UserQuestion,
             host_approval_authority: None,
         };
@@ -4357,7 +4440,9 @@ impl RedactedInterruptQuestionSet {
                     allow_freetext,
                     ..
                 } => Ok(RedactedInterruptQuestion::Single {
-                    option_ids: redacted_option_ids(options.iter().map(|option| option.id.as_str()))?,
+                    option_ids: redacted_option_ids(
+                        options.iter().map(|option| option.id.as_str()),
+                    )?,
                     allow_freetext: *allow_freetext,
                 }),
                 InterruptQuestion::Multi {
@@ -4365,7 +4450,9 @@ impl RedactedInterruptQuestionSet {
                     allow_freetext,
                     ..
                 } => Ok(RedactedInterruptQuestion::Multi {
-                    option_ids: redacted_option_ids(options.iter().map(|option| option.id.as_str()))?,
+                    option_ids: redacted_option_ids(
+                        options.iter().map(|option| option.id.as_str()),
+                    )?,
                     allow_freetext: *allow_freetext,
                 }),
                 InterruptQuestion::Freetext { .. } => Ok(RedactedInterruptQuestion::Freetext),
@@ -4481,7 +4568,9 @@ impl RedactedInterruptQuestion {
                     !selected_ids.is_empty() && selected_ids.len() <= option_ids.len(),
                     "QuestionTool multi-select answer has an invalid number of options"
                 );
-                let unique = selected_ids.iter().collect::<std::collections::BTreeSet<_>>();
+                let unique = selected_ids
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>();
                 ensure!(
                     unique.len() == selected_ids.len()
                         && selected_ids
@@ -4498,7 +4587,9 @@ impl RedactedInterruptQuestion {
                 },
                 ResolveResponse::Freetext { text },
             ) => validate_interrupt_free_text(text),
-            (Self::Freetext, ResolveResponse::Freetext { text }) => validate_interrupt_free_text(text),
+            (Self::Freetext, ResolveResponse::Freetext { text }) => {
+                validate_interrupt_free_text(text)
+            }
             _ => bail!("QuestionTool answer shape does not match its durable question contract"),
         }
     }
@@ -4639,8 +4730,7 @@ pub struct AgentTreeRuntime {
     /// Stable fair cursor for bounded live-maintenance reconciliation, scoped
     /// to the session whose durable order it represents. It is local
     /// scheduling state only; durable request order remains DB-owned.
-    reconcile_cursors:
-        Arc<std::sync::Mutex<std::collections::HashMap<Uuid, Option<(i64, Uuid)>>>>,
+    reconcile_cursors: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, Option<(i64, Uuid)>>>>,
 }
 
 impl AgentTreeRuntime {
@@ -4715,7 +4805,8 @@ impl AgentTreeRuntime {
         // Creating an eligible request is also the delivery boundary.  Do not
         // leave a durable `resolving` claim for a later recovery pass merely
         // because this is the first request in a freshly started daemon.
-        self.begin_delivery(session_id, decision.decision_request_id).await?;
+        self.begin_delivery(session_id, decision.decision_request_id)
+            .await?;
         Ok(decision)
     }
 
@@ -4770,13 +4861,21 @@ impl AgentTreeRuntime {
         };
         let Some(delivery) = self.resolver_delivery.as_ref() else {
             self.lifecycle
-                .abandon_auto_resolution(session_id, packet.decision_request_id, self.clock.now_unix_ms())
+                .abandon_auto_resolution(
+                    session_id,
+                    packet.decision_request_id,
+                    self.clock.now_unix_ms(),
+                )
                 .await?;
             return Ok(AutoResolutionBegin::WaitingForUser);
         };
         if delivery.accept(session_id, *route, packet.clone()).is_err() {
             self.lifecycle
-                .abandon_auto_resolution(session_id, packet.decision_request_id, self.clock.now_unix_ms())
+                .abandon_auto_resolution(
+                    session_id,
+                    packet.decision_request_id,
+                    self.clock.now_unix_ms(),
+                )
                 .await?;
             // A parent can disappear after the durable route selection but
             // before its executor acknowledges the packet. Re-evaluate the
@@ -4897,8 +4996,8 @@ impl AgentTreeRuntime {
         // delivery source.
         let mut terminal_deadlines = Vec::new();
         while processed < limit {
-            let page_limit = (limit - processed)
-                .min(crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE);
+            let page_limit =
+                (limit - processed).min(crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE);
             let page = self
                 .lifecycle
                 .db
@@ -4969,8 +5068,7 @@ impl AgentTreeRuntime {
             after = None;
             break;
         }
-        self
-            .reconcile_cursors
+        self.reconcile_cursors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(session_id, after.or(last_processed));
@@ -4988,8 +5086,7 @@ impl AgentTreeRuntime {
         recovery_epoch: Uuid,
     ) -> Result<AgentTreeRecovery> {
         let now_unix_ms = self.clock.now_unix_ms();
-        self
-            .lifecycle
+        self.lifecycle
             .recover_session(session_id, recovery_epoch, now_unix_ms)
             .await
     }
@@ -5056,9 +5153,15 @@ impl AgentTreeRuntime {
                     .db
                     .agent_instance(session_id, decision.agent_instance_id)
                     .await?;
-                let parent = owner.as_ref().and_then(|agent| agent.parent_agent_instance_id);
+                let parent = owner
+                    .as_ref()
+                    .and_then(|agent| agent.parent_agent_instance_id);
                 let resolver_policy = match owner.as_ref() {
-                    Some(owner) => self.lifecycle.resolved_question_policy(session_id, owner).await?,
+                    Some(owner) => {
+                        self.lifecycle
+                            .resolved_question_policy(session_id, owner)
+                            .await?
+                    }
                     None => None,
                 };
                 // A persisted warm route is only a prior attempt, never a
@@ -5074,9 +5177,7 @@ impl AgentTreeRuntime {
                         .await?
                         .is_some_and(|parent| {
                             parent.state == AgentInstanceState::Running
-                                && self
-                                    .resolvers
-                                    .parent_cache_resumable(session_id, parent_id)
+                                && self.resolvers.parent_cache_resumable(session_id, parent_id)
                         }),
                     None => false,
                 };
@@ -5095,8 +5196,12 @@ impl AgentTreeRuntime {
                             packet_from_decision(
                                 &decision,
                                 parent,
-                                owner.as_ref().and_then(|agent| agent.resolved_profile_snapshot_id),
-                                resolver_policy.as_ref().map(|policy| policy.resolver_slot.clone()),
+                                owner
+                                    .as_ref()
+                                    .and_then(|agent| agent.resolved_profile_snapshot_id),
+                                resolver_policy
+                                    .as_ref()
+                                    .map(|policy| policy.resolver_slot.clone()),
                             )?,
                         )
                         .is_ok(),
@@ -5342,13 +5447,19 @@ pub enum AutoResolutionBegin {
 /// contract, never the original QuestionTool continuation IDs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PublicDecisionAnswer {
-    Option { id: String },
-    FreeText { text: String },
+    Option {
+        id: String,
+    },
+    FreeText {
+        text: String,
+    },
     /// A real QuestionTool continuation. This is deliberately distinct from
     /// free text: a resolver must return the daemon wire envelope that the
     /// parked tool call understands, and it is checked against the redacted
     /// question contract before the decision can settle.
-    InterruptResponse { response: ResolveResponse },
+    InterruptResponse {
+        response: ResolveResponse,
+    },
 }
 
 impl PublicDecisionAnswer {
@@ -5416,9 +5527,7 @@ impl HostApprovalAuthority {
         // debugging aid.  A nil member would otherwise turn the DB's exact
         // interrupt fence into a test-shaped escape hatch in release builds.
         ensure!(
-            !session_id.is_nil()
-                && !agent_instance_id.is_nil()
-                && !interrupt_id.is_nil(),
+            !session_id.is_nil() && !agent_instance_id.is_nil() && !interrupt_id.is_nil(),
             "host approval authority requires non-nil session, agent, and interrupt identities"
         );
         // SAFETY: cockpit-db deliberately exposes no safe constructor for
@@ -5608,8 +5717,7 @@ impl HostCapabilityRefreshAuthority {
 /// Issue the daemon-local capability used by worker and boot composition
 /// paths. It is intentionally crate-private: protocol requests, agent
 /// prompts, and a generic storage client cannot obtain this marker.
-pub(crate) fn daemon_host_capability_refresh_authority(
-) -> DbHostCapabilityRefreshAuthority {
+pub(crate) fn daemon_host_capability_refresh_authority() -> DbHostCapabilityRefreshAuthority {
     HostCapabilityRefreshAuthority::trusted_daemon_host().into_db()
 }
 
@@ -5832,7 +5940,10 @@ impl AgentTreeLifecycle {
         // unambiguous; the one persistence codec below emits the canonical
         // public `null` marker for a generic durable row.
         let mut options_contract = serde_json::Map::new();
-        options_contract.insert("options".to_string(), serde_json::to_value(contract.options)?);
+        options_contract.insert(
+            "options".to_string(),
+            serde_json::to_value(contract.options)?,
+        );
         options_contract.insert(
             "question".to_string(),
             serde_json::Value::String(contract.presentation.question),
@@ -5893,38 +6004,40 @@ impl AgentTreeLifecycle {
                     "rationale_redaction_class": contract.rationale_redaction_class,
                 }))
             })
-            .or_else(|| contract.recommended_option_id.map(|option_id| {
-                serde_json::to_string(&serde_json::json!({
-                    "option_id": option_id,
-                    "rationale": recommendation_rationale_is_present.then_some("redacted"),
-                    "rationale_redaction_class": contract.rationale_redaction_class,
-                }))
-            }))
+            .or_else(|| {
+                contract.recommended_option_id.map(|option_id| {
+                    serde_json::to_string(&serde_json::json!({
+                        "option_id": option_id,
+                        "rationale": recommendation_rationale_is_present.then_some("redacted"),
+                        "rationale_redaction_class": contract.rationale_redaction_class,
+                    }))
+                })
+            })
             .transpose()?;
         let input = NewDecisionRequest {
-                    session_id,
-                    agent_instance_id: contract.agent_instance_id,
-                    expected_agent_revision: contract.expected_agent_revision,
-                    waiting_state: if decision_class == DecisionClass::HostApproval {
-                        AgentInstanceState::WaitingForApproval
-                    } else {
-                        AgentInstanceState::WaitingForUser
-                    },
-                    options_contract_json,
-                    free_text_contract_json,
-                    recommendation_json,
-                    rationale_redaction_class: contract.rationale_redaction_class,
-                    decision_class: decision_class.as_str().into(),
-                    host_approval_operation_id,
-                    deadline_unix_ms,
-                    policy_receipt_json: serde_json::to_string(&serde_json::json!({
-                        "policy": if decision_class.permits_auto_resolution() { "automatic" } else { "manual" }
-                    }))?,
-                    // Resolver choice is host policy. The agent supplies no
-                    // route because a persisted request must not be able to
-                    // self-authorize a resolver after restart.
-                    resolver_route: None,
-                };
+            session_id,
+            agent_instance_id: contract.agent_instance_id,
+            expected_agent_revision: contract.expected_agent_revision,
+            waiting_state: if decision_class == DecisionClass::HostApproval {
+                AgentInstanceState::WaitingForApproval
+            } else {
+                AgentInstanceState::WaitingForUser
+            },
+            options_contract_json,
+            free_text_contract_json,
+            recommendation_json,
+            rationale_redaction_class: contract.rationale_redaction_class,
+            decision_class: decision_class.as_str().into(),
+            host_approval_operation_id,
+            deadline_unix_ms,
+            policy_receipt_json: serde_json::to_string(&serde_json::json!({
+                "policy": if decision_class.permits_auto_resolution() { "automatic" } else { "manual" }
+            }))?,
+            // Resolver choice is host policy. The agent supplies no
+            // route because a persisted request must not be able to
+            // self-authorize a resolver after restart.
+            resolver_route: None,
+        };
         match (
             interrupt_id,
             host_capability_refresh_operation,
@@ -5945,28 +6058,30 @@ impl AgentTreeLifecycle {
                     )
                     .await
             }
-            (Some(interrupt_id), Some(operation), None) => self
-                .db
-                .create_host_capability_refresh_decision_for_interrupt(
-                    input,
-                    operation.operation_id,
-                    operation.request_id,
-                    operation.requires_dedicated_child_initialization(),
-                    interrupt_id,
-                    HostCapabilityRefreshAuthority::trusted_daemon_host().into_db(),
-                    now_unix_ms,
-                )
-                .await,
+            (Some(interrupt_id), Some(operation), None) => {
+                self.db
+                    .create_host_capability_refresh_decision_for_interrupt(
+                        input,
+                        operation.operation_id,
+                        operation.request_id,
+                        operation.requires_dedicated_child_initialization(),
+                        interrupt_id,
+                        HostCapabilityRefreshAuthority::trusted_daemon_host().into_db(),
+                        now_unix_ms,
+                    )
+                    .await
+            }
             (None, Some(_), None) => bail!(
                 "host capability refresh must be composed through its real QuestionTool interrupt"
             ),
-            (None, None, Some(_)) => bail!(
-                "host approval must be composed through its real QuestionTool interrupt"
-            ),
-            (Some(interrupt_id), None, None) => self
-                .db
-                .create_decision_request_for_interrupt(input, interrupt_id, now_unix_ms)
-                .await,
+            (None, None, Some(_)) => {
+                bail!("host approval must be composed through its real QuestionTool interrupt")
+            }
+            (Some(interrupt_id), None, None) => {
+                self.db
+                    .create_decision_request_for_interrupt(input, interrupt_id, now_unix_ms)
+                    .await
+            }
             (None, None, None) => self.db.create_decision_request(input, now_unix_ms).await,
             (_, Some(_), Some(_)) => bail!(
                 "one decision cannot combine host capability refresh and host approval authority"
@@ -5980,7 +6095,9 @@ impl AgentTreeLifecycle {
         after: Option<AgentTreePageCursor>,
         limit: usize,
     ) -> Result<AgentTreePage<DecisionAttentionRow>> {
-        self.db.decision_attention_page(session_id, after, limit).await
+        self.db
+            .decision_attention_page(session_id, after, limit)
+            .await
     }
 
     /// Chooses a resolver only after reading the durable policy class and the
@@ -5993,7 +6110,11 @@ impl AgentTreeLifecycle {
         resolvers: &dyn DecisionResolverDirectory,
         now_unix_ms: i64,
     ) -> Result<AutoResolutionBegin> {
-        let Some(decision) = self.db.decision_request(session_id, decision_request_id).await? else {
+        let Some(decision) = self
+            .db
+            .decision_request(session_id, decision_request_id)
+            .await?
+        else {
             return Ok(AutoResolutionBegin::Retry);
         };
         if is_terminal(decision.state) {
@@ -6090,7 +6211,11 @@ impl AgentTreeLifecycle {
             .context("decision request is not authorized for this session")?;
         if decision.state == DecisionState::AutoResolved {
             let private_answer = self
-                .private_continuation_answer_for_public_answer(session_id, decision_request_id, &answer)
+                .private_continuation_answer_for_public_answer(
+                    session_id,
+                    decision_request_id,
+                    &answer,
+                )
                 .await?;
             validate_answer(&decision, &answer)?;
             let steer = self
@@ -6159,13 +6284,8 @@ impl AgentTreeLifecycle {
             .private_decision_option_mappings(session_id, decision_request_id)
             .await?;
         let public_answer = public_decision_answer_from_private_continuation(&answer, &mappings)?;
-        self.resolve_user_answer(
-            session_id,
-            decision_request_id,
-            public_answer,
-            now_unix_ms,
-        )
-        .await
+        self.resolve_user_answer(session_id, decision_request_id, public_answer, now_unix_ms)
+            .await
     }
 
     pub async fn resolve_auto_result(
@@ -6239,7 +6359,11 @@ impl AgentTreeLifecycle {
         decision_request_id: Uuid,
         now_unix_ms: i64,
     ) -> Result<bool> {
-        let Some(decision) = self.db.decision_request(session_id, decision_request_id).await? else {
+        let Some(decision) = self
+            .db
+            .decision_request(session_id, decision_request_id)
+            .await?
+        else {
             return Ok(false);
         };
         if decision.state != DecisionState::Resolving {
@@ -6325,15 +6449,15 @@ impl AgentTreeLifecycle {
                 &serde_json::json!({ "source": "host_approval" }).to_string(),
                 &answer_resume_payload(
                     "user",
-                    &PrivateDecisionContinuationAnswer::InterruptResponse {
-                        response,
-                    },
+                    &PrivateDecisionContinuationAnswer::InterruptResponse { response },
                 ),
                 now_unix_ms,
             )
             .await?
         {
-            DecisionTransitionOutcome::Transitioned(row) => Ok(DecisionSettlement::Resolved(row.state)),
+            DecisionTransitionOutcome::Transitioned(row) => {
+                Ok(DecisionSettlement::Resolved(row.state))
+            }
             DecisionTransitionOutcome::AlreadyTerminal(receipt) => {
                 Ok(DecisionSettlement::AlreadyTerminal(receipt.terminal_state))
             }
@@ -6407,7 +6531,7 @@ impl AgentTreeLifecycle {
         let offered = offered.context("host approval cancellation has no offered question set")?;
         ensure!(
             crate::approval::host_approval_response_declines(&response, &offered),
-            "host approval cancellation response is not cancel or an exact offered deny option"
+            "host approval cancellation response is not cancel, an exact offered deny option, or the structured noninteractive denial"
         );
         // Parsing then re-serializing the typed response normalizes the
         // durable continuation payload. The response shape is still the exact
@@ -6449,7 +6573,10 @@ impl AgentTreeLifecycle {
                 )
                 .await?;
             for decision in page.entries {
-                if decision.deadline_unix_ms.is_none_or(|deadline| deadline > now_unix_ms) {
+                if decision
+                    .deadline_unix_ms
+                    .is_none_or(|deadline| deadline > now_unix_ms)
+                {
                     continue;
                 }
                 if matches!(
@@ -6483,7 +6610,11 @@ impl AgentTreeLifecycle {
         decision_request_id: Uuid,
         now_unix_ms: i64,
     ) -> Result<DecisionSettlement> {
-        let Some(decision) = self.db.decision_request(session_id, decision_request_id).await? else {
+        let Some(decision) = self
+            .db
+            .decision_request(session_id, decision_request_id)
+            .await?
+        else {
             return Ok(DecisionSettlement::Retry);
         };
         if is_terminal(decision.state) {
@@ -6494,7 +6625,10 @@ impl AgentTreeLifecycle {
                 .context("terminal decision has no receipt")?;
             return Ok(DecisionSettlement::AlreadyTerminal(receipt.terminal_state));
         }
-        if decision.deadline_unix_ms.is_none_or(|deadline| deadline > now_unix_ms) {
+        if decision
+            .deadline_unix_ms
+            .is_none_or(|deadline| deadline > now_unix_ms)
+        {
             return Ok(DecisionSettlement::Retry);
         }
         self.settle(
@@ -6583,8 +6717,7 @@ impl AgentTreeLifecycle {
                 )
                 .await?;
             pending_decisions.extend(
-                page
-                    .entries
+                page.entries
                     .into_iter()
                     .map(|decision| decision.decision_request_id),
             );
@@ -6598,11 +6731,7 @@ impl AgentTreeLifecycle {
         for agent_instance_id in nonterminal_steer_owners {
             claimed_late_user_steers.extend(
                 self.db
-                    .claim_late_user_decision_steers(
-                        session_id,
-                        agent_instance_id,
-                        recovery_epoch,
-                    )
+                    .claim_late_user_decision_steers(session_id, agent_instance_id, recovery_epoch)
                     .await?,
             );
             accepted_late_user_steers.extend(
@@ -6677,7 +6806,9 @@ impl AgentTreeLifecycle {
             .decision_terminal_receipt(session_id, decision_request_id)
             .await?
             .context("terminal decision has no receipt")?;
-        Ok(DecisionForSettlement::AlreadyTerminal(receipt.terminal_state))
+        Ok(DecisionForSettlement::AlreadyTerminal(
+            receipt.terminal_state,
+        ))
     }
 
     async fn settle(
@@ -6690,32 +6821,36 @@ impl AgentTreeLifecycle {
         now_unix_ms: i64,
     ) -> Result<DecisionSettlement> {
         let outcome = match resume_payload_json {
-            Some(payload) => self
-                .db
-                .resolve_decision_request_with_resume_payload(
-                    session_id,
-                    decision.decision_request_id,
-                    decision.revision,
-                    terminal_state,
-                    receipt_json,
-                    &payload,
-                    now_unix_ms,
-                )
-                .await?,
-            None => self
-                .db
-                .resolve_decision_request(
-                    session_id,
-                    decision.decision_request_id,
-                    decision.revision,
-                    terminal_state,
-                    receipt_json,
-                    now_unix_ms,
-                )
-                .await?,
+            Some(payload) => {
+                self.db
+                    .resolve_decision_request_with_resume_payload(
+                        session_id,
+                        decision.decision_request_id,
+                        decision.revision,
+                        terminal_state,
+                        receipt_json,
+                        &payload,
+                        now_unix_ms,
+                    )
+                    .await?
+            }
+            None => {
+                self.db
+                    .resolve_decision_request(
+                        session_id,
+                        decision.decision_request_id,
+                        decision.revision,
+                        terminal_state,
+                        receipt_json,
+                        now_unix_ms,
+                    )
+                    .await?
+            }
         };
         match outcome {
-            DecisionTransitionOutcome::Transitioned(row) => Ok(DecisionSettlement::Resolved(row.state)),
+            DecisionTransitionOutcome::Transitioned(row) => {
+                Ok(DecisionSettlement::Resolved(row.state))
+            }
             DecisionTransitionOutcome::AlreadyTerminal(receipt) => {
                 Ok(DecisionSettlement::AlreadyTerminal(receipt.terminal_state))
             }
@@ -6813,9 +6948,9 @@ fn validate_answer(decision: &DecisionRequestRow, answer: &PublicDecisionAnswer)
         PublicDecisionAnswer::Option { id } => {
             ensure!(is_safe_option_id(id), "decision option id is invalid");
             ensure!(
-                contract["options"].as_array().is_some_and(|options| options.iter().any(|option| {
-                    option["id"].as_str() == Some(id)
-                })),
+                contract["options"].as_array().is_some_and(|options| options
+                    .iter()
+                    .any(|option| { option["id"].as_str() == Some(id) })),
                 "decision answer is not an offered option"
             );
         }
@@ -6837,7 +6972,10 @@ fn validate_answer(decision: &DecisionRequestRow, answer: &PublicDecisionAnswer)
                 text.chars().count() <= max_chars as usize,
                 "free-text decision answer exceeds its durable contract"
             );
-            ensure!(!text.contains('\0'), "free-text decision answer contains NUL");
+            ensure!(
+                !text.contains('\0'),
+                "free-text decision answer contains NUL"
+            );
         }
         PublicDecisionAnswer::InterruptResponse { .. } => {
             bail!("decision does not own a QuestionTool continuation");
@@ -6856,7 +6994,9 @@ fn validate_bounded_free_text_contract(contract: &FreeTextContract) -> Result<()
             let _ = max_chars;
             Ok(())
         }
-        (true, Some(_)) => bail!("free-text decision maximum must be between 1 and 10000 characters"),
+        (true, Some(_)) => {
+            bail!("free-text decision maximum must be between 1 and 10000 characters")
+        }
         (true, None) => bail!("allowed free-text decisions require an explicit bounded maximum"),
         (false, None) => Ok(()),
         (false, Some(_)) => bail!("disallowed free-text decisions must not carry a maximum"),
@@ -6870,10 +7010,7 @@ fn validate_generic_decision_answer_channels(
     options: &[DecisionOption],
     free_text: Option<&FreeTextContract>,
 ) -> Result<()> {
-    ensure!(
-        options.len() <= 64,
-        "generic decision has too many options"
-    );
+    ensure!(options.len() <= 64, "generic decision has too many options");
     for option in options {
         ensure!(
             is_safe_option_id(&option.id),
@@ -6899,7 +7036,10 @@ fn validate_new_decision_contract_answer_channels(contract: &NewDecisionContract
             );
             interrupt_contract.validate_contract()
         }
-        None => validate_generic_decision_answer_channels(&contract.options, contract.free_text.as_ref()),
+        None => validate_generic_decision_answer_channels(
+            &contract.options,
+            contract.free_text.as_ref(),
+        ),
     }
 }
 
@@ -6955,7 +7095,9 @@ fn public_interrupt_response_from_private_continuation(
         ResolveResponse::Batch { responses } => ResolveResponse::Batch {
             responses: responses
                 .iter()
-                .map(|response| public_interrupt_response_from_private_continuation(response, mappings))
+                .map(|response| {
+                    public_interrupt_response_from_private_continuation(response, mappings)
+                })
                 .collect::<Result<Vec<_>>>()?,
         },
         ResolveResponse::Cancel => ResolveResponse::Cancel,
@@ -6986,7 +7128,7 @@ fn private_decision_continuation_answer_from_public(
         }
         PublicDecisionAnswer::InterruptResponse { response } => {
             Ok(PrivateDecisionContinuationAnswer::InterruptResponse {
-            response: private_interrupt_response_for_continuation(response, mappings)?,
+                response: private_interrupt_response_for_continuation(response, mappings)?,
             })
         }
     }
@@ -7099,9 +7241,9 @@ fn is_terminal(state: DecisionState) -> bool {
 fn is_safe_option_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
 }
 
 /// The AgentTree daemon endpoint exposes only opaque option capabilities.
@@ -7141,7 +7283,8 @@ fn validate_public_option_token(value: &str) -> Result<()> {
     let uuid_text = value
         .strip_prefix("option:")
         .context("public decision option id is not an opaque daemon token")?;
-    let uuid = Uuid::parse_str(uuid_text).context("public decision option id has an invalid UUID")?;
+    let uuid =
+        Uuid::parse_str(uuid_text).context("public decision option id has an invalid UUID")?;
     ensure!(
         !uuid.is_nil()
             && uuid.get_version_num() == 7

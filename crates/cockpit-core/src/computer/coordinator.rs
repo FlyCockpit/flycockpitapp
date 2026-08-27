@@ -2426,7 +2426,8 @@ impl ComputerActionCoordinator {
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
             return CoordinatedOutcome::Denied {
-                reason: "computer action approval is no longer live for this backend handoff".to_string(),
+                reason: "computer action approval is no longer live for this backend handoff"
+                    .to_string(),
             };
         }
 
@@ -2502,10 +2503,7 @@ impl ComputerActionCoordinator {
             .map(ActionRiskClass::classify)
             .unwrap_or(ActionRiskClass::Unknown);
         let action_payload_digest = canonical_computer_action_payload_digest(actions);
-        let lease_binding_digest = self
-            .host_lease
-            .as_ref()
-            .map(host_lease_binding_digest);
+        let lease_binding_digest = self.host_lease.as_ref().map(host_lease_binding_digest);
         let target_binding_digest = target_evidence_binding_digest(
             self.backend_kind,
             self.host_lease.as_ref(),
@@ -2547,10 +2545,7 @@ impl ComputerActionCoordinator {
             .first()
             .map(ActionRiskClass::classify)
             .unwrap_or(ActionRiskClass::Unknown);
-        let lease_binding_digest = self
-            .host_lease
-            .as_ref()
-            .map(host_lease_binding_digest);
+        let lease_binding_digest = self.host_lease.as_ref().map(host_lease_binding_digest);
         let target_evidence_binding_digest = target_evidence_binding_digest(
             self.backend_kind,
             self.host_lease.as_ref(),
@@ -4110,21 +4105,12 @@ mod tests {
 
     #[test]
     fn virtual_target_evidence_has_its_own_exact_approval_binding() {
-        let first = target_evidence_binding_digest(
-            BackendKind::VirtualDisplay,
-            None,
-            Some([0xA1; 16]),
-        );
-        let identical = target_evidence_binding_digest(
-            BackendKind::VirtualDisplay,
-            None,
-            Some([0xA1; 16]),
-        );
-        let different_display = target_evidence_binding_digest(
-            BackendKind::VirtualDisplay,
-            None,
-            Some([0xB2; 16]),
-        );
+        let first =
+            target_evidence_binding_digest(BackendKind::VirtualDisplay, None, Some([0xA1; 16]));
+        let identical =
+            target_evidence_binding_digest(BackendKind::VirtualDisplay, None, Some([0xA1; 16]));
+        let different_display =
+            target_evidence_binding_digest(BackendKind::VirtualDisplay, None, Some([0xB2; 16]));
 
         assert_eq!(first, identical);
         assert_ne!(

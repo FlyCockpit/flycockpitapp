@@ -53,6 +53,7 @@ fn client_manifest_stays_below_application_and_storage_layers() {
         feature_mappings,
         BTreeSet::from([
             "default = []",
+            "extended = [\"cockpit-proto/extended\"]",
             "remote = [\"cockpit-proto/remote\"]",
             "test-support = []",
         ]),

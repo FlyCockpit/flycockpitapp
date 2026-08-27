@@ -39,8 +39,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Context as _;
 use crate::sync::lock_or_recover;
+use anyhow::Context as _;
 
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -347,11 +347,9 @@ impl Drop for HostApprovalEffectHandoff {
         let claimed = self.claimed;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let Ok(db_authority) = authority.db_for_effect_handoff(
-                    session_id,
-                    agent_instance_id,
-                    interrupt_id,
-                ) else {
+                let Ok(db_authority) =
+                    authority.db_for_effect_handoff(session_id, agent_instance_id, interrupt_id)
+                else {
                     return;
                 };
                 if claimed {
@@ -920,12 +918,8 @@ fn take_matching_pre_resolved_interrupt(
     description: &str,
     questions: &InterruptQuestionSet,
 ) -> Option<(Uuid, ResolveResponse)> {
-    let interrupt_id = matching_pre_resolved_interrupt_id(
-        agent_instance_id,
-        agent,
-        description,
-        questions,
-    )?;
+    let interrupt_id =
+        matching_pre_resolved_interrupt_id(agent_instance_id, agent, description, questions)?;
     take_pre_resolved_interrupt(interrupt_id).map(|response| (interrupt_id, response))
 }
 
@@ -953,7 +947,7 @@ fn matching_pre_resolved_interrupt_id(
                         &question.description,
                         &question.questions,
                     )
-                        .as_deref()
+                    .as_deref()
                         == Some(key.as_str()))
                 .then_some(*interrupt_id)
             })
@@ -1956,13 +1950,12 @@ pub async fn raise_and_wait(
     // identity; the root lookup covers driver controls that run outside the
     // turn task-local scope.  Isolated/daemonless helpers intentionally keep
     // the legacy implementation below.
-    let owner = crate::engine::agent::current_agent_instance_id().or(
-        db.session_root_agent(session_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|root| root.agent_instance_id),
-    );
+    let owner = crate::engine::agent::current_agent_instance_id().or(db
+        .session_root_agent(session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|root| root.agent_instance_id));
     match owner {
         Some(agent_instance_id) => {
             raise_and_wait_with_agent_tree(
@@ -1978,7 +1971,18 @@ pub async fn raise_and_wait(
             )
             .await
         }
-        None => raise_and_wait_legacy(db, interrupts, session_id, agent, description, set, log_label).await,
+        None => {
+            raise_and_wait_legacy(
+                db,
+                interrupts,
+                session_id,
+                agent,
+                description,
+                set,
+                log_label,
+            )
+            .await
+        }
     }
 }
 
@@ -2078,7 +2082,9 @@ async fn abort_unbound_host_capability_refresh_initialization(
         .await
     {
         Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationAbort::Aborted) => {}
-        Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationAbort::AlreadyBound) => {
+        Ok(
+            crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationAbort::AlreadyBound,
+        ) => {
             // An ambiguous storage failure may be reported after the bind
             // committed. Preserve that exact bound operation and let its
             // durable terminalizer/recovery path decide its outcome; a stale
@@ -2165,12 +2171,8 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         },
     };
     if let Some(agent_instance_id) = agent_instance_id
-        && let Some((interrupt_id, response)) = take_matching_pre_resolved_interrupt(
-            Some(agent_instance_id),
-            agent,
-            description,
-            &set,
-        )
+        && let Some((interrupt_id, response)) =
+            take_matching_pre_resolved_interrupt(Some(agent_instance_id), agent, description, &set)
     {
         if let Some(operation) = decision_subject.host_approval_operation() {
             // A restart must consume the original persisted approval operation,
@@ -2178,7 +2180,10 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
             // an already-approved effect into Cancel). The caller-provided
             // facts are recomputed from the actual effect input and must match
             // the stored kind/digest before the one-use CAS succeeds.
-            let replayed = match db.decision_request_for_interrupt(session_id, interrupt_id).await {
+            let replayed = match db
+                .decision_request_for_interrupt(session_id, interrupt_id)
+                .await
+            {
                 Ok(Some(decision))
                     if decision.decision_class == "host_approval"
                         && crate::approval::host_approval_response_allows(&response, &set) =>
@@ -2210,10 +2215,11 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                     // we restore the durable operation UUID; handing the
                     // newly allocated prompt UUID to the effect scope would
                     // strand the actual dispatching record on restart.
-                    let operation = match operation.clone().with_persisted_operation_id(operation_id) {
-                        Ok(operation) => operation,
-                        Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
-                    };
+                    let operation =
+                        match operation.clone().with_persisted_operation_id(operation_id) {
+                            Ok(operation) => operation,
+                            Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
+                        };
                     let dispatched = db
                         .consume_host_approval_final_operation(
                             db_authority,
@@ -2341,7 +2347,10 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         }
         #[cfg(not(test))]
         {
-            if matches!(&decision_subject, crate::agent_tree::HostDecisionSubject::UserQuestion) {
+            if matches!(
+                &decision_subject,
+                crate::agent_tree::HostDecisionSubject::UserQuestion
+            ) {
                 return raise_and_wait_legacy(
                     db,
                     interrupts,
@@ -2430,7 +2439,9 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     // which removes the registry entry and leaves no synthetic continuation.
     let pending = interrupts.register(interrupt_id);
     let host_operation = decision_subject.host_approval_operation().cloned();
-    let host_operation_id = host_operation.as_ref().map(|operation| operation.operation_id);
+    let host_operation_id = host_operation
+        .as_ref()
+        .map(|operation| operation.operation_id);
     // The capability is created only after the real interrupt has been
     // raised and registered. It is carried through both reservation and the
     // atomic decision bind; a durable operation UUID alone is never enough.
@@ -2589,14 +2600,11 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         Some(authority) => authority,
         None => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
     };
-    let db_authority = match authority.db_for_effect_handoff(
-        session_id,
-        agent_instance_id,
-        interrupt_id,
-    ) {
-        Ok(authority) => authority,
-        Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
-    };
+    let db_authority =
+        match authority.db_for_effect_handoff(session_id, agent_instance_id, interrupt_id) {
+            Ok(authority) => authority,
+            Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
+        };
     match db
         .consume_host_approval_final_operation(
             db_authority,
@@ -2690,7 +2698,10 @@ mod tests {
 
     async fn running_host_effect_agent() -> (crate::db::Db, Uuid, Uuid, i64) {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("project", "/repo", "builder").await.unwrap();
+        let session = db
+            .create_session("project", "/repo", "builder")
+            .await
+            .unwrap();
         let agent = db
             .create_agent_instance(
                 crate::db::agent_tree_decisions::NewAgentInstance {
@@ -2721,7 +2732,12 @@ mod tests {
             crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent) => agent,
             outcome => panic!("unexpected running transition: {outcome:?}"),
         };
-        (db, session.session_id, agent.agent_instance_id, agent.revision)
+        (
+            db,
+            session.session_id,
+            agent.agent_instance_id,
+            agent.revision,
+        )
     }
 
     async fn insert_ready_host_effect_handoff(
@@ -2734,10 +2750,9 @@ mod tests {
         let candidate = serde_json::from_str::<serde_json::Value>(&operation.canonical_input_json)
             .unwrap()["candidate_effects"][0]
             .clone();
-        let selected_candidate_json = String::from_utf8(
-            crate::agent_tree::canonical_json_bytes(&candidate).unwrap(),
-        )
-        .unwrap();
+        let selected_candidate_json =
+            String::from_utf8(crate::agent_tree::canonical_json_bytes(&candidate).unwrap())
+                .unwrap();
         let operation_id = operation.operation_id.to_string();
         let operation_kind = operation.operation_kind.clone();
         let canonical_input_json = operation.canonical_input_json.clone();
@@ -2963,7 +2978,10 @@ mod tests {
             "pre-bind cleanup test",
         )
         .await;
-        assert!(matches!(outcome, InterruptOutcome::Resolved(ResolveResponse::Cancel)));
+        assert!(matches!(
+            outcome,
+            InterruptOutcome::Resolved(ResolveResponse::Cancel)
+        ));
 
         let child_after = db
             .agent_instance(session.session_id, child.agent_instance_id)
@@ -2975,7 +2993,10 @@ mod tests {
             crate::db::agent_tree_decisions::AgentInstanceState::Cancelled
         );
         assert_eq!(
-            db.list_open_interrupts(session.session_id).await.unwrap().len(),
+            db.list_open_interrupts(session.session_id)
+                .await
+                .unwrap()
+                .len(),
             0,
             "the raw pre-bind interrupt is resolved in the same abort transaction"
         );
@@ -3843,7 +3864,10 @@ mod tests {
     #[tokio::test]
     async fn cancelled_host_approval_effect_recheck_rejects_before_dispatch() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("project", "/repo", "builder").await.unwrap();
+        let session = db
+            .create_session("project", "/repo", "builder")
+            .await
+            .unwrap();
         let agent = db
             .create_agent_instance(
                 crate::db::agent_tree_decisions::NewAgentInstance {
@@ -3892,7 +3916,8 @@ mod tests {
         let operation_kind_for_insert = operation_kind.clone();
         let canonical_input_for_insert = canonical_input_json.clone();
         let input_digest_for_insert = input_digest.clone();
-        let selected_response_json = r#"{"data":{"selected_id":"approve"},"kind":"single"}"#.to_owned();
+        let selected_response_json =
+            r#"{"data":{"selected_id":"approve"},"kind":"single"}"#.to_owned();
         let selected_candidate_json = String::from_utf8(
             crate::agent_tree::canonical_json_bytes(&serde_json::json!({
                 "selection": "approve",
@@ -3960,14 +3985,16 @@ mod tests {
                         operation,
                     ),
                 ));
-                assert!(recheck_current_host_approval_effect_boundary(
-                    "test_effect_boundary",
-                    &[serde_json::json!({
-                        "execute": {"operation": "effect-handoff"},
-                    })],
-                )
-                .await
-                .is_err());
+                assert!(
+                    recheck_current_host_approval_effect_boundary(
+                        "test_effect_boundary",
+                        &[serde_json::json!({
+                            "execute": {"operation": "effect-handoff"},
+                        })],
+                    )
+                    .await
+                    .is_err()
+                );
                 Ok::<(), anyhow::Error>(())
             },
             |_: &()| Some(true),
@@ -4209,7 +4236,10 @@ mod tests {
                 serde_json::json!({"description": "new", "content": "body"}),
             ),
             ("delete", serde_json::json!({"absorbed_into": "umbrella"})),
-            ("remove_file", serde_json::json!({"path": "references/old.md"})),
+            (
+                "remove_file",
+                serde_json::json!({"path": "references/old.md"}),
+            ),
         ] {
             let (db, session_id, agent_instance_id, revision) = running_host_effect_agent().await;
             let root = format!("/external-skills/{action}");
@@ -4348,7 +4378,10 @@ mod tests {
     #[tokio::test]
     async fn nested_effect_cancellation_wins_after_claim_over_outer_success() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("project", "/repo", "builder").await.unwrap();
+        let session = db
+            .create_session("project", "/repo", "builder")
+            .await
+            .unwrap();
         let agent = db
             .create_agent_instance(
                 crate::db::agent_tree_decisions::NewAgentInstance {
@@ -4391,10 +4424,9 @@ mod tests {
             }),
         )
         .unwrap();
-        let selected_candidate_json = String::from_utf8(
-            crate::agent_tree::canonical_json_bytes(&candidate).unwrap(),
-        )
-        .unwrap();
+        let selected_candidate_json =
+            String::from_utf8(crate::agent_tree::canonical_json_bytes(&candidate).unwrap())
+                .unwrap();
         let operation_id = operation.operation_id;
         let operation_kind = operation.operation_kind.clone();
         let canonical_input_json = operation.canonical_input_json.clone();
@@ -4503,13 +4535,19 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(states, ("submission_unknown".into(), "submission_unknown".into()));
+        assert_eq!(
+            states,
+            ("submission_unknown".into(), "submission_unknown".into())
+        );
     }
 
     #[tokio::test]
     async fn pre_resolved_host_approval_replay_completes_the_persisted_operation_receipt() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("project", "/repo", "builder").await.unwrap();
+        let session = db
+            .create_session("project", "/repo", "builder")
+            .await
+            .unwrap();
         let agent = db
             .create_agent_instance(
                 crate::db::agent_tree_decisions::NewAgentInstance {
@@ -4547,11 +4585,9 @@ mod tests {
                 "execute": {"effect": "replay-receipt"},
             }],
         });
-        let persisted_operation = crate::agent_tree::HostApprovalOperation::new(
-            "replay_receipt_effect",
-            input.clone(),
-        )
-        .unwrap();
+        let persisted_operation =
+            crate::agent_tree::HostApprovalOperation::new("replay_receipt_effect", input.clone())
+                .unwrap();
         let persisted_operation_id = persisted_operation.operation_id;
         let question = InterruptQuestion::Single {
             prompt: "Approve replay receipt effect?".into(),
@@ -4632,11 +4668,8 @@ mod tests {
         // Recovery reconstructs the same canonical facts but starts with a
         // fresh UUID. The replay bridge must replace it only after matching
         // the persisted decision and drive that persisted UUID to completion.
-        let replay_operation = crate::agent_tree::HostApprovalOperation::new(
-            "replay_receipt_effect",
-            input,
-        )
-        .unwrap();
+        let replay_operation =
+            crate::agent_tree::HostApprovalOperation::new("replay_receipt_effect", input).unwrap();
         assert_ne!(replay_operation.operation_id, persisted_operation_id);
         let replay_questions = questions.clone();
         let concrete_effect = serde_json::json!({
@@ -4710,8 +4743,12 @@ mod tests {
         .await
         .unwrap();
 
-        let (operation_state, handoff_state, handoff_operation_id, receipt):
-            (String, String, String, String) = db
+        let (operation_state, handoff_state, handoff_operation_id, receipt): (
+            String,
+            String,
+            String,
+            String,
+        ) = db
             .read(move |conn| {
                 conn.query_row(
                     "SELECT operation.state, handoff.state, handoff.operation_id,

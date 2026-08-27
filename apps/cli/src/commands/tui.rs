@@ -224,10 +224,7 @@ mod tests {
 
     #[test]
     fn modes_session_setup_mode_is_the_canonical_proto_type() {
-        assert_eq!(
-            SessionMode::Code,
-            cockpit_tui::tui::app::SessionMode::Code
-        );
+        assert_eq!(SessionMode::Code, cockpit_tui::tui::app::SessionMode::Code);
         assert_eq!(
             SessionMode::Assistant,
             cockpit_tui::tui::app::SessionMode::Assistant

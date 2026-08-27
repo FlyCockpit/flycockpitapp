@@ -1,4 +1,4 @@
-use crate::support::{IsolatedHome, SpawnedDaemon, output_text};
+use crate::support::{IsolatedHome, SpawnedDaemon, assert_success, output_text};
 
 #[test]
 fn reports_unopenable_database() {
@@ -17,26 +17,32 @@ fn reports_unopenable_database() {
     assert!(text.contains("schema: unavailable"), "{text}");
 }
 
-#[test]
-fn reports_amended_migration() {
-    let home = IsolatedHome::new();
-    let first = home
-        .cockpit()
-        .args(["--no-sandbox", "doctor", "--offline"])
+#[tokio::test]
+async fn reports_amended_migration() {
+    // Doctor is read-only and never materializes SQLite. Boot (then stop) a
+    // real daemon so the ledger exists, then amend it and re-run doctor.
+    let daemon = SpawnedDaemon::start().await;
+    let stop = daemon
+        .command()
+        .args(["daemon", "stop", "--grace", "0"])
         .output()
         .unwrap();
-    assert_eq!(first.status.code(), Some(1), "{}", output_text(&first));
+    assert_success(
+        "stop daemon before amending migration ledger",
+        &stop,
+        daemon.home(),
+    );
 
-    let conn = rusqlite::Connection::open(home.db_path()).unwrap();
+    let conn = rusqlite::Connection::open(daemon.db_path()).unwrap();
     conn.execute(
-        "UPDATE schema_version SET sha256 = 'amended' WHERE version = 1",
+        "UPDATE schema_version SET sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE version = 1",
         [],
     )
     .unwrap();
     drop(conn);
 
-    let output = home
-        .cockpit()
+    let output = daemon
+        .command()
         .args(["--no-sandbox", "doctor", "--offline"])
         .output()
         .unwrap();

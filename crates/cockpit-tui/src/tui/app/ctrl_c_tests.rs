@@ -101,8 +101,8 @@ fn auto_prune_notice_renders_muted() {
     use super::App;
     use crate::tui::history::{MarkdownOpts, render_entry};
     use crate::tui::theme::MUTED_COLOR_INDEX;
-    use cockpit_config::extended::{DiffStyle, ThinkingDisplay};
     use cockpit_client::presentation::TurnEvent;
+    use cockpit_config::extended::{DiffStyle, ThinkingDisplay};
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);

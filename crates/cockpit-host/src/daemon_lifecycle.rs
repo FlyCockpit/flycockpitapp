@@ -711,14 +711,42 @@ fn read_process_executable(_pid: u32) -> std::io::Result<PathBuf> {
     ))
 }
 
+/// Kernel existence probe (`kill(pid, 0)`). Used by restart to wait until a
+/// draining daemon has actually exited and released its exclusive boot lock,
+/// not merely unlinked its pid/socket files.
 #[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
+pub fn process_exists(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return true;
+        // An unrepresentable pid cannot be our daemon. Treat it as released
+        // so restart waits do not stall and then attach to an unlinked socket.
+        return false;
     };
     // SAFETY: signal 0 performs an existence/permission probe only.
     let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    if rc != 0 {
+        // ESRCH: gone. EPERM and conversion-adjacent errors: we cannot prove
+        // this pid is our daemon, so fail toward released rather than waiting
+        // forever.
+        return false;
+    }
+    !process_is_unreaped_zombie(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_unreaped_zombie(pid: libc::pid_t) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // comm may contain spaces and parentheses; the state field follows the
+    // last ')' of the comm field.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        == Some("Z")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_unreaped_zombie(_pid: libc::pid_t) -> bool {
+    false
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -936,6 +964,15 @@ mod tests {
         );
         crate::private_fs::write_private_file_exclusive(path, body.as_bytes())
             .expect("receipt fixture");
+    }
+
+    #[test]
+    fn process_exists_reports_current_process_and_treats_unrepresentable_pid_as_released() {
+        assert!(process_exists(std::process::id()));
+        assert!(
+            !process_exists(u32::MAX),
+            "pid conversion failure must fail toward released"
+        );
     }
 
     #[test]

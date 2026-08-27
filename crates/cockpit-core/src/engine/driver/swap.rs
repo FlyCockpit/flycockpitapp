@@ -793,8 +793,13 @@ impl Driver {
             // behind it in the same batch.
             if matches!(
                 &transaction.correlation,
-                TransactionCorrelation::DefaultUpdate { authority: None, .. }
-                    | TransactionCorrelation::RetainedDefaultUpdate { authority: None, .. }
+                TransactionCorrelation::DefaultUpdate {
+                    authority: None,
+                    ..
+                } | TransactionCorrelation::RetainedDefaultUpdate {
+                    authority: None,
+                    ..
+                }
             ) {
                 tracing::warn!(
                     session_id = %self.session.id,
@@ -896,9 +901,7 @@ impl Driver {
                                 default_update_id,
                                 crate::db::session_log::DefaultModelUpdateReceipt {
                                     outcome_json: encoded,
-                                    authority_revision: Some(
-                                        authority.authority_revision.clone(),
-                                    ),
+                                    authority_revision: Some(authority.authority_revision.clone()),
                                     config_generation: Some(authority.config_generation),
                                 },
                             )
@@ -1002,12 +1005,12 @@ impl Driver {
                                 Some(authority.config_generation),
                             )
                         }
-                        crate::daemon::proto::DefaultModelStandaloneOutcome::Rejected { .. } => {
-                            (
-                                Some(authority.authority_revision.clone()),
-                                Some(authority.config_generation),
-                            )
-                        }
+                        crate::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
+                            ..
+                        } => (
+                            Some(authority.authority_revision.clone()),
+                            Some(authority.config_generation),
+                        ),
                     };
                     let receipt = self
                         .session
@@ -1453,10 +1456,9 @@ impl Driver {
         // and retained snapshot have been projected. Without this gate a
         // driver could capture Trust, then write a project layer after an
         // IgnoreConfig decision committed.
-        let _config_publication_guard =
-            crate::daemon::server::CONFIG_PUBLICATION_RPC_LOCK
-                .lock()
-                .await;
+        let _config_publication_guard = crate::daemon::server::CONFIG_PUBLICATION_RPC_LOCK
+            .lock()
+            .await;
 
         let prior_session = self
             .session

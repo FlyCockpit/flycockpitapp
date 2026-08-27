@@ -984,8 +984,40 @@ pub async fn wait_for_restart_release(
 }
 
 fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
-    let pid_released = expected_pid.is_none_or(|pid| read_pid_file(&paths.pid_file) != Some(pid));
-    pid_released && !paths.pid_file.exists() && !paths.socket.exists()
+    let pid_file_released =
+        expected_pid.is_none_or(|pid| read_pid_file(&paths.pid_file) != Some(pid));
+    // The exclusive SQLite boot lock is a kernel flock on the dying
+    // process. Pid/socket files are unlinked during drain *before* that
+    // process exits; spawning the replacement then fails with
+    // `database already has a live exclusive owner`.
+    let process_released = expected_pid.is_none_or(|pid| {
+        #[cfg(unix)]
+        {
+            if !cockpit_host::daemon_lifecycle::process_exists(pid) {
+                return true;
+            }
+            match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
+                Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt))
+                    if receipt.pid == pid =>
+                {
+                    matches!(
+                        cockpit_host::daemon_lifecycle::verify_cockpit_daemon_receipt_identity(
+                            &receipt
+                        ),
+                        cockpit_host::daemon_lifecycle::PidIdentity::Missing
+                            | cockpit_host::daemon_lifecycle::PidIdentity::NotDaemon
+                    )
+                }
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            true
+        }
+    });
+    pid_file_released && process_released && !paths.pid_file.exists() && !paths.socket.exists()
 }
 
 /// Spawn a detached *ephemeral* daemon bound to `paths` (a unique
@@ -3198,6 +3230,18 @@ mod tests {
 
         assert!(paths.pid_file.exists());
         assert!(paths.socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_release_waits_for_old_pid_exit_not_just_unlinked_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        assert!(
+            !restart_metadata_released(&paths, Some(std::process::id())),
+            "a still-live predecessor must block replacement spawn even after pid/socket unlink"
+        );
+        assert!(restart_metadata_released(&paths, None));
     }
 
     #[cfg(unix)]

@@ -143,10 +143,7 @@ pub enum DriverControl {
         // for the whole recovered recursive subtree. The worker installs all
         // of them before it consumes any claim or resumes a pending decision.
         respond_to: tokio::sync::oneshot::Sender<
-            std::result::Result<
-                Vec<RecoveredNoninteractiveResolverEndpoint>,
-                String,
-            >,
+            std::result::Result<Vec<RecoveredNoninteractiveResolverEndpoint>, String>,
         >,
     },
     /// Rebuild the live members of one durable batch through a single
@@ -156,10 +153,7 @@ pub enum DriverControl {
         recoveries: Vec<RecoveredNoninteractiveTaskChild>,
         terminal_children: Vec<RecoveredNoninteractiveTaskTerminal>,
         respond_to: tokio::sync::oneshot::Sender<
-            std::result::Result<
-                Vec<RecoveredNoninteractiveResolverEndpoint>,
-                String,
-            >,
+            std::result::Result<Vec<RecoveredNoninteractiveResolverEndpoint>, String>,
         >,
     },
     #[cfg(test)]
@@ -461,7 +455,9 @@ impl RecoveryActivationGate {
             notified.as_mut().enable();
             match self.state.load(std::sync::atomic::Ordering::Acquire) {
                 Self::RELEASED => return Ok(()),
-                Self::ABORTED => anyhow::bail!("recovered executor activation was aborted before its resume claim was consumed"),
+                Self::ABORTED => anyhow::bail!(
+                    "recovered executor activation was aborted before its resume claim was consumed"
+                ),
                 Self::PENDING => notified.await,
                 _ => anyhow::bail!("recovered executor activation gate has an invalid state"),
             }
@@ -549,8 +545,12 @@ pub enum LateUserSteerContinuationOutcome {
     /// worker: its receipt stays attached until the checkpoint reaches a
     /// terminal boundary.
     Parked,
-    Interrupted { reason: String },
-    Failed { reason: String },
+    Interrupted {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 impl LateUserSteerContinuationOutcome {
@@ -3312,9 +3312,7 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) -> anyhow::Result<crate::engine::agent::AgentTreeEndpointGeneration> {
         anyhow::ensure!(
-            self.stack
-                .last()
-                .and_then(|frame| frame.agent_instance_id)
+            self.stack.last().and_then(|frame| frame.agent_instance_id)
                 == Some(recovery.parent_agent_instance_id),
             "recovered interactive task parent is not the exact live continuation"
         );
@@ -3329,10 +3327,9 @@ impl Driver {
                 == Some(recovery.child_agent.as_str()),
             "recovered task child agent does not match its durable descriptor"
         );
-        let model = crate::engine::model_roles::DelegationModelSelector::from_value(
-            args.get("model"),
-        )
-        .map_err(anyhow::Error::msg)?;
+        let model =
+            crate::engine::model_roles::DelegationModelSelector::from_value(args.get("model"))
+                .map_err(anyhow::Error::msg)?;
         let remaining_depth = args
             .get("remaining_depth")
             .and_then(serde_json::Value::as_u64)
@@ -3379,7 +3376,10 @@ impl Driver {
         let recovered_late_user_steer_continuation_id = snapshot
             .get("late_user_steer_continuation_id")
             .and_then(serde_json::Value::as_str)
-            .map(|raw| uuid::Uuid::parse_str(raw).context("recovered interactive late steer continuation id is not a UUID"))
+            .map(|raw| {
+                uuid::Uuid::parse_str(raw)
+                    .context("recovered interactive late steer continuation id is not a UUID")
+            })
             .transpose()?;
         let recovered_late_steer_permit = match (
             recovered_late_user_steer_continuation_id,
@@ -3431,8 +3431,8 @@ impl Driver {
                     .map(|next_prompt| (continuation_id.continuation_id, next_prompt))
             })
             .transpose()?;
-        let next_prompt = snapshot_next_prompt
-            .unwrap_or_else(|| Message::user(recovery.payload.clone()));
+        let next_prompt =
+            snapshot_next_prompt.unwrap_or_else(|| Message::user(recovery.payload.clone()));
         if accepted_late_steer_next_prompt.is_some()
             && self
                 .recovered_interactive_late_steer_continuations
@@ -3529,7 +3529,10 @@ impl Driver {
                     pending_response: None,
                 },
             );
-            debug_assert!(previous.is_none(), "checked before attaching interactive executor");
+            debug_assert!(
+                previous.is_none(),
+                "checked before attaching interactive executor"
+            );
         }
         if recovered_child_has_parked_continuation
             || recovered_late_user_steer_continuation_id.is_some()
@@ -3662,8 +3665,13 @@ impl Driver {
                 .await
             {
                 Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_))
-                | Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_)) => return,
-                Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict) => continue,
+                | Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_)) =>
+                {
+                    return;
+                }
+                Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict) => {
+                    continue;
+                }
                 Err(error) => {
                     tracing::warn!(%error, %agent_instance_id, "terminalizing interactive agent-tree executor failed");
                     return;
@@ -3689,10 +3697,7 @@ impl Driver {
     /// is deliberately never queued on this path.  The replayed tool result
     /// becomes the only next model prompt and carries the same permit through
     /// its final provider/completion boundary.
-    fn restore_recovered_parked_late_steer(
-        &mut self,
-        agent_instance_id: uuid::Uuid,
-    ) -> Result<()> {
+    fn restore_recovered_parked_late_steer(&mut self, agent_instance_id: uuid::Uuid) -> Result<()> {
         let Some(recovered) = self
             .recovered_interactive_late_steer_continuations
             .get(&agent_instance_id)
@@ -3736,9 +3741,11 @@ impl Driver {
             },
         );
         if let Some(previous) = previous {
-            let _ = previous.respond_to.send(LateUserSteerContinuationOutcome::failed(
-                "late user steer synthetic replay receipt identity collision",
-            ));
+            let _ = previous
+                .respond_to
+                .send(LateUserSteerContinuationOutcome::failed(
+                    "late user steer synthetic replay receipt identity collision",
+                ));
             bail!("late user steer synthetic replay receipt identity collision");
         }
         self.stack
@@ -3970,46 +3977,46 @@ impl Driver {
                 crate::engine::agent::with_agent_instance_id(
                     top.agent_instance_id,
                     crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                    late_user_steer_permit.map(|permit| {
-                        crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                        late_user_steer_permit.map(|permit| {
+                            crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                                self.session.clone(),
+                                permit.steer_id,
+                                permit.continuation_id,
+                                permit.agent_instance_id,
+                                permit.recovery_epoch,
+                                cancel.clone(),
+                            )
+                        }),
+                        turn_with_backup(
+                            &agent,
+                            backup_model.as_ref(),
+                            &fallback_models,
+                            &mut top.history,
+                            next_prompt.clone(),
                             self.session.clone(),
-                            permit.steer_id,
-                            permit.continuation_id,
-                            permit.agent_instance_id,
-                            permit.recovery_epoch,
+                            self.locks.clone(),
+                            self.redact.clone(),
+                            self.cwd.clone(),
+                            self.config.clone(),
+                            self.interrupts.clone(),
                             cancel.clone(),
-                        )
-                    }),
-                    turn_with_backup(
-                    &agent,
-                    backup_model.as_ref(),
-                    &fallback_models,
-                    &mut top.history,
-                    next_prompt.clone(),
-                    self.session.clone(),
-                    self.locks.clone(),
-                    self.redact.clone(),
-                    self.cwd.clone(),
-                    self.config.clone(),
-                    self.interrupts.clone(),
-                    cancel.clone(),
-                    self.approver.clone(),
-                    self.lsp.clone(),
-                    self.resource_scheduler.clone(),
-                    self.loop_guard_threshold,
-                    is_root,
-                    crate::skills::manage::SkillWriteOrigin::Foreground,
-                    None,
-                    context_usage,
-                    deferred_log,
-                    call_id,
-                    tandem.as_ref(),
-                    self.goal_root_turn
-                        .map(|(goal_id, generation, _)| (goal_id, generation)),
-                    Some(lifecycle_turn_id.clone()),
-                    tx,
-                    Some(&mut turn_metadata),
-                    ),
+                            self.approver.clone(),
+                            self.lsp.clone(),
+                            self.resource_scheduler.clone(),
+                            self.loop_guard_threshold,
+                            is_root,
+                            crate::skills::manage::SkillWriteOrigin::Foreground,
+                            None,
+                            context_usage,
+                            deferred_log,
+                            call_id,
+                            tandem.as_ref(),
+                            self.goal_root_turn
+                                .map(|(goal_id, generation, _)| (goal_id, generation)),
+                            Some(lifecycle_turn_id.clone()),
+                            tx,
+                            Some(&mut turn_metadata),
+                        ),
                     ),
                 )
                 .await
@@ -4042,9 +4049,8 @@ impl Driver {
                         tx,
                     )
                     .await;
-                    let _ = self.take_late_steer_for_interactive_root_terminal(
-                        &mut late_user_steer_permit,
-                    );
+                    let _ = self
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     self.finish_late_steer_deliveries(
                         &late_user_steer_queue_item_ids,
                         LateUserSteerContinuationOutcome::Cancelled,
@@ -4059,9 +4065,8 @@ impl Driver {
                         tx,
                     )
                     .await;
-                    let _ = self.take_late_steer_for_interactive_root_terminal(
-                        &mut late_user_steer_permit,
-                    );
+                    let _ = self
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     self.finish_late_steer_deliveries(
                         &late_user_steer_queue_item_ids,
                         LateUserSteerContinuationOutcome::interrupted(
@@ -4096,9 +4101,8 @@ impl Driver {
                         tx,
                     )
                     .await;
-                    let _ = self.take_late_steer_for_interactive_root_terminal(
-                        &mut late_user_steer_permit,
-                    );
+                    let _ = self
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     self.finish_late_steer_deliveries(
                         &late_user_steer_queue_item_ids,
                         LateUserSteerContinuationOutcome::failed(format!(
@@ -4190,9 +4194,7 @@ impl Driver {
                         }
                     }
                     if let Some(permit) = self
-                        .take_late_steer_for_interactive_root_terminal(
-                            &mut late_user_steer_permit,
-                        )
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit)
                     {
                         self.finish_late_steer_deliveries(
                             &self.late_steer_queue_item_ids_for_permit(permit),
@@ -4620,11 +4622,9 @@ impl Driver {
     /// dispatch (preflight, deadline, and recovery gates): those are orderly
     /// driver exits, not evidence that the user steer ran.
     fn begin_late_steer_continuation(&mut self) {
-        self.late_steer_continuation_outcome = Some(
-            LateUserSteerContinuationOutcome::interrupted(
-                "late user steer did not reach a completed continuation",
-            ),
-        );
+        self.late_steer_continuation_outcome = Some(LateUserSteerContinuationOutcome::interrupted(
+            "late user steer did not reach a completed continuation",
+        ));
     }
 
     /// Record an explicit terminal result only while a late-steer run is
@@ -4703,16 +4703,19 @@ impl Driver {
         respond_to: tokio::sync::oneshot::Sender<LateUserSteerContinuationOutcome>,
         input_queue: &crate::engine::message::UserSubmissionQueue,
     ) {
-        let checkpoint = match serde_json::from_str::<serde_json::Value>(continuation_checkpoint_json) {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => {
-                let _ = respond_to.send(LateUserSteerContinuationOutcome::failed(format!(
-                    "accepted late steer continuation checkpoint is malformed: {error}"
-                )));
-                return;
-            }
-        };
-        let checkpoint_matches = checkpoint.get("version").and_then(serde_json::Value::as_u64)
+        let checkpoint =
+            match serde_json::from_str::<serde_json::Value>(continuation_checkpoint_json) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    let _ = respond_to.send(LateUserSteerContinuationOutcome::failed(format!(
+                        "accepted late steer continuation checkpoint is malformed: {error}"
+                    )));
+                    return;
+                }
+            };
+        let checkpoint_matches = checkpoint
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
             == Some(1)
             && checkpoint
                 .get("steer_id")
@@ -4807,9 +4810,11 @@ impl Driver {
                 respond_to,
             },
         ) {
-            let _ = previous.respond_to.send(LateUserSteerContinuationOutcome::failed(
-                "late user steer queue identity collision",
-            ));
+            let _ = previous
+                .respond_to
+                .send(LateUserSteerContinuationOutcome::failed(
+                    "late user steer queue identity collision",
+                ));
         }
     }
 
@@ -4891,8 +4896,7 @@ impl Driver {
                     .await
                 {
                     Ok(Some(agent)) => {
-                        agent.state
-                            == crate::db::agent_tree_decisions::AgentInstanceState::Running
+                        agent.state == crate::db::agent_tree_decisions::AgentInstanceState::Running
                     }
                     Ok(None) => false,
                     Err(error) => {
@@ -4941,11 +4945,11 @@ impl Driver {
                         // Queue ids are freshly allocated. If that invariant is
                         // ever violated, fail the prior claim closed rather
                         // than silently replacing its acknowledgement handle.
-                        let _ = previous.respond_to.send(
-                            LateUserSteerContinuationOutcome::failed(
+                        let _ = previous
+                            .respond_to
+                            .send(LateUserSteerContinuationOutcome::failed(
                                 "late user steer queue identity collision",
-                            ),
-                        );
+                            ));
                     }
                 } else {
                     let _ = respond_to.send(LateUserSteerContinuationOutcome::interrupted(
@@ -4974,8 +4978,7 @@ impl Driver {
                             frame.history.clone(),
                             frame.agent.name.clone(),
                         )
-                    })
-                {
+                    }) {
                     // The endpoint belongs to the actual parent frame. Reuse
                     // its complete live request context, not merely its
                     // provider/model selection: retaining the exact system,
@@ -4990,19 +4993,21 @@ impl Driver {
                             .clone()
                             .unwrap_or_default();
                         model
-                        .text_completion_with_live_context(
-                            crate::engine::model::UtilityCallSite::AgentTreeDecision,
-                            params,
-                            &system,
-                            &history,
-                            &prompt,
-                            &agent_name,
-                            &cancel,
-                        )
-                        .await
-                        .map_err(|error| format!("warm parent resolver failed: {error:#}"))
+                            .text_completion_with_live_context(
+                                crate::engine::model::UtilityCallSite::AgentTreeDecision,
+                                params,
+                                &system,
+                                &history,
+                                &prompt,
+                                &agent_name,
+                                &cancel,
+                            )
+                            .await
+                            .map_err(|error| format!("warm parent resolver failed: {error:#}"))
                     }
-                    None => Err("warm parent resolver has no live exact agent executor".to_string()),
+                    None => {
+                        Err("warm parent resolver has no live exact agent executor".to_string())
+                    }
                 };
                 let _ = respond_to.send(result);
             }
@@ -5238,7 +5243,9 @@ impl Driver {
                 transactions,
                 respond_to,
             } => {
-                let result = self.emit_recovered_default_terminals(transactions, tx).await;
+                let result = self
+                    .emit_recovered_default_terminals(transactions, tx)
+                    .await;
                 if let Some(respond_to) = respond_to {
                     let _ = respond_to.send(result);
                 }
@@ -8516,7 +8523,7 @@ impl Driver {
                     self.active_agent(),
                     "Unbounded schedule loop approval",
                     InterruptQuestionSet {
-                    questions: vec![question.clone()],
+                        questions: vec![question.clone()],
                     },
                 )
                 .await?;
@@ -8813,7 +8820,9 @@ impl Driver {
                         .await;
                     }
                 }
-                Err(error) => tracing::warn!(%error, task_call_id = %pending.call_id, "completing interactive task child failed"),
+                Err(error) => {
+                    tracing::warn!(%error, task_call_id = %pending.call_id, "completing interactive task child failed")
+                }
             }
         }
         child.answering.map(|pending| {
@@ -9002,7 +9011,9 @@ impl Driver {
                     .await
                 {
                     Ok(_) => {}
-                    Err(error) => tracing::warn!(%error, task_call_id = %pending.call_id, "failing interactive task child failed"),
+                    Err(error) => {
+                        tracing::warn!(%error, task_call_id = %pending.call_id, "failing interactive task child failed")
+                    }
                 }
             }
 
@@ -9111,7 +9122,7 @@ impl Driver {
                 &queue_item_ids,
                 LateUserSteerContinuationOutcome::interrupted(error),
             )
-                .await;
+            .await;
             return Ok(());
         }
         let tracks_late_steer = queue_item_ids.iter().any(|queue_item_id| {
@@ -9195,13 +9206,10 @@ impl Driver {
         // durable task snapshot causes a fresh reattach; once this method owns
         // it, the normal turn path persists the next checkpoint before any
         // further model call.
-        let recovered_next_prompt = submission
-            .queue_item_ids
-            .iter()
-            .find_map(|queue_item_id| {
-                self.recovered_interactive_continuations
-                    .remove(queue_item_id)
-            });
+        let recovered_next_prompt = submission.queue_item_ids.iter().find_map(|queue_item_id| {
+            self.recovered_interactive_continuations
+                .remove(queue_item_id)
+        });
         let submission_has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
@@ -10084,18 +10092,16 @@ impl Driver {
         // Capture the immutable permit once per submitted steer-run.  It stays
         // in scope across model/tool continuation rounds, while only the first
         // round consumes the durable external-journal continuation id.
-        let mut late_user_steer_permit = queue_item_ids
-            .iter()
-            .find_map(|queue_item_id| {
-                self.pending_late_user_steer_acks
-                    .get(queue_item_id)
-                    .map(|pending| LateUserSteerPermitIdentity {
-                        steer_id: pending.steer_id,
-                        continuation_id: pending.continuation_id,
-                        recovery_epoch: pending.recovery_epoch,
-                        agent_instance_id: pending.agent_instance_id,
-                    })
-            });
+        let mut late_user_steer_permit = queue_item_ids.iter().find_map(|queue_item_id| {
+            self.pending_late_user_steer_acks
+                .get(queue_item_id)
+                .map(|pending| LateUserSteerPermitIdentity {
+                    steer_id: pending.steer_id,
+                    continuation_id: pending.continuation_id,
+                    recovery_epoch: pending.recovery_epoch,
+                    agent_instance_id: pending.agent_instance_id,
+                })
+        });
         let mut late_user_steer_first_call_id =
             late_user_steer_permit.map(|permit| permit.continuation_id);
         if let Some(permit) = late_user_steer_permit {
@@ -10141,8 +10147,7 @@ impl Driver {
             // external-journal before-handoff fence: a crash/recovery cannot
             // dispatch its provider turn a second time under a new UUID.
             let late_user_steer_continuation_id = late_user_steer_first_call_id.take();
-            let call_id = late_user_steer_continuation_id
-                .unwrap_or_else(uuid::Uuid::new_v4);
+            let call_id = late_user_steer_continuation_id.unwrap_or_else(uuid::Uuid::new_v4);
             let context_usage = self.context_usage_snapshot();
 
             // Model-comparison tandem (shadow) set for this turn. Cloned out of
@@ -10169,7 +10174,7 @@ impl Driver {
                 &next_prompt,
                 late_user_steer_permit.map(|permit| permit.continuation_id),
             )
-                .await?;
+            .await?;
             // Run-invocation turn reservation: exact N max, terminal before N+1.
             if let Some(run_id) = run_invocation_id {
                 let now = std::time::SystemTime::now()
@@ -10261,50 +10266,50 @@ impl Driver {
                 crate::engine::agent::with_agent_instance_id(
                     top.agent_instance_id,
                     crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                    late_user_steer_permit.map(|permit| {
-                        crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                        late_user_steer_permit.map(|permit| {
+                            crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                                self.session.clone(),
+                                permit.steer_id,
+                                permit.continuation_id,
+                                permit.agent_instance_id,
+                                permit.recovery_epoch,
+                                cancel.clone(),
+                            )
+                        }),
+                        turn_with_backup(
+                            &agent,
+                            backup_model.as_ref(),
+                            &fallback_models,
+                            &mut top.history,
+                            next_prompt.clone(),
                             self.session.clone(),
-                            permit.steer_id,
-                            permit.continuation_id,
-                            permit.agent_instance_id,
-                            permit.recovery_epoch,
+                            self.locks.clone(),
+                            self.redact.clone(),
+                            self.cwd.clone(),
+                            self.config.clone(),
+                            self.interrupts.clone(),
                             cancel.clone(),
-                        )
-                    }),
-                    turn_with_backup(
-                    &agent,
-                    backup_model.as_ref(),
-                    &fallback_models,
-                    &mut top.history,
-                    next_prompt.clone(),
-                    self.session.clone(),
-                    self.locks.clone(),
-                    self.redact.clone(),
-                    self.cwd.clone(),
-                    self.config.clone(),
-                    self.interrupts.clone(),
-                    cancel.clone(),
-                    self.approver.clone(),
-                    self.lsp.clone(),
-                    self.resource_scheduler.clone(),
-                    self.loop_guard_threshold,
-                    is_root,
-                    crate::skills::manage::SkillWriteOrigin::Foreground,
-                    None,
-                    context_usage,
-                    deferred_log,
-                    // The main/interactive frames never register the `seed`
-                    // tool (it's a read-only-noninteractive-subagent + normal-
-                    // mode affordance, GOALS §3c); a fresh empty collector
-                    // satisfies the signature and is never drained here.
-                    call_id,
-                    tandem.as_ref(),
-                    self.goal_root_turn
-                        .map(|(goal_id, generation, _)| (goal_id, generation)),
-                    Some(lifecycle_turn_id.clone()),
-                    tx,
-                    Some(&mut turn_metadata),
-                    ),
+                            self.approver.clone(),
+                            self.lsp.clone(),
+                            self.resource_scheduler.clone(),
+                            self.loop_guard_threshold,
+                            is_root,
+                            crate::skills::manage::SkillWriteOrigin::Foreground,
+                            None,
+                            context_usage,
+                            deferred_log,
+                            // The main/interactive frames never register the `seed`
+                            // tool (it's a read-only-noninteractive-subagent + normal-
+                            // mode affordance, GOALS §3c); a fresh empty collector
+                            // satisfies the signature and is never drained here.
+                            call_id,
+                            tandem.as_ref(),
+                            self.goal_root_turn
+                                .map(|(goal_id, generation, _)| (goal_id, generation)),
+                            Some(lifecycle_turn_id.clone()),
+                            tx,
+                            Some(&mut turn_metadata),
+                        ),
                     ),
                 )
                 .await
@@ -10337,9 +10342,7 @@ impl Driver {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
                         code: "parked_interrupt".to_string(),
                     });
-                    self.finish_late_steer_continuation(
-                        LateUserSteerContinuationOutcome::Parked,
-                    );
+                    self.finish_late_steer_continuation(LateUserSteerContinuationOutcome::Parked);
                     return Ok(());
                 }
                 Err(e) if crate::engine::model::is_late_user_steer_deferred(&e) => {
@@ -10354,9 +10357,8 @@ impl Driver {
                             "late user steer deferred behind a newer owner continuation",
                         ),
                     );
-                    let _ = self.take_late_steer_for_interactive_root_terminal(
-                        &mut late_user_steer_permit,
-                    );
+                    let _ = self
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());
                 }
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
@@ -10390,9 +10392,8 @@ impl Driver {
                         tx,
                     )
                     .await;
-                    let _ = self.take_late_steer_for_interactive_root_terminal(
-                        &mut late_user_steer_permit,
-                    );
+                    let _ = self
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());
                 }
                 // The daemon began draining (`daemon-graceful-drain-shutdown.md`):
@@ -10413,9 +10414,8 @@ impl Driver {
                         tx,
                     )
                     .await;
-                    let _ = self.take_late_steer_for_interactive_root_terminal(
-                        &mut late_user_steer_permit,
-                    );
+                    let _ = self
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());
                 }
                 // A terminal inference failure (TTFT / idle timeout, network,
@@ -10443,12 +10443,9 @@ impl Driver {
                     );
                     self.record_failed_turn_recovery(&agent, &attempted_prompt, call_id, f, tx)
                         .await;
-                    self.finish_late_steer_continuation(
-                        LateUserSteerContinuationOutcome::failed(format!(
-                            "late user steer inference failed: {}",
-                            f.class
-                        )),
-                    );
+                    self.finish_late_steer_continuation(LateUserSteerContinuationOutcome::failed(
+                        format!("late user steer inference failed: {}", f.class),
+                    ));
                     if !self.handle_goal_usage_limit_failure(f, tx).await {
                         self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
                             class: f.class.clone(),
@@ -10480,15 +10477,13 @@ impl Driver {
                         tx,
                     )
                     .await;
-                    let _ = self.take_late_steer_for_interactive_root_terminal(
-                        &mut late_user_steer_permit,
-                    );
+                    let _ = self
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());
                 }
                 Err(e) => {
-                    let _ = self.take_late_steer_for_interactive_root_terminal(
-                        &mut late_user_steer_permit,
-                    );
+                    let _ = self
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Err(e);
                 }
             };
@@ -10713,34 +10708,34 @@ impl Driver {
                         let target_id = self.active_queue_target_id();
                         drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
                         if let Some(queued) = queued.into_iter().next() {
-                        let queue_item_ids = queued.queue_item_ids.clone();
-                        match queued.kind {
-                            UserSubmissionKind::Compact => {
-                                self.do_compact(tx).await;
-                                input_rx.finish(&queue_item_ids).await;
-                                continue;
-                            }
-                            UserSubmissionKind::User => {
-                                let Some(prepared) = self
-                                    .prepare_queued_user_submission(queued, input_rx, tx)
-                                    .await
-                                else {
+                            let queue_item_ids = queued.queue_item_ids.clone();
+                            match queued.kind {
+                                UserSubmissionKind::Compact => {
+                                    self.do_compact(tx).await;
                                     input_rx.finish(&queue_item_ids).await;
-                                    return Ok(());
-                                };
-                                if self.record_queued_user_fold(&prepared, tx).await.is_err() {
-                                    input_rx
-                                        .requeue_front_after(
-                                            prepared,
-                                            self.active_queue_target(),
-                                            DURABLE_SUBMISSION_RETRY_BACKOFF,
-                                        )
-                                        .await;
-                                    return Ok(());
+                                    continue;
                                 }
-                                input_rx.finish(&queue_item_ids).await;
-                                self.reset_delegation_retry_budget();
-                                next_prompt =
+                                UserSubmissionKind::User => {
+                                    let Some(prepared) = self
+                                        .prepare_queued_user_submission(queued, input_rx, tx)
+                                        .await
+                                    else {
+                                        input_rx.finish(&queue_item_ids).await;
+                                        return Ok(());
+                                    };
+                                    if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+                                        input_rx
+                                            .requeue_front_after(
+                                                prepared,
+                                                self.active_queue_target(),
+                                                DURABLE_SUBMISSION_RETRY_BACKOFF,
+                                            )
+                                            .await;
+                                        return Ok(());
+                                    }
+                                    input_rx.finish(&queue_item_ids).await;
+                                    self.reset_delegation_retry_budget();
+                                    next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
                                         expected_model_state_generation: None,
                                         expected_model: None,
@@ -10760,12 +10755,12 @@ impl Driver {
                                         pending_terminal_disposition: None,
                                         run_invocation_id: prepared.run_invocation_id,
                                     });
-                                // Continue under the next invocation's identity when present.
-                                // (Outer `run_invocation_id` still binds the original run.)
-                                continue;
+                                    // Continue under the next invocation's identity when present.
+                                    // (Outer `run_invocation_id` still binds the original run.)
+                                    continue;
+                                }
                             }
                         }
-                    }
                     }
                     // Root turn reached a genuine normal `Done` and no queued
                     // user work remains: consult the ROOT stop gate. This is the
@@ -10836,9 +10831,8 @@ impl Driver {
                     self.finish_late_steer_continuation(
                         LateUserSteerContinuationOutcome::Completed,
                     );
-                    let _ = self.take_late_steer_for_interactive_root_terminal(
-                        &mut late_user_steer_permit,
-                    );
+                    let _ = self
+                        .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());
                 }
                 TurnOutcome::SpawnSubagent {
@@ -10990,10 +10984,8 @@ impl Driver {
                             continue;
                         }
                     }
-                    let Some(parent_agent_instance_id) = self
-                        .stack
-                        .last()
-                        .and_then(|frame| frame.agent_instance_id)
+                    let Some(parent_agent_instance_id) =
+                        self.stack.last().and_then(|frame| frame.agent_instance_id)
                     else {
                         tracing::warn!("interactive task started without a durable parent agent");
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -11067,10 +11059,12 @@ impl Driver {
                         )
                         .await
                     {
-                        Ok(mut children) if children.len() == 1 => children
-                            .pop()
-                            .expect("one published interactive child")
-                            .agent_instance_id,
+                        Ok(mut children) if children.len() == 1 => {
+                            children
+                                .pop()
+                                .expect("one published interactive child")
+                                .agent_instance_id
+                        }
                         Ok(_) => {
                             tracing::error!(%task_call_id, "interactive task publication returned an invalid child count");
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -11806,7 +11800,7 @@ impl Driver {
             env_overlay: self.stack[0].agent.env_overlay.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
-            session_short_id: self.session.short_id.clone(),
+            session_short_id: self.session.short_id(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,

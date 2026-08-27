@@ -1976,7 +1976,9 @@ where
         initial_model: None,
         no_sandbox: ctx.no_sandbox,
         interactive: true,
-        session_entry_mode: target_session_id.is_none().then_some(ctx.session_entry_mode),
+        session_entry_mode: target_session_id
+            .is_none()
+            .then_some(ctx.session_entry_mode),
         model_override: None,
         client_protocol_version,
         env_snapshot: Some(ctx.env_snapshot.clone()),
@@ -2186,7 +2188,9 @@ pub async fn try_spawn_with_model(
         no_sandbox,
         lifecycle,
         intent,
-        session_id.is_none().then_some(proto::SessionEntryMode::Code),
+        session_id
+            .is_none()
+            .then_some(proto::SessionEntryMode::Code),
     )
     .await
 }
@@ -2776,12 +2780,9 @@ async fn try_spawn_inner(
                         .handle_event_with_resync(
                             event,
                             move |_session_id, attach_snapshot, last| async move {
-                                let attached = reconnect_and_attach(
-                                    &resync_driver,
-                                    &attach_snapshot,
-                                    &last,
-                                )
-                                .await?;
+                                let attached =
+                                    reconnect_and_attach(&resync_driver, &attach_snapshot, &last)
+                                        .await?;
                                 let (new_client, payload) = split_reconnect_attached(attached);
                                 *resync_current_client.write().await = new_client;
                                 Ok(payload)
@@ -2818,13 +2819,7 @@ async fn try_spawn_inner(
                     let Some(session_id) = attach_snapshot.session_id else {
                         return;
                     };
-                    match reconnect_and_attach(
-                        &driver,
-                        &attach_snapshot,
-                        &last_applied_seq,
-                    )
-                    .await
-                    {
+                    match reconnect_and_attach(&driver, &attach_snapshot, &last_applied_seq).await {
                         Ok(attached) => {
                             let (new_client, payload) = split_reconnect_attached(attached);
                             *current_client.write().await = new_client;

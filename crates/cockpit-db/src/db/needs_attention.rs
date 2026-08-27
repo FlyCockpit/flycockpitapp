@@ -140,14 +140,8 @@ impl Db {
         description: &str,
         question: Option<&InterruptQuestion>,
     ) -> Result<Uuid> {
-        self.raise_interrupt_with_agent_instance(
-            session_id,
-            agent_id,
-            None,
-            description,
-            question,
-        )
-        .await
+        self.raise_interrupt_with_agent_instance(session_id, agent_id, None, description, question)
+            .await
     }
 
     /// Single-question counterpart to
@@ -317,8 +311,8 @@ impl Db {
                         AND (decision_request_id IS NULL
                              OR question_json IS NOT NULL OR questions_json IS NOT NULL)",
                     params![now, response_json, interrupt_id.to_string()],
-            )
-            .context("resolving needs_attention")?;
+                )
+                .context("resolving needs_attention")?;
             if affected == 0 {
                 // AgentTree terminalization owns the same real QuestionTool
                 // row and may have committed its response projection first.
@@ -489,7 +483,7 @@ impl Db {
     }
 
     pub async fn park_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             // A real QuestionTool interrupt can be bound to a pending
             // AgentTree decision.  Parking is still part of the original
             // continuation protocol, so make that one reversible projection
@@ -568,6 +562,86 @@ impl Db {
         .await
     }
 
+    /// Crash-recovery path for a decision-owned Attention row that was
+    /// `executing` when the worker died.
+    ///
+    /// Legacy [`Self::mark_interrupt_interrupted`] is intentionally inert for
+    /// linked rows. A terminal AgentTree decision already claimed the
+    /// continuation; replaying a host-approval parked tool would re-execute
+    /// it. This uses the same short-lived mutation guard as
+    /// [`Self::complete_executing_interrupt`] so the schema trigger accepts
+    /// `executing → interrupted`.
+    pub async fn mark_executing_linked_interrupt_interrupted(
+        &self,
+        session_id: Uuid,
+        interrupt_id: Uuid,
+    ) -> Result<bool> {
+        self.transaction(move |conn| {
+            let linked_decision: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT n.decision_request_id, n.session_id
+                       FROM needs_attention n
+                       JOIN decision_requests d
+                         ON d.decision_request_id = n.decision_request_id
+                        AND d.session_id = n.session_id
+                      WHERE n.interrupt_id = ?1
+                        AND n.session_id = ?2
+                        AND n.state = 'executing'
+                        AND n.decision_request_id IS NOT NULL
+                        AND (n.question_json IS NOT NULL OR n.questions_json IS NOT NULL)
+                        AND d.state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')",
+                    params![interrupt_id.to_string(), session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((decision_request_id, linked_session_id)) = linked_decision else {
+                return Ok(false);
+            };
+            conn.execute(
+                "INSERT INTO decision_attention_mutation_guards (decision_request_id, session_id)
+                 VALUES (?1, ?2)",
+                params![decision_request_id, linked_session_id],
+            )?;
+            let affected = conn
+                .execute(
+                    "UPDATE needs_attention
+                        SET state = 'interrupted', revision = revision + 1
+                      WHERE interrupt_id = ?1
+                        AND session_id = ?2
+                        AND state = 'executing'
+                        AND decision_request_id = ?3",
+                    params![
+                        interrupt_id.to_string(),
+                        session_id.to_string(),
+                        decision_request_id,
+                    ],
+                )
+                .context("marking linked executing interrupt interrupted")?;
+            if affected == 1 {
+                crate::db::agent_tree_decisions::insert_control_event(
+                    conn,
+                    session_id,
+                    "attention_transition",
+                    Uuid::parse_str(&decision_request_id)
+                        .context("decoding linked interrupt decision id")?,
+                    InterruptState::Interrupted.as_str(),
+                    Utc::now().timestamp_millis(),
+                )?;
+            }
+            let removed = conn.execute(
+                "DELETE FROM decision_attention_mutation_guards
+                 WHERE decision_request_id = ?1 AND session_id = ?2",
+                params![decision_request_id, linked_session_id],
+            )?;
+            ensure!(
+                removed == 1,
+                "linked executing interrupt decision guard disappeared"
+            );
+            Ok(affected > 0)
+        })
+        .await
+    }
+
     pub async fn acknowledge_interrupted_turns(&self, session_id: Uuid) -> Result<usize> {
         let now = Utc::now().timestamp();
         self.write(move |conn| {
@@ -640,7 +714,7 @@ impl Db {
 
     pub async fn complete_executing_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
         let now = Utc::now().timestamp();
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             // A linked QuestionTool row is protected by the decision-owned
             // projection trigger. Its decision was already terminal before
             // the parked continuation could be replayed, so install the

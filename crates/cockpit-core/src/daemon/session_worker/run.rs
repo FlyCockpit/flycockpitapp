@@ -4793,6 +4793,12 @@ pub(super) async fn run_worker(
     );
     let shutdown_gate = model.shutdown_gate();
     let spawn_args = SpawnArgs {
+        // TODO(issue #59): feed `GuidanceProposalService::compile_guidance_for_context`
+        // output here (session overrides persistent per kind) so accepted
+        // computer-use guidance rules are compiled into new model contexts.
+        // Empty for now — the feature is inert until enablement is turned on
+        // at a config layer, so the cached system prefix stays byte-identical.
+        compiled_guidance: vec![],
         model,
         env_overlay: env_overlay.clone(),
         // The active model's resolved extra-request-body fragment

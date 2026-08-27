@@ -24957,6 +24957,7 @@ async fn run_docs_ask_pipeline(
     );
     let session = Arc::new(session);
     let spawn_args = crate::engine::builtin::SpawnArgs {
+        compiled_guidance: vec![],
         model,
         params: crate::engine::model::ModelParams {
             additional_params: reasoning_params,

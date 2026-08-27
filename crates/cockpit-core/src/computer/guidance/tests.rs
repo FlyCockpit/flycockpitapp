@@ -972,3 +972,94 @@ fn computer_guidance_compiler_templates_match_prompt_lookup_table() {
         assert_eq!(got, want, "template {i} must match prompt lookup table");
     }
 }
+
+// ===========================================================================
+// computer_guidance_compile_context — AC9
+// ===========================================================================
+
+/// AC9: byte-identical insertion of only compiler literals into a new context;
+/// session overrides persistent for the same kind; no rationale/proposal/path
+/// bytes appear in the inserted block.
+#[test]
+fn computer_guidance_compile_context_inserts_only_compiler_literals() {
+    let session_rules = vec![ComputerGuidanceRuleV1::MaxReversibleBatch { max_actions: 2 }];
+    let persistent_rules = vec![
+        ComputerGuidanceRuleV1::MaxReversibleBatch { max_actions: 5 },
+        ComputerGuidanceRuleV1::ObservationCadence(ObservationCadence::BeforeEachAction),
+    ];
+
+    // The compiled guidance bytes are the compose_and_compile output.
+    let compiled = compose_and_compile(&session_rules, &persistent_rules);
+
+    // Session (max_actions=2) overrides persistent (max_actions=5) for the
+    // same kind; the observation_cadence kind from persistent unions in.
+    let compiled_str = std::str::from_utf8(&compiled).unwrap();
+    assert!(
+        compiled_str.contains("Execute at most two reversible computer actions"),
+        "session value (two) must override persistent (five)"
+    );
+    assert!(
+        !compiled_str.contains("Execute at most five reversible computer actions"),
+        "persistent value (five) must be suppressed by the session override"
+    );
+    assert!(
+        compiled_str.contains("Observe immediately before every computer action."),
+        "distinct kind from persistent unions in"
+    );
+    // Fixed discriminant order: observation_cadence (kind 1) before
+    // max_reversible_batch (kind 5).
+    let obs_idx = compiled_str
+        .find("Observe immediately before every computer action.")
+        .unwrap();
+    let batch_idx = compiled_str.find("Execute at most two").unwrap();
+    assert!(obs_idx < batch_idx, "kinds emit in fixed discriminant order");
+
+    // Byte-identical: compose_and_compile is deterministic.
+    let compiled2 = compose_and_compile(&session_rules, &persistent_rules);
+    assert_eq!(compiled, compiled2, "compilation is byte-identical");
+
+    // Insert into a new context's system prompt.
+    let mut system = String::from("ROLE PROMPT\n\nHarness: cockpit 0.1.0\n");
+    let before_len = system.len();
+    append_compiled_guidance(&mut system, &compiled);
+    assert!(system.len() > before_len, "guidance block was inserted");
+
+    // Only code-owned compiler literals appear — never rationale, proposal,
+    // provider, model, project, or path bytes.
+    let forbidden = [
+        "rationale",
+        "proposal",
+        "provider",
+        "model_id",
+        "project_root",
+        "/x/",
+        "secret",
+    ];
+    for needle in forbidden {
+        assert!(
+            !system.contains(needle),
+            "inserted context must not contain `{needle}` (only compiler literals)"
+        );
+    }
+    // Empty guidance is a no-op so existing prompt-cache prefixes stay
+    // byte-identical and cache-stable.
+    let mut untouched = String::from("baseline\n");
+    let snapshot = untouched.clone();
+    append_compiled_guidance(&mut untouched, &[]);
+    assert_eq!(untouched, snapshot, "empty guidance is a no-op");
+}
+
+/// AC9: the inserted guidance block contains a delimiter header and the
+/// compiler literal bytes verbatim (byte-for-byte, no mutation).
+#[test]
+fn computer_guidance_compile_context_block_is_delimited_and_verbatim() {
+    let rules = vec![ComputerGuidanceRuleV1::PointerVerification(
+        PointerVerification::BeforeEveryPointerAction,
+    )];
+    let compiled = compose_and_compile(&rules, &[]);
+    let mut system = String::new();
+    append_compiled_guidance(&mut system, &compiled);
+    assert!(system.contains("# Computer-use guidance"));
+    // The compiler literal bytes appear verbatim inside the block.
+    assert!(system.contains(std::str::from_utf8(&compiled).unwrap()));
+}

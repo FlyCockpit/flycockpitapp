@@ -12188,6 +12188,7 @@ impl Driver {
             params.prompt_cache_retention = None;
         }
         crate::engine::builtin::SpawnArgs {
+            compiled_guidance: vec![],
             model: self.stack[0].agent.model.clone(),
             params,
             env_overlay: self.stack[0].agent.env_overlay.clone(),
@@ -12256,6 +12257,7 @@ impl Driver {
             self.model_override.clone()
         };
         crate::engine::builtin::SpawnArgs {
+            compiled_guidance: vec![],
             granted_tools: grant,
             delegation_model: model,
             delegated: true,
@@ -12305,6 +12307,7 @@ impl Driver {
             self.model_override.clone()
         };
         crate::engine::builtin::SpawnArgs {
+            compiled_guidance: vec![],
             granted_tools: grant,
             delegation_model: model,
             delegated: true,

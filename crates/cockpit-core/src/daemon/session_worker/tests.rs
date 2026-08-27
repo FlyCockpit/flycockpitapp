@@ -2951,6 +2951,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         .unwrap(),
     );
     crate::engine::builtin::SpawnArgs {
+        compiled_guidance: vec![],
         model,
         params: crate::engine::model::ModelParams::default(),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),

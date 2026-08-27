@@ -240,6 +240,15 @@ pub struct SpawnArgs {
     /// Vault-backed credential store for delegated model construction.
     /// Production session/driver spawns pass `Some`; tests may leave `None`.
     pub credential_store: Option<crate::credentials::CredentialStore>,
+    /// Compiled computer-use guidance bytes (issue #59) to append to the
+    /// cached system block for **new** model contexts. Produced by
+    /// `GuidanceProposalService::compile_guidance_for_context` (session
+    /// overrides persistent per kind; kinds emit in fixed discriminant
+    /// order). Contains only the 24 code-owned compiler literals — never
+    /// rationale, proposal, provider, model, project, or tool bytes. Empty
+    /// when no accepted rules apply, so existing prompt-cache prefixes are
+    /// byte-identical and cache-stable.
+    pub compiled_guidance: Vec<u8>,
 }
 
 impl SpawnArgs {
@@ -1152,9 +1161,15 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         }
         out.push('\n');
         out.push_str(&role_system);
+        // Insert accepted computer-use guidance rules into the new context
+        // (issue #59, AC9). Only code-owned compiler literals are appended;
+        // a no-op when no rules apply so the cached prefix is byte-identical.
+        crate::computer::guidance::append_compiled_guidance(&mut out, &args.compiled_guidance);
         out
     } else {
-        compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd)
+        let mut out = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
+        crate::computer::guidance::append_compiled_guidance(&mut out, &args.compiled_guidance);
+        out
     }
 }
 
@@ -3642,6 +3657,7 @@ mod tests {
             .unwrap(),
         );
         SpawnArgs {
+            compiled_guidance: vec![],
             model,
             params: ModelParams::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -5404,6 +5420,7 @@ mod tests {
         // A vNext delegation must use the typed effective-grant path instead
         // of the legacy per-tool authority list.
         let granted_args = SpawnArgs {
+            compiled_guidance: vec![],
             granted_tools: vec!["mcp".to_string()],
             ..test_spawn_args(tmp.path())
         };

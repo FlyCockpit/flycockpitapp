@@ -5356,6 +5356,7 @@ impl Driver {
                 // scopes) and retained.
                 let concurrent = if pinned.generation() != admission_generation {
                     let fresh_args = crate::engine::builtin::SpawnArgs {
+                        compiled_guidance: vec![],
                         config: pinned.clone(),
                         ..driver.spawn_args_delegated_in_cwd_scoped(
                             &child_cwd.resolved,
@@ -5430,6 +5431,7 @@ impl Driver {
                         // Docs.2) all resolve under ONE generation, consistent with
                         // the handoff expansion.
                         let docs_args = crate::engine::builtin::SpawnArgs {
+                            compiled_guidance: vec![],
                             config: pinned.clone(),
                             ..driver.spawn_args_delegated_in_cwd(
                                 &child_cwd.resolved,
@@ -5509,6 +5511,7 @@ impl Driver {
                     // impossible for the config to move between build and dispatch —
                     // no split, no post-build generation re-check needed.
                     let dispatch_args = crate::engine::builtin::SpawnArgs {
+                        compiled_guidance: vec![],
                         config: pinned.clone(),
                         ..driver.spawn_args_delegated_in_cwd_scoped(
                             &child_cwd.resolved,
@@ -7402,6 +7405,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
     let child = crate::engine::builtin::load(
         &child_agent,
         &crate::engine::builtin::SpawnArgs {
+            compiled_guidance: vec![],
             model: parent_agent.model.clone(),
             params: crate::engine::model::ModelParams {
                 prompt_cache_key: None,
@@ -9481,6 +9485,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 let recovery_model = model.clone();
                 let recovery_granted_tools = granted_tools.clone();
                 let child_args = crate::engine::builtin::SpawnArgs {
+                    compiled_guidance: vec![],
                     model: agent.model.clone(),
                     params: crate::engine::model::ModelParams {
                         prompt_cache_key: None,
@@ -9836,6 +9841,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         }
                     };
                     let child_args = crate::engine::builtin::SpawnArgs {
+                        compiled_guidance: vec![],
                         model: agent.model.clone(),
                         params: crate::engine::model::ModelParams {
                             prompt_cache_key: None,

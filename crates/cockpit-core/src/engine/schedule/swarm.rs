@@ -708,6 +708,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         }
     };
     let args = SpawnArgs {
+        compiled_guidance: vec![],
         model,
         params: ctx.agent.params.clone(),
         env_overlay: ctx.agent.env_overlay.clone(),

@@ -445,6 +445,7 @@ thread_local! {
 
 impl ConfigMutationLock {
     pub(crate) fn acquire(target: &Path) -> Result<Self> {
+        ensure_config_parent_dir(target)?;
         let target_identity = mutation_lock_identity(target);
         let (parent, lock_leaf, display_path) = open_mutation_lock_parent(target)?;
         let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
@@ -461,6 +462,7 @@ impl ConfigMutationLock {
         target: &Path,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<Self> {
+        ensure_config_parent_dir(target)?;
         let target_identity = mutation_lock_identity(target);
         let (parent, lock_leaf, display_path) = open_mutation_lock_parent(target)?;
         let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
@@ -3318,6 +3320,42 @@ pub(crate) fn probe_directory_writable_from_retained_directory(
         return Ok(());
     }
     anyhow::bail!("could not allocate a private retained-directory writability probe")
+}
+
+/// Probe an existing regular leaf for write permission without replacing it.
+///
+/// Directory writability is not enough: an atomic rename can still replace a
+/// `0400` config file when its parent is writable. A missing leaf is allowed
+/// so first-time creation can proceed after the directory probe.
+pub(crate) fn probe_existing_leaf_writable_from_retained_directory(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<()> {
+    validate_single_leaf(leaf)?;
+    #[cfg(unix)]
+    {
+        match open_file_at_nofollow(
+            directory,
+            leaf,
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("probing writability of {}", display_path.display())),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::OpenOptions::new().write(true).open(display_path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("probing writability of {}", display_path.display())),
+        }
+    }
 }
 
 /// Remove one optional regular leaf relative to a retained directory.

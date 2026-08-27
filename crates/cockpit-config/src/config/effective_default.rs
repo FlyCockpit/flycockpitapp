@@ -1691,6 +1691,11 @@ impl RetainedEffectiveDefaultTarget {
             self.canonical_config_path
                 .parent()
                 .unwrap_or_else(|| Path::new(".")),
+        )?;
+        crate::config::files::probe_existing_leaf_writable_from_retained_directory(
+            &self.directory,
+            &self.config_leaf,
+            &self.canonical_config_path,
         )
     }
 
@@ -2390,7 +2395,16 @@ fn recover_one(
             tracing::debug!("leaving retained default-update journal for capability recovery");
             return Ok(Vec::new());
         }
-        AmbientJournalClassification::NonRetained(record) => record,
+        AmbientJournalClassification::NonRetained(record) => {
+            // A digest/trust mismatch is not a recovery failure. The journal
+            // describes some other file or policy; leave it for repair and
+            // treat this layer's own bytes as trustworthy.
+            if journal_context_error(&record, config_path).is_some() {
+                tracing::debug!("leaving out-of-context effective-default journal for repair");
+                return Ok(Vec::new());
+            }
+            record
+        }
     };
 
     // A replacement can win after the preliminary pathname classification.
@@ -2482,6 +2496,11 @@ fn sweep_orphans(config_path: &Path) {
     let Ok(target) = capture_ambient_orphan_target(config_path) else {
         return;
     };
+    // An untouched layer has no backup or stale temporary. Acquiring the
+    // mutation lock here would allocate a lock leaf the layer never earned.
+    if !captured_target_has_orphan_debris(&target) {
+        return;
+    }
     let directory_key = target
         .canonical_config_path
         .parent()
@@ -2518,6 +2537,19 @@ fn capture_ambient_orphan_target(config_path: &Path) -> Result<CapturedEffective
         lower_paths: Vec::new(),
     };
     RetainedEffectiveDefaultTarget::capture_ambient(parent, &selected)
+}
+
+fn captured_target_has_orphan_debris(target: &CapturedEffectiveDefaultTarget) -> bool {
+    if matches!(target.read_leaf(&target.backup_leaf), Ok(Some(_))) {
+        return true;
+    }
+    matches!(
+        crate::config::files::stale_private_temp_leaves_from_retained_directory(
+            &target.directory,
+            STALE_TEMP_AGE,
+        ),
+        Ok(leaves) if !leaves.is_empty()
+    )
 }
 
 fn sweep_captured_orphans_locked(target: &CapturedEffectiveDefaultTarget) {

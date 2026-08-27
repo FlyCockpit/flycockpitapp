@@ -366,7 +366,23 @@ impl RetainedProviderModelFavoriteTarget {
         self
     }
 
+    fn verify_captured_directory_still_named(&self) -> Result<()> {
+        let source_lock = self
+            .precedence_locks
+            .first()
+            .context("captured provider source lock is missing")?;
+        anyhow::ensure!(
+            crate::config::files::directory_handle_matches_path(
+                &source_lock.config_directory,
+                &source_lock.display_config_parent,
+            )?,
+            "captured provider source has been replaced"
+        );
+        Ok(())
+    }
+
     fn verify_pre_write(&self) -> Result<()> {
+        self.verify_captured_directory_still_named()?;
         if let Some(verifier) = &self.pre_write_verifier {
             verifier()?;
         }

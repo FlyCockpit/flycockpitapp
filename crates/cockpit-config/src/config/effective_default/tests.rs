@@ -1180,7 +1180,13 @@ fn ambient_mutation_keeps_probe_and_lock_on_captured_a_after_path_becomes_b() {
             .unwrap()
             .map(|entry| {
                 let entry = entry.unwrap();
-                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                let path = entry.path();
+                let bytes = if path.is_dir() {
+                    Vec::new()
+                } else {
+                    std::fs::read(&path).unwrap()
+                };
+                (entry.file_name(), bytes)
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1221,12 +1227,23 @@ fn ambient_mutation_keeps_probe_and_lock_on_captured_a_after_path_becomes_b() {
             .contains("effective-default-lock")),
         "the capability-local lock belongs to held A, not the replacement path",
     );
-    assert!(
-        std::fs::read_dir(&live_dir).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("effective-default-lock")),
+    let before_lock_names: Vec<_> = before
+        .iter()
+        .filter(|(name, _)| name.to_string_lossy().contains("effective-default-lock"))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut after_lock_names: Vec<_> = std::fs::read_dir(&live_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name();
+            name.to_string_lossy()
+                .contains("effective-default-lock")
+                .then_some(name)
+        })
+        .collect();
+    after_lock_names.sort();
+    assert_eq!(
+        after_lock_names, before_lock_names,
         "B must not receive an ambient lock sidecar",
     );
     assert_eq!(

@@ -28,6 +28,7 @@ workspace = true
 default = []
 extended = [
     "cockpit-client/extended",
+    "cockpit-config/extended",
     "cockpit-core/extended",
     "cockpit-db/extended",
     "cockpit-proto/extended",

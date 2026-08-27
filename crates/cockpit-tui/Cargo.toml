@@ -14,7 +14,7 @@ workspace = true
 
 [features]
 default = []
-extended = ["cockpit-client/extended", "cockpit-core/extended", "cockpit-proto/extended"]
+extended = ["cockpit-client/extended", "cockpit-config/extended", "cockpit-core/extended", "cockpit-proto/extended"]
 remote = ["cockpit-client/remote", "cockpit-core/remote", "cockpit-proto/remote"]
 
 [dependencies]

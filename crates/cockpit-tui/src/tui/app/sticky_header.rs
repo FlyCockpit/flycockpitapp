@@ -16,7 +16,8 @@ use ratatui::widgets::Paragraph;
 use super::render::chat_visible_top;
 use super::{App, MouseGestureInvalidation};
 use crate::tui::history::HistoryEntry;
-use crate::tui::theme::{ACCENT_BLUE, MUTED_COLOR_INDEX, TRANSCRIPT_HOVER_BG};
+use crate::tui::pins_overlay::{PIN_YELLOW, preview_text_rows};
+use crate::tui::theme::{MUTED_COLOR_INDEX, TRANSCRIPT_HOVER_BG};
 
 /// Two content lines. Stable: never 1, never a mid-frame change.
 pub(super) const STICKY_USER_HEADER_HEIGHT: u16 = 2;
@@ -126,17 +127,56 @@ impl App {
     }
 
     fn render_sticky_user_header(&self, frame: &mut Frame, area: Rect) {
-        let style = Style::default()
-            .fg(ACCENT_BLUE)
+        let raw = self
+            .sticky_header_history_index
+            .and_then(|idx| self.history.get(idx))
+            .and_then(user_raw_text)
+            .unwrap_or("");
+        let label = " you ";
+        let indent = "     ";
+        let show_label = area.width as usize > label.len() + 1;
+        let preview_width = if show_label {
+            (area.width as usize).saturating_sub(label.len())
+        } else {
+            area.width as usize
+        }
+        .max(1);
+        let mut rows = preview_text_rows(raw, preview_width, STICKY_USER_HEADER_HEIGHT as usize);
+        rows.resize(STICKY_USER_HEADER_HEIGHT as usize, String::new());
+
+        let bg = Style::default().bg(TRANSCRIPT_HOVER_BG);
+        let label_style = Style::default()
+            .fg(PIN_YELLOW)
             .bg(TRANSCRIPT_HOVER_BG)
             .add_modifier(Modifier::BOLD);
-        let muted = Style::default()
+        let body_style = Style::default()
             .fg(ratatui::style::Color::Indexed(MUTED_COLOR_INDEX))
             .bg(TRANSCRIPT_HOVER_BG);
-        let lines = vec![
-            Line::from(vec![Span::styled(" you", style)]),
-            Line::from(vec![Span::styled(" previous message", muted)]),
-        ];
-        frame.render_widget(Paragraph::new(lines), area);
+
+        let lines = if show_label {
+            vec![
+                Line::from(vec![
+                    Span::styled(label, label_style),
+                    Span::styled(rows[0].clone(), body_style),
+                ]),
+                Line::from(vec![
+                    Span::styled(indent, bg),
+                    Span::styled(rows[1].clone(), body_style),
+                ]),
+            ]
+        } else {
+            vec![
+                Line::from(vec![Span::styled(rows[0].clone(), body_style)]),
+                Line::from(vec![Span::styled(rows[1].clone(), body_style)]),
+            ]
+        };
+        frame.render_widget(Paragraph::new(lines).style(bg), area);
+    }
+}
+
+fn user_raw_text(entry: &HistoryEntry) -> Option<&str> {
+    match entry {
+        HistoryEntry::User { text, .. } => Some(text.as_str()),
+        _ => None,
     }
 }

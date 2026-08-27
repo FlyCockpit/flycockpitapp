@@ -267,11 +267,73 @@ pub fn preview_text(text: &str, max: usize) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("");
     let max = max.max(8);
+    truncate_preview_line(first, max)
+}
+
+/// Width-fitted preview of the raw message: up to `max_rows` visual lines
+/// taken from the source text (never from a render cache), with an
+/// ellipsis on the last row when more content remains. Each row is
+/// truncated through [`preview_text`]'s ellipsis rule.
+pub fn preview_text_rows(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    let width = width.max(1);
+    let source: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut rows = Vec::new();
+    for (i, line) in source.iter().copied().enumerate() {
+        let mut rest = line;
+        while !rest.is_empty() {
+            let last_slot = rows.len() + 1 >= max_rows;
+            if last_slot {
+                let later_lines = i + 1 < source.len();
+                let rest_overflows = rest.chars().count() > width;
+                let preview = if later_lines && !rest_overflows {
+                    preview_text(&format!("{rest} …"), width.max(8))
+                } else {
+                    preview_text(rest, width.max(8))
+                };
+                rows.push(fit_preview_to_width(&preview, width));
+                return rows;
+            }
+            let (head, tail) = split_preview_line(rest, width);
+            rows.push(head);
+            rest = tail;
+        }
+    }
+    rows
+}
+
+fn truncate_preview_line(first: &str, max: usize) -> String {
     if first.chars().count() <= max {
         first.to_string()
     } else {
         let head: String = first.chars().take(max.saturating_sub(1)).collect();
         format!("{head}…")
+    }
+}
+
+fn split_preview_line(line: &str, width: usize) -> (String, &str) {
+    if line.chars().count() <= width {
+        return (line.to_string(), "");
+    }
+    let split = line
+        .char_indices()
+        .nth(width)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    (line[..split].to_string(), &line[split..])
+}
+
+fn fit_preview_to_width(preview: &str, width: usize) -> String {
+    if preview.chars().count() <= width {
+        preview.to_string()
+    } else {
+        truncate_preview_line(preview, width)
     }
 }
 
@@ -464,6 +526,24 @@ mod tests {
         let p = preview_text(&long, 10);
         assert!(p.ends_with('…'));
         assert_eq!(p.chars().count(), 10);
+    }
+
+    #[test]
+    fn preview_text_rows_takes_two_source_lines_and_ellipsizes() {
+        let rows = preview_text_rows("alpha\nbeta\ngamma", 20, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "alpha");
+        assert!(rows[1].contains("beta"), "{rows:?}");
+        assert!(rows[1].contains('…'), "{rows:?}");
+    }
+
+    #[test]
+    fn preview_text_rows_wraps_a_long_single_line() {
+        let rows = preview_text_rows(&"x".repeat(30), 10, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].chars().count(), 10);
+        assert!(rows[1].ends_with('…'), "{rows:?}");
+        assert_eq!(rows[1].chars().count(), 10);
     }
 
     #[test]

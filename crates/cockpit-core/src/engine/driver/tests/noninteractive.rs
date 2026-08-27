@@ -31,15 +31,13 @@ async fn intermediate_noninteractive_continue_checkpoint_survives_cancel_or_fail
         let (respond_to, receipt) = tokio::sync::oneshot::channel();
         retain_noninteractive_late_steer_checkpoint(
             &[],
-            vec![
-                (
-                    uuid::Uuid::now_v7(),
-                    continuation_id,
-                    uuid::Uuid::now_v7(),
-                    "accepted late steer body".to_string(),
-                    respond_to,
-                ),
-            ],
+            vec![(
+                uuid::Uuid::now_v7(),
+                continuation_id,
+                uuid::Uuid::now_v7(),
+                "accepted late steer body".to_string(),
+                respond_to,
+            )],
             outcome.clone(),
         );
         assert_eq!(

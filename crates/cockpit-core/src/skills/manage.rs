@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 #[cfg(test)]
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::ser::SerializeStruct;
@@ -383,7 +383,10 @@ impl<'a> SkillMutationService<'a> {
     /// callers rely on that type-level boundary to ensure a cancellation or
     /// revision cannot win after an approved effect is claimed but before the
     /// selected filesystem mutation begins.
-    pub(crate) fn apply_prepared(&self, prepared: &PreparedSkillMutation) -> Result<SkillMutationResult> {
+    pub(crate) fn apply_prepared(
+        &self,
+        prepared: &PreparedSkillMutation,
+    ) -> Result<SkillMutationResult> {
         let result = match prepared {
             PreparedSkillMutation::Create(prepared) => self.create_prepared(prepared),
             PreparedSkillMutation::Delete(prepared) => self.delete_prepared(prepared),
@@ -408,7 +411,9 @@ impl<'a> SkillMutationService<'a> {
     ) -> &'b Path {
         match prepared {
             PreparedSkillMutation::Create(prepared) => &prepared.root.diagnostic_path,
-            PreparedSkillMutation::Delete(prepared) => &prepared.target.writable_root.diagnostic_path,
+            PreparedSkillMutation::Delete(prepared) => {
+                &prepared.target.writable_root.diagnostic_path
+            }
             PreparedSkillMutation::RemoveFile(prepared) => {
                 &prepared.target.writable_root.diagnostic_path
             }
@@ -471,13 +476,8 @@ impl<'a> SkillMutationService<'a> {
         // entries; it never discovers or validates user content anew.
         validate_managed_skill_contents(&manifest, &args.name)?;
         let root = PreparedSkillRoot::prepare_for_create(&root)?;
-        let provenance = provenance_bytes(
-            None,
-            self.origin,
-            SkillManageAction::Create,
-            true,
-            false,
-        )?;
+        let provenance =
+            provenance_bytes(None, self.origin, SkillManageAction::Create, true, false)?;
         Ok(PreparedSkillMutation::Create(PreparedCreate {
             name: args.name.clone(),
             root,
@@ -673,9 +673,7 @@ impl<'a> SkillMutationService<'a> {
             // an already-swapped package or symlink is rejected rather than
             // silently receiving a prepared operation.
             let package_directory = open_directory_child(&package_parent, &package_name)
-                .with_context(|| {
-                    format!("opening prepared skill package {}", package.display())
-                })?;
+                .with_context(|| format!("opening prepared skill package {}", package.display()))?;
             return Ok(ManagedTarget {
                 skill,
                 package,
@@ -689,9 +687,7 @@ impl<'a> SkillMutationService<'a> {
         #[cfg(not(unix))]
         {
             let _ = (skill, package, writable_root, pinned);
-            bail!(
-                "skill mutations require descriptor-anchored filesystem support on this platform"
-            )
+            bail!("skill mutations require descriptor-anchored filesystem support on this platform")
         }
     }
 
@@ -732,10 +728,12 @@ impl<'a> SkillMutationService<'a> {
         let now = chrono::Utc::now().timestamp();
         match prepared {
             PreparedSkillMutation::Create(prepared) => {
-                db.ensure_skill_usage(prepared.usage_seed.clone(), now).await?;
+                db.ensure_skill_usage(prepared.usage_seed.clone(), now)
+                    .await?;
             }
             PreparedSkillMutation::RemoveFile(prepared) => {
-                db.record_skill_patch(prepared.usage_seed.clone(), now).await?;
+                db.record_skill_patch(prepared.usage_seed.clone(), now)
+                    .await?;
             }
             PreparedSkillMutation::Delete(_) => {}
         }
@@ -769,9 +767,7 @@ impl PreparedSkillRoot {
         #[cfg(not(unix))]
         {
             let _ = path;
-            bail!(
-                "skill mutations require descriptor-anchored filesystem support on this platform"
-            )
+            bail!("skill mutations require descriptor-anchored filesystem support on this platform")
         }
     }
 
@@ -779,9 +775,9 @@ impl PreparedSkillRoot {
     fn open_existing(path: &Path) -> Result<Self> {
         #[cfg(unix)]
         {
-            let canonical = path
-                .canonicalize()
-                .with_context(|| format!("canonicalizing writable skills root {}", path.display()))?;
+            let canonical = path.canonicalize().with_context(|| {
+                format!("canonicalizing writable skills root {}", path.display())
+            })?;
             let capability = UnixPreparedSkillRoot::open_existing(&canonical)?;
             return Ok(Self {
                 diagnostic_path: canonical,
@@ -791,21 +787,21 @@ impl PreparedSkillRoot {
         #[cfg(not(unix))]
         {
             let _ = path;
-            bail!(
-                "skill mutations require descriptor-anchored filesystem support on this platform"
-            )
+            bail!("skill mutations require descriptor-anchored filesystem support on this platform")
         }
     }
 
     #[cfg(unix)]
     fn package_parent(&self, package: &Path) -> Result<std::fs::File> {
-        let relative = package.strip_prefix(&self.diagnostic_path).with_context(|| {
-            format!(
-                "skill package {} escapes writable root {}",
-                package.display(),
-                self.diagnostic_path.display()
-            )
-        })?;
+        let relative = package
+            .strip_prefix(&self.diagnostic_path)
+            .with_context(|| {
+                format!(
+                    "skill package {} escapes writable root {}",
+                    package.display(),
+                    self.diagnostic_path.display()
+                )
+            })?;
         let parent = relative.parent().context("skill package has no parent")?;
         let root = self.capability.open_existing_root()?;
         open_directory_chain(&root, parent)
@@ -956,7 +952,9 @@ impl UnixPreparedSkillRoot {
                         .file_name()
                         .context("writable skills root has no missing component")?;
                     missing_components.push(name.to_os_string());
-                    cursor = cursor.parent().context("writable skills root has no ancestor")?;
+                    cursor = cursor
+                        .parent()
+                        .context("writable skills root has no ancestor")?;
                 }
                 Err(error) => {
                     return Err(error)
@@ -1011,9 +1009,8 @@ impl ManagedTarget {
         // parent. This rejects an ancestor/root replacement even though that
         // replacement cannot redirect the descriptor-rooted operation.
         let _root = self.writable_root.capability.open_existing_root()?;
-        let current = open_directory_child(&self.package_parent, &self.package_name).with_context(|| {
-            format!("opening current skill package {}", self.package.display())
-        })?;
+        let current = open_directory_child(&self.package_parent, &self.package_name)
+            .with_context(|| format!("opening current skill package {}", self.package.display()))?;
         ensure!(
             same_directory_identity(&current, &self.package_directory)?,
             "skill package changed after preparation; refusing mutation"
@@ -1038,7 +1035,7 @@ impl ManagedTarget {
             parent.directory.as_raw_fd(),
             &leaf_c,
         )
-            .with_context(|| format!("checking support file {}", relative.display()))?;
+        .with_context(|| format!("checking support file {}", relative.display()))?;
         ensure!(
             stat.st_mode & libc::S_IFMT == libc::S_IFREG,
             "support file must be a regular non-symlink file: {}",
@@ -1051,8 +1048,13 @@ impl ManagedTarget {
         let package = self.open_verified_package()?;
         let source = component_cstring_os(&self.package_name)?;
         let tombstone = component_cstring(tombstone)?;
-        move_noreplace(&self.package_parent, &source, &self.package_parent, &tombstone)
-            .with_context(|| format!("staging deletion of {}", self.package.display()))?;
+        move_noreplace(
+            &self.package_parent,
+            &source,
+            &self.package_parent,
+            &tombstone,
+        )
+        .with_context(|| format!("staging deletion of {}", self.package.display()))?;
         let staged = match open_directory_child_cstr(&self.package_parent, &tombstone) {
             Ok(staged) if same_directory_identity(&staged, &package)? => staged,
             Ok(_) => {
@@ -1107,8 +1109,11 @@ impl ManagedTarget {
         validate_directory_bindings(&parent.bindings)?;
         let leaf = component_cstring(leaf)?;
         let staged = component_cstring(staged)?;
-        let stat = cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.directory.as_raw_fd(), &leaf)
-            .context("checking prepared support file before staging")?;
+        let stat = cockpit_host::private_fs::held_fd::fstatat_nofollow(
+            parent.directory.as_raw_fd(),
+            &leaf,
+        )
+        .context("checking prepared support file before staging")?;
         ensure!(
             stat.st_mode & libc::S_IFMT == libc::S_IFREG,
             "support file changed after preparation; refusing mutation"
@@ -1124,11 +1129,9 @@ impl ManagedTarget {
             let _ = move_noreplace(&parent.directory, &staged, &parent.directory, &leaf);
             bail!("support file changed while staging; refusing mutation");
         }
-        if let Err(error) = cockpit_host::private_fs::held_fd::unlinkat(
-            parent.directory.as_raw_fd(),
-            &staged,
-            0,
-        ) {
+        if let Err(error) =
+            cockpit_host::private_fs::held_fd::unlinkat(parent.directory.as_raw_fd(), &staged, 0)
+        {
             let _ = move_noreplace(&parent.directory, &staged, &parent.directory, &leaf);
             return Err(error).context("removing staged support file");
         }
@@ -1367,7 +1370,11 @@ fn open_or_create_directory_child_os(
     let name = component_cstring_os(name)?;
     match open_directory_child_cstr(parent, &name) {
         Ok(directory) => Ok(directory),
-        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
             match cockpit_host::private_fs::held_fd::mkdirat(parent.as_raw_fd(), &name, 0o755) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1395,8 +1402,12 @@ fn entry_exists_nofollow(parent: &std::fs::File, name: &std::ffi::CStr) -> Resul
 fn same_directory_identity(left: &std::fs::File, right: &std::fs::File) -> Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let left = left.metadata().context("reading held skill directory identity")?;
-    let right = right.metadata().context("reading prepared skill directory identity")?;
+    let left = left
+        .metadata()
+        .context("reading held skill directory identity")?;
+    let right = right
+        .metadata()
+        .context("reading prepared skill directory identity")?;
     Ok(left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino())
 }
 
@@ -1490,7 +1501,8 @@ fn atomic_write_at(parent: &std::fs::File, name: &str, bytes: &[u8]) -> Result<(
                 &destination,
                 0,
             ) {
-                let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+                let _ =
+                    cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
                 return Err(error).context("publishing held skill file without replacement");
             }
             cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0)
@@ -1501,7 +1513,9 @@ fn atomic_write_at(parent: &std::fs::File, name: &str, bytes: &[u8]) -> Result<(
             return Err(error).context("checking held skill metadata destination");
         }
     }
-    parent.sync_all().context("syncing held skill package directory")?;
+    parent
+        .sync_all()
+        .context("syncing held skill package directory")?;
     Ok(())
 }
 
@@ -1553,7 +1567,10 @@ fn remove_tree_nofollow(directory: &std::fs::File) -> Result<()> {
                 return Err(error);
             }
         };
-        let stat = match cockpit_host::private_fs::held_fd::fstatat_nofollow(directory.as_raw_fd(), &name_c) {
+        let stat = match cockpit_host::private_fs::held_fd::fstatat_nofollow(
+            directory.as_raw_fd(),
+            &name_c,
+        ) {
             Ok(stat) => stat,
             Err(error) => {
                 // SAFETY: stream still has one owner.
@@ -2191,14 +2208,16 @@ mod tests {
                 "{error:#}"
             );
             assert!(!outside.join("skills/must-not-escape/SKILL.md").exists());
-            assert!(tmp
-                .path()
-                .join("container-held/skills/existing/SKILL.md")
-                .is_file());
-            assert!(!tmp
-                .path()
-                .join("container-held/skills/must-not-escape/SKILL.md")
-                .exists());
+            assert!(
+                tmp.path()
+                    .join("container-held/skills/existing/SKILL.md")
+                    .is_file()
+            );
+            assert!(
+                !tmp.path()
+                    .join("container-held/skills/must-not-escape/SKILL.md")
+                    .exists()
+            );
         })
         .await;
     }
@@ -2235,7 +2254,10 @@ mod tests {
             symlink(&outside, root.join("specific")).unwrap();
 
             assert!(svc.apply_prepared(&prepared).is_err());
-            assert_eq!(std::fs::read_to_string(outside.join("SKILL.md")).unwrap(), "outside must remain");
+            assert_eq!(
+                std::fs::read_to_string(outside.join("SKILL.md")).unwrap(),
+                "outside must remain"
+            );
             assert!(root.join("specific-held/SKILL.md").is_file());
         })
         .await;
@@ -2274,7 +2296,10 @@ mod tests {
             symlink(&outside, package.join("references")).unwrap();
 
             assert!(svc.apply_prepared(&prepared).is_err());
-            assert_eq!(std::fs::read_to_string(outside.join("old.md")).unwrap(), "outside must remain");
+            assert_eq!(
+                std::fs::read_to_string(outside.join("old.md")).unwrap(),
+                "outside must remain"
+            );
             assert_eq!(
                 std::fs::read_to_string(package.join("references-held/old.md")).unwrap(),
                 "held content"

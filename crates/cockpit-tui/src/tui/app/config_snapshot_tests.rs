@@ -265,9 +265,11 @@ fn tui_config_count_stable_across_interactions() {
         1,
     );
     // turn-event application: a foreground-target event re-runs skill discovery.
-    app.apply_event(cockpit_client::presentation::TurnEvent::ForegroundInputTarget {
-        target: cockpit_proto::QueueTarget::root("Build"),
-    });
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ForegroundInputTarget {
+            target: cockpit_proto::QueueTarget::root("Build"),
+        },
+    );
     // /settings close and /new both funnel through `resync`; attached, it must
     // not read disk.
     app.resync_config_after_local_write();
@@ -411,9 +413,11 @@ fn assert_config_epoch_reset_accepts_authoritative_zero(path: ConfigEpochPath) {
         }
         ConfigEpochPath::SameSessionReconnect => {
             app.agent_runner = Some(Ok(stub_runner()));
-            app.apply_event(cockpit_client::presentation::TurnEvent::DaemonLinkReconnected {
-                active_model_state: None,
-            });
+            app.apply_event(
+                cockpit_client::presentation::TurnEvent::DaemonLinkReconnected {
+                    active_model_state: None,
+                },
+            );
         }
     }
 

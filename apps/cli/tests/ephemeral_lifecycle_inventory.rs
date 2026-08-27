@@ -1605,10 +1605,7 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
         "let constructor = OwnedDaemonSession::connect;\n    let session = constructor(mode)",
         1,
     );
-    assert_eq!(
-        raw_owner_acquisitions(&function_item),
-        Vec::<String>::new()
-    );
+    assert_eq!(raw_owner_acquisitions(&function_item), Vec::<String>::new());
     assert_eq!(raw_owner_connect_path_count(&function_item), 1);
 
     let test_then_production_literal = r#"

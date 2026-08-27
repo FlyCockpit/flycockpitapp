@@ -732,16 +732,12 @@ mod tests {
             },
         );
 
-        let nearest = crate::config::providers::provider_file_path_for_dir(
-            &app.join(".cockpit"),
-            "default",
-        )
-        .ok();
-        let outer = crate::config::providers::provider_file_path_for_dir(
-            &root.join(".cockpit"),
-            "default",
-        )
-        .ok();
+        let nearest =
+            crate::config::providers::provider_file_path_for_dir(&app.join(".cockpit"), "default")
+                .ok();
+        let outer =
+            crate::config::providers::provider_file_path_for_dir(&root.join(".cockpit"), "default")
+                .ok();
         assert_eq!(config_write_target_for_provider(&app, "default"), nearest);
         assert_ne!(config_write_target_for_provider(&app, "default"), outer);
         crate::config::trust::clear_runtime_policy_for_tests();
@@ -764,16 +760,12 @@ mod tests {
             },
         );
 
-        let outer = crate::config::providers::provider_file_path_for_dir(
-            &root.join(".cockpit"),
-            "default",
-        )
-        .unwrap();
-        let inner = crate::config::providers::provider_file_path_for_dir(
-            &app.join(".cockpit"),
-            "default",
-        )
-        .unwrap();
+        let outer =
+            crate::config::providers::provider_file_path_for_dir(&root.join(".cockpit"), "default")
+                .unwrap();
+        let inner =
+            crate::config::providers::provider_file_path_for_dir(&app.join(".cockpit"), "default")
+                .unwrap();
 
         std::fs::create_dir_all(outer.parent().unwrap()).unwrap();
         std::fs::write(&outer, "{}").unwrap();

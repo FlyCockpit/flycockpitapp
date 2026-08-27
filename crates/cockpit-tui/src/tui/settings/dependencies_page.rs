@@ -254,7 +254,8 @@ impl SettingsPage for DependenciesPage {
                 .wrap(Wrap { trim: false })
                 .line_count(inner_width)
         };
-        let max_scroll = (content_rows.saturating_sub(inner_height as usize)).min(u16::MAX as usize) as u16;
+        let max_scroll =
+            (content_rows.saturating_sub(inner_height as usize)).min(u16::MAX as usize) as u16;
         self.max_scroll.set(max_scroll);
         let scroll = self.scroll.min(max_scroll);
         frame.render_widget(

@@ -840,7 +840,11 @@ mod tests {
         data.push(b'\n');
         let mut r = CappedLineReader::new(&data[..], BACKGROUND_LINE_READ_CAP);
         let line = r.next_line().await.unwrap().unwrap();
-        assert_eq!(line.len(), BACKGROUND_LINE_READ_CAP, "reader caps at READ cap");
+        assert_eq!(
+            line.len(),
+            BACKGROUND_LINE_READ_CAP,
+            "reader caps at READ cap"
+        );
         assert!(line.len() > BACKGROUND_LINE_BYTE_CAP);
         let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
         ring.push(line);

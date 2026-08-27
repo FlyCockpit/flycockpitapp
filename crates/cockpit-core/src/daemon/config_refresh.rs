@@ -230,13 +230,8 @@ pub(crate) async fn refresh_session_config(
     mut failure_deduper: Option<&mut ConfigRefreshFailureDeduper>,
 ) -> Result<Option<ConfigRefreshResult>> {
     for _ in 0..3 {
-        match refresh_session_config_once(
-            db,
-            config_source,
-            handle,
-            failure_deduper.as_deref_mut(),
-        )
-        .await?
+        match refresh_session_config_once(db, config_source, handle, failure_deduper.as_deref_mut())
+            .await?
         {
             Some(result) if result.stale => continue,
             Some(result) => return Ok(Some(result)),
@@ -254,8 +249,11 @@ async fn refresh_session_config_once(
 ) -> Result<Option<ConfigRefreshResult>> {
     let expected_generation = handle.config_snapshot().generation;
     let resolved_trust =
-        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(db, &handle.project_root)
-            .await?;
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            db,
+            &handle.project_root,
+        )
+        .await?;
     let trust_policy = resolved_trust.policy.clone();
     let trust_revision = resolved_trust.revision;
     if !handle.trust_transition_matches(&resolved_trust) {
@@ -288,8 +286,7 @@ async fn refresh_session_config_once(
             &handle.project_root,
             &trust_policy,
             &workspace_layer,
-        )
-    {
+        ) {
         Ok(configs) => configs,
         Err(error) => {
             let notice = if let Some(invalid) =
@@ -386,7 +383,8 @@ async fn refresh_session_config_once(
     {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            let notice = format!("{CONFIG_REFRESH_FAILURE_PREFIX}: provider source provenance is invalid");
+            let notice =
+                format!("{CONFIG_REFRESH_FAILURE_PREFIX}: provider source provenance is invalid");
             tracing::warn!(%error, "background config refresh provider provenance rejected");
             if failure_deduper
                 .as_deref_mut()

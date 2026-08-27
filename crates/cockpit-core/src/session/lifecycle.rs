@@ -228,8 +228,8 @@ impl Session {
             "entry mode may only be set before a new session is persisted"
         );
         self.session_entry_mode = mode;
-        let staged = self
-            .stage_pending_row(|row| row.session_entry_mode = mode.as_str().to_string());
+        let staged =
+            self.stage_pending_row(|row| row.session_entry_mode = mode.as_str().to_string());
         anyhow::ensure!(
             staged,
             "deferred session row disappeared while setting entry mode"

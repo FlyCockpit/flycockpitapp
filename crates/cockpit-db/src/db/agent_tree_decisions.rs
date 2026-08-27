@@ -144,7 +144,9 @@ impl HostCapabilityRefreshOperationState {
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
-            _ => Err(invalid_persisted_value("host capability refresh operation state")),
+            _ => Err(invalid_persisted_value(
+                "host capability refresh operation state",
+            )),
         }
     }
 }
@@ -219,8 +221,12 @@ pub enum HostCapabilityRefreshExecutionClaim {
     /// receipt; it must never issue a second local probe merely because the
     /// execution claim was already taken.
     InFlight,
-    Failed { error_text: String },
-    Cancelled { error_text: String },
+    Failed {
+        error_text: String,
+    },
+    Cancelled {
+        error_text: String,
+    },
     NotReady,
 }
 
@@ -678,7 +684,9 @@ enum DecisionCreationKind {
     /// daemon composition capability, so a caller holding only `Db` cannot
     /// turn a string-shaped `host_approval` request into an effect authority.
     #[cfg(feature = "host-approval-composition")]
-    HostApproval { authority: HostApprovalAuthority },
+    HostApproval {
+        authority: HostApprovalAuthority,
+    },
     #[cfg(feature = "host-capability-refresh-composition")]
     HostCapabilityRefresh {
         operation_id: Uuid,
@@ -904,7 +912,11 @@ impl Db {
                     input.task_delegation_child_uuid.map(|id| id.to_string()),
                     input.resolved_profile_snapshot_id.map(|id| id.to_string()),
                     workspace_ref,
-                    if input.auto_answer_enabled { 1_i64 } else { 0_i64 },
+                    if input.auto_answer_enabled {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
                     now_unix_ms,
                 ],
             )
@@ -967,8 +979,8 @@ impl Db {
                      WHERE session_id = ?1 AND runtime_key = 'session-root'",
                     [&session_id_text],
                     |row| row.get(0),
-            )
-            .optional()?;
+                )
+                .optional()?;
             if let Some(existing) = existing {
                 let root = load_agent(conn, session_id, parse_uuid(existing)?)?
                     .context("session root agent disappeared")?;
@@ -994,7 +1006,9 @@ impl Db {
                         .context("repaired session root agent disappeared");
                 }
                 ensure!(
-                    root.workspace_ref.as_deref().is_some_and(is_host_workspace_ref),
+                    root.workspace_ref
+                        .as_deref()
+                        .is_some_and(is_host_workspace_ref),
                     "session root carries an invalid workspace reference"
                 );
                 return Ok(root);
@@ -1063,7 +1077,10 @@ impl Db {
                 .query_row(
                     "SELECT canonical_payload FROM agent_profile_snapshots
                      WHERE session_id = ?1 AND snapshot_id = ?2",
-                    params![session_id.to_string(), resolved_profile_snapshot_id.to_string()],
+                    params![
+                        session_id.to_string(),
+                        resolved_profile_snapshot_id.to_string()
+                    ],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -1265,113 +1282,127 @@ impl Db {
                 "task delegation publication snapshot is empty"
             );
         }
-        let rows = self.transaction(move |conn| {
-            let parent = load_agent(conn, session_id, parent_agent_instance_id)?
-                .context("task delegation parent agent is not authorized for this session")?;
-            ensure!(
-                !parent.state.is_terminal(),
-                "cannot publish a task child below a terminal parent"
-            );
-            let mut rows = Vec::with_capacity(children.len());
-            for child in children {
-                let updated = conn.execute(
-                    "UPDATE task_delegation_children
+        let rows = self
+            .transaction(move |conn| {
+                let parent = load_agent(conn, session_id, parent_agent_instance_id)?
+                    .context("task delegation parent agent is not authorized for this session")?;
+                ensure!(
+                    !parent.state.is_terminal(),
+                    "cannot publish a task child below a terminal parent"
+                );
+                let mut rows = Vec::with_capacity(children.len());
+                for child in children {
+                    let updated = conn.execute(
+                        "UPDATE task_delegation_children
                         SET status = 'running', snapshot_json = ?3,
                             started_at = COALESCE(started_at, ?4), updated_at = ?4
                       WHERE task_call_id = ?1 AND label = ?2 AND status = 'created'",
-                    params![
-                        &task_call_id,
-                        &child.label,
-                        &child.snapshot_json,
-                        now_unix_ms / 1_000,
-                    ],
-                )?;
-                let (child_uuid_text, status, snapshot_json): (String, String, Option<String>) = conn
-                    .query_row(
-                        "SELECT c.child_uuid, c.status, c.snapshot_json
+                        params![
+                            &task_call_id,
+                            &child.label,
+                            &child.snapshot_json,
+                            now_unix_ms / 1_000,
+                        ],
+                    )?;
+                    let (child_uuid_text, status, snapshot_json): (String, String, Option<String>) =
+                        conn.query_row(
+                            "SELECT c.child_uuid, c.status, c.snapshot_json
                            FROM task_delegation_children c
                            JOIN task_delegation_jobs j ON j.task_call_id = c.task_call_id
                           WHERE c.task_call_id = ?1 AND c.label = ?2
                             AND j.parent_session_id = ?3",
-                        params![&task_call_id, &child.label, session_id.to_string()],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .context("task delegation child publication is not authorized for this session")?;
-                ensure!(
-                    updated == 1
-                        || (matches!(status.as_str(), "running" | "backgrounded" | "paused_pending_tool")
-                            && snapshot_json.is_some()),
-                    "task delegation child is not safely published"
-                );
-                let child_uuid = parse_uuid(child_uuid_text)?;
-                let existing: Option<String> = conn
-                    .query_row(
-                        "SELECT agent_instance_id FROM agent_instances
-                          WHERE session_id = ?1 AND task_delegation_child_uuid = ?2",
-                        params![session_id.to_string(), child_uuid.to_string()],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(existing) = existing {
-                    let existing = load_agent(conn, session_id, parse_uuid(existing)?)?
-                        .context("task delegation agent mapping disappeared")?;
+                            params![&task_call_id, &child.label, session_id.to_string()],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .context(
+                            "task delegation child publication is not authorized for this session",
+                        )?;
                     ensure!(
-                        existing.parent_agent_instance_id == Some(parent_agent_instance_id)
-                            && existing.task_delegation_job_id.as_deref() == Some(task_call_id.as_str()),
-                        "task delegation child mapping has incompatible lineage"
+                        updated == 1
+                            || (matches!(
+                                status.as_str(),
+                                "running" | "backgrounded" | "paused_pending_tool"
+                            ) && snapshot_json.is_some()),
+                        "task delegation child is not safely published"
                     );
-                    rows.push(existing);
-                    continue;
-                }
-                let agent_instance_id = Uuid::new_v4();
-                conn.execute(
-                    "INSERT INTO agent_instances (
+                    let child_uuid = parse_uuid(child_uuid_text)?;
+                    let existing: Option<String> = conn
+                        .query_row(
+                            "SELECT agent_instance_id FROM agent_instances
+                          WHERE session_id = ?1 AND task_delegation_child_uuid = ?2",
+                            params![session_id.to_string(), child_uuid.to_string()],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(existing) = existing {
+                        let existing = load_agent(conn, session_id, parse_uuid(existing)?)?
+                            .context("task delegation agent mapping disappeared")?;
+                        ensure!(
+                            existing.parent_agent_instance_id == Some(parent_agent_instance_id)
+                                && existing.task_delegation_job_id.as_deref()
+                                    == Some(task_call_id.as_str()),
+                            "task delegation child mapping has incompatible lineage"
+                        );
+                        rows.push(existing);
+                        continue;
+                    }
+                    let agent_instance_id = Uuid::new_v4();
+                    conn.execute(
+                        "INSERT INTO agent_instances (
                          agent_instance_id, session_id, parent_agent_instance_id,
                          task_delegation_job_id, task_delegation_child_uuid,
                          resolved_profile_snapshot_id, workspace_ref, auto_answer_enabled,
                          state, revision, created_at_unix_ms, updated_at_unix_ms
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'created', 0, ?8, ?8)",
-                    params![
-                        agent_instance_id.to_string(),
-                        session_id.to_string(),
-                        parent_agent_instance_id.to_string(),
-                        &task_call_id,
-                        child_uuid.to_string(),
-                        parent.resolved_profile_snapshot_id.map(|id| id.to_string()),
-                        parent.workspace_ref.clone(),
+                        params![
+                            agent_instance_id.to_string(),
+                            session_id.to_string(),
+                            parent_agent_instance_id.to_string(),
+                            &task_call_id,
+                            child_uuid.to_string(),
+                            parent.resolved_profile_snapshot_id.map(|id| id.to_string()),
+                            parent.workspace_ref.clone(),
+                            now_unix_ms,
+                        ],
+                    )?;
+                    insert_control_event(
+                        conn,
+                        session_id,
+                        "agent_created",
+                        agent_instance_id,
+                        AgentInstanceState::Created.as_str(),
                         now_unix_ms,
-                    ],
-                )?;
-                insert_control_event(
-                    conn,
-                    session_id,
-                    "agent_created",
-                    agent_instance_id,
-                    AgentInstanceState::Created.as_str(),
-                    now_unix_ms,
-                )?;
-                let started = conn.execute(
-                    "UPDATE agent_instances
+                    )?;
+                    let started = conn.execute(
+                        "UPDATE agent_instances
                         SET state = 'running', revision = 1, updated_at_unix_ms = ?1
                       WHERE session_id = ?2 AND agent_instance_id = ?3 AND state = 'created'",
-                    params![now_unix_ms, session_id.to_string(), agent_instance_id.to_string()],
-                )?;
-                ensure!(started == 1, "task delegation child lifecycle start CAS lost");
-                insert_control_event(
-                    conn,
-                    session_id,
-                    "agent_transition",
-                    agent_instance_id,
-                    AgentInstanceState::Running.as_str(),
-                    now_unix_ms,
-                )?;
-                rows.push(
-                    load_agent(conn, session_id, agent_instance_id)?
-                        .context("published task delegation agent missing")?,
-                );
-            }
-            Ok(rows)
-        }).await?;
+                        params![
+                            now_unix_ms,
+                            session_id.to_string(),
+                            agent_instance_id.to_string()
+                        ],
+                    )?;
+                    ensure!(
+                        started == 1,
+                        "task delegation child lifecycle start CAS lost"
+                    );
+                    insert_control_event(
+                        conn,
+                        session_id,
+                        "agent_transition",
+                        agent_instance_id,
+                        AgentInstanceState::Running.as_str(),
+                        now_unix_ms,
+                    )?;
+                    rows.push(
+                        load_agent(conn, session_id, agent_instance_id)?
+                            .context("published task delegation agent missing")?,
+                    );
+                }
+                Ok(rows)
+            })
+            .await?;
         for row in &rows {
             if let Some(snapshot_id) = row.resolved_profile_snapshot_id {
                 self.set_agent_auto_answer_from_resolved_profile(
@@ -1399,59 +1430,68 @@ impl Db {
         recovery_anchor: Uuid,
         now_unix_ms: i64,
     ) -> Result<AgentInstanceRow> {
-        ensure!(!recovery_anchor.is_nil(), "recursive child recovery anchor must not be nil");
-        let runtime_key = format!("recursive-noninteractive:{parent_agent_instance_id}:{recovery_anchor}");
-        let child = self.transaction(move |conn| {
-            let parent = load_agent(conn, session_id, parent_agent_instance_id)?
-                .context("recursive child parent is not authorized for this session")?;
-            ensure!(
-                !parent.state.is_terminal(),
-                "cannot bind a recursive child to a terminal parent"
-            );
-            let agent_instance_id = Uuid::new_v4();
-            conn.execute(
-                "INSERT INTO agent_instances (
+        ensure!(
+            !recovery_anchor.is_nil(),
+            "recursive child recovery anchor must not be nil"
+        );
+        let runtime_key =
+            format!("recursive-noninteractive:{parent_agent_instance_id}:{recovery_anchor}");
+        let child = self
+            .transaction(move |conn| {
+                let parent = load_agent(conn, session_id, parent_agent_instance_id)?
+                    .context("recursive child parent is not authorized for this session")?;
+                ensure!(
+                    !parent.state.is_terminal(),
+                    "cannot bind a recursive child to a terminal parent"
+                );
+                let agent_instance_id = Uuid::new_v4();
+                conn.execute(
+                    "INSERT INTO agent_instances (
                      agent_instance_id, session_id, parent_agent_instance_id, runtime_key,
                      resolved_profile_snapshot_id, workspace_ref, auto_answer_enabled,
                      state, revision, created_at_unix_ms, updated_at_unix_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'created', 0, ?7, ?7)",
-                params![
-                    agent_instance_id.to_string(),
-                    session_id.to_string(),
-                    parent_agent_instance_id.to_string(),
-                    runtime_key,
-                    parent.resolved_profile_snapshot_id.map(|id| id.to_string()),
-                    parent.workspace_ref,
+                    params![
+                        agent_instance_id.to_string(),
+                        session_id.to_string(),
+                        parent_agent_instance_id.to_string(),
+                        runtime_key,
+                        parent.resolved_profile_snapshot_id.map(|id| id.to_string()),
+                        parent.workspace_ref,
+                        now_unix_ms,
+                    ],
+                )?;
+                insert_control_event(
+                    conn,
+                    session_id,
+                    "agent_created",
+                    agent_instance_id,
+                    AgentInstanceState::Created.as_str(),
                     now_unix_ms,
-                ],
-            )?;
-            insert_control_event(
-                conn,
-                session_id,
-                "agent_created",
-                agent_instance_id,
-                AgentInstanceState::Created.as_str(),
-                now_unix_ms,
-            )?;
-            let changed = conn.execute(
-                "UPDATE agent_instances
+                )?;
+                let changed = conn.execute(
+                    "UPDATE agent_instances
                  SET state = 'running', revision = 1, updated_at_unix_ms = ?1
                  WHERE session_id = ?2 AND agent_instance_id = ?3 AND state = 'created'",
-                params![now_unix_ms, session_id.to_string(), agent_instance_id.to_string()],
-            )?;
-            ensure!(changed == 1, "recursive child lifecycle start CAS lost");
-            insert_control_event(
-                conn,
-                session_id,
-                "agent_transition",
-                agent_instance_id,
-                AgentInstanceState::Running.as_str(),
-                now_unix_ms,
-            )?;
-            load_agent(conn, session_id, agent_instance_id)?
-                .context("created recursive child agent missing")
-        })
-        .await?;
+                    params![
+                        now_unix_ms,
+                        session_id.to_string(),
+                        agent_instance_id.to_string()
+                    ],
+                )?;
+                ensure!(changed == 1, "recursive child lifecycle start CAS lost");
+                insert_control_event(
+                    conn,
+                    session_id,
+                    "agent_transition",
+                    agent_instance_id,
+                    AgentInstanceState::Running.as_str(),
+                    now_unix_ms,
+                )?;
+                load_agent(conn, session_id, agent_instance_id)?
+                    .context("created recursive child agent missing")
+            })
+            .await?;
         if let Some(snapshot_id) = child.resolved_profile_snapshot_id {
             self.set_agent_auto_answer_from_resolved_profile(
                 session_id,
@@ -1483,107 +1523,141 @@ impl Db {
         children: Vec<NewRecursiveNoninteractiveExecutor>,
         now_unix_ms: i64,
     ) -> Result<Vec<AgentInstanceRow>> {
-        ensure!(!children.is_empty(), "recursive executor checkpoint requires at least one child");
+        ensure!(
+            !children.is_empty(),
+            "recursive executor checkpoint requires at least one child"
+        );
         let mut seen_agent_ids = std::collections::HashSet::new();
         let mut seen_anchors = std::collections::HashSet::new();
         for child in &children {
-            ensure!(!child.agent_instance_id.is_nil(), "recursive child agent id must not be nil");
-            ensure!(!child.recovery_anchor.is_nil(), "recursive child recovery anchor must not be nil");
-            ensure!(seen_agent_ids.insert(child.agent_instance_id), "recursive checkpoint has duplicate child agent id");
-            ensure!(seen_anchors.insert(child.recovery_anchor), "recursive checkpoint has duplicate recovery anchor");
+            ensure!(
+                !child.agent_instance_id.is_nil(),
+                "recursive child agent id must not be nil"
+            );
+            ensure!(
+                !child.recovery_anchor.is_nil(),
+                "recursive child recovery anchor must not be nil"
+            );
+            ensure!(
+                seen_agent_ids.insert(child.agent_instance_id),
+                "recursive checkpoint has duplicate child agent id"
+            );
+            ensure!(
+                seen_anchors.insert(child.recovery_anchor),
+                "recursive checkpoint has duplicate recovery anchor"
+            );
         }
         let parent_snapshot_json = parent_snapshot.into_json();
-        let created = self.transaction(move |conn| {
-            let parent = load_agent(conn, session_id, parent_agent_instance_id)?
-                .context("recursive executor parent is not authorized for this session")?;
-            ensure!(
-                !parent.state.is_terminal(),
-                "cannot checkpoint recursive children under a terminal parent"
-            );
-            let parent_updated = if let Some(task_child_uuid) = parent.task_delegation_child_uuid {
-                conn.execute(
-                    "UPDATE task_delegation_children
+        let created = self
+            .transaction(move |conn| {
+                let parent = load_agent(conn, session_id, parent_agent_instance_id)?
+                    .context("recursive executor parent is not authorized for this session")?;
+                ensure!(
+                    !parent.state.is_terminal(),
+                    "cannot checkpoint recursive children under a terminal parent"
+                );
+                let parent_updated =
+                    if let Some(task_child_uuid) = parent.task_delegation_child_uuid {
+                        conn.execute(
+                            "UPDATE task_delegation_children
                         SET snapshot_json = ?1, updated_at = ?2
                       WHERE child_uuid = ?3
                         AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
-                    params![parent_snapshot_json, now_unix_ms / 1000, task_child_uuid.to_string()],
-                )?
-            } else {
-                conn.execute(
-                    "UPDATE recursive_noninteractive_executors
+                            params![
+                                parent_snapshot_json,
+                                now_unix_ms / 1000,
+                                task_child_uuid.to_string()
+                            ],
+                        )?
+                    } else {
+                        conn.execute(
+                            "UPDATE recursive_noninteractive_executors
                         SET snapshot_json = ?1, updated_at_unix_ms = ?2
                       WHERE session_id = ?3 AND agent_instance_id = ?4",
-                    params![parent_snapshot_json, now_unix_ms, session_id.to_string(), parent_agent_instance_id.to_string()],
-                )?
-            };
-            ensure!(parent_updated == 1, "recursive parent has no live durable continuation descriptor");
-
-            let mut rows = Vec::with_capacity(children.len());
-            for child in children {
-                let runtime_key = format!(
-                    "recursive-noninteractive:{parent_agent_instance_id}:{}",
-                    child.recovery_anchor
+                            params![
+                                parent_snapshot_json,
+                                now_unix_ms,
+                                session_id.to_string(),
+                                parent_agent_instance_id.to_string()
+                            ],
+                        )?
+                    };
+                ensure!(
+                    parent_updated == 1,
+                    "recursive parent has no live durable continuation descriptor"
                 );
-                conn.execute(
-                    "INSERT INTO agent_instances (
+
+                let mut rows = Vec::with_capacity(children.len());
+                for child in children {
+                    let runtime_key = format!(
+                        "recursive-noninteractive:{parent_agent_instance_id}:{}",
+                        child.recovery_anchor
+                    );
+                    conn.execute(
+                        "INSERT INTO agent_instances (
                          agent_instance_id, session_id, parent_agent_instance_id, runtime_key,
                          resolved_profile_snapshot_id, workspace_ref, auto_answer_enabled,
                          state, revision, created_at_unix_ms, updated_at_unix_ms
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'created', 0, ?7, ?7)",
-                    params![
-                        child.agent_instance_id.to_string(),
-                        session_id.to_string(),
-                        parent_agent_instance_id.to_string(),
-                        runtime_key,
-                        parent.resolved_profile_snapshot_id.map(|id| id.to_string()),
-                        parent.workspace_ref.clone(),
+                        params![
+                            child.agent_instance_id.to_string(),
+                            session_id.to_string(),
+                            parent_agent_instance_id.to_string(),
+                            runtime_key,
+                            parent.resolved_profile_snapshot_id.map(|id| id.to_string()),
+                            parent.workspace_ref.clone(),
+                            now_unix_ms,
+                        ],
+                    )?;
+                    insert_control_event(
+                        conn,
+                        session_id,
+                        "agent_created",
+                        child.agent_instance_id,
+                        AgentInstanceState::Created.as_str(),
                         now_unix_ms,
-                    ],
-                )?;
-                insert_control_event(
-                    conn,
-                    session_id,
-                    "agent_created",
-                    child.agent_instance_id,
-                    AgentInstanceState::Created.as_str(),
-                    now_unix_ms,
-                )?;
-                let changed = conn.execute(
-                    "UPDATE agent_instances
+                    )?;
+                    let changed = conn.execute(
+                        "UPDATE agent_instances
                      SET state = 'running', revision = 1, updated_at_unix_ms = ?1
                      WHERE agent_instance_id = ?2 AND session_id = ?3 AND state = 'created'",
-                    params![now_unix_ms, child.agent_instance_id.to_string(), session_id.to_string()],
-                )?;
-                ensure!(changed == 1, "recursive child lifecycle start CAS lost");
-                insert_control_event(
-                    conn,
-                    session_id,
-                    "agent_transition",
-                    child.agent_instance_id,
-                    AgentInstanceState::Running.as_str(),
-                    now_unix_ms,
-                )?;
-                conn.execute(
-                    "INSERT INTO recursive_noninteractive_executors (
+                        params![
+                            now_unix_ms,
+                            child.agent_instance_id.to_string(),
+                            session_id.to_string()
+                        ],
+                    )?;
+                    ensure!(changed == 1, "recursive child lifecycle start CAS lost");
+                    insert_control_event(
+                        conn,
+                        session_id,
+                        "agent_transition",
+                        child.agent_instance_id,
+                        AgentInstanceState::Running.as_str(),
+                        now_unix_ms,
+                    )?;
+                    conn.execute(
+                        "INSERT INTO recursive_noninteractive_executors (
                          agent_instance_id, session_id, parent_agent_instance_id,
                          launch_json, snapshot_json, created_at_unix_ms, updated_at_unix_ms
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                    params![
-                        child.agent_instance_id.to_string(),
-                        session_id.to_string(),
-                        parent_agent_instance_id.to_string(),
-                        child.launch.into_json(),
-                        child.snapshot.into_json(),
-                        now_unix_ms,
-                    ],
-                )?;
-                rows.push(
-                    load_agent(conn, session_id, child.agent_instance_id)?
-                        .context("created recursive child agent missing")?,
-                );
-            }
-            Ok(rows)
-        }).await?;
+                        params![
+                            child.agent_instance_id.to_string(),
+                            session_id.to_string(),
+                            parent_agent_instance_id.to_string(),
+                            child.launch.into_json(),
+                            child.snapshot.into_json(),
+                            now_unix_ms,
+                        ],
+                    )?;
+                    rows.push(
+                        load_agent(conn, session_id, child.agent_instance_id)?
+                            .context("created recursive child agent missing")?,
+                    );
+                }
+                Ok(rows)
+            })
+            .await?;
         for child in &created {
             if let Some(snapshot_id) = child.resolved_profile_snapshot_id {
                 self.set_agent_auto_answer_from_resolved_profile(
@@ -1610,16 +1684,27 @@ impl Db {
         self.transaction(move |conn| {
             let child = load_agent(conn, session_id, agent_instance_id)?
                 .context("recursive executor child is not authorized for this session")?;
-            ensure!(child.parent_agent_instance_id == Some(parent_agent_instance_id), "recursive executor parent does not match durable lineage");
+            ensure!(
+                child.parent_agent_instance_id == Some(parent_agent_instance_id),
+                "recursive executor parent does not match durable lineage"
+            );
             conn.execute(
                 "INSERT INTO recursive_noninteractive_executors (
                      agent_instance_id, session_id, parent_agent_instance_id,
                      launch_json, snapshot_json, created_at_unix_ms, updated_at_unix_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                params![agent_instance_id.to_string(), session_id.to_string(), parent_agent_instance_id.to_string(), launch.into_json(), snapshot.into_json(), now_unix_ms],
+                params![
+                    agent_instance_id.to_string(),
+                    session_id.to_string(),
+                    parent_agent_instance_id.to_string(),
+                    launch.into_json(),
+                    snapshot.into_json(),
+                    now_unix_ms
+                ],
             )?;
             Ok(())
-        }).await
+        })
+        .await
     }
 
     pub async fn persist_recursive_noninteractive_snapshot(
@@ -1634,9 +1719,15 @@ impl Db {
                 "UPDATE recursive_noninteractive_executors
                     SET snapshot_json = ?1, updated_at_unix_ms = ?2
                   WHERE session_id = ?3 AND agent_instance_id = ?4",
-                params![snapshot.into_json(), now_unix_ms, session_id.to_string(), agent_instance_id.to_string()],
+                params![
+                    snapshot.into_json(),
+                    now_unix_ms,
+                    session_id.to_string(),
+                    agent_instance_id.to_string()
+                ],
             )? == 1)
-        }).await
+        })
+        .await
     }
 
     /// Atomically records one recursive child's authored outcome and its
@@ -1823,29 +1914,47 @@ impl Db {
         children: Vec<(Uuid, bool)>,
         now_unix_ms: i64,
     ) -> Result<()> {
-        ensure!(!children.is_empty(), "recursive completion requires at least one child");
+        ensure!(
+            !children.is_empty(),
+            "recursive completion requires at least one child"
+        );
         let parent_snapshot_json = parent_snapshot.into_json();
         self.transaction(move |conn| {
             let parent = load_agent(conn, session_id, parent_agent_instance_id)?
                 .context("recursive completion parent is not authorized for this session")?;
-            ensure!(!parent.state.is_terminal(), "cannot resume a terminal recursive parent");
+            ensure!(
+                !parent.state.is_terminal(),
+                "cannot resume a terminal recursive parent"
+            );
             let parent_updated = if let Some(task_child_uuid) = parent.task_delegation_child_uuid {
                 conn.execute(
                     "UPDATE task_delegation_children
                         SET snapshot_json = ?1, updated_at = ?2
                       WHERE child_uuid = ?3
                         AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
-                    params![parent_snapshot_json, now_unix_ms / 1000, task_child_uuid.to_string()],
+                    params![
+                        parent_snapshot_json,
+                        now_unix_ms / 1000,
+                        task_child_uuid.to_string()
+                    ],
                 )?
             } else {
                 conn.execute(
                     "UPDATE recursive_noninteractive_executors
                         SET snapshot_json = ?1, updated_at_unix_ms = ?2
                       WHERE session_id = ?3 AND agent_instance_id = ?4",
-                    params![parent_snapshot_json, now_unix_ms, session_id.to_string(), parent_agent_instance_id.to_string()],
+                    params![
+                        parent_snapshot_json,
+                        now_unix_ms,
+                        session_id.to_string(),
+                        parent_agent_instance_id.to_string()
+                    ],
                 )?
             };
-            ensure!(parent_updated == 1, "recursive completion parent has no live continuation descriptor");
+            ensure!(
+                parent_updated == 1,
+                "recursive completion parent has no live continuation descriptor"
+            );
             // Do not use a raw state update here.  A child can be parked on an
             // Attention record while its runner is reporting a sibling result,
             // and the normal lifecycle transition is the only place that
@@ -1857,7 +1966,10 @@ impl Db {
             for (child_agent_instance_id, failed) in children {
                 let child = load_agent(conn, session_id, child_agent_instance_id)?
                     .context("recursive completion child is not authorized for this session")?;
-                ensure!(child.parent_agent_instance_id == Some(parent_agent_instance_id), "recursive completion child is not owned by parent");
+                ensure!(
+                    child.parent_agent_instance_id == Some(parent_agent_instance_id),
+                    "recursive completion child is not owned by parent"
+                );
                 if child.state.is_terminal() {
                     continue;
                 }
@@ -1931,7 +2043,8 @@ impl Db {
                 fail_after_control_event(4, child_agent_instance_id)?;
             }
             Ok(())
-        }).await
+        })
+        .await
     }
 
     pub async fn recursive_noninteractive_recovery_descriptor(
@@ -2065,7 +2178,11 @@ impl Db {
             Ok(original_args_json
                 .as_deref()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .and_then(|value| value.get("interactive").and_then(serde_json::Value::as_bool))
+                .and_then(|value| {
+                    value
+                        .get("interactive")
+                        .and_then(serde_json::Value::as_bool)
+                })
                 == Some(false))
         })
         .await
@@ -2189,7 +2306,10 @@ impl Db {
         next_state: AgentInstanceState,
         now_unix_ms: i64,
     ) -> Result<bool> {
-        ensure!(next_state.is_terminal(), "task child lifecycle target must be terminal");
+        ensure!(
+            next_state.is_terminal(),
+            "task child lifecycle target must be terminal"
+        );
         let receipt_json = json!({
             "source": "task_delegation",
             "task_call_id": task_call_id.as_str(),
@@ -2199,11 +2319,7 @@ impl Db {
         .to_string();
         for _ in 0..4 {
             let Some(agent) = self
-                .task_delegation_child_agent(
-                    session_id,
-                    task_call_id.clone(),
-                    label.clone(),
-                )
+                .task_delegation_child_agent(session_id, task_call_id.clone(), label.clone())
                 .await?
             else {
                 return Ok(false);
@@ -2485,7 +2601,6 @@ impl Db {
         .await
     }
 
-
     /// Lists only direct, session-authorized descendants. The caller cannot
     /// use an instance UUID from another session as an existence oracle.
     pub async fn agent_instance_children(
@@ -2533,7 +2648,13 @@ impl Db {
             "agent lineage page limit is out of range"
         );
         self.read(move |conn| {
-            let ids = list_lineage_ids_conn(conn, session_id, root_agent_instance_id, after.as_ref(), limit + 1)?;
+            let ids = list_lineage_ids_conn(
+                conn,
+                session_id,
+                root_agent_instance_id,
+                after.as_ref(),
+                limit + 1,
+            )?;
             let has_more = ids.len() > limit;
             let ids = ids.into_iter().take(limit).collect::<Vec<_>>();
             let mut entries = Vec::with_capacity(ids.len());
@@ -2547,7 +2668,10 @@ impl Db {
                     id: last.agent_instance_id,
                 }
             });
-            Ok(AgentTreePage { entries, next_cursor })
+            Ok(AgentTreePage {
+                entries,
+                next_cursor,
+            })
         })
         .await
     }
@@ -2702,7 +2826,10 @@ impl Db {
         after_session_event_seq: i64,
         limit: usize,
     ) -> Result<Vec<AgentTreeEventRow>> {
-        ensure!(limit > 0 && limit <= 1_000, "agent tree event page limit is out of range");
+        ensure!(
+            limit > 0 && limit <= 1_000,
+            "agent tree event page limit is out of range"
+        );
         self.read(move |conn| {
             let mut statement = conn.prepare(
                 "SELECT seq, data_json FROM session_events
@@ -2711,7 +2838,11 @@ impl Db {
             )?;
             let rows = statement
                 .query_map(
-                    params![session_id.to_string(), after_session_event_seq, limit as i64],
+                    params![
+                        session_id.to_string(),
+                        after_session_event_seq,
+                        limit as i64
+                    ],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3185,7 +3316,7 @@ impl Db {
             DecisionCreationKind::Generic,
             now_unix_ms,
         )
-            .await
+        .await
     }
 
     /// Attach a durable decision to an already-persisted interactive question
@@ -3204,7 +3335,7 @@ impl Db {
             DecisionCreationKind::Generic,
             now_unix_ms,
         )
-            .await
+        .await
     }
 
     /// Create the sole automatically-resolvable decision class through the
@@ -3336,8 +3467,7 @@ impl Db {
                 [],
                 |row| row.get(0),
             )?;
-            u64::try_from(value)
-                .context("host capability refresh generation high-water is invalid")
+            u64::try_from(value).context("host capability refresh generation high-water is invalid")
         })
         .await
     }
@@ -3357,7 +3487,10 @@ impl Db {
                   WHERE singleton = 1",
                 [],
             )?;
-            ensure!(changed == 1, "host capability refresh generation allocator is missing");
+            ensure!(
+                changed == 1,
+                "host capability refresh generation allocator is missing"
+            );
             let generation: i64 = conn.query_row(
                 "SELECT high_water_generation
                    FROM host_capability_refresh_generation_allocator
@@ -3641,7 +3774,10 @@ impl Db {
                   ORDER BY operation.created_at_unix_ms, operation.operation_id",
             )?;
             statement
-                .query_map([session_id.to_string()], host_capability_refresh_operation_from_row)?
+                .query_map(
+                    [session_id.to_string()],
+                    host_capability_refresh_operation_from_row,
+                )?
                 .map(|result| result.map_err(anyhow::Error::from))
                 .collect()
         })
@@ -3755,7 +3891,10 @@ impl Db {
         lease_expires_at_unix_ms: i64,
         now_unix_ms: i64,
     ) -> Result<HostCapabilityRefreshExecutionClaim> {
-        ensure!(!owner_token.is_nil(), "host capability refresh lease owner token must not be nil");
+        ensure!(
+            !owner_token.is_nil(),
+            "host capability refresh lease owner token must not be nil"
+        );
         ensure!(
             lease_expires_at_unix_ms > now_unix_ms,
             "host capability refresh execution lease must expire in the future"
@@ -4387,7 +4526,10 @@ impl Db {
         _authority: HostApprovalAuthority,
         now_unix_ms: i64,
     ) -> Result<()> {
-        ensure!(!operation_id.is_nil(), "host approval operation id must not be nil");
+        ensure!(
+            !operation_id.is_nil(),
+            "host approval operation id must not be nil"
+        );
         validate_host_operation_binding(&operation_kind, &input_digest)?;
         validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
         self.transaction(move |conn| {
@@ -4810,7 +4952,10 @@ impl Db {
                     agent_instance_id.to_string(),
                 ],
             )?;
-            ensure!(changed == 1, "unclaimed host approval operation lost its rejection CAS");
+            ensure!(
+                changed == 1,
+                "unclaimed host approval operation lost its rejection CAS"
+            );
             Ok(true)
         })
         .await
@@ -6330,7 +6475,11 @@ impl Db {
                      WHERE steer_id = ?1 AND session_id = ?2
                        AND delivered_at_unix_ms IS NULL
                        AND claimed_recovery_epoch = ?3",
-                    params![steer_id.to_string(), session_id.to_string(), recovery_epoch.to_string()],
+                    params![
+                        steer_id.to_string(),
+                        session_id.to_string(),
+                        recovery_epoch.to_string()
+                    ],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -6534,7 +6683,10 @@ impl Db {
         resume_payload_json: &str,
         now_unix_ms: i64,
     ) -> Result<DecisionTransitionOutcome> {
-        ensure!(terminal_state.is_terminal(), "decision resolution must be terminal");
+        ensure!(
+            terminal_state.is_terminal(),
+            "decision resolution must be terminal"
+        );
         let resume_payload_json = validate_resume_payload_json(resume_payload_json)?;
         self.transition_decision_request(
             session_id,
@@ -6568,12 +6720,14 @@ impl Db {
         now_unix_ms: i64,
     ) -> Result<DecisionTransitionOutcome> {
         let resume_payload_json = validate_resume_payload_json(resume_payload_json)?;
-        let selected_response_json = interrupt_response_from_resume_payload(Some(&resume_payload_json))
-            .context("host approval resume payload is missing its selected response")?;
+        let selected_response_json =
+            interrupt_response_from_resume_payload(Some(&resume_payload_json))
+                .context("host approval resume payload is missing its selected response")?;
         let selected_response: serde_json::Value = serde_json::from_str(&selected_response_json)
             .context("host approval selected response is not valid JSON")?;
-        let selected_response_json = String::from_utf8(canonical_json_bytes(&selected_response)?)
-            .context("canonical host approval selected response was not UTF-8")?;
+        let selected_response_json =
+            String::from_utf8(canonical_json_bytes(&selected_response)?)
+                .context("canonical host approval selected response was not UTF-8")?;
         self.transition_decision_request(
             session_id,
             decision_request_id,
@@ -6605,9 +6759,8 @@ impl Db {
         now_unix_ms: i64,
     ) -> Result<DecisionTransitionOutcome> {
         let receipt_json = redact_receipt_json(receipt_json)?;
-        let host_capability_refresh_allowed = host_capability_refresh_response_allows(
-            resume_payload_json.as_deref(),
-        );
+        let host_capability_refresh_allowed =
+            host_capability_refresh_response_allows(resume_payload_json.as_deref());
         if trusted_host_approval {
             ensure!(
                 host_selected_response_json.is_some(),
@@ -7148,25 +7301,36 @@ fn list_lineage_ids_conn(
     after: Option<&AgentTreePageCursor>,
     limit: usize,
 ) -> Result<Vec<Uuid>> {
-    let (root_clause, cursor_clause, mut values): (&str, &str, Vec<rusqlite::types::Value>) =
-        match (root_agent_instance_id, after) {
-            (Some(root), Some(cursor)) => (
-                "AND agent_instance_id IN (SELECT agent_instance_id FROM tree)",
-                "AND (created_at_unix_ms > ?3 OR (created_at_unix_ms = ?3 AND agent_instance_id > ?4))",
-                vec![session_id.to_string().into(), root.to_string().into(), cursor.created_at_unix_ms.into(), cursor.id.to_string().into()],
-            ),
-            (Some(root), None) => (
-                "AND agent_instance_id IN (SELECT agent_instance_id FROM tree)",
-                "",
-                vec![session_id.to_string().into(), root.to_string().into()],
-            ),
-            (None, Some(cursor)) => (
-                "",
-                "AND (created_at_unix_ms > ?2 OR (created_at_unix_ms = ?2 AND agent_instance_id > ?3))",
-                vec![session_id.to_string().into(), cursor.created_at_unix_ms.into(), cursor.id.to_string().into()],
-            ),
-            (None, None) => ("", "", vec![session_id.to_string().into()]),
-        };
+    let (root_clause, cursor_clause, mut values): (&str, &str, Vec<rusqlite::types::Value>) = match (
+        root_agent_instance_id,
+        after,
+    ) {
+        (Some(root), Some(cursor)) => (
+            "AND agent_instance_id IN (SELECT agent_instance_id FROM tree)",
+            "AND (created_at_unix_ms > ?3 OR (created_at_unix_ms = ?3 AND agent_instance_id > ?4))",
+            vec![
+                session_id.to_string().into(),
+                root.to_string().into(),
+                cursor.created_at_unix_ms.into(),
+                cursor.id.to_string().into(),
+            ],
+        ),
+        (Some(root), None) => (
+            "AND agent_instance_id IN (SELECT agent_instance_id FROM tree)",
+            "",
+            vec![session_id.to_string().into(), root.to_string().into()],
+        ),
+        (None, Some(cursor)) => (
+            "",
+            "AND (created_at_unix_ms > ?2 OR (created_at_unix_ms = ?2 AND agent_instance_id > ?3))",
+            vec![
+                session_id.to_string().into(),
+                cursor.created_at_unix_ms.into(),
+                cursor.id.to_string().into(),
+            ],
+        ),
+        (None, None) => ("", "", vec![session_id.to_string().into()]),
+    };
     if let Some(root) = root_agent_instance_id {
         ensure!(
             load_agent(conn, session_id, root)?.is_some(),
@@ -7257,16 +7421,16 @@ fn load_decision(
     };
     validate_redaction_class(&decision.rationale_redaction_class)
         .context("persisted decision rationale class is invalid")?;
-    validate_decision_class(&decision.decision_class).context("persisted decision class is invalid")?;
+    validate_decision_class(&decision.decision_class)
+        .context("persisted decision class is invalid")?;
     let public_option_ids = validate_durable_decision_answer_contract(
         &decision.options_contract_json,
         decision.free_text_contract_json.as_deref(),
     )
     .context("persisted decision answer contract is invalid")?;
-    let has_question_tool_contract = durable_decision_has_question_tool_contract(
-        &decision.options_contract_json,
-    )
-    .context("persisted decision QuestionTool binding is invalid")?;
+    let has_question_tool_contract =
+        durable_decision_has_question_tool_contract(&decision.options_contract_json)
+            .context("persisted decision QuestionTool binding is invalid")?;
     let mappings = load_private_decision_option_mappings_conn(
         conn,
         decision.session_id,
@@ -7288,13 +7452,15 @@ fn load_decision(
             "SELECT agent_instance_id, question_json, questions_json
                FROM needs_attention
               WHERE session_id = ?1 AND decision_request_id = ?2",
-            params![decision.session_id.to_string(), decision.decision_request_id.to_string()],
+            params![
+                decision.session_id.to_string(),
+                decision.decision_request_id.to_string()
+            ],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let (attention_owner, question_json, questions_json) = attention.context(
-        "persisted decision is missing its sole durable Attention projection",
-    )?;
+    let (attention_owner, question_json, questions_json) =
+        attention.context("persisted decision is missing its sole durable Attention projection")?;
     let expected_owner = decision.agent_instance_id.to_string();
     ensure!(
         attention_owner.as_deref() == Some(expected_owner.as_str()),
@@ -7345,9 +7511,9 @@ fn load_decision(
             }),
         )
         .context("persisted decision recommendation is invalid")?,
-        None if decision.decision_class == "low_risk" => bail!(
-            "persisted low-risk durable decision is missing the approved host recommendation"
-        ),
+        None if decision.decision_class == "low_risk" => {
+            bail!("persisted low-risk durable decision is missing the approved host recommendation")
+        }
         None => {}
     }
     Ok(Some(decision))
@@ -7440,7 +7606,9 @@ fn load_late_user_steer(
                     .get::<_, Option<String>>(9)?
                     .map(parse_uuid)
                     .transpose()?,
-                execution_state: LateUserDecisionSteerExecutionState::parse(&row.get::<_, String>(10)?)?,
+                execution_state: LateUserDecisionSteerExecutionState::parse(
+                    &row.get::<_, String>(10)?,
+                )?,
                 accepted_recovery_epoch: row
                     .get::<_, Option<String>>(11)?
                     .map(parse_uuid)
@@ -7591,7 +7759,11 @@ fn abort_host_capability_refresh_initialization_conn(
           WHERE session_id = ?2 AND agent_instance_id = ?3
             AND decision_request_id IS NULL
             AND state IN ('open', 'parked', 'executing', 'interrupted')",
-        params![now_unix_ms, session_id.to_string(), agent_instance_id.to_string()],
+        params![
+            now_unix_ms,
+            session_id.to_string(),
+            agent_instance_id.to_string()
+        ],
     )?;
 
     if !child.state.is_terminal() {
@@ -7848,7 +8020,9 @@ fn cancel_live_descendants(
             Some("completed") => AgentInstanceState::Completed,
             Some("failed") => AgentInstanceState::Failed,
             Some("cancelled") => AgentInstanceState::Cancelled,
-            Some(_) => bail!("subtree cancellation found a nonterminal host capability refresh operation"),
+            Some(_) => {
+                bail!("subtree cancellation found a nonterminal host capability refresh operation")
+            }
         };
         ensure!(
             current_state.legal_transition(target_state),
@@ -7889,7 +8063,9 @@ fn cancel_live_descendants(
                 target_state.as_str(),
                 session_id.to_string(),
                 revision + 1,
-                redacted_marker("cascade cancellation with durable host-operation terminal outcome"),
+                redacted_marker(
+                    "cascade cancellation with durable host-operation terminal outcome"
+                ),
                 event_seq,
                 now_unix_ms,
             ],
@@ -8325,9 +8501,10 @@ fn validate_host_operation_binding(operation_kind: &str, input_digest: &str) -> 
     ensure!(
         !operation_kind.is_empty()
             && operation_kind.len() <= 128
-            && operation_kind
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'),
+            && operation_kind.bytes().all(|byte| byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || byte == b'_'
+                || byte == b'-'),
         "host approval operation kind is invalid"
     );
     ensure!(
@@ -8341,7 +8518,10 @@ fn validate_host_operation_binding(operation_kind: &str, input_digest: &str) -> 
 /// that the composition point persisted. A digest by itself is not enough at
 /// a concrete effect boundary: accepting alternate JSON spellings would make
 /// it impossible to prove which candidate set was actually approved.
-fn validate_host_operation_canonical_input(canonical_input_json: &str, input_digest: &str) -> Result<()> {
+fn validate_host_operation_canonical_input(
+    canonical_input_json: &str,
+    input_digest: &str,
+) -> Result<()> {
     ensure!(
         canonical_input_json.len() <= 512 * 1024,
         "host approval canonical input exceeds durable limit"
@@ -8350,8 +8530,8 @@ fn validate_host_operation_canonical_input(canonical_input_json: &str, input_dig
         .context("host approval canonical input must be valid JSON")?;
     validate_host_operation_candidate_set(&value)?;
     let canonical = canonical_json_bytes(&value)?;
-    let canonical = std::str::from_utf8(&canonical)
-        .context("canonical host approval input was not UTF-8")?;
+    let canonical =
+        std::str::from_utf8(&canonical).context("canonical host approval input was not UTF-8")?;
     ensure!(
         canonical == canonical_input_json,
         "host approval input is not canonical JSON"
@@ -8360,7 +8540,12 @@ fn validate_host_operation_canonical_input(canonical_input_json: &str, input_dig
     digest.update(b"flycockpit.host-approval-input.v1\0");
     digest.update(canonical.as_bytes());
     ensure!(
-        digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>() == input_digest,
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            == input_digest,
         "host approval canonical input does not match its digest"
     );
     Ok(())
@@ -8420,8 +8605,7 @@ fn host_operation_candidate_matches_any_concrete_effect(
                 | "persist_grant"
                 | "persist_rule"
                 | "persist_reject"
-        )
-            && candidate.get(effect_name) == Some(effect_value)
+        ) && candidate.get(effect_name) == Some(effect_value)
     })
 }
 
@@ -8527,9 +8711,11 @@ fn validate_host_approval_response_against_offered_interrupt(
             serde_json::from_str::<InterruptQuestion>(raw)
                 .context("host approval interrupt question is malformed")?,
         ],
-        (None, Some(raw)) => serde_json::from_str::<InterruptQuestionSet>(raw)
-            .context("host approval interrupt question set is malformed")?
-            .questions,
+        (None, Some(raw)) => {
+            serde_json::from_str::<InterruptQuestionSet>(raw)
+                .context("host approval interrupt question set is malformed")?
+                .questions
+        }
         (None, None) | (Some(_), Some(_)) => unreachable!("validated exclusive question shape"),
     };
     ensure!(
@@ -8538,8 +8724,14 @@ fn validate_host_approval_response_against_offered_interrupt(
     );
     let response: ResolveResponse = serde_json::from_str(selected_response_json)
         .context("host approval selected response is not a valid response envelope")?;
-    let (InterruptQuestion::Single { options, allow_freetext, .. }, ResolveResponse::Single { selected_id }) =
-        (&questions[0], response)
+    let (
+        InterruptQuestion::Single {
+            options,
+            allow_freetext,
+            ..
+        },
+        ResolveResponse::Single { selected_id },
+    ) = (&questions[0], response)
     else {
         bail!("host approval response is not the exact offered single-select answer");
     };
@@ -8645,10 +8837,16 @@ fn redact_receipt_json(raw: &str) -> Result<String> {
 }
 
 fn validate_resume_payload_json(raw: &str) -> Result<String> {
-    ensure!(raw.len() <= 32 * 1024, "decision resume payload exceeds durable limit");
+    ensure!(
+        raw.len() <= 32 * 1024,
+        "decision resume payload exceeds durable limit"
+    );
     let value: serde_json::Value =
         serde_json::from_str(raw).context("decision resume payload must be valid JSON")?;
-    ensure!(value.is_object(), "decision resume payload must be an object");
+    ensure!(
+        value.is_object(),
+        "decision resume payload must be an object"
+    );
     Ok(raw.to_owned())
 }
 
@@ -8680,7 +8878,11 @@ fn redact_options_contract(raw: &str) -> Result<RedactedOptionsContract> {
         object.keys().all(|key| {
             matches!(
                 key.as_str(),
-                "options" | "question" | "description" | "task_call_id" | "workspace_ref"
+                "options"
+                    | "question"
+                    | "description"
+                    | "task_call_id"
+                    | "workspace_ref"
                     | "interrupt_response_contract"
             )
         }) && object.contains_key("options"),
@@ -8699,7 +8901,10 @@ fn redact_options_contract(raw: &str) -> Result<RedactedOptionsContract> {
         ensure!(question.is_string(), "decision question must be a string");
     }
     if let Some(description) = object.remove("description") {
-        ensure!(description.is_string(), "decision description must be a string");
+        ensure!(
+            description.is_string(),
+            "decision description must be a string"
+        );
     }
     if let Some(task_call_id) = object.remove("task_call_id") {
         ensure!(
@@ -8818,7 +9023,9 @@ fn redact_interrupt_response_contract(
         .as_object()
         .context("QuestionTool continuation contract must be an object")?;
     ensure!(
-        object.keys().all(|key| key == "schema" || key == "questions"),
+        object
+            .keys()
+            .all(|key| key == "schema" || key == "questions"),
         "QuestionTool continuation contract contains an unapproved field"
     );
     ensure!(
@@ -8870,7 +9077,10 @@ fn redact_interrupt_response_contract(
                     })
                     .collect::<Result<Vec<_>>>()?;
                 ensure!(
-                    option_ids.iter().collect::<std::collections::BTreeSet<_>>().len()
+                    option_ids
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
                         == option_ids.len(),
                     "QuestionTool option ids must be unique"
                 );
@@ -8973,18 +9183,26 @@ fn validate_durable_decision_answer_contract(
     );
     ensure!(
         contract.get("question").and_then(serde_json::Value::as_str) == Some("Decision required")
-            && contract.get("description").and_then(serde_json::Value::as_str)
+            && contract
+                .get("description")
+                .and_then(serde_json::Value::as_str)
                 == Some("An agent decision is waiting")
             && contract.get("task_call_id") == Some(&serde_json::Value::Null)
             && contract.get("workspace_ref") == Some(&serde_json::Value::Null)
-            && contract.get("redacted").and_then(serde_json::Value::as_bool) == Some(true),
+            && contract
+                .get("redacted")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
         "durable decision options contract is not the canonical redacted projection"
     );
     let options = contract
         .get("options")
         .and_then(serde_json::Value::as_array)
         .context("durable decision options contract is missing its options array")?;
-    ensure!(options.len() <= 64, "durable decision options contract has too many options");
+    ensure!(
+        options.len() <= 64,
+        "durable decision options contract has too many options"
+    );
     let mut option_ids = std::collections::BTreeSet::new();
     for option in options {
         let option = option
@@ -8999,7 +9217,10 @@ fn validate_durable_decision_answer_contract(
             .and_then(serde_json::Value::as_str)
             .context("durable decision option is missing its id")?;
         validate_daemon_minted_public_option_id(id)?;
-        ensure!(option_ids.insert(id.to_owned()), "durable decision option ids must be unique");
+        ensure!(
+            option_ids.insert(id.to_owned()),
+            "durable decision option ids must be unique"
+        );
     }
     let interrupt_response_contract = contract
         .get("interrupt_response_contract")
@@ -9077,9 +9298,11 @@ fn validate_question_tool_contract_matches_interrupt<'a>(
             serde_json::from_str::<InterruptQuestion>(raw)
                 .context("QuestionTool interrupt question is malformed")?,
         ],
-        (None, Some(raw)) => serde_json::from_str::<InterruptQuestionSet>(raw)
-            .context("QuestionTool interrupt question set is malformed")?
-            .questions,
+        (None, Some(raw)) => {
+            serde_json::from_str::<InterruptQuestionSet>(raw)
+                .context("QuestionTool interrupt question set is malformed")?
+                .questions
+        }
         (None, None) | (Some(_), Some(_)) => unreachable!("exclusive shape was validated"),
     };
     ensure!(
@@ -9186,9 +9409,11 @@ fn validate_raw_interrupt_approval_binding(
             serde_json::from_str::<InterruptQuestion>(raw)
                 .context("QuestionTool approval interrupt question is malformed")?,
         ],
-        (None, Some(raw)) => serde_json::from_str::<InterruptQuestionSet>(raw)
-            .context("QuestionTool approval interrupt question set is malformed")?
-            .questions,
+        (None, Some(raw)) => {
+            serde_json::from_str::<InterruptQuestionSet>(raw)
+                .context("QuestionTool approval interrupt question set is malformed")?
+                .questions
+        }
         (None, None) | (Some(_), Some(_)) => unreachable!("exclusive shape was validated"),
     };
     let approval_questions = questions
@@ -9240,7 +9465,10 @@ fn validate_persisted_host_approval_operation_binding(
     decision: &DecisionRequestRow,
     has_question_tool_contract: bool,
 ) -> Result<()> {
-    match (decision.decision_class.as_str(), decision.host_approval_operation_id) {
+    match (
+        decision.decision_class.as_str(),
+        decision.host_approval_operation_id,
+    ) {
         ("host_approval", Some(operation_id)) => {
             ensure!(
                 has_question_tool_contract,
@@ -9282,8 +9510,8 @@ fn validate_persisted_host_approval_operation_binding(
 }
 
 fn validate_durable_free_text_contract(raw: &str) -> Result<bool> {
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .context("durable free-text contract must be a JSON object")?;
+    let value: serde_json::Value =
+        serde_json::from_str(raw).context("durable free-text contract must be a JSON object")?;
     let object = value
         .as_object()
         .context("durable free-text contract must be a JSON object")?;
@@ -9311,7 +9539,9 @@ fn validate_durable_free_text_contract(raw: &str) -> Result<bool> {
         .transpose()?;
     let allows_free_text = match (allowed, max_chars) {
         (true, Some(1..=10_000)) => true,
-        (true, Some(_)) => bail!("durable free-text contract max_chars must be between 1 and 10000"),
+        (true, Some(_)) => {
+            bail!("durable free-text contract max_chars must be between 1 and 10000")
+        }
         (true, None) => bail!("durable allowed free-text contract requires a bounded max_chars"),
         (false, None) => false,
         (false, Some(_)) => bail!("durable disallowed free-text contract must not carry max_chars"),
@@ -9428,14 +9658,12 @@ fn redact_recommendation(
     let object: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(raw).context("decision recommendation must be a JSON object")?;
     ensure!(
-        object
-            .keys()
-            .all(|key| {
-                key == "option_id"
-                    || key == "rationale"
-                    || key == "rationale_redaction_class"
-                    || key == "host_action"
-            }),
+        object.keys().all(|key| {
+            key == "option_id"
+                || key == "rationale"
+                || key == "rationale_redaction_class"
+                || key == "host_action"
+        }),
         "decision recommendation contains an unapproved field"
     );
     let option_id = object
@@ -9462,7 +9690,11 @@ fn redact_recommendation(
         .unwrap_or(false);
     let supplied_rationale_redaction_class = object
         .get("rationale_redaction_class")
-        .map(|value| value.as_str().context("decision rationale class must be a string"))
+        .map(|value| {
+            value
+                .as_str()
+                .context("decision rationale class must be a string")
+        })
         .transpose()?;
     if let Some(class) = supplied_rationale_redaction_class {
         validate_redaction_class(class)?;
@@ -9473,7 +9705,11 @@ fn redact_recommendation(
     }
     let host_action = object
         .get("host_action")
-        .map(|value| value.as_str().context("host-owned recommendation action must be a string"))
+        .map(|value| {
+            value
+                .as_str()
+                .context("host-owned recommendation action must be a string")
+        })
         .transpose()?;
     if let Some(host_action) = host_action {
         // The contract exposes exactly one host-authored, non-sensitive
@@ -9590,7 +9826,9 @@ fn validate_durable_recommendation<'a>(
         mapped == 1,
         "durable decision recommendation option lacks its exact private continuation mapping"
     );
-    let rationale = object.get("rationale").expect("required canonical rationale field");
+    let rationale = object
+        .get("rationale")
+        .expect("required canonical rationale field");
     ensure!(
         rationale.is_null() || rationale.as_str() == Some("redacted"),
         "durable decision recommendation rationale is not redacted"
@@ -9604,13 +9842,15 @@ fn validate_durable_recommendation<'a>(
         rationale_redaction_class == expected_rationale_redaction_class,
         "durable decision recommendation rationale class does not match its decision"
     );
-    let host_action = object.get("host_action").expect("required canonical host action field");
+    let host_action = object
+        .get("host_action")
+        .expect("required canonical host action field");
     match (decision_class, host_action) {
         ("low_risk", serde_json::Value::String(action))
             if action == "refresh_local_host_capabilities" => {}
-        ("low_risk", _) => bail!(
-            "low-risk durable recommendation must carry the approved host action semantics"
-        ),
+        ("low_risk", _) => {
+            bail!("low-risk durable recommendation must carry the approved host action semantics")
+        }
         (_, serde_json::Value::Null) => {}
         _ => bail!("durable recommendation carries an unapproved host action semantic"),
     }
@@ -9625,7 +9865,8 @@ fn validate_daemon_minted_public_option_id(value: &str) -> Result<()> {
     let Some(uuid_text) = value.strip_prefix("option:") else {
         bail!("durable public option id is not daemon-minted");
     };
-    let uuid = Uuid::parse_str(uuid_text).context("durable public option id has an invalid UUID")?;
+    let uuid =
+        Uuid::parse_str(uuid_text).context("durable public option id has an invalid UUID")?;
     ensure!(
         !uuid.is_nil()
             && uuid.get_version_num() == 7
@@ -9673,7 +9914,12 @@ fn validate_safe_display(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_bounded_display(value: &str, field: &str, max_chars: usize, required: bool) -> Result<()> {
+fn validate_bounded_display(
+    value: &str,
+    field: &str,
+    max_chars: usize,
+    required: bool,
+) -> Result<()> {
     let lower = value.to_ascii_lowercase();
     ensure!(
         (!required || !value.trim().is_empty())
@@ -9852,16 +10098,15 @@ fn validate_recursive_noninteractive_snapshot_json(raw: &str) -> Result<String> 
     canonical_recursive_noninteractive_json_string(&value, "continuation snapshot")
 }
 
-fn validate_host_capability_refresh_snapshot_identity(
-    generation: u64,
-    digest: &str,
-) -> Result<()> {
-    ensure!(generation >= 1, "host capability refresh snapshot generation must be positive");
+fn validate_host_capability_refresh_snapshot_identity(generation: u64, digest: &str) -> Result<()> {
+    ensure!(
+        generation >= 1,
+        "host capability refresh snapshot generation must be positive"
+    );
     ensure!(
         digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())),
+            && digest.bytes().all(|byte| byte.is_ascii_digit()
+                || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())),
         "host capability refresh snapshot digest is invalid"
     );
     Ok(())
@@ -9964,10 +10209,12 @@ mod tests {
             // validation; it does not grant the value any production use.
             assert!(unsafe { HostWorkspaceRef::from_daemon_derived(malformed.into()) }.is_err());
         }
-        assert!(unsafe {
-            HostWorkspaceRef::from_daemon_derived(format!("workspace:v1:{}", "a".repeat(64)))
-        }
-        .is_ok());
+        assert!(
+            unsafe {
+                HostWorkspaceRef::from_daemon_derived(format!("workspace:v1:{}", "a".repeat(64)))
+            }
+            .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -10010,9 +10257,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(rejected
-            .to_string()
-            .contains("inherit its exact parent workspace reference"));
+        assert!(
+            rejected
+                .to_string()
+                .contains("inherit its exact parent workspace reference")
+        );
     }
 
     #[test]
@@ -10029,12 +10278,15 @@ mod tests {
             r#"{"version":1,"task_call_id":"task","label":"label","child_agent":"child","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
         )
         .is_err());
-        assert!(ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(
-            r#"{"version":3,"history":[]}"#,
-        )
-        .is_err());
-        assert!(ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize("not-json")
-            .is_err());
+        assert!(
+            ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(
+                r#"{"version":3,"history":[]}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize("not-json").is_err()
+        );
     }
 
     #[tokio::test]
@@ -10075,8 +10327,9 @@ mod tests {
             r#"{"version":1,"task_call_id":"child","label":"child","child_agent":"agent","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
         )
         .is_err());
-        assert!(ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize("not-json")
-            .is_err());
+        assert!(
+            ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize("not-json").is_err()
+        );
         assert!(
             db.agent_instance(session.session_id, child_id)
                 .await
@@ -10121,11 +10374,17 @@ mod tests {
             if page.is_empty() {
                 break;
             }
-            assert!(page.len() <= 2, "each maintenance turn has a fixed event budget");
+            assert!(
+                page.len() <= 2,
+                "each maintenance turn has a fixed event budget"
+            );
             after = page.last().expect("nonempty event page").session_event_seq;
             observed.extend(page.into_iter().map(|event| event.session_event_seq));
         }
-        assert!(observed.len() >= 8, "the fixture creates a multi-page event backlog");
+        assert!(
+            observed.len() >= 8,
+            "the fixture creates a multi-page event backlog"
+        );
         assert!(
             observed.windows(2).all(|pair| pair[0] < pair[1]),
             "the durable event cursor is stable and never skips or reorders backlog entries"
@@ -10141,11 +10400,7 @@ mod tests {
             let agent = running_agent(&db, session.session_id, 10 + offset).await;
             let decision = db
                 .create_decision_request(
-                    standard_decision(
-                        session.session_id,
-                        agent.agent_instance_id,
-                        agent.revision,
-                    ),
+                    standard_decision(session.session_id, agent.agent_instance_id, agent.revision),
                     100,
                 )
                 .await
@@ -10161,10 +10416,12 @@ mod tests {
                 .recoverable_decision_requests_page(session.session_id, after.clone(), 2)
                 .await
                 .unwrap();
-            assert!(page.entries.len() <= 2, "one DB maintenance query is bounded");
+            assert!(
+                page.entries.len() <= 2,
+                "one DB maintenance query is bounded"
+            );
             observed.extend(
-                page
-                    .entries
+                page.entries
                     .iter()
                     .map(|decision| (decision.created_at_unix_ms, decision.decision_request_id)),
             );
@@ -10203,7 +10460,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(page.entries.len() <= 2, "one allowed-refresh scan is bounded");
+            assert!(
+                page.entries.len() <= 2,
+                "one allowed-refresh scan is bounded"
+            );
             observed.extend(page.entries.iter().map(|operation| operation.operation_id));
             let Some(cursor) = page.next_cursor else {
                 break;
@@ -10288,22 +10548,23 @@ mod tests {
                 .await
                 .unwrap();
             assert!(page.entries.len() <= 2, "one outbox scan is bounded");
-            observed.extend(
-                page.entries.into_iter().map(|operation| {
-                    (
-                        operation.result_snapshot_generation.unwrap(),
-                        operation.completed_at_unix_ms.unwrap(),
-                        operation.operation_id,
-                    )
-                }),
-            );
+            observed.extend(page.entries.into_iter().map(|operation| {
+                (
+                    operation.result_snapshot_generation.unwrap(),
+                    operation.completed_at_unix_ms.unwrap(),
+                    operation.operation_id,
+                )
+            }));
             let Some(cursor) = page.next_cursor else {
                 break;
             };
             after = Some(cursor);
         }
         assert_eq!(
-            observed.iter().map(|(generation, _, _)| *generation).collect::<Vec<_>>(),
+            observed
+                .iter()
+                .map(|(generation, _, _)| *generation)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5],
             "the generation/timestamp/operation-id cursor cannot skip a large completed outbox"
         );
@@ -10326,9 +10587,9 @@ mod tests {
     }
     use crate::db::task_delegation_payloads::NewTaskDelegationPayload;
     use crate::db::task_delegations::{DelegationChildInit, TaskDelegationJobUpsert};
-    use crate::db::wire::{InterruptOption, InterruptQuestion, ResolveResponse};
     #[cfg(feature = "host-capability-refresh-composition")]
     use crate::db::wire::InterruptQuestionSet;
+    use crate::db::wire::{InterruptOption, InterruptQuestion, ResolveResponse};
 
     fn test_host_capability_receipt(generation: u64) -> (String, String) {
         let value = json!({"generation": generation});
@@ -10404,21 +10665,24 @@ mod tests {
         }))
         .unwrap();
         let offered = validate_durable_decision_answer_contract(&contract, None).unwrap();
-        assert!(validate_durable_private_option_mappings(
-            &offered,
-            [(option_id.as_str(), "continue")],
-        )
-        .is_ok());
-        assert!(validate_durable_private_option_mappings(
-            &offered,
-            std::iter::empty::<(&str, &str)>(),
-        )
-        .is_err());
-        assert!(validate_durable_private_option_mappings(
-            &offered,
-            [(option_id.as_str(), "continue"), (option_id.as_str(), "other")],
-        )
-        .is_err());
+        assert!(
+            validate_durable_private_option_mappings(&offered, [(option_id.as_str(), "continue")],)
+                .is_ok()
+        );
+        assert!(
+            validate_durable_private_option_mappings(&offered, std::iter::empty::<(&str, &str)>(),)
+                .is_err()
+        );
+        assert!(
+            validate_durable_private_option_mappings(
+                &offered,
+                [
+                    (option_id.as_str(), "continue"),
+                    (option_id.as_str(), "other")
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -10457,13 +10721,15 @@ mod tests {
             sandbox_escalation: None,
         };
         let valid_json = serde_json::to_string(&valid).unwrap();
-        assert!(validate_question_tool_contract_matches_interrupt(
-            &contract,
-            mapping,
-            Some(&valid_json),
-            None,
-        )
-        .is_ok());
+        assert!(
+            validate_question_tool_contract_matches_interrupt(
+                &contract,
+                mapping,
+                Some(&valid_json),
+                None,
+            )
+            .is_ok()
+        );
 
         let shape_mismatch = InterruptQuestion::Multi {
             prompt: "Continue?".into(),
@@ -10476,13 +10742,15 @@ mod tests {
             allow_freetext: false,
         };
         let shape_mismatch_json = serde_json::to_string(&shape_mismatch).unwrap();
-        assert!(validate_question_tool_contract_matches_interrupt(
-            &contract,
-            mapping,
-            Some(&shape_mismatch_json),
-            None,
-        )
-        .is_err());
+        assert!(
+            validate_question_tool_contract_matches_interrupt(
+                &contract,
+                mapping,
+                Some(&shape_mismatch_json),
+                None,
+            )
+            .is_err()
+        );
 
         let offered_option_mismatch = InterruptQuestion::Single {
             prompt: "Continue?".into(),
@@ -10499,13 +10767,15 @@ mod tests {
             sandbox_escalation: None,
         };
         let offered_option_mismatch_json = serde_json::to_string(&offered_option_mismatch).unwrap();
-        assert!(validate_question_tool_contract_matches_interrupt(
-            &contract,
-            mapping,
-            Some(&offered_option_mismatch_json),
-            None,
-        )
-        .is_err());
+        assert!(
+            validate_question_tool_contract_matches_interrupt(
+                &contract,
+                mapping,
+                Some(&offered_option_mismatch_json),
+                None,
+            )
+            .is_err()
+        );
 
         let freetext_mismatch = InterruptQuestion::Single {
             prompt: "Continue?".into(),
@@ -10522,13 +10792,15 @@ mod tests {
             sandbox_escalation: None,
         };
         let freetext_mismatch_json = serde_json::to_string(&freetext_mismatch).unwrap();
-        assert!(validate_question_tool_contract_matches_interrupt(
-            &contract,
-            mapping,
-            Some(&freetext_mismatch_json),
-            None,
-        )
-        .is_err());
+        assert!(
+            validate_question_tool_contract_matches_interrupt(
+                &contract,
+                mapping,
+                Some(&freetext_mismatch_json),
+                None,
+            )
+            .is_err()
+        );
     }
 
     async fn subject_notice_count(db: &Db, session_id: Uuid, subject_id: Uuid) -> i64 {
@@ -10905,13 +11177,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_capability_refresh_operation_state_graph_allows_executing_cancellation_only_as_new_terminal_edge() {
+    async fn host_capability_refresh_operation_state_graph_allows_executing_cancellation_only_as_new_terminal_edge()
+     {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/workspace", "root").await.unwrap();
         let agent = running_agent(&db, session.session_id, 10).await;
 
-        let cancelled =
-            allowed_host_capability_refresh(&db, session.session_id, &agent, 20).await;
+        let cancelled = allowed_host_capability_refresh(&db, session.session_id, &agent, 20).await;
         let _cancelled_lease = match db
             .claim_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
@@ -10994,8 +11266,8 @@ mod tests {
                 .contains("state transition is invalid"),
             "the new executing cancellation edge must not open unrelated forward jumps"
         );
-        assert!(db
-            .cancel_host_capability_refresh_operation(
+        assert!(
+            db.cancel_host_capability_refresh_operation(
                 host_capability_refresh_authority(),
                 session.session_id,
                 invalid,
@@ -11003,7 +11275,8 @@ mod tests {
                 51,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         let failed = allowed_host_capability_refresh(&db, session.session_id, &agent, 60).await;
         let failed_lease = match db
@@ -11021,8 +11294,8 @@ mod tests {
             HostCapabilityRefreshExecutionClaim::Claimed { lease } => lease,
             other => panic!("expected failed terminal fixture, got {other:?}"),
         };
-        assert!(db
-            .fail_host_capability_refresh_execution(
+        assert!(
+            db.fail_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
                 session.session_id,
                 failed,
@@ -11031,7 +11304,8 @@ mod tests {
                 62,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let failed_to_cancelled = db
             .transaction(move |conn| {
                 conn.execute(
@@ -11051,8 +11325,7 @@ mod tests {
             "failed must remain terminal"
         );
 
-        let completed =
-            allowed_host_capability_refresh(&db, session.session_id, &agent, 70).await;
+        let completed = allowed_host_capability_refresh(&db, session.session_id, &agent, 70).await;
         let completed_lease = match db
             .claim_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
@@ -11070,8 +11343,8 @@ mod tests {
         };
         let (receipt_json, receipt_digest) =
             test_host_capability_receipt(completed_lease.snapshot_generation());
-        assert!(db
-            .complete_host_capability_refresh_execution(
+        assert!(
+            db.complete_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
                 session.session_id,
                 completed,
@@ -11082,7 +11355,8 @@ mod tests {
                 72,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let completed_to_failed = db
             .transaction(move |conn| {
                 conn.execute(
@@ -11104,7 +11378,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_execution_lease_renewal_keeps_live_probe_past_original_deadline_and_reaps_abandoned_claim() {
+    async fn refresh_execution_lease_renewal_keeps_live_probe_past_original_deadline_and_reaps_abandoned_claim()
+     {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/workspace", "root").await.unwrap();
         let agent = running_agent(&db, session.session_id, 10).await;
@@ -11130,8 +11405,8 @@ mod tests {
         // The probe remains live beyond its original lease by renewing its
         // exact token-fenced claim. A periodic reaper cannot infer staleness
         // from the original claim timestamp.
-        assert!(db
-            .renew_host_capability_refresh_execution_lease(
+        assert!(
+            db.renew_host_capability_refresh_execution_lease(
                 host_capability_refresh_authority(),
                 session.session_id,
                 operation_id,
@@ -11140,15 +11415,16 @@ mod tests {
                 99,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert_eq!(
             db.reap_stale_host_capability_refresh_operations(
                 host_capability_refresh_authority(),
                 session.session_id,
                 120,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             0,
             "renewed live probe must survive beyond its original 100ms lease"
         );
@@ -11161,12 +11437,12 @@ mod tests {
                 session.session_id,
                 180,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             1
         );
-        assert!(!db
-            .renew_host_capability_refresh_execution_lease(
+        assert!(
+            !db.renew_host_capability_refresh_execution_lease(
                 host_capability_refresh_authority(),
                 session.session_id,
                 operation_id,
@@ -11175,7 +11451,8 @@ mod tests {
                 181,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert!(matches!(
             db.claim_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
@@ -11196,8 +11473,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/workspace", "root").await.unwrap();
         let agent = running_agent(&db, session.session_id, 10).await;
-        let operation =
-            allowed_host_capability_refresh(&db, session.session_id, &agent, 20).await;
+        let operation = allowed_host_capability_refresh(&db, session.session_id, &agent, 20).await;
         let claimed_generation = match db
             .claim_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
@@ -11213,35 +11489,37 @@ mod tests {
             HostCapabilityRefreshExecutionClaim::Claimed { lease } => lease.snapshot_generation(),
             other => panic!("expected global execution claim, got {other:?}"),
         };
-        assert!(db
-            .has_executing_host_capability_refresh_operations(
+        assert!(
+            db.has_executing_host_capability_refresh_operations(
                 host_capability_refresh_authority(),
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         assert_eq!(
             db.reconcile_host_capability_refresh_execution_leases_at_boot(
                 host_capability_refresh_authority(),
                 41,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             1,
             "a new daemon process fences even an unexpired previous-process lease"
         );
-        assert!(!db
-            .has_executing_host_capability_refresh_operations(
+        assert!(
+            !db.has_executing_host_capability_refresh_operations(
                 host_capability_refresh_authority(),
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert_eq!(
             db.reserve_host_capability_boot_snapshot_generation(
                 host_capability_refresh_authority(),
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             claimed_generation + 1,
             "boot cannot overtake a global executing claim without first terminalizing it"
         );
@@ -11310,8 +11588,8 @@ mod tests {
                 session.session_id,
                 42,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             1
         );
         assert!(matches!(
@@ -11358,8 +11636,8 @@ mod tests {
         };
         let (first_receipt_json, first_receipt_digest) =
             test_host_capability_receipt(first_lease.snapshot_generation());
-        assert!(db
-            .complete_host_capability_refresh_execution(
+        assert!(
+            db.complete_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
                 session.session_id,
                 first,
@@ -11370,7 +11648,8 @@ mod tests {
                 41,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         // Simulate a crash after the durable completion receipt but before
         // the process can make its snapshot live and ack the outbox. A newer
         // approved operation must not probe/publish first, or the old receipt
@@ -11388,8 +11667,8 @@ mod tests {
             .unwrap(),
             HostCapabilityRefreshExecutionClaim::InFlight,
         ));
-        assert!(db
-            .mark_host_capability_refresh_published(
+        assert!(
+            db.mark_host_capability_refresh_published(
                 host_capability_refresh_authority(),
                 session.session_id,
                 first,
@@ -11398,7 +11677,8 @@ mod tests {
                 43,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert!(matches!(
             db.claim_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
@@ -11417,8 +11697,14 @@ mod tests {
     #[tokio::test]
     async fn completed_refresh_outbox_blocks_later_execution_across_sessions_until_global_ack() {
         let db = Db::open_in_memory().unwrap();
-        let first_session = db.create_session("p", "/workspace-a", "root").await.unwrap();
-        let second_session = db.create_session("p", "/workspace-b", "root").await.unwrap();
+        let first_session = db
+            .create_session("p", "/workspace-a", "root")
+            .await
+            .unwrap();
+        let second_session = db
+            .create_session("p", "/workspace-b", "root")
+            .await
+            .unwrap();
         let first_agent = running_agent(&db, first_session.session_id, 10).await;
         let second_agent = running_agent(&db, second_session.session_id, 11).await;
         let first =
@@ -11443,8 +11729,8 @@ mod tests {
         };
         let (first_receipt_json, first_receipt_digest) =
             test_host_capability_receipt(first_lease.snapshot_generation());
-        assert!(db
-            .complete_host_capability_refresh_execution(
+        assert!(
+            db.complete_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
                 first_session.session_id,
                 first,
@@ -11455,7 +11741,8 @@ mod tests {
                 41,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         // A second session shares the same daemon-local snapshot store. It
         // cannot issue generation 2 while session A's durable generation 1
@@ -11473,8 +11760,8 @@ mod tests {
             .unwrap(),
             HostCapabilityRefreshExecutionClaim::InFlight,
         ));
-        assert!(db
-            .mark_host_capability_refresh_published(
+        assert!(
+            db.mark_host_capability_refresh_published(
                 host_capability_refresh_authority(),
                 first_session.session_id,
                 first,
@@ -11483,7 +11770,8 @@ mod tests {
                 43,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert!(matches!(
             db.claim_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
@@ -11522,8 +11810,8 @@ mod tests {
         };
         let (receipt_json, receipt_digest) =
             test_host_capability_receipt(lease.snapshot_generation());
-        assert!(db
-            .complete_host_capability_refresh_execution(
+        assert!(
+            db.complete_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
                 session.session_id,
                 operation,
@@ -11534,15 +11822,16 @@ mod tests {
                 41,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         // This simulates an unsafe raw concurrent writer after the dispatcher
         // has loaded the completed row. The SQL trigger is a second fence;
         // the acknowledgement method independently matches generation/digest.
         let operation_id = operation.to_string();
         let session_id = session.session_id.to_string();
-        assert!(db
-            .transaction(move |conn| {
+        assert!(
+            db.transaction(move |conn| {
                 let error = conn
                     .execute(
                         "UPDATE host_capability_refresh_operations
@@ -11555,9 +11844,10 @@ mod tests {
                 Ok(())
             })
             .await
-            .is_ok());
-        assert!(!db
-            .mark_host_capability_refresh_published(
+            .is_ok()
+        );
+        assert!(
+            !db.mark_host_capability_refresh_published(
                 host_capability_refresh_authority(),
                 session.session_id,
                 operation,
@@ -11566,9 +11856,10 @@ mod tests {
                 42,
             )
             .await
-            .unwrap());
-        assert!(db
-            .mark_host_capability_refresh_published(
+            .unwrap()
+        );
+        assert!(
+            db.mark_host_capability_refresh_published(
                 host_capability_refresh_authority(),
                 session.session_id,
                 operation,
@@ -11577,7 +11868,8 @@ mod tests {
                 43,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -11585,13 +11877,15 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/workspace", "root").await.unwrap();
         let first_agent = running_agent(&db, session.session_id, 10).await;
-        let first = allowed_host_capability_refresh(&db, session.session_id, &first_agent, 20).await;
+        let first =
+            allowed_host_capability_refresh(&db, session.session_id, &first_agent, 20).await;
         let second_agent = db
             .agent_instance(session.session_id, first_agent.agent_instance_id)
             .await
             .unwrap()
             .unwrap();
-        let second = allowed_host_capability_refresh(&db, session.session_id, &second_agent, 30).await;
+        let second =
+            allowed_host_capability_refresh(&db, session.session_id, &second_agent, 30).await;
         let first_generation = match db
             .claim_host_capability_refresh_execution(
                 host_capability_refresh_authority(),
@@ -11609,11 +11903,9 @@ mod tests {
         };
         assert_eq!(first_generation, 1);
         assert_eq!(
-            db.host_capability_refresh_generation_high_water(
-                host_capability_refresh_authority(),
-            )
-            .await
-            .unwrap(),
+            db.host_capability_refresh_generation_high_water(host_capability_refresh_authority(),)
+                .await
+                .unwrap(),
             1
         );
         assert_eq!(
@@ -11622,8 +11914,8 @@ mod tests {
                 session.session_id,
                 41,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             0,
             "startup reconciliation only reports repaired pre-bind operations"
         );
@@ -11644,20 +11936,25 @@ mod tests {
         };
         assert_eq!(second_generation, 2);
         assert_eq!(
-            db.host_capability_refresh_generation_high_water(
-                host_capability_refresh_authority(),
-            )
-            .await
-            .unwrap(),
+            db.host_capability_refresh_generation_high_water(host_capability_refresh_authority(),)
+                .await
+                .unwrap(),
             2
         );
     }
 
     #[tokio::test]
-    async fn global_completed_refresh_outbox_replays_reverse_cross_session_receipts_by_generation() {
+    async fn global_completed_refresh_outbox_replays_reverse_cross_session_receipts_by_generation()
+    {
         let db = Db::open_in_memory().unwrap();
-        let first_session = db.create_session("p", "/workspace-a", "root").await.unwrap();
-        let second_session = db.create_session("p", "/workspace-b", "root").await.unwrap();
+        let first_session = db
+            .create_session("p", "/workspace-a", "root")
+            .await
+            .unwrap();
+        let second_session = db
+            .create_session("p", "/workspace-b", "root")
+            .await
+            .unwrap();
         let first_agent = running_agent(&db, first_session.session_id, 10).await;
         let second_agent = running_agent(&db, second_session.session_id, 11).await;
         let first =
@@ -11707,7 +12004,14 @@ mod tests {
                             updated_at_unix_ms = ?3
                       WHERE operation_id = ?4 AND session_id = ?5
                         AND agent_instance_id = ?6 AND state = 'allowed'",
-                    params![lease_token, generation, completed_at - 1, operation_id, session_id, agent_id],
+                    params![
+                        lease_token,
+                        generation,
+                        completed_at - 1,
+                        operation_id,
+                        session_id,
+                        agent_id
+                    ],
                 )?;
                 conn.execute(
                     "UPDATE host_capability_refresh_operations
@@ -11716,7 +12020,14 @@ mod tests {
                             result_snapshot_digest = ?3,
                             updated_at_unix_ms = ?4, completed_at_unix_ms = ?4
                       WHERE operation_id = ?5 AND session_id = ?6 AND state = 'executing'",
-                    params![receipt_json, generation, receipt_digest, completed_at, operation_id, session_id],
+                    params![
+                        receipt_json,
+                        generation,
+                        receipt_digest,
+                        completed_at,
+                        operation_id,
+                        session_id
+                    ],
                 )?;
             }
             Ok(())
@@ -11747,19 +12058,19 @@ mod tests {
             db.latest_published_host_capability_refresh_snapshot_receipt(
                 host_capability_refresh_authority(),
             )
-                .await
-                .unwrap()
-                .is_none(),
+            .await
+            .unwrap()
+            .is_none(),
             "boot must not seed from an unpublished later receipt before this ordered outbox drains"
         );
         assert_eq!(
             db.latest_completed_host_capability_refresh_snapshot_receipt(
                 host_capability_refresh_authority(),
             )
-                .await
-                .unwrap()
-                .expect("newest completed receipt")
-                .generation,
+            .await
+            .unwrap()
+            .expect("newest completed receipt")
+            .generation,
             2,
             "the completed high-water alone is intentionally not a boot seed"
         );
@@ -11817,15 +12128,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
-        assert!(db
-            .accept_late_user_decision_steer_execution(
+        assert!(
+            db.accept_late_user_decision_steer_execution(
                 session.session_id,
                 steer.steer_id,
                 first_epoch,
                 30,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         // Crash window: the provider/model side effect began after acceptance
         // but the continuation completion record was not written. A successor
@@ -11837,15 +12149,16 @@ mod tests {
         db.begin_late_user_decision_steer_recovery(session.session_id, successor_epoch)
             .await
             .unwrap();
-        assert!(db
-            .claim_late_user_decision_steers(
+        assert!(
+            db.claim_late_user_decision_steers(
                 session.session_id,
                 agent.agent_instance_id,
                 successor_epoch,
             )
             .await
             .unwrap()
-            .is_empty());
+            .is_empty()
+        );
         let resumed = db
             .accepted_late_user_decision_steers_for_recovery(
                 session.session_id,
@@ -11880,29 +12193,31 @@ mod tests {
             .unwrap(),
             "a successor resumes the original continuation identity; it cannot accept a second one"
         );
-        assert!(db
-            .complete_late_user_decision_steer_execution(
+        assert!(
+            db.complete_late_user_decision_steer_execution(
                 session.session_id,
                 steer.steer_id,
                 successor_epoch,
                 32,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert_eq!(
             model_side_effects.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "completion/recovery must not execute the accepted side effect twice"
         );
-        assert!(db
-            .ack_late_user_decision_steer_delivery(
+        assert!(
+            db.ack_late_user_decision_steer_delivery(
                 session.session_id,
                 steer.steer_id,
                 successor_epoch,
                 33,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -11931,14 +12246,10 @@ mod tests {
         let steer = auto_resolved_late_steer(&db, session.session_id, &root, 20).await;
         let epoch = Uuid::new_v4();
         assert_eq!(
-            db.claim_late_user_decision_steers(
-                session.session_id,
-                root.agent_instance_id,
-                epoch,
-            )
-            .await
-            .unwrap()
-            .len(),
+            db.claim_late_user_decision_steers(session.session_id, root.agent_instance_id, epoch,)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         assert!(
@@ -12061,11 +12372,7 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         let parking_decision = db
             .create_decision_request(
-                standard_decision(
-                    session.session_id,
-                    owner.agent_instance_id,
-                    owner.revision,
-                ),
+                standard_decision(session.session_id, owner.agent_instance_id, owner.revision),
                 40,
             )
             .await
@@ -12105,37 +12412,40 @@ mod tests {
         // The executor's negative acknowledgement releases only the pending
         // claim. A recovery while the new decision is still waiting must not
         // redeliver or manufacture an accepted checkpoint.
-        assert!(db
-            .release_late_user_decision_steer_claim(
+        assert!(
+            db.release_late_user_decision_steer_claim(
                 session.session_id,
                 steer.steer_id,
                 first_epoch,
                 42,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let waiting_epoch = Uuid::new_v4();
         db.begin_late_user_decision_steer_recovery(session.session_id, waiting_epoch)
             .await
             .unwrap();
-        assert!(db
-            .claim_late_user_decision_steers(
+        assert!(
+            db.claim_late_user_decision_steers(
                 session.session_id,
                 owner.agent_instance_id,
                 waiting_epoch,
             )
             .await
             .unwrap()
-            .is_empty());
-        assert!(db
-            .accepted_late_user_decision_steers_for_recovery(
+            .is_empty()
+        );
+        assert!(
+            db.accepted_late_user_decision_steers_for_recovery(
                 session.session_id,
                 owner.agent_instance_id,
                 waiting_epoch,
             )
             .await
             .unwrap()
-            .is_empty());
+            .is_empty()
+        );
 
         // Resolving the newer decision atomically resumes the owner. Only
         // now can a new exact-revision executor claim and accept the same
@@ -12172,8 +12482,8 @@ mod tests {
             .unwrap();
         assert_eq!(retried.len(), 1);
         assert_eq!(retried[0].steer_id, steer.steer_id);
-        assert!(db
-            .late_user_decision_steer_dispatch_permit_is_current(
+        assert!(
+            db.late_user_decision_steer_dispatch_permit_is_current(
                 session.session_id,
                 steer.steer_id,
                 steer.continuation_id,
@@ -12182,7 +12492,8 @@ mod tests {
                 44,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let accepted = db
             .late_user_decision_steer(session.session_id, steer.steer_id)
             .await
@@ -12228,15 +12539,16 @@ mod tests {
         db.begin_late_user_decision_steer_recovery(session.session_id, waiting_recovery_epoch)
             .await
             .unwrap();
-        assert!(db
-            .accepted_late_user_decision_steers_for_recovery(
+        assert!(
+            db.accepted_late_user_decision_steers_for_recovery(
                 session.session_id,
                 resumed_owner.agent_instance_id,
                 waiting_recovery_epoch,
             )
             .await
             .unwrap()
-            .is_empty());
+            .is_empty()
+        );
         assert!(matches!(
             db.resolve_decision_request(
                 session.session_id,
@@ -12271,15 +12583,16 @@ mod tests {
         db.begin_late_user_decision_steer_recovery(session.session_id, successor_epoch)
             .await
             .unwrap();
-        assert!(db
-            .claim_late_user_decision_steers(
+        assert!(
+            db.claim_late_user_decision_steers(
                 session.session_id,
                 owner.agent_instance_id,
                 successor_epoch,
             )
             .await
             .unwrap()
-            .is_empty());
+            .is_empty()
+        );
         let recovered = db
             .accepted_late_user_decision_steers_for_recovery(
                 session.session_id,
@@ -12298,8 +12611,8 @@ mod tests {
             Some(resumed_owner.revision),
             "recovery keeps the immutable original handoff revision"
         );
-        assert!(db
-            .late_user_decision_steer_dispatch_permit_is_current(
+        assert!(
+            db.late_user_decision_steer_dispatch_permit_is_current(
                 session.session_id,
                 recovered.steer_id,
                 recovered.continuation_id,
@@ -12335,7 +12648,10 @@ mod tests {
         );
         let (claim, cancelled) = tokio::join!(claim, cancel);
         let _ = claim.unwrap();
-        assert!(matches!(cancelled.unwrap(), AgentTransitionOutcome::Transitioned(_)));
+        assert!(matches!(
+            cancelled.unwrap(),
+            AgentTransitionOutcome::Transitioned(_)
+        ));
 
         // An executor must always perform the accepting CAS immediately before
         // it can start a model turn. Whichever transaction won the first race,
@@ -12363,7 +12679,13 @@ mod tests {
                     "SELECT execution_state, rejection_reason, claimed_recovery_epoch
                      FROM agent_decision_steers WHERE steer_id = ?1",
                     [steer.steer_id.to_string()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
                 )?)
             })
             .await
@@ -12391,22 +12713,23 @@ mod tests {
             .len(),
             1
         );
-        assert!(db
-            .accept_late_user_decision_steer_execution(
+        assert!(
+            db.accept_late_user_decision_steer_execution(
                 session.session_id,
                 steer.steer_id,
                 epoch,
                 90,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let accepted = db
             .late_user_decision_steer(session.session_id, steer.steer_id)
             .await
             .unwrap()
             .unwrap();
-        assert!(db
-            .late_user_decision_steer_dispatch_permit_is_current(
+        assert!(
+            db.late_user_decision_steer_dispatch_permit_is_current(
                 session.session_id,
                 accepted.steer_id,
                 accepted.continuation_id,
@@ -12415,7 +12738,8 @@ mod tests {
                 90,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         let owner = db
             .agent_instance(session.session_id, accepted.agent_instance_id)
@@ -12473,18 +12797,19 @@ mod tests {
                 .len(),
             1
         );
-        assert!(db
-            .accept_late_user_decision_steer_execution(
+        assert!(
+            db.accept_late_user_decision_steer_execution(
                 session.session_id,
                 steer.steer_id,
                 epoch,
                 105,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
-        assert!(db
-            .settle_recursive_noninteractive_child_outcome(
+        assert!(
+            db.settle_recursive_noninteractive_child_outcome(
                 session.session_id,
                 parent.agent_instance_id,
                 child.agent_instance_id,
@@ -12495,7 +12820,8 @@ mod tests {
                 106,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         let terminal = db
             .late_user_decision_steer(session.session_id, steer.steer_id)
@@ -12510,8 +12836,8 @@ mod tests {
             terminal.rejection_reason.as_deref(),
             Some("owner_terminal_failed")
         );
-        assert!(db
-            .accepted_late_user_decision_steers_for_recovery(
+        assert!(
+            db.accepted_late_user_decision_steers_for_recovery(
                 session.session_id,
                 child.agent_instance_id,
                 Uuid::new_v4(),
@@ -12537,15 +12863,16 @@ mod tests {
                 .len(),
             1
         );
-        assert!(db
-            .accept_late_user_decision_steer_execution(
+        assert!(
+            db.accept_late_user_decision_steer_execution(
                 session.session_id,
                 steer.steer_id,
                 epoch,
                 120,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let steer_id = steer.steer_id.to_string();
         let immutable_identity = db
             .write(move |conn| {
@@ -12556,7 +12883,12 @@ mod tests {
                 Ok(())
             })
             .await;
-        assert!(immutable_identity.unwrap_err().to_string().contains("immutable"));
+        assert!(
+            immutable_identity
+                .unwrap_err()
+                .to_string()
+                .contains("immutable")
+        );
 
         let steer_id = steer.steer_id.to_string();
         let stale_state = db
@@ -12568,7 +12900,12 @@ mod tests {
                 Ok(())
             })
             .await;
-        assert!(stale_state.unwrap_err().to_string().contains("forward-only"));
+        assert!(
+            stale_state
+                .unwrap_err()
+                .to_string()
+                .contains("forward-only")
+        );
 
         let steer_id = steer.steer_id.to_string();
         let checkpoint_rewrite = db
@@ -12580,10 +12917,12 @@ mod tests {
                 Ok(())
             })
             .await;
-        assert!(checkpoint_rewrite
-            .unwrap_err()
-            .to_string()
-            .contains("checkpoint is immutable"));
+        assert!(
+            checkpoint_rewrite
+                .unwrap_err()
+                .to_string()
+                .contains("checkpoint is immutable")
+        );
     }
 
     #[tokio::test]
@@ -12592,8 +12931,8 @@ mod tests {
         let session = db.create_session("p", "/workspace", "root").await.unwrap();
         let agent = running_agent(&db, session.session_id, 130).await;
         let epoch = Uuid::new_v4();
-        assert!(db
-            .claim_agent_resume(
+        assert!(
+            db.claim_agent_resume(
                 session.session_id,
                 agent.agent_instance_id,
                 agent.revision,
@@ -12601,7 +12940,8 @@ mod tests {
                 140,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert!(matches!(
             db.transition_agent_instance(
                 session.session_id,
@@ -12630,7 +12970,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_child_executor_attachment_claims_are_independent_from_running_provider_permits() {
+    async fn waiting_child_executor_attachment_claims_are_independent_from_running_provider_permits()
+     {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/workspace", "root").await.unwrap();
         let parent = running_agent(&db, session.session_id, 150).await;
@@ -12664,8 +13005,8 @@ mod tests {
                 other => panic!("waiting child transition must succeed, got {other:?}"),
             };
             let epoch = Uuid::new_v4();
-            assert!(db
-                .claim_agent_resume(
+            assert!(
+                db.claim_agent_resume(
                     session.session_id,
                     waiting.agent_instance_id,
                     waiting.revision,
@@ -12673,9 +13014,10 @@ mod tests {
                     153 + offset,
                 )
                 .await
-                .unwrap());
-            assert!(db
-                .consume_agent_resume_claims_atomically(
+                .unwrap()
+            );
+            assert!(
+                db.consume_agent_resume_claims_atomically(
                     session.session_id,
                     vec![(waiting.agent_instance_id, waiting.revision)],
                     epoch,
@@ -12706,15 +13048,16 @@ mod tests {
             .len(),
             1
         );
-        assert!(db
-            .accept_late_user_decision_steer_execution(
+        assert!(
+            db.accept_late_user_decision_steer_execution(
                 session.session_id,
                 steer.steer_id,
                 accepted_epoch,
                 172,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let running = db
             .agent_instance(session.session_id, agent.agent_instance_id)
             .await
@@ -12772,7 +13115,10 @@ mod tests {
             )
             .await
             .unwrap();
-        for child in [terminal_child.agent_instance_id, live_child.agent_instance_id] {
+        for child in [
+            terminal_child.agent_instance_id,
+            live_child.agent_instance_id,
+        ] {
             db.insert_recursive_noninteractive_executor(
                 session.session_id,
                 child,
@@ -12791,8 +13137,8 @@ mod tests {
             .unwrap();
         }
 
-        assert!(db
-            .settle_recursive_noninteractive_child_outcome(
+        assert!(
+            db.settle_recursive_noninteractive_child_outcome(
                 session.session_id,
                 parent.agent_instance_id,
                 terminal_child.agent_instance_id,
@@ -12803,22 +13149,27 @@ mod tests {
                 15,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         let terminal_outcome = db
             .recursive_noninteractive_outcome(session.session_id, terminal_child.agent_instance_id)
             .await
             .unwrap()
             .expect("terminal recursive child retains its durable dependency receipt");
-        assert_eq!(terminal_outcome.parent_agent_instance_id, parent.agent_instance_id);
-        assert!(db
-            .recursive_noninteractive_recovery_descriptor(
+        assert_eq!(
+            terminal_outcome.parent_agent_instance_id,
+            parent.agent_instance_id
+        );
+        assert!(
+            db.recursive_noninteractive_recovery_descriptor(
                 session.session_id,
                 terminal_child.agent_instance_id,
             )
             .await
             .unwrap()
-            .is_none());
+            .is_none()
+        );
 
         let live_descriptor = db
             .recursive_noninteractive_recovery_descriptor(
@@ -12828,7 +13179,10 @@ mod tests {
             .await
             .unwrap()
             .expect("live recursive sibling remains recoverable after a mixed restart");
-        assert_eq!(live_descriptor.parent_agent_instance_id, parent.agent_instance_id);
+        assert_eq!(
+            live_descriptor.parent_agent_instance_id,
+            parent.agent_instance_id
+        );
     }
 
     #[tokio::test]
@@ -13601,23 +13955,20 @@ mod tests {
                     (
                         AgentInstanceState::Created,
                         AgentInstanceState::Running | AgentInstanceState::Cancelled
+                    ) | (
+                        AgentInstanceState::Running,
+                        AgentInstanceState::WaitingForUser
+                            | AgentInstanceState::WaitingForApproval
+                            | AgentInstanceState::Completed
+                            | AgentInstanceState::Failed
+                            | AgentInstanceState::Cancelled
+                    ) | (
+                        AgentInstanceState::WaitingForUser | AgentInstanceState::WaitingForApproval,
+                        AgentInstanceState::Running
+                            | AgentInstanceState::Completed
+                            | AgentInstanceState::Failed
+                            | AgentInstanceState::Cancelled
                     )
-                        | (
-                            AgentInstanceState::Running,
-                            AgentInstanceState::WaitingForUser
-                                | AgentInstanceState::WaitingForApproval
-                                | AgentInstanceState::Completed
-                                | AgentInstanceState::Failed
-                                | AgentInstanceState::Cancelled
-                        )
-                        | (
-                            AgentInstanceState::WaitingForUser
-                                | AgentInstanceState::WaitingForApproval,
-                            AgentInstanceState::Running
-                                | AgentInstanceState::Completed
-                                | AgentInstanceState::Failed
-                                | AgentInstanceState::Cancelled
-                        )
                 );
                 assert_eq!(
                     current.legal_transition(next),
@@ -13945,7 +14296,8 @@ mod tests {
                     agent_instance_id: child.agent_instance_id,
                     expected_agent_revision: child.revision,
                     waiting_state: AgentInstanceState::WaitingForUser,
-                    options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
+                    options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#
+                        .into(),
                     free_text_contract_json: None,
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -13966,7 +14318,8 @@ mod tests {
                     agent_instance_id: root.agent_instance_id,
                     expected_agent_revision: root.revision,
                     waiting_state: AgentInstanceState::WaitingForApproval,
-                    options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
+                    options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#
+                        .into(),
                     free_text_contract_json: None,
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -14099,7 +14452,8 @@ mod tests {
                         agent_instance_id: agent.agent_instance_id,
                         expected_agent_revision: agent.revision,
                         waiting_state: AgentInstanceState::WaitingForUser,
-                        options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
+                        options_contract_json:
+                            r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
                         free_text_contract_json: None,
                         recommendation_json: None,
                         rationale_redaction_class: "public".into(),
@@ -14320,7 +14674,8 @@ mod tests {
                         agent_instance_id: agent.agent_instance_id,
                         expected_agent_revision: agent.revision,
                         waiting_state: AgentInstanceState::WaitingForUser,
-                        options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
+                        options_contract_json:
+                            r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
                         free_text_contract_json: None,
                         recommendation_json: None,
                         rationale_redaction_class: "public".into(),
@@ -14370,7 +14725,8 @@ mod tests {
                     agent_instance_id: agent.agent_instance_id,
                     expected_agent_revision: agent.revision,
                     waiting_state: AgentInstanceState::WaitingForApproval,
-                        options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
+                    options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#
+                        .into(),
                     free_text_contract_json: None,
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -14441,13 +14797,13 @@ mod tests {
                 NewAgentInstance {
                     session_id: b.session_id,
                     parent_agent_instance_id: None,
-                task_delegation_job_id: Some("task-1".into()),
-                task_delegation_child_uuid: Some(child_uuid),
-                resolved_profile_snapshot_id: None,
-                workspace_ref: None,
-                auto_answer_enabled: false,
-            },
-            10,
+                    task_delegation_job_id: Some("task-1".into()),
+                    task_delegation_child_uuid: Some(child_uuid),
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                10,
             )
             .await
             .unwrap_err();
@@ -14457,13 +14813,13 @@ mod tests {
                 NewAgentInstance {
                     session_id: a.session_id,
                     parent_agent_instance_id: None,
-                task_delegation_job_id: Some("task-1".into()),
-                task_delegation_child_uuid: Some(child_uuid),
-                resolved_profile_snapshot_id: None,
-                workspace_ref: None,
-                auto_answer_enabled: false,
-            },
-            11,
+                    task_delegation_job_id: Some("task-1".into()),
+                    task_delegation_child_uuid: Some(child_uuid),
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                11,
             )
             .await
             .unwrap();
@@ -14556,12 +14912,7 @@ mod tests {
         .await
         .unwrap();
         let root = db
-            .ensure_session_root_agent(
-                session.session_id,
-                None,
-                host_workspace_ref(),
-                1,
-            )
+            .ensure_session_root_agent(session.session_id, None, host_workspace_ref(), 1)
             .await
             .unwrap();
         let children = db
@@ -14648,12 +14999,7 @@ mod tests {
         .await
         .unwrap();
         let root = db
-            .ensure_session_root_agent(
-                session.session_id,
-                None,
-                host_workspace_ref(),
-                1,
-            )
+            .ensure_session_root_agent(session.session_id, None, host_workspace_ref(), 1)
             .await
             .unwrap();
         let rows = db
@@ -15027,7 +15373,8 @@ mod tests {
                     agent_instance_id: agent.agent_instance_id,
                     expected_agent_revision: agent.revision,
                     waiting_state: AgentInstanceState::WaitingForUser,
-                    options_contract_json: r#"{"options":[{"id":"approve","label":"Approve"}]}"#.into(),
+                    options_contract_json: r#"{"options":[{"id":"approve","label":"Approve"}]}"#
+                        .into(),
                     free_text_contract_json: Some(r#"{"allowed":true}"#.into()),
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -15078,7 +15425,8 @@ mod tests {
                     agent_instance_id: agent.agent_instance_id,
                     expected_agent_revision: agent.revision,
                     waiting_state: AgentInstanceState::WaitingForUser,
-                    options_contract_json: r#"{"options":[{"id":"approve","label":"Approve"}]}"#.into(),
+                    options_contract_json: r#"{"options":[{"id":"approve","label":"Approve"}]}"#
+                        .into(),
                     free_text_contract_json: None,
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -15117,11 +15465,31 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                ("agent_created".into(), "agent".into(), agent.agent_instance_id.to_string()),
-                ("agent_transition".into(), "agent".into(), agent.agent_instance_id.to_string()),
-                ("agent_transition".into(), "agent".into(), agent.agent_instance_id.to_string()),
-                ("decision_pending".into(), "decision".into(), decision.decision_request_id.to_string()),
-                ("decision_transition".into(), "decision".into(), decision.decision_request_id.to_string()),
+                (
+                    "agent_created".into(),
+                    "agent".into(),
+                    agent.agent_instance_id.to_string()
+                ),
+                (
+                    "agent_transition".into(),
+                    "agent".into(),
+                    agent.agent_instance_id.to_string()
+                ),
+                (
+                    "agent_transition".into(),
+                    "agent".into(),
+                    agent.agent_instance_id.to_string()
+                ),
+                (
+                    "decision_pending".into(),
+                    "decision".into(),
+                    decision.decision_request_id.to_string()
+                ),
+                (
+                    "decision_transition".into(),
+                    "decision".into(),
+                    decision.decision_request_id.to_string()
+                ),
             ]
         );
         assert_eq!(
@@ -15159,7 +15527,8 @@ mod tests {
                         agent_instance_id: agent.agent_instance_id,
                         expected_agent_revision: agent.revision,
                         waiting_state: AgentInstanceState::WaitingForUser,
-                        options_contract_json: r#"{"options":[{"id":"approve","label":"Approve"}]}"#.into(),
+                        options_contract_json:
+                            r#"{"options":[{"id":"approve","label":"Approve"}]}"#.into(),
                         free_text_contract_json: Some(r#"{"allowed":true,"max_chars":120}"#.into()),
                         recommendation_json: Some(r#"{"option_id":"approve"}"#.into()),
                         rationale_redaction_class: "sensitive".into(),
@@ -15227,11 +15596,7 @@ mod tests {
         let agent = running_agent(&db, session.session_id, 1).await;
         let decision = db
             .create_decision_request(
-                standard_decision(
-                    session.session_id,
-                    agent.agent_instance_id,
-                    agent.revision,
-                ),
+                standard_decision(session.session_id, agent.agent_instance_id, agent.revision),
                 2,
             )
             .await
@@ -15281,11 +15646,7 @@ mod tests {
         let agent = running_agent(&db, session.session_id, 1).await;
         let decision = db
             .create_decision_request(
-                standard_decision(
-                    session.session_id,
-                    agent.agent_instance_id,
-                    agent.revision,
-                ),
+                standard_decision(session.session_id, agent.agent_instance_id, agent.revision),
                 2,
             )
             .await
@@ -15463,7 +15824,11 @@ mod tests {
         let mut digest = Sha256::new();
         digest.update(b"flycockpit.host-approval-input.v1\0");
         digest.update(operation_input.as_bytes());
-        let input_digest = digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let input_digest = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let decision_id_for_bind = decision_id.to_string();
         let session_id_for_bind = session_id.to_string();
         let agent_id_for_bind = agent.agent_instance_id.to_string();
@@ -15567,7 +15932,10 @@ mod tests {
             )?;
             conn.execute(
                 "UPDATE needs_attention SET decision_request_id = ?1 WHERE interrupt_id = ?2",
-                params![decision_id.to_string(), restored_approval_interrupt_id.to_string()],
+                params![
+                    decision_id.to_string(),
+                    restored_approval_interrupt_id.to_string()
+                ],
             )?;
             conn.execute(
                 "DELETE FROM agent_host_approval_operations WHERE operation_id = ?1",
@@ -15615,11 +15983,7 @@ mod tests {
         let agent = running_agent(&db, session.session_id, 1).await;
         let decision = db
             .create_decision_request(
-                standard_decision(
-                    session.session_id,
-                    agent.agent_instance_id,
-                    agent.revision,
-                ),
+                standard_decision(session.session_id, agent.agent_instance_id, agent.revision),
                 2,
             )
             .await
@@ -15687,9 +16051,8 @@ mod tests {
         }
 
         let mut options: serde_json::Value = serde_json::from_str(&original_options).unwrap();
-        options["options"][0]["id"] = serde_json::Value::String(
-            "option:00000000-0000-4000-8000-000000000001".into(),
-        );
+        options["options"][0]["id"] =
+            serde_json::Value::String("option:00000000-0000-4000-8000-000000000001".into());
         let malformed_options = canonical_json_string(&options).unwrap();
         db.write({
             let decision_id = decision_id;
@@ -15703,7 +16066,11 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(db.decision_request(session.session_id, decision_id).await.is_err());
+        assert!(
+            db.decision_request(session.session_id, decision_id)
+                .await
+                .is_err()
+        );
         db.write({
             let decision_id = decision_id;
             let original_options = original_options.clone();
@@ -15720,9 +16087,8 @@ mod tests {
 
         let mut recommendation: serde_json::Value =
             serde_json::from_str(original_recommendation.as_deref().unwrap()).unwrap();
-        recommendation["option_id"] = serde_json::Value::String(
-            "option:018f47a2-7b3c-7def-8123-000000000001".into(),
-        );
+        recommendation["option_id"] =
+            serde_json::Value::String("option:018f47a2-7b3c-7def-8123-000000000001".into());
         let malformed_recommendation = canonical_json_string(&recommendation).unwrap();
         db.write({
             let decision_id = decision_id;
@@ -15736,7 +16102,11 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(db.decision_request(session.session_id, decision_id).await.is_err());
+        assert!(
+            db.decision_request(session.session_id, decision_id)
+                .await
+                .is_err()
+        );
         db.write({
             let decision_id = decision_id;
             let original_recommendation = original_recommendation.clone();
@@ -15763,7 +16133,11 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(db.decision_request(session.session_id, decision_id).await.is_err());
+        assert!(
+            db.decision_request(session.session_id, decision_id)
+                .await
+                .is_err()
+        );
 
         db.write({
             let decision_id = decision_id;
@@ -15808,7 +16182,11 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(db.decision_request(session.session_id, decision_id).await.is_err());
+        assert!(
+            db.decision_request(session.session_id, decision_id)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

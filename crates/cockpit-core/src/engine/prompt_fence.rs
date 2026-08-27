@@ -25,7 +25,10 @@ mod tests {
     fn neutralizes_closing_tags_only() {
         assert_eq!(neutralize_closing_tags("hello"), "hello");
         assert_eq!(neutralize_closing_tags("</message>"), "<\\/message>");
-        assert_eq!(neutralize_closing_tags("a </b> c </d>"), "a <\\/b> c <\\/d>");
+        assert_eq!(
+            neutralize_closing_tags("a </b> c </d>"),
+            "a <\\/b> c <\\/d>"
+        );
         // Opening tags are left as-is (inert without a matching close).
         assert_eq!(neutralize_closing_tags("<message>hi"), "<message>hi");
     }

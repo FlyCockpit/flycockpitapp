@@ -15,10 +15,8 @@ static NEXT_AGENT_TREE_ENDPOINT_GENERATION: std::sync::atomic::AtomicU64 =
 /// The producer keeps the value until its matching detach path, while the
 /// worker registry uses it for compare-and-remove fencing.
 pub(crate) fn next_agent_tree_endpoint_generation() -> AgentTreeEndpointGeneration {
-    let generation = NEXT_AGENT_TREE_ENDPOINT_GENERATION.fetch_add(
-        1,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let generation =
+        NEXT_AGENT_TREE_ENDPOINT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Wrapping would make an ancient in-process cleanup indistinguishable from
     // a newly attached endpoint.  Reaching this limit is not recoverable in a
     // single daemon process, so fail closed rather than reintroducing ABA.
@@ -91,9 +89,8 @@ pub enum AgentTreeExecutorRequest {
         continuation_id: uuid::Uuid,
         recovery_epoch: uuid::Uuid,
         payload_json: String,
-        respond_to: tokio::sync::oneshot::Sender<
-            crate::engine::driver::LateUserSteerContinuationOutcome,
-        >,
+        respond_to:
+            tokio::sync::oneshot::Sender<crate::engine::driver::LateUserSteerContinuationOutcome>,
     },
     /// Resume a previously accepted late-user steer after a worker crash.  This
     /// is deliberately distinct from delivery: the row is already behind its
@@ -105,9 +102,8 @@ pub enum AgentTreeExecutorRequest {
         recovery_epoch: uuid::Uuid,
         payload_json: String,
         continuation_checkpoint_json: String,
-        respond_to: tokio::sync::oneshot::Sender<
-            crate::engine::driver::LateUserSteerContinuationOutcome,
-        >,
+        respond_to:
+            tokio::sync::oneshot::Sender<crate::engine::driver::LateUserSteerContinuationOutcome>,
     },
 }
 

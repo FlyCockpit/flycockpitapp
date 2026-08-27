@@ -658,9 +658,7 @@ impl LeaksPane {
         let mut list_lines: Vec<Line> = Vec::new();
         match &self.state {
             LeaksPaneState::Loading => list_lines.push(Line::from("loading…")),
-            LeaksPaneState::Empty => {
-                list_lines.push(Line::from("no contained leak reports"))
-            }
+            LeaksPaneState::Empty => list_lines.push(Line::from("no contained leak reports")),
             LeaksPaneState::FilteredEmpty => {
                 list_lines.push(Line::from("no reports match the active filter"))
             }
@@ -878,7 +876,9 @@ mod tests {
 
     fn ready_pane(n: usize) -> LeaksPane {
         let mut pane = LeaksPane::open(Some(PathBuf::from("/t.sock")));
-        let reports = (0..n).map(|i| sample_report(&format!("rpt-{i:02}"))).collect();
+        let reports = (0..n)
+            .map(|i| sample_report(&format!("rpt-{i:02}")))
+            .collect();
         pane.apply_rpc_result(Ok(LeaksRpcResult {
             reports,
             next_cursor: None,
@@ -970,7 +970,10 @@ mod tests {
     fn delete_confirmation_visible_over_long_list() {
         let mut pane = ready_pane(30);
         pane.selected = 25;
-        assert!(matches!(pane.handle_key(press(KeyCode::Char('D'))), LeaksOutcome::Stay));
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Char('D'))),
+            LeaksOutcome::Stay
+        ));
         let rows = render_rows(&mut pane, 60, 8);
         let joined = rows.join("\n");
         assert!(
@@ -993,12 +996,17 @@ mod tests {
         pane.selected = 25;
         // Render once so `reconcile_list_scroll` populates `list_scroll`.
         let _ = render_rows(&mut pane, 60, 8);
-        assert!(pane.list_scroll > 0, "a deep selection should have scrolled");
+        assert!(
+            pane.list_scroll > 0,
+            "a deep selection should have scrolled"
+        );
         let scrolled = pane.list_scroll;
 
         // Append (next page): selection and scroll are preserved.
         pane.apply_rpc_result(Ok(LeaksRpcResult {
-            reports: (30..40).map(|i| sample_report(&format!("rpt-{i:02}"))).collect(),
+            reports: (30..40)
+                .map(|i| sample_report(&format!("rpt-{i:02}")))
+                .collect(),
             next_cursor: None,
             has_more: false,
             append: true,
@@ -1010,7 +1018,9 @@ mod tests {
 
         // Fresh reload: both reset to the top.
         pane.apply_rpc_result(Ok(LeaksRpcResult {
-            reports: (0..5).map(|i| sample_report(&format!("new-{i:02}"))).collect(),
+            reports: (0..5)
+                .map(|i| sample_report(&format!("new-{i:02}")))
+                .collect(),
             next_cursor: None,
             has_more: false,
             append: false,

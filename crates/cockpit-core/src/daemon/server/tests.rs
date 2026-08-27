@@ -13137,8 +13137,7 @@ async fn get_workspace_trust_reads_persisted_mode() {
 async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _, mut work_rx) =
-        attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+    let (mut state, _, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path()).await;
     let handle = state
         .attached
         .as_ref()
@@ -13196,19 +13195,19 @@ async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy(
             .mode,
         crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
     );
-    assert!(ctx
-        .registry
-        .interrupt_and_stop(session_id)
-        .await
-        .expect("test worker stops cleanly"));
+    assert!(
+        ctx.registry
+            .interrupt_and_stop(session_id)
+            .await
+            .expect("test worker stops cleanly")
+    );
 }
 
 #[tokio::test]
 async fn set_workspace_trust_does_not_hold_publication_lock_while_worker_refreshes() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _, mut work_rx) =
-        attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+    let (mut state, _, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path()).await;
     let handle = state
         .attached
         .as_ref()
@@ -13266,8 +13265,7 @@ async fn set_workspace_trust_does_not_hold_publication_lock_while_worker_refresh
 async fn set_workspace_trust_refresh_failure_reports_committed_unpublished_reconnect() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _, mut work_rx) =
-        attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+    let (mut state, _, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path()).await;
     let handle = state
         .attached
         .as_ref()
@@ -14590,8 +14588,12 @@ async fn attached_state_with_worker_receiver(
                 crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 chrono::Utc::now().timestamp(),
             )?;
-            let mut row =
-                crate::db::Db::build_new_session_row_conn(conn, "p", &session_project_root, "Build")?;
+            let mut row = crate::db::Db::build_new_session_row_conn(
+                conn,
+                "p",
+                &session_project_root,
+                "Build",
+            )?;
             let selection = stub_active_model_ref();
             row.provider = Some(selection.provider.clone());
             row.model = Some(selection.model.clone());
@@ -20539,8 +20541,12 @@ async fn live_worker_with_receiver(
                 crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 chrono::Utc::now().timestamp(),
             )?;
-            let mut row =
-                crate::db::Db::build_new_session_row_conn(conn, "p", &session_project_root, "Build")?;
+            let mut row = crate::db::Db::build_new_session_row_conn(
+                conn,
+                "p",
+                &session_project_root,
+                "Build",
+            )?;
             let selection = stub_active_model_ref();
             row.provider = Some(selection.provider.clone());
             row.model = Some(selection.model.clone());
@@ -28202,9 +28208,9 @@ async fn list_agents_respects_workspace_trust() {
         .expect("attached")
         .handle
         .replace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
-        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-        mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-    });
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        });
 
     let response = inventory_bundle(&mut state, &ctx, "Build").await;
     let Response::InventoryBundle { agents, .. } = response else {
@@ -28445,8 +28451,7 @@ async fn set_model_favorite_idempotent_rejects_external_durable_drift() {
     .unwrap();
 
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
-    let (mut state, _, _work_rx) =
-        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let (mut state, _, _work_rx) = attached_state_with_worker_receiver(&ctx, project.path()).await;
     let handle = state
         .attached
         .as_ref()
@@ -28610,7 +28615,11 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
     )
     .with_retained_provider_model_sources(&retained)
     .expect("global provider source proof");
-    assert!(initial.retained_provider_model_source("global", "a").is_some());
+    assert!(
+        initial
+            .retained_provider_model_source("global", "a")
+            .is_some()
+    );
     handle.set_full_config_snapshot_for_tests(initial);
 
     let refreshed_handle = handle.clone();
@@ -28649,12 +28658,17 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
     .expect("global retained favorite update succeeds");
     assert!(matches!(response, Response::Ack));
     refresh.await.unwrap();
-    assert!(crate::config::providers::ConfigDoc::providers_from_paths(&[global_config.clone()])
-        .providers["global"]
-        .models[0]
-        .favorite);
     assert!(
-        !project.path().join(".cockpit/providers/global.json").exists(),
+        crate::config::providers::ConfigDoc::providers_from_paths(&[global_config.clone()])
+            .providers["global"]
+            .models[0]
+            .favorite
+    );
+    assert!(
+        !project
+            .path()
+            .join(".cockpit/providers/global.json")
+            .exists(),
         "a global-source favorite mutation must not manufacture a workspace provider file"
     );
 
@@ -28878,7 +28892,11 @@ async fn set_default_model_recovers_cleanup_after_durable_receipt_before_cleanup
     let refresh_handle = handle.clone();
     let refresh = tokio::spawn(async move {
         match work_rx.recv().await.expect("one retained config refresh") {
-            SessionWork::ReplaceConfigSnapshot { snapshot, respond_to, .. } => {
+            SessionWork::ReplaceConfigSnapshot {
+                snapshot,
+                respond_to,
+                ..
+            } => {
                 refresh_handle.set_config_snapshot_for_tests_at_generation(
                     1,
                     snapshot.providers.clone(),
@@ -28987,8 +29005,7 @@ async fn modes_session_setup_retained_receipt_cleanup_requires_exact_ledger_clai
         .session_id;
     let update_id = Uuid::new_v4();
     let authority = cockpit_config::config::effective_default::DefaultUpdateAuthorityBinding::new(
-        "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
-            .to_string(),
+        "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c".to_string(),
         7,
     )
     .unwrap();
@@ -29012,13 +29029,12 @@ async fn modes_session_setup_retained_receipt_cleanup_requires_exact_ledger_clai
         "a valid-shaped receipt marker with no ledger row remains pending"
     );
 
-    let mismatched_outcome = serde_json::to_string(
-        &proto::DefaultModelStandaloneOutcome::Rejected {
+    let mismatched_outcome =
+        serde_json::to_string(&proto::DefaultModelStandaloneOutcome::Rejected {
             user_message: "different terminal outcome".to_string(),
             diagnostic_code: "different_outcome".to_string(),
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     ctx.db
         .record_default_model_update_receipt(
             session_id,
@@ -29108,7 +29124,11 @@ async fn modes_session_setup_clear_default_records_retained_inherited_selection(
     let lower_for_refresh = lower.clone();
     let refresh = tokio::spawn(async move {
         match work_rx.recv().await.expect("config snapshot replacement") {
-            SessionWork::ReplaceConfigSnapshot { snapshot, respond_to, .. } => {
+            SessionWork::ReplaceConfigSnapshot {
+                snapshot,
+                respond_to,
+                ..
+            } => {
                 assert_eq!(snapshot.providers.active_model, Some(lower_for_refresh));
                 refreshed_handle.set_config_snapshot_for_tests(
                     snapshot.providers.clone(),
@@ -29152,8 +29172,7 @@ async fn modes_session_setup_clear_default_records_retained_inherited_selection(
         "only the selected upper layer is cleared"
     );
     assert_eq!(
-        crate::config::providers::ConfigDoc::providers_from_paths(&[lower_config])
-            .active_model,
+        crate::config::providers::ConfigDoc::providers_from_paths(&[lower_config]).active_model,
         Some(lower.clone()),
     );
     assert!(matches!(
@@ -29211,7 +29230,11 @@ async fn modes_session_setup_set_default_model_keeps_retained_explicit_target_af
     env.set_cockpit_config(&config_b);
     let refresh = tokio::spawn(async move {
         match work_rx.recv().await.expect("config snapshot replacement") {
-            SessionWork::ReplaceConfigSnapshot { snapshot, respond_to, .. } => {
+            SessionWork::ReplaceConfigSnapshot {
+                snapshot,
+                respond_to,
+                ..
+            } => {
                 assert_eq!(
                     snapshot
                         .providers
@@ -29287,7 +29310,8 @@ async fn modes_session_setup_set_default_model_keeps_retained_explicit_target_af
 /// never touched, and restoring the old binding leaves no hidden successful
 /// default behind the rejected terminal result.
 #[tokio::test]
-async fn modes_session_setup_set_default_model_rejects_directory_swap_without_touching_replacement() {
+async fn modes_session_setup_set_default_model_rejects_directory_swap_without_touching_replacement()
+{
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
@@ -29312,8 +29336,7 @@ async fn modes_session_setup_set_default_model_rejects_directory_swap_without_to
     let config_a = target_dir.join("config.json");
     env.set_cockpit_config(&config_a);
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
-    let (mut state, _, _work_rx) =
-        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let (mut state, _, _work_rx) = attached_state_with_worker_receiver(&ctx, project.path()).await;
     let mut event_rx = state
         .attached
         .as_ref()
@@ -29363,9 +29386,11 @@ async fn modes_session_setup_set_default_model_rejects_directory_swap_without_to
         }
     ));
     assert!(
-        crate::config::providers::ConfigDoc::providers_from_paths(&[target_dir.join("config.json")])
-            .active_model
-            .is_none(),
+        crate::config::providers::ConfigDoc::providers_from_paths(
+            &[target_dir.join("config.json")]
+        )
+        .active_model
+        .is_none(),
         "replacement directory must never receive the retained mutation"
     );
     assert!(
@@ -29425,7 +29450,11 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
     let refresh_handle = handle.clone();
     let refresh = tokio::spawn(async move {
         match work_rx.recv().await.expect("retained config refresh") {
-            SessionWork::ReplaceConfigSnapshot { snapshot, respond_to, .. } => {
+            SessionWork::ReplaceConfigSnapshot {
+                snapshot,
+                respond_to,
+                ..
+            } => {
                 refresh_handle.set_config_snapshot_for_tests_at_generation(
                     1,
                     snapshot.providers.clone(),
@@ -29486,16 +29515,17 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
             if authority_revision == revision
     ));
     assert_eq!(
-        crate::config::providers::ConfigDoc::providers_from_paths(&[target_dir.join("config.json")])
-            .active_model,
+        crate::config::providers::ConfigDoc::providers_from_paths(
+            &[target_dir.join("config.json")]
+        )
+        .active_model,
         None,
         "B is never opened for A's retained mutation"
     );
-    let moved_selection = crate::config::providers::ConfigDoc::providers_from_paths(&[
-        moved_dir.join("config.json"),
-    ])
-    .active_model
-    .expect("A alone contains the committed default");
+    let moved_selection =
+        crate::config::providers::ConfigDoc::providers_from_paths(&[moved_dir.join("config.json")])
+            .active_model
+            .expect("A alone contains the committed default");
     assert_eq!(moved_selection.provider, "p");
     assert_eq!(moved_selection.model, "a");
     assert!(
@@ -29567,7 +29597,8 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
 /// rewrite A's journal; restoring the exact held attachment lets the normal
 /// retained recovery path record and emit the one A-bound receipt.
 #[tokio::test]
-async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_receipt_crash_without_touching_b() {
+async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_receipt_crash_without_touching_b()
+ {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
@@ -29623,7 +29654,11 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
         let mut refreshes = 0;
         while let Some(work) = work_rx.recv().await {
             match work {
-                SessionWork::ReplaceConfigSnapshot { snapshot, respond_to, .. } => {
+                SessionWork::ReplaceConfigSnapshot {
+                    snapshot,
+                    respond_to,
+                    ..
+                } => {
                     refreshes += 1;
                     worker_handle.set_config_snapshot_for_tests_at_generation(
                         1,
@@ -29718,7 +29753,10 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
             .is_none(),
         "no durable terminal receipt exists before its handoff"
     );
-    assert!(event_rx.try_recv().is_err(), "no pre-receipt terminal event");
+    assert!(
+        event_rx.try_recv().is_err(),
+        "no pre-receipt terminal event"
+    );
 
     std::fs::rename(&target_dir, &moved_dir).unwrap();
     std::fs::rename(&replacement_dir, &target_dir).unwrap();
@@ -29735,9 +29773,11 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
         "B never rewrites or retires A's sealed journal"
     );
     assert_eq!(
-        std::fs::read(cockpit_config::config::effective_default::backup_path_for_layer(
-            &moved_dir.join("config.json"),
-        ))
+        std::fs::read(
+            cockpit_config::config::effective_default::backup_path_for_layer(
+                &moved_dir.join("config.json"),
+            )
+        )
         .unwrap(),
         backup_bytes,
         "B never begins A's private cleanup"
@@ -29758,7 +29798,10 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
             .is_none(),
         "replacement B cannot mint a terminal receipt"
     );
-    assert!(event_rx.try_recv().is_err(), "replacement emits no terminal event");
+    assert!(
+        event_rx.try_recv().is_err(),
+        "replacement emits no terminal event"
+    );
 
     std::fs::rename(&target_dir, &replacement_dir).unwrap();
     std::fs::rename(&moved_dir, &target_dir).unwrap();
@@ -29905,7 +29948,12 @@ async fn set_model_favorite_writes_trusted_project_provider_layer() {
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
     let (mut state, _, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
-    let trust_policy = state.attached.as_ref().unwrap().handle.current_trust_policy();
+    let trust_policy = state
+        .attached
+        .as_ref()
+        .unwrap()
+        .handle
+        .current_trust_policy();
     let (providers, extended) = ctx
         .config_source()
         .load_with_trust(project.path(), &trust_policy)
@@ -30051,9 +30099,9 @@ async fn list_models_respects_workspace_trust() {
         .expect("attached")
         .handle
         .replace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
-        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-        mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-    });
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        });
 
     let response = inventory_bundle(&mut state, &ctx, "Build").await;
     let Response::InventoryBundle { models, .. } = response else {
@@ -33406,11 +33454,13 @@ async fn modes_session_setup_dispatch_preserves_attach_time_workspace_identity()
     let Response::Attached { session_id, .. } = response else {
         panic!("expected Attached response");
     };
-    assert!(state
-        .attached
-        .as_ref()
-        .and_then(|attached| attached.workspace_identity.as_ref())
-        .is_some());
+    assert!(
+        state
+            .attached
+            .as_ref()
+            .and_then(|attached| attached.workspace_identity.as_ref())
+            .is_some()
+    );
 
     // A replacement directory at the same spelling is a distinct workspace,
     // even if a caller was previously authorized to attach the old one.
@@ -33642,7 +33692,10 @@ async fn modes_session_setup_dispatch_never_rereads_workspace_config_after_swap_
     )
     .await
     .expect("replaced-root refresh is contained");
-    assert!(refresh.is_none(), "replacement root must not publish config");
+    assert!(
+        refresh.is_none(),
+        "replacement root must not publish config"
+    );
     let after_failed_refresh = handle.config_snapshot();
     assert_eq!(
         after_failed_refresh.generation, before_failed_refresh.generation,
@@ -33760,8 +33813,7 @@ async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_dura
     // replacement must retain the last-good worker snapshot rather than
     // publishing replacement authority.
     std::fs::rename(&workspace, &moved).expect("move attached workspace");
-    std::fs::create_dir_all(replacement.join(".cockpit/providers"))
-        .expect("replacement workspace");
+    std::fs::create_dir_all(replacement.join(".cockpit/providers")).expect("replacement workspace");
     std::fs::write(
         replacement.join(".cockpit/config.json"),
         "{ invalid replacement configuration",
@@ -33773,15 +33825,17 @@ async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_dura
     )
     .expect("poison replacement provider");
     std::fs::rename(&replacement, &workspace).expect("install replacement workspace");
-    assert!(crate::daemon::config_refresh::refresh_session_config(
-        &ctx.db,
-        ctx.config_source(),
-        &handle,
-        None,
-    )
-    .await
-    .expect("replacement refresh is contained")
-    .is_none());
+    assert!(
+        crate::daemon::config_refresh::refresh_session_config(
+            &ctx.db,
+            ctx.config_source(),
+            &handle,
+            None,
+        )
+        .await
+        .expect("replacement refresh is contained")
+        .is_none()
+    );
     assert_eq!(
         handle.config_snapshot().generation,
         initial_generation,
@@ -33804,13 +33858,13 @@ async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_dura
     )
     .await
     .expect("restored last-good setup endpoint response");
-    let Response::SessionSetupSnapshot {
-        snapshot: restored,
-    } = response
-    else {
+    let Response::SessionSetupSnapshot { snapshot: restored } = response else {
         panic!("expected restored session setup snapshot");
     };
-    assert_eq!(restored, initial, "failed refresh must not poison setup truth");
+    assert_eq!(
+        restored, initial,
+        "failed refresh must not poison setup truth"
+    );
 
     let mut refreshed_providers = initial_providers;
     crate::daemon::agent_installation::session_setup_test_support::add_refreshed_offering(
@@ -33842,7 +33896,10 @@ async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_dura
     )
     .await
     .expect("refreshed setup endpoint response");
-    let Response::SessionSetupSnapshot { snapshot: refreshed } = response else {
+    let Response::SessionSetupSnapshot {
+        snapshot: refreshed,
+    } = response
+    else {
         panic!("expected refreshed session setup snapshot");
     };
     assert_eq!(

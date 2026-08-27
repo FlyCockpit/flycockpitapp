@@ -137,10 +137,12 @@ impl crate::config::extended::hooks::RetainedHookExecutionAuthority
         components: &[String],
     ) -> Result<crate::config::extended::hooks::HookExecutionLaunch, String> {
         assert_eq!(components, &["hooks".to_owned(), "check".to_owned()]);
-        Ok(crate::config::extended::hooks::HookExecutionLaunch::ambient(
-            PathBuf::from("/daemon-private/snapshots/check"),
-            PathBuf::from("/retained-source-cwd"),
-        ))
+        Ok(
+            crate::config::extended::hooks::HookExecutionLaunch::ambient(
+                PathBuf::from("/daemon-private/snapshots/check"),
+                PathBuf::from("/retained-source-cwd"),
+            ),
+        )
     }
 }
 

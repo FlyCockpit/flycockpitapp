@@ -117,8 +117,7 @@ async fn persist_and_broadcast_default_model_update_receipt(
     let (authority_revision, config_generation) = match (&outcome, authority) {
         (
             proto::DefaultModelStandaloneOutcome::Applied {
-                authority_revision,
-                ..
+                authority_revision, ..
             },
             Some(authority),
         ) if authority_revision == &authority.authority_revision => (
@@ -217,7 +216,8 @@ fn retained_receipt_proof_matches_ledger(
     ) {
         return false;
     }
-    let Ok(outcome) = serde_json::from_str::<proto::DefaultModelStandaloneOutcome>(&receipt.outcome_json)
+    let Ok(outcome) =
+        serde_json::from_str::<proto::DefaultModelStandaloneOutcome>(&receipt.outcome_json)
     else {
         return false;
     };
@@ -276,8 +276,9 @@ async fn retained_receipt_proof_from_ledger(
         ),
         "recorded retained default receipt has a different authority binding"
     );
-    let outcome = serde_json::from_str::<proto::DefaultModelStandaloneOutcome>(&receipt.outcome_json)
-        .context("recorded retained default receipt is not a protocol outcome")?;
+    let outcome =
+        serde_json::from_str::<proto::DefaultModelStandaloneOutcome>(&receipt.outcome_json)
+            .context("recorded retained default receipt is not a protocol outcome")?;
     let canonical_outcome_json = serde_json::to_string(&outcome)
         .context("serializing recorded retained default receipt canonically")?;
     anyhow::ensure!(
@@ -327,8 +328,7 @@ async fn finalize_retained_default_after_terminal_receipt(
     receipt_proof: cockpit_config::config::effective_default::RetainedDefaultReceiptProof,
 ) -> std::result::Result<anyhow::Result<()>, tokio::task::JoinError> {
     #[cfg(test)]
-    let crash_point =
-        cockpit_config::config::effective_default::current_crash_inject_for_tests();
+    let crash_point = cockpit_config::config::effective_default::current_crash_inject_for_tests();
     tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         {
@@ -360,11 +360,9 @@ async fn recover_retained_defaults_for_attached_worker(
     // driver model persistence may need the same coordinator before it can
     // service the replacement. The retained target lock plus generation and
     // trust-revision CAS below provide the ordering/freshness fences.
-    let policy = crate::config::trust::resolve_workspace_trust_policy_from_db(
-        &ctx.db,
-        &handle.project_root,
-    )
-    .await?;
+    let policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &handle.project_root)
+            .await?;
     let target = match handle
         .workspace_root_authority
         .retained_effective_default_target_for_policy(&policy)
@@ -426,13 +424,16 @@ async fn recover_retained_defaults_for_attached_worker(
         anyhow::bail!("retained effective-default journal contains inconsistent authority seals");
     }
 
-    let refresh = crate::daemon::config_refresh::refresh_session_config_after_retained_default_mutation(
-        &ctx.db,
-        ctx.config_source(),
-        handle,
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("retained recovery could not refresh attached worker: {error:?}"))?;
+    let refresh =
+        crate::daemon::config_refresh::refresh_session_config_after_retained_default_mutation(
+            &ctx.db,
+            ctx.config_source(),
+            handle,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("retained recovery could not refresh attached worker: {error:?}")
+        })?;
     let selection = handle.config_snapshot().providers.active_model;
     let recovered_generation = sealed_authority
         .as_ref()
@@ -5995,8 +5996,9 @@ async fn handle_serialized_request_impl(
                     ),
                 });
             }
-            let trust_root = crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
-                .map_err(internal)?;
+            let trust_root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
             let requested_mode = workspace_trust_mode_to_db(mode);
             // The coordinator prevents new workers from being inserted while
             // this transition is in flight. Snapshot the existing exact
@@ -6062,8 +6064,7 @@ async fn handle_serialized_request_impl(
                         .await
                         .map_err(internal)?;
                     if latest.is_some_and(|decision| {
-                        decision.revision == committed.revision
-                            && decision.mode == requested_mode
+                        decision.revision == committed.revision && decision.mode == requested_mode
                     }) {
                         let current = inventory::current_config_generation();
                         inventory::compare_and_bump_config_generation(current)
@@ -6079,36 +6080,37 @@ async fn handle_serialized_request_impl(
                     }),
                 };
             }
-            let resolved_policy = match crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
-                &ctx.db,
-                &trust_root.root,
-            )
-            .await
-            {
-                Ok(policy) => policy,
-                Err(error) => {
-                    // The decision already committed. Do not turn that into
-                    // an Internal/rejected-looking result merely because the
-                    // confirming read failed; keep the newly fail-closed
-                    // policy cells and force the old snapshots down.
-                    drop(_authority_publication);
-                    drop(_config_publication_guard);
-                    drop(_guard);
-                    for handle in handles {
-                        if let Err(stop_error) =
-                            ctx.registry.interrupt_and_stop(handle.session_id).await
-                        {
-                            tracing::error!(%stop_error, session_id = %handle.session_id, "stopping worker after committed workspace-trust confirmation failure failed");
+            let resolved_policy =
+                match crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+                    &ctx.db,
+                    &trust_root.root,
+                )
+                .await
+                {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        // The decision already committed. Do not turn that into
+                        // an Internal/rejected-looking result merely because the
+                        // confirming read failed; keep the newly fail-closed
+                        // policy cells and force the old snapshots down.
+                        drop(_authority_publication);
+                        drop(_config_publication_guard);
+                        drop(_guard);
+                        for handle in handles {
+                            if let Err(stop_error) =
+                                ctx.registry.interrupt_and_stop(handle.session_id).await
+                            {
+                                tracing::error!(%stop_error, session_id = %handle.session_id, "stopping worker after committed workspace-trust confirmation failure failed");
+                            }
                         }
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: format!(
+                                "workspace trust was saved, but its policy could not be confirmed ({error}); reconnect attached sessions"
+                            ),
+                        });
                     }
-                    return Err(ErrorPayload {
-                        code: ErrorCode::Conflict,
-                        message: format!(
-                            "workspace trust was saved, but its policy could not be confirmed ({error}); reconnect attached sessions"
-                        ),
-                    });
-                }
-            };
+                };
             if resolved_policy.revision != committed.revision
                 || resolved_policy.policy.mode != requested_mode
             {
@@ -6180,10 +6182,14 @@ async fn handle_serialized_request_impl(
                 let current_transition = latest.is_some_and(|decision| {
                     decision.revision == committed.revision && decision.mode == requested_mode
                 });
-                let workers_published = handles.iter().zip(&transitions).all(|(handle, transition)| {
-                    handle.trust_transition_matches(transition)
-                        && handle.config_snapshot().trust_revision == transition.revision
-                });
+                let workers_published =
+                    handles
+                        .iter()
+                        .zip(&transitions)
+                        .all(|(handle, transition)| {
+                            handle.trust_transition_matches(transition)
+                                && handle.config_snapshot().trust_revision == transition.revision
+                        });
                 if !current_transition || !workers_published {
                     None
                 } else {
@@ -8562,11 +8568,7 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?;
             Ok(Response::AgentAttentionPage {
                 session_id,
-                entries: page
-                    .entries
-                    .into_iter()
-                    .map(agent_attention_wire)
-                    .collect(),
+                entries: page.entries.into_iter().map(agent_attention_wire).collect(),
                 next_cursor: page.next_cursor.map(agent_tree_cursor_to_wire),
             })
         }
@@ -8579,7 +8581,8 @@ async fn handle_serialized_request_impl(
             let attached = require_attached(state)?;
             ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
-            attached.handle
+            attached
+                .handle
                 .send_work(SessionWork::ResolveAgentDecision {
                     decision_request_id,
                     answer: agent_decision_answer_from_wire(answer),
@@ -8902,9 +8905,7 @@ async fn handle_serialized_request_impl(
                 .models
                 .iter()
                 .find(|entry| entry.id == model)
-                .ok_or_else(|| {
-                    bad_request(format!("model {model} not in provider {provider}"))
-                })?;
+                .ok_or_else(|| bad_request(format!("model {model} not in provider {provider}")))?;
             let favorite_is_noop = selected_model.favorite == favorite;
             let expected_generation = snapshot.generation;
             let source = snapshot
@@ -8946,21 +8947,18 @@ async fn handle_serialized_request_impl(
                 })?;
             let generation_handle = att.handle.clone();
             let source_for_generation_fence = source.clone();
-            let target = target
-                .with_pre_write_verifier(std::sync::Arc::new(move || {
-                    let current = generation_handle.config_snapshot();
-                    anyhow::ensure!(
-                        current.generation == expected_generation
-                            && current
-                                .retained_provider_model_source(
-                                    source_for_generation_fence.provider_id(),
-                                    source_for_generation_fence.model_id(),
-                                )
-                                == Some(&source_for_generation_fence),
-                        "provider favorite source generation changed before retained write"
-                    );
-                    Ok(())
-                }));
+            let target = target.with_pre_write_verifier(std::sync::Arc::new(move || {
+                let current = generation_handle.config_snapshot();
+                anyhow::ensure!(
+                    current.generation == expected_generation
+                        && current.retained_provider_model_source(
+                            source_for_generation_fence.provider_id(),
+                            source_for_generation_fence.model_id(),
+                        ) == Some(&source_for_generation_fence),
+                    "provider favorite source generation changed before retained write"
+                );
+                Ok(())
+            }));
             // A no-op is still an authority-bound durable observation. Never
             // acknowledge solely from an old worker snapshot: validate the
             // full retained chain and exact provider/model bytes under the
@@ -8978,18 +8976,17 @@ async fn handle_serialized_request_impl(
                 return Ok(Response::Ack);
             }
             let post_generation_handle = att.handle.clone();
-            let target = target
-                .with_post_write_verifier(std::sync::Arc::new(move |_receipt| {
-                    // Publication has not run yet, so this remains the old
-                    // worker generation. A concurrent watcher/refresh that won
-                    // while the retained write ran invalidates the attempt before
-                    // its new source can be published.
-                    anyhow::ensure!(
-                        post_generation_handle.config_snapshot().generation == expected_generation,
-                        "provider favorite generation changed before publication"
-                    );
-                    Ok(())
-                }));
+            let target = target.with_post_write_verifier(std::sync::Arc::new(move |_receipt| {
+                // Publication has not run yet, so this remains the old
+                // worker generation. A concurrent watcher/refresh that won
+                // while the retained write ran invalidates the attempt before
+                // its new source can be published.
+                anyhow::ensure!(
+                    post_generation_handle.config_snapshot().generation == expected_generation,
+                    "provider favorite generation changed before publication"
+                );
+                Ok(())
+            }));
             let receipt = tokio::task::spawn_blocking(move || target.write_model_favorite(favorite))
                 .await
                 .map_err(internal)?
@@ -9092,8 +9089,7 @@ async fn handle_serialized_request_impl(
             // publication coordinator. The guard is intentionally optional:
             // every path drops it before awaiting a worker/driver publication
             // and reacquires only for its short Phase-3 authority fence.
-            let mut config_publication_guard =
-                Some(CONFIG_PUBLICATION_RPC_LOCK.lock().await);
+            let mut config_publication_guard = Some(CONFIG_PUBLICATION_RPC_LOCK.lock().await);
             let trust_policy = attached_trust_policy_fenced_to_worker(ctx, att).await?;
             let session_id = att.handle.session_id;
             // A caller retrying after a daemon crash receives the one durable
@@ -9222,7 +9218,8 @@ async fn handle_serialized_request_impl(
                     return Ok(Response::Ack);
                 }
             };
-            let (mut recovered, mut recovery_finalization, receipt_validation) = recovery.into_parts();
+            let (mut recovered, mut recovery_finalization, receipt_validation) =
+                recovery.into_parts();
             if let Some(receipt_validation) = receipt_validation {
                 if receipt_validation.proof().session_id() != session_id {
                     tracing::warn!(
@@ -9231,11 +9228,9 @@ async fn handle_serialized_request_impl(
                     );
                     return Ok(Response::Ack);
                 }
-                if let Err(error) = validate_retained_receipt_proof_against_ledger(
-                    ctx,
-                    receipt_validation.proof(),
-                )
-                .await
+                if let Err(error) =
+                    validate_retained_receipt_proof_against_ledger(ctx, receipt_validation.proof())
+                        .await
                 {
                     tracing::warn!(%error, "receipt-emitted retained journal does not match the durable ledger; retaining it");
                     return Ok(Response::Ack);
@@ -9353,16 +9348,18 @@ async fn handle_serialized_request_impl(
                         "retained effective-default recovery lost its receipt finalization token",
                     ));
                 };
-                let Some((recovered_update_id, recovered_authority)) = recovered.first().and_then(
-                    |transaction| match &transaction.correlation {
+                let Some((recovered_update_id, recovered_authority)) =
+                    recovered.first().and_then(|transaction| {
+                        match &transaction.correlation {
                         crate::config::providers::TransactionCorrelation::RetainedDefaultUpdate {
                             default_update_id,
                             authority: Some(authority),
                             ..
                         } => Some((*default_update_id, authority.clone())),
                         _ => None,
-                    },
-                ) else {
+                    }
+                    })
+                else {
                     return Ok(Response::Ack);
                 };
                 let proof = match retained_receipt_proof_from_ledger(
@@ -9406,7 +9403,9 @@ async fn handle_serialized_request_impl(
                 if recovered.iter().any(|transaction| {
                     transaction.correlation.default_update_authority().cloned() != sealed_authority
                 }) {
-                    tracing::warn!("retained recovered default journal contains inconsistent authority seals; retaining journal handoff");
+                    tracing::warn!(
+                        "retained recovered default journal contains inconsistent authority seals; retaining journal handoff"
+                    );
                     return Ok(Response::Ack);
                 }
                 let sealed_generation = sealed_authority
@@ -9472,7 +9471,9 @@ async fn handle_serialized_request_impl(
                 let _recovery_phase_three_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
                 let recovery_phase_three_policy = attached_trust_policy(ctx, att).await?;
                 if recovery_phase_three_policy != trust_policy {
-                    tracing::warn!("retained recovered default policy changed before authority seal; retaining journal handoff");
+                    tracing::warn!(
+                        "retained recovered default policy changed before authority seal; retaining journal handoff"
+                    );
                     return Ok(Response::Ack);
                 }
                 if let Err(error) = cockpit_config::config::effective_default::retained_default_after_refresh_before_terminal_receipt("attached") {
@@ -9515,7 +9516,9 @@ async fn handle_serialized_request_impl(
                                 sealed.clone()
                             }
                             Ok(_) => {
-                                tracing::warn!("retained recovered default is sealed for a source excluded by the current workspace trust policy; retaining journal handoff");
+                                tracing::warn!(
+                                    "retained recovered default is sealed for a source excluded by the current workspace trust policy; retaining journal handoff"
+                                );
                                 return Ok(Response::Ack);
                             }
                             Err(error) => {
@@ -9563,16 +9566,23 @@ async fn handle_serialized_request_impl(
                 };
                 let recovered_update_id = recovered
                     .first()
-                    .and_then(|transaction| match &transaction.correlation {
+                    .and_then(|transaction| {
+                        match &transaction.correlation {
                         crate::config::providers::TransactionCorrelation::RetainedDefaultUpdate {
                             default_update_id,
                             ..
                         } => Some(*default_update_id),
                         _ => None,
+                    }
                     })
-                    .ok_or_else(|| internal("retained recovered default lost its update correlation"))?;
+                    .ok_or_else(|| {
+                        internal("retained recovered default lost its update correlation")
+                    })?;
                 drop(_recovery_phase_three_guard);
-                if let Err(error) = crate::daemon::effective_default_recovery::deliver_retained_default_terminals(ctx, recovered)
+                if let Err(error) =
+                    crate::daemon::effective_default_recovery::deliver_retained_default_terminals(
+                        ctx, recovered,
+                    )
                     .await
                 {
                     // The journal remains at the committed phase, so a later
@@ -9596,10 +9606,16 @@ async fn handle_serialized_request_impl(
                             return Ok(Response::Ack);
                         }
                     };
-                    match finalize_retained_default_after_terminal_receipt(finalization, proof).await {
+                    match finalize_retained_default_after_terminal_receipt(finalization, proof)
+                        .await
+                    {
                         Ok(Ok(())) => {}
-                        Ok(Err(error)) => tracing::warn!(%error, "retained recovered default receipt cleanup failed; journal remains for idempotent cleanup"),
-                        Err(error) => tracing::warn!(%error, "retained recovered default finalization task failed; journal remains for recovery"),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "retained recovered default receipt cleanup failed; journal remains for idempotent cleanup")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "retained recovered default finalization task failed; journal remains for recovery")
+                        }
                     }
                 }
                 // This request's prior committed operation has now supplied
@@ -9656,8 +9672,7 @@ async fn handle_serialized_request_impl(
                     .projected_effective_default_after_retained_update_for_policy(
                         &trust_policy,
                         None,
-                    )
-                {
+                    ) {
                     Ok(projected) => {
                         let inherited = projected.active_model.clone();
                         match cockpit_config::config::effective_default::validate_projected_inherited_default(
@@ -9751,7 +9766,9 @@ async fn handle_serialized_request_impl(
                     });
                     if let Err(error) = authority {
                         if mutation.wrote {
-                            tracing::warn!("retained default commit lost its attached authority before refresh; retaining journal handoff");
+                            tracing::warn!(
+                                "retained default commit lost its attached authority before refresh; retaining journal handoff"
+                            );
                             return Ok(Response::Ack);
                         }
                         (
@@ -9915,7 +9932,10 @@ async fn handle_serialized_request_impl(
                     // receipt could not be written. Its retained journal stays
                     // available for the next refresh/recovery attempt.
                     if retained_commit {
-                        tracing::warn!(?error, "retained default commit could not persist its terminal receipt; retaining journal handoff");
+                        tracing::warn!(
+                            ?error,
+                            "retained default commit could not persist its terminal receipt; retaining journal handoff"
+                        );
                         return Ok(Response::Ack);
                     }
                     return Err(error);
@@ -9927,10 +9947,16 @@ async fn handle_serialized_request_impl(
                         "retained default terminal receipt lacks its authority proof",
                     ));
                 };
-                match finalize_retained_default_after_terminal_receipt(finalization, receipt_proof).await {
+                match finalize_retained_default_after_terminal_receipt(finalization, receipt_proof)
+                    .await
+                {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::warn!(%error, "retained default receipt cleanup failed; retry requires ledger-validated retained cleanup"),
-                    Err(error) => tracing::warn!(%error, "retained default finalization task failed; journal remains for recovery"),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "retained default receipt cleanup failed; retry requires ledger-validated retained cleanup")
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "retained default finalization task failed; journal remains for recovery")
+                    }
                 }
             }
             Ok(Response::Ack)
@@ -13969,10 +13995,7 @@ async fn handle_serialized_request_impl(
             let trust_policy = attached.handle.current_trust_policy();
             let (_, extended) = ctx
                 .config_source
-                .load_effective_for_daemon(
-                    &attached.handle.project_root,
-                    &trust_policy,
-                )
+                .load_effective_for_daemon(&attached.handle.project_root, &trust_policy)
                 .map_err(internal)?;
             let receipt = recovery
                 .register_local_path(
@@ -14027,10 +14050,7 @@ async fn handle_serialized_request_impl(
             let trust_policy = attached.handle.current_trust_policy();
             let (_, extended) = ctx
                 .config_source
-                .load_effective_for_daemon(
-                    &attached.handle.project_root,
-                    &trust_policy,
-                )
+                .load_effective_for_daemon(&attached.handle.project_root, &trust_policy)
                 .map_err(internal)?;
             let receipt = recovery
                 .retain_https_media(
@@ -14244,10 +14264,7 @@ async fn handle_serialized_request_impl(
             let trust_policy = attached.handle.current_trust_policy();
             let (_, extended) = ctx
                 .config_source
-                .load_effective_for_daemon(
-                    &attached.handle.project_root,
-                    &trust_policy,
-                )
+                .load_effective_for_daemon(&attached.handle.project_root, &trust_policy)
                 .map_err(internal)?;
             let recovery = ctx
                 .media_storage_recovery
@@ -15329,11 +15346,7 @@ async fn handle_concurrent_request_impl(
                 .map_err(internal)?;
             Ok(Response::AgentAttentionPage {
                 session_id,
-                entries: page
-                    .entries
-                    .into_iter()
-                    .map(agent_attention_wire)
-                    .collect(),
+                entries: page.entries.into_iter().map(agent_attention_wire).collect(),
                 next_cursor: page.next_cursor.map(agent_tree_cursor_to_wire),
             })
         }
@@ -15344,10 +15357,13 @@ async fn handle_concurrent_request_impl(
         } => {
             let attached = require_shared_attached(&shared)?;
             ensure_agent_tree_attached_session(session_id, attached.session_id())?;
-            let handle = ctx.registry.live_handle(session_id).ok_or_else(|| ErrorPayload {
-                code: ErrorCode::UnknownSession,
-                message: "attached session worker is unavailable".into(),
-            })?;
+            let handle = ctx
+                .registry
+                .live_handle(session_id)
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: "attached session worker is unavailable".into(),
+                })?;
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             handle
                 .send_work(SessionWork::ResolveAgentDecision {
@@ -15831,7 +15847,8 @@ async fn refresh_host_capabilities_request(
     state: &MutableClientState,
     ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    refresh_host_capabilities_request_with_handle(require_attached(state)?.handle.clone(), ctx).await
+    refresh_host_capabilities_request_with_handle(require_attached(state)?.handle.clone(), ctx)
+        .await
 }
 
 /// Concurrent-dispatch counterpart for the durable host-capability refresh
@@ -22430,8 +22447,7 @@ pub(super) async fn get_inventory_bundle(
 fn verify_session_setup_workspace_authority(
     workspace_identity: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
     project_root: &Path,
-    workspace_config_authority:
-        &crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority,
+    workspace_config_authority: &crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority,
 ) -> std::result::Result<(), ErrorPayload> {
     workspace_identity
         .verify(project_root)
@@ -22443,8 +22459,7 @@ fn verify_session_setup_workspace_authority(
         .verify()
         .map_err(|_| ErrorPayload {
             code: ErrorCode::Conflict,
-            message: "attached workspace configuration authority changed; reattach required"
-                .into(),
+            message: "attached workspace configuration authority changed; reattach required".into(),
         })
 }
 
@@ -22464,10 +22479,13 @@ pub(super) async fn get_session_setup_snapshot(
             message: format!("session `{session_id}` is not the attached session"),
         });
     }
-    let workspace_identity = att.workspace_identity.as_ref().ok_or_else(|| ErrorPayload {
-        code: ErrorCode::Conflict,
-        message: "attached workspace identity is unavailable".into(),
-    })?;
+    let workspace_identity = att
+        .workspace_identity
+        .as_ref()
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "attached workspace identity is unavailable".into(),
+        })?;
     verify_session_setup_workspace_authority(
         workspace_identity,
         &att.handle.project_root,
@@ -22506,8 +22524,8 @@ pub(super) async fn get_session_setup_snapshot(
             // consistent projection rather than serving a mixed authority view.
             continue;
         }
-        let project_sources_projected = resolved_trust.policy.mode
-            == crate::db::workspace_trust::WorkspaceTrustMode::Trust;
+        let project_sources_projected =
+            resolved_trust.policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust;
         let providers = held.providers.clone();
         let config_generation = held.generation;
         let trust_revision = held.trust_revision;
@@ -22690,10 +22708,13 @@ async fn get_session_setup_snapshot_shared(
             message: format!("session `{session_id}` is not the attached session"),
         });
     }
-    let workspace_identity = att.workspace_identity.as_ref().ok_or_else(|| ErrorPayload {
-        code: ErrorCode::Conflict,
-        message: "attached workspace identity is unavailable".into(),
-    })?;
+    let workspace_identity = att
+        .workspace_identity
+        .as_ref()
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "attached workspace identity is unavailable".into(),
+        })?;
     verify_session_setup_workspace_authority(
         workspace_identity,
         &att.project_root,
@@ -22723,8 +22744,8 @@ async fn get_session_setup_snapshot_shared(
         {
             continue;
         }
-        let project_sources_projected = resolved_trust.policy.mode
-            == crate::db::workspace_trust::WorkspaceTrustMode::Trust;
+        let project_sources_projected =
+            resolved_trust.policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust;
         let providers = held.providers.clone();
         let config_generation = held.generation;
         let trust_revision = held.trust_revision;
@@ -25118,7 +25139,9 @@ pub(super) fn curator_run_report_to_proto(
     }
 }
 
-fn agent_tree_cursor_from_wire(cursor: proto::AgentTreeCursor) -> crate::db::agent_tree_decisions::AgentTreePageCursor {
+fn agent_tree_cursor_from_wire(
+    cursor: proto::AgentTreeCursor,
+) -> crate::db::agent_tree_decisions::AgentTreePageCursor {
     crate::db::agent_tree_decisions::AgentTreePageCursor {
         created_at_unix_ms: cursor.created_at_unix_ms,
         id: cursor.id,
@@ -25138,14 +25161,18 @@ fn ensure_agent_tree_attached_session(
     })
 }
 
-fn agent_tree_cursor_to_wire(cursor: crate::db::agent_tree_decisions::AgentTreePageCursor) -> proto::AgentTreeCursor {
+fn agent_tree_cursor_to_wire(
+    cursor: crate::db::agent_tree_decisions::AgentTreePageCursor,
+) -> proto::AgentTreeCursor {
     proto::AgentTreeCursor {
         created_at_unix_ms: cursor.created_at_unix_ms,
         id: cursor.id,
     }
 }
 
-fn agent_tree_node_wire(node: crate::db::agent_tree_decisions::AgentInstanceRow) -> proto::AgentTreeNode {
+fn agent_tree_node_wire(
+    node: crate::db::agent_tree_decisions::AgentInstanceRow,
+) -> proto::AgentTreeNode {
     proto::AgentTreeNode {
         agent_instance_id: node.agent_instance_id,
         parent_agent_instance_id: node.parent_agent_instance_id,
@@ -25180,7 +25207,9 @@ fn agent_attention_wire(
     }
 }
 
-fn agent_decision_answer_from_wire(answer: proto::AgentDecisionAnswer) -> crate::agent_tree::PublicDecisionAnswer {
+fn agent_decision_answer_from_wire(
+    answer: proto::AgentDecisionAnswer,
+) -> crate::agent_tree::PublicDecisionAnswer {
     match answer {
         proto::AgentDecisionAnswer::Option { option_id } => {
             crate::agent_tree::PublicDecisionAnswer::option(option_id)

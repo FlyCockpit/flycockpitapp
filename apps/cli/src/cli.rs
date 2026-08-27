@@ -1655,11 +1655,15 @@ mod tests {
             Some(Command::Code)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "assistant"]).unwrap().command,
+            Cli::try_parse_from(["cockpit", "assistant"])
+                .unwrap()
+                .command,
             Some(Command::Assistant)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "computer"]).unwrap().command,
+            Cli::try_parse_from(["cockpit", "computer"])
+                .unwrap()
+                .command,
             Some(Command::Computer)
         ));
         assert!(matches!(

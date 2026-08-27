@@ -517,12 +517,12 @@ pub use effective_sandbox::{
     evaluate_set_sandbox, sandbox_capability_snapshot, sandbox_capability_snapshot_with_reasons,
     sandbox_mode_available, sandbox_mode_selectable, unpublished_host_capability_snapshot,
 };
+pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime};
 pub use handle::{
     InteractiveClientGuard, OversizedRunInvocationAdmission, OversizedTextArtifactAdmission,
     ReplaceConfigSnapshotResult, SessionConfigHandle, SessionConfigSnapshot, SessionWork,
     SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
 };
-pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime};
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 pub(crate) use helpers::daemon_no_sandbox;
 #[allow(unused_imports)]

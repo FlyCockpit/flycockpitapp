@@ -28,8 +28,7 @@ fn selection(provider: &str, model: &str) -> ActiveModelRef {
 
 fn test_default_update_authority(generation: u64) -> DefaultUpdateAuthorityBinding {
     DefaultUpdateAuthorityBinding::new(
-        "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
-            .to_string(),
+        "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c".to_string(),
         generation,
     )
     .unwrap()
@@ -221,11 +220,7 @@ fn retained_config_only_target(
     std::fs::create_dir_all(&project_root).unwrap();
     let prior = selection("old", "a");
     let requested = selection("new", "b");
-    write_layer(
-        &config_dir,
-        Some(&prior),
-        &[("old", "a"), ("new", "b")],
-    );
+    write_layer(&config_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
     let config_path = config_dir.join("config.json");
     let target = RetainedEffectiveDefaultTarget::new(
         std::fs::File::open(&config_dir).unwrap(),
@@ -813,11 +808,7 @@ fn retained_config_only_recovery_matches_prepared_and_committed_journal_contract
         std::fs::create_dir_all(&project_root).unwrap();
         let prior = selection("old", "a");
         let target_selection = selection("new", "b");
-        write_layer(
-            &config_dir,
-            Some(&prior),
-            &[("old", "a"), ("new", "b")],
-        );
+        write_layer(&config_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
         let config_path = config_dir.join("config.json");
         let target = RetainedEffectiveDefaultTarget::new(
             std::fs::File::open(&config_dir).unwrap(),
@@ -882,15 +873,13 @@ fn retained_config_only_recovery_matches_prepared_and_committed_journal_contract
                 Some(prior)
             },
         );
-        let mut finalization = finalization
-            .expect("correlated recovery retains a terminal finalizer");
+        let mut finalization =
+            finalization.expect("correlated recovery retains a terminal finalizer");
         finalization
             .bind_default_update_authority(test_default_update_authority(1))
             .expect("recovery seals its authority before terminal receipt");
         finalization
-            .finalize_after_terminal_receipt(&test_retained_receipt_proof(
-                update_id, session_id, 1,
-            ))
+            .finalize_after_terminal_receipt(&test_retained_receipt_proof(update_id, session_id, 1))
             .expect("receipt finalization removes retained artifacts");
         assert!(journal_and_backup_are_gone(&config_path));
         assert!(
@@ -944,7 +933,10 @@ fn ambient_recovery_never_converges_or_delivers_a_retained_default_journal() {
     )
     .expect("ambient recovery declines retained work rather than failing startup");
     assert!(ambient.is_empty());
-    assert!(delivered.is_empty(), "ambient recovery must not emit a receipt");
+    assert!(
+        delivered.is_empty(),
+        "ambient recovery must not emit a receipt"
+    );
     assert!(
         journal_path_for_config(&config_path).exists(),
         "only retained worker recovery may retire the private journal"
@@ -1069,7 +1061,11 @@ fn ambient_recovery_reclassifies_a_replaced_journal_before_touching_retained_sid
     set_crash_inject(None);
     let retained_journal = journal_path_for_config(&live_config);
     let retained_backup = backup_path_for_config(&live_config);
-    assert!(replacement_dir.join(retained_journal.file_name().unwrap()).exists());
+    assert!(
+        replacement_dir
+            .join(retained_journal.file_name().unwrap())
+            .exists()
+    );
 
     let moved_a = tmp.path().join("moved-a");
     let replacement_for_hook = replacement_dir.clone();
@@ -1082,10 +1078,10 @@ fn ambient_recovery_reclassifies_a_replaced_journal_before_touching_retained_sid
 
     // The journal is not at `live` until the hook runs; save B's bytes by its
     // current retained directory before invoking ambient recovery.
-    let journal_before = std::fs::read(replacement_dir.join(retained_journal.file_name().unwrap()))
-        .unwrap();
-    let backup_before = std::fs::read(replacement_dir.join(retained_backup.file_name().unwrap()))
-        .unwrap();
+    let journal_before =
+        std::fs::read(replacement_dir.join(retained_journal.file_name().unwrap())).unwrap();
+    let backup_before =
+        std::fs::read(replacement_dir.join(retained_backup.file_name().unwrap())).unwrap();
     let config_before = std::fs::read(replacement_dir.join("config.json")).unwrap();
 
     reset_ambient_recovery_operation_counts_for_tests();
@@ -1218,23 +1214,19 @@ fn ambient_mutation_keeps_probe_and_lock_on_captured_a_after_path_becomes_b() {
     assert_eq!(operations.mutation_writable_probes, 1);
     assert_eq!(operations.mutation_lock_acquisitions, 1);
     assert!(
-        std::fs::read_dir(&moved_a)
+        std::fs::read_dir(&moved_a).unwrap().any(|entry| entry
             .unwrap()
-            .any(|entry| entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains("effective-default-lock")),
+            .file_name()
+            .to_string_lossy()
+            .contains("effective-default-lock")),
         "the capability-local lock belongs to held A, not the replacement path",
     );
     assert!(
-        std::fs::read_dir(&live_dir)
+        std::fs::read_dir(&live_dir).unwrap().all(|entry| !entry
             .unwrap()
-            .all(|entry| !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains("effective-default-lock")),
+            .file_name()
+            .to_string_lossy()
+            .contains("effective-default-lock")),
         "B must not receive an ambient lock sidecar",
     );
     assert_eq!(
@@ -1293,11 +1285,7 @@ fn retained_commit_keeps_journal_until_terminal_finalization() {
     std::fs::create_dir_all(&project_root).unwrap();
     let prior = selection("old", "a");
     let target_selection = selection("new", "b");
-    write_layer(
-        &config_dir,
-        Some(&prior),
-        &[("old", "a"), ("new", "b")],
-    );
+    write_layer(&config_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
     let config_path = config_dir.join("config.json");
     let target = RetainedEffectiveDefaultTarget::new(
         std::fs::File::open(&config_dir).unwrap(),
@@ -1354,9 +1342,7 @@ fn retained_commit_keeps_journal_until_terminal_finalization() {
         "a sealed retained authority is write-once"
     );
     pending
-        .finalize_after_terminal_receipt(&test_retained_receipt_proof(
-            update_id, session_id, 1,
-        ))
+        .finalize_after_terminal_receipt(&test_retained_receipt_proof(update_id, session_id, 1))
         .expect("terminal handoff finalizes retained artifacts");
     assert!(journal_and_backup_are_gone(&config_path));
 }
@@ -1371,11 +1357,7 @@ fn retained_receipt_marker_makes_post_receipt_recovery_cleanup_only() {
     std::fs::create_dir_all(&project_root).unwrap();
     let prior = selection("old", "a");
     let target_selection = selection("new", "b");
-    write_layer(
-        &config_dir,
-        Some(&prior),
-        &[("old", "a"), ("new", "b")],
-    );
+    write_layer(&config_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
     let config_path = config_dir.join("config.json");
     let target = RetainedEffectiveDefaultTarget::new(
         std::fs::File::open(&config_dir).unwrap(),
@@ -1425,7 +1407,8 @@ fn retained_receipt_marker_makes_post_receipt_recovery_cleanup_only() {
         "receipt-marked recovery never re-emits a terminal correlation"
     );
     assert!(finalization.is_none());
-    let receipt_validation = receipt_validation.expect("receipt marker needs daemon-ledger validation");
+    let receipt_validation =
+        receipt_validation.expect("receipt marker needs daemon-ledger validation");
     assert_eq!(receipt_validation.proof(), &proof);
     assert!(
         !journal_and_backup_are_gone(&config_path),
@@ -1473,11 +1456,7 @@ fn retained_receipt_marker_missing_or_mismatched_proof_fails_closed() {
     assert!(!journal_and_backup_are_gone(&config_path));
 
     let mut record = target.load_journal().unwrap().unwrap();
-    record.receipt_proof = Some(test_retained_receipt_proof(
-        Uuid::new_v4(),
-        session_id,
-        3,
-    ));
+    record.receipt_proof = Some(test_retained_receipt_proof(Uuid::new_v4(), session_id, 3));
     target.write_journal(&record).unwrap();
     assert!(
         recover_retained_effective_default_journal(&target).is_err(),
@@ -1513,7 +1492,8 @@ fn retained_corrupt_authority_seal_fails_closed_without_rewriting_journal() {
         .load_journal()
         .unwrap()
         .expect("committed retained journal");
-    let Some(TransactionCorrelation::RetainedDefaultUpdate { authority, .. }) = record.correlation.as_mut()
+    let Some(TransactionCorrelation::RetainedDefaultUpdate { authority, .. }) =
+        record.correlation.as_mut()
     else {
         panic!("expected config-only default-update correlation");
     };

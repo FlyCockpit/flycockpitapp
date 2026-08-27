@@ -379,8 +379,10 @@ impl Db {
                     anyhow::bail!("task delegation activation child `{label}` is missing");
                 };
                 anyhow::ensure!(
-                    matches!(status.as_str(), "running" | "backgrounded" | "paused_pending_tool")
-                        && existing_snapshot.is_some(),
+                    matches!(
+                        status.as_str(),
+                        "running" | "backgrounded" | "paused_pending_tool"
+                    ) && existing_snapshot.is_some(),
                     "task delegation child `{label}` is not safely published"
                 );
             }
@@ -1108,9 +1110,7 @@ fn immediate_transaction<T>(
             }
         },
         Ok(Err(error)) => finish_immediate_rollback(conn, error),
-        Err(_) => {
-            finish_immediate_rollback(conn, anyhow::anyhow!("db transaction job panicked"))
-        }
+        Err(_) => finish_immediate_rollback(conn, anyhow::anyhow!("db transaction job panicked")),
     }
 }
 
@@ -1364,7 +1364,9 @@ mod tests {
                       WHERE task_call_id = 'dependency-job'",
                 )?;
                 let rows = statement
-                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
@@ -1423,16 +1425,18 @@ mod tests {
         assert_eq!(before[0].status, DelegationStatus::Created);
         assert!(before[0].started_at.is_none());
 
-        assert!(db
-            .activate_task_delegation_children_with_snapshots(
+        assert!(
+            db.activate_task_delegation_children_with_snapshots(
                 "task-initial-snapshot",
                 vec![(
                     "default".to_string(),
-                    r#"{"version":2,"history":[],"next_prompt":{"User":{"content":[]}}}"#.to_string(),
+                    r#"{"version":2,"history":[],"next_prompt":{"User":{"content":[]}}}"#
+                        .to_string(),
                 )],
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let after = db
             .list_task_delegation_children(session.session_id)
             .await

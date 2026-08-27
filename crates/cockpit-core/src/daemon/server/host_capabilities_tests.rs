@@ -184,7 +184,8 @@ async fn host_capabilities_get_returns_features_and_secret_store() {
 }
 
 #[tokio::test]
-async fn host_capabilities_refresh_requires_an_attached_durable_decision_and_discards_stale_generation() {
+async fn host_capabilities_refresh_requires_an_attached_durable_decision_and_discards_stale_generation()
+ {
     let _guard = lock_keyring_probe_tests();
     reset_keyring_probe_cache_for_test();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -238,7 +239,10 @@ async fn staged_refresh_never_leaks_when_the_durable_completion_is_cancelled_or_
     assert!(cancelled_stage.snapshot().generation > initial.generation);
     drop(cancelled_stage);
     assert_eq!(
-        store.current().expect("initial snapshot remains live").generation,
+        store
+            .current()
+            .expect("initial snapshot remains live")
+            .generation,
         initial.generation,
         "cancellation between probe and durable completion must not publish"
     );
@@ -250,7 +254,10 @@ async fn staged_refresh_never_leaks_when_the_durable_completion_is_cancelled_or_
         .expect("stage refresh before simulated DB failure");
     drop(failed_stage);
     assert_eq!(
-        store.current().expect("initial snapshot remains live").generation,
+        store
+            .current()
+            .expect("initial snapshot remains live")
+            .generation,
         initial.generation,
         "a failed durable completion must not publish a staged probe"
     );
@@ -266,7 +273,10 @@ async fn staged_refresh_never_leaks_when_the_durable_completion_is_cancelled_or_
         .expect("stage later uncommitted refresh");
     let (committed, published) = publish_staged_host_capabilities_refresh(&store, committed_stage)
         .expect("committed stage must install or match the exact live snapshot");
-    assert!(published, "only the successful receipt may change the live view");
+    assert!(
+        published,
+        "only the successful receipt may change the live view"
+    );
     assert_eq!(
         store.current().expect("committed snapshot").generation,
         committed.generation
@@ -291,9 +301,11 @@ async fn recovered_committed_generation_advances_next_refresh_and_rejects_mismat
         &collected,
         cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
     );
-    assert!(recovered
-        .publish_committed(generation_two.clone())
-        .expect("durable generation two installs on recovery"));
+    assert!(
+        recovered
+            .publish_committed(generation_two.clone())
+            .expect("durable generation two installs on recovery")
+    );
     assert_eq!(
         recovered.begin_refresh(),
         3,
@@ -305,9 +317,11 @@ async fn recovered_committed_generation_advances_next_refresh_and_rejects_mismat
         &collected,
         cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
     );
-    assert!(recovered
-        .publish_committed(generation_three.clone())
-        .expect("generation three installs after recovered generation two"));
+    assert!(
+        recovered
+            .publish_committed(generation_three.clone())
+            .expect("generation three installs after recovered generation two")
+    );
     assert_eq!(recovered.current().as_deref(), Some(&generation_three));
 
     let mut mismatched = generation_three;

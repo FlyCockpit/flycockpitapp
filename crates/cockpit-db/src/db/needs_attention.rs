@@ -140,14 +140,8 @@ impl Db {
         description: &str,
         question: Option<&InterruptQuestion>,
     ) -> Result<Uuid> {
-        self.raise_interrupt_with_agent_instance(
-            session_id,
-            agent_id,
-            None,
-            description,
-            question,
-        )
-        .await
+        self.raise_interrupt_with_agent_instance(session_id, agent_id, None, description, question)
+            .await
     }
 
     /// Single-question counterpart to
@@ -317,8 +311,8 @@ impl Db {
                         AND (decision_request_id IS NULL
                              OR question_json IS NOT NULL OR questions_json IS NOT NULL)",
                     params![now, response_json, interrupt_id.to_string()],
-            )
-            .context("resolving needs_attention")?;
+                )
+                .context("resolving needs_attention")?;
             if affected == 0 {
                 // AgentTree terminalization owns the same real QuestionTool
                 // row and may have committed its response projection first.

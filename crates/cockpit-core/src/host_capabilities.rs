@@ -303,10 +303,7 @@ impl HostCapabilitySnapshotStore {
     /// same or a newer generation is a durable/in-memory split-brain signal;
     /// callers must retain the outbox entry and fail closed rather than
     /// acknowledging an unpublished result.
-    pub fn publish_committed(
-        &self,
-        snapshot: HostCapabilitySnapshot,
-    ) -> Result<bool, String> {
+    pub fn publish_committed(&self, snapshot: HostCapabilitySnapshot) -> Result<bool, String> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match &inner.current {
             Some(current) if current.generation > snapshot.generation => {
@@ -414,7 +411,8 @@ pub async fn stage_host_capabilities_refresh_with_secret_store(
     inputs: &HostCapabilityProbeInputs,
     secret_store: SecretStoreSnapshot,
 ) -> Result<StagedHostCapabilityRefresh, String> {
-    stage_host_capabilities_refresh_inner(store, inputs, Some(secret_store), store.begin_refresh()).await
+    stage_host_capabilities_refresh_inner(store, inputs, Some(secret_store), store.begin_refresh())
+        .await
 }
 
 /// Stage a host refresh at the generation reserved by the durable operation

@@ -46,8 +46,8 @@ pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
     diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
     knowledge, locks, mcp, media_reservation, model_system_prompt, packages, providers, redact,
-    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools,
-    user_agent, welcome, wizard,
+    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools, user_agent, welcome,
+    wizard,
 };
 
 /// Narrow process-boundary fixtures used by the CLI's integration tests.
@@ -242,9 +242,9 @@ pub mod integration {
                     initial_model: None,
                     no_sandbox: false,
                     interactive,
-                    session_entry_mode: session_id.is_none().then_some(
-                        crate::daemon::proto::SessionEntryMode::Code,
-                    ),
+                    session_entry_mode: session_id
+                        .is_none()
+                        .then_some(crate::daemon::proto::SessionEntryMode::Code),
                     model_override: None,
                     client_protocol_version: self.inner.negotiated().version,
                     env_snapshot: None,

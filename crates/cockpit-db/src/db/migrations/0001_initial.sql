@@ -2239,6 +2239,16 @@ WHEN OLD.decision_request_id IS NOT NULL
             AND NEW.state = 'parked'
             AND NEW.resolved_at IS OLD.resolved_at
         )
+        -- Crash recovery: a linked host-approval (or other side-effecting)
+        -- continuation was `executing` when the worker died. Replaying it
+        -- would re-run the approved tool; the decision is already terminal,
+        -- so the projection may move to `interrupted` under the same guard.
+        OR (
+            (OLD.question_json IS NOT NULL OR OLD.questions_json IS NOT NULL)
+            AND OLD.state = 'executing'
+            AND NEW.state = 'interrupted'
+            AND NEW.resolved_at IS OLD.resolved_at
+        )
     )
     OR NEW.revision <> OLD.revision + 1
     OR NOT EXISTS (

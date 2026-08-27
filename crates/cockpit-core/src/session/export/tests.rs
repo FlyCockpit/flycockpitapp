@@ -1804,7 +1804,7 @@ async fn export_follows_session_compacted_successor() {
         crate::session::test_redaction_key_resolver(),
     )
     .unwrap();
-    pred.record_session_compacted("builder", succ.id, &succ.short_id, 3, "handoff brief")
+    pred.record_session_compacted("builder", succ.id, &succ.short_id(), 3, "handoff brief")
         .await
         .unwrap();
     // Each session has one inference call.

@@ -4136,6 +4136,11 @@ async fn run_boot_housekeeping(db: &Db) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "sweeping ephemeral sessions on boot failed"),
     }
+    match db.sweep_empty_display_sessions().await {
+        Ok(n) if n > 0 => tracing::info!(count = n, "swept empty display-only sessions on boot"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "sweeping empty display sessions on boot failed"),
+    }
     run_retention_pass(
         db.clone(),
         retention_config(),

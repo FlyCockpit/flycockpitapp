@@ -1,6 +1,6 @@
 pub use cockpit_test_support::TestEnvGuard;
 
-const LARGE_ASYNC_TEST_STACK: usize = 8 * 1024 * 1024;
+const LARGE_ASYNC_TEST_STACK: usize = crate::daemon::session_worker::TOKIO_WORKER_STACK_SIZE;
 
 /// Run a deeply nested async engine test on the same stack size used by
 /// Cockpit CLI Tokio workers. Constructing the future inside the spawned

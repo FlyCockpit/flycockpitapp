@@ -870,7 +870,8 @@ pub enum Request {
     },
 
     /// Create a new assistant session through the daemon registry. The
-    /// session is deferred and is not persisted until its first user message.
+    /// session is deferred until worker start flushes the row, immediately
+    /// before durable lifecycle setup.
     CreateAssistantSession {
         name: String,
         project_root: String,

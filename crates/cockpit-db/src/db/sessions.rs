@@ -950,13 +950,12 @@ impl Db {
     }
 
     /// Build a brand-new session row — fresh UUID + project-unique
-    /// provisional short_id — **without** writing it to the DB. Used by the
-    /// lazy-persistence path (session-id-display-and-lazy-persist): the
-    /// daemon holds the row in memory and only [`Self::insert_session_row`]s
-    /// it on the first user message, so an opened-but-unused session leaves
-    /// no DB trace. The short_id is checked against the live table at build
-    /// time for a useful display value; the eventual INSERT is the reservation
-    /// point and may retry with a different final short_id.
+    /// provisional short_id — **without** writing it to the DB. The daemon
+    /// holds the row in memory until worker construction succeeds, then
+    /// `persist_if_needed` inserts it before spawn. Attach therefore always
+    /// leaves a durable row; the INSERT is the reservation point and may
+    /// retry with a different final short_id. The short_id is checked
+    /// against the live table at build time for a useful display value.
     pub async fn new_session_row(
         &self,
         project_id: &str,
@@ -2065,6 +2064,68 @@ impl Db {
         Ok(removed)
     }
 
+    /// Remove durable sessions that were flushed on attach and never became
+    /// active. Retention may prune transcript events after
+    /// `transcript_window_days` while keeping the session row for
+    /// `session_window_days`; those emptied-but-real rows, plus pinned,
+    /// renamed, ended, or parent sessions, must survive.
+    pub async fn sweep_empty_display_sessions(&self) -> Result<usize> {
+        let ids = self
+            .read(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT session_id
+                           FROM sessions
+                          WHERE ephemeral = 0
+                            AND ended_at_unix_ms IS NULL
+                            AND user_renamed = 0
+                            AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM session_events AS e
+                                   WHERE e.session_id = sessions.session_id
+                                )
+                            AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM pins
+                                   WHERE pins.session_id = sessions.session_id
+                                )
+                            AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM sessions AS child
+                                   WHERE child.parent_session_id = sessions.session_id
+                                      OR child.btw_parent_session_id = sessions.session_id
+                                )",
+                    )
+                    .context("preparing empty-session sweep")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let s: String = row.get(0)?;
+                        parse_uuid(&s)
+                    })
+                    .context("querying empty-session sweep")?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.context("decoding empty session row")?);
+                }
+                Ok(out)
+            })
+            .await?;
+        let mut removed = 0;
+        for id in ids {
+            match self.delete_session(id).await {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %id,
+                        error = %error,
+                        "empty display session sweep delete failed; continuing"
+                    );
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// Set the read/unread marker to now (migration 0010). Called when a
     /// client opens/resumes the session — everything the agent produced
     /// up to this instant counts as seen; later agent output reads as
@@ -2469,12 +2530,17 @@ impl Db {
                 "SELECT s.*
                    FROM sessions AS s
                   WHERE s.project_root = ?1 AND s.ephemeral = 0
-                  ORDER BY COALESCE(
-                               (SELECT MAX(e.ts_ms)
-                                  FROM session_events AS e
-                                 WHERE e.session_id = s.session_id
-                                   AND e.type IN ('user_message', 'assistant_message')),
-                               s.last_active_at_unix_ms
+                    AND EXISTS (
+                          SELECT 1
+                            FROM session_events AS e
+                           WHERE e.session_id = s.session_id
+                             AND e.type IN ('user_message', 'assistant_message')
+                        )
+                  ORDER BY (
+                               SELECT MAX(e.ts_ms)
+                                 FROM session_events AS e
+                                WHERE e.session_id = s.session_id
+                                  AND e.type IN ('user_message', 'assistant_message')
                            ) DESC,
                            s.last_active_at_unix_ms DESC,
                            s.session_id DESC
@@ -3311,6 +3377,79 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        let phantom = db.create_session("p", "/proj", "Build").await.unwrap();
+        db.write({
+            let phantom_id = phantom.session_id;
+            move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET last_active_at_unix_ms = 50_000 WHERE session_id = ?1",
+                    [phantom_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        let selected = db
+            .most_recent_session_for_root_by_message("/proj")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.session_id, first.session_id,
+            "empty attach rows must not win run --continue"
+        );
+        assert_eq!(db.sweep_empty_display_sessions().await.unwrap(), 1);
+        assert!(db.get_session(phantom.session_id).await.unwrap().is_none());
+        assert!(db.get_session(first.session_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn sweep_empty_display_sessions_keeps_real_emptied_and_linked_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let ended = db.create_session("p", "/proj", "Build").await.unwrap();
+        record_message(&db, ended.session_id, "later pruned", false).await;
+        db.end_session(ended.session_id).await.unwrap();
+        db.write({
+            let ended_id = ended.session_id;
+            move |conn| {
+                conn.execute(
+                    "DELETE FROM session_events WHERE session_id = ?1",
+                    [ended_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let tool_only = db.create_session("p", "/proj", "Build").await.unwrap();
+        record_tool_timeline(&db, tool_only.session_id, "call-1").await;
+
+        let renamed = db.create_session("p", "/proj", "Build").await.unwrap();
+        db.rename_session(renamed.session_id, "kept by rename")
+            .await
+            .unwrap();
+
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        record_message(&db, child.session_id, "child has the transcript", false).await;
+
+        let phantom = db.create_session("p", "/proj", "Build").await.unwrap();
+
+        assert_eq!(db.sweep_empty_display_sessions().await.unwrap(), 1);
+        assert!(db.get_session(ended.session_id).await.unwrap().is_some());
+        assert!(
+            db.get_session(tool_only.session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(db.get_session(renamed.session_id).await.unwrap().is_some());
+        assert!(db.get_session(parent.session_id).await.unwrap().is_some());
+        assert!(db.get_session(child.session_id).await.unwrap().is_some());
+        assert!(db.get_session(phantom.session_id).await.unwrap().is_none());
     }
 
     #[tokio::test]

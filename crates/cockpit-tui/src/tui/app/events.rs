@@ -232,15 +232,20 @@ impl App {
         sandbox_supported: bool,
     ) {
         let enabled = mode.enabled();
+        let already_hydrated = self.sandbox_state_hydrated;
+        let changed = already_hydrated && self.sandbox_mode != mode;
+        self.sandbox_state_hydrated = true;
         self.no_sandbox = !enabled;
         self.sandbox_mode = mode;
         self.container_network_enabled = container_network_enabled;
         self.container_availability = container_availability;
-        let toast = match mode {
-            cockpit_proto::SandboxMode::Sandbox => "sandbox on".to_string(),
-            other => format!("sandbox {}", sandbox_mode_label(other)),
-        };
-        self.show_toast(&toast, ToastKind::Info);
+        if changed {
+            let toast = match mode {
+                cockpit_proto::SandboxMode::Sandbox => "sandbox on".to_string(),
+                other => format!("sandbox {}", sandbox_mode_label(other)),
+            };
+            self.show_toast(&toast, ToastKind::Info);
+        }
         if should_clear_sandbox_down_notice(enabled, sandbox_supported) {
             self.sandbox_down_notice = None;
         }
@@ -2306,18 +2311,24 @@ impl App {
                 }
             }
             TurnEvent::SandboxEscalationState { enabled } => {
+                let changed = self.sandbox_escalation_enabled != enabled;
                 self.sandbox_escalation_enabled = enabled;
-                self.show_toast(
-                    format!(
-                        "sandbox escalation {}",
-                        if enabled { "allowed" } else { "disallowed" }
-                    ),
-                    ToastKind::Info,
-                );
+                if changed {
+                    self.show_toast(
+                        format!(
+                            "sandbox escalation {}",
+                            if enabled { "allowed" } else { "disallowed" }
+                        ),
+                        ToastKind::Info,
+                    );
+                }
             }
             TurnEvent::ApprovalModeState { mode } => {
+                let changed = self.approval_mode != mode;
                 self.approval_mode = mode;
-                self.show_toast(format!("permissions {}", mode.as_str()), ToastKind::Info);
+                if changed {
+                    self.show_toast(format!("permissions {}", mode.as_str()), ToastKind::Info);
+                }
             }
             TurnEvent::DelegationRecursionState {
                 enabled,

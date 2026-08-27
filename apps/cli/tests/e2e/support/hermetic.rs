@@ -53,6 +53,9 @@ pub const REMOTE_OSC52_SSH_CONNECTION: &str = "127.0.0.1 65535 127.0.0.1 22";
 /// portable-pty's Unix spawn always injects `SHELL` after `env_clear()`.
 /// Pin a constant so the live child never inherits the host/passwd shell.
 pub const HERMETIC_PTY_SHELL: &str = "/bin/sh";
+/// Fixed system search path. PATH is a poison key (never inherited) but
+/// doctor and host tools still need `git`/`rg` from the base system.
+pub const HERMETIC_PATH: &str = "/usr/bin:/bin";
 
 pub const INITIAL_PTY_COLS: u16 = 100;
 pub const INITIAL_PTY_ROWS: u16 = 30;
@@ -61,7 +64,7 @@ pub const MAX_PTY_COLS: u16 = 200;
 pub const MAX_PTY_ROWS: u16 = 60;
 
 /// Canonical allowlisted environment keys, in declaration order.
-pub const HERMETIC_ENV_KEYS: [&str; 9] = [
+pub const HERMETIC_ENV_KEYS: [&str; 10] = [
     "HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
@@ -71,6 +74,7 @@ pub const HERMETIC_ENV_KEYS: [&str; 9] = [
     "TERM",
     "LANG",
     "LC_ALL",
+    "PATH",
 ];
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -321,6 +325,10 @@ impl HermeticLaunchSpec {
             ("TERM".into(), HERMETIC_TERM.into()),
             ("LANG".into(), HERMETIC_LOCALE.into()),
             ("LC_ALL".into(), HERMETIC_LOCALE.into()),
+            // Do not inherit the developer PATH (it is a poison key). A
+            // fixed system search path lets doctor find host git/rg without
+            // leaking the caller's environment.
+            ("PATH".into(), HERMETIC_PATH.into()),
         ];
         env.extend(self.extra_env.iter().cloned());
         env
@@ -578,11 +586,7 @@ impl HermeticCockpit {
     }
 
     fn pid_from_file(&self) -> Option<u32> {
-        std::fs::read_to_string(self.home.pid_file())
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        cockpit_host::daemon_lifecycle::read_pid_file(&self.home.pid_file())
     }
 
     pub fn spawn_pty(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -876,6 +880,32 @@ impl HermeticCockpit {
             "same-size resize redraw after injected input",
             Duration::from_secs(2),
         );
+    }
+
+    /// Attach and policy broadcasts can still land after the ready composer
+    /// or settings chrome first appear. No-op input comparisons need the
+    /// visible grid to stay unchanged across redraws for a quiet interval,
+    /// not merely two adjacent frames.
+    pub fn settle_visible_state(&mut self, timeout: Duration) {
+        const QUIET: Duration = Duration::from_millis(400);
+        let deadline = Instant::now() + timeout;
+        let mut prev = self.snapshot().visible_state();
+        let mut stable_since = Instant::now();
+        loop {
+            self.checkpoint_input_with_redraw();
+            let now = self.snapshot().visible_state();
+            if now == prev {
+                if Instant::now().saturating_duration_since(stable_since) >= QUIET {
+                    return;
+                }
+            } else {
+                prev = now;
+                stable_since = Instant::now();
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for visible state to settle");
+            }
+        }
     }
 
     pub fn pty_size(&self) -> Option<(u16, u16)> {

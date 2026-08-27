@@ -3179,6 +3179,83 @@ pub(super) async fn finish_parked_replay_completion(
     true
 }
 
+/// A terminal AgentTree decision may replay its parked continuation unless
+/// that park is a host-approval tool (bash/write/…). Other decision-linked
+/// tools — including `web_search`/`web_fetch` credential HostEffect prompts —
+/// park under the dispatched tool name, not `"question"`, and must still
+/// replay a recorded answer.
+fn should_replay_terminal_linked_tool(
+    row: &crate::db::needs_attention::NeedsAttentionRow,
+    decision: &crate::db::agent_tree_decisions::DecisionRequestRow,
+) -> bool {
+    let host_approval =
+        decision.host_approval_operation_id.is_some() || decision.decision_class == "host_approval";
+    if host_approval {
+        tracing::info!(
+            interrupt_id = %row.interrupt_id,
+            tool = row.parked.as_ref().map(|payload| payload.tool.as_str()),
+            decision_class = %decision.decision_class,
+            "skipping crash-recovery replay of host-approval parked tool"
+        );
+        return false;
+    }
+    if row
+        .parked
+        .as_ref()
+        .is_some_and(|payload| payload.tool != "question")
+    {
+        tracing::debug!(
+            interrupt_id = %row.interrupt_id,
+            tool = row.parked.as_ref().map(|payload| payload.tool.as_str()),
+            decision_class = %decision.decision_class,
+            "replaying terminal linked decision for a non-question parked tool"
+        );
+    }
+    true
+}
+
+async fn settle_or_replay_executing_interrupt(
+    session: &crate::session::Session,
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    session_id: Uuid,
+    row: crate::db::needs_attention::NeedsAttentionRow,
+    terminal_tree_interrupt_replays: &mut Vec<crate::db::needs_attention::NeedsAttentionRow>,
+) {
+    let linked_decision = match session
+        .db
+        .decision_request_for_interrupt(session_id, row.interrupt_id)
+        .await
+    {
+        Ok(decision) => decision,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                interrupt_id = %row.interrupt_id,
+                "loading executing interrupt lifecycle decision failed"
+            );
+            return;
+        }
+    };
+    if let Some(decision) = linked_decision.as_ref()
+        && decision.state.is_terminal()
+        && should_replay_terminal_linked_tool(&row, decision)
+    {
+        terminal_tree_interrupt_replays.push(row);
+        return;
+    }
+    settle_unrecoverable_interrupt(
+        session,
+        event_tx,
+        redaction,
+        session_id,
+        row.interrupt_id,
+        linked_decision.is_some(),
+        interrupt_restart_notice_text(row.interrupt_id, Ok(())),
+    )
+    .await;
+}
+
 pub(super) fn validate_parked_interrupt_payload(
     row: &crate::db::needs_attention::NeedsAttentionRow,
 ) -> std::result::Result<(), &'static str> {
@@ -3198,6 +3275,58 @@ pub(super) fn validate_parked_interrupt_payload(
         return Err("parked replay call id does not match resume anchor");
     }
     Ok(())
+}
+
+fn interrupt_restart_notice_text(interrupt_id: Uuid, payload: Result<(), &'static str>) -> String {
+    match payload {
+        Ok(()) => format!(
+            "Interrupted request {interrupt_id}: replay was in progress during worker restart."
+        ),
+        Err(reason) => format!("Interrupted request {interrupt_id}: {reason}."),
+    }
+}
+
+async fn settle_unrecoverable_interrupt(
+    session: &crate::session::Session,
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    session_id: Uuid,
+    interrupt_id: Uuid,
+    linked: bool,
+    notice_text: String,
+) {
+    let marked = if linked {
+        session
+            .db
+            .mark_executing_linked_interrupt_interrupted(session_id, interrupt_id)
+            .await
+    } else {
+        session.db.mark_interrupt_interrupted(interrupt_id).await
+    };
+    match marked {
+        Ok(true) => {}
+        Ok(false) => tracing::error!(
+            %interrupt_id,
+            %session_id,
+            linked,
+            "settling unrecoverable interrupt did not change the durable row"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            %interrupt_id,
+            "marking unrecoverable interrupt failed"
+        ),
+    }
+    send_current_session_event(
+        session,
+        event_tx,
+        redaction,
+        proto::Event::Notice {
+            session_id,
+            text: notice_text,
+        },
+        NoticeSource::DaemonDirect,
+    );
 }
 
 pub(super) async fn forward_queue_updates(
@@ -4302,7 +4431,7 @@ pub(super) async fn run_worker(
         },
         cwd: project_root.clone(),
         config: SessionConfigHandle::new(config_snapshot.clone()),
-        session_short_id: session.short_id.clone(),
+        session_short_id: session.short_id(),
         assistant_identity_prefix,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         // The daemon root is always the user-facing interactive agent —
@@ -4701,6 +4830,17 @@ pub(super) async fn run_worker(
     }
     driver.set_daemon_scheduler_source(scheduler);
     driver.set_write_scope_source(write_scope.clone());
+    // Durable lifecycle rows foreign-key to `sessions`. Resume is already
+    // persisted; a deferred new session must flush before the root lease or
+    // agent-tree insert. Fail closed so this worker cannot run untracked.
+    if let Err(error) = session.persist_if_needed() {
+        tracing::error!(
+            %error,
+            %session_id,
+            "persisting deferred session before durable lifecycle setup failed"
+        );
+        return;
+    }
     // Open the session's root write authority. Every delegation descends from
     // it, and it is what session deletion and shutdown drain against. Idempotent
     // so a worker restart reuses the existing root rather than minting a second.
@@ -5012,90 +5152,47 @@ pub(super) async fn run_worker(
                         if validate_parked_interrupt_payload(&row).is_ok()
                             && row.response.is_some() =>
                     {
-                        let terminal_tree_decision = match session
-                            .db
-                            .decision_request_for_interrupt(session_id, row.interrupt_id)
-                            .await
-                        {
-                            Ok(Some(decision)) => matches!(
-                                decision.state,
-                                crate::db::agent_tree_decisions::DecisionState::Answered
-                                    | crate::db::agent_tree_decisions::DecisionState::AutoResolved
-                                    | crate::db::agent_tree_decisions::DecisionState::TimedOut
-                                    | crate::db::agent_tree_decisions::DecisionState::Cancelled
-                            ),
-                            Ok(None) => false,
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    interrupt_id = %row.interrupt_id,
-                                    "loading executing interrupt lifecycle decision failed"
-                                );
-                                false
-                            }
-                        };
-                        if terminal_tree_decision {
-                            terminal_tree_interrupt_replays.push(row);
-                            continue;
-                        }
-                        if let Err(error) = session
-                            .db
-                            .mark_interrupt_interrupted(row.interrupt_id)
-                            .await
-                        {
-                            tracing::warn!(
-                                %error,
-                                interrupt_id = %row.interrupt_id,
-                                "marking unrecoverable executing interrupt failed"
-                            );
-                        }
-                        send_current_session_event(
+                        settle_or_replay_executing_interrupt(
                             &session,
                             &event_tx,
                             &redaction,
-                            proto::Event::Notice {
-                                session_id,
-                                text: format!(
-                                    "Interrupted request {}: replay was in progress during worker restart.",
-                                    row.interrupt_id
-                                ),
-                            },
-                            NoticeSource::DaemonDirect,
-                        );
+                            session_id,
+                            row,
+                            &mut terminal_tree_interrupt_replays,
+                        )
+                        .await;
                     }
                     crate::db::needs_attention::InterruptState::Open
                     | crate::db::needs_attention::InterruptState::Parked
                     | crate::db::needs_attention::InterruptState::Executing => {
-                        if let Err(error) = session
+                        let linked_decision = match session
                             .db
-                            .mark_interrupt_interrupted(row.interrupt_id)
+                            .decision_request_for_interrupt(session_id, row.interrupt_id)
                             .await
                         {
-                            tracing::warn!(
-                                %error,
-                                interrupt_id = %row.interrupt_id,
-                                "marking unrecoverable interrupt failed"
-                            );
-                        }
-                        send_current_session_event(
+                            Ok(decision) => decision,
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    interrupt_id = %row.interrupt_id,
+                                    "loading unrecoverable interrupt lifecycle decision failed"
+                                );
+                                continue;
+                            }
+                        };
+                        settle_unrecoverable_interrupt(
                             &session,
                             &event_tx,
                             &redaction,
-                            proto::Event::Notice {
-                                session_id,
-                                text: match validate_parked_interrupt_payload(&row) {
-                                    Ok(()) => format!(
-                                        "Interrupted request {}: replay was in progress during worker restart.",
-                                        row.interrupt_id
-                                    ),
-                                    Err(reason) => format!(
-                                        "Interrupted request {}: {reason}.",
-                                        row.interrupt_id
-                                    ),
-                                },
-                            },
-                            NoticeSource::DaemonDirect,
-                        );
+                            session_id,
+                            row.interrupt_id,
+                            linked_decision.is_some(),
+                            interrupt_restart_notice_text(
+                                row.interrupt_id,
+                                validate_parked_interrupt_payload(&row),
+                            ),
+                        )
+                        .await;
                     }
                     _ => {}
                 }
@@ -5372,7 +5469,7 @@ pub(super) async fn run_worker(
         registry: tree_resolver_registry.clone(),
         completions: agent_tree_resolver_tx,
     }));
-    let tree_recovery = match tree_runtime.recover_session(session_id, tree_epoch).await {
+    let tree_recovery = match Box::pin(tree_runtime.recover_session(session_id, tree_epoch)).await {
         Ok(recovery) => recovery,
         Err(_) => return,
     };
@@ -5796,31 +5893,15 @@ pub(super) async fn run_worker(
                 {
                     continue;
                 }
-                let terminal_tree_decision = match session
-                    .db
-                    .decision_request_for_interrupt(session_id, row.interrupt_id)
-                    .await
-                {
-                    Ok(Some(decision)) => matches!(
-                        decision.state,
-                        crate::db::agent_tree_decisions::DecisionState::Answered
-                            | crate::db::agent_tree_decisions::DecisionState::AutoResolved
-                            | crate::db::agent_tree_decisions::DecisionState::TimedOut
-                            | crate::db::agent_tree_decisions::DecisionState::Cancelled
-                    ),
-                    Ok(None) => false,
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            interrupt_id = %row.interrupt_id,
-                            "loading post-recovery executing interrupt decision failed"
-                        );
-                        false
-                    }
-                };
-                if terminal_tree_decision {
-                    terminal_tree_interrupt_replays.push(row);
-                }
+                settle_or_replay_executing_interrupt(
+                    &session,
+                    &event_tx,
+                    &redaction,
+                    session_id,
+                    row,
+                    &mut terminal_tree_interrupt_replays,
+                )
+                .await;
             }
         }
         Err(error) => {
@@ -7840,13 +7921,13 @@ pub(super) async fn run_worker(
                         }));
                         continue;
                     }
-                    // Lazy persistence (session-id-display-and-lazy-persist): the
-                    // first user message is what commits the `sessions` row.
-                    // Flush it *before* `touch()` and before the driver runs, so
-                    // the row exists ahead of any dependent write (tool_calls,
-                    // inference_calls, locks). A persist failure aborts the
-                    // message rather than letting dependents reference a missing
-                    // row.
+                    // Lazy persistence (session-id-display-and-lazy-persist):
+                    // worker start already flushed the row for durable
+                    // lifecycle setup. Repeat here before `touch()` and the
+                    // driver so a late first message still has a parent row
+                    // if that earlier flush was skipped. Idempotent. A persist
+                    // failure aborts the message rather than letting dependents
+                    // reference a missing row.
                     match session.persist_if_needed() {
                         Ok(_) => {}
                         Err(e) => {

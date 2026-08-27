@@ -561,6 +561,28 @@ fn host_capabilities_probe_platform_keyring_unsets_on_failure_and_caches() {
 }
 
 #[test]
+fn host_capabilities_probe_platform_keyring_keeps_store_on_first_success() {
+    let _guard = lock_keyring_probe_tests();
+    reset_keyring_probe_cache_for_test();
+    keyring_core::unset_default_store();
+    let first = probe_platform_keyring_with(
+        || {
+            let store = keyring_core::mock::Store::new().expect("mock store");
+            keyring_core::set_default_store(store);
+            Ok(())
+        },
+        false,
+    );
+    assert_eq!(first.state, FeatureCapabilityState::Available);
+    assert!(
+        default_platform_store_is_registered(),
+        "successful first-run construct must leave the process-global store registered"
+    );
+    keyring_core::unset_default_store();
+    reset_keyring_probe_cache_for_test();
+}
+
+#[test]
 fn host_capabilities_refresh_preserves_existing_platform_store() {
     let _guard = lock_keyring_probe_tests();
     reset_keyring_probe_cache_for_test();

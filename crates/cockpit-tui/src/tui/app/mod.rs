@@ -2657,6 +2657,9 @@ pub struct App {
     /// `--no-sandbox`, which wins). A `/sandbox` flip still overrides.
     pub(super) no_sandbox: bool,
     pub(super) sandbox_mode: cockpit_proto::SandboxMode,
+    /// First daemon `SandboxState` is attach hydration and must not toast;
+    /// later transitions toast only when the mode actually changes.
+    pub(super) sandbox_state_hydrated: bool,
     pub(super) sandbox_intent: cockpit_proto::SandboxMode,
     pub(super) container_network_enabled: bool,
     pub(super) container_availability: cockpit_proto::ContainerAvailability,
@@ -3893,6 +3896,7 @@ impl App {
             ctrl_c_armed_at: None,
             no_sandbox,
             sandbox_mode: cockpit_proto::SandboxMode::from_enabled(!no_sandbox),
+            sandbox_state_hydrated: false,
             sandbox_intent: cockpit_proto::SandboxMode::from_enabled(!no_sandbox),
             container_network_enabled: false,
             container_availability: cockpit_proto::ContainerAvailability::unpublished(),
@@ -4163,18 +4167,13 @@ impl App {
         for line in tail {
             println!("{line}");
         }
-        // Print the last opened session id — but only when it was actually
-        // persisted (session-id-display-and-lazy-persist). An opened-but-
-        // unused session left no DB row, so we print nothing about it.
-        // Print the 6-char short id so the exit line matches the welcome
-        // box; fall back to the full UUID only if the short id is somehow
-        // absent (defensive — it should always be set once attached).
-        if self.current_session_persisted {
-            if let Some(short_id) = self.launch.session_short_id.as_deref() {
-                println!("session {short_id}");
-            } else if let Some(session_id) = self.launch.session_id {
-                println!("session {session_id}");
-            }
+        // Attach now flushes a durable sessions row, so print the id even
+        // when the user never submitted a message. Prefer the 6-char short
+        // id so the exit line matches the welcome box.
+        if let Some(short_id) = self.launch.session_short_id.as_deref() {
+            println!("session {short_id}");
+        } else if let Some(session_id) = self.launch.session_id {
+            println!("session {session_id}");
         }
         result
     }

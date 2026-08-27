@@ -1221,7 +1221,9 @@ impl SessionRegistry {
             session_worker::initial_active_agent_for_llm_mode(&extended_cfg, llm_mode);
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
-        // un-written. The worker persists it on the first user message.
+        // un-written until `start_worker` flushes it, immediately before
+        // durable lifecycle rows (agent-tree, write-scope) that foreign-key
+        // to `sessions`.
         let mut session = Session::create_deferred(
             self.inner.db.clone(),
             project_root,
@@ -1300,8 +1302,8 @@ impl SessionRegistry {
     }
 
     /// Create a new assistant session through the normal daemon worker path,
-    /// preserving deferred-persistence semantics. The session row is not
-    /// inserted until the worker receives the first user message.
+    /// preserving deferred-persistence semantics until `start_worker` flushes
+    /// the row, immediately before durable lifecycle setup.
     pub async fn create_assistant_session(
         &self,
         assistant_name: &str,
@@ -1665,13 +1667,12 @@ impl SessionRegistry {
         let extended_cfg = extended_cfg.clone();
 
         // Recovery of a pre-selection session is a two-phase operation. The
-        // full selection is visible in memory while the worker is validated,
-        // but the durable row remains untouched until every fallible worker
-        // construction step has succeeded. The commit immediately precedes
-        // `session_worker::spawn`, which is synchronous and infallible; any
-        // future fallible construction must remain above that commit. Existing
-        // selections are never overwritten by Attach; intentional changes go
-        // through SetActiveModel.
+        // full selection is visible in memory while the worker is validated.
+        // The deferred sessions row is flushed after that commit and immediately
+        // precedes `session_worker::spawn`, which is synchronous and infallible;
+        // attach always writes a durable parent row before agent-tree dependents.
+        // Existing selections are never overwritten by Attach; intentional
+        // changes go through SetActiveModel.
         let staged_recovery = if session.active_model_ref().is_none() {
             let active = recovery_model
                 .or_else(|| providers_cfg.active_model.clone())
@@ -1767,6 +1768,13 @@ impl SessionRegistry {
                 .set_active_model_ref(staged_recovery)
                 .context("committing recovered session model after worker validation")?;
         }
+        // Agent-tree and write-scope rows foreign-key to `sessions`. Flush
+        // the deferred row here, after every fallible construction step and
+        // the recovery model commit, so a new worker never inserts those
+        // dependents against a missing parent.
+        session
+            .persist_if_needed()
+            .context("persisting deferred session before durable lifecycle setup")?;
         let terminal_lock_cleanup_gate = Arc::new(AsyncMutex::new(()));
         let terminal_closing = Arc::new(AtomicBool::new(false));
         let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));

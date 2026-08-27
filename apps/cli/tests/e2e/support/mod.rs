@@ -62,6 +62,21 @@ impl IsolatedHome {
             &project,
         ] {
             std::fs::create_dir_all(dir).expect("create isolated integration dir");
+            // Backup-lock ancestry refuses group/other-writable parents.
+            // `create_dir_all` honors umask (often 0002 → 0775), which would
+            // make an existing-ledger daemon start fail closed.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                    .expect("restrict isolated integration dir");
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("restrict isolated temp root");
         }
         Self {
             _root: root,
@@ -307,11 +322,7 @@ impl SpawnedDaemon {
     }
 
     pub fn try_pid(&self) -> Option<u32> {
-        std::fs::read_to_string(self.home.pid_file())
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        cockpit_host::daemon_lifecycle::read_pid_file(&self.home.pid_file())
     }
 
     pub fn socket_path(&self) -> PathBuf {

@@ -29,10 +29,16 @@ pub struct CachedCatalog {
 /// are part of the key so two agents bound to different profiles (or the
 /// same name at different scopes) never share a cached tool list.
 pub fn cache_key(name: &str, cfg: &ServerConfig) -> String {
-    cache_key_for(name, cfg, McpScope::Workspace, DEFAULT_PROFILE)
+    cache_key_for(name, cfg, McpScope::Workspace, DEFAULT_PROFILE, None)
 }
 
-pub fn cache_key_for(name: &str, cfg: &ServerConfig, scope: McpScope, profile: &str) -> String {
+pub fn cache_key_for(
+    name: &str,
+    cfg: &ServerConfig,
+    scope: McpScope,
+    profile: &str,
+    agent: Option<&str>,
+) -> String {
     let ident = match cfg.transport {
         super::config::Transport::Stdio => format!(
             "stdio|{}|{}",
@@ -53,6 +59,8 @@ pub fn cache_key_for(name: &str, cfg: &ServerConfig, scope: McpScope, profile: &
     hasher.update(scope.as_str().as_bytes());
     hasher.update(b"\0");
     hasher.update(profile.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(agent.unwrap_or("").as_bytes());
     let hex = crate::intel::hex_lower(&hasher.finalize());
     format!("{name}-{}", &hex[..16])
 }
@@ -151,10 +159,17 @@ mod tests {
     #[test]
     fn cache_key_separates_scope_and_profile() {
         let cfg = server();
-        let workspace_default = cache_key_for("s1", &cfg, McpScope::Workspace, DEFAULT_PROFILE);
-        let global_default = cache_key_for("s1", &cfg, McpScope::Global, DEFAULT_PROFILE);
-        let agent_default = cache_key_for("s1", &cfg, McpScope::Agent, DEFAULT_PROFILE);
-        let workspace_admin = cache_key_for("s1", &cfg, McpScope::Workspace, "admin");
+        let workspace_default =
+            cache_key_for("s1", &cfg, McpScope::Workspace, DEFAULT_PROFILE, None);
+        let global_default = cache_key_for("s1", &cfg, McpScope::Global, DEFAULT_PROFILE, None);
+        let agent_default = cache_key_for(
+            "s1",
+            &cfg,
+            McpScope::Agent,
+            DEFAULT_PROFILE,
+            Some("agent-a"),
+        );
+        let workspace_admin = cache_key_for("s1", &cfg, McpScope::Workspace, "admin", None);
         assert_ne!(
             workspace_default, global_default,
             "same server at different scopes must not share a cache key"

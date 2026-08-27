@@ -6437,7 +6437,7 @@ CREATE TABLE agent_mutation_journals (
     action                TEXT NOT NULL CHECK (action IN (
         'eject_builtin', 'save_definition', 'create_definition',
         'delete_custom', 'reset_builtin', 'reset_all_builtins',
-        'save_goal_supervision'
+        'save_goal_supervision', 'add_mcp_server'
     )),
     consumed_revision     TEXT,
     affected_hint         INTEGER NOT NULL CHECK (affected_hint >= 0),
@@ -6458,6 +6458,7 @@ CREATE TABLE agent_mutation_journals (
     terminal_response_json TEXT CHECK (
         terminal_response_json IS NULL OR json_valid(terminal_response_json)
     ),
+    credential_compensation_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(credential_compensation_json)),
     created_at_unix_ms    INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
     CHECK (length(trim(owner_digest)) > 0),

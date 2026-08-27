@@ -62,6 +62,7 @@ pub fn named_secret_references_for(
 ) -> std::collections::BTreeSet<String> {
     let mut refs: std::collections::BTreeSet<String> =
         cfg.env_credential_refs.values().cloned().collect();
+    collect_inline_secret_refs(&mut refs, cfg.env.values());
     collect_auth_secret_refs(&mut refs, server, profile, &cfg.auth);
     for (name, auth) in &cfg.profiles {
         collect_auth_secret_refs(&mut refs, server, name, auth);
@@ -83,13 +84,11 @@ fn collect_auth_secret_refs(
             if let Some(name) = &header.credential_ref {
                 refs.insert(name.clone());
             }
-            refs.insert(header_cred_key_for(server, profile));
+            collect_inline_secret_refs(refs, std::iter::once(&header.value));
         }
         Auth::Env(env) => {
             refs.extend(env.credential_refs.values().cloned());
-            for env_name in env.vars.keys().chain(env.credential_refs.keys()) {
-                refs.insert(auth_env_cred_key_for(server, profile, env_name));
-            }
+            collect_inline_secret_refs(refs, env.vars.values());
         }
         Auth::Oauth(_) => {
             refs.insert(cred_key_for(server, profile));
@@ -98,6 +97,19 @@ fn collect_auth_secret_refs(
             }
         }
         Auth::None => {}
+    }
+}
+
+fn collect_inline_secret_refs<'a>(
+    refs: &mut std::collections::BTreeSet<String>,
+    values: impl IntoIterator<Item = &'a String>,
+) {
+    for value in values {
+        refs.extend(
+            crate::envref::referenced_names(value)
+                .into_iter()
+                .filter_map(|name| name.strip_prefix("secret:").map(str::to_owned)),
+        );
     }
 }
 
@@ -810,7 +822,11 @@ mod tests {
         );
         let refs = named_secret_references_for("svc", &cfg, "admin");
         assert!(refs.contains("mcp:svc:admin"), "{refs:?}");
-        assert!(refs.contains("mcp:svc:header"), "{refs:?}");
+        assert!(refs.contains("foo"), "{refs:?}");
+        assert!(
+            !refs.contains("mcp:svc:header"),
+            "environment-only headers do not imply a vault item: {refs:?}"
+        );
     }
 
     #[test]

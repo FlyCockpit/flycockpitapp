@@ -62,13 +62,15 @@ fn build_auth(args: &McpAddArgs) -> Result<Auth> {
 async fn add(args: McpAddArgs) -> Result<()> {
     let transport = parse_transport(&args.transport)?;
     let auth = build_auth(&args)?;
-    if args.scope == "agent" || args.scope.starts_with("agent=") {
-        bail!(
-            "MCP scope `agent` writes the agent package through MutateAgent (one CAS); if the agent is being edited (8h non-renewable editor lease) settle or cancel that lease first"
-        );
-    }
+    let agent_scope = args
+        .scope
+        .strip_prefix("agent=")
+        .map(str::to_owned)
+        .or_else(|| (args.scope == "agent").then(|| crate::agents::FALLBACK_PRIMARY.to_string()));
     let target_scope = match args.scope.as_str() {
         "global" | "workspace" => Some(args.scope.clone()),
+        "agent" => None,
+        scope if scope.starts_with("agent=") => None,
         other => bail!("unknown MCP scope `{other}` (expected global|workspace|agent[=<name>])"),
     };
 
@@ -77,6 +79,17 @@ async fn add(args: McpAddArgs) -> Result<()> {
         .await
         .context("starting persistent daemon for MCP config save")?;
     let project_root = cwd.display().to_string();
+    if let Some(agent_name) = agent_scope {
+        return add_agent_scoped(
+            args,
+            transport,
+            auth,
+            &daemon.client,
+            project_root,
+            agent_name,
+        )
+        .await;
+    }
     let snapshot_session_id = uuid::Uuid::new_v4().to_string();
     let snapshot = daemon
         .client
@@ -100,9 +113,9 @@ async fn add(args: McpAddArgs) -> Result<()> {
     }
     let cfg = McpConfig::parse(
         config
-            .mcp_config_json
+            .mcp_authored_config_json
             .as_deref()
-            .context("daemon MCP snapshot omitted its redacted projection")?,
+            .context("daemon MCP snapshot omitted its redacted authored projection")?,
     )?;
     let owner_root = config
         .mcp_owner_root
@@ -143,7 +156,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
     if let Some(profile) = args.profile.as_deref()
         && profile != crate::mcp::config::DEFAULT_PROFILE
     {
-        let selected = server.auth.clone();
+        let selected = std::mem::replace(&mut server.auth, Auth::None);
         server.profiles.insert(profile.to_string(), selected);
     }
     // Validate required fields per transport up front.
@@ -161,10 +174,22 @@ async fn add(args: McpAddArgs) -> Result<()> {
     // key. The daemon `SaveMcpConfig` path normalizes the literal to a
     // reference. OAuth/env/none carry no literal secret at add time.
     let mut secret_values: BTreeMap<String, String> = BTreeMap::new();
-    if let Auth::Header(header) = &mut server.auth {
+    let selected_profile = args
+        .profile
+        .as_deref()
+        .unwrap_or(crate::mcp::config::DEFAULT_PROFILE);
+    let selected_auth = if selected_profile == crate::mcp::config::DEFAULT_PROFILE {
+        &mut server.auth
+    } else {
+        server
+            .profiles
+            .get_mut(selected_profile)
+            .context("selected MCP credential profile is missing")?
+    };
+    if let Auth::Header(header) = selected_auth {
         let value = header.value.trim();
         if !value.is_empty() {
-            let key = crate::mcp::auth::header_cred_key(&args.name);
+            let key = crate::mcp::auth::header_cred_key_for(&args.name, selected_profile);
             secret_values.insert(key.clone(), value.to_string());
             header.value.clear();
             header.credential_ref = Some(key);
@@ -191,7 +216,11 @@ async fn add(args: McpAddArgs) -> Result<()> {
     }
     let client_operation_id = uuid::Uuid::new_v4().to_string();
     let patch_wire = serde_json::to_string(&patch).context("serializing MCP patch")?;
-    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&project_root, &patch_wire);
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash_for_scope(
+        &project_root,
+        &patch_wire,
+        target_scope.as_deref(),
+    );
     match daemon
         .client
         .request(Request::SaveMcpConfig {
@@ -223,7 +252,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
             && returned_root == project_root
             && returned_owner_root == owner_root
             && (target_scope.is_some() || returned_config_path == config_path)
-            && consumed_revision == expected_revision
+            && (target_scope.is_some() || consumed_revision == expected_revision)
             && cockpit_proto::is_opaque_authority_token(&request_hash)
             && returned_intent_hash == mutation_intent_hash
             && cockpit_proto::is_opaque_authority_token(&result_revision)
@@ -239,6 +268,131 @@ async fn add(args: McpAddArgs) -> Result<()> {
     println!(
         "MCP config changes apply on the next tool call; agent-binding changes apply when the agent is next rebuilt."
     );
+    Ok(())
+}
+
+async fn add_agent_scoped(
+    args: McpAddArgs,
+    transport: Transport,
+    auth: Auth,
+    client: &cockpit_client::DaemonClient,
+    project_root: String,
+    agent_name: String,
+) -> Result<()> {
+    let selected_profile = args
+        .profile
+        .clone()
+        .unwrap_or_else(|| crate::mcp::config::DEFAULT_PROFILE.to_string());
+    let mut server = ServerConfig {
+        transport,
+        endpoint: args.endpoint,
+        command: args.command,
+        args: args.args,
+        env: Default::default(),
+        env_credential_refs: Default::default(),
+        auth,
+        mode: Default::default(),
+        enabled: !args.disabled,
+        cache_ttl_secs: 3600,
+        connect_timeout_secs: None,
+        timeout_secs: None,
+        profiles: BTreeMap::new(),
+    };
+    if selected_profile != crate::mcp::config::DEFAULT_PROFILE {
+        let selected = std::mem::replace(&mut server.auth, Auth::None);
+        server.profiles.insert(selected_profile.clone(), selected);
+    }
+    match transport {
+        Transport::Stdio => {
+            server.require_command(&args.name)?;
+        }
+        _ => {
+            server.require_endpoint(&args.name)?;
+        }
+    }
+    let mut secret_values = BTreeMap::new();
+    let selected_auth = if selected_profile == crate::mcp::config::DEFAULT_PROFILE {
+        &mut server.auth
+    } else {
+        server
+            .profiles
+            .get_mut(&selected_profile)
+            .context("selected MCP credential profile is missing")?
+    };
+    if let Auth::Header(header) = selected_auth {
+        let literal = header.value.trim();
+        if !literal.is_empty() && !literal.starts_with('$') {
+            let key = crate::mcp::auth::header_cred_key_for(&args.name, &selected_profile);
+            secret_values.insert(
+                key.clone(),
+                cockpit_proto::SensitiveWirePayload::from(literal.to_string()),
+            );
+            header.value.clear();
+            header.credential_ref = Some(key);
+        }
+    }
+    let selected_auth = server.auth_for_profile_named(&args.name, &selected_profile)?;
+    let reference_only = match selected_auth {
+        Auth::Header(header) => {
+            header.value.trim().is_empty() || header.value.trim_start().starts_with('$')
+        }
+        Auth::Env(env) => env
+            .vars
+            .values()
+            .all(|value| value.trim().is_empty() || value.trim_start().starts_with('$')),
+        Auth::Oauth(_) | Auth::None => true,
+    };
+    if !reference_only {
+        bail!(
+            "agent-scope MCP credentials must use a `$secret:<name>` or environment reference; literal secrets are refused"
+        );
+    }
+    let snapshot = client
+        .request(Request::GetAgentEditSnapshot {
+            project_root: project_root.clone(),
+            name: agent_name.clone(),
+        })
+        .await?
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    let Response::AgentEditSnapshot(snapshot) = snapshot else {
+        bail!("daemon returned an unexpected agent edit snapshot");
+    };
+    if !snapshot.editable {
+        bail!("agent `{agent_name}` is not an editable workspace package");
+    }
+    let mutation = cockpit_proto::AgentMutation::AddMcpServer {
+        name: agent_name.clone(),
+        server: args.name.clone(),
+        server_json: serde_json::to_string(&server).context("serializing MCP server")?,
+        profile: selected_profile,
+        secret_values,
+    };
+    let expected_revision = Some(snapshot.revision.clone());
+    let mutation_intent_hash = cockpit_proto::agent_mutation_intent_hash(
+        &project_root,
+        &mutation,
+        expected_revision.as_deref(),
+    );
+    let response = client
+        .request(Request::MutateAgent {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
+            mutation_intent_hash,
+            project_root,
+            mutation,
+            expected_revision,
+        })
+        .await?
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    let Response::AgentMutated(result) = response else {
+        bail!("daemon returned an unexpected agent MCP mutation response");
+    };
+    println!(
+        "Added MCP server `{}` to agent package `{}`. Live sessions keep their current bindings; new or rebuilt sessions use the change.",
+        args.name, agent_name
+    );
+    if !result.changed {
+        bail!("daemon reported that the agent MCP mutation made no change");
+    }
     Ok(())
 }
 
@@ -297,6 +451,8 @@ mod tests {
             header_value: None,
             header_name: None,
             disabled: false,
+            scope: "workspace".into(),
+            profile: None,
         }
     }
 

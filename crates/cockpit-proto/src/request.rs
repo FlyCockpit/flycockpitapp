@@ -1740,6 +1740,10 @@ pub enum Request {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         server: String,
+        #[serde(default)]
+        profile: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
 
     /// Complete or poll daemon-owned MCP OAuth. `input` may carry a callback
@@ -2971,10 +2975,22 @@ impl Request {
                 client_operation_id,
                 project_root,
                 server,
+                profile,
+                agent,
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("MCP server", server, MAX_OWNER_PROVIDER_ID_BYTES)?;
+                if !profile.is_empty() {
+                    validate_owner_identifier(
+                        "MCP credential profile",
+                        profile,
+                        MAX_OWNER_PROVIDER_ID_BYTES,
+                    )?;
+                }
+                if let Some(agent) = agent {
+                    validate_owner_identifier("agent", agent, MAX_AGENT_NAME_BYTES)?;
+                }
             }
             Self::CompleteMcpOAuth {
                 client_operation_id,
@@ -3283,7 +3299,8 @@ impl Request {
                     | crate::AgentMutation::CreateDefinition { name, .. }
                     | crate::AgentMutation::DeleteCustom { name }
                     | crate::AgentMutation::ResetBuiltin { name }
-                    | crate::AgentMutation::SaveGoalSupervision { name, .. } => Some(name),
+                    | crate::AgentMutation::SaveGoalSupervision { name, .. }
+                    | crate::AgentMutation::AddMcpServer { name, .. } => Some(name),
                     crate::AgentMutation::ResetAllBuiltins => None,
                 };
                 if let Some(name) = name {
@@ -3311,6 +3328,26 @@ impl Request {
                         return Err("agent creation must not carry a consumed revision".into());
                     }
                     crate::AgentMutation::CreateDefinition { .. } => {}
+                    crate::AgentMutation::AddMcpServer {
+                        server,
+                        server_json,
+                        profile,
+                        ..
+                    } => {
+                        validate_owner_identifier(
+                            "MCP server",
+                            server,
+                            MAX_OWNER_PROVIDER_ID_BYTES,
+                        )?;
+                        validate_owner_identifier(
+                            "MCP profile",
+                            profile,
+                            MAX_OWNER_PROVIDER_ID_BYTES,
+                        )?;
+                        if server_json.len() > MAX_OWNER_MCP_PATCH_BYTES {
+                            return Err("agent MCP server payload is too large".to_string());
+                        }
+                    }
                     _ if expected_revision.is_none() => {
                         return Err("agent mutation requires a consumed revision".into());
                     }
@@ -4211,7 +4248,7 @@ macro_rules! command {
             (Request::BeginProviderOAuth { client_operation_id, provider_id }, "begin_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|provider_id:String", [client_operation_id: String => param, provider_id: String => param]);
             (Request::CompleteProviderOAuth { client_operation_id, flow_id, input }, "complete_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>", [client_operation_id: String => param, flow_id: String => param, input: Option<SensitiveWirePayload> => param]);
             (Request::CancelProviderOAuth { client_operation_id, begin_client_operation_id, flow_id }, "cancel_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>", [client_operation_id: String => param, begin_client_operation_id: String => param, flow_id: Option<String> => param]);
-            (Request::BeginMcpOAuth { client_operation_id, project_root, server }, "begin_mcp_oauth", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|server:String", [client_operation_id: String => param, project_root: String => project_root, server: String => param]);
+            (Request::BeginMcpOAuth { client_operation_id, project_root, server, profile, agent }, "begin_mcp_oauth", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|server:String|profile:String|agent:Option<String>", [client_operation_id: String => param, project_root: String => project_root, server: String => param, profile: String => param, agent: Option<String> => param]);
             (Request::CompleteMcpOAuth { client_operation_id, flow_id, input }, "complete_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>", [client_operation_id: String => param, flow_id: String => param, input: Option<SensitiveWirePayload> => param]);
             (Request::CancelMcpOAuth { client_operation_id, begin_client_operation_id, flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>", [client_operation_id: String => param, begin_client_operation_id: String => param, flow_id: Option<String> => param]);
             (Request::DeleteProviderCredential { client_operation_id, provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|project_root:Option<String>", [client_operation_id: String => param, provider_id: String => param, project_root: Option<String> => param]);

@@ -7251,6 +7251,8 @@ mod tests {
                 client_operation_id: "begin-mcp".into(),
                 project_root: "/tmp/project".into(),
                 server: "server".into(),
+                profile: String::new(),
+                agent: None,
             },
             Request::CompleteMcpOAuth {
                 client_operation_id: "complete-mcp".into(),

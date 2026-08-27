@@ -82,6 +82,15 @@ impl McpConnectContext {
         self
     }
 
+    pub fn with_agent_bound(mut self, agent_bound: bool) -> Self {
+        self.agent_bound = agent_bound;
+        self
+    }
+
+    pub(super) fn cache_agent_identity(&self, agent_bound: bool) -> Option<&str> {
+        agent_bound.then_some(self.agent_id.as_str())
+    }
+
     async fn authorize_connect(&self, name: &str, cfg: &ServerConfig) -> Result<()> {
         if matches!(self.approval_mode, ApprovalMode::Yolo) {
             return Ok(());
@@ -92,6 +101,8 @@ impl McpConnectContext {
         let identity = cfg.connect_identity(name)?;
         match approver
             .authorize(AuthorizationRequest::McpServerConnect {
+                agent: &self.agent_id,
+                profile: &self.credential_profile,
                 server: name,
                 identity: &identity,
                 agent_bound: self.agent_bound,

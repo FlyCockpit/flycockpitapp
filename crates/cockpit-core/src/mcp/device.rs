@@ -38,7 +38,7 @@ impl std::fmt::Debug for DeviceAuthorization {
             .field("device_code", &"[REDACTED]")
             .field("user_code", &"[REDACTED]")
             .field("verification_uri", &self.verification_uri)
-            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("verification_uri_complete", &"[REDACTED]")
             .field("interval_secs", &self.interval_secs)
             .field("expires_in_secs", &self.expires_in_secs)
             .finish()
@@ -90,11 +90,10 @@ pub fn validate_verification_uri(uri: &str) -> Result<()> {
     if uri.chars().any(char::is_control) {
         bail!("MCP device-flow verification_uri contains control characters");
     }
-    let lower = uri.to_ascii_lowercase();
-    let ok = lower.starts_with("https://")
-        || lower.starts_with("http://127.0.0.1")
-        || lower.starts_with("http://localhost")
-        || lower.starts_with("http://[::1]");
+    let parsed = reqwest::Url::parse(uri).context("parsing MCP device-flow verification_uri")?;
+    let ok = parsed.scheme() == "https"
+        || (parsed.scheme() == "http"
+            && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")));
     if !ok {
         bail!("MCP device-flow verification_uri must be https or loopback");
     }
@@ -242,6 +241,7 @@ pub async fn poll_device_token(oauth: &OauthAuth, device_code: &str) -> Result<D
 
 pub async fn run_device_poll_loop<F, Fut>(
     mut interval_secs: u64,
+    expires_in_secs: u64,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut poll: F,
 ) -> Result<StoredTokens>
@@ -250,26 +250,53 @@ where
     Fut: std::future::Future<Output = Result<DevicePollOutcome>>,
 {
     let started = std::time::Instant::now();
+    let max_secs = expires_in_secs.min(DEVICE_MAX_POLL_SECS);
+    interval_secs = interval_secs.clamp(MIN_INTERVAL_SECS, 30);
     // RFC 8628: wait one interval before the first poll.
-    tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+    wait_device_interval(interval_secs, started, max_secs, &cancelled).await?;
     loop {
         if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
             bail!("MCP device-flow cancelled");
         }
-        if started.elapsed() > Duration::from_secs(DEVICE_MAX_POLL_SECS) {
+        if started.elapsed() >= Duration::from_secs(max_secs) {
             bail!("MCP device-flow timed out; try again");
         }
         match poll().await? {
             DevicePollOutcome::Success(tokens) => return Ok(tokens),
             DevicePollOutcome::Pending => {
-                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                wait_device_interval(interval_secs, started, max_secs, &cancelled).await?;
             }
             DevicePollOutcome::SlowDown => {
                 interval_secs = interval_secs.saturating_add(DEVICE_SLOW_DOWN_INCREMENT_SECS);
-                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                interval_secs = interval_secs.min(30);
+                wait_device_interval(interval_secs, started, max_secs, &cancelled).await?;
             }
             DevicePollOutcome::Denied(error) => bail!("MCP device-flow failed: {error}"),
         }
+    }
+}
+
+async fn wait_device_interval(
+    interval_secs: u64,
+    started: std::time::Instant,
+    max_secs: u64,
+    cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let deadline = started + Duration::from_secs(max_secs);
+    let wake = std::time::Instant::now() + Duration::from_secs(interval_secs);
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("MCP device-flow cancelled");
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            bail!("MCP device-flow expired; start a new login");
+        }
+        if now >= wake {
+            return Ok(());
+        }
+        let remaining = wake.min(deadline).saturating_duration_since(now);
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
     }
 }
 
@@ -311,7 +338,7 @@ mod tests {
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ticks_clone = ticks.clone();
-        let tokens = run_device_poll_loop(0, cancelled.clone(), move || {
+        let tokens = run_device_poll_loop(0, 60, cancelled.clone(), move || {
             let n = ticks_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move {
                 Ok(match n {
@@ -331,9 +358,11 @@ mod tests {
         assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) >= 3);
 
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let err = run_device_poll_loop(0, cancelled, || async { Ok(DevicePollOutcome::Pending) })
-            .await
-            .unwrap_err();
+        let err = run_device_poll_loop(0, 60, cancelled, || async {
+            Ok(DevicePollOutcome::Pending)
+        })
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
     }
 }

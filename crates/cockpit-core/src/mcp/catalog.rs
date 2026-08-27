@@ -51,7 +51,15 @@ pub async fn list_tools_cached_with_context(
     cfg: &ServerConfig,
     context: McpConnectContext,
 ) -> Result<Vec<ToolDescriptor>> {
-    list_tools_cached_identified(name, cfg, McpScope::Workspace, DEFAULT_PROFILE, context).await
+    list_tools_cached_identified(
+        name,
+        cfg,
+        McpScope::Workspace,
+        DEFAULT_PROFILE,
+        false,
+        context,
+    )
+    .await
 }
 
 pub async fn list_tools_cached_identified(
@@ -59,9 +67,11 @@ pub async fn list_tools_cached_identified(
     cfg: &ServerConfig,
     scope: McpScope,
     profile: &str,
+    agent_bound: bool,
     context: McpConnectContext,
 ) -> Result<Vec<ToolDescriptor>> {
-    let key = cache::cache_key_for(name, cfg, scope, profile);
+    let agent = context.cache_agent_identity(agent_bound);
+    let key = cache::cache_key_for(name, cfg, scope, profile, agent);
     if let Some(cached) = cache::load(&key, cfg.cache_ttl_secs) {
         return Ok(sanitize_tool_descriptors(cached.tools));
     }
@@ -83,7 +93,10 @@ async fn list_tools_for_entry(
         &cfg,
         entry.source,
         &entry.profile,
-        context.with_profile(entry.profile.clone()),
+        entry.agent_bound,
+        context
+            .with_profile(entry.profile.clone())
+            .with_agent_bound(entry.agent_bound),
     )
     .await
 }
@@ -429,6 +442,11 @@ async fn approve_external_mcp_tool(
     };
     approver
         .authorize(crate::approval::AuthorizationRequest::ExternalMcpTool {
+            agent: &tool_ctx.agent_id,
+            profile: target
+                .get("profile")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(DEFAULT_PROFILE),
             server,
             tool,
             input,

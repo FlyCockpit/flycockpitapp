@@ -1767,6 +1767,9 @@ fn mutate_agent(
                 (true, 1, Some(agent_edit_snapshot(root, &name)?))
             }
         }
+        AgentMutation::AddMcpServer { .. } => {
+            return Err("disk daemon fake does not emulate agent-package MCP mutation".into());
+        }
     };
     let config_generation = if changed {
         publish_config_generation()

@@ -526,6 +526,21 @@ pub async fn mutate(
     let request_project_root = project_root.clone();
     let root = trusted_root(ctx, &project_root).await?;
     let canonical_root = root.to_string_lossy().into_owned();
+    if let AgentMutation::AddMcpServer { name, .. } = &mutation
+        && ctx
+            .db
+            .has_unsettled_agent_editor_lease(
+                canonical_root.clone(),
+                name.clone(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?
+    {
+        return Err(conflict(format!(
+            "agent `{name}` is being edited; complete or cancel the editor lease before changing MCP bindings"
+        )));
+    }
     let keyed_request_identity = agent_mutation_keyed_identity(
         ctx,
         &owner_digest,
@@ -544,18 +559,37 @@ pub async fn mutate(
     let journal_request_root = request_project_root.clone();
     let journal_intent_hash = mutation_intent_hash.clone();
     let publication_vault = ctx.secret_vault.clone();
-    let (plan, result, committed_match) = tokio::task::spawn_blocking(move || {
+    let (plan, result, committed_match, staged_mutations) = tokio::task::spawn_blocking(move || {
         let guard = cockpit_config::config::hold_config_mutation_lock(
             &authority_root.join(".cockpit/config.json"),
         )
         .map_err(internal)?;
         recover_reset_all_locked(&authority_root, &guard)?;
+        #[cfg(target_os = "windows")]
+        if let AgentMutation::AddMcpServer { name, .. } = &authority_mutation {
+            recover_windows_agent_package_swap(&authority_root, name)?;
+        }
         let plan = prepare_mutation_plan_sync(
             &authority_root,
             &authority_mutation,
             authority_revision.as_deref(),
             &publication_vault,
         )?;
+        let credential_stage = match &authority_mutation {
+            AgentMutation::AddMcpServer {
+                server,
+                server_json,
+                profile,
+                secret_values,
+                ..
+            } => Some((
+                server.clone(),
+                server_json.clone(),
+                profile.clone(),
+                secret_values.clone(),
+            )),
+            _ => None,
+        };
         let journal_action = plan.action.clone();
         let journal_name = plan.agent_name.clone();
         let journal_revision = authority_revision.clone();
@@ -564,8 +598,10 @@ pub async fn mutate(
         let affected_hint = i64::from(plan.affected_hint);
         let consumed_config_generation = i64::try_from(plan.consumed_config_generation)
             .map_err(|_| internal("agent mutation config generation is out of range"))?;
-        authority_db
-            .insert_agent_mutation_journal_under_publication_lock(
+        let stage_vault = publication_vault.clone();
+        let stage_root = journal_root.clone();
+        let staged_mutations = authority_db
+            .insert_agent_mutation_journal_under_publication_lock_with(
                 crate::db::agent_mutation_journals::AgentMutationJournalFence {
                     owner_digest: journal_owner,
                     client_operation_id: journal_operation,
@@ -585,6 +621,69 @@ pub async fn mutate(
                     intended_projection_identity: journal_identity,
                     created_at_unix_ms: chrono::Utc::now().timestamp_millis(),
                 },
+                move |conn| {
+                    let Some((server_name, server_json, profile, staged)) = credential_stage else {
+                        return Ok((std::collections::BTreeMap::new(), "{}".to_string()));
+                    };
+                    let server: crate::mcp::config::ServerConfig = serde_json::from_str(&server_json)?;
+                    let mut config = crate::mcp::config::McpConfig::default();
+                    config.servers.insert(server_name.clone(), server);
+                    crate::daemon::server::dispatch::validate_and_normalize_mcp_credentials(
+                        &mut config,
+                        &staged,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                    let server = &config.servers[&server_name];
+                    let oauth_key = matches!(
+                        server.auth_for_profile_named(&server_name, &profile)?,
+                        crate::mcp::config::Auth::Oauth(_)
+                    )
+                    .then(|| crate::mcp::auth::cred_key_for(&server_name, &profile));
+                    let mut mutations = std::collections::BTreeMap::new();
+                    for reference in crate::mcp::auth::named_secret_references_for(
+                        &server_name,
+                        server,
+                        &profile,
+                    ) {
+                        if let Some(value) = staged.get(&reference) {
+                            crate::secret_ownership::reject_conflicting_named_ownership_on_conn(
+                                conn,
+                                &reference,
+                                "mcp",
+                                &stage_root,
+                            )?;
+                            let mutation = stage_vault.mutate_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                                &reference,
+                                Some(value.as_str().as_bytes()),
+                            )?;
+                            let ownership_inserted = conn.execute(
+                                "INSERT OR IGNORE INTO secret_named_ownership
+                                 (item_id, owner_kind, project_root, created_at)
+                                 VALUES (?1, 'mcp', ?2, ?3)",
+                                rusqlite::params![reference, stage_root, chrono::Utc::now().timestamp_millis()],
+                            )? == 1;
+                            mutations.insert(
+                                reference.clone(),
+                                AgentCredentialMutation {
+                                    vault: mutation,
+                                    ownership_inserted,
+                                },
+                            );
+                        } else if oauth_key.as_deref() != Some(reference.as_str()) {
+                            crate::secret_ownership::ensure_static_named_reference_owned_on_conn(
+                                conn,
+                                &stage_vault,
+                                &reference,
+                                "mcp",
+                                &stage_root,
+                            )?;
+                        }
+                    }
+                    let compensation_json = serde_json::to_string(&mutations)?;
+                    Ok((mutations, compensation_json))
+                },
             )
             .map_err(|error| conflict(error.to_string()))?;
         // The same exclusive publication guard covers planning, durable fence
@@ -602,7 +701,7 @@ pub async fn mutate(
             .as_ref()
             .err()
             .map(|_| projection_matches_plan(&authority_root, &plan, &publication_vault));
-        Ok::<_, ErrorPayload>((plan, result, committed_match))
+        Ok::<_, ErrorPayload>((plan, result, committed_match, staged_mutations))
     })
     .await
     .map_err(join_error)??;
@@ -636,6 +735,7 @@ pub async fn mutate(
                 None => false,
             };
             if !committed_match {
+                compensate_agent_mcp_credentials(ctx, &canonical_root, &staged_mutations).await?;
                 delete_agent_mutation_journal(ctx, &owner_digest, &client_operation_id).await?;
                 return Err(error);
             }
@@ -696,6 +796,17 @@ pub async fn mutate(
             })
         }
     };
+    if matches!(
+        &mutation,
+        AgentMutation::AddMcpServer { secret_values, .. } if !secret_values.is_empty()
+    ) && let Err(error) = ctx.publish_owner_redaction_table()
+    {
+        ctx.poison_redaction_publication(&error);
+        return Err(ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: "agent MCP credentials were committed but redaction publication failed; restart the daemon and retry the exact operation".into(),
+        });
+    }
     if let Response::AgentMutated(result) = &mut response {
         bind_agent_mutation_receipt(
             result,
@@ -739,6 +850,12 @@ struct AgentMutationPlan {
     changed_hint: bool,
     consumed_config_generation: u64,
     result_is_absent: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct AgentCredentialMutation {
+    vault: crate::secure_key::SecretVaultMutation,
+    ownership_inserted: bool,
 }
 
 fn projection_identity(vault: &crate::secure_key::SecretVault, bytes: Option<&[u8]>) -> String {
@@ -966,6 +1083,40 @@ fn prepare_mutation_plan_sync(
                 false,
             )
         }
+        AgentMutation::AddMcpServer {
+            name,
+            server,
+            server_json,
+            profile,
+            secret_values,
+        } => {
+            validate_name(name)?;
+            let current = snapshot_sync(root, name)?;
+            ensure_revision(&current.revision, expected_revision)?;
+            if current.source_layer != AgentSourceLayer::Workspace {
+                return Err(conflict(
+                    "agent MCP configuration can only mutate a workspace-owned package",
+                ));
+            }
+            let current_identity = agent_package_projection_identity(root, name, vault)?;
+            let update = prepare_agent_mcp_add(
+                root,
+                name,
+                server,
+                server_json,
+                profile,
+                secret_values,
+                false,
+            )?;
+            (
+                "add_mcp_server",
+                Some(name.clone()),
+                current_identity,
+                projection_identity(vault, Some(&update.identity_bytes)),
+                1,
+                false,
+            )
+        }
     };
     let changed_hint = consumed != intended;
     let affected_hint = if changed_hint { affected_hint } else { 0 };
@@ -1054,6 +1205,121 @@ fn intended_definition_bytes(
     Ok(markdown.as_bytes().to_vec())
 }
 
+struct AgentMcpUpdate {
+    markdown: String,
+    mcp_json: String,
+    identity_bytes: Vec<u8>,
+}
+
+fn agent_package_projection_identity(
+    root: &Path,
+    name: &str,
+    vault: &crate::secure_key::SecretVault,
+) -> Result<String, ErrorPayload> {
+    let def = crate::agents::resolve(root, name)
+        .map_err(bad_config)?
+        .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?;
+    if def.package_files.is_none() {
+        return Err(bad_request(
+            "agent MCP configuration requires a directory-form agent package",
+        ));
+    }
+    let bytes = def.vnext_digest_bytes().map_err(bad_config)?;
+    Ok(projection_identity(vault, Some(&bytes)))
+}
+
+fn prepare_agent_mcp_add(
+    root: &Path,
+    name: &str,
+    server_name: &str,
+    server_json: &str,
+    profile: &str,
+    secret_values: &std::collections::BTreeMap<String, cockpit_proto::SensitiveWirePayload>,
+    allow_identical_existing: bool,
+) -> Result<AgentMcpUpdate, ErrorPayload> {
+    if server_name == crate::mcp::builtin::BUILTIN_SERVER_ID {
+        return Err(bad_request(
+            "the reserved cockpit MCP server cannot be redefined",
+        ));
+    }
+    let mut def = crate::agents::resolve(root, name)
+        .map_err(bad_config)?
+        .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?;
+    let files = def.package_files.as_ref().ok_or_else(|| {
+        bad_request("agent MCP configuration requires a directory-form agent package")
+    })?;
+    let mut config = match files.get("mcp.json") {
+        Some(bytes) => crate::mcp::config::McpConfig::parse(
+            std::str::from_utf8(bytes)
+                .map_err(|_| bad_request("agent package mcp.json is not valid UTF-8"))?,
+        )
+        .map_err(bad_config)?,
+        None => crate::mcp::config::McpConfig::default(),
+    };
+    let server: crate::mcp::config::ServerConfig =
+        serde_json::from_str(server_json).map_err(bad_config)?;
+    let mut candidate = crate::mcp::config::McpConfig::default();
+    candidate.servers.insert(server_name.to_string(), server);
+    crate::daemon::server::dispatch::validate_and_normalize_mcp_credentials(
+        &mut candidate,
+        secret_values,
+    )?;
+    let server = candidate
+        .servers
+        .remove(server_name)
+        .expect("inserted above");
+    if let Some(existing) = config.servers.get(server_name)
+        && (!allow_identical_existing || existing != &server)
+    {
+        return Err(conflict(format!(
+            "MCP server `{server_name}` already exists in agent package `{name}`"
+        )));
+    }
+    server
+        .validate_transport_auth(server_name)
+        .map_err(bad_config)?;
+    let reference_only = server
+        .env
+        .values()
+        .all(|value| value.trim().is_empty() || value.trim_start().starts_with('$'))
+        && server.iter_auth_profiles().all(|(_, auth)| match auth {
+            crate::mcp::config::Auth::Header(header) => {
+                header.value.trim().is_empty() || header.value.trim_start().starts_with('$')
+            }
+            crate::mcp::config::Auth::Env(env) => env
+                .vars
+                .values()
+                .all(|value| value.trim().is_empty() || value.trim_start().starts_with('$')),
+            crate::mcp::config::Auth::Oauth(_) | crate::mcp::config::Auth::None => true,
+        });
+    if !reference_only {
+        return Err(bad_request(
+            "agent-package MCP auth must use credential references; literal secrets are refused",
+        ));
+    }
+    server
+        .auth_for_profile_named(server_name, profile)
+        .map_err(bad_config)?;
+    config.servers.insert(server_name.to_string(), server);
+    def.mcp_bindings
+        .retain(|binding| binding.server != server_name);
+    def.mcp_bindings.push(crate::agents::McpBinding {
+        server: server_name.to_string(),
+        profile: profile.to_string(),
+    });
+    let markdown = def.to_markdown().map_err(bad_config)?;
+    let mcp_json = serde_json::to_string_pretty(&config).map_err(internal)?;
+    let files = def.package_files.as_mut().expect("package checked above");
+    files.insert("agent.md".to_string(), markdown.as_bytes().to_vec());
+    files.insert("mcp.json".to_string(), mcp_json.as_bytes().to_vec());
+    let identity_bytes = def.vnext_digest_bytes().map_err(bad_config)?;
+    Ok(AgentMcpUpdate {
+        markdown,
+        mcp_json,
+        identity_bytes,
+    })
+}
+
 fn reset_all_target_projection_identity(
     root: &Path,
     vault: &crate::secure_key::SecretVault,
@@ -1085,6 +1351,10 @@ fn projection_matches_plan(
     vault: &crate::secure_key::SecretVault,
 ) -> Result<bool, ErrorPayload> {
     if let Some(name) = plan.agent_name.as_deref() {
+        if plan.action == "add_mcp_server" {
+            return Ok(agent_package_projection_identity(root, name, vault)?
+                == plan.intended_projection_identity);
+        }
         return Ok(
             target_projection_identity(root, name, vault)? == plan.intended_projection_identity
         );
@@ -1098,6 +1368,9 @@ fn projection_matches_consumed(
     vault: &crate::secure_key::SecretVault,
 ) -> Result<bool, ErrorPayload> {
     let current = match plan.agent_name.as_deref() {
+        Some(name) if plan.action == "add_mcp_server" => {
+            agent_package_projection_identity(root, name, vault)?
+        }
         Some(name) => target_projection_identity(root, name, vault)?,
         None => reset_all_target_projection_identity(root, vault)?,
     };
@@ -1171,6 +1444,81 @@ async fn delete_agent_mutation_journal(
         .map_err(internal)
 }
 
+async fn compensate_agent_mcp_credentials(
+    ctx: &DaemonContext,
+    project_root: &str,
+    mutations: &std::collections::BTreeMap<String, AgentCredentialMutation>,
+) -> Result<(), ErrorPayload> {
+    let project_root = project_root.to_owned();
+    let mutations = mutations.clone();
+    ctx.db
+        .transaction(move |conn| {
+            let kind = cockpit_db::secret_vault::SecretVaultKind::NamedSecret;
+            for (name, record) in &mutations {
+                let mutation = &record.vault;
+                let current = cockpit_db::secret_vault::load_item_conn(conn, kind, name)?;
+                let revision: u64 = conn
+                    .query_row(
+                        "SELECT revision FROM secret_vault_item_revisions WHERE kind = ?1 AND item_id = ?2",
+                        rusqlite::params![kind.as_str(), name],
+                        |row| row.get::<_, i64>(0),
+                    )?
+                    .try_into()?;
+                if revision != mutation.after.generation || current != mutation.after.row {
+                    continue;
+                }
+                let next_revision = revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("vault item revision overflow"))?;
+                match &mutation.prior.row {
+                    Some(row) => {
+                        conn.execute(
+                            "INSERT INTO secret_vault_items
+                             (kind,item_id,key_version,nonce,ciphertext,created_at,updated_at,revision)
+                             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                             ON CONFLICT(kind,item_id) DO UPDATE SET
+                               key_version=excluded.key_version,nonce=excluded.nonce,
+                               ciphertext=excluded.ciphertext,created_at=excluded.created_at,
+                               updated_at=excluded.updated_at,revision=excluded.revision",
+                            rusqlite::params![row.kind.as_str(), row.item_id, row.key_version,
+                                row.nonce, row.ciphertext, row.created_at, row.updated_at,
+                                i64::try_from(next_revision)?],
+                        )?;
+                    }
+                    None => {
+                        conn.execute(
+                            "DELETE FROM secret_vault_items WHERE kind = ?1 AND item_id = ?2",
+                            rusqlite::params![kind.as_str(), name],
+                        )?;
+                    }
+                }
+                conn.execute(
+                    "INSERT INTO secret_vault_item_revisions (kind,item_id,revision)
+                     VALUES (?1,?2,?3)
+                     ON CONFLICT(kind,item_id) DO UPDATE SET revision=excluded.revision",
+                    rusqlite::params![kind.as_str(), name, i64::try_from(next_revision)?],
+                )?;
+                if record.ownership_inserted {
+                    conn.execute(
+                        "DELETE FROM secret_named_ownership
+                         WHERE item_id = ?1 AND owner_kind = 'mcp' AND project_root = ?2",
+                        rusqlite::params![name, project_root],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    ctx.publish_owner_redaction_table().map_err(|error| {
+        ctx.poison_redaction_publication(&error);
+        ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: "agent MCP credential rollback completed but redaction publication failed; restart the daemon".into(),
+        }
+    })
+}
+
 async fn settle_agent_mutation_journal(
     ctx: &DaemonContext,
     owner: String,
@@ -1221,6 +1569,7 @@ pub async fn recover_agent_mutation_journals(
     type Row = (
         String,
         String,
+        String,
         Vec<u8>,
         Vec<u8>,
         i64,
@@ -1242,7 +1591,8 @@ pub async fn recover_agent_mutation_journals(
             let mut stmt = conn.prepare(
                 "SELECT owner_digest,client_operation_id,request_hash,keyed_request_identity,fencing_generation,
                         project_root,request_project_root,agent_name,action,consumed_revision,affected_hint,changed_hint,consumed_config_generation,
-                        mutation_intent_hash,consumed_projection_identity,intended_projection_identity
+                        mutation_intent_hash,consumed_projection_identity,intended_projection_identity,
+                        credential_compensation_json
                    FROM agent_mutation_journals ORDER BY created_at_unix_ms",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -1263,6 +1613,7 @@ pub async fn recover_agent_mutation_journals(
                     row.get(13)?,
                     row.get(14)?,
                     row.get(15)?,
+                    row.get(16)?,
                 ))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1288,6 +1639,7 @@ pub async fn recover_agent_mutation_journals(
         mutation_intent_hash,
         consumed_projection_identity,
         intended_projection_identity,
+        credential_compensation_json,
     ) in rows
     {
         let Ok(request_hash): Result<[u8; 32], _> = request_hash.try_into() else {
@@ -1338,6 +1690,13 @@ pub async fn recover_agent_mutation_journals(
         let result_is_absent = plan.result_is_absent;
         let (matches, still_consumed, definition_revision, inventory_revision) = publication
             .with_target(&lock_target, move |_| {
+                #[cfg(target_os = "windows")]
+                if check_plan.action == "add_mcp_server"
+                    && let Some(name) = projection_name.as_deref()
+                {
+                    recover_windows_agent_package_swap(&check_root, name)
+                        .map_err(|error| anyhow::anyhow!(error.message))?;
+                }
                 let matches = projection_matches_plan(&check_root, &check_plan, &check_vault)
                     .map_err(|error| anyhow::anyhow!(error.message))?;
                 let still_consumed = if matches {
@@ -1376,6 +1735,11 @@ pub async fn recover_agent_mutation_journals(
                 ),
             })?;
         if !matches {
+            let credential_mutations: std::collections::BTreeMap<
+                String,
+                AgentCredentialMutation,
+            > = serde_json::from_str(&credential_compensation_json).map_err(internal)?;
+            compensate_agent_mcp_credentials(ctx, &project_root, &credential_mutations).await?;
             if still_consumed {
                 cancel_agent_mutation_journal(
                     ctx,
@@ -2842,6 +3206,7 @@ fn mutate_sync_locked(
         .map(|(consumed, _)| consumed)
         .unwrap_or_else(crate::daemon::server::inventory::current_config_generation);
     let resets_inventory = matches!(&mutation, AgentMutation::ResetAllBuiltins);
+    let changes_mcp_binding = matches!(&mutation, AgentMutation::AddMcpServer { .. });
     let (changed, affected, snapshot) = match mutation {
         AgentMutation::EjectBuiltin { name } => {
             validate_name(&name)?;
@@ -3007,6 +3372,54 @@ fn mutate_sync_locked(
                 (true, 1, Some(snapshot_sync(root, &name)?))
             }
         }
+        AgentMutation::AddMcpServer {
+            name,
+            server,
+            server_json,
+            profile,
+            secret_values,
+        } => {
+            validate_name(&name)?;
+            let current = snapshot_sync(root, &name)?;
+            ensure_revision(&current.revision, expected_revision.as_deref())?;
+            if current.source_layer != AgentSourceLayer::Workspace {
+                return Err(conflict(
+                    "agent MCP configuration can only mutate a workspace-owned package",
+                ));
+            }
+            let update = prepare_agent_mcp_add(
+                root,
+                &name,
+                &server,
+                &server_json,
+                &profile,
+                &secret_values,
+                true,
+            )?;
+            let agent_target = project_agent_write_path(root, &name)?;
+            if agent_target.file_name().and_then(|value| value.to_str()) != Some("agent.md") {
+                return Err(bad_request(
+                    "agent MCP configuration requires a directory-form agent package",
+                ));
+            }
+            let package_dir = agent_target
+                .parent()
+                .ok_or_else(|| bad_request("agent package has no parent"))?
+                .to_path_buf();
+            let mcp_target = package_dir.join("mcp.json");
+            let prior_agent = nofollow_read(&agent_target)?;
+            let prior_mcp = nofollow_read(&mcp_target)?;
+            let changed = prior_agent.as_deref() != Some(update.markdown.as_bytes())
+                || prior_mcp.as_deref() != Some(update.mcp_json.as_bytes());
+            if changed {
+                publish_agent_package_mcp_atomic(&package_dir, &update)?;
+            }
+            (
+                changed,
+                u32::from(changed),
+                Some(snapshot_sync(root, &name)?),
+            )
+        }
     };
     let generation = match durable_generation_pair {
         Some((consumed, result)) => {
@@ -3045,6 +3458,13 @@ fn mutate_sync_locked(
                 },
             ),
         }
+    } else if changes_mcp_binding && changed {
+        (
+            None,
+            cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                warning: "agent MCP binding committed; existing live sessions retain their current catalog until the agent is rebuilt".into(),
+            },
+        )
     } else {
         (None, cockpit_proto::AgentMutationOutcome::Reconciled)
     };
@@ -3091,6 +3511,249 @@ fn project_agent_path(root: &Path, name: &str) -> Result<PathBuf, ErrorPayload> 
         &relative,
         crate::daemon::fs_api::AuthorizedCanonicalPathMode::WriteTarget,
     )
+}
+
+fn publish_agent_package_mcp_atomic(
+    package_dir: &Path,
+    update: &AgentMcpUpdate,
+) -> Result<(), ErrorPayload> {
+    let parent = package_dir
+        .parent()
+        .ok_or_else(|| bad_request("agent package has no parent"))?;
+    let leaf = package_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| bad_request("agent package name is invalid"))?;
+    let staging = parent.join(format!(".{leaf}.mcp-stage-{}", uuid::Uuid::now_v7()));
+    let staged_result = (|| {
+        copy_agent_package_tree(package_dir, &staging)?;
+        cockpit_config::config::write_config_bytes_atomic(
+            &staging.join("agent.md"),
+            update.markdown.as_bytes(),
+        )
+        .map_err(internal)?;
+        cockpit_config::config::write_config_bytes_atomic(
+            &staging.join("mcp.json"),
+            update.mcp_json.as_bytes(),
+        )
+        .map_err(internal)?;
+        exchange_agent_package_dirs(package_dir, &staging)
+    })();
+    if staged_result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return staged_result;
+    }
+    if let Err(error) = std::fs::remove_dir_all(&staging) {
+        tracing::warn!(path = %staging.display(), %error, "retaining old agent package after atomic exchange");
+    }
+    Ok(())
+}
+
+fn copy_agent_package_tree(source: &Path, target: &Path) -> Result<(), ErrorPayload> {
+    let metadata = std::fs::symlink_metadata(source).map_err(internal)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(conflict("agent package is not a real directory"));
+    }
+    std::fs::create_dir(target).map_err(internal)?;
+    std::fs::set_permissions(target, metadata.permissions()).map_err(internal)?;
+    for entry in std::fs::read_dir(source).map_err(internal)? {
+        let entry = entry.map_err(internal)?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&source_path).map_err(internal)?;
+        if metadata.file_type().is_symlink() {
+            return Err(conflict("agent packages cannot contain symlinks"));
+        }
+        if metadata.is_dir() {
+            copy_agent_package_tree(&source_path, &target_path)?;
+        } else if metadata.is_file() {
+            let bytes = nofollow_read(&source_path)?
+                .ok_or_else(|| conflict("agent package file changed while staging"))?;
+            cockpit_config::config::write_config_bytes_atomic(&target_path, &bytes)
+                .map_err(internal)?;
+        } else {
+            return Err(conflict("agent package contains an unsupported file type"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn exchange_agent_package_dirs(left: &Path, right: &Path) -> Result<(), ErrorPayload> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let left = std::ffi::CString::new(left.as_os_str().as_bytes()).map_err(internal)?;
+    let right = std::ffi::CString::new(right.as_os_str().as_bytes()).map_err(internal)?;
+    // SAFETY: both C strings live across the syscall; RENAME_EXCHANGE swaps
+    // two existing entries atomically without following either final path.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(internal(std::io::Error::last_os_error()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn exchange_agent_package_dirs(left: &Path, right: &Path) -> Result<(), ErrorPayload> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let left = std::ffi::CString::new(left.as_os_str().as_bytes()).map_err(internal)?;
+    let right = std::ffi::CString::new(right.as_os_str().as_bytes()).map_err(internal)?;
+    // SAFETY: both paths are valid C strings and RENAME_SWAP atomically
+    // exchanges the two existing directory entries.
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(internal(std::io::Error::last_os_error()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WindowsAgentPackageSwap {
+    staging_leaf: String,
+    backup_leaf: String,
+    phase: String,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_agent_swap_marker(left: &Path) -> Result<PathBuf, ErrorPayload> {
+    let parent = left
+        .parent()
+        .ok_or_else(|| bad_request("agent package has no parent"))?;
+    let leaf = left
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| bad_request("agent package name is invalid"))?;
+    Ok(parent.join(format!(".{leaf}.mcp-swap-state.json")))
+}
+
+#[cfg(target_os = "windows")]
+fn write_windows_agent_swap(
+    marker: &Path,
+    state: &WindowsAgentPackageSwap,
+) -> Result<(), ErrorPayload> {
+    let bytes = serde_json::to_vec(state).map_err(internal)?;
+    cockpit_config::config::write_config_bytes_atomic(marker, &bytes).map_err(internal)
+}
+
+#[cfg(target_os = "windows")]
+fn finish_windows_agent_package_swap(
+    left: &Path,
+    state: &mut WindowsAgentPackageSwap,
+) -> Result<(), ErrorPayload> {
+    let parent = left
+        .parent()
+        .ok_or_else(|| bad_request("agent package has no parent"))?;
+    if Path::new(&state.staging_leaf).components().count() != 1
+        || Path::new(&state.backup_leaf).components().count() != 1
+    {
+        return Err(conflict(
+            "agent package swap marker contains an invalid path",
+        ));
+    }
+    let right = parent.join(&state.staging_leaf);
+    let backup = parent.join(&state.backup_leaf);
+    let marker = windows_agent_swap_marker(left)?;
+    if state.phase == "prepared" {
+        if left.exists() && !backup.exists() {
+            std::fs::rename(left, &backup).map_err(internal)?;
+        } else if left.exists() || !backup.exists() {
+            return Err(conflict(
+                "agent package swap prepared phase is inconsistent",
+            ));
+        }
+        state.phase = "live_moved".into();
+        write_windows_agent_swap(&marker, state)?;
+    }
+    if state.phase == "live_moved" {
+        if !left.exists() && right.exists() && backup.exists() {
+            std::fs::rename(&right, left).map_err(internal)?;
+        } else if !left.exists() || right.exists() || !backup.exists() {
+            return Err(conflict(
+                "agent package swap live-moved phase is inconsistent",
+            ));
+        }
+        state.phase = "staged_live".into();
+        write_windows_agent_swap(&marker, state)?;
+    }
+    if state.phase == "staged_live" {
+        if left.exists() && !right.exists() && backup.exists() {
+            std::fs::rename(&backup, &right).map_err(internal)?;
+        } else if !left.exists() || !right.exists() || backup.exists() {
+            return Err(conflict(
+                "agent package swap staged-live phase is inconsistent",
+            ));
+        }
+        state.phase = "complete".into();
+        write_windows_agent_swap(&marker, state)?;
+    }
+    if state.phase != "complete" {
+        return Err(conflict("agent package swap marker has an invalid phase"));
+    }
+    std::fs::remove_file(marker).map_err(internal)
+}
+
+#[cfg(target_os = "windows")]
+fn exchange_agent_package_dirs(left: &Path, right: &Path) -> Result<(), ErrorPayload> {
+    let right_leaf = right
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| bad_request("agent package staging name is invalid"))?;
+    let leaf = left
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| bad_request("agent package name is invalid"))?;
+    let mut state = WindowsAgentPackageSwap {
+        staging_leaf: right_leaf.to_owned(),
+        backup_leaf: format!(".{leaf}.mcp-swap-old-{}", uuid::Uuid::now_v7()),
+        phase: "prepared".into(),
+    };
+    write_windows_agent_swap(&windows_agent_swap_marker(left)?, &state)?;
+    finish_windows_agent_package_swap(left, &mut state)
+}
+
+#[cfg(target_os = "windows")]
+fn recover_windows_agent_package_swap(root: &Path, name: &str) -> Result<(), ErrorPayload> {
+    validate_name(name)?;
+    let left = root.join(".cockpit").join("agents").join(name);
+    let marker = windows_agent_swap_marker(&left)?;
+    let raw = match std::fs::read(&marker) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(internal(error)),
+    };
+    let mut state: WindowsAgentPackageSwap = serde_json::from_slice(&raw).map_err(internal)?;
+    finish_windows_agent_package_swap(&left, &mut state)?;
+    let old_package = left
+        .parent()
+        .expect("agent package has parent")
+        .join(&state.staging_leaf);
+    std::fs::remove_dir_all(old_package).map_err(internal)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn exchange_agent_package_dirs(_left: &Path, _right: &Path) -> Result<(), ErrorPayload> {
+    Err(bad_request(
+        "atomic agent-package MCP publication is unavailable on this platform",
+    ))
 }
 
 /// Write target for a workspace mutation: `agents/<name>/agent.md` when a

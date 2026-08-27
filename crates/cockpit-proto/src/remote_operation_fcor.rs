@@ -741,6 +741,19 @@ impl CanonicalFcorValueV1 for crate::AgentMutation {
                 name.encode_fcor_value_v1(&mut nested)?;
                 patch.encode_fcor_value_v1(&mut nested)?;
             }
+            Self::AddMcpServer {
+                name,
+                server,
+                server_json,
+                profile,
+                ..
+            } => {
+                nested.push_u16(8);
+                name.encode_fcor_value_v1(&mut nested)?;
+                server.encode_fcor_value_v1(&mut nested)?;
+                server_json.encode_fcor_value_v1(&mut nested)?;
+                profile.encode_fcor_value_v1(&mut nested)?;
+            }
         }
         out.0.extend(nested.0);
         Ok(())

@@ -130,9 +130,10 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
-    /// Parent-reachable MCP servers. Child catalogs intersect agent-bound
-    /// servers with this set; scope-level servers stay visible.
-    pub mcp_parent_reachable: Option<std::collections::BTreeSet<String>>,
+    /// Parent-reachable MCP bindings `(server, profile)`. Child catalogs
+    /// intersect agent-bound servers with this set; scope-level servers stay
+    /// visible.
+    pub mcp_parent_reachable: Option<std::collections::BTreeSet<(String, String)>>,
     /// Root selection (explicit fresh choice, persisted installed-root resume,
     /// or legacy plan-level override). A delegated vNext child never inherits
     /// this field: it resolves its own prepared slot default unless its direct

@@ -580,7 +580,8 @@ impl SettingsCx {
                 }
                 KeyCode::Enter => {
                     let input = flow.callback.text().trim().to_string();
-                    if input.is_empty() {
+                    let is_device = flow.user_code.is_some();
+                    if input.is_empty() && !is_device {
                         flow.status = Some(
                             "paste the callback URL or authorization code, then press Enter".into(),
                         );
@@ -610,7 +611,7 @@ impl SettingsCx {
                         super::SettingsDaemonEffectWork::McpOAuthComplete {
                             client_operation_id: client_operation_id.clone(),
                             flow_id: flow_id.clone(),
-                            input: super::SecretPayload::new(input),
+                            input: (!is_device).then(|| super::SecretPayload::new(input)),
                         },
                         super::SettingsMutationAction::McpOAuthComplete {
                             server: flow.server.clone(),
@@ -619,7 +620,14 @@ impl SettingsCx {
                             expected_request_hash,
                         },
                     );
-                    flow.status = Some("completing authentication…".into());
+                    flow.status = Some(
+                        if is_device {
+                            "polling for device authorization…"
+                        } else {
+                            "completing authentication…"
+                        }
+                        .into(),
+                    );
                     s.oauth = Some(flow);
                 }
                 _ => {
@@ -672,7 +680,14 @@ impl SettingsCx {
                 if let Some(name) = names.get(s.cursor)
                     && let Some(server) = cfg.servers.get(name)
                 {
-                    if matches!(server.auth, Auth::Oauth(_)) {
+                    let oauth_profile = if matches!(server.auth, Auth::Oauth(_)) {
+                        Some(crate::mcp::config::DEFAULT_PROFILE.to_string())
+                    } else {
+                        server.profiles.iter().find_map(|(profile, auth)| {
+                            matches!(auth, Auth::Oauth(_)).then(|| profile.clone())
+                        })
+                    };
+                    if let Some(oauth_profile) = oauth_profile {
                         let name = name.clone();
                         let client_operation_id = uuid::Uuid::new_v4().to_string();
                         let project_root = self
@@ -685,6 +700,8 @@ impl SettingsCx {
                             "begin_mcp_oauth",
                             &project_root,
                             &name,
+                            &oauth_profile,
+                            &None::<String>,
                         )) {
                             Ok(hash) => hash,
                             Err(error) => {
@@ -702,6 +719,8 @@ impl SettingsCx {
                                 client_operation_id: client_operation_id.clone(),
                                 project_root,
                                 server: name.clone(),
+                                profile: oauth_profile,
+                                agent: None,
                             },
                             super::SettingsMutationAction::McpOAuthBegin {
                                 server: name,
@@ -855,6 +874,15 @@ impl SettingsCx {
             )),
             Line::from(""),
         ];
+        for warning in &self.mcp_shadow_warnings {
+            lines.push(Line::from(Span::styled(
+                format!("shadowed: {warning}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if !self.mcp_shadow_warnings.is_empty() {
+            lines.push(Line::from(""));
+        }
         let mut bindings = Vec::new();
         let names: Vec<&String> = cfg.servers.keys().collect();
         for (i, name) in names.iter().enumerate() {

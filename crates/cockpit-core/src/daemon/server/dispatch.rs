@@ -117,6 +117,7 @@ struct ProviderEditCapability {
     config_generation: u64,
     mcp_target_path: std::path::PathBuf,
     mcp_revision: String,
+    mcp_scope_targets: std::collections::BTreeMap<String, (std::path::PathBuf, String)>,
     expires_at: Instant,
 }
 
@@ -548,7 +549,46 @@ async fn recover_retained_defaults_for_attached_worker(
 struct McpOAuthPending {
     project_root: String,
     server: String,
-    flow: crate::mcp::auth::McpOAuthFlow,
+    #[serde(default = "default_mcp_profile")]
+    profile: String,
+    flow: McpOAuthPendingFlow,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "grant", rename_all = "snake_case")]
+enum McpOAuthPendingFlow {
+    Browser(crate::mcp::auth::McpOAuthFlow),
+    Device {
+        oauth: crate::mcp::config::OauthAuth,
+        device_code: SealedOAuthText,
+        interval_secs: u64,
+        expires_in_secs: u64,
+        user_code: SealedOAuthText,
+        verification_uri: String,
+        verification_uri_complete: String,
+    },
+}
+
+fn default_mcp_profile() -> String {
+    crate::mcp::config::DEFAULT_PROFILE.to_string()
+}
+
+fn mcp_pending_device_display(
+    pending: &McpOAuthPending,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match &pending.flow {
+        McpOAuthPendingFlow::Device {
+            user_code,
+            verification_uri,
+            verification_uri_complete,
+            ..
+        } => (
+            Some(user_code.expose().to_string()),
+            Some(verification_uri.clone()),
+            Some(verification_uri_complete.clone()),
+        ),
+        McpOAuthPendingFlow::Browser(_) => (None, None, None),
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1990,28 +2030,48 @@ impl OAuthFlowStore {
         {
             flows.remove(&id);
         }
+        let (user_code, verification_uri, verification_uri_complete) =
+            mcp_pending_device_display(&flow);
         flows.insert(
             id,
             StoredMcpOAuthFlow {
                 owner,
                 begin_client_operation_id,
                 authorize_url,
-                user_code: None,
-                verification_uri: None,
-                verification_uri_complete: None,
+                user_code,
+                verification_uri,
+                verification_uri_complete,
                 created_at: Instant::now(),
                 flow: McpOAuthFlow::Ready(flow),
             },
         );
     }
 
-    async fn mcp_started(&self, owner: &str, begin_id: &str) -> Option<(String, String)> {
+    async fn mcp_started(
+        &self,
+        owner: &str,
+        begin_id: &str,
+    ) -> Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
         flows
             .iter()
             .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
-            .map(|(id, flow)| (id.clone(), flow.authorize_url.clone()))
+            .map(|(id, flow)| {
+                (
+                    id.clone(),
+                    flow.authorize_url.clone(),
+                    flow.user_code.clone(),
+                    flow.verification_uri.clone(),
+                    flow.verification_uri_complete.clone(),
+                )
+            })
     }
 
     async fn claim_mcp(
@@ -11840,13 +11900,21 @@ async fn handle_serialized_request_impl(
                         Response::McpOAuthStarted {
                             flow_id,
                             authorize_url,
+                            user_code,
+                            verification_uri,
+                            verification_uri_complete,
                             ..
                         } => match load_oauth_flow(ctx, flow_id)? {
                             Some(DurableOAuthFlow::Mcp {
                                 authorize_url: durable_url,
+                                pending,
                                 ..
                             }) => {
                                 *authorize_url = durable_url.expose().to_owned();
+                                let display = mcp_pending_device_display(&pending);
+                                *user_code = display.0;
+                                *verification_uri = display.1;
+                                *verification_uri_complete = display.2;
                                 None
                             }
                             Some(DurableOAuthFlow::Expired { terminal_error, .. })
@@ -12276,6 +12344,17 @@ async fn handle_serialized_request_impl(
                     _ => {
                         return Err(bad_request(
                             "provider OAuth flow is unknown or belongs to another owner",
+                        ));
+                    }
+                };
+                let durable_expires_at_unix_ms = match &durable_flow {
+                    Some(DurableOAuthFlow::Mcp {
+                        expires_at_unix_ms,
+                        ..
+                    }) => *expires_at_unix_ms,
+                    _ => {
+                        return Err(bad_request(
+                            "MCP OAuth flow is not available for completion",
                         ));
                     }
                 };
@@ -12731,7 +12810,14 @@ async fn handle_serialized_request_impl(
             client_operation_id,
             project_root,
             server,
+            profile,
+            agent,
         } => {
+            let profile = if profile.is_empty() {
+                crate::mcp::config::DEFAULT_PROFILE.to_string()
+            } else {
+                profile
+            };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
@@ -12745,10 +12831,15 @@ async fn handle_serialized_request_impl(
             let request_hash = local_operation_secret_request_hash(
                 ctx,
                 b"flycockpit/local-operation/mcp-oauth/begin/v1\0",
-                &("begin_mcp_oauth", &project_root, &server),
+                &("begin_mcp_oauth", &project_root, &server, &profile, &agent),
             )?;
-            let receipt_request_hash =
-                local_operation_request_hash(&("begin_mcp_oauth", &project_root, &server))?;
+            let receipt_request_hash = local_operation_request_hash(&(
+                "begin_mcp_oauth",
+                &project_root,
+                &server,
+                &profile,
+                &agent,
+            ))?;
             // Admission and exact replay precede every mutable trust/config/
             // ownership check and capacity sweep. Otherwise an already-settled
             // begin can become unreplayable merely because its workspace was
@@ -12794,6 +12885,7 @@ async fn handle_serialized_request_impl(
                         begin_request_hash,
                         begin_fencing_generation,
                         authorize_url,
+                        pending,
                         expires_at_unix_ms,
                         ..
                     }) = durable
@@ -12814,14 +12906,16 @@ async fn handle_serialized_request_impl(
                             "the OAuth flow expired before completion; start a new login",
                         ));
                     }
+                    let (user_code, verification_uri, verification_uri_complete) =
+                        mcp_pending_device_display(&pending);
                     return Ok(Response::McpOAuthStarted {
                         client_operation_id,
                         request_hash,
                         flow_id,
                         authorize_url: authorize_url.expose().to_owned(),
-                        user_code: None,
-                        verification_uri: None,
-                        verification_uri_complete: None,
+                        user_code,
+                        verification_uri,
+                        verification_uri_complete,
                     });
                 }
                 LocalOperationStart::Replay(response) => return Ok(response),
@@ -12834,11 +12928,40 @@ async fn handle_serialized_request_impl(
                     crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
                         .await
                         .map_err(workspace_trust_error)?;
-                let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
-                let config = mcp_config_from_paths(&paths)?;
-                let server_config = config.servers.get(&server).cloned().ok_or_else(|| {
-                    bad_request(format!("MCP server `{server}` is not configured"))
-                })?;
+                let server_config = if let Some(agent) = agent.as_deref() {
+                    let def = crate::agents::resolve(&cwd, agent)
+                        .map_err(bad_config)?
+                        .ok_or_else(|| bad_request(format!("agent `{agent}` was not found")))?;
+                    let catalog = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
+                        &cwd, 0, &def,
+                    )
+                    .catalog();
+                    let entry = catalog.servers.get(&server).ok_or_else(|| {
+                        bad_request(format!("MCP server `{server}` is not available to agent `{agent}`"))
+                    })?;
+                    if !entry.agent_bound {
+                        return Err(bad_request(format!(
+                            "MCP OAuth agent selector requires an agent-package server; `{server}` comes from {} scope",
+                            entry.source.as_str()
+                        )));
+                    }
+                    if entry.profile != profile {
+                        return Err(bad_request(format!(
+                            "agent `{agent}` binds MCP server `{server}` to credential profile `{}` rather than requested profile `{profile}`",
+                            entry.profile
+                        )));
+                    }
+                    entry.server.clone()
+                } else {
+                    let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
+                    let config = mcp_config_from_paths(&paths)?;
+                    config.servers.get(&server).cloned().ok_or_else(|| {
+                        bad_request(format!("MCP server `{server}` is not configured"))
+                    })?
+                };
+                let server_config = server_config
+                    .with_selected_profile(&server, &profile)
+                    .map_err(|error| bad_request(error.to_string()))?;
                 if !matches!(server_config.auth, crate::mcp::config::Auth::Oauth(_)) {
                     return Err(bad_request(format!(
                         "MCP server `{server}` is not configured for OAuth"
@@ -12847,7 +12970,7 @@ async fn handle_serialized_request_impl(
                 ensure_mcp_ownership_available(
                     ctx,
                     &project_root,
-                    [crate::mcp::auth::cred_key(&server)],
+                    [crate::mcp::auth::cred_key_for(&server, &profile)],
                 )
                 .await?;
                 Ok::<_, ErrorPayload>(server_config)
@@ -12868,7 +12991,13 @@ async fn handle_serialized_request_impl(
                     return Err(terminal_error);
                 }
             };
-            if let Some((flow_id, authorize_url)) = ctx
+            if let Some((
+                flow_id,
+                authorize_url,
+                user_code,
+                verification_uri,
+                verification_uri_complete,
+            )) = ctx
                 .oauth_flows
                 .mcp_started(&owner, &client_operation_id)
                 .await
@@ -12878,9 +13007,9 @@ async fn handle_serialized_request_impl(
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id,
                     authorize_url,
-                    user_code: None,
-                    verification_uri: None,
-                    verification_uri_complete: None,
+                    user_code,
+                    verification_uri,
+                    verification_uri_complete,
                 };
                 let receipt = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
@@ -12929,6 +13058,8 @@ async fn handle_serialized_request_impl(
                 },
             )) = durable_replay
             {
+                let (user_code, verification_uri, verification_uri_complete) =
+                    mcp_pending_device_display(&pending);
                 ctx.oauth_flows
                     .insert_mcp(
                         flow_id.clone(),
@@ -12943,9 +13074,9 @@ async fn handle_serialized_request_impl(
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: flow_id.clone(),
                     authorize_url: authorize_url.expose().to_owned(),
-                    user_code: None,
-                    verification_uri: None,
-                    verification_uri_complete: None,
+                    user_code,
+                    verification_uri,
+                    verification_uri_complete,
                 };
                 let receipt = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
@@ -13006,7 +13137,7 @@ async fn handle_serialized_request_impl(
                     }
                 };
                 let flow_id = uuid::Uuid::new_v4().to_string();
-                let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let authorize_url = device.verification_uri_complete.clone();
                 let response = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
@@ -13016,28 +13147,57 @@ async fn handle_serialized_request_impl(
                     verification_uri: Some(device.verification_uri.clone()),
                     verification_uri_complete: Some(device.verification_uri_complete.clone()),
                 };
-                // Poll in the daemon; CancelMcpOAuth flips the Completing fence.
-                let poll_oauth = oauth.clone();
-                let poll_code = device.device_code.clone();
-                let poll_cancel = cancelled.clone();
-                tokio::spawn(async move {
-                    let interval = device.interval_secs;
-                    let _ = crate::mcp::device::run_device_poll_loop(interval, poll_cancel, || {
-                        crate::mcp::device::poll_device_token(&poll_oauth, &poll_code)
-                    })
-                    .await;
-                });
-                let _ = cancelled;
-                let _ = flow_id;
-                finish_local_operation(
+                let receipt = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    authorize_url: String::new(),
+                    user_code: None,
+                    verification_uri: None,
+                    verification_uri_complete: None,
+                };
+                let pending = McpOAuthPending {
+                    project_root,
+                    server,
+                    profile,
+                    flow: McpOAuthPendingFlow::Device {
+                        oauth,
+                        device_code: device.device_code.clone().into(),
+                        interval_secs: device.interval_secs,
+                        expires_in_secs: device.expires_in_secs,
+                        user_code: device.user_code.clone().into(),
+                        verification_uri: device.verification_uri.clone(),
+                        verification_uri_complete: device.verification_uri_complete.clone(),
+                    },
+                };
+                let pending_bytes =
+                    zeroize::Zeroizing::new(serde_json::to_vec(&pending).map_err(internal)?);
+                let durable_pending =
+                    serde_json::from_slice(pending_bytes.as_slice()).map_err(internal)?;
+                let created_at_unix_ms = oauth_wall_ms();
+                commit_oauth_begin(
                     ctx,
-                    owner,
-                    client_operation_id,
+                    flow_id.clone(),
+                    DurableOAuthFlow::Mcp {
+                        owner: owner.clone(),
+                        begin_client_operation_id: client_operation_id.clone(),
+                        begin_request_hash: request_hash,
+                        begin_fencing_generation: fencing_generation,
+                        authorize_url: authorize_url.clone().into(),
+                        pending: durable_pending,
+                        created_at_unix_ms,
+                        expires_at_unix_ms: oauth_expiry_ms(created_at_unix_ms),
+                    },
+                    owner.clone(),
+                    client_operation_id.clone(),
                     request_hash,
                     fencing_generation,
-                    &response,
+                    receipt,
                 )
                 .await?;
+                ctx.oauth_flows
+                    .insert_mcp(flow_id, owner, client_operation_id, authorize_url, pending)
+                    .await;
                 return Ok(response);
             }
             let (flow, authorize_url) =
@@ -13063,7 +13223,8 @@ async fn handle_serialized_request_impl(
             let pending = McpOAuthPending {
                 project_root,
                 server,
-                flow,
+                profile,
+                flow: McpOAuthPendingFlow::Browser(flow),
             };
             let created_at_unix_ms = oauth_wall_ms();
             let response = Response::McpOAuthStarted {
@@ -13119,6 +13280,7 @@ async fn handle_serialized_request_impl(
                     pending: McpOAuthPending {
                         project_root: pending.project_root.clone(),
                         server: pending.server.clone(),
+                        profile: pending.profile.clone(),
                         flow: durable_flow_copy,
                     },
                     created_at_unix_ms,
@@ -13300,16 +13462,46 @@ async fn handle_serialized_request_impl(
                 // Once claimed, this flow is one-shot. A provider exchange may have
                 // consumed its authorization code even if vault persistence fails,
                 // so it must not be reinserted for a second exchange.
-                let tokens = crate::mcp::auth::complete_oauth_flow(pending.flow, input.as_deref())
-                    .await
-                    .map_err(internal)?;
+                let tokens = match pending.flow {
+                    McpOAuthPendingFlow::Browser(flow) => {
+                        crate::mcp::auth::complete_oauth_flow(flow, input.as_deref())
+                            .await
+                            .map_err(internal)?
+                    }
+                    McpOAuthPendingFlow::Device {
+                        oauth,
+                        device_code,
+                        interval_secs,
+                        expires_in_secs,
+                        ..
+                    } => {
+                        let remaining_secs = u64::try_from(
+                            durable_expires_at_unix_ms.saturating_sub(oauth_wall_ms()) / 1_000,
+                        )
+                        .unwrap_or(0);
+                        crate::mcp::device::run_device_poll_loop(
+                            interval_secs,
+                            expires_in_secs.min(remaining_secs),
+                            cancellation_fence.clone(),
+                            || crate::mcp::device::poll_device_token(&oauth, device_code.expose()),
+                        )
+                        .await
+                        .map_err(internal)?
+                    }
+                };
                 let record =
                     zeroize::Zeroizing::new(serde_json::to_vec(&tokens).map_err(internal)?);
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
                 if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(conflict("MCP OAuth completion was cancelled"));
                 }
-                let credential_key = crate::mcp::auth::cred_key(&pending.server);
+                if oauth_wall_ms() >= durable_expires_at_unix_ms {
+                    return Err(conflict(
+                        "the OAuth flow expired before token persistence; start a new login",
+                    ));
+                }
+                let credential_key =
+                    crate::mcp::auth::cred_key_for(&pending.server, &pending.profile);
                 let owner_root = pending.project_root.clone();
                 let terminal_response = Response::McpOAuthCompleted {
                     client_operation_id: client_operation_id.clone(),
@@ -13338,6 +13530,9 @@ async fn handle_serialized_request_impl(
                 let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
+                        if chrono::Utc::now().timestamp_millis() >= durable_expires_at_unix_ms {
+                            anyhow::bail!("MCP OAuth flow expired before token persistence");
+                        }
                         let marker = vault
                             .get_item_on_conn(
                                 conn,
@@ -14173,6 +14368,7 @@ async fn handle_serialized_request_impl(
                     &mutation_intent_hash,
                     &patch,
                     &secret_values_json,
+                    &target_scope,
                 ),
             )?;
             let fencing_generation = match begin_local_operation(
@@ -16711,6 +16907,21 @@ async fn provider_catalog_snapshot(
         String::new()
     };
     let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
+    let mcp_scope_targets = ["global", "workspace"]
+        .into_iter()
+        .filter_map(|scope| {
+            let target =
+                crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                    cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope)
+                })?;
+            let path = target
+                .parent()?
+                .join(cockpit_config::config::dirs::MCP_FILE);
+            let path = canonical_mcp_target_path(&path).ok()?;
+            let revision = mcp_target_layer_revision(&path).ok()?;
+            Some((scope.to_string(), (path, revision)))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
             .lock()
@@ -16744,6 +16955,7 @@ async fn provider_catalog_snapshot(
                     .as_ref()
                     .map(|mcp| mcp.revision.clone())
                     .unwrap_or_default(),
+                mcp_scope_targets,
                 expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
             },
         );
@@ -16929,6 +17141,7 @@ async fn apply_provider_mutation(
                     config_generation: commit.config_generation,
                     mcp_target_path: capability.mcp_target_path,
                     mcp_revision: capability.mcp_revision,
+                    mcp_scope_targets: capability.mcp_scope_targets,
                     expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
                 },
             );
@@ -17041,6 +17254,7 @@ pub(super) fn register_mcp_edit_capability_for_test(
             config_generation: 0,
             mcp_target_path: std::path::PathBuf::from(config_path),
             mcp_revision: revision.to_string(),
+            mcp_scope_targets: std::collections::BTreeMap::new(),
             expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
         },
     );
@@ -18475,10 +18689,53 @@ fn redacted_mcp_config_snapshot(
         Err(error) => return Err(internal(error)),
     };
     crate::mcp::config::redact_config_for_owner_view(&mut config);
+    let catalog = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        crate::mcp::resolver::discover_effective_catalog(cwd)
+    });
+    let mut shadowed = catalog
+        .shadowed
+        .iter()
+        .filter_map(|entry| {
+            entry.shadowed_by.map(|shadowed_by| {
+                serde_json::json!({
+                    "server": entry.name,
+                    "source": entry.source.as_str(),
+                    "shadowed_by": shadowed_by.as_str(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    for listing in crate::agents::list_all(cwd) {
+        let Ok(def) = listing.def else {
+            continue;
+        };
+        let agent_catalog =
+            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, 0, &def).catalog();
+        shadowed.extend(agent_catalog.shadowed.iter().filter_map(|entry| {
+            let shadowed_by = entry.shadowed_by?;
+            if entry.source != crate::mcp::resolver::McpScope::Agent
+                && shadowed_by != crate::mcp::resolver::McpScope::Agent
+            {
+                return None;
+            }
+            Some(serde_json::json!({
+                "agent": listing.name,
+                "server": entry.name,
+                "source": entry.source.as_str(),
+                "shadowed_by": shadowed_by.as_str(),
+            }))
+        }));
+    }
+    let mut effective_value = serde_json::to_value(&config).map_err(internal)?;
+    if !shadowed.is_empty()
+        && let Some(root) = effective_value.as_object_mut()
+    {
+        root.insert("shadowed".to_string(), serde_json::Value::Array(shadowed));
+    }
     let mut authored = prior;
     crate::mcp::config::redact_config_for_owner_view(&mut authored);
     Ok(Some(RedactedMcpConfigSnapshot {
-        effective_config_json: serde_json::to_string(&config).map_err(internal)?,
+        effective_config_json: serde_json::to_string(&effective_value).map_err(internal)?,
         authored_config_json: serde_json::to_string(&authored).map_err(internal)?,
         config_path: path.to_string_lossy().into_owned(),
         revision: mcp_target_layer_revision(&path)?,
@@ -19256,6 +19513,7 @@ mod provider_atomic_authority_tests {
             config_generation: 7,
             mcp_target_path: "/project/.cockpit/mcp.json".into(),
             mcp_revision: "mcp-revision".into(),
+            mcp_scope_targets: std::collections::BTreeMap::new(),
             expires_at: Instant::now() + Duration::from_secs(60),
         }
     }
@@ -20893,11 +21151,11 @@ async fn save_mcp_config(
 ) -> std::result::Result<Response, ErrorPayload> {
     let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let requested_project_root = project_root.to_owned();
-    let mutation_intent_hash = local_operation_request_hash_hex(&local_operation_request_hash(&(
-        "save_mcp_config",
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash_for_scope(
         &requested_project_root,
         patch_json,
-    ))?);
+        target_scope,
+    );
     if mutation_intent_hash != supplied_mutation_intent_hash {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -20928,8 +21186,8 @@ async fn save_mcp_config(
         || capability.project_root != project_root
         || owner_root != project_root
         || (target_scope.is_none()
-            && capability.mcp_target_path != std::path::Path::new(config_path))
-        || capability.mcp_revision != expected_revision
+            && (capability.mcp_target_path != std::path::Path::new(config_path)
+                || capability.mcp_revision != expected_revision))
     {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -20989,6 +21247,20 @@ async fn save_mcp_config(
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
     let path = canonical_mcp_target_path(&path)?;
+    let authoritative_expected_revision = if let Some(scope) = target_scope {
+        let (authorized_path, authorized_revision) =
+            capability.mcp_scope_targets.get(scope).ok_or_else(|| {
+                conflict("MCP target scope was not present in the authority snapshot")
+            })?;
+        if authorized_path != &path {
+            return Err(conflict(
+                "MCP target scope changed since the authority snapshot; reload before retrying",
+            ));
+        }
+        authorized_revision.as_str()
+    } else {
+        expected_revision
+    };
     if target_scope.is_none()
         && (path != capability.mcp_target_path || path != std::path::Path::new(config_path))
     {
@@ -21335,7 +21607,7 @@ async fn save_mcp_config(
         .collect::<std::collections::BTreeSet<_>>();
     use sha2::Digest as _;
     let consumed_revision = mcp_target_layer_revision(&path)?;
-    if consumed_revision != expected_revision {
+    if consumed_revision != authoritative_expected_revision {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: "MCP config changed since the authority snapshot; reload before retrying"
@@ -21365,8 +21637,10 @@ async fn save_mcp_config(
     let mut all_refs = std::collections::BTreeSet::new();
     let mut oauth_keys = std::collections::BTreeSet::new();
     for (server_name, server) in &config.servers {
-        if matches!(server.auth, crate::mcp::config::Auth::Oauth(_)) {
-            oauth_keys.insert(crate::mcp::auth::cred_key(server_name));
+        for (profile, auth) in server.iter_auth_profiles() {
+            if matches!(auth, crate::mcp::config::Auth::Oauth(_)) {
+                oauth_keys.insert(crate::mcp::auth::cred_key_for(server_name, profile));
+            }
         }
         for reference in mcp_secret_references(server_name, server) {
             all_refs.insert(reference);
@@ -22480,7 +22754,7 @@ pub(super) async fn recover_all_mcp_config_journals(
 /// Validate the reference-only MCP wire projection and normalize a newly
 /// entered literal into the corresponding credential reference.  This runs
 /// before any vault transaction or filesystem write.
-fn validate_and_normalize_mcp_credentials(
+pub(crate) fn validate_and_normalize_mcp_credentials(
     config: &mut crate::mcp::config::McpConfig,
     staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
 ) -> std::result::Result<(), ErrorPayload> {
@@ -22497,73 +22771,21 @@ fn validate_and_normalize_mcp_credentials(
             "server env",
         )?;
 
-        match &mut server.auth {
-            crate::mcp::config::Auth::Header(header) => {
-                if let Some(reference) = &header.credential_ref {
-                    validate_mcp_secret_ref(reference)?;
-                    if staged.contains_key(reference) {
-                        consumed.insert(reference.clone());
-                    }
-                    if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
-                        let value = staged.get(reference).ok_or_else(|| {
-                            bad_request(format!(
-                                "MCP server `{server_name}` header must use a staged secret or reference"
-                            ))
-                        })?;
-                        if value.as_str() != header.value.trim() {
-                            return Err(bad_request(format!(
-                                "MCP server `{server_name}` header literal does not match its staged secret"
-                            )));
-                        }
-                        zeroize::Zeroize::zeroize(&mut header.value);
-                    } else if !header.value.trim().is_empty() {
-                        return Err(bad_request(format!(
-                            "MCP server `{server_name}` header cannot combine an environment reference with a credential reference"
-                        )));
-                    }
-                } else if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
-                    let reference = crate::mcp::auth::header_cred_key(server_name);
-                    let value = staged.get(&reference).ok_or_else(|| {
-                        bad_request(format!(
-                            "MCP server `{server_name}` header value must be a reference or staged secret"
-                        ))
-                    })?;
-                    if value.as_str() != header.value.trim() {
-                        return Err(bad_request(format!(
-                            "MCP server `{server_name}` header literal does not match its staged secret"
-                        )));
-                    }
-                    zeroize::Zeroize::zeroize(&mut header.value);
-                    header.credential_ref = Some(reference.clone());
-                    consumed.insert(reference);
-                }
-            }
-            crate::mcp::config::Auth::Env(env) => {
-                normalize_mcp_env_map(
-                    server_name,
-                    &mut env.vars,
-                    &mut env.credential_refs,
-                    crate::mcp::auth::auth_env_cred_key,
-                    staged,
-                    &mut consumed,
-                    "auth env",
-                )?;
-            }
-            crate::mcp::config::Auth::Oauth(_) | crate::mcp::config::Auth::None => {}
+        normalize_mcp_auth(
+            server_name,
+            crate::mcp::config::DEFAULT_PROFILE,
+            &mut server.auth,
+            staged,
+            &mut consumed,
+        )?;
+        for (profile, auth) in &mut server.profiles {
+            normalize_mcp_auth(server_name, profile, auth, staged, &mut consumed)?;
         }
 
         for reference in server.env_credential_refs.values() {
             validate_mcp_secret_ref(reference)?;
             if staged.contains_key(reference) {
                 consumed.insert(reference.clone());
-            }
-        }
-        if let crate::mcp::config::Auth::Env(env) = &server.auth {
-            for reference in env.credential_refs.values() {
-                validate_mcp_secret_ref(reference)?;
-                if staged.contains_key(reference) {
-                    consumed.insert(reference.clone());
-                }
             }
         }
     }
@@ -22576,11 +22798,84 @@ fn validate_and_normalize_mcp_credentials(
     Ok(())
 }
 
+fn normalize_mcp_auth(
+    server_name: &str,
+    profile: &str,
+    auth: &mut crate::mcp::config::Auth,
+    staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
+    consumed: &mut std::collections::BTreeSet<String>,
+) -> std::result::Result<(), ErrorPayload> {
+    match auth {
+        crate::mcp::config::Auth::Header(header) => {
+            if let Some(reference) = &header.credential_ref {
+                validate_mcp_secret_ref(reference)?;
+                if staged.contains_key(reference) {
+                    consumed.insert(reference.clone());
+                }
+                if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
+                    let value = staged.get(reference).ok_or_else(|| {
+                            bad_request(format!(
+                                "MCP server `{server_name}` header must use a staged secret or reference"
+                            ))
+                        })?;
+                    if value.as_str() != header.value.trim() {
+                        return Err(bad_request(format!(
+                            "MCP server `{server_name}` header literal does not match its staged secret"
+                        )));
+                    }
+                    zeroize::Zeroize::zeroize(&mut header.value);
+                } else if !header.value.trim().is_empty() {
+                    return Err(bad_request(format!(
+                        "MCP server `{server_name}` header cannot combine an environment reference with a credential reference"
+                    )));
+                }
+            } else if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
+                let reference = crate::mcp::auth::header_cred_key_for(server_name, profile);
+                let value = staged.get(&reference).ok_or_else(|| {
+                        bad_request(format!(
+                            "MCP server `{server_name}` header value must be a reference or staged secret"
+                        ))
+                    })?;
+                if value.as_str() != header.value.trim() {
+                    return Err(bad_request(format!(
+                        "MCP server `{server_name}` header literal does not match its staged secret"
+                    )));
+                }
+                zeroize::Zeroize::zeroize(&mut header.value);
+                header.credential_ref = Some(reference.clone());
+                consumed.insert(reference);
+            }
+        }
+        crate::mcp::config::Auth::Env(env) => {
+            normalize_mcp_env_map(
+                server_name,
+                &mut env.vars,
+                &mut env.credential_refs,
+                |server, name| crate::mcp::auth::auth_env_cred_key_for(server, profile, name),
+                staged,
+                &mut consumed,
+                "auth env",
+            )?;
+        }
+        crate::mcp::config::Auth::Oauth(_) | crate::mcp::config::Auth::None => {}
+    }
+
+    if let crate::mcp::config::Auth::Env(env) = auth {
+        for reference in env.credential_refs.values() {
+            validate_mcp_secret_ref(reference)?;
+            if staged.contains_key(reference) {
+                consumed.insert(reference.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_mcp_env_map(
     server_name: &str,
     values: &mut std::collections::BTreeMap<String, String>,
     refs: &mut std::collections::BTreeMap<String, String>,
-    key_fn: fn(&str, &str) -> String,
+    key_fn: impl Fn(&str, &str) -> String,
     staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
     consumed: &mut std::collections::BTreeSet<String>,
     field: &str,
@@ -22750,23 +23045,46 @@ fn mcp_secret_references(
     server_name: &str,
     server: &crate::mcp::config::ServerConfig,
 ) -> std::collections::BTreeSet<String> {
-    let mut refs: std::collections::BTreeSet<String> =
-        server.env_credential_refs.values().cloned().collect();
-    match &server.auth {
-        crate::mcp::config::Auth::Header(header) => {
-            if let Some(name) = &header.credential_ref {
-                refs.insert(name.clone());
+    let mut refs = server
+        .env_credential_refs
+        .values()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for value in server.env.values() {
+        collect_mcp_inline_secret_references(&mut refs, value);
+    }
+    for (profile, auth) in server.iter_auth_profiles() {
+        match auth {
+            crate::mcp::config::Auth::Header(header) => {
+                if let Some(reference) = &header.credential_ref {
+                    refs.insert(reference.clone());
+                }
+                collect_mcp_inline_secret_references(&mut refs, &header.value);
             }
+            crate::mcp::config::Auth::Env(env) => {
+                refs.extend(env.credential_refs.values().cloned());
+                for value in env.vars.values() {
+                    collect_mcp_inline_secret_references(&mut refs, value);
+                }
+            }
+            crate::mcp::config::Auth::Oauth(_) => {
+                refs.insert(crate::mcp::auth::cred_key_for(server_name, profile));
+            }
+            crate::mcp::config::Auth::None => {}
         }
-        crate::mcp::config::Auth::Env(env) => {
-            refs.extend(env.credential_refs.values().cloned());
-        }
-        crate::mcp::config::Auth::Oauth(_) => {
-            refs.insert(crate::mcp::auth::cred_key(server_name));
-        }
-        crate::mcp::config::Auth::None => {}
     }
     refs
+}
+
+fn collect_mcp_inline_secret_references(
+    refs: &mut std::collections::BTreeSet<String>,
+    value: &str,
+) {
+    refs.extend(
+        crate::envref::referenced_names(value)
+            .into_iter()
+            .filter_map(|name| name.strip_prefix("secret:").map(str::to_owned)),
+    );
 }
 
 fn validate_daemon_provider_url(url: &str) -> std::result::Result<(), ErrorPayload> {

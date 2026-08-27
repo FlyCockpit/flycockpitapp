@@ -368,9 +368,12 @@ async fn dispatch(
                         call_args.clone(),
                         None,
                         "mcp.invoke",
-                        super::catalog::connect_context(host).with_profile(entry.profile.clone()),
+                        super::catalog::connect_context(host)
+                            .with_profile(entry.profile.clone())
+                            .with_agent_bound(entry.agent_bound),
                         entry.source,
                         &entry.profile,
+                        entry.agent_bound,
                     )
                     .await
                     {

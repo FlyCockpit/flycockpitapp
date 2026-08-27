@@ -1547,6 +1547,7 @@
   "begin_mcp_oauth": {
     "params": {
       "client_operation_id": "begin-mcp",
+      "profile": "",
       "project_root": "/tmp/project",
       "server": "example"
     },

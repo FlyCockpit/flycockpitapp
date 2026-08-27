@@ -311,6 +311,8 @@ pub enum AuthorizationRequest<'a> {
         input: &'a serde_json::Value,
     },
     ExternalMcpTool {
+        agent: &'a str,
+        profile: &'a str,
         server: &'a str,
         tool: &'a str,
         /// Canonical JSON arguments passed to the third-party tool.
@@ -330,6 +332,8 @@ pub enum AuthorizationRequest<'a> {
     },
     /// Connect to a configured external MCP server before it spawns or egresses.
     McpServerConnect {
+        agent: &'a str,
+        profile: &'a str,
         server: &'a str,
         identity: &'a str,
         agent_bound: bool,
@@ -573,12 +577,14 @@ impl Approver {
                 self.approve_tool_call_inner(label, input).await
             }
             AuthorizationRequest::ExternalMcpTool {
+                agent,
+                profile,
                 server,
                 tool,
                 input,
                 target,
             } => {
-                self.approve_mcp_tool_inner(server, tool, input, target)
+                self.approve_mcp_tool_inner(agent, profile, server, tool, input, target)
                     .await
             }
             AuthorizationRequest::CustomTool {
@@ -591,11 +597,13 @@ impl Approver {
                     .await
             }
             AuthorizationRequest::McpServerConnect {
+                agent,
+                profile,
                 server,
                 identity,
                 agent_bound,
             } => {
-                self.approve_mcp_server_connect_inner(server, identity, agent_bound)
+                self.approve_mcp_server_connect_inner(agent, profile, server, identity, agent_bound)
                     .await
             }
             AuthorizationRequest::FileWrite {

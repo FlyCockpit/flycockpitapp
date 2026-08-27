@@ -309,6 +309,8 @@ impl Approver {
         target: &serde_json::Value,
     ) -> Result<Decision> {
         self.authorize(AuthorizationRequest::ExternalMcpTool {
+            agent: &self.agent_id,
+            profile: crate::mcp::config::DEFAULT_PROFILE,
             server,
             tool,
             input,
@@ -319,6 +321,8 @@ impl Approver {
 
     pub(super) async fn approve_mcp_tool_inner(
         &self,
+        requesting_agent: &str,
+        profile: &str,
         server: &str,
         tool: &str,
         input: &serde_json::Value,
@@ -328,8 +332,8 @@ impl Approver {
             .get("agent_bound")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let agent = agent_bound.then_some(self.agent_id.as_str());
-        let grant_target = crate::approval::store::mcp_tool_key_for(agent, server, tool);
+        let agent = agent_bound.then_some(requesting_agent);
+        let grant_target = crate::approval::store::mcp_tool_key_for(agent, profile, server, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
         if let Some(scope) = self
             .store
@@ -372,12 +376,11 @@ impl Approver {
         }
         let prompt = if agent_bound {
             format!(
-                "`{tool}` on MCP server `{server}` wants to run for agent `{}`. This server is external to cockpit.",
-                self.agent_id
+                "`{tool}` on MCP server `{server}` wants to run for agent `{requesting_agent}` using credential profile `{profile}`. This server is external to cockpit."
             )
         } else {
             format!(
-                "`{tool}` on MCP server `{server}` wants to run. This server is external to cockpit."
+                "`{tool}` on MCP server `{server}` wants to run using credential profile `{profile}`. This server is external to cockpit."
             )
         };
         let question = approval_question(
@@ -426,7 +429,7 @@ impl Approver {
                 ).await.is_err() {
                     Decision::Deny
                 } else {
-                    if let Err(e) = self.store.record_mcp_tool(server, tool, scope).await {
+                    if let Err(e) = self.store.record_mcp_tool_key(&grant_target, scope).await {
                         tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool grant failed; rejecting selected capability");
                         crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
                         Decision::Deny
@@ -442,7 +445,7 @@ impl Approver {
                 ).await.is_err() {
                     Decision::Deny
                 } else {
-                    if let Err(e) = self.store.record_mcp_tool_reject(server, tool, scope).await {
+                    if let Err(e) = self.store.record_mcp_tool_reject_key(&grant_target, scope).await {
                         tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool reject failed; denying once");
                         crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
                     }
@@ -601,12 +604,15 @@ impl Approver {
     /// The grant key includes the resolved, non-secret connection identity.
     pub(super) async fn approve_mcp_server_connect_inner(
         &self,
+        requesting_agent: &str,
+        profile: &str,
         server: &str,
         identity: &str,
         agent_bound: bool,
     ) -> Result<Decision> {
-        let agent = agent_bound.then_some(self.agent_id.as_str());
-        let target = crate::approval::store::mcp_server_connect_key_for(agent, server, identity);
+        let agent = agent_bound.then_some(requesting_agent);
+        let target =
+            crate::approval::store::mcp_server_connect_key_for(agent, profile, server, identity);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
         if let Some(scope) = self.store.mcp_tool_reject_scope_for_key(&target).await {
             let decision = Decision::StandingReject { scope };
@@ -639,7 +645,14 @@ impl Approver {
         {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
-        let prompt = mcp_server_connect_prompt(server, identity);
+        let base_prompt = mcp_server_connect_prompt(server, identity);
+        let prompt = if agent_bound {
+            format!(
+                "{base_prompt} Agent `{requesting_agent}` will use credential profile `{profile}`."
+            )
+        } else {
+            format!("{base_prompt} Credential profile: `{profile}`.")
+        };
         let question = approval_question(
             &target,
             false,
@@ -686,7 +699,7 @@ impl Approver {
                 } else {
                     if let Err(error) = self
                         .store
-                        .record_mcp_server_connect(server, identity, scope)
+                        .record_mcp_server_connect_key(&target, scope)
                         .await
                     {
                         tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect grant failed; rejecting selected capability");
@@ -706,7 +719,7 @@ impl Approver {
                 } else {
                     if let Err(error) = self
                         .store
-                        .record_mcp_server_connect_reject(server, identity, scope)
+                        .record_mcp_server_connect_reject_key(&target, scope)
                         .await
                     {
                         tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect reject failed; denying once");

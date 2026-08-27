@@ -1190,6 +1190,7 @@ pub(super) enum SettingsSaveOutcome {
 }
 
 enum PendingSettingsOperation {
+    GuidanceTrace,
     ExtendedLoad {
         requested_path: String,
         project_root: String,
@@ -1287,6 +1288,11 @@ enum PendingSettingsOperation {
 impl PendingSettingsOperation {
     fn target(&self) -> SettingsEffectTarget {
         match self {
+            Self::GuidanceTrace => SettingsEffectTarget {
+                surface: "settings.guidance-trace",
+                owner: "attached-session".into(),
+                revision: None,
+            },
             Self::ExtendedLoad {
                 requested_path,
                 snapshot_session_id,
@@ -2804,6 +2810,7 @@ pub struct SettingsCx {
     daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
     blocking_effects: VecDeque<SettingsBlockingEffectRequest>,
     pending_settings: BTreeMap<uuid::Uuid, PendingSettingsOperation>,
+    guidance_trace_lines: Vec<String>,
     pending_mcp_oauth: Option<PendingMcpOAuth>,
     pending_mcp_navigation: Option<(String, bool)>,
     completed_mcp_navigation: Option<(String, bool, Result<(), String>)>,
@@ -2953,6 +2960,19 @@ struct ProviderEditAuthority {
 }
 
 impl SettingsCx {
+    fn queue_guidance_trace(&mut self) {
+        let target = SettingsEffectTarget {
+            surface: "settings.guidance-trace",
+            owner: "attached-session".into(),
+            revision: None,
+        };
+        let operation_id = self.enqueue_daemon_work(
+            target,
+            SettingsDaemonEffectWork::Request(Request::GetGuidanceEnablementTrace),
+        );
+        self.pending_settings
+            .insert(operation_id, PendingSettingsOperation::GuidanceTrace);
+    }
     fn authority_operation_pending(&self) -> bool {
         !self.pending_settings.is_empty()
             || !self.daemon_effects.is_empty()
@@ -3524,6 +3544,29 @@ impl SettingsCx {
             return Ok(());
         }
         match pending {
+            PendingSettingsOperation::GuidanceTrace => {
+                self.guidance_trace_lines = match completion.response {
+                    Ok(Response::GuidanceEnablementTrace {
+                        global,
+                        project,
+                        provider,
+                        model,
+                        enabled,
+                        config_generation,
+                    }) => vec![
+                        format!(
+                            "Computer guidance proposals: {} (generation {config_generation})",
+                            if enabled { "enabled" } else { "disabled" }
+                        ),
+                        format!("global: {global:?}"),
+                        format!("project: {project:?}"),
+                        format!("provider: {provider:?}"),
+                        format!("model: {model:?}"),
+                    ],
+                    Ok(other) => vec![format!("Guidance trace unavailable: {other:?}")],
+                    Err(error) => vec![format!("Guidance trace unavailable: {error}")],
+                };
+            }
             PendingSettingsOperation::ExtendedLoad {
                 requested_path,
                 project_root: _,
@@ -6505,7 +6548,9 @@ impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
         let mut settings = Self::open_with_config(config_path, ProvidersConfig::default());
         settings.cx.queue_provider_catalog(None);
+        settings.cx.queue_guidance_trace();
         settings.cx.queue_extended_load();
+        settings.cx.queue_guidance_trace();
         settings
     }
 
@@ -6534,6 +6579,7 @@ impl SettingsDialog {
                 daemon_effects: VecDeque::new(),
                 blocking_effects: VecDeque::new(),
                 pending_settings: BTreeMap::new(),
+                guidance_trace_lines: vec!["Loading daemon guidance trace…".into()],
                 pending_mcp_oauth: None,
                 pending_mcp_navigation: None,
                 completed_mcp_navigation: None,
@@ -6622,6 +6668,7 @@ impl SettingsDialog {
         s.active_project_root = Some(cwd);
         s.cx.queue_provider_catalog(None);
         s.cx.queue_extended_load();
+        s.cx.queue_guidance_trace();
         // `open_with_config` already loaded the exact selected layer together
         // with its opaque revision. Do not replace it with the layered
         // effective projection here: doing so would materialize inherited
@@ -7826,6 +7873,7 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(3),
+        Constraint::Length(7),
     ])
     .split(area);
 
@@ -7868,9 +7916,21 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
             .style(muted_style()),
         rows[2],
     );
+
+    let guidance_lines = cx.guidance_enablement_trace_lines();
+    frame.render_widget(
+        Paragraph::new(guidance_lines.join("\n"))
+            .wrap(Wrap { trim: false })
+            .style(muted_style()),
+        rows[3],
+    );
 }
 
 impl SettingsCx {
+    fn guidance_enablement_trace_lines(&self) -> Vec<String> {
+        self.guidance_trace_lines.clone()
+    }
+
     /// The image-generation session capability snapshot for the active session,
     /// from which the Generation node derives its [`GenerationPrincipal`]. The
     /// TUI settings dialog only runs for the LOCAL owner of this daemon (there

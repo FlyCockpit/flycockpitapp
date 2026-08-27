@@ -14337,6 +14337,68 @@ async fn handle_serialized_request_impl(
             }
         }
 
+        Request::ListGuidanceProposals => {
+            let service = ctx.guidance_proposals.lock().await;
+            Ok(Response::GuidanceProposals {
+                proposals: service.pending_proposals(),
+            })
+        }
+        Request::GetGuidanceEnablementTrace => {
+            let attached = state
+                .attached
+                .as_ref()
+                .ok_or_else(|| invalid("session attachment required"))?;
+            let snapshot = attached.handle.config_snapshot();
+            let active = snapshot.providers.active_model.as_ref();
+            let provider_id = active.map(|value| value.provider.as_str()).unwrap_or("");
+            let model_id = active.map(|value| value.model.as_str()).unwrap_or("");
+            let resolution =
+                crate::computer::guidance::enablement::resolve_guidance_enablement_pinned(
+                    &snapshot.providers,
+                    snapshot.guidance_global_layer,
+                    snapshot.guidance_project_layer,
+                    provider_id,
+                    model_id,
+                );
+            Ok(Response::GuidanceEnablementTrace {
+                global: snapshot.guidance_global_layer,
+                project: snapshot.guidance_project_layer,
+                provider: snapshot
+                    .providers
+                    .providers
+                    .get(provider_id)
+                    .and_then(|value| value.allow_computer_guidance_proposals),
+                model: snapshot
+                    .providers
+                    .providers
+                    .get(provider_id)
+                    .and_then(|value| value.models.get(model_id))
+                    .and_then(|value| value.allow_computer_guidance_proposals),
+                enabled: resolution.enabled,
+                config_generation: snapshot.generation,
+            })
+        }
+        Request::ReviewGuidanceProposal {
+            proposal_id,
+            decision,
+        } => {
+            let mut service = ctx.guidance_proposals.lock().await;
+            let installed = service
+                .review_by_id(
+                    *proposal_id.as_bytes(),
+                    decision,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::GuidanceProposalReviewed {
+                installed_rules: installed
+                    .iter()
+                    .map(crate::computer::guidance::ComputerGuidanceRuleV1::encode)
+                    .collect(),
+            })
+        }
+
         Request::StopDaemon { grace_secs } => {
             tracing::info!(?grace_secs, "StopDaemon requested via client");
             if let Some(secs) = grace_secs {
@@ -16012,6 +16074,18 @@ async fn handle_concurrent_request_impl(
             provider,
             model,
         } => guidance_estimate(&ctx, project_root, provider, model).await,
+        Request::ListGuidanceProposals => {
+            let service = ctx.guidance_proposals.lock().await;
+            Ok(Response::GuidanceProposals {
+                proposals: service.pending_proposals(),
+            })
+        }
+        Request::GetGuidanceEnablementTrace => Err(invalid(
+            "guidance enablement trace requires serialized attached dispatch",
+        )),
+        Request::ReviewGuidanceProposal { .. } => Err(invalid(
+            "guidance proposal review requires serialized local dispatch",
+        )),
         // Owner-only concurrent policy reads. Their ordering is declared
         // `concurrent` in the command table (and asserted by
         // `request_ordering_concurrent_set_is_exactly_the_enumerated_reads`), so
@@ -24958,6 +25032,7 @@ async fn run_docs_ask_pipeline(
     let session = Arc::new(session);
     let spawn_args = crate::engine::builtin::SpawnArgs {
         compiled_guidance: vec![],
+        guidance_compiler: None,
         model,
         params: crate::engine::model::ModelParams {
             additional_params: reasoning_params,

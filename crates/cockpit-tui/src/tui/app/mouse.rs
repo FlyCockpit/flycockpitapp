@@ -393,7 +393,8 @@ impl App {
             | Overlay::Multireview(_)
             | Overlay::Quick(_)
             | Overlay::SessionSetup(_)
-            | Overlay::AgentTree(_) => return,
+            | Overlay::AgentTree(_)
+            | Overlay::GuidanceReview(_) => return,
             Overlay::None => {}
         }
         if self.mouse_capture && self.handle_suggestion_box_mouse(&mouse) {

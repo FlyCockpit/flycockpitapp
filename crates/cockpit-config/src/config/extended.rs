@@ -2132,6 +2132,27 @@ pub struct GuidanceProposalDocLayers {
     pub project: Option<bool>,
 }
 
+/// Project the guidance layer values from the exact retained daemon snapshot
+/// without reopening any path. Snapshot chains are least-to-most specific;
+/// the final layer is the canonical project/explicit layer and preceding
+/// layers contribute to the trusted global slot.
+pub fn guidance_proposal_doc_layers_from_snapshot_chain(
+    chain: &crate::config::WorkspaceConfigLayerSnapshotChain,
+) -> Result<GuidanceProposalDocLayers> {
+    let mut out = GuidanceProposalDocLayers::default();
+    let last = chain.layers.len().saturating_sub(1);
+    for (index, layer) in chain.layers.iter().enumerate() {
+        let doc = extended_doc_from_workspace_snapshot(layer)?;
+        let value = guidance_proposal_field_from_doc(&doc);
+        if index == last {
+            out.project = fold_enablement_value(out.project, value);
+        } else {
+            out.global = fold_enablement_value(out.global, value);
+        }
+    }
+    Ok(out)
+}
+
 /// Fold a newly seen layer value into an accumulated slot, preserving the
 /// sticky-disable-wins / else-enable / else-absent algebra that
 /// `resolve_enablement` applies across layers. Multiple discovered

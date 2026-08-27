@@ -19,17 +19,13 @@
 //! The four `guidance_proposal_*` audit events are emitted through the
 //! [`GuidanceAuditWriter`] trait. The real tamper-evident audit-chain writer is
 //! a separate pending decision (not yet filed as an issue); until it lands a
-//! [`StubGuidanceAuditWriter`] logs a warning and proceeds. The contract
-//! requires fail-closed behavior when a writer is unavailable at create time;
-//! that wiring is deferred with the real writer and marked with `TODO` — it is
-//! intentionally NOT remote/transport work, but it depends on an unfiled
-//! owner scope decision, so it is stubbed here rather than invented.
+//! Until the tamper-evident chain is installed, production uses
+//! [`StubGuidanceAuditWriter`] and proposal creation fails closed.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use super::audit::{AuditEventKind, Disposition, GuidanceScope, domain_digest, domains};
-use super::enablement::resolve_guidance_enablement;
+use super::enablement::resolve_guidance_enablement_pinned;
 use super::lifecycle::{PendingProposalStore, ProposalId, ProposalScopeKey};
 use super::{
     ComputerGuidanceRuleV1, EnablementResolution, PROPOSAL_EXPIRY_SECS_MILLIS, normalize_rationale,
@@ -151,6 +147,13 @@ pub trait GuidanceAuditWriter: Send + Sync {
     /// check this before changing durable state; `append` remains authoritative
     /// because availability can change between the two calls.
     fn is_available(&self) -> bool {
+        true
+    }
+
+    /// Whether this adapter can deliver into the final audit chain now. A
+    /// durable-outbox-only adapter remains available for safe commits but
+    /// leaves rows pending.
+    fn delivers_immediately(&self) -> bool {
         true
     }
 
@@ -361,9 +364,28 @@ pub enum TransitionProposalError {
 /// - the audit writer (stub until the real chain lands).
 pub struct GuidanceProposalService {
     pending: PendingProposalStore,
-    accepted: AcceptedRulesStore,
+    accepted: Arc<AcceptedRulesStore>,
     db: Arc<Db>,
     audit: Arc<dyn GuidanceAuditWriter>,
+}
+
+#[derive(Clone)]
+pub struct GuidanceCompiler {
+    accepted: Arc<AcceptedRulesStore>,
+    session_id: [u8; 16],
+}
+
+impl GuidanceCompiler {
+    pub fn compile(&self, cwd: &std::path::Path, provider_id: &str, model_id: &str) -> Vec<u8> {
+        let project = canonical_project_digest(cwd.as_os_str().as_encoded_bytes());
+        let provider = provider_digest(provider_id);
+        let model = model_digest(provider_id, model_id);
+        let session = self
+            .accepted
+            .session_rules(&self.session_id, &project, &provider, &model);
+        let persistent = self.accepted.persistent_rules(&project, &provider, &model);
+        super::compose_and_compile(&session, &persistent)
+    }
 }
 
 /// The enablement resolution plus the config generation it was resolved under,
@@ -374,12 +396,65 @@ pub struct GuidanceEnablementTrace {
     pub config_generation: u64,
 }
 
+/// Trusted, generation-pinned create authority resolved once at the daemon
+/// worker boundary. Lifecycle code never reopens config files or resolves a
+/// second generation beneath that boundary.
+#[derive(Debug, Clone)]
+pub struct GuidanceCreateSnapshot {
+    pub enablement: GuidanceEnablementTrace,
+    pub project_digest: [u8; 32],
+    pub provider_digest: [u8; 32],
+    pub model_digest: [u8; 32],
+}
+
 impl GuidanceProposalService {
+    pub fn pending_proposals(&self) -> Vec<cockpit_proto::PendingGuidanceProposal> {
+        self.pending
+            .proposals()
+            .map(|(_, proposal)| cockpit_proto::PendingGuidanceProposal {
+                proposal_id: uuid::Uuid::from_bytes(proposal.proposal_id.0),
+                rules: proposal
+                    .rules
+                    .iter()
+                    .map(ComputerGuidanceRuleV1::encode)
+                    .collect(),
+                rationale: proposal.rationale.clone(),
+                expires_at_unix_secs: proposal.expires_at,
+            })
+            .collect()
+    }
+
+    pub async fn review_by_id(
+        &mut self,
+        proposal_id: [u8; 16],
+        decision: cockpit_proto::GuidanceProposalDecision,
+        now_unix_ms: i64,
+    ) -> Result<Vec<ComputerGuidanceRuleV1>, TransitionProposalError> {
+        let scope = self
+            .pending
+            .proposals()
+            .find(|(_, proposal)| proposal.proposal_id.0 == proposal_id)
+            .map(|(scope, _)| scope.clone())
+            .ok_or(TransitionProposalError::NotFound)?;
+        match decision {
+            cockpit_proto::GuidanceProposalDecision::Reject => {
+                self.reject(&scope, proposal_id, now_unix_ms).await?;
+                Ok(Vec::new())
+            }
+            cockpit_proto::GuidanceProposalDecision::AcceptSession => {
+                self.accept_session(&scope, proposal_id, now_unix_ms).await
+            }
+            cockpit_proto::GuidanceProposalDecision::AcceptPersistent => {
+                self.accept_persistent(&scope, proposal_id, now_unix_ms)
+                    .await
+            }
+        }
+    }
     /// Construct a service backed by `db` and the stub audit writer.
     pub fn new(db: Arc<Db>) -> Self {
         Self {
             pending: PendingProposalStore::new(),
-            accepted: AcceptedRulesStore::new(),
+            accepted: Arc::new(AcceptedRulesStore::new()),
             db,
             audit: Arc::new(StubGuidanceAuditWriter),
         }
@@ -390,10 +465,116 @@ impl GuidanceProposalService {
     pub fn with_audit_writer(db: Arc<Db>, audit: Arc<dyn GuidanceAuditWriter>) -> Self {
         Self {
             pending: PendingProposalStore::new(),
-            accepted: AcceptedRulesStore::new(),
+            accepted: Arc::new(AcceptedRulesStore::new()),
             db,
             audit,
         }
+    }
+
+    pub fn compiler(&self, session_id: [u8; 16]) -> GuidanceCompiler {
+        GuidanceCompiler {
+            accepted: self.accepted.clone(),
+            session_id,
+        }
+    }
+
+    /// Reload machine-local persistent rules during daemon boot. Session rules
+    /// intentionally have no durable representation.
+    pub async fn reload_persistent_rules(&self) -> anyhow::Result<usize> {
+        let rows = self.db.load_persistent_guidance_rules().await?;
+        let mut loaded = 0;
+        for (project, provider, model, encoded) in rows {
+            let project_digest = parse_hex32(&project)
+                .ok_or_else(|| anyhow::anyhow!("invalid stored guidance project digest"))?;
+            let provider_digest = parse_hex32(&provider)
+                .ok_or_else(|| anyhow::anyhow!("invalid stored guidance provider digest"))?;
+            let model_digest = parse_hex32(&model)
+                .ok_or_else(|| anyhow::anyhow!("invalid stored guidance model digest"))?;
+            let rule = ComputerGuidanceRuleV1::decode(&encoded)?;
+            self.accepted.install_persistent(
+                PersistentRuleKey {
+                    project_digest,
+                    provider_digest,
+                    model_digest,
+                },
+                vec![rule],
+            );
+            loaded += 1;
+        }
+        Ok(loaded)
+    }
+
+    /// Retry every audit event left in the durable outbox by an append error
+    /// or daemon crash. Delivery marking is idempotent; the audit writer must
+    /// use the proposal/state identity for append deduplication.
+    pub async fn flush_audit_outbox(&self, now_unix_ms: i64) -> anyhow::Result<usize> {
+        if !self.audit.delivers_immediately() {
+            return Ok(0);
+        }
+        let pending = self.db.pending_guidance_proposal_audits().await?;
+        let mut delivered = 0;
+        for item in pending {
+            let row = &item.receipt;
+            let accepted_scope = item.event_accepted_scope;
+            let kind = match item.event_state {
+                GuidanceProposalReceiptState::Created => AuditEventKind::GuidanceProposalCreated,
+                GuidanceProposalReceiptState::Accepted => AuditEventKind::GuidanceProposalAccepted,
+                GuidanceProposalReceiptState::Rejected => AuditEventKind::GuidanceProposalRejected,
+                GuidanceProposalReceiptState::Expired
+                | GuidanceProposalReceiptState::ExpiredOnRestart => {
+                    AuditEventKind::GuidanceProposalExpired
+                }
+            };
+            let event = GuidanceAuditEvent {
+                kind,
+                proposal_id: parse_hex16(&row.proposal_id)
+                    .ok_or_else(|| anyhow::anyhow!("invalid receipt proposal id"))?,
+                session_id: parse_hex16(&row.session_id)
+                    .ok_or_else(|| anyhow::anyhow!("invalid receipt session id"))?,
+                delegation_id: parse_hex16(&row.delegation_id)
+                    .ok_or_else(|| anyhow::anyhow!("invalid receipt delegation id"))?,
+                canonical_project_digest: parse_hex32(&row.canonical_project_digest)
+                    .ok_or_else(|| anyhow::anyhow!("invalid receipt project digest"))?,
+                provider_digest: parse_hex32(&row.provider_digest)
+                    .ok_or_else(|| anyhow::anyhow!("invalid receipt provider digest"))?,
+                model_digest: parse_hex32(&row.model_digest)
+                    .ok_or_else(|| anyhow::anyhow!("invalid receipt model digest"))?,
+                config_generation: u64::try_from(row.config_generation)?,
+                rule_kind_bits: u16::try_from(row.rule_kind_bits)?,
+                disposition: match item.event_state {
+                    GuidanceProposalReceiptState::Accepted => match accepted_scope {
+                        Some(GuidanceProposalAcceptedScope::Session) => {
+                            Some(Disposition::AcceptedSession)
+                        }
+                        Some(GuidanceProposalAcceptedScope::Persistent) => {
+                            Some(Disposition::AcceptedPersistent)
+                        }
+                        None => anyhow::bail!("accepted guidance audit lacks scope"),
+                    },
+                    GuidanceProposalReceiptState::Rejected => Some(Disposition::Rejected),
+                    GuidanceProposalReceiptState::Expired
+                    | GuidanceProposalReceiptState::ExpiredOnRestart => Some(Disposition::Expired),
+                    GuidanceProposalReceiptState::Created => None,
+                },
+                scope: match accepted_scope {
+                    Some(GuidanceProposalAcceptedScope::Session) => Some(GuidanceScope::Session),
+                    Some(GuidanceProposalAcceptedScope::Persistent) => {
+                        Some(GuidanceScope::ProjectProviderModel)
+                    }
+                    None => None,
+                },
+            };
+            self.audit.append(&event)?;
+            self.db
+                .mark_guidance_proposal_audit_delivered(
+                    &row.proposal_id,
+                    item.event_state,
+                    now_unix_ms,
+                )
+                .await?;
+            delivered += 1;
+        }
+        Ok(delivered)
     }
 
     /// Borrow the pending-proposal store (for the review UI to read typed
@@ -402,18 +583,29 @@ impl GuidanceProposalService {
         &self.pending
     }
 
-    /// Resolve the enablement trace for `(cwd, provider_id, model_id)` (AC2).
-    pub fn enablement_trace(
+    pub fn resolve_create_snapshot(
         &self,
         providers: &crate::config::providers::ProvidersConfig,
-        cwd: &Path,
+        global: Option<bool>,
+        project: Option<bool>,
         provider_id: &str,
         model_id: &str,
-    ) -> GuidanceEnablementTrace {
-        let resolution = resolve_guidance_enablement(providers, cwd, provider_id, model_id);
-        GuidanceEnablementTrace {
-            config_generation: providers.resolution_generation.max(1),
-            resolution,
+        project_identity: &[u8],
+    ) -> GuidanceCreateSnapshot {
+        GuidanceCreateSnapshot {
+            enablement: GuidanceEnablementTrace {
+                resolution: resolve_guidance_enablement_pinned(
+                    providers,
+                    global,
+                    project,
+                    provider_id,
+                    model_id,
+                ),
+                config_generation: providers.resolution_generation.max(1),
+            },
+            project_digest: canonical_project_digest(project_identity),
+            provider_digest: provider_digest(provider_id),
+            model_digest: model_digest(provider_id, model_id),
         }
     }
 
@@ -436,11 +628,7 @@ impl GuidanceProposalService {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_proposal(
         &mut self,
-        providers: &crate::config::providers::ProvidersConfig,
-        cwd: &Path,
-        provider_id: &str,
-        model_id: &str,
-        project_identity: &[u8],
+        snapshot: GuidanceCreateSnapshot,
         session_id: [u8; 16],
         delegation_id: [u8; 16],
         proposal_id: [u8; 16],
@@ -448,9 +636,8 @@ impl GuidanceProposalService {
         rationale: Option<String>,
         now_unix_ms: i64,
     ) -> Result<(), CreateProposalError> {
-        let enablement = self.enablement_trace(providers, cwd, provider_id, model_id);
         // 1. Enablement gate (AC11).
-        if !enablement.resolution.enabled {
+        if !snapshot.enablement.resolution.enabled {
             return Err(CreateProposalError::Disabled);
         }
 
@@ -463,9 +650,9 @@ impl GuidanceProposalService {
             None => None,
         };
 
-        let project_d = canonical_project_digest(project_identity);
-        let provider_d = provider_digest(provider_id);
-        let model_d = model_digest(provider_id, model_id);
+        let project_d = snapshot.project_digest;
+        let provider_d = snapshot.provider_digest;
+        let model_d = snapshot.model_digest;
         let key = ProposalScopeKey {
             session_id,
             delegation_id,
@@ -497,7 +684,7 @@ impl GuidanceProposalService {
             canonical_project_digest: &hex32(&project_d),
             provider_digest: &hex32(&provider_d),
             model_digest: &hex32(&model_d),
-            config_generation: enablement.config_generation as i64,
+            config_generation: snapshot.enablement.config_generation as i64,
             rule_kind_bits: rule_kind_bits as i64,
             created_at_unix_ms: now_unix_ms,
             expires_at_unix_ms,
@@ -527,24 +714,23 @@ impl GuidanceProposalService {
             canonical_project_digest: project_d,
             provider_digest: provider_d,
             model_digest: model_d,
-            config_generation: enablement.config_generation,
+            config_generation: snapshot.enablement.config_generation,
             rule_kind_bits,
             disposition: None,
             scope: None,
         };
-        if let Err(e) = self.audit.append(&audit_event) {
-            // Fail closed: remove the unaudited receipt and restore both quota
-            // counters in one transaction. Nothing is installed in memory.
-            self.db
-                .rollback_created_guidance_proposal_receipt(&hex16(&proposal_id))
+        if self.audit.delivers_immediately() && self.audit.append(&audit_event).is_ok() {
+            if let Err(error) = self
+                .db
+                .mark_guidance_proposal_audit_delivered(
+                    &hex16(&proposal_id),
+                    GuidanceProposalReceiptState::Created,
+                    now_unix_ms,
+                )
                 .await
-                .map_err(|rollback| {
-                    CreateProposalError::Storage(format!(
-                        "audit unavailable ({e}); durable rollback failed: {rollback}"
-                    ))
-                })?;
-            self.pending.release(&key, pid);
-            return Err(CreateProposalError::AuditUnavailable(e.to_string()));
+            {
+                tracing::warn!(%error, "guidance created audit delivery mark remains retryable");
+            }
         }
 
         // 6. Install typed values + rationale into memory.
@@ -641,23 +827,50 @@ impl GuidanceProposalService {
 
         // Durable CAS: created -> accepted.
         let proposal_id_str = hex16(&proposal_id);
-        let applied = self
-            .db
-            .cas_guidance_proposal_receipt_state(
-                &proposal_id_str,
-                GuidanceProposalReceiptState::Created,
-                GuidanceProposalReceiptState::Accepted,
-                Some(accepted_scope),
-                Some(now_unix_ms),
-            )
-            .await
-            .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
+        let applied = if accepted_scope == GuidanceProposalAcceptedScope::Persistent {
+            self.db
+                .accept_persistent_guidance_proposal(
+                    &proposal_id_str,
+                    &hex32(&scope.project_digest),
+                    &hex32(&scope.provider_digest),
+                    &hex32(&scope.model_digest),
+                    proposal
+                        .rules
+                        .iter()
+                        .map(ComputerGuidanceRuleV1::encode)
+                        .collect(),
+                    now_unix_ms,
+                )
+                .await
+                .map_err(|e| TransitionProposalError::Storage(e.to_string()))?
+        } else {
+            self.db
+                .cas_guidance_proposal_receipt_state(
+                    &proposal_id_str,
+                    GuidanceProposalReceiptState::Created,
+                    GuidanceProposalReceiptState::Accepted,
+                    Some(accepted_scope),
+                    Some(now_unix_ms),
+                )
+                .await
+                .map_err(|e| TransitionProposalError::Storage(e.to_string()))?
+        };
         if !applied {
             return Err(TransitionProposalError::CasConflict {
                 expected: GuidanceProposalReceiptState::Created,
             });
         }
 
+        // Build terminal audit metadata from the creation receipt, preserving
+        // the generation and rule-kind bitset stamped at proposal creation.
+        let receipt = self
+            .db
+            .guidance_proposal_receipt(&proposal_id_str)
+            .await
+            .map_err(|e| TransitionProposalError::Storage(e.to_string()))?
+            .ok_or(TransitionProposalError::NotFound)?;
+
+        let rules = proposal.rules.clone();
         // Audit append.
         let (disp, gscope) = match accepted_scope {
             GuidanceProposalAcceptedScope::Session => {
@@ -676,28 +889,34 @@ impl GuidanceProposalService {
             canonical_project_digest: scope.project_digest,
             provider_digest: scope.provider_digest,
             model_digest: scope.model_digest,
-            config_generation: 0,
-            rule_kind_bits: validate_proposal(&proposal.rules).unwrap_or(0),
+            config_generation: receipt.config_generation as u64,
+            rule_kind_bits: receipt.rule_kind_bits as u16,
             disposition: Some(disp),
             scope: Some(gscope),
         };
-        if let Err(e) = self.audit.append(&audit_event) {
-            // Best-effort rollback of the CAS so the receipt does not lie.
-            let _ = self
-                .db
-                .cas_guidance_proposal_receipt_state(
-                    &proposal_id_str,
-                    GuidanceProposalReceiptState::Accepted,
-                    GuidanceProposalReceiptState::Rejected,
-                    None,
-                    Some(now_unix_ms),
-                )
-                .await;
-            return Err(TransitionProposalError::AuditUnavailable(e.to_string()));
-        }
+        let audit_error = if !self.audit.delivers_immediately() {
+            None
+        } else {
+            match self.audit.append(&audit_event) {
+                Ok(()) => {
+                    if let Err(error) = self
+                        .db
+                        .mark_guidance_proposal_audit_delivered(
+                            &proposal_id_str,
+                            GuidanceProposalReceiptState::Accepted,
+                            now_unix_ms,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, "guidance accepted audit delivery mark remains retryable");
+                    }
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            }
+        };
 
         // Install the accepted rules into the accepted-rules store.
-        let rules = proposal.rules.clone();
         match accepted_scope {
             GuidanceProposalAcceptedScope::Session => {
                 let key = SessionRuleKey {
@@ -720,6 +939,9 @@ impl GuidanceProposalService {
 
         // Drop memory (rationale + typed values gone).
         self.pending.remove_committed(scope, pid);
+        if let Some(error) = audit_error {
+            tracing::warn!(%error, proposal_id = %proposal_id_str, "accepted guidance audit delivery deferred to durable outbox");
+        }
         Ok(rules)
     }
 
@@ -775,6 +997,12 @@ impl GuidanceProposalService {
             });
         }
 
+        let receipt = self
+            .db
+            .guidance_proposal_receipt(&proposal_id_str)
+            .await
+            .map_err(|e| TransitionProposalError::Storage(e.to_string()))?
+            .ok_or(TransitionProposalError::NotFound)?;
         let audit_event = GuidanceAuditEvent {
             kind: AuditEventKind::GuidanceProposalRejected,
             proposal_id,
@@ -783,16 +1011,34 @@ impl GuidanceProposalService {
             canonical_project_digest: scope.project_digest,
             provider_digest: scope.provider_digest,
             model_digest: scope.model_digest,
-            config_generation: 0,
-            rule_kind_bits: 0,
+            config_generation: receipt.config_generation as u64,
+            rule_kind_bits: receipt.rule_kind_bits as u16,
             disposition: Some(Disposition::Rejected),
             scope: None,
         };
-        if let Err(e) = self.audit.append(&audit_event) {
-            return Err(TransitionProposalError::AuditUnavailable(e.to_string()));
-        }
+        let audit_error = if !self.audit.delivers_immediately() {
+            None
+        } else {
+            match self.audit.append(&audit_event) {
+                Ok(()) => {
+                    self.db
+                        .mark_guidance_proposal_audit_delivered(
+                            &proposal_id_str,
+                            GuidanceProposalReceiptState::Rejected,
+                            now_unix_ms,
+                        )
+                        .await
+                        .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            }
+        };
 
         self.pending.remove_committed(scope, pid);
+        if let Some(error) = audit_error {
+            tracing::warn!(%error, proposal_id = %proposal_id_str, "rejected guidance audit delivery deferred to durable outbox");
+        }
         Ok(())
     }
 
@@ -1027,9 +1273,14 @@ impl GuidanceProposalService {
                 _ => None,
             },
         };
-        self.audit
-            .append(&event)
-            .map_err(|e| TransitionProposalError::AuditUnavailable(e.to_string()))?;
+        if self.audit.delivers_immediately() && self.audit.append(&event).is_ok() {
+            self.db
+                .mark_guidance_proposal_audit_delivered(proposal_id_str, to, now_unix_ms)
+                .await
+                .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
+        }
+        // An append failure is recoverable from the durable outbox and must
+        // not retain typed/rationale memory after the terminal CAS.
         Ok(true)
     }
 }
@@ -1082,23 +1333,21 @@ mod tests {
         cfg
     }
 
+    fn snapshot(
+        svc: &GuidanceProposalService,
+        providers: &crate::config::providers::ProvidersConfig,
+        model: &str,
+        project: &[u8],
+    ) -> GuidanceCreateSnapshot {
+        svc.resolve_create_snapshot(providers, None, None, "p", model, project)
+    }
+
     #[tokio::test]
     async fn create_denied_when_disabled_with_zero_side_effects() {
         let mut svc = fresh_service();
+        let create = snapshot(&svc, &providers_disabled(), "m", b"project");
         let err = svc
-            .create_proposal(
-                &providers_disabled(),
-                Path::new("/x"),
-                "p",
-                "m",
-                b"project",
-                id16(1),
-                id16(2),
-                id16(9),
-                vec![rule()],
-                None,
-                1000,
-            )
+            .create_proposal(create, id16(1), id16(2), id16(9), vec![rule()], None, 1000)
             .await
             .unwrap_err();
         assert_eq!(err, CreateProposalError::Disabled);
@@ -1110,12 +1359,9 @@ mod tests {
     #[tokio::test]
     async fn create_succeeds_when_enabled_and_installs_memory() {
         let mut svc = fresh_service();
+        let create = snapshot(&svc, &providers_enabled(), "m", b"project");
         svc.create_proposal(
-            &providers_enabled(),
-            Path::new("/x"),
-            "p",
-            "m",
-            b"project",
+            create,
             id16(1),
             id16(2),
             id16(9),
@@ -1135,12 +1381,9 @@ mod tests {
         let mut svc = fresh_service();
         for n in 1..=3u8 {
             let model = format!("m{n}");
+            let create = snapshot(&svc, &providers_enabled(), &model, b"project");
             svc.create_proposal(
-                &providers_enabled(),
-                Path::new("/x"),
-                "p",
-                &model,
-                b"project",
+                create,
                 id16(1),
                 id16(2),
                 id16(n),
@@ -1151,20 +1394,9 @@ mod tests {
             .await
             .unwrap();
         }
+        let create = snapshot(&svc, &providers_enabled(), "m", b"project");
         let err = svc
-            .create_proposal(
-                &providers_enabled(),
-                Path::new("/x"),
-                "p",
-                "m",
-                b"project",
-                id16(1),
-                id16(2),
-                id16(10),
-                vec![rule()],
-                None,
-                2000,
-            )
+            .create_proposal(create, id16(1), id16(2), id16(10), vec![rule()], None, 2000)
             .await
             .unwrap_err();
         assert!(matches!(err, CreateProposalError::CapExceeded(_)));
@@ -1176,12 +1408,9 @@ mod tests {
     #[tokio::test]
     async fn expiry_drops_memory_and_cas_receipt() {
         let mut svc = fresh_service();
+        let create = snapshot(&svc, &providers_enabled(), "m", b"project");
         svc.create_proposal(
-            &providers_enabled(),
-            Path::new("/x"),
-            "p",
-            "m",
-            b"project",
+            create,
             id16(1),
             id16(2),
             id16(9),
@@ -1213,12 +1442,9 @@ mod tests {
             provider_digest: provider,
             model_digest: model,
         };
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
         svc.create_proposal(
-            &providers_enabled(),
-            Path::new("/x"),
-            "p",
-            "m",
-            b"proj",
+            create,
             id16(1),
             id16(2),
             id16(9),
@@ -1243,12 +1469,9 @@ mod tests {
             provider_digest: provider,
             model_digest: model,
         };
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
         svc.create_proposal(
-            &providers_enabled(),
-            Path::new("/x"),
-            "p",
-            "m",
-            b"proj",
+            create,
             id16(1),
             id16(3),
             id16(8),
@@ -1295,21 +1518,10 @@ mod tests {
             db.clone(),
             Arc::new(Recording(recorded.clone())),
         );
-        svc.create_proposal(
-            &providers_enabled(),
-            Path::new("/x"),
-            "p",
-            "m",
-            b"proj",
-            id16(1),
-            id16(2),
-            id16(9),
-            vec![rule()],
-            None,
-            1000,
-        )
-        .await
-        .unwrap();
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        svc.create_proposal(create, id16(1), id16(2), id16(9), vec![rule()], None, 1000)
+            .await
+            .unwrap();
         let before = svc.delegation_counter(&id16(2)).await.unwrap();
         assert_eq!(before, 1);
 

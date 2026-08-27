@@ -1939,6 +1939,23 @@ pub use response::{
 #[cfg(feature = "remote")]
 pub use response::{RemoteGoalOutcomeV1, RemoteOperationStateV1, RemoteOperationStatusV1};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidanceProposalDecision {
+    Reject,
+    AcceptSession,
+    AcceptPersistent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingGuidanceProposal {
+    pub proposal_id: Uuid,
+    pub rules: Vec<[u8; 3]>,
+    pub rationale: Option<String>,
+    pub expires_at_unix_secs: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeRepairState {
     pub session_id: Uuid,

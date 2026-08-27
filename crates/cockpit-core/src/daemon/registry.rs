@@ -174,6 +174,8 @@ pub struct SessionRegistry {
 
 struct Inner {
     db: Db,
+    guidance_proposals:
+        Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     locks: Arc<LockManager>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
@@ -615,6 +617,11 @@ impl SessionRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                guidance_proposals: Arc::new(tokio::sync::Mutex::new(
+                    crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                        db.clone(),
+                    )),
+                )),
                 db,
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
@@ -644,6 +651,12 @@ impl SessionRegistry {
                 host_capability_probes: Mutex::new(None),
             }),
         }
+    }
+
+    pub(crate) fn guidance_proposals(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>> {
+        self.inner.guidance_proposals.clone()
     }
 
     pub fn set_host_capabilities(
@@ -1831,6 +1844,7 @@ impl SessionRegistry {
         let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));
         let (handle, join, start_permit) = session_worker::spawn(
             session,
+            self.guidance_proposals(),
             self.inner.locks.clone(),
             redact,
             model,
@@ -1863,6 +1877,11 @@ impl SessionRegistry {
                 )
                 .with_trust_revision(trust_revision)
                 .with_retained_provider_model_sources(&workspace_layer)?
+                .with_guidance_doc_layers(
+                    crate::config::extended::guidance_proposal_doc_layers_from_snapshot_chain(
+                        &workspace_layer,
+                    )?,
+                )
                 .with_host_capabilities(self.current_host_capabilities());
                 match self.host_capability_refresh_runtime() {
                     Some(runtime) => snapshot.with_host_capability_refresh_runtime(runtime),

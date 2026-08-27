@@ -1025,6 +1025,10 @@ pub struct Driver {
     /// config for the driver and every `ToolCtx` it builds; installed by the
     /// worker via [`Self::set_config_handle`] before the loop starts.
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_proposals: Option<
+        Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
+    >,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     pub stack: Vec<AgentSession>,
     /// Completion acknowledgements for durable late steers queued for an exact
     /// interactive target. Keyed by the queue item's UUID, so a reused display
@@ -1735,6 +1739,38 @@ fn subagent_routing_event_data(
 const JOB_CHANNEL_CAPACITY: usize = 256;
 
 impl Driver {
+    pub fn set_guidance_proposal_service(
+        &mut self,
+        service: Arc<
+            tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+        >,
+    ) {
+        self.guidance_proposals = Some(service);
+    }
+
+    pub fn set_guidance_compiler(
+        &mut self,
+        compiler: crate::computer::guidance::service::GuidanceCompiler,
+    ) {
+        self.guidance_compiler = Some(compiler);
+    }
+
+    pub async fn invalidate_guidance_session(&self) {
+        let Some(service) = &self.guidance_proposals else {
+            return;
+        };
+        let session_id = *self.session.id.as_bytes();
+        let mut service = service.lock().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Err(error) = service
+            .invalidate(|scope| scope.session_id == session_id, now)
+            .await
+        {
+            tracing::warn!(%error, "guidance session invalidation deferred");
+        }
+        service.clear_session_rules(&session_id);
+    }
+
     async fn handle_retained_native_computer_items(&mut self, metadata: &mut BackupTurnMetadata) {
         if metadata.native_computer_items.is_empty() {
             return;
@@ -1748,10 +1784,61 @@ impl Driver {
         else {
             return;
         };
+        match computer_native::extract_guidance_proposal_candidate(&raw_items) {
+            Ok(Some(candidate)) => {
+                let result = async {
+                    let service = self
+                        .guidance_proposals
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("guidance proposal service unavailable"))?;
+                    let delegation_id = uuid::Uuid::parse_str(&coordinator.delegation_id().0)
+                        .map_err(|_| {
+                            anyhow::anyhow!("computer delegation lacks a UUID authority binding")
+                        })?;
+                    let pinned = self.config.snapshot();
+                    let snapshot = service.lock().await.resolve_create_snapshot(
+                        &pinned.providers,
+                        pinned.guidance_global_layer,
+                        pinned.guidance_project_layer,
+                        &coordinator.provider_id().0,
+                        &coordinator.model_id().0,
+                        self.cwd.as_os_str().as_encoded_bytes(),
+                    );
+                    service
+                        .lock()
+                        .await
+                        .create_proposal(
+                            snapshot,
+                            *self.session.id.as_bytes(),
+                            *delegation_id.as_bytes(),
+                            *uuid::Uuid::new_v4().as_bytes(),
+                            candidate.rules,
+                            candidate.rationale,
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                        .map_err(anyhow::Error::from)
+                }
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(%error, "computer guidance proposal denied");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "invalid computer guidance proposal denied"),
+        }
+        let action_items: Vec<_> = raw_items
+            .iter()
+            .filter(|item| {
+                item.get("type").and_then(serde_json::Value::as_str)
+                    != Some("computer_guidance_proposal")
+            })
+            .cloned()
+            .collect();
         let wire = computer_native::handle_retained_native_computer_items(
             coordinator,
             contract,
-            raw_items,
+            action_items,
         )
         .await;
         if wire.is_empty() {
@@ -1892,6 +1979,8 @@ impl Driver {
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
+            guidance_proposals: None,
+            guidance_compiler: None,
             agent: self.stack[0].agent.clone(),
             write_scope: self.write_scope.clone(),
         };
@@ -2229,6 +2318,8 @@ impl Driver {
             redact: redact.clone(),
             cwd: cwd.clone(),
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            guidance_proposals: None,
+            guidance_compiler: None,
             agent: root.clone(),
             // Installed later by `set_write_scope_source`; the authority's copy
             // is updated through the same setter.
@@ -6838,6 +6929,22 @@ impl Driver {
         subagent_id: Option<&str>,
         end_reason: &str,
     ) {
+        if let (Some(service), Some(id)) = (&self.guidance_proposals, subagent_id)
+            && let Ok(delegation_id) = uuid::Uuid::parse_str(id)
+        {
+            let now = chrono::Utc::now().timestamp_millis();
+            if let Err(error) = service
+                .lock()
+                .await
+                .invalidate(
+                    |scope| scope.delegation_id == *delegation_id.as_bytes(),
+                    now,
+                )
+                .await
+            {
+                tracing::warn!(%error, %delegation_id, "guidance delegation invalidation deferred");
+            }
+        }
         let snapshot = self.config.snapshot();
         let mut discarded = crate::engine::agent::hooks::StopGateState::default();
         let _ = crate::engine::agent::hooks::run_stop_hooks(
@@ -12189,6 +12296,7 @@ impl Driver {
         }
         crate::engine::builtin::SpawnArgs {
             compiled_guidance: vec![],
+            guidance_compiler: self.guidance_compiler.clone(),
             model: self.stack[0].agent.model.clone(),
             params,
             env_overlay: self.stack[0].agent.env_overlay.clone(),

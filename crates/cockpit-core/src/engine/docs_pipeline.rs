@@ -185,7 +185,6 @@ pub async fn run(
     // question. The cwd-parameterized spawn: clone the resolver's
     // SpawnArgs and override only `cwd`.
     let answerer_args = SpawnArgs {
-        compiled_guidance: vec![],
         cwd: resolved.path.clone(),
         ..spawn_args.clone()
     };

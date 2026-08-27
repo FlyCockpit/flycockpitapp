@@ -5,20 +5,20 @@
 //! auto-link, no rich text), and dispatches the three review actions: reject,
 //! accept session, accept persistent.
 //!
-//! ## Scope boundary
-//!
-//! The typed rules are displayed as code-owned kind labels only — never the
-//! raw rationale bytes are interpreted as markup. Accepting/rejecting crosses
-//! a daemon RPC (the [`GuidanceProposalService`] owns the durable CAS + audit
-//! + rule install). The production dispatcher wiring over the daemon wire
-//! protocol is transport work deferred past the local launch scope; until it
-//! lands the action handlers are stubbed with `TODO` and the review surface is
-//! inert. The pure presentation + action-routing logic here is unit-tested so
-//! the UI contract (text-only rationale; three action paths) is locked in.
+//! The typed rules are displayed as code-owned kind labels only. Review crosses
+//! the owner-only daemon RPC; a successful list response is therefore also the
+//! UI's authority proof for exposing mutation keys.
 //!
 //! [`GuidanceProposalService`]: cockpit_core::computer::guidance::service::GuidanceProposalService
 
 use cockpit_core::computer::guidance::{ComputerGuidanceRuleV1, RuleKind};
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+use std::sync::{Arc, Mutex};
 
 /// A pending proposal presented to the reviewer. The rationale is the already
 /// normalized inert plaintext (see
@@ -146,34 +146,228 @@ pub fn apply_review_action(
     }
 }
 
-/// TODO(daemon-rpc): production dispatcher over the daemon wire protocol.
-/// Until the proposal-review RPCs land (deferred transport work past the local
-/// launch scope), the review surface is inert. This stub returns an
-/// unavailable outcome so the UI never silently mutates durable state.
-#[derive(Debug, Default)]
-pub struct StubGuidanceReviewDispatcher;
+pub struct DaemonGuidanceReviewDispatcher {
+    client: cockpit_client::DaemonClient,
+}
 
-impl GuidanceReviewDispatcher for StubGuidanceReviewDispatcher {
-    fn reject(&self, _proposal_id: &[u8; 16]) -> anyhow::Result<()> {
-        Err(anyhow::anyhow!(
-            "guidance proposal review RPC not yet wired (deferred transport work)"
-        ))
+type LoadResult = Result<Vec<GuidanceReviewProposal>, String>;
+
+/// Reachable `/guidance` review overlay. Network work is performed off the
+/// reducer thread and each successful mutation refreshes the authoritative
+/// daemon list before another action can be taken.
+pub struct GuidanceReviewPane {
+    lifecycle: cockpit_client::LifecycleClient,
+    proposals: Vec<GuidanceReviewProposal>,
+    selected: usize,
+    owner_authorized: bool,
+    status: String,
+    pending: Arc<Mutex<Option<LoadResult>>>,
+    busy: bool,
+    redraw: Arc<tokio::sync::Notify>,
+}
+
+impl GuidanceReviewPane {
+    pub fn open(
+        lifecycle: cockpit_client::LifecycleClient,
+        redraw: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        let mut pane = Self {
+            lifecycle,
+            proposals: Vec::new(),
+            selected: 0,
+            owner_authorized: false,
+            status: "Loading pending proposals…".into(),
+            pending: Arc::new(Mutex::new(None)),
+            busy: false,
+            redraw,
+        };
+        pane.refresh();
+        pane
     }
-    fn accept_session(
-        &self,
-        _proposal_id: &[u8; 16],
-    ) -> anyhow::Result<Vec<ComputerGuidanceRuleV1>> {
-        Err(anyhow::anyhow!(
-            "guidance proposal review RPC not yet wired (deferred transport work)"
-        ))
+
+    fn refresh(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.owner_authorized = false;
+        self.status = "Loading pending proposals…".into();
+        let lifecycle = self.lifecycle.clone();
+        let slot = self.pending.clone();
+        let redraw = self.redraw.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = crate::tui::settings::settings_daemon_client(&lifecycle).await?;
+                DaemonGuidanceReviewDispatcher::new(client).list().await
+            }
+            .await
+            .map_err(|error| error.to_string());
+            *slot.lock().expect("guidance result lock") = Some(result);
+            redraw.notify_one();
+        });
     }
-    fn accept_persistent(
+
+    fn review(&mut self, decision: cockpit_proto::GuidanceProposalDecision) {
+        if self.busy || !self.owner_authorized {
+            return;
+        }
+        let Some(proposal) = self.proposals.get(self.selected) else {
+            return;
+        };
+        self.busy = true;
+        self.owner_authorized = false;
+        self.status = "Applying review decision…".into();
+        let proposal_id = proposal.proposal_id;
+        let lifecycle = self.lifecycle.clone();
+        let slot = self.pending.clone();
+        let redraw = self.redraw.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = crate::tui::settings::settings_daemon_client(&lifecycle).await?;
+                let dispatcher = DaemonGuidanceReviewDispatcher::new(client);
+                dispatcher.review(proposal_id, decision).await?;
+                dispatcher.list().await
+            }
+            .await
+            .map_err(|error| error.to_string());
+            *slot.lock().expect("guidance result lock") = Some(result);
+            redraw.notify_one();
+        });
+    }
+
+    fn poll(&mut self) {
+        let result = self.pending.lock().expect("guidance result lock").take();
+        let Some(result) = result else {
+            return;
+        };
+        self.busy = false;
+        match result {
+            Ok(proposals) => {
+                self.proposals = proposals;
+                self.selected = self.selected.min(self.proposals.len().saturating_sub(1));
+                self.owner_authorized = true;
+                self.status = if self.proposals.is_empty() {
+                    "No pending guidance proposals. [g] refresh  [Esc/q] close".into()
+                } else {
+                    format!("Proposal {} of {}", self.selected + 1, self.proposals.len())
+                };
+            }
+            Err(error) => {
+                self.owner_authorized = false;
+                self.status =
+                    format!("Unable to load/review proposals: {error}. [g] retry  [Esc/q] close");
+            }
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.poll();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => true,
+            KeyCode::Char('g') => {
+                self.refresh();
+                false
+            }
+            KeyCode::Up | KeyCode::Char('k') if !self.busy => {
+                self.selected = self.selected.saturating_sub(1);
+                false
+            }
+            KeyCode::Down | KeyCode::Char('j') if !self.busy => {
+                self.selected = (self.selected + 1).min(self.proposals.len().saturating_sub(1));
+                false
+            }
+            KeyCode::Char('r') => {
+                self.review(cockpit_proto::GuidanceProposalDecision::Reject);
+                false
+            }
+            KeyCode::Char('s') => {
+                self.review(cockpit_proto::GuidanceProposalDecision::AcceptSession);
+                false
+            }
+            KeyCode::Char('p') => {
+                self.review(cockpit_proto::GuidanceProposalDecision::AcceptPersistent);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.poll();
+        let width = area.width.saturating_sub(8).min(88);
+        let height = area.height.saturating_sub(4).min(30);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        let mut lines = vec![self.status.clone(), String::new()];
+        if let Some(proposal) = self.proposals.get(self.selected) {
+            lines.extend(render_review_lines(proposal));
+        }
+        frame.render_widget(
+            Paragraph::new(lines.join("\n"))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(" Guidance review ")
+                        .borders(Borders::ALL),
+                ),
+            popup,
+        );
+    }
+}
+
+impl DaemonGuidanceReviewDispatcher {
+    pub fn new(client: cockpit_client::DaemonClient) -> Self {
+        Self { client }
+    }
+
+    pub async fn list(&self) -> anyhow::Result<Vec<GuidanceReviewProposal>> {
+        let response = self
+            .client
+            .request(cockpit_proto::Request::ListGuidanceProposals)
+            .await??;
+        let cockpit_proto::Response::GuidanceProposals { proposals } = response else {
+            anyhow::bail!("unexpected guidance proposal list response")
+        };
+        proposals
+            .into_iter()
+            .map(|proposal| {
+                Ok(GuidanceReviewProposal {
+                    proposal_id: *proposal.proposal_id.as_bytes(),
+                    rules: proposal
+                        .rules
+                        .iter()
+                        .map(|rule| ComputerGuidanceRuleV1::decode(rule))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    rationale: proposal.rationale,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn review(
         &self,
-        _proposal_id: &[u8; 16],
+        proposal_id: [u8; 16],
+        decision: cockpit_proto::GuidanceProposalDecision,
     ) -> anyhow::Result<Vec<ComputerGuidanceRuleV1>> {
-        Err(anyhow::anyhow!(
-            "guidance proposal review RPC not yet wired (deferred transport work)"
-        ))
+        let response = self
+            .client
+            .request(cockpit_proto::Request::ReviewGuidanceProposal {
+                proposal_id: uuid::Uuid::from_bytes(proposal_id),
+                decision,
+            })
+            .await??;
+        let cockpit_proto::Response::GuidanceProposalReviewed { installed_rules } = response else {
+            anyhow::bail!("unexpected guidance proposal review response")
+        };
+        installed_rules
+            .iter()
+            .map(|rule| ComputerGuidanceRuleV1::decode(rule).map_err(Into::into))
+            .collect()
     }
 }
 
@@ -307,13 +501,5 @@ mod tests {
             other => panic!("expected AcceptedPersistent, got {other:?}"),
         }
         assert_eq!(d.persistents.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn stub_dispatcher_is_inert() {
-        let p = proposal(None);
-        let stub = StubGuidanceReviewDispatcher;
-        let outcome = apply_review_action(&p, GuidanceReviewAction::Reject, &stub);
-        assert!(matches!(outcome, ReviewOutcome::Unavailable(_)));
     }
 }

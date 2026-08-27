@@ -6996,3 +6996,31 @@ CREATE TABLE guidance_proposal_counters (
     count      INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
     PRIMARY KEY (scope_kind, scope_id)
 );
+
+-- Machine-local accepted guidance.  Unlike proposal receipts, an accepted
+-- persistent rule necessarily contains its typed three-byte value.  It is
+-- deliberately isolated from config/export tables and keyed only by opaque
+-- local scope digests.  Session-scoped accepted rules never enter SQLite.
+CREATE TABLE accepted_persistent_guidance_rules (
+    canonical_project_digest TEXT NOT NULL CHECK (length(canonical_project_digest) = 64),
+    provider_digest          TEXT NOT NULL CHECK (length(provider_digest) = 64),
+    model_digest             TEXT NOT NULL CHECK (length(model_digest) = 64),
+    rule_kind                INTEGER NOT NULL CHECK (rule_kind BETWEEN 1 AND 6),
+    encoded_rule             BLOB NOT NULL CHECK (length(encoded_rule) = 3),
+    updated_at_unix_ms       INTEGER NOT NULL,
+    PRIMARY KEY (canonical_project_digest, provider_digest, model_digest, rule_kind)
+);
+
+-- Durable audit outbox.  Receipt transition and outbox insertion are one
+-- transaction, closing the CAS-before-audit crash window.  Payload fields are
+-- the receipt's content-free metadata; typed values and rationale never enter
+-- this table.  A delivered row is retained for idempotent recovery.
+CREATE TABLE guidance_proposal_audit_outbox (
+    proposal_id       TEXT NOT NULL,
+    terminal_state    TEXT NOT NULL CHECK (terminal_state IN ('created','accepted','rejected','expired','expired_on_restart')),
+    accepted_scope    TEXT CHECK (accepted_scope IS NULL OR accepted_scope IN ('session','persistent')),
+    transitioned_at_unix_ms INTEGER NOT NULL,
+    delivered_at_unix_ms INTEGER,
+    PRIMARY KEY (proposal_id, terminal_state),
+    FOREIGN KEY (proposal_id) REFERENCES guidance_proposal_receipts(proposal_id) ON DELETE CASCADE
+);

@@ -168,6 +168,9 @@ pub struct PendingProposalStore {
 }
 
 impl PendingProposalStore {
+    pub fn proposals(&self) -> impl Iterator<Item = (&ProposalScopeKey, &PendingProposal)> {
+        self.pending.iter()
+    }
     /// A store with no proposals and no reservations.
     pub fn new() -> Self {
         Self {

@@ -249,6 +249,7 @@ pub struct SpawnArgs {
     /// when no accepted rules apply, so existing prompt-cache prefixes are
     /// byte-identical and cache-stable.
     pub compiled_guidance: Vec<u8>,
+    pub guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
 }
 
 impl SpawnArgs {
@@ -1148,6 +1149,10 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
 }
 
 fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &SpawnArgs) -> String {
+    let compiled_guidance = args.guidance_compiler.as_ref().map_or_else(
+        || args.compiled_guidance.clone(),
+        |compiler| compiler.compile(&args.cwd, model.provider_id(), model.model_id_ref()),
+    );
     let role_prompt = assistant_role_prompt(role_prompt, args.assistant_identity_prefix.as_deref());
     let model_prompt = args
         .model_system_prompt_snapshot
@@ -1164,11 +1169,11 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         // Insert accepted computer-use guidance rules into the new context
         // (issue #59, AC9). Only code-owned compiler literals are appended;
         // a no-op when no rules apply so the cached prefix is byte-identical.
-        crate::computer::guidance::append_compiled_guidance(&mut out, &args.compiled_guidance);
+        crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
     } else {
         let mut out = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
-        crate::computer::guidance::append_compiled_guidance(&mut out, &args.compiled_guidance);
+        crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
     }
 }
@@ -3658,6 +3663,7 @@ mod tests {
         );
         SpawnArgs {
             compiled_guidance: vec![],
+            guidance_compiler: None,
             model,
             params: ModelParams::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -5421,6 +5427,7 @@ mod tests {
         // of the legacy per-tool authority list.
         let granted_args = SpawnArgs {
             compiled_guidance: vec![],
+            guidance_compiler: None,
             granted_tools: vec!["mcp".to_string()],
             ..test_spawn_args(tmp.path())
         };

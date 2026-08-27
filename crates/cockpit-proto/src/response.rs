@@ -969,6 +969,20 @@ pub enum Response {
         #[serde(default)]
         model_instruction_tokens: u64,
     },
+    GuidanceProposals {
+        proposals: Vec<crate::PendingGuidanceProposal>,
+    },
+    GuidanceEnablementTrace {
+        global: Option<bool>,
+        project: Option<bool>,
+        provider: Option<bool>,
+        model: Option<bool>,
+        enabled: bool,
+        config_generation: u64,
+    },
+    GuidanceProposalReviewed {
+        installed_rules: Vec<[u8; 3]>,
+    },
 
     /// The resulting sandbox mode after a [`Request::SetSandbox`].
     SandboxState {
@@ -1516,6 +1530,9 @@ macro_rules! response_variants {
             (Response::UsageCounts { .. }, "usage_counts");
             (Response::StatsRollup { .. }, "stats_rollup");
             (Response::GuidanceEstimate { .. }, "guidance_estimate");
+            (Response::GuidanceProposals { .. }, "guidance_proposals");
+            (Response::GuidanceEnablementTrace { .. }, "guidance_enablement_trace");
+            (Response::GuidanceProposalReviewed { .. }, "guidance_proposal_reviewed");
             (Response::SandboxState { .. }, "sandbox_state");
             (Response::SandboxEscalationState { .. }, "sandbox_escalation_state");
             (Response::RedactionState { .. }, "redaction_state");

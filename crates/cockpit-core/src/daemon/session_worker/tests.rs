@@ -899,6 +899,11 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
             model,
@@ -1232,6 +1237,11 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
             model,
@@ -1538,6 +1548,11 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
             model,
@@ -2502,7 +2517,12 @@ async fn absent_scheduler_is_not_an_error() {
     };
 
     let (handle, join, start_permit) = spawn(
-        session,
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                session.db.clone(),
+            )),
+        )),
         locks,
         redact,
         model,
@@ -2602,7 +2622,12 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
     let (handle, join, start_permit) = spawn(
-        session,
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                session.db.clone(),
+            )),
+        )),
         Arc::new(LockManager::in_memory(db)),
         redact,
         model,
@@ -2952,6 +2977,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
     );
     crate::engine::builtin::SpawnArgs {
         compiled_guidance: vec![],
+        guidance_compiler: None,
         model,
         params: crate::engine::model::ModelParams::default(),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),

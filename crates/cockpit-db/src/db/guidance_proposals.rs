@@ -151,6 +151,14 @@ pub struct GuidanceProposalReceiptRow {
     pub transitioned_at_unix_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingGuidanceAuditRow {
+    pub receipt: GuidanceProposalReceiptRow,
+    pub event_state: GuidanceProposalReceiptState,
+    pub event_accepted_scope: Option<GuidanceProposalAcceptedScope>,
+    pub transitioned_at_unix_ms: i64,
+}
+
 fn parse_receipt_row(row: &rusqlite::Row<'_>) -> Result<GuidanceProposalReceiptRow> {
     let state_str: String = row.get("state")?;
     let state = GuidanceProposalReceiptState::from_str(&state_str)
@@ -253,6 +261,56 @@ fn validate_hex16(s: &str, field: &str) -> Result<()> {
 }
 
 impl Db {
+    /// Atomically accept a proposal persistently, upsert every closed encoded
+    /// rule, and enqueue the accepted audit event. No accepted receipt can be
+    /// committed without its machine-local rules.
+    pub async fn accept_persistent_guidance_proposal(
+        &self,
+        proposal_id: &str,
+        project_digest: &str,
+        provider_digest: &str,
+        model_digest: &str,
+        encoded_rules: Vec<[u8; 3]>,
+        transitioned_at_unix_ms: i64,
+    ) -> Result<bool> {
+        validate_hex64(project_digest, "canonical_project_digest")?;
+        validate_hex64(provider_digest, "provider_digest")?;
+        validate_hex64(model_digest, "model_digest")?;
+        let proposal_id = proposal_id.to_string();
+        let project_digest = project_digest.to_string();
+        let provider_digest = provider_digest.to_string();
+        let model_digest = model_digest.to_string();
+        self.transaction(move |conn| {
+            let changed = conn.execute(
+                "UPDATE guidance_proposal_receipts
+                 SET state = 'accepted', accepted_scope = 'persistent', transitioned_at_unix_ms = ?1
+                 WHERE proposal_id = ?2 AND state = 'created'",
+                params![transitioned_at_unix_ms, proposal_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            for encoded in encoded_rules {
+                conn.execute(
+                    "INSERT INTO accepted_persistent_guidance_rules
+                         (canonical_project_digest, provider_digest, model_digest, rule_kind, encoded_rule, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(canonical_project_digest, provider_digest, model_digest, rule_kind)
+                     DO UPDATE SET encoded_rule = excluded.encoded_rule, updated_at_unix_ms = excluded.updated_at_unix_ms",
+                    params![project_digest, provider_digest, model_digest, i64::from(encoded[1]), encoded.to_vec(), transitioned_at_unix_ms],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO guidance_proposal_audit_outbox
+                     (proposal_id, terminal_state, accepted_scope, transitioned_at_unix_ms)
+                 VALUES (?1, 'accepted', 'persistent', ?2)
+                 ON CONFLICT(proposal_id, terminal_state) DO NOTHING",
+                params![proposal_id, transitioned_at_unix_ms],
+            )?;
+            Ok(true)
+        }).await
+    }
+
     /// Atomically insert a content-free `created` receipt and increment the
     /// session + delegation creation counters, enforcing the 3/10 caps.
     /// On any failure (cap exceeded or duplicate id) the transaction rolls
@@ -379,6 +437,13 @@ impl Db {
                 [&insert.session_id],
             )
             .context("incrementing session counter")?;
+            conn.execute(
+                "INSERT INTO guidance_proposal_audit_outbox
+                     (proposal_id, terminal_state, accepted_scope, transitioned_at_unix_ms)
+                 VALUES (?1, 'created', NULL, ?2)",
+                params![insert.proposal_id, insert.created_at_unix_ms],
+            )
+            .context("enqueueing guidance proposal created audit event")?;
             Ok(())
         })
         .await
@@ -462,7 +527,7 @@ impl Db {
         let accepted_scope_str = accepted_scope.map(|s| s.as_str().to_string());
         let transitioned_at =
             transitioned_at_unix_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let changed = conn
                 .execute(
                     "UPDATE guidance_proposal_receipts
@@ -479,9 +544,137 @@ impl Db {
                     ],
                 )
                 .context("CAS guidance proposal receipt state")?;
+            if changed == 1 && to_state_str != "created" {
+                conn.execute(
+                    "INSERT INTO guidance_proposal_audit_outbox
+                         (proposal_id, terminal_state, accepted_scope, transitioned_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(proposal_id, terminal_state) DO NOTHING",
+                    params![
+                        proposal_id,
+                        to_state_str,
+                        accepted_scope_str,
+                        transitioned_at
+                    ],
+                )
+                .context("enqueueing guidance proposal audit event")?;
+            }
             Ok(changed == 1)
         })
         .await
+    }
+
+    /// Mark the durable terminal audit event delivered after the append
+    /// succeeds.  A crash before this call leaves a retryable outbox row.
+    pub async fn mark_guidance_proposal_audit_delivered(
+        &self,
+        proposal_id: &str,
+        terminal_state: GuidanceProposalReceiptState,
+        delivered_at_unix_ms: i64,
+    ) -> Result<()> {
+        let proposal_id = proposal_id.to_string();
+        let terminal_state = terminal_state.as_str().to_string();
+        self.write(move |conn| {
+            let changed = conn.execute(
+                "UPDATE guidance_proposal_audit_outbox
+                 SET delivered_at_unix_ms = COALESCE(delivered_at_unix_ms, ?1)
+                 WHERE proposal_id = ?2 AND terminal_state = ?3",
+                params![delivered_at_unix_ms, proposal_id, terminal_state],
+            )?;
+            anyhow::ensure!(changed == 1, "guidance proposal audit outbox row missing");
+            Ok(())
+        })
+        .await
+    }
+
+    /// Undelivered audit events in stable creation/transition order. Joining
+    /// the receipt supplies the original safe metadata required to reconstruct
+    /// the event after a crash.
+    pub async fn pending_guidance_proposal_audits(&self) -> Result<Vec<PendingGuidanceAuditRow>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT r.proposal_id, r.session_id, r.delegation_id,
+                        r.canonical_project_digest, r.provider_digest, r.model_digest,
+                        r.config_generation, r.rule_kind_bits, r.created_at_unix_ms,
+                        r.expires_at_unix_ms, r.state, r.accepted_scope,
+                        r.transitioned_at_unix_ms,
+                        o.terminal_state AS outbox_state,
+                        o.accepted_scope AS outbox_accepted_scope,
+                        o.transitioned_at_unix_ms AS outbox_transitioned_at
+                 FROM guidance_proposal_audit_outbox o
+                 JOIN guidance_proposal_receipts r USING (proposal_id)
+                 WHERE o.delivered_at_unix_ms IS NULL
+                 ORDER BY o.transitioned_at_unix_ms, o.proposal_id",
+            )?;
+            let rows = stmt
+                .query_and_then([], |row| {
+                    let receipt = parse_receipt_row(row)?;
+                    let state: String = row.get("outbox_state")?;
+                    let event_state = GuidanceProposalReceiptState::from_str(&state)
+                        .context("guidance audit outbox has unknown state")?;
+                    let scope: Option<String> = row.get("outbox_accepted_scope")?;
+                    let event_accepted_scope = scope
+                        .as_deref()
+                        .map(GuidanceProposalAcceptedScope::from_str)
+                        .transpose()
+                        .context("guidance audit outbox has unknown accepted scope")?;
+                    Ok(PendingGuidanceAuditRow {
+                        receipt,
+                        event_state,
+                        event_accepted_scope,
+                        transitioned_at_unix_ms: row.get("outbox_transitioned_at")?,
+                    })
+                })?
+                .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Persist one accepted persistent rule. The caller supplies the closed
+    /// three-byte encoding; this table is local-only and is never exported.
+    pub async fn upsert_persistent_guidance_rule(
+        &self,
+        project_digest: &str,
+        provider_digest: &str,
+        model_digest: &str,
+        encoded_rule: [u8; 3],
+        updated_at_unix_ms: i64,
+    ) -> Result<()> {
+        validate_hex64(project_digest, "canonical_project_digest")?;
+        validate_hex64(provider_digest, "provider_digest")?;
+        validate_hex64(model_digest, "model_digest")?;
+        let project_digest = project_digest.to_string();
+        let provider_digest = provider_digest.to_string();
+        let model_digest = model_digest.to_string();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO accepted_persistent_guidance_rules
+                     (canonical_project_digest, provider_digest, model_digest, rule_kind, encoded_rule, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(canonical_project_digest, provider_digest, model_digest, rule_kind)
+                 DO UPDATE SET encoded_rule = excluded.encoded_rule, updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![project_digest, provider_digest, model_digest, i64::from(encoded_rule[1]), encoded_rule.to_vec(), updated_at_unix_ms],
+            )?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn load_persistent_guidance_rules(
+        &self,
+    ) -> Result<Vec<(String, String, String, [u8; 3])>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT canonical_project_digest, provider_digest, model_digest, encoded_rule
+                 FROM accepted_persistent_guidance_rules ORDER BY canonical_project_digest, provider_digest, model_digest, rule_kind"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let bytes: Vec<u8> = row.get(3)?;
+                let encoded: [u8; 3] = bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, encoded))
+            })?.collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }).await
     }
 
     /// Read a single receipt row by `proposal_id`, or `None` if absent.

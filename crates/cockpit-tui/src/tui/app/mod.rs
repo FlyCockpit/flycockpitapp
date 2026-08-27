@@ -1353,6 +1353,7 @@ pub(super) enum Overlay {
     Diff(crate::tui::diff_pane::DiffPane),
     SessionSetup(crate::tui::session_setup::SessionSetupPane),
     AgentTree(crate::tui::agent_tree_pane::AgentTreePane),
+    GuidanceReview(crate::tui::guidance_review::GuidanceReviewPane),
     Help(help_overlay::HelpOverlay),
 }
 
@@ -1402,6 +1403,7 @@ impl Overlay {
             | Self::Sealed(_)
             | Self::SessionSetup(_)
             | Self::AgentTree(_)
+            | Self::GuidanceReview(_)
             | Self::Help(_) => None,
         }
     }
@@ -4279,7 +4281,8 @@ impl App {
                         needs_redraw = true;
                     }
                     _ = async_notify.notified() => {
-                        needs_redraw = self.drain_async_actions();
+                        self.drain_async_actions();
+                        needs_redraw = true;
                     }
                     _ = wait_optional_duration(paste_wait) => {
                         let decision = self.terminal_paste_classifier.flush_due(terminal_input.now());
@@ -4329,7 +4332,8 @@ impl App {
                         needs_redraw = true;
                     }
                     _ = async_notify.notified() => {
-                        needs_redraw = self.drain_async_actions();
+                        self.drain_async_actions();
+                        needs_redraw = true;
                     }
                     _ = wait_optional_duration(paste_wait) => {
                         let decision = self.terminal_paste_classifier.flush_due(terminal_input.now());

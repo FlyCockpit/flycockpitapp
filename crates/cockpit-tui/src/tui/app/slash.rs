@@ -391,6 +391,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "guidance",
+        description: "Review pending computer-use guidance proposals (Owner only)",
+        takes_args: false,
+        run: run_guidance,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "goal-settings",
         description: "Edit goal-verification overrides for this session or agent",
         takes_args: false,
@@ -881,6 +889,14 @@ fn run_gitignore_allow(app: &mut App, args: &str) -> bool {
 
 fn run_goal(app: &mut App, args: &str) -> bool {
     app.handle_goal_command(args);
+    false
+}
+
+fn run_guidance(app: &mut App, _: &str) -> bool {
+    app.overlay = Overlay::GuidanceReview(crate::tui::guidance_review::GuidanceReviewPane::open(
+        app.lifecycle.clone(),
+        app.async_actions.notifier(),
+    ));
     false
 }
 

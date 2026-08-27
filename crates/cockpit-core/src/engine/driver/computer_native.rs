@@ -198,6 +198,75 @@ pub(crate) fn with_live_loop_native_computer_geometry(
     agent
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuidanceProposalCandidate {
+    pub rules: Vec<crate::computer::guidance::ComputerGuidanceRuleV1>,
+    pub rationale: Option<String>,
+}
+
+/// Extract the single closed typed proposal item allowed beside native
+/// computer calls. All scope and identity fields are deliberately absent.
+pub fn extract_guidance_proposal_candidate(
+    raw_output: &[serde_json::Value],
+) -> anyhow::Result<Option<GuidanceProposalCandidate>> {
+    let mut candidate = None;
+    for item in raw_output {
+        if item.get("type").and_then(serde_json::Value::as_str)
+            != Some("computer_guidance_proposal")
+        {
+            continue;
+        }
+        if candidate.is_some() {
+            anyhow::bail!("multiple computer guidance proposals in one response");
+        }
+        let object = item
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("guidance proposal must be an object"))?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "type" | "rules" | "rationale"))
+        {
+            anyhow::bail!("computer guidance proposal contains an unknown field");
+        }
+        let values = object
+            .get("rules")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("guidance proposal rules must be an array"))?;
+        let rules = values
+            .iter()
+            .map(|value| {
+                let bytes = value
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("guidance rule must be a three-byte array"))?;
+                if bytes.len() != 3 {
+                    anyhow::bail!("guidance rule must contain exactly three bytes");
+                }
+                let mut encoded = [0_u8; 3];
+                for (target, value) in encoded.iter_mut().zip(bytes) {
+                    *target = value
+                        .as_u64()
+                        .filter(|value| *value <= u8::MAX as u64)
+                        .ok_or_else(|| anyhow::anyhow!("guidance rule bytes must be u8 values"))?
+                        as u8;
+                }
+                crate::computer::guidance::ComputerGuidanceRuleV1::decode(&encoded)
+                    .map_err(Into::into)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let rationale = match object.get("rationale") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("guidance rationale must be text"))?
+                    .to_owned(),
+            ),
+        };
+        candidate = Some(GuidanceProposalCandidate { rules, rationale });
+    }
+    Ok(candidate)
+}
+
 /// Handle native computer items from a provider completion.
 ///
 /// This is the named production driver registration function (AC5). Both the

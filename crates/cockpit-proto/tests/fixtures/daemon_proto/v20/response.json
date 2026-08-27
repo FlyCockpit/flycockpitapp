@@ -2727,6 +2727,29 @@
     },
     "response": "agent_decision_steered"
   },
+  "guidance_proposals": {
+    "data": {
+      "proposals": []
+    },
+    "response": "guidance_proposals"
+  },
+  "guidance_enablement_trace": {
+    "data": {
+      "global": null,
+      "project": true,
+      "provider": null,
+      "model": null,
+      "enabled": true,
+      "config_generation": 7
+    },
+    "response": "guidance_enablement_trace"
+  },
+  "guidance_proposal_reviewed": {
+    "data": {
+      "installed_rules": [[1, 1, 1]]
+    },
+    "response": "guidance_proposal_reviewed"
+  },
   "session_setup_snapshot": {
     "data": {
       "snapshot": {

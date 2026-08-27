@@ -2370,7 +2370,7 @@ where
             StreamedAssistantContent::Unknown(item) => {
                 let value = item.value();
                 let native_shape = match value.get("type").and_then(serde_json::Value::as_str) {
-                    Some("computer_call") => true,
+                    Some("computer_call" | "computer_guidance_proposal") => true,
                     Some("tool_use") => {
                         value.get("name").and_then(serde_json::Value::as_str) == Some("computer")
                     }

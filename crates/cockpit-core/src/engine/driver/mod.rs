@@ -11,8 +11,8 @@
 //! the primary-agent identity swaps every time the stack height
 //! changes, and the user's messages route to whoever's on top.
 
-mod context_reduction;
 mod computer_native;
+mod context_reduction;
 mod delegation_helpers;
 mod inbound;
 mod noninteractive;

@@ -2390,7 +2390,7 @@ impl ComputerActionCoordinator {
             }
         }
 
-        Ok(Self {
+        let mut coordinator = Self {
             backend,
             geometry,
             target_adapter,
@@ -2435,7 +2435,7 @@ impl ComputerActionCoordinator {
         }
 
         Ok(coordinator)
-    })
+    }
 
     /// The immutable display geometry obtained at open time.
     pub fn geometry(&self) -> &DisplayGeometry {
@@ -2627,8 +2627,7 @@ impl ComputerActionCoordinator {
                         );
                         return ExecuteArtifacts {
                             outcome: CoordinatedOutcome::Denied {
-                                reason: "computer handoff journal dispatch refused"
-                                    .to_string(),
+                                reason: "computer handoff journal dispatch refused".to_string(),
                             },
                             live_frame: None,
                         };
@@ -3409,7 +3408,8 @@ impl ComputerActionCoordinator {
         let outcome = artifacts.outcome;
         self.last_live_frame = artifacts.live_frame;
         self.journal.record(call_id, outcome.clone());
-        self.journal.record_identity(identity.clone(), payload_digest.clone());
+        self.journal
+            .record_identity(identity.clone(), payload_digest.clone());
         // Persist the terminal outcome to the durable store (AC13).
         if let Some(store) = &self.outcome_store {
             store.store(&identity, &outcome, &payload_digest);
@@ -3421,29 +3421,41 @@ impl ComputerActionCoordinator {
     /// [`ExecuteArtifacts`] with both the sanitized outcome (journalable) and
     /// the live frame (for transient continuation assembly only). This is the
     /// single entry point the live loop calls.
-    pub async fn execute_native_call(
-        &mut self,
-        call: &NativeComputerCall,
-    ) -> ExecuteArtifacts {
+    pub async fn execute_native_call(&mut self, call: &NativeComputerCall) -> ExecuteArtifacts {
         match call {
             NativeComputerCall::OpenAi { call_id, actions } => {
                 let outcome = self.execute_openai_call(call_id, actions).await;
                 let live_frame = self.take_last_live_frame();
-                ExecuteArtifacts { outcome, live_frame }
+                ExecuteArtifacts {
+                    outcome,
+                    live_frame,
+                }
             }
-            NativeComputerCall::Anthropic20251124 { tool_use_id, action } => {
+            NativeComputerCall::Anthropic20251124 {
+                tool_use_id,
+                action,
+            } => {
                 let outcome = self
                     .execute_anthropic_20251124_call(tool_use_id, action)
                     .await;
                 let live_frame = self.take_last_live_frame();
-                ExecuteArtifacts { outcome, live_frame }
+                ExecuteArtifacts {
+                    outcome,
+                    live_frame,
+                }
             }
-            NativeComputerCall::Anthropic20250124 { tool_use_id, action } => {
+            NativeComputerCall::Anthropic20250124 {
+                tool_use_id,
+                action,
+            } => {
                 let outcome = self
                     .execute_anthropic_20250124_call(tool_use_id, action)
                     .await;
                 let live_frame = self.take_last_live_frame();
-                ExecuteArtifacts { outcome, live_frame }
+                ExecuteArtifacts {
+                    outcome,
+                    live_frame,
+                }
             }
             NativeComputerCall::UnsupportedVariant { detail, .. } => ExecuteArtifacts {
                 outcome: CoordinatedOutcome::UnsupportedProviderVariant {
@@ -3591,7 +3603,8 @@ impl ComputerActionCoordinator {
         let outcome = artifacts.outcome;
         self.last_live_frame = artifacts.live_frame;
         self.journal.record(call_id, outcome.clone());
-        self.journal.record_identity(identity.clone(), payload_digest.clone());
+        self.journal
+            .record_identity(identity.clone(), payload_digest.clone());
         // Persist the terminal outcome to the durable store (AC13).
         if let Some(store) = &self.outcome_store {
             store.store(&identity, &outcome, &payload_digest);
@@ -3736,7 +3749,8 @@ impl ComputerActionCoordinator {
         let outcome = artifacts.outcome;
         self.last_live_frame = artifacts.live_frame;
         self.journal.record(call_id, outcome.clone());
-        self.journal.record_identity(identity.clone(), payload_digest.clone());
+        self.journal
+            .record_identity(identity.clone(), payload_digest.clone());
         // Persist the terminal outcome to the durable store (AC13).
         if let Some(store) = &self.outcome_store {
             store.store(&identity, &outcome, &payload_digest);
@@ -4589,11 +4603,8 @@ mod tests {
         // Build the continuation through the native seam with the live frame.
         // With a successful capture (live frame present), the continuation
         // carries a real `computer_call_output` transient — not TextOnly.
-        let continuation = NativeResponseExtractor::build_continuation(
-            call,
-            &outcome,
-            live_frame.as_ref(),
-        );
+        let continuation =
+            NativeResponseExtractor::build_continuation(call, &outcome, live_frame.as_ref());
         match &continuation {
             NativeComputerContinuation::OpenAi { transient, .. } => {
                 assert!(
@@ -4738,11 +4749,8 @@ mod tests {
             .execute_anthropic_20251124_call(tool_use_id, action)
             .await;
         let live_frame = coordinator.take_last_live_frame();
-        let continuation = NativeResponseExtractor::build_continuation(
-            call,
-            &outcome,
-            live_frame.as_ref(),
-        );
+        let continuation =
+            NativeResponseExtractor::build_continuation(call, &outcome, live_frame.as_ref());
         // With a successful capture (live frame present), the Anthropic
         // continuation carries a transient image block — not text-only.
         match &continuation {
@@ -4796,11 +4804,8 @@ mod tests {
             .execute_anthropic_20250124_call(tool_use_id, action)
             .await;
         let live_frame = coordinator.take_last_live_frame();
-        let continuation = NativeResponseExtractor::build_continuation(
-            call,
-            &outcome,
-            live_frame.as_ref(),
-        );
+        let continuation =
+            NativeResponseExtractor::build_continuation(call, &outcome, live_frame.as_ref());
         // With a successful capture (live frame present), the Anthropic
         // continuation carries a transient image block — not text-only.
         match &continuation {

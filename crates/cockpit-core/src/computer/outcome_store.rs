@@ -29,7 +29,12 @@ pub struct StoredOutcome {
 pub trait ComputerOutcomeStore: Send + Sync {
     /// Store a sanitized outcome for the given identity + digest. Overwrites
     /// if the identity already exists.
-    fn store(&self, identity: &ActionIdentity, outcome: &CoordinatedOutcome, digest: &ActionPayloadDigest);
+    fn store(
+        &self,
+        identity: &ActionIdentity,
+        outcome: &CoordinatedOutcome,
+        digest: &ActionPayloadDigest,
+    );
 
     /// Look up a stored outcome by identity. Returns the outcome and the
     /// digest it was stored under.
@@ -57,7 +62,12 @@ impl MemoryOutcomeStore {
 }
 
 impl ComputerOutcomeStore for MemoryOutcomeStore {
-    fn store(&self, identity: &ActionIdentity, outcome: &CoordinatedOutcome, digest: &ActionPayloadDigest) {
+    fn store(
+        &self,
+        identity: &ActionIdentity,
+        outcome: &CoordinatedOutcome,
+        digest: &ActionPayloadDigest,
+    ) {
         self.entries.lock().unwrap().insert(
             identity.clone(),
             StoredOutcome {
@@ -107,7 +117,12 @@ impl SqliteOutcomeStore {
 }
 
 impl ComputerOutcomeStore for SqliteOutcomeStore {
-    fn store(&self, _identity: &ActionIdentity, _outcome: &CoordinatedOutcome, _digest: &ActionPayloadDigest) {
+    fn store(
+        &self,
+        _identity: &ActionIdentity,
+        _outcome: &CoordinatedOutcome,
+        _digest: &ActionPayloadDigest,
+    ) {
         // TODO: Implement SQLite persistence using the computer_outcome_store
         // table. Serialize CoordinatedOutcome via serde_json and store the
         // identity + digest + outcome_json.

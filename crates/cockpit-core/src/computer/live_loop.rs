@@ -17,11 +17,11 @@
 //! function [`handle_native_computer_items`] in `engine/driver`), replacing
 //! today's silent drop of every model-emitted computer action.
 
-use super::coordinator::{
-    ComputerActionCoordinator, ExecuteArtifacts, NativeComputerCall,
-    NativeComputerContinuation, NativeResponseExtractor,
-};
 use super::ComputerToolContract;
+use super::coordinator::{
+    ComputerActionCoordinator, ExecuteArtifacts, NativeComputerCall, NativeComputerContinuation,
+    NativeResponseExtractor,
+};
 
 /// The single public live-loop orchestrator for provider-native computer use.
 ///
@@ -70,14 +70,10 @@ impl<'a> NativeComputerLiveLoop<'a> {
     /// Extract native computer items from a provider completion using the
     /// contract bound to this live loop. For OpenAI Responses, pass the raw
     /// `output` array; for Anthropic, pass the raw `content` array.
-    pub fn extract(
-        &self,
-        raw: &[serde_json::Value],
-    ) -> Vec<NativeComputerCall> {
+    pub fn extract(&self, raw: &[serde_json::Value]) -> Vec<NativeComputerCall> {
         match self.contract {
             ComputerToolContract::OpenAiResponses => Self::extract_openai(raw),
-            ComputerToolContract::Anthropic20251124
-            | ComputerToolContract::Anthropic20250124 => {
+            ComputerToolContract::Anthropic20251124 | ComputerToolContract::Anthropic20250124 => {
                 Self::extract_anthropic(raw, self.contract)
             }
         }
@@ -131,11 +127,14 @@ impl<'a> NativeComputerLiveLoop<'a> {
 mod tests {
     use super::*;
     use crate::computer::coordinator::{
-        ComputerActionCoordinator, ComputerApprovalTier, ComputerAuthorizer,
-        ComputerToolContract, CoordinatorParams, DelegationId, FakeComputerAuthorizer,
-        OwnerInstance, ProviderId, ModelId,
+        ComputerActionCoordinator, ComputerApprovalTier, ComputerAuthorizer, ComputerToolContract,
+        CoordinatorParams, DelegationId, FakeComputerAuthorizer, ModelId, OwnerInstance,
+        ProviderId,
     };
-    use crate::computer::{ComputerBackend, ComputerBatchReport, ComputerAction, ComputerActionOutcome, DisplayGeometry, PixelSize, LogicalSize, ScaleFactor};
+    use crate::computer::{
+        ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerBatchReport,
+        DisplayGeometry, LogicalSize, PixelSize, ScaleFactor,
+    };
     use async_trait::async_trait;
     use std::sync::Arc;
 
@@ -149,8 +148,14 @@ mod tests {
         fn new() -> Self {
             Self {
                 geometry: DisplayGeometry {
-                    physical: PixelSize { width: 1024, height: 768 },
-                    logical: LogicalSize { width: 1024.0, height: 768.0 },
+                    physical: PixelSize {
+                        width: 1024,
+                        height: 768,
+                    },
+                    logical: LogicalSize {
+                        width: 1024.0,
+                        height: 768.0,
+                    },
                     scale_factor: ScaleFactor(1.0),
                 },
                 execute_count: std::sync::atomic::AtomicUsize::new(0),
@@ -298,9 +303,7 @@ mod tests {
         let mut live_loop =
             NativeComputerLiveLoop::new(&mut coordinator, ComputerToolContract::OpenAiResponses);
 
-        let continuations = live_loop
-            .handle_native_computer_items(&[])
-            .await;
+        let continuations = live_loop.handle_native_computer_items(&[]).await;
         assert!(continuations.is_empty());
     }
 

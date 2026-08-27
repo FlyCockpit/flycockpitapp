@@ -20,11 +20,9 @@
 //! Rig function-tool dispatch refuses reserved native computer tool names
 //! via [`crate::computer::is_reserved_native_computer_tool_name`].
 
-use crate::computer::coordinator::{
-    ComputerActionCoordinator, NativeComputerContinuation,
-};
-use crate::computer::live_loop::NativeComputerLiveLoop;
 use crate::computer::ComputerToolContract;
+use crate::computer::coordinator::{ComputerActionCoordinator, NativeComputerContinuation};
+use crate::computer::live_loop::NativeComputerLiveLoop;
 
 /// Handle native computer items from a provider completion.
 ///
@@ -60,12 +58,12 @@ mod tests {
     use super::*;
     use crate::computer::coordinator::{
         ComputerApprovalTier, ComputerAuthorizer, ComputerToolContract, CoordinatorParams,
-        DelegationId, FakeComputerAuthorizer, NativeComputerCall, NativeComputerContinuation,
-        NativeResponseExtractor, OwnerInstance, ProviderId, ModelId,
+        DelegationId, FakeComputerAuthorizer, ModelId, NativeComputerCall,
+        NativeComputerContinuation, NativeResponseExtractor, OwnerInstance, ProviderId,
     };
     use crate::computer::{
-        ComputerBackend, ComputerBatchReport, ComputerAction, ComputerActionOutcome,
-        DisplayGeometry, PixelSize, LogicalSize, ScaleFactor,
+        ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerBatchReport,
+        DisplayGeometry, LogicalSize, PixelSize, ScaleFactor,
     };
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -79,8 +77,14 @@ mod tests {
         fn new() -> Self {
             Self {
                 geometry: DisplayGeometry {
-                    physical: PixelSize { width: 1024, height: 768 },
-                    logical: LogicalSize { width: 1024.0, height: 768.0 },
+                    physical: PixelSize {
+                        width: 1024,
+                        height: 768,
+                    },
+                    logical: LogicalSize {
+                        width: 1024.0,
+                        height: 768.0,
+                    },
                     scale_factor: ScaleFactor(1.0),
                 },
             }
@@ -159,9 +163,12 @@ mod tests {
             ]
         })];
 
-        let continuations =
-            handle_native_computer_items(Some(coordinator), ComputerToolContract::OpenAiResponses, &output)
-                .await;
+        let continuations = handle_native_computer_items(
+            Some(coordinator),
+            ComputerToolContract::OpenAiResponses,
+            &output,
+        )
+        .await;
         assert_eq!(continuations.len(), 1);
         assert!(matches!(
             &continuations[0],

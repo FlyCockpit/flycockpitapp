@@ -696,6 +696,9 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         goal_supervision: GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
+        capabilities: None,
+        tool_steering: None,
+        context_policy: None,
         vnext: None,
         prompt: "body".into(),
         prompt_variants: std::collections::HashMap::new(),
@@ -1763,5 +1766,136 @@ fn docs_answerer_keeps_grep_and_glob_defensive_descriptions() {
     assert_eq!(
         definition_of(&glob, LlmMode::Defensive, Some(&glob_override)).description,
         glob.defensive_description().unwrap()
+    );
+}
+
+// ── Issue #75 Stage 1: posture schema (additive, no behavior change) ──────
+
+#[test]
+fn agent_def_capabilities_parse_and_validate() {
+    use std::collections::BTreeSet;
+    use super::AgentCapability;
+
+    let def = def_with_tools("custom", &["read", "bash"]);
+    // An empty set = explicitly none.
+    let mut def = def;
+    def.capabilities = Some(BTreeSet::new());
+    validate_invariants(&def).expect("empty capability set is valid");
+
+    let mut caps = BTreeSet::new();
+    caps.insert(AgentCapability::FollowupSeed);
+    caps.insert(AgentCapability::SandboxEscalate);
+    caps.insert(AgentCapability::ForkContext);
+    caps.insert(AgentCapability::ScopedParallelWrite);
+    def.capabilities = Some(caps);
+    validate_invariants(&def).expect("all four capabilities are valid");
+
+    // Wire names parse via serde.
+    let yaml = "schemaVersion: 2\nagentId: test/cap\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [textGeneration]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: [followupSeed, sandboxEscalate, forkContext, scopedParallelWrite]\ndescription: x\n";
+    let parsed = parse_agent(yaml, "cap", "cap.md".into()).expect("capabilities parse");
+    let resolved = parsed.capabilities.expect("capabilities present");
+    assert!(resolved.contains(&AgentCapability::FollowupSeed));
+    assert!(resolved.contains(&AgentCapability::ScopedParallelWrite));
+}
+
+#[test]
+fn agent_def_tool_description_text_round_trips() {
+    // A bare string parses as Text and serializes back as a bare string.
+    let spec = ToolDescriptionSpec::Text("single canonical text".to_string());
+    let yaml = serde_yaml::to_string(&spec).expect("serialize");
+    assert_eq!(yaml.trim(), "single canonical text");
+
+    let back: ToolDescriptionSpec = serde_yaml::from_str(&yaml).expect("deserialize");
+    assert_eq!(back, spec);
+
+    // to_override maps Text to all three legacy slots.
+    let ov = spec.to_override();
+    assert_eq!(ov.normal.as_deref(), Some("single canonical text"));
+    assert_eq!(ov.frontier.as_deref(), Some("single canonical text"));
+    assert_eq!(ov.defensive.as_deref(), Some("single canonical text"));
+}
+
+#[test]
+fn agent_def_context_policy_bounds() {
+    let mut def = def_with_tools("custom", &["read"]);
+    // Valid bounds.
+    def.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(10),
+        inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+    });
+    validate_invariants(&def).expect("10 is in range");
+
+    def.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(95),
+        inline_caps: Some(crate::agents::InlineCapsProfile::Large),
+    });
+    validate_invariants(&def).expect("95 is in range");
+
+    // Out of range (below).
+    def.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(9),
+        inline_caps: None,
+    });
+    let err = validate_invariants(&def).unwrap_err().to_string();
+    assert!(err.contains("autoCompactPct"), "{err}");
+    assert!(err.contains("9"), "{err}");
+
+    // Out of range (above).
+    def.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(96),
+        inline_caps: None,
+    });
+    let err = validate_invariants(&def).unwrap_err().to_string();
+    assert!(err.contains("96"), "{err}");
+}
+
+#[test]
+fn agent_def_digest_changes_iff_posture_fields_change() {
+    // vnext_digest_bytes hashes the full canonical markdown, so the new
+    // posture fields (emitted by to_markdown) must change the digest iff
+    // they change. Use a legacy (non-vnext) def so to_markdown emits the
+    // frontmatter fields directly.
+    let mut base = def_with_tools("custom", &["read"]);
+    base.capabilities = None;
+    base.tool_steering = None;
+    base.context_policy = None;
+    let digest_base = base.vnext_digest_bytes().expect("digest base");
+
+    let mut with_caps = base.clone();
+    let mut caps = std::collections::BTreeSet::new();
+    caps.insert(crate::agents::AgentCapability::FollowupSeed);
+    with_caps.capabilities = Some(caps);
+    let digest_caps = with_caps.vnext_digest_bytes().expect("digest caps");
+    assert_ne!(
+        digest_base, digest_caps,
+        "declaring capabilities must change the digest"
+    );
+
+    let mut with_steering = base.clone();
+    with_steering.tool_steering = Some(crate::agents::ToolSteering::Verbose);
+    let digest_steering = with_steering.vnext_digest_bytes().expect("digest steering");
+    assert_ne!(
+        digest_base, digest_steering,
+        "declaring toolSteering must change the digest"
+    );
+
+    let mut with_policy = base.clone();
+    with_policy.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(60),
+        inline_caps: None,
+    });
+    let digest_policy = with_policy.vnext_digest_bytes().expect("digest policy");
+    assert_ne!(
+        digest_base, digest_policy,
+        "declaring contextPolicy must change the digest"
+    );
+
+    // Reverting to None reproduces the base digest (stability).
+    let mut reverted = with_caps.clone();
+    reverted.capabilities = None;
+    let digest_reverted = reverted.vnext_digest_bytes().expect("digest reverted");
+    assert_eq!(
+        digest_base, digest_reverted,
+        "clearing the posture field reproduces the base digest"
     );
 }

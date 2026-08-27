@@ -236,6 +236,9 @@ fn create_assistant_with_installation_id_sync(
         goal_supervision: crate::agents::GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
+        capabilities: None,
+        tool_steering: None,
+        context_policy: None,
         // Assistant homes are daemon-owned definition locations, so they are
         // the sole constructor allowed to use the local publisher. Tool/model
         // selections from the legacy wizard remain host-side setup inputs and

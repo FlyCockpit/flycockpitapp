@@ -1215,7 +1215,7 @@ fn agent_path_in_prefers_existing_flat_file() {
 
 #[test]
 fn agent_path_in_surfaces_dir_form_when_present() {
-    // Forward-compat: a `<name>/` directory (the future per-mode layout)
+    // A `<name>/` directory is the per-model override layout.
     // is surfaced rather than assuming `<name>.md`.
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("builder");
@@ -1227,7 +1227,7 @@ fn agent_path_in_surfaces_dir_form_when_present() {
 
 #[test]
 fn agent_path_in_prefers_dir_form_over_flat() {
-    // When both a flat `<name>.md` and a per-mode `<name>/` directory exist,
+    // When both a flat `<name>.md` and a per-model `<name>/` directory exist,
     // the richer directory form wins — it falls back to the flat sibling
     // internally for any absent mode.
     let tmp = tempfile::tempdir().unwrap();
@@ -1602,11 +1602,19 @@ Body.
 fn unknown_tool_description_mode_key_is_rejected() {
     let text = r#"---
 description: A custom builder.
-mode: primary
-tools: [grep]
+schemaVersion: 2
+agentId: authored/builder
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Execute a coding task
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
 tool_descriptions:
   grep:
-    verbose: "Search differently."
+    normal: "Search differently."
 ---
 
 Body.
@@ -1615,7 +1623,7 @@ Body.
     let msg = format!("{err}");
     assert!(msg.contains("tool_descriptions.grep:"), "{msg}");
     assert!(
-        msg.contains("unknown tool-description key `verbose`"),
+        msg.contains("unknown tool-description key `normal`"),
         "{msg}"
     );
     assert_eq!(
@@ -1798,6 +1806,24 @@ fn agent_def_capabilities_parse_and_validate() {
 }
 
 #[test]
+fn agent_def_load_and_model_override_warnings_are_advisory() {
+    let text = "---\nschemaVersion: 2\nagentId: authored/local-worker\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: local\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: local-small\n        upstreamIdentity: local/small-model\n        providerAliases:\n          - providerId: local\n            modelId: small-model\ncapabilities: [forkContext]\ndescription: local worker\n---\nbody\n";
+    let def = parse_agent(text, "local-worker", "local-worker.md".into()).unwrap();
+    let before = PostureResolution::from_def(&def).grants().clone();
+
+    let load_warnings = def.load_warnings();
+    assert_eq!(load_warnings.len(), 1);
+    assert!(load_warnings[0].contains("local/small models"));
+    assert!(def.model_override_warning("cloud", "large-model").is_some());
+    assert!(def.model_override_warning("local", "small-model").is_none());
+    assert_eq!(
+        PostureResolution::from_def(&def).grants(),
+        &before,
+        "warnings must never mutate grants"
+    );
+}
+
+#[test]
 fn child_posture_intersection_never_widens_parent() {
     let mut parent = def_with_tools("parent", &["read"]);
     parent.capabilities = Some(BTreeSet::from([AgentCapability::FollowupSeed]));
@@ -1831,6 +1857,32 @@ fn agent_def_tool_description_text_round_trips() {
     let ov = spec.to_override();
     assert_eq!(ov.text.as_deref(), Some("single canonical text"));
     assert_eq!(ov.verbose_text.as_deref(), Some("single canonical text"));
+
+    let spec = ToolDescriptionSpec::WithVerbose {
+        text: "canonical text".to_string(),
+        verbose_text: Some("canonical text with warning prose".to_string()),
+    };
+    let yaml = serde_yaml::to_string(&spec).expect("serialize verbose form");
+    assert!(yaml.contains("text: canonical text"), "{yaml}");
+    assert!(yaml.contains("verboseText:"), "{yaml}");
+    let back: ToolDescriptionSpec = serde_yaml::from_str(&yaml).expect("deserialize verbose form");
+    assert_eq!(back, spec);
+    let override_ = spec.to_override();
+    assert_eq!(override_.text.as_deref(), Some("canonical text"));
+    assert_eq!(
+        override_.verbose_text.as_deref(),
+        Some("canonical text with warning prose")
+    );
+
+    let canonical_only = ToolDescriptionSpec::WithVerbose {
+        text: "canonical fallback".to_string(),
+        verbose_text: None,
+    }
+    .to_override();
+    assert_eq!(
+        canonical_only.verbose_text.as_deref(),
+        Some("canonical fallback")
+    );
 }
 
 #[test]

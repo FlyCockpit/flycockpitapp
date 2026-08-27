@@ -1136,17 +1136,17 @@ impl From<Capability> for crate::agents::AgentCapability {
 /// encode different per-agent intent (e.g. `Build` "delegate-eager" vs a
 /// "do-it-yourself" agent) while validation/repair stay uniform. Overrides are
 /// fixed at agent-construction time, so the serialized tools array stays
-/// byte-stable for a given `(agent, mode)` → prompt-cache hit preserved; this
+/// byte-stable for a given `(agent, steering)` → prompt-cache hit preserved; this
 /// adds **no** new mid-session mutation.
 #[derive(Default, Clone)]
 pub struct ToolBox {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     mcp_builtin_tools: BTreeMap<String, McpBuiltinToolEntry>,
     /// Per-tool-name description overrides. Empty (the default) means every
-    /// tool renders its own base/per-mode description — byte-identical to the
+    /// tool renders its own steering-selected description — byte-identical to the
     /// pre-override behavior.
     overrides: BTreeMap<String, ToolDescOverride>,
-    /// Rendered tool schemas for this finalized toolbox, keyed by LLM mode.
+    /// Rendered tool schemas for this finalized toolbox, keyed by steering.
     /// Builder-style mutations clear it so per-agent overrides stay exact.
     definition_cache: Arc<Mutex<HashMap<crate::agents::ToolSteering, Vec<ToolDefinition>>>>,
     capability_unavailable: BTreeMap<String, Vec<crate::capabilities::ToolCapabilityIssue>>,
@@ -1361,8 +1361,7 @@ impl ToolBox {
 
     /// Project every tool to a `ToolDefinition`, rendering descriptions in
     /// the given `steering` and applying any per-agent override. The
-    /// `steering` flows from the agent def's `toolSteering` (derived from the
-    /// legacy mode at the existing seams until defs declare it); the
+    /// `steering` flows from the agent def's `toolSteering`; the
     /// overrides are the ones registered via [`Self::with_override`] at
     /// construction time.
     pub fn definitions(&self, steering: crate::agents::ToolSteering) -> Vec<ToolDefinition> {
@@ -2491,9 +2490,9 @@ mod steering_tests {
     }
 
     /// PER-AGENT AXIS: an override replaces the rendered description text for
-    /// the active mode while leaving the SCHEMA untouched, and composes with
-    /// the per-mode axis (each mode can carry its own override text). A mode
-    /// with no override text falls back to the tool's own per-mode form.
+    /// the active steering while leaving the SCHEMA untouched, and composes
+    /// with the terse/verbose axis. An absent steering override falls back to
+    /// the tool's own rendering.
     #[test]
     fn definition_of_applies_per_agent_override_and_composes_with_mode() {
         let tool = tools::read::ReadTool;
@@ -2523,7 +2522,7 @@ mod steering_tests {
         );
     }
 
-    /// A partial override (text for only one mode) leaves the other mode on
+    /// A partial override (text for only one steering) leaves the other on
     /// the tool's own base description — the fallback contract.
     #[test]
     fn definition_of_partial_override_falls_back_per_mode() {
@@ -2624,7 +2623,7 @@ mod steering_tests {
     }
 
     /// CACHE-SAFETY: the serialized tools array is byte-stable across repeated
-    /// renders for a given `(agent, mode)`. An empty override is dropped, so a
+    /// renders for a given `(agent, steering)`. An empty override is dropped, so a
     /// box with a no-op override serializes identically to one without any.
     #[test]
     fn toolbox_definitions_are_byte_stable_with_overrides() {

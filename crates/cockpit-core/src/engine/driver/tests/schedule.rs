@@ -473,6 +473,7 @@ fn schedule_journaling_driver(
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
     });
     let mut driver = Driver::with_max_schedules(session, locks, table, root, agent, 8);

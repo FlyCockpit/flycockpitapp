@@ -620,47 +620,36 @@ fn tool_family(name: &str) -> &'static str {
     }
 }
 
-/// A markdown agent's per-agent description override for one tool (prompt
-/// `per-agent-tool-definitions.md`). Authored in `tool_descriptions:`
-/// frontmatter as a per-mode object:
+/// A markdown agent's per-agent description override for one tool. Authored in
+/// `tool_descriptions:` frontmatter either as one canonical string or as a
+/// canonical string plus optional verbose steering text:
 ///
 /// ```yaml
 /// tool_descriptions:
 ///   task:
-///     normal: "Delegate substantive work here."
-///     frontier: "Delegate only clearly separable work."
-///     defensive: "Hand each well-scoped piece to a subagent …"
+///     text: "Delegate substantive work here."
+///     verboseText: "Hand each well-scoped piece to a subagent …"
 /// ```
 ///
-/// Tool authors write **two** tiers: [`crate::engine::tool::Tool::description`]
-/// (normal, also used for frontier) and
-/// [`crate::engine::tool::Tool::verbose_description`]. Agent authors may
-/// override **any of the three modes** independently. `frontier` is the only
-/// place frontier-specific tool text can exist anywhere in the system — the
-/// trait-level `frontier_description` slot was deliberately removed. An
-/// omitted mode always falls back to the tool's own text for that mode; there
-/// is no way to set one mode's text and have it leak into another.
+/// A bare string applies to both steering renderings. The object form applies
+/// `text` to terse steering and `verboseText`, when present, to verbose
+/// steering; when `verboseText` is omitted, the canonical `text` is used for
+/// both.
 ///
 /// Only the *description text* is selected; the tool's ID and SCHEMA are
 /// never affected (schema variation would change validation/repair behavior).
 ///
-/// Deserialization stays hand-written (a [`serde::de::Visitor`]) so scalar
-/// strings can fail with an explicit breaking-change diagnostic while
-/// `{normal, frontier, defensive}` maps continue to work under both YAML and
-/// JSON.
+/// Deserialization stays hand-written so the closed object schema is identical
+/// under YAML and JSON. The retired `{normal, frontier, defensive}` shape is a
+/// hard error; this prelaunch cleanup intentionally has no compatibility shim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolDescriptionSpec {
-    /// A single canonical description text, applied to every mode/steering.
-    /// Serialized as a bare string (issue #75): the per-mode trio collapses to
-    /// one text, with optional `verbose_text` carrying the defensive prose.
+    /// A single canonical description text, applied to both steerings.
     Text(String),
-    /// Distinct per-mode text; either field may be omitted to fall back to the
-    /// tool's own base description for that mode. Retained while the
-    /// mode-keyed description engines still exist (collapsed in Stage 3).
-    PerMode {
-        normal: Option<String>,
-        frontier: Option<String>,
-        defensive: Option<String>,
+    /// Canonical terse text plus optional verbose steering text.
+    WithVerbose {
+        text: String,
+        verbose_text: Option<String>,
     },
 }
 
@@ -669,23 +658,12 @@ impl Serialize for ToolDescriptionSpec {
         use serde::ser::SerializeMap;
         match self {
             ToolDescriptionSpec::Text(text) => ser.serialize_str(text),
-            ToolDescriptionSpec::PerMode {
-                normal,
-                frontier,
-                defensive,
-            } => {
-                let len = normal.is_some() as usize
-                    + frontier.is_some() as usize
-                    + defensive.is_some() as usize;
+            ToolDescriptionSpec::WithVerbose { text, verbose_text } => {
+                let len = 1 + usize::from(verbose_text.is_some());
                 let mut map = ser.serialize_map(Some(len))?;
-                if let Some(n) = normal {
-                    map.serialize_entry("normal", n)?;
-                }
-                if let Some(f) = frontier {
-                    map.serialize_entry("frontier", f)?;
-                }
-                if let Some(d) = defensive {
-                    map.serialize_entry("defensive", d)?;
+                map.serialize_entry("text", text)?;
+                if let Some(verbose) = verbose_text {
+                    map.serialize_entry("verboseText", verbose)?;
                 }
                 map.end()
             }
@@ -699,7 +677,7 @@ impl<'de> Deserialize<'de> for ToolDescriptionSpec {
         impl<'de> serde::de::Visitor<'de> for SpecVisitor {
             type Value = ToolDescriptionSpec;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a bare string or a `{normal, frontier, defensive}` map")
+                f.write_str("a bare string or a `{text, verboseText?}` map")
             }
             fn visit_str<E: serde::de::Error>(
                 self,
@@ -717,26 +695,36 @@ impl<'de> Deserialize<'de> for ToolDescriptionSpec {
                 self,
                 mut map: A,
             ) -> std::result::Result<Self::Value, A::Error> {
-                let mut normal: Option<String> = None;
-                let mut frontier: Option<String> = None;
-                let mut defensive: Option<String> = None;
+                let mut text: Option<String> = None;
+                let mut verbose_text: Option<String> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
-                        "normal" => normal = map.next_value()?,
-                        "frontier" => frontier = map.next_value()?,
-                        "defensive" => defensive = map.next_value()?,
+                        "text" => text = map.next_value()?,
+                        "verboseText" => verbose_text = map.next_value()?,
                         other => {
                             return Err(serde::de::Error::custom(format!(
-                                "unknown tool-description key `{other}` (expected `normal`, `frontier`, or `defensive`)"
+                                "unknown tool-description key `{other}` (expected `text` or `verboseText`)"
                             )));
                         }
                     }
                 }
-                Ok(ToolDescriptionSpec::PerMode {
-                    normal,
-                    frontier,
-                    defensive,
-                })
+                let text = text.ok_or_else(|| {
+                    serde::de::Error::custom("tool-description object requires non-empty `text`")
+                })?;
+                if text.trim().is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "tool-description object requires non-empty `text`",
+                    ));
+                }
+                if verbose_text
+                    .as_ref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(serde::de::Error::custom(
+                        "tool-description `verboseText` must be non-empty when present",
+                    ));
+                }
+                Ok(ToolDescriptionSpec::WithVerbose { text, verbose_text })
             }
         }
         de.deserialize_any(SpecVisitor)
@@ -745,25 +733,21 @@ impl<'de> Deserialize<'de> for ToolDescriptionSpec {
 
 impl ToolDescriptionSpec {
     /// Project to the engine-level [`crate::engine::tool::ToolDescOverride`].
-    /// `Text` maps to both the terse (`text`) and verbose (`verbose_text`)
-    /// slots so the single canonical string overrides every steering.
-    /// `PerMode` collapses: `normal` → `text`, `defensive` → `verbose_text`;
-    /// the `frontier` slot is dropped (frontier and normal share the terse
-    /// rendering under the new steering model).
+    /// A bare `Text` maps to both renderings. `WithVerbose` preserves the
+    /// canonical text for both renderings unless it carries explicit verbose
+    /// prose.
     pub fn to_override(&self) -> crate::engine::tool::ToolDescOverride {
         match self {
             ToolDescriptionSpec::Text(text) => crate::engine::tool::ToolDescOverride {
                 text: Some(text.clone()),
                 verbose_text: Some(text.clone()),
             },
-            ToolDescriptionSpec::PerMode {
-                normal,
-                frontier: _,
-                defensive,
-            } => crate::engine::tool::ToolDescOverride {
-                text: normal.clone(),
-                verbose_text: defensive.clone(),
-            },
+            ToolDescriptionSpec::WithVerbose { text, verbose_text } => {
+                crate::engine::tool::ToolDescOverride {
+                    text: Some(text.clone()),
+                    verbose_text: Some(verbose_text.as_ref().unwrap_or(text).clone()),
+                }
+            }
         }
     }
 }
@@ -780,9 +764,7 @@ where
         type Value = BTreeMap<String, ToolDescriptionSpec>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str(
-                "a map of tool names to bare strings or `{normal, frontier, defensive}` maps",
-            )
+            f.write_str("a map of tool names to bare strings or `{text, verboseText?}` maps")
         }
 
         fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -805,10 +787,8 @@ where
     de.deserialize_map(ToolDescriptionsVisitor)
 }
 
-/// Reachability of an agent in the delegation tree. **Not** the
-/// defensive/normal LLM-mode axis (that future feature owns a separate
-/// key — see implementation note forward-compat notes);
-/// do not overload this.
+/// Reachability of an agent in the delegation tree. This is an execution-role
+/// classification, not model selection or posture.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentMode {
@@ -825,8 +805,8 @@ pub enum AgentMode {
 impl AgentMode {
     /// Whether this agent may be delegated to via `task` (i.e. it is a
     /// reachable subagent). The `Primary`/`All` distinction for chat
-    /// ownership is consumed by the future LLM-modes work; only subagent
-    /// reachability is load-bearing today.
+    /// ownership is consumed by primary selection; subagent reachability is
+    /// consumed by delegation.
     pub fn is_subagent(self) -> bool {
         matches!(self, AgentMode::All | AgentMode::Subagent)
     }
@@ -900,6 +880,45 @@ pub fn next_primary_in_cycle(current: &str, order: &[String]) -> String {
 }
 
 impl AgentDef {
+    /// Non-fatal diagnostics produced when this definition is loaded. Keeping
+    /// these separate from invariant errors lets inventory/settings surfaces
+    /// warn without silently changing the definition's grants.
+    pub fn load_warnings(&self) -> Vec<String> {
+        invariants::small_model_capability_warning(self)
+            .into_iter()
+            .collect()
+    }
+
+    /// Warn when an explicit runtime model override falls outside every model
+    /// suggested by this definition. Suggestions are advisory: this never
+    /// changes capabilities, tools, steering, or context policy.
+    pub fn model_override_warning(&self, provider: &str, model: &str) -> Option<String> {
+        let vnext = self.vnext.as_ref()?;
+        let suggestions = vnext
+            .model_slots
+            .values()
+            .flat_map(|slot| slot.suggested_models.iter())
+            .collect::<Vec<_>>();
+        if suggestions.is_empty() {
+            return None;
+        }
+        let qualified = format!("{provider}/{model}");
+        let matches = suggestions.iter().any(|recommendation| {
+            recommendation.upstream_identity == qualified
+                || recommendation.upstream_identity == model
+                || recommendation
+                    .provider_aliases
+                    .iter()
+                    .any(|alias| alias.provider_id == provider && alias.model_id == model)
+        });
+        (!matches).then(|| {
+            format!(
+                "agent `{}` is using explicit model override `{qualified}`, which is outside its suggested models; posture and capability grants are unchanged",
+                self.name
+            )
+        })
+    }
+
     /// The agent's effective system prompt (issue #75). The canonical body
     /// is [`Self::prompt`]; when [`Self::prompt_overrides`] carries a body
     /// for the given `model_hint` (matched by model-slot name or model id),
@@ -1384,7 +1403,7 @@ pub fn load_from_file(path: &Path) -> Result<AgentDef> {
     let name = agent_name_from_path(path)
         .ok_or_else(|| anyhow::anyhow!("agent file {} has no usable file stem", path.display()))?;
     let def = parse_agent(&text, &name, path.to_path_buf())?;
-    validate_invariants(&def)?;
+    validate_loaded_def(&def)?;
     Ok(def)
 }
 
@@ -1396,7 +1415,7 @@ pub fn load_from_file(path: &Path) -> Result<AgentDef> {
 pub fn load_workspace_named_from_file(path: &Path, name: &str) -> Result<AgentDef> {
     let text = read_agent_markdown(path)?;
     let def = parse_agent(&text, name, path.to_path_buf())?;
-    validate_invariants(&def)?;
+    validate_loaded_def(&def)?;
     Ok(def)
 }
 
@@ -1421,7 +1440,7 @@ fn load_builtin_override_from_file(path: &Path, name: &str) -> Result<AgentDef> 
             path.display()
         );
     }
-    validate_invariants(&def)?;
+    validate_loaded_def(&def)?;
     Ok(def)
 }
 
@@ -1436,7 +1455,7 @@ pub fn load_daemon_local_named_from_file(path: &Path, name: &str) -> Result<Agen
         path.to_path_buf(),
         DefinitionScope::DaemonLocal,
     )?;
-    validate_invariants(&def)?;
+    validate_loaded_def(&def)?;
     Ok(def)
 }
 
@@ -1449,7 +1468,7 @@ pub fn parse_daemon_local_markdown(text: &str, name: &str) -> Result<AgentDef> {
         PathBuf::from("<daemon-assistant-definition>"),
         DefinitionScope::DaemonLocal,
     )?;
-    validate_invariants(&def)?;
+    validate_loaded_def(&def)?;
     Ok(def)
 }
 
@@ -1600,8 +1619,16 @@ fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
     if let Some(flat) = flat_def {
         base.prompt = flat.prompt;
     }
-    validate_invariants(&base)?;
+    validate_loaded_def(&base)?;
     Ok(base)
+}
+
+fn validate_loaded_def(def: &AgentDef) -> Result<()> {
+    validate_invariants(def)?;
+    for warning in def.load_warnings() {
+        tracing::warn!(agent = %def.name, %warning, "agent definition loaded with warning");
+    }
+    Ok(())
 }
 
 fn read_agent_markdown(path: &Path) -> Result<String> {
@@ -1912,7 +1939,7 @@ fn agent_markdown_oversized(path: &Path, dir: &Path, name: &str) -> bool {
 }
 
 /// Return the candidate agent name for a dir entry: the stem of a `.md`
-/// file, or a directory name (the reserved per-mode form). Non-`.md`
+/// file, or a directory name (the per-model override form). Non-`.md`
 /// files are ignored.
 fn agent_file_candidate_name(path: &Path) -> Option<String> {
     if path.is_dir() {
@@ -1979,7 +2006,7 @@ pub fn reset_all_builtins(cwd: &Path) -> Result<Vec<PathBuf>> {
                     .map_err(|e| anyhow::anyhow!("removing {}: {e}", flat.display()))?;
                 removed.push(flat);
             }
-            // Reserved per-mode dir form — remove it too so a reset is
+            // Per-model override dir form — remove it too so a reset is
             // complete once that form ships.
             let dir_form = dir.join(name);
             if dir_form.is_dir() {

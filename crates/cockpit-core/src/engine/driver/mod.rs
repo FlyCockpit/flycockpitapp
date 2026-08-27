@@ -74,8 +74,7 @@ use crate::engine::prune;
 use crate::engine::schedule::{ScheduleAuthority, ScheduleCommand, ScheduleEvent};
 use crate::redact::RedactionTable;
 
-const AUTO_COMPACT_FLOOR_PCT: u8 = 60;
-const AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT: u8 = 80;
+const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
 use crate::session::Session;
 
 /// Out-of-band control requests routed to the driver from the daemon
@@ -2532,8 +2531,8 @@ impl Driver {
         &mut self,
         active_idx: usize,
         // The rebound model to pin as `model_override` across the rebuild so a
-        // frontmatter `model:` cannot revert a per-node model override (modes
-        // AC5). `None` outside a model override — normal rebuild precedence.
+        // frontmatter `model:` cannot revert a per-node model override. `None`
+        // outside a model override — normal rebuild precedence.
         model_pin: Option<Arc<crate::engine::model::Model>>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
@@ -7871,7 +7870,7 @@ impl Driver {
     }
 
     /// Re-load a foreground frame under `new_model` (live model switch),
-    /// preserving its name and applying the caller's re-resolved LLM mode. The
+    /// preserving its name and pinned definition. The
     /// new model's reasoning and cache preferences are resolved from the
     /// daemon-authoritative session/request selection. Provider config supplies
     /// capabilities and wire mappings, but its default selection must not leak
@@ -7950,8 +7949,11 @@ impl Driver {
         selection: &crate::config::providers::ActiveModelRef,
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> Result<Agent> {
-        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
-        crate::engine::builtin::load(&name, &args)
+        let (_name, args) = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
+        crate::engine::builtin::rebuild_from_pinned_definition(
+            self.stack[frame_idx].agent.as_ref(),
+            &args,
+        )
     }
 
     fn rebuild_frame_with_model(
@@ -7961,12 +7963,15 @@ impl Driver {
         selection: &crate::config::providers::ActiveModelRef,
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> Agent {
-        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
-        // `builtin::load` honors a user override of a bundled primary; fall back
-        // to the same agent name's default build on a load failure so the swap
-        // never strands the session without a primary.
-        crate::engine::builtin::load(&name, &args)
-            .unwrap_or_else(|_| crate::engine::builtin::default_build(&args))
+        let (_name, args) = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
+        // Rebuild from the pinned definition; fall back to the default Build
+        // agent on a load failure so the swap never strands the session without
+        // a primary.
+        crate::engine::builtin::rebuild_from_pinned_definition(
+            self.stack[frame_idx].agent.as_ref(),
+            &args,
+        )
+        .unwrap_or_else(|_| crate::engine::builtin::default_build(&args))
     }
 
     /// Re-resolve the reasoning-param fragment for `model` from the config's
@@ -8303,22 +8308,19 @@ impl Driver {
         &self,
         ctx_cfg: &crate::config::providers::ContextConfig,
         context_policy: Option<&crate::agents::ContextPolicy>,
-        can_self_compact: bool,
     ) -> u8 {
         if let Some(explicit) = ctx_cfg.auto_compact_pct {
             return explicit;
         }
         // Issue #75: the def's contextPolicy.autoCompactPct is the sole
-        // posture-derived floor; the default is 80 (CAPABLE_MODE_DEFAULT_PCT).
+        // posture-derived floor. Omission is always 80, independent of the
+        // tool surface; the Careful definition explicitly requests 60.
         if let Some(policy) = context_policy
             && let Some(pct) = policy.auto_compact_pct
         {
             return pct;
         }
-        if !can_self_compact {
-            return AUTO_COMPACT_FLOOR_PCT;
-        }
-        AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT
+        AUTO_COMPACT_DEFAULT_PCT
     }
 
     fn effective_root_auto_compact_pct(
@@ -8327,7 +8329,7 @@ impl Driver {
     ) -> u8 {
         let frame = self.stack.first();
         let policy = frame.and_then(|f| f.agent.context_policy.as_ref());
-        self.effective_auto_compact_pct(ctx_cfg, policy, self.root_can_self_compact())
+        self.effective_auto_compact_pct(ctx_cfg, policy)
     }
 
     /// Last provider-reported input usage, with a debug-build-only threshold

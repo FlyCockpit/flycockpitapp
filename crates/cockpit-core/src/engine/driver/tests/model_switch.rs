@@ -2183,6 +2183,49 @@ async fn active_frame_refresh_is_byte_identical_when_config_unchanged() {
 }
 
 #[tokio::test]
+async fn foreground_definition_is_pinned_while_new_children_see_fresh_definition() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        let agents = tmp.path().join(".cockpit/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let definition = |body: &str| {
+            format!(
+                "---\ndescription: pinned builder\nschemaVersion: 2\nagentId: cockpit/builder\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test definition pinning\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
+            )
+        };
+        let path = agents.join("builder.md");
+        std::fs::write(&path, definition("PINNED GENERATION")).unwrap();
+        push_named_test_child(&mut driver, "builder");
+        assert_eq!(
+            driver.stack.last().unwrap().agent.role_prompt,
+            "PINNED GENERATION"
+        );
+
+        std::fs::write(&path, definition("FRESH GENERATION")).unwrap();
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+        driver.refresh_active_frame_for_turn(&tx).await;
+        assert_eq!(
+            driver.stack.last().unwrap().agent.role_prompt,
+            "PINNED GENERATION",
+            "the running foreground frame keeps its definition snapshot"
+        );
+
+        let mut args = driver.spawn_args(true);
+        args.model = driver.stack[0].agent.model.clone();
+        let fresh = crate::engine::builtin::load("builder", &args).unwrap();
+        assert_eq!(
+            fresh.role_prompt, "FRESH GENERATION",
+            "a newly constructed child resolves the fresh definition"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn active_frame_tool_surface_refresh_survives_model_build_failure() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let policy = crate::config::trust::WorkspaceTrustPolicy {
@@ -2219,7 +2262,7 @@ async fn active_frame_tool_surface_refresh_survives_model_build_failure() {
 }
 
 #[tokio::test]
-async fn active_frame_tool_surface_refresh_failure_emits_its_own_notice() {
+async fn active_frame_refresh_ignores_malformed_newer_definition() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -2236,22 +2279,12 @@ async fn active_frame_tool_surface_refresh_failure_emits_its_own_notice() {
             .refresh_active_tool_surface_for_turn(active_idx, None, &tx)
             .await;
 
-        assert_eq!(
-            Arc::as_ptr(&driver.stack[active_idx].agent),
-            before,
-            "non-root tool-surface failure must retain the previous agent"
-        );
+        assert_ne!(Arc::as_ptr(&driver.stack[active_idx].agent), before);
         let notices = drain_notices(&mut rx);
-        assert_eq!(notices.len(), 1, "expected one tool-surface notice");
-        assert!(
-            notices[0].contains("tool surface")
-                && notices[0].contains("Keeping the previous tool surface"),
-            "unexpected notice: {}",
-            notices[0]
-        );
+        assert!(notices.is_empty(), "pinned definition reload: {notices:?}");
         assert_eq!(
             driver.stack[active_idx].agent.name, "builder",
-            "non-root failure must not fall back to the default Build primary"
+            "the pinned child definition remains active"
         );
     })
     .await;
@@ -2276,13 +2309,8 @@ async fn active_frame_refresh_notices_dedupe_independently() {
 
         driver.refresh_active_frame_for_turn(&tx).await;
         let notices = drain_notices(&mut rx);
-        assert_eq!(
-            notices.len(),
-            2,
-            "both independent failures should report once"
-        );
+        assert_eq!(notices.len(), 1, "only the model refresh should fail");
         assert!(notices.iter().any(|text| text.contains("active model")));
-        assert!(notices.iter().any(|text| text.contains("tool surface")));
 
         driver.refresh_active_frame_for_turn(&tx).await;
         assert!(
@@ -2304,17 +2332,7 @@ async fn active_frame_refresh_notices_dedupe_independently() {
 
         write_malformed_agent_override(tmp.path(), "builder");
         driver.refresh_active_frame_for_turn(&tx).await;
-        let notices = drain_notices(&mut rx);
-        assert_eq!(
-            notices.len(),
-            1,
-            "only the reintroduced failure should notify"
-        );
-        assert!(
-            notices[0].contains("tool surface"),
-            "unexpected notice: {}",
-            notices[0]
-        );
+        assert!(drain_notices(&mut rx).is_empty());
     })
     .await;
 }
@@ -2331,7 +2349,7 @@ async fn active_frame_refresh_updates_schedule_agent() {
 }
 
 #[tokio::test]
-async fn active_frame_refresh_updates_schedule_when_tool_surface_fails() {
+async fn active_frame_refresh_updates_schedule_with_malformed_newer_definition() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -2345,18 +2363,13 @@ async fn active_frame_refresh_updates_schedule_when_tool_surface_fails() {
         driver.refresh_active_frame_for_turn(&tx).await;
 
         assert_eq!(driver.schedule.agent_name_for_tests(), "builder");
-        assert!(
-            drain_notices(&mut rx)
-                .iter()
-                .any(|notice| notice.contains("tool surface")),
-            "tool-surface failure should still be surfaced"
-        );
+        assert!(drain_notices(&mut rx).is_empty());
     })
     .await;
 }
 
 #[tokio::test]
-async fn active_frame_refresh_updates_schedule_when_both_refreshes_fail() {
+async fn active_frame_refresh_updates_schedule_when_model_refresh_fails() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -2380,10 +2393,7 @@ async fn active_frame_refresh_updates_schedule_when_both_refreshes_fail() {
             notices.iter().any(|notice| notice.contains("active model")),
             "model refresh failure should be surfaced: {notices:?}"
         );
-        assert!(
-            notices.iter().any(|notice| notice.contains("tool surface")),
-            "tool-surface failure should be surfaced: {notices:?}"
-        );
+        assert!(!notices.iter().any(|notice| notice.contains("tool surface")));
     })
     .await;
 }

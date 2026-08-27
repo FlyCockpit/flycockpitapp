@@ -1486,13 +1486,17 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, String> {
         };
         let kind = listing.kind;
         let name = listing.name;
-        let (description, model, valid, diagnostic) = match listing.def {
-            Ok(def) => (Some(def.description), def.model, true, None),
+        let (description, model, valid, diagnostic, warnings) = match listing.def {
+            Ok(def) => {
+                let warnings = def.load_warnings();
+                (Some(def.description), def.model, true, None, warnings)
+            }
             Err(_) => (
                 None,
                 None,
                 false,
                 Some(INVALID_AGENT_DIAGNOSTIC.to_string()),
+                Vec::new(),
             ),
         };
         if [
@@ -1502,6 +1506,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, String> {
         ]
         .into_iter()
         .flatten()
+        .chain(warnings.iter().map(String::as_str))
         .any(|value| value.len() > cockpit_proto::MAX_AGENT_METADATA_BYTES)
         {
             return Err(format!(
@@ -1527,6 +1532,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, String> {
             model,
             valid,
             diagnostic,
+            warnings,
             source_layer,
             source_identity,
             revision,

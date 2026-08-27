@@ -1701,6 +1701,7 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: old.env_overlay.clone(),
+        definition: old.definition.clone(),
         assistant_identity_prefix: None,
     });
     install_test_providers(
@@ -2376,25 +2377,24 @@ async fn effective_auto_compact_pct_defaults_when_unset() {
     let (driver, _tmp) = test_driver_without_network(8);
     let cfg = ContextConfig::default();
 
-    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, true), 80);
-    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, false), 60);
+    assert_eq!(driver.effective_auto_compact_pct(&cfg, None), 80);
     let conservative = crate::agents::ContextPolicy {
         auto_compact_pct: Some(60),
         inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
     };
     assert_eq!(
-        driver.effective_auto_compact_pct(&cfg, Some(&conservative), true),
+        driver.effective_auto_compact_pct(&cfg, Some(&conservative)),
         60
     );
 }
 
 #[tokio::test]
-async fn effective_auto_compact_pct_stays_60_without_mcp() {
+async fn effective_auto_compact_pct_is_80_without_mcp() {
     use crate::config::providers::ContextConfig;
     let (driver, _tmp) = test_driver_without_network(8);
     let cfg = ContextConfig::default();
 
-    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, false), 60);
+    assert_eq!(driver.effective_auto_compact_pct(&cfg, None), 80);
 }
 
 #[tokio::test]
@@ -2410,12 +2410,8 @@ async fn effective_auto_compact_pct_explicit_override_wins() {
         inline_caps: None,
     };
 
-    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, false), 50);
-    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, true), 50);
-    assert_eq!(
-        driver.effective_auto_compact_pct(&cfg, Some(&policy), true),
-        50
-    );
+    assert_eq!(driver.effective_auto_compact_pct(&cfg, None), 50);
+    assert_eq!(driver.effective_auto_compact_pct(&cfg, Some(&policy)), 50);
 }
 
 #[tokio::test]

@@ -310,6 +310,7 @@ fn build_fork_agent(
         delegated: parent.delegated,
         delegation_recursion: parent.delegation_recursion.clone(),
         vnext_grant: parent.vnext_grant.clone(),
+        definition: parent.definition.clone(),
     }
 }
 
@@ -422,6 +423,7 @@ mod tests {
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
         })
     }

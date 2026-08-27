@@ -959,6 +959,7 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
     });
     let mut driver2 =

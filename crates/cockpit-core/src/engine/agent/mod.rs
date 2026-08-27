@@ -236,6 +236,10 @@ pub struct Agent {
     pub delegation_recursion: crate::engine::builtin::DelegationRecursionContext,
     pub vnext_grant: Option<crate::agents::EffectiveVnextGrant>,
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    /// Exact definition snapshot used to construct this running agent. A
+    /// foreground frame keeps this snapshot across config/model refreshes;
+    /// newly constructed children resolve their own fresh definition.
+    pub(crate) definition: Option<Arc<crate::agents::AgentDef>>,
     /// The assistant identity prefix (SOUL/USER identity + instructions) that was
     /// prepended to [`Self::system`] at build time, retained so a per-candidate
     /// failover re-posture can recompose a system that is byte-identical to a

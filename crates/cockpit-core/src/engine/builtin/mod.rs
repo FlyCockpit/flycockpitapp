@@ -1698,6 +1698,23 @@ pub fn load_with_tool_surface_override(
     load_resolved_def(name, args, tool_surface_override, &mut def)
 }
 
+/// Rebuild a running foreground agent from the exact definition snapshot that
+/// originally constructed it. Config-driven tool/model material is refreshed
+/// through `args`, but edits to the definition itself affect only agents built
+/// after the edit (new children or a newly started root session).
+pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) -> Result<Agent> {
+    let Some(definition) = &agent.definition else {
+        return load(&agent.name, args);
+    };
+    let mut definition = (**definition).clone();
+    let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
+    // A foreground child may already carry the parent's no-widening
+    // intersection. Rebuilding from its governing definition must not restore
+    // grants removed at admission.
+    rebuilt.posture = agent.posture.clone();
+    Ok(rebuilt)
+}
+
 pub async fn load_with_assistant_db_and_tool_surface_override(
     name: &str,
     args: &SpawnArgs,
@@ -1958,12 +1975,13 @@ async fn resolve_child_def_with_db(
     }
 }
 
-/// Re-render an already-built delegated child's mode-dependent surface for a
+/// Re-render an already-built delegated child's model-dependent surface for a
 /// FAILOVER/BACKUP candidate `candidate_model`, recomposing the agent's
 /// system prompt for the candidate model. Per issue #75 the posture (tool
 /// steering, capability grants, context policy) comes from the agent's def
 /// and is model-independent, so only the composed `system` and `model`
-/// change — the role body, toolbox, grants, and steering are preserved.
+/// plus the candidate-selected role body change; the toolbox, grants, and
+/// steering are preserved.
 ///
 /// Returns `Ok(None)` ONLY when the candidate is the SAME model as the
 /// current agent (the primary attempt — no re-render needed). Any different
@@ -1971,9 +1989,11 @@ async fn resolve_child_def_with_db(
 /// prepends the candidate model's own system prompt): a same-def,
 /// different-model backup must NOT reuse the primary model's composed system.
 ///
-/// The role body is the agent's OWN resolved role (unchanged by the model
-/// swap), so this works for assistant-DB-backed agents too. Fails CLOSED with
-/// a content-safe error only when the system cannot be recomposed.
+/// The governing definition is the running agent's pinned snapshot. Older test
+/// and recovery agents without that snapshot re-resolve through the same
+/// workspace + assistant database path as their original construction. The
+/// candidate then selects its own per-model prompt override without changing
+/// the definition's posture or grants.
 pub(crate) async fn reposture_agent_for_candidate(
     agent: &Agent,
     candidate_model: &Arc<Model>,
@@ -1981,15 +2001,27 @@ pub(crate) async fn reposture_agent_for_candidate(
     cwd: &Path,
     db: &crate::db::Db,
 ) -> Result<Option<Agent>> {
-    let _ = db;
     let same_model = agent.model.provider_id() == candidate_model.provider_id()
         && agent.model.model_id_ref() == candidate_model.model_id_ref();
     if same_model {
         return Ok(None);
     }
-    // The role body is unchanged by a model swap (it comes from the def, not
-    // the model), so reuse the agent's OWN resolved role.
-    let role = agent.role_prompt.clone();
+    let definition = match &agent.definition {
+        Some(definition) => (**definition).clone(),
+        None => resolve_child_def_with_db(&agent.name, cwd, db).await?,
+    };
+    if let Some(warning) = definition.model_override_warning(
+        candidate_model.provider_id(),
+        candidate_model.model_id_ref(),
+    ) {
+        tracing::warn!(agent = %agent.name, provider = %candidate_model.provider_id(), model = %candidate_model.model_id_ref(), %warning, "failover model is outside agent definition suggestions");
+    }
+    let role = definition
+        .resolved_prompt_for_model(
+            candidate_model.provider_id(),
+            candidate_model.model_id_ref(),
+        )
+        .to_string();
     // Recompose the system for the ACTUAL candidate model (its own
     // model-specific system prompt), applying the SAME assistant identity
     // prefix the initial build used, so the repostured system is byte-identical
@@ -2265,6 +2297,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     );
     if def.name == "deepthink" {
         let model = resolve_agent_model(def, args)?;
+        emit_model_override_warning(def, args, &model);
         // Posture follows the child's OWN resolved model, not the root frame.
         let tool_steering = crate::agents::ToolSteering::from_def(def);
         let declared_posture = crate::agents::PostureResolution::from_def(def);
@@ -2302,6 +2335,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             },
             vnext_grant: effective_vnext_grant.clone(),
             env_overlay: args.env_overlay.clone(),
+            definition: Some(Arc::new(def.clone())),
             assistant_identity_prefix: args.assistant_identity_prefix.clone(),
         });
     }
@@ -2395,7 +2429,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // `per-agent-tool-definitions.md`): re-word a granted tool's description
     // for this markdown agent. Applied last so it lands on whatever tool of
     // that name is on the box; the schema is never touched, so the tools array
-    // stays byte-stable for `(agent, mode)`. Naming a non-granted tool was
+    // stays byte-stable for `(agent, steering)`. Naming a non-granted tool was
     // rejected at load (`validate_invariants`), so an override here always has
     // a matching tool.
     for (tool_name, spec) in &def.tool_descriptions {
@@ -2406,6 +2440,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // session). A malformed explicit frontmatter selector fails loudly because
     // it is a direct user setting; unset or unconfigured role slots fall back.
     let model = resolve_agent_model(def, args)?;
+    emit_model_override_warning(def, args, &model);
     // The child's posture (tool steering + capability grants) is resolved
     // from its OWN def (issue #75), never inherited from the root frame.
     let tool_steering = crate::agents::ToolSteering::from_def(def);
@@ -2443,8 +2478,17 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: effective_vnext_grant,
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def.clone())),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     })
+}
+
+fn emit_model_override_warning(def: &crate::agents::AgentDef, args: &SpawnArgs, model: &Model) {
+    if (args.model_override.is_some() || args.delegation_model.is_some() || def.model.is_some())
+        && let Some(warning) = def.model_override_warning(model.provider_id(), model.model_id_ref())
+    {
+        tracing::warn!(agent = %def.name, provider = %model.provider_id(), model = %model.model_id_ref(), %warning, "agent model override is outside suggested models");
+    }
 }
 
 fn effective_vnext_grant_for(
@@ -2824,7 +2868,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
     // iterations go to fresh `builder` tasks, while `Build` decides, briefs,
     // and reports. The override re-words only the description for this agent;
     // the tool ID + schema are unchanged, so the tools array stays byte-stable
-    // for `(Build, mode)`.
+    // for `(Build, steering)`.
     let tools = tools.with_override(
         "task",
         crate::engine::tool::ToolDescOverride {
@@ -2880,6 +2924,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -2949,6 +2994,7 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
         },
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3074,6 +3120,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3085,7 +3132,7 @@ pub fn goal_control(
     role: crate::engine::schedule::authority::SpawnWorkerKind,
     args: &SpawnArgs,
 ) -> Agent {
-    let def = crate::agents::embedded_internal_default("standard")
+    let mut def = crate::agents::embedded_internal_default("standard")
         .expect("standard has an internal agent definition");
     use crate::engine::schedule::authority::SpawnWorkerKind;
     let (name, system, tools) = match role {
@@ -3113,6 +3160,9 @@ pub fn goal_control(
             unreachable!("ordinary swarm workers are built by their dedicated factories")
         }
     };
+    def.name = name.to_string();
+    def.prompt = system.to_string();
+    def.prompt_overrides.clear();
     let model = args.effective_model();
     Agent {
         name: name.to_string(),
@@ -3138,6 +3188,7 @@ pub fn goal_control(
         },
         vnext_grant: None,
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3196,6 +3247,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3253,6 +3305,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3326,6 +3379,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -5305,7 +5359,7 @@ mod tests {
 
     #[test]
     fn builtin_prompts_have_no_mode_suffixed_files() {
-        // Issue #75 ratchet: the per-mode `.normal.md`/`.frontier.md` prompt
+        // Issue #75 ratchet: the retired `.normal.md`/`.frontier.md` prompt
         // bodies are gone; each bundled agent has a single canonical body.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/builtin");
         let entries = std::fs::read_dir(&dir).unwrap();
@@ -5842,7 +5896,7 @@ mod tests {
         local_child.name = "nested-child".to_string();
         local_child.prompt = "authenticated local snapshot".to_string();
         // The authenticated snapshot replaces the full authored body; do not
-        // retain embedded per-mode prompt variants that would mask it.
+        // retain embedded posture-keyed prompt variants that would mask it.
         local_child.prompt_overrides.clear();
         local_child.vnext.as_mut().unwrap().agent_id =
             "local/00000000-0000-0000-0000-000000000004".to_string();
@@ -6138,11 +6192,7 @@ mod tests {
         let mut tool_descriptions = std::collections::BTreeMap::new();
         tool_descriptions.insert(
             "read".to_string(),
-            ToolDescriptionSpec::PerMode {
-                normal: Some("builder: read the file you will edit yourself".to_string()),
-                frontier: None,
-                defensive: None,
-            },
+            ToolDescriptionSpec::Text("builder: read the file you will edit yourself".to_string()),
         );
         let def = AgentDef {
             name: "builder".to_string(),

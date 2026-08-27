@@ -2564,8 +2564,11 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
                     nofollow_read(&target)?.is_some(),
                 ))
             });
-            let (description, model, valid, diagnostic) = match entry.def {
-                Ok(def) => (Some(def.description), def.model, true, None),
+            let (description, model, valid, diagnostic, warnings) = match entry.def {
+                Ok(def) => {
+                    let warnings = def.load_warnings();
+                    (Some(def.description), def.model, true, None, warnings)
+                }
                 Err(_) => (
                     None,
                     None,
@@ -2573,6 +2576,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
                     Some(
                         "agent definition is invalid; inspect it through the daemon editor".into(),
                     ),
+                    Vec::new(),
                 ),
             };
             if [
@@ -2582,6 +2586,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
             ]
             .into_iter()
             .flatten()
+            .chain(warnings.iter().map(String::as_str))
             .any(|value| value.len() > cockpit_proto::MAX_AGENT_METADATA_BYTES)
             {
                 return Err(bad_request(format!(
@@ -2611,6 +2616,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
                 model,
                 valid,
                 diagnostic,
+                warnings,
                 source_layer,
                 source_identity: source_identity.to_string(),
                 revision,

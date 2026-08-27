@@ -431,6 +431,22 @@ pub enum VerificationBudgetAction {
     DispatchOriginal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationEstimateState {
+    Available,
+    EstimateUnavailable,
+}
+
+impl VerificationEstimateState {
+    fn parse(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "available" => Ok(Self::Available),
+            "estimate_unavailable" => Ok(Self::EstimateUnavailable),
+            _ => Err(invalid_value("verification estimate state")),
+        }
+    }
+}
+
 impl VerificationBudgetAction {
     fn as_str(self) -> &'static str {
         match self {
@@ -577,6 +593,7 @@ pub struct VerificationOperationRow {
     pub original_operation_digest: VerificationDigest,
     pub pretool_context_capability_digest: VerificationDigest,
     pub budget_action: Option<VerificationBudgetAction>,
+    pub estimate_state: VerificationEstimateState,
 }
 
 #[derive(Debug, Clone)]
@@ -813,6 +830,33 @@ impl Db {
             }
             load_operation(conn, input.session_id, operation_id)?.context("created verification operation missing")
         }).await
+    }
+
+    /// Host-only listing of verification operations for a session. Used by
+    /// dispatch tests and doctor counts; never an agent-facing API.
+    pub async fn list_verification_operations_for_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<VerificationOperationRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT operation_id FROM verification_operations
+                 WHERE session_id = ?1
+                 ORDER BY created_at_unix_ms ASC, operation_id ASC",
+            )?;
+            let ids = stmt
+                .query_map(params![session_id.to_string()], |row| {
+                    parse_uuid(row.get(0)?)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.into_iter()
+                .map(|operation_id| {
+                    load_operation(conn, session_id, operation_id)?
+                        .context("listed verification operation missing")
+                })
+                .collect()
+        })
+        .await
     }
 
     pub async fn start_verification_collection(
@@ -2005,7 +2049,8 @@ fn load_operation(
 ) -> Result<Option<VerificationOperationRow>> {
     conn.query_row(
         "SELECT operation_id, session_id, agent_instance_id, state, revision, collection_closed_at_unix_ms,
-                collection_revision, original_operation_digest, pretool_context_capability_digest, budget_action
+                collection_revision, original_operation_digest, pretool_context_capability_digest, budget_action,
+                estimate_state
          FROM verification_operations WHERE operation_id = ?1 AND session_id = ?2",
         params![operation_id.to_string(), session_id.to_string()],
         |row| Ok(VerificationOperationRow {
@@ -2015,6 +2060,7 @@ fn load_operation(
             original_operation_digest: VerificationDigest::parse(&row.get::<_, String>(7)?).map_err(anyhow_to_sql_error)?,
             pretool_context_capability_digest: VerificationDigest::parse(&row.get::<_, String>(8)?).map_err(anyhow_to_sql_error)?,
             budget_action: parse_budget_action(row.get(9)?)?,
+            estimate_state: VerificationEstimateState::parse(&row.get::<_, String>(10)?)?,
         }),
     ).optional().context("loading authorized verification operation")
 }

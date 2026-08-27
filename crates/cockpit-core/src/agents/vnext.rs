@@ -613,59 +613,76 @@ impl VnextAgentDef {
         let Some(policy) = &self.verification else {
             return Ok(VerificationDispatch::Off);
         };
-        let compiled = policy.compile();
-        let Some(rule) = compiled.select(subject) else {
-            return Ok(VerificationDispatch::Off);
-        };
-        if rule.action == VerificationAction::Off {
-            return Ok(VerificationDispatch::Off);
-        }
-        let reduction_budget = match session {
-            VerificationSessionReduction::Inherit => None,
-            VerificationSessionReduction::Off => return Ok(VerificationDispatch::Off),
-            VerificationSessionReduction::Restrict { selector, budget } => {
-                selector.validate()?;
-                if !selector.matches(subject) {
-                    return Ok(VerificationDispatch::Off);
-                }
-                budget
-            }
-        };
-        let requested = rule.requested_budget(host.verification_ceiling)?;
-        let requested_session_budget = match (reduction_budget, session_budget) {
-            (Some(reduction), Some(legacy)) => {
-                // Both seams may be present during the breaking migration;
-                // their intersection is the stricter budget, never a choice
-                // of one reduction that accidentally widens the other.
-                Some(reduction.reduce(legacy)?)
-            }
-            (Some(reduction), None) => Some(reduction),
-            (None, budget) => budget,
-        };
-        let resolved = match requested_session_budget {
-            Some(session) => requested.reduce(session)?,
-            None => requested,
-        };
-        let estimate_exceeds = match estimate {
-            VerificationEstimate::Known(estimated) => !resolved.contains(estimated),
-            VerificationEstimate::UnknownTokens | VerificationEstimate::UnknownPrice => true,
-        };
-        if estimate_exceeds {
-            return Ok(
-                match rule.on_budget_exceeded.unwrap_or(OnBudgetExceeded::Refuse) {
-                    OnBudgetExceeded::Refuse => VerificationDispatch::Refuse,
-                    OnBudgetExceeded::DispatchOriginal => VerificationDispatch::DispatchOriginal,
-                },
-            );
-        }
-        Ok(VerificationDispatch::Verify {
-            budget: resolved,
-            adjudicator_slot: rule
-                .adjudicator_slot
-                .clone()
-                .expect("validated verify rule"),
-        })
+        resolve_compiled_verification(
+            &policy.compile(),
+            host,
+            subject,
+            session,
+            session_budget,
+            estimate,
+        )
     }
+}
+
+fn resolve_compiled_verification(
+    compiled: &CompiledVerificationPolicy,
+    host: &VnextHostPolicy,
+    subject: &VerificationSubject<'_>,
+    session: VerificationSessionReduction,
+    session_budget: Option<VerificationBudget>,
+    estimate: VerificationEstimate,
+) -> Result<VerificationDispatch> {
+    let Some(rule) = compiled.select(subject) else {
+        return Ok(VerificationDispatch::Off);
+    };
+    if rule.action == VerificationAction::Off {
+        return Ok(VerificationDispatch::Off);
+    }
+    let reduction_budget = match session {
+        VerificationSessionReduction::Inherit => None,
+        VerificationSessionReduction::Off => return Ok(VerificationDispatch::Off),
+        VerificationSessionReduction::Restrict { selector, budget } => {
+            selector.validate()?;
+            if !selector.matches(subject) {
+                return Ok(VerificationDispatch::Off);
+            }
+            budget
+        }
+    };
+    let requested = rule.requested_budget(host.verification_ceiling)?;
+    let requested_session_budget = match (reduction_budget, session_budget) {
+        (Some(reduction), Some(legacy)) => {
+            // Both seams may be present during the breaking migration;
+            // their intersection is the stricter budget, never a choice
+            // of one reduction that accidentally widens the other.
+            Some(reduction.reduce(legacy)?)
+        }
+        (Some(reduction), None) => Some(reduction),
+        (None, budget) => budget,
+    };
+    let resolved = match requested_session_budget {
+        Some(session) => requested.reduce(session)?,
+        None => requested,
+    };
+    let estimate_exceeds = match estimate {
+        VerificationEstimate::Known(estimated) => !resolved.contains(estimated),
+        VerificationEstimate::UnknownTokens | VerificationEstimate::UnknownPrice => true,
+    };
+    if estimate_exceeds {
+        return Ok(
+            match rule.on_budget_exceeded.unwrap_or(OnBudgetExceeded::Refuse) {
+                OnBudgetExceeded::Refuse => VerificationDispatch::Refuse,
+                OnBudgetExceeded::DispatchOriginal => VerificationDispatch::DispatchOriginal,
+            },
+        );
+    }
+    Ok(VerificationDispatch::Verify {
+        budget: resolved,
+        adjudicator_slot: rule
+            .adjudicator_slot
+            .clone()
+            .expect("validated verify rule"),
+    })
 }
 
 /// The authority actually delivered to a running vNext agent.  Runtime code
@@ -681,9 +698,8 @@ pub struct EffectiveVnextGrant {
     pub delegation: Option<EffectiveDelegationGrant>,
     pub questions: Option<EffectiveQuestionPolicy>,
     /// Ordered, disjoint verification regions fixed when this profile was
-    /// resolved. The current prompt deliberately does not execute candidate
-    /// forks; retaining the compiled policy prevents an executor from
-    /// accidentally validating itself against live, changed markdown.
+    /// resolved. Runtime dispatch consumes this snapshot via
+    /// [`Self::resolve_verification`] rather than re-reading authored markdown.
     pub verification: Option<CompiledVerificationPolicy>,
     computer_delegation_enabled: bool,
     /// Original host ceiling snapshot retained for child intersection. It is
@@ -705,6 +721,29 @@ impl EffectiveVnextGrant {
                     self.computer_delegation_enabled,
                 )
         })
+    }
+
+    /// Resolve verification against this grant's snapshotted compiled policy
+    /// and host ceiling. Runtime dispatch must use this, not re-compile the
+    /// authored markdown.
+    pub fn resolve_verification(
+        &self,
+        subject: &VerificationSubject<'_>,
+        session: VerificationSessionReduction,
+        session_budget: Option<VerificationBudget>,
+        estimate: VerificationEstimate,
+    ) -> Result<VerificationDispatch> {
+        let Some(compiled) = &self.verification else {
+            return Ok(VerificationDispatch::Off);
+        };
+        resolve_compiled_verification(
+            compiled,
+            &self.host_policy,
+            subject,
+            session,
+            session_budget,
+            estimate,
+        )
     }
 
     pub fn permits_target(

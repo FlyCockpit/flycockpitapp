@@ -834,6 +834,21 @@ async fn execute_ordinary_call_unscoped(
             // post hook fires.
             return Err(invalid_input(reason.clone()));
         }
+        // ArtifactWrite verification: after every human/host approval (safety
+        // gate, loop, cage, /btw, pre-tool hooks) and before `dispatch_one_timed`.
+        // Frame inputs are already pinned above. Stage 1 is shadow-mode: a
+        // matching verify rule records a dispatch_original ledger row and the
+        // original call still executes.
+        let _verification = crate::engine::verification::intercept_ordinary_call(
+            crate::engine::verification::InterceptInput {
+                session: env.session,
+                agent: env.agent,
+                ctx: env.ctx,
+                resolved_name,
+                args: &args,
+            },
+        )
+        .await;
         // A real tool execution is about to occur: the pre-hook gate allowed
         // it and `dispatch_one_timed` will run. Post hooks fire only after a
         // real execution (success or failure).

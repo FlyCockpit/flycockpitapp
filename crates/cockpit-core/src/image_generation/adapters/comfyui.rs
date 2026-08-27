@@ -35,8 +35,8 @@ use crate::image_generation::transport::{
     ProviderTransportError, ProviderTransportOutcome, SubmissionDisposition,
 };
 use crate::image_generation_comfyui::{
-    ComfyCancellationCapability, ComfyPromptPayload, ComfyPromptResponse, ComfyViewRequest,
-    parse_history_response,
+    ComfyCancellationCapability, ComfyPromptPayload, ComfyPromptResponse, ComfyUploadRequest,
+    ComfyUploadResponse, ComfyViewRequest, parse_history_response,
 };
 use crate::image_generation_job::{
     ImageGenerationAdapter, ImageGenerationCancelRequest, ImageGenerationCancelResult,
@@ -62,6 +62,8 @@ pub const MAX_VIEW_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_CANCEL_RESPONSE_BYTES: usize = 64 * 1024;
 
 const EVIDENCE_DETAIL_MAX_CHARS: usize = 512;
+const UPLOAD_MULTIPART_BOUNDARY: &str = "----cockpit-image-upload";
+const UPLOAD_CONTENT_TYPE: &str = "multipart/form-data; boundary=----cockpit-image-upload";
 
 pub(crate) mod comfyui_adapter_sealed {
     pub trait Sealed {}
@@ -230,6 +232,18 @@ pub struct ComfyuiImagesAttemptInput {
     pub prompt_graph: serde_json::Value,
     /// The unique Cockpit-owned `client_id` for this attempt.
     pub client_id: String,
+    /// Verified component bytes to upload before submitting the graph. Every
+    /// placeholder is a Cockpit-generated opaque token; only the validated
+    /// server response may replace it in the bound graph.
+    pub uploads: Vec<ComfyuiUploadInput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComfyuiUploadInput {
+    pub placeholder: String,
+    pub artifact_name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
 }
 
 /// Inputs to reconcile a submitted prompt.
@@ -305,8 +319,12 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
                 };
             }
         };
+        let prompt_graph = match self.upload_references(&input).await {
+            Ok(graph) => graph,
+            Err(result) => return result,
+        };
         let payload = ComfyPromptPayload {
-            prompt: input.prompt_graph,
+            prompt: prompt_graph,
             client_id: input.client_id,
         };
         let body = match serde_json::to_vec(&payload) {
@@ -506,6 +524,170 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
     }
 }
 
+impl ComfyuiImagesAdapter {
+    async fn upload_references(
+        &self,
+        input: &ComfyuiImagesAttemptInput,
+    ) -> Result<serde_json::Value, ImageGenerationHandoffResult> {
+        let mut graph = input.prompt_graph.clone();
+        if input.uploads.is_empty() {
+            return Ok(graph);
+        }
+        let prefix = crate::image_generation_comfyui::attempt_upload_prefix(
+            &uuid::Uuid::parse_str(&input.client_id).map_err(|_| {
+                ImageGenerationHandoffResult::DefinitivelyRejected {
+                    evidence: comfy_evidence(b"upload_namespace", "invalid attempt identity"),
+                }
+            })?,
+        );
+        for upload in &input.uploads {
+            let upload_request =
+                ComfyUploadRequest::new(&prefix, &upload.artifact_name).map_err(|_| {
+                    ImageGenerationHandoffResult::DefinitivelyRejected {
+                        evidence: comfy_evidence(b"upload_namespace", "invalid upload identity"),
+                    }
+                })?;
+            let body = encode_upload_body(&upload_request, upload).map_err(|_| {
+                ImageGenerationHandoffResult::DefinitivelyRejected {
+                    evidence: comfy_evidence(b"upload_encode", "invalid upload body"),
+                }
+            })?;
+            let response = match self
+                .transport
+                .call(ComfyHttpRequest {
+                    method: ComfyMethod::Post,
+                    path: "/upload/image".to_string(),
+                    query: Vec::new(),
+                    body: Some(body),
+                    content_type: Some(UPLOAD_CONTENT_TYPE),
+                    body_limit: MAX_UPLOAD_RESPONSE_BYTES,
+                })
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Err(match error.submission_disposition() {
+                        SubmissionDisposition::DefinitivelyRejected => {
+                            ImageGenerationHandoffResult::DefinitivelyRejected {
+                                evidence: comfy_evidence(
+                                    b"upload_rejected",
+                                    "reference upload rejected",
+                                ),
+                            }
+                        }
+                        SubmissionDisposition::SubmissionUnknown => {
+                            ImageGenerationHandoffResult::SubmissionUnknown {
+                                evidence: comfy_evidence(
+                                    b"upload_ambiguous",
+                                    "reference upload handoff ambiguous",
+                                ),
+                            }
+                        }
+                    });
+                }
+            };
+            let uploaded: ComfyUploadResponse =
+                serde_json::from_slice(&response.body).map_err(|_| {
+                    ImageGenerationHandoffResult::SubmissionUnknown {
+                        evidence: comfy_evidence(
+                            b"upload_unparseable",
+                            "reference upload response invalid",
+                        ),
+                    }
+                })?;
+            crate::image_generation_comfyui::RemoteCleanupObligation::for_upload(&uploaded, false)
+                .map_err(|_| ImageGenerationHandoffResult::SubmissionUnknown {
+                    evidence: comfy_evidence(
+                        b"upload_identifier_invalid",
+                        "reference upload response invalid",
+                    ),
+                })?;
+            let server_name = if uploaded.subfolder.is_empty() {
+                uploaded.name
+            } else {
+                format!("{}/{}", uploaded.subfolder, uploaded.name)
+            };
+            replace_upload_placeholder(&mut graph, &upload.placeholder, &server_name).map_err(
+                |_| ImageGenerationHandoffResult::SubmissionUnknown {
+                    evidence: comfy_evidence(
+                        b"upload_binding_invalid",
+                        "reference binding unavailable",
+                    ),
+                },
+            )?;
+        }
+        Ok(graph)
+    }
+}
+
+fn encode_upload_body(
+    request: &ComfyUploadRequest,
+    upload: &ComfyuiUploadInput,
+) -> anyhow::Result<Vec<u8>> {
+    let boundary = UPLOAD_MULTIPART_BOUNDARY;
+    anyhow::ensure!(
+        !upload
+            .bytes
+            .windows(boundary.len())
+            .any(|window| window == boundary.as_bytes()),
+        "upload bytes contain the multipart boundary"
+    );
+    let mut body = Vec::new();
+    let field = |body: &mut Vec<u8>, name: &str, value: &str| {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    };
+    field(&mut body, "subfolder", &request.subfolder);
+    field(
+        &mut body,
+        "overwrite",
+        if request.overwrite { "true" } else { "false" },
+    );
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n", request.image_name, upload.mime).as_bytes());
+    body.extend_from_slice(&upload.bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    Ok(body)
+}
+
+fn replace_upload_placeholder(
+    value: &mut serde_json::Value,
+    placeholder: &str,
+    server_name: &str,
+) -> anyhow::Result<()> {
+    let mut replaced = false;
+    fn walk(
+        value: &mut serde_json::Value,
+        placeholder: &str,
+        server_name: &str,
+        replaced: &mut bool,
+    ) {
+        match value {
+            serde_json::Value::String(current) if current == placeholder => {
+                *current = server_name.to_owned();
+                *replaced = true;
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    walk(value, placeholder, server_name, replaced);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    walk(value, placeholder, server_name, replaced);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(value, placeholder, server_name, &mut replaced);
+    anyhow::ensure!(replaced, "upload placeholder absent from workflow");
+    Ok(())
+}
+
 /// The idempotent `{ "cancelled": bool }` ack from the job-scoped cancel route.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct CancelAck {
@@ -656,6 +838,7 @@ pub(crate) mod test_support {
         ComfyuiImagesAttemptInput {
             prompt_graph: serde_json::json!({ "3": { "class_type": "KSampler", "inputs": {} } }),
             client_id: "cockpit-attempt-1".to_string(),
+            uploads: Vec::new(),
         }
     }
 

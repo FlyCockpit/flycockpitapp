@@ -10,7 +10,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use cockpit_config::config::image_generation::{
     ImageAdapterKind, ImageEndpoint, ImageGenerationConfig, ImageGenerationTarget,
-    ImageTargetIdentity,
+    ImageTargetIdentity, WorkflowValueType,
 };
 use reqwest::header::{AUTHORIZATION, HeaderMap};
 
@@ -132,6 +132,7 @@ pub(crate) fn configured_image_generation_adapters(
                         )?),
                         Arc::new(ComfyPlanSource {
                             db: db.clone(),
+                            storage: storage.clone(),
                             target: target.clone(),
                             workflow,
                         }),
@@ -408,6 +409,7 @@ impl OpenrouterImagesPlanSource for OpenrouterPlanSource {
 
 struct ComfyPlanSource {
     db: cockpit_db::Db,
+    storage: Arc<crate::media_storage::MediaStorageRecovery>,
     target: ImageGenerationTarget,
     workflow: cockpit_config::config::image_generation::RegisteredComfyWorkflow,
 }
@@ -419,23 +421,62 @@ impl ComfyuiImagesPlanSource for ComfyPlanSource {
         request: &ImageGenerationHandoffRequest,
     ) -> ComfyuiImagesPlanResolution {
         let resolved = match resolve_image_generation_handoff_target(&self.db, request).await {
-            Ok(value)
-                if value.target.target_id == self.target.id
-                    && value.target.reference_artifacts.is_empty() =>
-            {
-                value
-            }
+            Ok(value) if value.target.target_id == self.target.id => value,
             _ => {
                 return ComfyuiImagesPlanResolution::Unresolvable {
                     safe_reason: "sealed workflow attempt is unavailable".into(),
                 };
             }
         };
+        let references = match read_image_generation_handoff_references(
+            &self.db,
+            &self.storage,
+            &resolved.target,
+        )
+        .await
+        {
+            Ok(references) => references,
+            Err(_) => {
+                return ComfyuiImagesPlanResolution::Unresolvable {
+                    safe_reason: "reference media unavailable".into(),
+                };
+            }
+        };
+        let mut references = references.into_iter();
+        let mut uploads = Vec::new();
         let applications = self
             .workflow
             .bindings
             .iter()
             .filter_map(|binding| {
+                if binding.value_type == WorkflowValueType::Image {
+                    let (mime, bytes) = references.next()?;
+                    let index = uploads.len() + 1;
+                    let placeholder = format!(
+                        "cockpit-reference-{}-{index}",
+                        request.external_operation_id.simple()
+                    );
+                    let extension = match mime.as_str() {
+                        "image/png" => "png",
+                        "image/jpeg" => "jpg",
+                        "image/webp" => "webp",
+                        _ => return None,
+                    };
+                    uploads.push(
+                        crate::image_generation::adapters::comfyui::ComfyuiUploadInput {
+                            placeholder: placeholder.clone(),
+                            artifact_name: format!("reference-{index}.{extension}"),
+                            mime,
+                            bytes,
+                        },
+                    );
+                    return Some(BindingApplication {
+                        parameter: binding.parameter,
+                        value: CanonicalBindingValue::ImageReference {
+                            upload_name: placeholder,
+                        },
+                    });
+                }
                 let key = serde_json::to_value(binding.parameter)
                     .ok()?
                     .as_str()?
@@ -455,6 +496,11 @@ impl ComfyuiImagesPlanSource for ComfyPlanSource {
                 })
             })
             .collect::<Vec<_>>();
+        if references.next().is_some() {
+            return ComfyuiImagesPlanResolution::Unresolvable {
+                safe_reason: "configured workflow has no binding for every reference".into(),
+            };
+        }
         let BoundWorkflowGraph { graph_json, .. } =
             match clone_and_bind_workflow(&self.workflow, &applications) {
                 Ok(value) => value,
@@ -469,6 +515,7 @@ impl ComfyuiImagesPlanSource for ComfyPlanSource {
                 ComfyuiImagesPlanResolution::Resolved(Box::new(ComfyuiImagesAttemptInput {
                     prompt_graph,
                     client_id: request.external_operation_id.to_string(),
+                    uploads,
                 }))
             }
             Err(_) => ComfyuiImagesPlanResolution::Unresolvable {

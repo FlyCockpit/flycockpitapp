@@ -1813,6 +1813,7 @@ mod tests {
                         task_call_id: None,
                     },
                     delivery_class: Default::default(),
+                    send_now: false,
                 },
                 Vec::new(),
             )))

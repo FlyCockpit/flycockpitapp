@@ -88,6 +88,147 @@ tokio::task_local! {
     static CURRENT_AGENT_INSTANCE_ID: Option<uuid::Uuid>;
 }
 
+/// Session-owned lifecycle authority for processes transferred out of a
+/// foreground tool call.  An adopted process deliberately does not retain the
+/// next turn's cancellation token, but remains reachable by session cancel and
+/// worker shutdown until its waiter has completed.
+#[derive(Clone, Default)]
+pub(crate) struct AdoptedProcessRegistry {
+    inner: Arc<tokio::sync::Mutex<AdoptedProcessRegistryState>>,
+}
+
+#[derive(Default)]
+struct AdoptedProcessRegistryState {
+    closed: bool,
+    jobs: std::collections::HashMap<String, AdoptedProcess>,
+}
+
+struct AdoptedProcess {
+    cancel: tokio_util::sync::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl AdoptedProcessRegistry {
+    /// Spawn and register one adopted waiter before the foreground tool
+    /// returns. A worker already draining accepts the handle only so shutdown
+    /// can join it, and cancels it immediately.
+    pub(crate) async fn spawn<F, Fut>(
+        &self,
+        queue: &crate::engine::message::UserSubmissionQueue,
+        job_id: String,
+        cancel: tokio_util::sync::CancellationToken,
+        future: F,
+    ) where
+        F: FnOnce(u64) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // Queue -> registry is the sole two-lock ordering. Capturing the
+        // generation and registering the waiter under the queue fence means a
+        // cancellation either owns this job or makes its eventual enqueue
+        // stale; it cannot fall between those decisions.
+        let fence = queue.cancellation_fence().await;
+        let cancellation_generation = fence.generation();
+        let mut state = self.inner.lock().await;
+        if state.closed {
+            cancel.cancel();
+        }
+        let registry = self.clone();
+        let finished_job_id = job_id.clone();
+        let handle = tokio::spawn(async move {
+            future(cancellation_generation).await;
+            registry.remove_finished(&finished_job_id).await;
+        });
+        let replaced = state.jobs.insert(job_id, AdoptedProcess { cancel, handle });
+        debug_assert!(replaced.is_none(), "adopted process ids are unique");
+    }
+
+    async fn remove_finished(&self, job_id: &str) {
+        self.inner.lock().await.jobs.remove(job_id);
+    }
+
+    /// Cancel every process currently adopted by this session. The registry
+    /// remains open so a later foreground turn can adopt new work.
+    pub(crate) async fn cancel_all(&self, queue: &crate::engine::message::UserSubmissionQueue) {
+        let _fence = queue.advance_cancellation_fence().await;
+        let state = self.inner.lock().await;
+        for job in state.jobs.values() {
+            job.cancel.cancel();
+        }
+    }
+
+    /// Close adoption before worker drain and cancel every existing process.
+    /// A racing registration observes `closed` and starts cancelled.
+    pub(crate) async fn begin_shutdown(&self, queue: &crate::engine::message::UserSubmissionQueue) {
+        let _fence = queue.advance_cancellation_fence().await;
+        let mut state = self.inner.lock().await;
+        state.closed = true;
+        for job in state.jobs.values() {
+            job.cancel.cancel();
+        }
+    }
+
+    /// Join all registered waiters after the foreground driver can no longer
+    /// create another one.
+    pub(crate) async fn join_all(&self) {
+        loop {
+            let handles = {
+                let mut state = self.inner.lock().await;
+                if state.jobs.is_empty() {
+                    return;
+                }
+                state
+                    .jobs
+                    .drain()
+                    .map(|(_, job)| {
+                        job.cancel.cancel();
+                        job.handle
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for handle in handles {
+                let _ = handle.await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn live_count(&self) -> usize {
+        self.inner.lock().await.jobs.len()
+    }
+}
+
+/// Live foreground queue bridge used only by backgroundable ordinary tools.
+/// A tool may observe a send-now escalation and transfer its owned process
+/// waiter into async completion without exposing queue authority to the tool
+/// schema or to lower crates.
+#[derive(Clone)]
+pub(crate) struct ForegroundQueueBridge {
+    pub(crate) queue: crate::engine::message::UserSubmissionQueue,
+    pub(crate) target: crate::engine::message::QueueTarget,
+    /// Async tool results ultimately attach to the durable root conversation;
+    /// an interactive child may finish before its adopted process does.
+    pub(crate) completion_target: crate::engine::message::QueueTarget,
+    pub(crate) adopted_processes: AdoptedProcessRegistry,
+}
+
+tokio::task_local! {
+    static CURRENT_FOREGROUND_QUEUE: Option<ForegroundQueueBridge>;
+}
+
+pub(crate) async fn with_foreground_queue<F>(bridge: ForegroundQueueBridge, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_FOREGROUND_QUEUE.scope(Some(bridge), future).await
+}
+
+pub(crate) fn current_foreground_queue() -> Option<ForegroundQueueBridge> {
+    CURRENT_FOREGROUND_QUEUE
+        .try_with(|bridge| bridge.clone())
+        .ok()
+        .flatten()
+}
+
 /// A revocable, durable permit for provider handoffs made while consuming an
 /// AgentTree late steer.
 ///

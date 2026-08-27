@@ -1918,8 +1918,11 @@ pub struct App {
     /// Class to apply on the next submit after an edit-all merge.
     pub(super) pending_queue_edit_class: Option<cockpit_proto::QueueDeliveryClass>,
     pub(super) pending_queue_edit_item_id: Option<uuid::Uuid>,
+    pub(super) pending_queue_edit_operation_id: Option<uuid::Uuid>,
+    pub(super) pending_queue_edit_request: Option<cockpit_proto::Request>,
     pub(super) pending_queue_edit_commit: bool,
     pub(super) pending_queue_edit_reserved: bool,
+    pub(super) pending_queue_edit_releasing: bool,
     /// User submissions accepted by the TUI while a session switch is in
     /// flight. They are held locally until the new daemon attachment is
     /// accepted, so they cannot be sent to the outgoing session.
@@ -1937,10 +1940,10 @@ pub struct App {
     /// Exact payloads rejected before the runner dispatcher accepted
     /// ownership. These are safe to retry only on their original session.
     pub(super) retained_pre_dispatch_submissions: Vec<RetainedPreDispatchSubmission>,
-    /// Current queue-edit foreground target. Seeded from the daemon attach
+    /// Current queue-routing foreground target. Seeded from the daemon attach
     /// snapshot and kept current by `ForegroundInputTarget` events. `None`
-    /// means the client lacks enough information to mark any queue item as
-    /// non-editable.
+    /// means the client cannot identify an active target; existing per-item
+    /// target identities remain authoritative.
     pub(super) foreground_input_target: Option<QueueTarget>,
     /// Fresh idle submits render immediately as a transcript row. The daemon
     /// still acknowledges them through the queue API, so the originating TUI
@@ -3639,8 +3642,11 @@ impl App {
             queue_row_hits: Vec::new(),
             pending_queue_edit_class: None,
             pending_queue_edit_item_id: None,
+            pending_queue_edit_operation_id: None,
+            pending_queue_edit_request: None,
             pending_queue_edit_commit: false,
             pending_queue_edit_reserved: false,
+            pending_queue_edit_releasing: false,
             pending_session_switch_submissions: Vec::new(),
             pending_session_switch_target: None,
             pending_ephemeral_session_switch_intent: None,

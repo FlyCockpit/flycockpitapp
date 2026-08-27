@@ -5068,8 +5068,11 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?;
             let result = response_rx.await.map_err(internal)??;
             Ok(Response::SetQueuedUserMessageClassResult {
+                queue_item_id: result.queue_item_id,
                 applied: result.applied,
                 reason: result.reason,
+                edit_operation_id: result.edit_operation_id,
+                edit_action: result.edit_action,
                 item: result.item,
                 queue: result.queue,
             })
@@ -5088,6 +5091,7 @@ async fn handle_serialized_request_impl(
             let result = response_rx.await.map_err(internal)??;
             Ok(Response::PromoteQueuedUserMessagesResult {
                 applied: result.applied,
+                reason: result.reason,
                 queue: result.queue,
             })
         }

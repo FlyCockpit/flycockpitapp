@@ -1874,6 +1874,8 @@ fn queued_user_message_for_test(text: &str) -> crate::engine::message::QueuedUse
         text: text.to_string(),
         display_text: None,
         target: crate::engine::message::QueueTarget::root("Build"),
+        delivery_class: Default::default(),
+        send_now: false,
     }
 }
 
@@ -4976,6 +4978,8 @@ async fn queue_item_carries_display_text() {
         text: "<file path=\"src/lib.rs\">expanded</file>".to_string(),
         display_text: Some("review @src/lib.rs".to_string()),
         target: crate::engine::message::QueueTarget::root("Build"),
+        delivery_class: Default::default(),
+        send_now: false,
     };
 
     let proto = queue_item_to_proto(item);

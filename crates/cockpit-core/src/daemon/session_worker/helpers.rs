@@ -85,6 +85,7 @@ pub(super) fn queue_item_to_proto(
         display_text: item.display_text,
         target: queue_target_to_proto(item.target),
         delivery_class: item.delivery_class,
+        send_now: item.send_now,
     }
 }
 
@@ -100,6 +101,9 @@ pub(super) fn remove_reason_to_proto(
         }
         crate::engine::message::RemoveQueuedMessageResult::NotFound => {
             proto::RemoveQueuedUserMessageReason::NotFound
+        }
+        crate::engine::message::RemoveQueuedMessageResult::EditConflict => {
+            proto::RemoveQueuedUserMessageReason::EditConflict
         }
     }
 }

@@ -4223,6 +4223,7 @@ async fn probe_user_message(
                     display_text: None,
                     target: proto::QueueTarget::default(),
                     delivery_class: Default::default(),
+                    send_now: false,
                 });
             UserMessageProbeResult::Duplicate { item, queue }
         }
@@ -5153,6 +5154,8 @@ pub(super) async fn run_worker(
         root,
         max_concurrent_schedules,
     );
+    let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
+    driver.set_adopted_process_registry(adopted_processes.clone());
     // Keep the exact daemon-owned binding input for every descendant spawn;
     // the driver never reconstructs local UUID references from display names.
     driver.set_vnext_local_installation_resolver(
@@ -8344,7 +8347,8 @@ pub(super) async fn run_worker(
                                         text: submission.text.clone(),
                                         display_text: submission.display_text.clone(),
                                         target: queue_target_to_proto(target),
-        delivery_class: Default::default(),
+                                        delivery_class: Default::default(),
+                                        send_now: false,
                                     },
                                     queue,
                                 )));
@@ -8809,6 +8813,7 @@ pub(super) async fn run_worker(
                                     display_text: submission.display_text.clone(),
                                     target: queue_target_to_proto(target),
                                     delivery_class: Default::default(),
+                                    send_now: false,
                                 },
                                 queue,
                             )));
@@ -8907,6 +8912,7 @@ pub(super) async fn run_worker(
                                                 display_text: submission.display_text.clone(),
                                                 target: queue_target_to_proto(target),
                                                 delivery_class: submission.delivery_class,
+                                                send_now: false,
                                             });
                                         let _ = respond_to.send(Ok((item, queue)));
                                     }
@@ -8979,6 +8985,7 @@ pub(super) async fn run_worker(
                             display_text: None,
                             target: proto::QueueTarget::default(),
                             delivery_class: Default::default(),
+                            send_now: false,
                         },
                     );
                     let _ = respond_to.send(Ok((item, queue)));
@@ -9271,17 +9278,24 @@ pub(super) async fn run_worker(
                     remote_operation,
                     respond_to,
                 } => {
-                    let target_id = target_id.unwrap_or_else(|| {
-                        foreground_input_target
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .id
-                            .clone()
-                    });
-                    let (result, staged, mut snapshot) = match driver_input_queue
-                        .stage_remove_editable_for(&target_id)
-                        .await
-                    {
+                    let staged_result = match target_id {
+                        Some(target_id) => {
+                            driver_input_queue
+                                .stage_remove_editable_for(&target_id)
+                                .await
+                        }
+                        None => {
+                            let foreground_target_id = foreground_input_target
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .id
+                                .clone();
+                            driver_input_queue
+                                .stage_remove_all(Some(&foreground_target_id))
+                                .await
+                        }
+                    };
+                    let (result, staged, mut snapshot) = match staged_result {
                         Ok(staged) => staged,
                         Err(_) => {
                             let _ = respond_to.send(Err(queue_removal_in_progress_error()));
@@ -9360,13 +9374,20 @@ pub(super) async fn run_worker(
                     replacement,
                     respond_to,
                 } => {
+                    let edit_operation_id = replacement
+                        .as_ref()
+                        .map(|replacement| replacement.operation_id);
+                    let edit_action = replacement.as_ref().map(|replacement| replacement.action);
                     let (result, item, snapshot) = driver_input_queue
                         .set_delivery_class(queue_item_id, delivery_class, replacement)
                         .await;
                     let reason = remove_reason_to_proto(result);
                     let _ = respond_to.send(Ok(proto::SetQueuedUserMessageClassResult {
+                        queue_item_id,
                         applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
                         reason,
+                        edit_operation_id,
+                        edit_action,
                         item: item.map(queue_item_to_proto),
                         queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
                     }));
@@ -9375,11 +9396,13 @@ pub(super) async fn run_worker(
                     delivery_class,
                     respond_to,
                 } => {
-                    let snapshot = driver_input_queue
+                    let (result, snapshot) = driver_input_queue
                         .set_all_delivery_class(delivery_class)
                         .await;
+                    let reason = remove_reason_to_proto(result);
                     let _ = respond_to.send(Ok(proto::PromoteQueuedUserMessagesResult {
-                        applied: true,
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
                         queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
                     }));
                 }
@@ -9387,16 +9410,19 @@ pub(super) async fn run_worker(
                     queue_item_id,
                     respond_to,
                 } => {
-                    let (result, item, snapshot) =
-                        driver_input_queue.mark_send_now(queue_item_id).await;
+                    let (result, item, snapshot) = match queue_item_id {
+                        Some(queue_item_id) => {
+                            driver_input_queue.mark_send_now(queue_item_id).await
+                        }
+                        None => {
+                            let (result, snapshot) = driver_input_queue.mark_all_send_now().await;
+                            (result, None, snapshot)
+                        }
+                    };
                     if matches!(
                         result,
                         crate::engine::message::RemoveQueuedMessageResult::Removed
                     ) {
-                        // TODO: if the in-flight tool is backgroundable (`bash`),
-                        // convert it to async completion so the boundary arrives
-                        // immediately. Until then this control is observed at
-                        // idle; mid-run send-now waits for Continue/Done.
                         let _ = driver_control_tx
                             .send(crate::engine::driver::DriverControl::FlushSendNow)
                             .await;
@@ -9422,6 +9448,13 @@ pub(super) async fn run_worker(
                     // is a no-op when no run is in flight. The driver then emits
                     // `AgentIdle`, clearing the TUI's busy state.
                     tracing::info!(session_id = %session_id, "cancel requested");
+                    // Cancel the foreground token before waiting on the adopted
+                    // queue/registry fence. A process racing to adoption in that
+                    // interval therefore inherits a cancelled token; the fence
+                    // then either owns its registry entry or invalidates its
+                    // enqueue generation. Both happen before durable cleanup.
+                    cancel_handle.cancel();
+                    adopted_processes.cancel_all(&driver_input_queue).await;
                     if let Some(staged) = driver_input_queue.stage_discard_pending().await {
                         let disposition =
                             crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled;
@@ -9451,7 +9484,6 @@ pub(super) async fn run_worker(
                             ),
                         }
                     }
-                    cancel_handle.cancel();
                 }
                 SessionWork::ResolveAgentDecision {
                     decision_request_id,
@@ -11077,7 +11109,8 @@ pub(super) async fn run_worker(
     // and the forwarder task exits.
     //
     // Registration barrier (`daemon-lifecycle-replay-timing-robustness.md`,
-    // finding 2): closing the input FIRST admits no new turn, so the in-flight
+    // finding 2): closing adopted-process registration and then the input
+    // admits no new detached work or turn, so the in-flight
     // turn can only run to completion or block on an interrupt. On a graceful
     // (resumable) shutdown we then run a park-drain loop — re-parking any
     // interrupt the in-flight turn registers (waking a blocked driver so its
@@ -11087,6 +11120,7 @@ pub(super) async fn run_worker(
     // once no further registration is possible. The loop is bounded: the input
     // is closed so the turn must terminate, and the drain path force-aborts
     // this worker at its deadline regardless.
+    adopted_processes.begin_shutdown(&driver_input_queue).await;
     driver_input_queue.close().await;
     let graceful_park = matches!(
         stop,
@@ -11130,6 +11164,7 @@ pub(super) async fn run_worker(
         shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
         interrupts.report_shutdown_commit(shutdown_park_committed);
     }
+    adopted_processes.join_all().await;
     drop(driver_input_queue);
     drop(engine_event_notice_tx);
     let _ = forward.await;

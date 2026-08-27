@@ -672,6 +672,7 @@ impl App {
                 self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
+                self.retry_pending_queue_edit();
                 if self.daemon_link.take().is_some() {
                     self.daemon_draining = false;
                     self.show_toast("daemon reconnected", ToastKind::Success);
@@ -681,6 +682,7 @@ impl App {
                 self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
+                self.retry_pending_queue_edit();
             }
             TurnEvent::DaemonLinkTerminal { error } => {
                 self.cancel_model_controls_for_terminal_link();
@@ -3971,6 +3973,33 @@ mod tests {
     use super::*;
     use cockpit_proto::InferenceErrorClass;
     use serde_json::json;
+
+    #[test]
+    fn every_successful_daemon_link_recovery_retries_pending_queue_edit() {
+        let source = include_str!("events.rs")
+            .split_once("pub(super) fn apply_event")
+            .expect("apply_event source")
+            .1;
+        for (variant, next_variant) in [
+            (
+                "TurnEvent::DaemonLinkReconnected",
+                "TurnEvent::DaemonLinkResynced",
+            ),
+            (
+                "TurnEvent::DaemonLinkResynced",
+                "TurnEvent::DaemonLinkTerminal",
+            ),
+        ] {
+            let arm = source
+                .split_once(variant)
+                .and_then(|(_, tail)| tail.split_once(next_variant).map(|(arm, _)| arm))
+                .unwrap_or_else(|| panic!("missing {variant} apply_event arm"));
+            assert!(
+                arm.contains("self.retry_pending_queue_edit();"),
+                "{variant} must retry a correlated queue edit"
+            );
+        }
+    }
 
     #[test]
     fn string_args_render_without_debug_escapes() {

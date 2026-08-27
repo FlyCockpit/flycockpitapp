@@ -309,6 +309,239 @@ async fn cancel_kills_process_group_promptly() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn send_now_adopts_live_bash_and_enqueues_result_after_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let command = "sleep 1; printf adopted";
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
+    let target = crate::engine::message::QueueTarget::root("Build");
+    let mut steer = crate::engine::message::UserSubmission::text("deliver now");
+    steer.delivery_class = crate::engine::message::QueueDeliveryClass::Held;
+    let (steer_id, _) = queue.push(steer, target.clone()).await;
+    let escalation_queue = queue.clone();
+    let escalator = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (result, _, _) = escalation_queue.mark_send_now(steer_id).await;
+        assert_eq!(
+            result,
+            crate::engine::message::RemoveQueuedMessageResult::Removed
+        );
+    });
+
+    let start = Instant::now();
+    let output = crate::engine::agent::with_foreground_queue(
+        crate::engine::agent::ForegroundQueueBridge {
+            queue: queue.clone(),
+            completion_target: target.clone(),
+            target,
+            adopted_processes: adopted_processes.clone(),
+        },
+        BashTool::new().call(serde_json::json!({ "command": command }), &ctx),
+    )
+    .await
+    .expect("bash call returns at the adopted boundary");
+    escalator.await.unwrap();
+    assert!(start.elapsed() < Duration::from_millis(900));
+    assert!(output.content.contains("moved to async completion"));
+    assert!(
+        queue
+            .snapshot()
+            .await
+            .iter()
+            .all(|item| !item.text.contains("[async result · bash")),
+        "the slow process result must not precede the send-now boundary"
+    );
+    let mut delivered = Vec::new();
+    queue
+        .drain_into_for_filtered(
+            &mut delivered,
+            16,
+            Some("root"),
+            crate::engine::message::QueueDrainFilter::SteeringOrSendNow,
+        )
+        .await;
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|submission| submission.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["deliver now"]
+    );
+    let delivered_ids = delivered
+        .iter()
+        .flat_map(|submission| submission.queue_item_ids.iter().copied())
+        .collect::<Vec<_>>();
+    queue.finish(&delivered_ids).await;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if queue.snapshot().await.iter().any(|item| {
+                item.text.contains("[async result · bash") && item.text.contains("adopted")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adopted bash result is enqueued");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_after_send_now_adoption_kills_bash_without_enqueuing_a_stale_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cancelled = tmp.path().join("adopted-cancelled");
+    let command = format!(
+        "trap 'touch {}' TERM; sleep 30; printf stale",
+        cancelled.display()
+    );
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command).await;
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
+    let target = crate::engine::message::QueueTarget::root("Build");
+    let (steer_id, _) = queue
+        .push(
+            crate::engine::message::UserSubmission::text("deliver now"),
+            target.clone(),
+        )
+        .await;
+    let escalation_queue = queue.clone();
+    let escalator = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (result, _, _) = escalation_queue.mark_send_now(steer_id).await;
+        assert_eq!(
+            result,
+            crate::engine::message::RemoveQueuedMessageResult::Removed
+        );
+    });
+
+    let output = crate::engine::agent::with_foreground_queue(
+        crate::engine::agent::ForegroundQueueBridge {
+            queue: queue.clone(),
+            completion_target: target.clone(),
+            target,
+            adopted_processes: adopted_processes.clone(),
+        },
+        BashTool::new().call(serde_json::json!({ "command": command }), &ctx),
+    )
+    .await
+    .expect("bash call returns at the adopted boundary");
+    escalator.await.unwrap();
+    assert!(output.content.contains("moved to async completion"));
+
+    let unrelated_next_turn = tokio_util::sync::CancellationToken::new();
+    unrelated_next_turn.cancel();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !cancelled.exists(),
+        "a fresh turn token must not own the adopted process"
+    );
+    assert_eq!(adopted_processes.live_count().await, 1);
+    adopted_processes.cancel_all(&queue).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !cancelled.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adopted bash process receives cancellation");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while adopted_processes.live_count().await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled adopted waiter unregisters from the session");
+    assert!(
+        queue
+            .snapshot()
+            .await
+            .iter()
+            .all(|item| !item.text.contains("[async result · bash")),
+        "a cancelled adopted process must not enqueue a stale tool result"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_discards_completed_adopted_result_waiting_behind_send_now() {
+    let tmp = tempfile::tempdir().unwrap();
+    let finished = tmp.path().join("adopted-finished");
+    let command = format!("sleep 0.2; printf stale; touch {}", finished.display());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command).await;
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
+    let target = crate::engine::message::QueueTarget::root("Build");
+    let (steer_id, _) = queue
+        .push(
+            crate::engine::message::UserSubmission::text("deliver now"),
+            target.clone(),
+        )
+        .await;
+    let escalation_queue = queue.clone();
+    let escalator = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (result, _, _) = escalation_queue.mark_send_now(steer_id).await;
+        assert_eq!(
+            result,
+            crate::engine::message::RemoveQueuedMessageResult::Removed
+        );
+    });
+
+    crate::engine::agent::with_foreground_queue(
+        crate::engine::agent::ForegroundQueueBridge {
+            queue: queue.clone(),
+            completion_target: target.clone(),
+            target,
+            adopted_processes,
+        },
+        BashTool::new().call(serde_json::json!({ "command": command }), &ctx),
+    )
+    .await
+    .expect("bash call returns at the adopted boundary");
+    escalator.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !finished.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adopted bash process finishes while send-now remains queued");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    ctx.cancel.cancel();
+    let mut delivered = Vec::new();
+    queue
+        .drain_into_for_filtered(
+            &mut delivered,
+            16,
+            Some("root"),
+            crate::engine::message::QueueDrainFilter::SteeringOrSendNow,
+        )
+        .await;
+    let delivered_ids = delivered
+        .iter()
+        .flat_map(|submission| submission.queue_item_ids.iter().copied())
+        .collect::<Vec<_>>();
+    queue.finish(&delivered_ids).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        queue
+            .snapshot()
+            .await
+            .iter()
+            .all(|item| !item.text.contains("[async result · bash")),
+        "cancellation must discard a completed result still waiting to enqueue"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn kill_child_skips_grace_when_sigterm_reaps_child() {
     let tmp = tempfile::tempdir().unwrap();
     let ready = tmp.path().join("ready");

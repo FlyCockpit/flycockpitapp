@@ -2805,9 +2805,18 @@ impl App {
             .into_iter()
             .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
-        if self.pending_queue_edit_item_id.is_some() && !self.pending_queue_edit_reserved {
-            self.show_toast("reserving queued message for edit…", super::ToastKind::Info);
-            return false;
+        if self.pending_queue_edit_item_id.is_some() {
+            if self.pending_queue_edit_commit || self.pending_queue_edit_releasing {
+                self.show_toast(
+                    "queued-message edit settlement is still pending…",
+                    super::ToastKind::Info,
+                );
+                return false;
+            }
+            if !self.pending_queue_edit_reserved {
+                self.show_toast("reserving queued message for edit…", super::ToastKind::Info);
+                return false;
+            }
         }
         let delivery_class_explicit = self.pending_queue_edit_class.is_some();
         let delivery_class = self.pending_queue_edit_class.take().unwrap_or_else(|| {
@@ -2829,17 +2838,20 @@ impl App {
                 );
                 return false;
             }
+            let Some(operation_id) = self.pending_queue_edit_operation_id else {
+                self.show_toast(
+                    "queued-message edit identity is unavailable; submission is blocked",
+                    super::ToastKind::Info,
+                );
+                return false;
+            };
             let replacement = cockpit_proto::QueueItemReplacement {
+                operation_id,
+                action: cockpit_proto::QueueEditAction::Commit,
                 text: wire.clone(),
                 display_text: Some(submitted.clone()),
                 tag_expansions,
-                editing: false,
             };
-            if let Some(item) = self.queue.iter_mut().find(|item| item.id == queue_item_id) {
-                item.text = replacement.text.clone();
-                item.display_text = replacement.display_text.clone();
-                item.delivery_class = delivery_class;
-            }
             self.send_queue_request(Request::SetQueuedUserMessageClass {
                 queue_item_id,
                 delivery_class,
@@ -3394,6 +3406,10 @@ impl App {
                     proto::QueueDeliveryClass::Held
                 };
                 self.pending_queue_edit_class = Some(merge_class);
+                let removed_ids = removed_items
+                    .iter()
+                    .map(|item| item.id)
+                    .collect::<std::collections::HashSet<_>>();
                 let removed_text = removed_items
                     .into_iter()
                     .map(|item| {
@@ -3403,19 +3419,25 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                self.replace_queue_from_proto(queue);
+                self.queue.retain(|item| !removed_ids.contains(&item.id));
+                let _ = queue;
                 QueueEditOutcome::Edited {
                     text: removed_text,
                     partial: matches!(reason, proto::RemoveQueuedUserMessageReason::AlreadyStarted),
                 }
             }
             Ok(Response::RemoveQueuedUserMessagesResult { reason, queue, .. }) => {
-                self.replace_queue_from_proto(queue);
+                // QueueUpdated owns the authoritative mirror; the RPC snapshot
+                // may be older than an independently delivered queue event.
+                let _ = queue;
                 match reason {
                     proto::RemoveQueuedUserMessageReason::AlreadyStarted => {
                         QueueEditOutcome::AlreadyStarted
                     }
                     proto::RemoveQueuedUserMessageReason::NotFound => QueueEditOutcome::Fallthrough,
+                    proto::RemoveQueuedUserMessageReason::EditConflict => {
+                        QueueEditOutcome::TransportError
+                    }
                     proto::RemoveQueuedUserMessageReason::Removed => {
                         debug_assert!(
                             false,
@@ -3476,6 +3498,8 @@ pub(super) fn optimistic_queue_item_with_id(
         text,
         display_text,
         target: cockpit_proto::QueueTarget::root(""),
+        delivery_class: Default::default(),
+        send_now: false,
     }
 }
 
@@ -4668,6 +4692,7 @@ mod queued_message_edit_tests {
             display_text: None,
             target,
             delivery_class: Default::default(),
+            send_now: false,
         }
     }
 
@@ -4694,6 +4719,7 @@ mod queued_message_edit_tests {
                     display_text: None,
                     target: cockpit_proto::QueueTarget::default(),
                     delivery_class: Default::default(),
+                    send_now: false,
                 },
                 QueueItem {
                     id: newer.id,
@@ -4702,6 +4728,7 @@ mod queued_message_edit_tests {
                     display_text: Some("edit @a.rs".to_string()),
                     target: cockpit_proto::QueueTarget::default(),
                     delivery_class: Default::default(),
+                    send_now: false,
                 },
             ],
             queue: Vec::new(),
@@ -4768,6 +4795,7 @@ mod queued_message_edit_tests {
                 display_text: Some("editable @compact".to_string()),
                 target: cockpit_proto::QueueTarget::default(),
                 delivery_class: Default::default(),
+                send_now: false,
             }],
             queue: Vec::new(),
         });
@@ -4856,13 +4884,13 @@ mod queued_message_edit_tests {
     }
 
     #[test]
-    fn up_edit_mixed_queue_edits_foreground_and_keeps_other_target() {
+    fn up_edit_mixed_queue_edits_the_whole_queue() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         let root =
             proto_item_with_target("root edit", QueueItemStatus::Queued, proto_target("root"));
         let child = proto_item_with_target(
-            "child stays",
+            "child edit",
             QueueItemStatus::Queued,
             proto_target("task:1:child"),
         );
@@ -4872,13 +4900,12 @@ mod queued_message_edit_tests {
         app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: true,
             reason: RemoveQueuedUserMessageReason::Removed,
-            removed_items: vec![root],
-            queue: vec![child],
+            removed_items: vec![root, child],
+            queue: Vec::new(),
         });
 
-        assert_eq!(app.composer.text(), "root edit");
-        assert_eq!(app.queue.len(), 1);
-        assert_eq!(app.queue[0].text, "child stays");
+        assert_eq!(app.composer.text(), "root edit\n\nchild edit");
+        assert!(app.queue.is_empty());
     }
 
     #[test]

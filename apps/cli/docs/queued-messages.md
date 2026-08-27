@@ -10,9 +10,9 @@ queued and shown above the composer.
   the activity epoch and fires UserPromptSubmit).
 - **held** — delivered after the run completes.
 - **send now** — an escalation, not a stored class. The in-flight tool is never
-  killed. Backgroundable tools (`bash`) are intended to convert to async
-  completion so the boundary arrives immediately; other tools wait for the next
-  Continue/Done safe point.
+  killed. A live `bash` process transfers to async completion so the boundary
+  arrives immediately and its result attaches when the process exits; other
+  tools finish normally and deliver at the resulting safe point.
 
 Visual order is delivery order: the **steering · next turn** group on top,
 **after completion** below. Toggling a class moves the message between groups
@@ -31,14 +31,23 @@ Per-message and box-level toggles override the setting.
 
 ## Routing
 
-Queued messages always target the focused agent layer. The box title names that
-agent.
+Queued messages target the agent layer that was focused when they were
+submitted. If a snapshot spans nested agent layers, Cockpit renders a separate
+delivery batch for each target, focused/deepest first, matching the order in
+which the agent stack will reach their boundaries.
 
 ## Controls
 
-Box: `[send now] [steer all|hold all] [edit] [cancel]`.
+Box: `[send now] [steer all|hold all] [edit] [cancel]`. These are atomic
+whole-queue operations, including when queued items span a focus transition.
 
 Per message (hover or keyboard focus): `[send now] [steer|hold] [edit] [cancel]`.
+
+Opening a per-message edit reserves that exact queue slot. Queue mutations are
+serialized until the edit is committed or cancelled; reconnects retry the same
+operation identity, so a lost acknowledgement cannot duplicate the message.
+Existing image attachments remain attached when its text is edited. Explicitly
+holding a message also clears any prior send-now escalation.
 
 Edit-all merges messages into one buffer. The merged message takes the class of
 the earliest-delivered member (steering if any member was steering). Per-message

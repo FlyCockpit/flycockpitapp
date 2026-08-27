@@ -1346,6 +1346,7 @@ export const queueItemSchema = z
     display_text: z.string().optional(),
     target: queueTargetSchema,
     delivery_class: queueDeliveryClassSchema.default("steering"),
+    send_now: z.boolean().default(false),
   })
   .passthrough();
 export type QueueItem = z.infer<typeof queueItemSchema>;

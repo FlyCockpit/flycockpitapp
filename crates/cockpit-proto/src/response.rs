@@ -108,8 +108,13 @@ pub enum Response {
 
     /// Result of [`Request::SetQueuedUserMessageClass`].
     SetQueuedUserMessageClassResult {
+        queue_item_id: Uuid,
         applied: bool,
         reason: RemoveQueuedUserMessageReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit_operation_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit_action: Option<crate::QueueEditAction>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item: Option<QueueItem>,
         queue: Vec<QueueItem>,
@@ -118,6 +123,7 @@ pub enum Response {
     /// Result of [`Request::PromoteQueuedUserMessages`].
     PromoteQueuedUserMessagesResult {
         applied: bool,
+        reason: RemoveQueuedUserMessageReason,
         queue: Vec<QueueItem>,
     },
 
@@ -125,6 +131,8 @@ pub enum Response {
     SendNowQueuedUserMessageResult {
         applied: bool,
         reason: RemoveQueuedUserMessageReason,
+        /// Updated item for a one-message request; absent for an atomic
+        /// whole-queue escalation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item: Option<QueueItem>,
         queue: Vec<QueueItem>,

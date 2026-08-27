@@ -4888,6 +4888,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         display_text: None,
         target: proto::QueueTarget::default(),
         delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (state, first_response) = first.await.expect("first turn request joins");
@@ -4946,6 +4947,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         display_text: None,
         target: proto::QueueTarget::default(),
         delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     assert!(matches!(
@@ -11036,6 +11038,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
                 display_text: None,
                 target: proto::QueueTarget::default(),
                 delivery_class: Default::default(),
+                send_now: false,
             },
             Vec::new(),
         )));
@@ -11175,6 +11178,7 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
                 display_text: None,
                 target: proto::QueueTarget::default(),
                 delivery_class: Default::default(),
+                send_now: false,
             },
             queue: Vec::new(),
         }))
@@ -15129,6 +15133,7 @@ async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically(
         display_text: submission.display_text.clone(),
         target: proto::QueueTarget::default(),
         delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (_state, result) = request.await.unwrap();
@@ -15241,6 +15246,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
         display_text: None,
         target: proto::QueueTarget::default(),
         delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (_state, result) = task.await.unwrap();
@@ -18469,7 +18475,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             delivery_class: proto::QueueDeliveryClass::Steering,
         },
         "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
-            queue_item_id: Uuid::new_v4(),
+            queue_item_id: Some(Uuid::new_v4()),
         },
         "resume_paused_work" => Request::ResumePausedWork { session_id },
         "cancel_paused_work" => Request::CancelPausedWork { session_id },
@@ -21108,6 +21114,7 @@ fn proto_queue_item(text: &str) -> proto::QueueItem {
         display_text: None,
         target: proto::QueueTarget::default(),
         delivery_class: Default::default(),
+        send_now: false,
     }
 }
 
@@ -21172,7 +21179,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             delivery_class: proto::QueueDeliveryClass::Steering,
         },
         "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
-            queue_item_id: Uuid::from_u128(1),
+            queue_item_id: Some(Uuid::from_u128(1)),
         },
         "repair_resume" => Request::RepairResume { session_id },
         "cancel_turn" => Request::CancelTurn,
@@ -21361,8 +21368,11 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(delivery_class, proto::QueueDeliveryClass::Held);
                     respond_to
                         .send(Ok(proto::SetQueuedUserMessageClassResult {
+                            queue_item_id,
                             applied: true,
                             reason: proto::RemoveQueuedUserMessageReason::Removed,
+                            edit_operation_id: None,
+                            edit_action: None,
                             item: Some(proto_queue_item("classed")),
                             queue: Vec::new(),
                         }))
@@ -21379,6 +21389,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     respond_to
                         .send(Ok(proto::PromoteQueuedUserMessagesResult {
                             applied: true,
+                            reason: proto::RemoveQueuedUserMessageReason::Removed,
                             queue: Vec::new(),
                         }))
                         .unwrap();
@@ -21390,7 +21401,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         respond_to,
                     },
                 ) => {
-                    assert_eq!(queue_item_id, Uuid::from_u128(1));
+                    assert_eq!(queue_item_id, Some(Uuid::from_u128(1)));
                     respond_to
                         .send(Ok(proto::SendNowQueuedUserMessageResult {
                             applied: true,
@@ -21769,7 +21780,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             delivery_class: proto::QueueDeliveryClass::Steering,
         },
         "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
-            queue_item_id: Uuid::new_v4(),
+            queue_item_id: Some(Uuid::new_v4()),
         },
         "repair_resume" => Request::RepairResume {
             session_id: Uuid::new_v4(),
@@ -25128,7 +25139,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::SendNowQueuedUserMessage {
-                queue_item_id: Uuid::new_v4(),
+                queue_item_id: Some(Uuid::new_v4()),
             },
             kind: "send_now_queued_user_message",
             session_id: Some(attached_session_id),
@@ -27726,6 +27737,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         display_text: submission.display_text.clone(),
         target: proto::QueueTarget::default(),
         delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (mut state, competing) = competing.await.unwrap();
@@ -27768,6 +27780,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         display_text: submission.display_text.clone(),
         target: proto::QueueTarget::default(),
         delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (_, retry_result) = retry.await.unwrap();
@@ -31347,6 +31360,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                 display_text: None,
                 target: proto::QueueTarget::default(),
                 delivery_class: Default::default(),
+                send_now: false,
             };
             respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
         }
@@ -32821,6 +32835,7 @@ async fn btw_concurrent_with_parent_turn() {
         display_text: None,
         target: proto::QueueTarget::default(),
         delivery_class: Default::default(),
+        send_now: false,
     };
     btw_respond.send(Ok((btw_item, Vec::new()))).unwrap();
     assert!(matches!(
@@ -32835,6 +32850,7 @@ async fn btw_concurrent_with_parent_turn() {
         display_text: None,
         target: proto::QueueTarget::default(),
         delivery_class: Default::default(),
+        send_now: false,
     };
     parent_respond.send(Ok((parent_item, Vec::new()))).unwrap();
     assert!(matches!(
@@ -34696,6 +34712,7 @@ async fn response_redaction_scrubs_queue_display_metadata() {
             display_text: Some("review @fci_response_secret_12345".to_string()),
             target: proto::QueueTarget::default(),
             delivery_class: Default::default(),
+            send_now: false,
         };
         let response = scrub_proto_response(
             Response::UserMessageQueued {
@@ -34729,6 +34746,7 @@ async fn redaction_preserves_uuid_when_secret_overlaps() {
             display_text: Some("review @88c0e13f".to_string()),
             target: proto::QueueTarget::default(),
             delivery_class: Default::default(),
+            send_now: false,
         };
 
         let scrubbed = scrub_proto_response(
@@ -34781,6 +34799,7 @@ async fn event_redaction_preserves_typed_fields() {
                 display_text: Some("review @88c0e13f".to_string()),
                 target: proto::QueueTarget::default(),
                 delivery_class: Default::default(),
+                send_now: false,
             }],
         };
 

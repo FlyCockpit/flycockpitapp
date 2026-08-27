@@ -993,48 +993,100 @@ impl App {
     }
 
     fn queue_content_lines(&self) -> usize {
-        let (steering, held) = self.queue_grouped();
+        let groups = self.queue_delivery_groups();
+        let mixed_targets = groups.len() > 1;
         let mut lines = 0;
-        if !steering.is_empty() {
-            lines += 1 + steering.len();
-        }
-        if !held.is_empty() {
-            lines += 1 + held.len();
+        for (_, steering, held) in groups {
+            if mixed_targets {
+                lines += 1;
+            }
+            if !steering.is_empty() {
+                lines += 1 + steering.len();
+            }
+            if !held.is_empty() {
+                lines += 1 + held.len();
+            }
         }
         lines
     }
 
-    pub(super) fn queue_grouped(
+    /// Project the queue in the same order in which focused agent layers can
+    /// consume it. The active target is first; suspended ancestors then follow
+    /// deepest-first. Each target is independently ordered as steering,
+    /// escalated held, then ordinary held.
+    pub(super) fn queue_delivery_groups(
         &self,
-    ) -> (
+    ) -> Vec<(
+        cockpit_proto::QueueTarget,
         Vec<&cockpit_proto::QueueItem>,
         Vec<&cockpit_proto::QueueItem>,
-    ) {
-        let mut steering = Vec::new();
-        let mut held = Vec::new();
+    )> {
+        let foreground_id = self
+            .foreground_input_target
+            .as_ref()
+            .map(|target| target.id.as_str());
+        let mut targets = Vec::<(usize, cockpit_proto::QueueTarget)>::new();
         for item in &self.queue {
-            if item.delivery_class.is_steering() {
-                steering.push(item);
-            } else {
-                held.push(item);
+            if !targets
+                .iter()
+                .any(|(_, target)| target.id == item.target.id)
+            {
+                targets.push((targets.len(), item.target.clone()));
             }
         }
-        (steering, held)
+        targets.sort_by(|(left_index, left), (right_index, right)| {
+            let left_focused = foreground_id == Some(left.id.as_str());
+            let right_focused = foreground_id == Some(right.id.as_str());
+            right_focused
+                .cmp(&left_focused)
+                .then_with(|| right.depth.cmp(&left.depth))
+                .then_with(|| left_index.cmp(right_index))
+        });
+
+        targets
+            .into_iter()
+            .map(|(_, target)| {
+                let mut steering = self
+                    .queue
+                    .iter()
+                    .filter(|item| item.target.id == target.id && item.delivery_class.is_steering())
+                    .collect::<Vec<_>>();
+                steering.extend(self.queue.iter().filter(|item| {
+                    item.target.id == target.id
+                        && item.send_now
+                        && item.delivery_class == cockpit_proto::QueueDeliveryClass::Held
+                }));
+                let held = self
+                    .queue
+                    .iter()
+                    .filter(|item| {
+                        item.target.id == target.id
+                            && !item.send_now
+                            && item.delivery_class == cockpit_proto::QueueDeliveryClass::Held
+                    })
+                    .collect::<Vec<_>>();
+                (target, steering, held)
+            })
+            .collect()
     }
 
     fn queue_box_title(&self) -> Line<'static> {
-        let agent = self
-            .foreground_input_target
-            .as_ref()
-            .map(|target| target.agent.as_str())
-            .filter(|agent| !agent.is_empty())
-            .or_else(|| {
-                self.queue
-                    .first()
-                    .map(|item| item.target.agent.as_str())
-                    .filter(|agent| !agent.is_empty())
-            })
-            .unwrap_or("agent");
+        let groups = self.queue_delivery_groups();
+        let agent = if groups.len() > 1 {
+            "queued messages"
+        } else {
+            groups
+                .first()
+                .map(|(target, _, _)| target.agent.as_str())
+                .filter(|agent| !agent.is_empty())
+                .or_else(|| {
+                    self.foreground_input_target
+                        .as_ref()
+                        .map(|target| target.agent.as_str())
+                        .filter(|agent| !agent.is_empty())
+                })
+                .unwrap_or("agent")
+        };
         Line::from(vec![Span::styled(
             format!(" {agent} "),
             Style::default().fg(MUTED_TEXT),
@@ -1840,19 +1892,13 @@ impl App {
         let queue_text_style = Style::default().fg(MUTED_TEXT);
         let header_style = queue_text_style.add_modifier(Modifier::ITALIC);
         let non_foreground_style = queue_text_style.add_modifier(Modifier::DIM);
+        let groups = self.queue_delivery_groups();
+        let mixed_targets = groups.len() > 1;
         let inner_w = content_area.width.saturating_sub(2).max(1) as usize;
-        let (steering, held) = self.queue_grouped();
-        let steering_meta: Vec<(uuid::Uuid, cockpit_proto::QueueDeliveryClass)> = steering
-            .iter()
-            .map(|item| (item.id, item.delivery_class))
-            .collect();
-        let held_meta: Vec<(uuid::Uuid, cockpit_proto::QueueDeliveryClass)> = held
-            .iter()
-            .map(|item| (item.id, item.delivery_class))
-            .collect();
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut row_meta = Vec::<(u16, uuid::Uuid, cockpit_proto::QueueDeliveryClass)>::new();
 
-        let mut push_header = |label: &str| {
+        let push_header = |lines: &mut Vec<Line<'static>>, label: &str| {
             let text = first_line_truncated(label, inner_w);
             let pad = inner_w.saturating_sub(display_width(&text));
             lines.push(Line::from(vec![
@@ -1862,7 +1908,8 @@ impl App {
                 Span::raw(" "),
             ]));
         };
-        let mut push_item = |msg: &cockpit_proto::QueueItem| {
+        let push_item = |lines: &mut Vec<Line<'static>>, msg: &cockpit_proto::QueueItem| {
+            let line = lines.len() as u16;
             let non_foreground = self
                 .foreground_input_target
                 .as_ref()
@@ -1880,10 +1927,17 @@ impl App {
                 inner_w,
             );
             let body_w = display_width(&body);
-            let annotation = if non_foreground {
+            let annotation = if non_foreground || mixed_targets || msg.send_now {
                 let remaining = inner_w.saturating_sub(body_w);
                 if remaining > 0 {
-                    first_line_truncated(&format!(" · {}", msg.target.agent), remaining)
+                    let mut parts = Vec::new();
+                    if non_foreground || mixed_targets {
+                        parts.push(msg.target.agent.as_str());
+                    }
+                    if msg.send_now {
+                        parts.push("send now");
+                    }
+                    first_line_truncated(&format!(" · {}", parts.join(" · ")), remaining)
                 } else {
                     String::new()
                 }
@@ -1898,38 +1952,40 @@ impl App {
             }
             spans.extend([Span::raw(" ".repeat(trailing)), Span::raw(" ")]);
             lines.push(Line::from(spans));
+            line
         };
 
-        if !steering.is_empty() {
-            push_header("steering · next turn");
-            for msg in steering {
-                push_item(msg);
+        for (target, steering, held) in groups {
+            if mixed_targets {
+                let suffix = self
+                    .foreground_input_target
+                    .as_ref()
+                    .is_some_and(|foreground| foreground.id == target.id)
+                    .then_some(" · focused")
+                    .unwrap_or_default();
+                push_header(&mut lines, &format!("{}{}", target.agent, suffix));
             }
-        }
-        if !held.is_empty() {
-            push_header("after completion");
-            for msg in held {
-                push_item(msg);
+            if !steering.is_empty() {
+                push_header(&mut lines, "steering · next turn");
+                for msg in steering {
+                    let line = push_item(&mut lines, msg);
+                    row_meta.push((line, msg.id, msg.delivery_class));
+                }
+            }
+            if !held.is_empty() {
+                push_header(&mut lines, "after completion");
+                for msg in held {
+                    let line = push_item(&mut lines, msg);
+                    row_meta.push((line, msg.id, msg.delivery_class));
+                }
             }
         }
 
         frame.render_widget(Paragraph::new(lines), content_area);
         self.queue_row_hits.clear();
         self.paint_queue_box_buttons(frame, area);
-        let mut line = 0u16;
-        if !steering_meta.is_empty() {
-            line = line.saturating_add(1);
-            for (id, class) in steering_meta {
-                self.paint_queue_message_row(frame, content_area, line, id, class);
-                line = line.saturating_add(1);
-            }
-        }
-        if !held_meta.is_empty() {
-            line = line.saturating_add(1);
-            for (id, class) in held_meta {
-                self.paint_queue_message_row(frame, content_area, line, id, class);
-                line = line.saturating_add(1);
-            }
+        for (line, id, class) in row_meta {
+            self.paint_queue_message_row(frame, content_area, line, id, class);
         }
     }
 
@@ -6727,6 +6783,8 @@ mod render_history_spacing_tests {
             text: "queued".to_string(),
             display_text: None,
             target: QueueTarget::default(),
+            delivery_class: Default::default(),
+            send_now: false,
         });
         assert_eq!(
             banner_top_row(
@@ -10395,6 +10453,8 @@ mod prediction_ghost_context_indicator_tests {
             text: text.to_string(),
             display_text: None,
             target,
+            delivery_class: Default::default(),
+            send_now: false,
         }
     }
 
@@ -10435,6 +10495,60 @@ mod prediction_ghost_context_indicator_tests {
         let row = row_text(&buf, 2, 50);
         assert!(row.contains("check @src/lib.rs"), "{row:?}");
         assert!(!row.contains("<file"), "{row:?}");
+    }
+
+    #[test]
+    fn queue_visual_order_matches_send_now_steering_held_drain_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut held = queued_item("held", QueueTarget::root("Build"));
+        held.delivery_class = QueueDeliveryClass::Held;
+        let mut send_now = queued_item("urgent held", QueueTarget::root("Build"));
+        send_now.delivery_class = QueueDeliveryClass::Held;
+        send_now.send_now = true;
+        let steering = queued_item("steering", QueueTarget::root("Build"));
+        let held_id = held.id;
+        let send_now_id = send_now.id;
+        let steering_id = steering.id;
+        app.queue.extend([held, send_now, steering]);
+
+        assert_eq!(
+            app.queue_visual_ids(),
+            vec![steering_id, send_now_id, held_id]
+        );
+    }
+
+    #[test]
+    fn mixed_target_visual_order_matches_stack_delivery_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let root = QueueTarget::root("Build");
+        let child = QueueTarget::child("builder", 1, "call-1", "default");
+        app.foreground_input_target = Some(child.clone());
+
+        let root_steering = queued_item("root steering", root.clone());
+        let mut child_held = queued_item("child held", child.clone());
+        child_held.delivery_class = QueueDeliveryClass::Held;
+        let mut root_held = queued_item("root held", root);
+        root_held.delivery_class = QueueDeliveryClass::Held;
+        let child_steering = queued_item("child steering", child);
+        let expected = vec![
+            child_steering.id,
+            child_held.id,
+            root_steering.id,
+            root_held.id,
+        ];
+        app.queue
+            .extend([root_steering, child_held, root_held, child_steering]);
+
+        assert_eq!(app.queue_visual_ids(), expected);
+        let height = app.queue_lines();
+        let buf = render_queue_buffer(&mut app, 60, height);
+        let top = row_text(&buf, 0, 60);
+        assert!(
+            top.contains("queued messages"),
+            "mixed-target title must not claim one target: {top:?}"
+        );
     }
 
     #[test]

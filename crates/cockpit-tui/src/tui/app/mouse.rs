@@ -86,8 +86,10 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Moved) {
             if self.mouse_capture {
                 let _ = self.button_registry.handle_mouse(mouse);
+                self.update_queue_pointer(mouse);
                 let _link_hover_changed = self.link_registry.update_hover(mouse.column, mouse.row);
             } else {
+                self.queue_hover = None;
                 self.link_registry.clear_hover();
             }
             if self.link_registry.hovered().is_some() {
@@ -545,6 +547,7 @@ impl App {
             // Clicking into the composer dismisses any chat
             // selection — the user has switched contexts.
             self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+            self.blur_queue_focus();
             self.composer.set_cursor_from_visual_position(
                 line,
                 col,
@@ -2370,6 +2373,53 @@ mod affordance_hover_tests {
 
         assert_eq!(app.hovered_affordance, None);
         assert_eq!(app.hovered_control_chip, None);
+    }
+
+    #[test]
+    fn moved_mouse_updates_queue_hover_without_clicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.daemon_prompt = None;
+        app.dialog = Dialog::None;
+        let id = uuid::Uuid::new_v4();
+        app.queue_row_hits = vec![(id, Rect::new(2, 7, 30, 1))];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 8,
+            row: 7,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.queue_hover, Some(id));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 8,
+            row: 8,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.queue_hover, None);
+    }
+
+    #[test]
+    fn composer_click_blurs_queue_focus_before_typing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.daemon_prompt = None;
+        app.dialog = Dialog::None;
+        app.input_area = Some(Rect::new(0, 5, 40, 3));
+        app.queue_focus = Some(uuid::Uuid::new_v4());
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(app.queue_focus, None);
     }
 
     #[test]

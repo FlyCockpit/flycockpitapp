@@ -2163,7 +2163,7 @@ pub enum SessionWork {
         >,
     },
     SendNowQueuedUserMessage {
-        queue_item_id: Uuid,
+        queue_item_id: Option<Uuid>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::SendNowQueuedUserMessageResult, proto::ErrorPayload>,
         >,

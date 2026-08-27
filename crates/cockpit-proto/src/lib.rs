@@ -3438,18 +3438,32 @@ pub struct QueueItem {
     /// from `queuedMessagesAsSteering`.
     #[serde(default)]
     pub delivery_class: QueueDeliveryClass,
+    /// True after the item has been escalated for the next safe boundary.
+    /// This is projected on the wire because it changes both delivery and
+    /// visual order; it is not a third persisted delivery class.
+    #[serde(default)]
+    pub send_now: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueueItemReplacement {
+    /// Stable identity for the complete reserve/commit/release lifecycle.
+    /// Retrying any phase with this id is idempotent.
+    pub operation_id: Uuid,
+    pub action: QueueEditAction,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
     #[serde(default)]
     pub tag_expansions: Vec<TagExpansionMeta>,
-    /// Reserve the queue slot while its text is open in the composer.
-    #[serde(default)]
-    pub editing: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueEditAction {
+    Reserve,
+    Commit,
+    Release,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3514,6 +3528,9 @@ pub enum RemoveQueuedUserMessageReason {
     Removed,
     AlreadyStarted,
     NotFound,
+    /// Another edit lifecycle owns the item, or the supplied edit operation
+    /// does not own the active lease.
+    EditConflict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6695,6 +6712,7 @@ mod tests {
                 task_call_id: None,
             },
             delivery_class: QueueDeliveryClass::Held,
+            send_now: false,
         };
 
         let response = Envelope::response(
@@ -6784,6 +6802,38 @@ mod tests {
             other => panic!("unexpected request: {other:?}"),
         }
 
+        let edit_operation_id = Uuid::new_v4();
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::SetQueuedUserMessageClass {
+                queue_item_id: item_id,
+                delivery_class: QueueDeliveryClass::Held,
+                replacement: Some(QueueItemReplacement {
+                    operation_id: edit_operation_id,
+                    action: QueueEditAction::Reserve,
+                    text: "editable".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                }),
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        match back.body {
+            Body::Request {
+                request:
+                    Request::SetQueuedUserMessageClass {
+                        replacement: Some(replacement),
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(replacement.operation_id, edit_operation_id);
+                assert_eq!(replacement.action, QueueEditAction::Reserve);
+            }
+            other => panic!("unexpected edit reservation: {other:?}"),
+        }
+
         let request = Envelope::request(
             Uuid::new_v4(),
             Request::RemoveNewestQueuedUserMessage {
@@ -6845,7 +6895,7 @@ mod tests {
         let request = Envelope::request(
             Uuid::new_v4(),
             Request::SendNowQueuedUserMessage {
-                queue_item_id: item_id,
+                queue_item_id: Some(item_id),
             },
         );
         let back: Envelope =
@@ -6854,9 +6904,28 @@ mod tests {
             Body::Request {
                 request: Request::SendNowQueuedUserMessage { queue_item_id },
                 ..
-            } => assert_eq!(queue_item_id, item_id),
+            } => assert_eq!(queue_item_id, Some(item_id)),
             other => panic!("unexpected request: {other:?}"),
         }
+
+        let whole_queue = Envelope::request(
+            Uuid::new_v4(),
+            Request::SendNowQueuedUserMessage {
+                queue_item_id: None,
+            },
+        );
+        let json = serde_json::to_value(&whole_queue).unwrap();
+        assert!(json["params"].get("queue_item_id").is_none());
+        let back: Envelope = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back.body,
+            Body::Request {
+                request: Request::SendNowQueuedUserMessage {
+                    queue_item_id: None
+                },
+                ..
+            }
+        ));
 
         let missing_class: QueueItem = serde_json::from_value(serde_json::json!({
             "id": item_id,
@@ -6866,6 +6935,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(missing_class.delivery_class, QueueDeliveryClass::Steering);
+        assert!(!missing_class.send_now);
 
         let request = Envelope::request(
             Uuid::new_v4(),
@@ -8023,7 +8093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v20_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v22_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -8138,13 +8208,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v20 {response_name} assistant identity is invalid: {error}")
+                panic!("current v21 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v20 assistant inventory must carry bounded opaque revisions");
+            .expect("current v21 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -8236,7 +8306,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v20 MCP CAS fixture must carry {field}"
+                "current v21 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -8286,7 +8356,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v20 fixture must carry an operation id for {tag}"
+                "current v21 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");

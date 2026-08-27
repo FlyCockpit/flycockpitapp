@@ -10,6 +10,8 @@ fn item(id: u128, text: &str) -> QueuedUserMessage {
         text: text.to_string(),
         display_text: None,
         target: cockpit_proto::QueueTarget::root("Build"),
+        delivery_class: Default::default(),
+        send_now: false,
     }
 }
 

@@ -643,9 +643,9 @@ pub enum Request {
         target_id: Option<String>,
     },
 
-    /// Atomically remove every editable queued user message for a foreground
-    /// target. When `target_id` is absent, the worker uses its current
-    /// foreground input target.
+    /// Atomically remove editable queued user messages. `Some(target_id)`
+    /// narrows the operation to one target; `None` claims the whole session
+    /// queue for box-level edit/cancel semantics.
     RemoveEditableQueuedUserMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
@@ -665,10 +665,12 @@ pub enum Request {
         delivery_class: QueueDeliveryClass,
     },
 
-    /// Escalate one queued user message for delivery as soon as it is
-    /// safe. Never aborts an in-flight tool call mid-execution.
+    /// Escalate queued user messages for delivery as soon as it is safe.
+    /// `None` atomically escalates the whole queue. Never aborts an in-flight
+    /// tool call mid-execution.
     SendNowQueuedUserMessage {
-        queue_item_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_item_id: Option<Uuid>,
     },
 
     /// Explicitly resume durable work that was paused during daemon shutdown.
@@ -4298,7 +4300,7 @@ macro_rules! command {
             (Request::RemoveEditableQueuedUserMessages { target_id }, "remove_editable_queued_user_messages", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>", [target_id: Option<String> => param]);
             (Request::SetQueuedUserMessageClass { queue_item_id, delivery_class, replacement }, "set_queued_user_message_class", session_writer, attached, true, local_only, none, serialized, none, "queue_item_id:Uuid|delivery_class:QueueDeliveryClass|replacement:Option<QueueItemReplacement>", [queue_item_id: Uuid => queue, delivery_class: QueueDeliveryClass => param, replacement: Option<QueueItemReplacement> => param]);
             (Request::PromoteQueuedUserMessages { delivery_class }, "promote_queued_user_messages", session_writer, attached, true, local_only, none, serialized, none, "delivery_class:QueueDeliveryClass", [delivery_class: QueueDeliveryClass => param]);
-            (Request::SendNowQueuedUserMessage { queue_item_id }, "send_now_queued_user_message", session_writer, attached, true, local_only, none, serialized, none, "queue_item_id:Uuid", [queue_item_id: Uuid => queue]);
+            (Request::SendNowQueuedUserMessage { queue_item_id }, "send_now_queued_user_message", session_writer, attached, true, local_only, none, serialized, none, "queue_item_id:Option<Uuid>", [queue_item_id: Option<Uuid> => param]);
             (Request::ResumePausedWork { session_id }, "resume_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);

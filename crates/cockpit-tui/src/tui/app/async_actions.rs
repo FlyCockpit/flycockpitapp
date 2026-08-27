@@ -1858,6 +1858,17 @@ impl App {
                 }
                 _ => {}
             },
+            AsyncActionKind::DaemonRpc(
+                "queue.edit.reservation" | "queue.edit.commit" | "queue.edit.release",
+            ) => match result.payload {
+                Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                    self.apply_queue_control_response(*response);
+                }
+                Err(error) => {
+                    self.fail_pending_queue_edit(&error);
+                }
+                _ => {}
+            },
             AsyncActionKind::Blocking("btw.teardown") => match result.payload {
                 Ok(AsyncActionPayload::BtwTransition {
                     created,
@@ -3318,6 +3329,9 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "mcp.local"
                 | "paste.image_path_admission"
                 | "queue.control"
+                | "queue.edit.commit"
+                | "queue.edit.release"
+                | "queue.edit.reservation"
                 | "resources.promote"
                 | "sealed.effect"
                 | "sessions.mutation"

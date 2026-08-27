@@ -89,6 +89,7 @@ pub mod tags;
 pub mod test_env;
 pub mod tls_crypto_provider;
 pub mod tokens;
+pub mod tool_media_authority;
 pub mod tools;
 pub mod typed_media_result;
 pub mod user_agent;

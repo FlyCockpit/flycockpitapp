@@ -268,6 +268,20 @@ fn classify_call(
 
     // Ordinary tool: classify by static ToolEffect.
     if let Some(tool) = active_tools.get(resolved_name) {
+        // Parallel admission is a positive capability proof, not merely an
+        // effect label. Custom tools can deliberately report `ReadOnly` while
+        // still wrapping arbitrary shell commands, and approval-gated tools
+        // must never race an ordinary lane.
+        if !tool.is_registered_ordinary_operation() {
+            return CallClassification::SerialBarrier {
+                reason: SerialBarrierReason::UnknownTool,
+            };
+        }
+        if crate::engine::tool::tool_requires_permission(tool.as_ref()) {
+            return CallClassification::SerialBarrier {
+                reason: SerialBarrierReason::ApprovalGated,
+            };
+        }
         match tool.effect() {
             ToolEffect::ReadOnly => CallClassification::ParallelLane {
                 reason: ParallelLaneReason::ReadOnlyOrdinary,

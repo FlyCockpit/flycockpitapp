@@ -68,6 +68,94 @@ pub use vnext::{
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 
+/// Per-agent capability grants (issue #75). These replace the four
+/// mode-gated [`crate::engine::tool::Capability`] variants: a grant is now
+/// an explicit member of the agent definition's `capabilities` set rather
+/// than a side effect of the session-global `LlmMode`. Wire names are the
+/// camelCase spellings below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentCapability {
+    FollowupSeed,
+    SandboxEscalate,
+    ForkContext,
+    ScopedParallelWrite,
+}
+
+impl AgentCapability {
+    pub fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "followupSeed" => Some(Self::FollowupSeed),
+            "sandboxEscalate" => Some(Self::SandboxEscalate),
+            "forkContext" => Some(Self::ForkContext),
+            "scopedParallelWrite" => Some(Self::ScopedParallelWrite),
+            _ => None,
+        }
+    }
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::FollowupSeed => "followupSeed",
+            Self::SandboxEscalate => "sandboxEscalate",
+            Self::ForkContext => "forkContext",
+            Self::ScopedParallelWrite => "scopedParallelWrite",
+        }
+    }
+}
+
+/// Per-agent tool-description steering (issue #75). `Verbose` renders the
+/// former `defensive_description()`/`defensive_parameters()` text; `Terse`
+/// renders the normal/base text. Defaults to `Terse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolSteering {
+    #[default]
+    Terse,
+    Verbose,
+}
+
+impl ToolSteering {
+    /// Derive steering from the legacy [`crate::config::extended::LlmMode`]
+    /// at the existing seams: `Defensive` -> `Verbose`, else `Terse`. Used
+    /// while undeclared defs still fall back to the mode.
+    pub fn from_llm_mode(mode: crate::config::extended::LlmMode) -> Self {
+        match mode {
+            crate::config::extended::LlmMode::Defensive => Self::Verbose,
+            crate::config::extended::LlmMode::Normal | crate::config::extended::LlmMode::Frontier => {
+                Self::Terse
+            }
+        }
+    }
+}
+
+/// Inline-caps profile for context tagging (issue #75). Replaces
+/// `TagInlineCaps::for_mode`. Defaults to `Standard` (48 KiB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InlineCapsProfile {
+    Conservative,
+    #[default]
+    Standard,
+    Large,
+}
+
+/// Per-agent context policy (issue #75). Replaces the mode-derived
+/// auto-compact floor and inline-caps profile. Defaults:
+/// `auto_compact_pct = 80`, `inline_caps = Standard`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContextPolicy {
+    #[serde(rename = "autoCompactPct", default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_pct: Option<u8>,
+    #[serde(rename = "inlineCaps", default, skip_serializing_if = "Option::is_none")]
+    pub inline_caps: Option<InlineCapsProfile>,
+}
+
+impl ContextPolicy {
+    /// The default auto-compact percentage (80) used when the def does not
+    /// declare one.
+    pub const DEFAULT_AUTO_COMPACT_PCT: u8 = 80;
+}
+
 /// A fully-resolved agent definition: the embedded default for a
 /// built-in, or a user-authored file on disk. The `model`/`temperature`/
 /// `tools` here are what the engine builds the agent from — an edited
@@ -124,6 +212,22 @@ pub struct AgentDef {
     /// and user-authored agents do not inherit fork eligibility accidentally.
     #[serde(rename = "forkEligible", default)]
     pub fork_eligible: bool,
+    /// Explicit per-agent capability grants (issue #75). `None` = "not yet
+    /// declared" (legacy fallback to the mode gate until Stage 5 closes the
+    /// ratchet); `Some(empty)` = explicitly none. The four variants mirror the
+    /// legacy [`crate::engine::tool::Capability`] set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<BTreeSet<AgentCapability>>,
+    /// Per-agent tool-description steering (issue #75). `None` = not declared
+    /// (derive from the legacy mode at the existing seams); `Some` selects the
+    /// rendering directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_steering: Option<ToolSteering>,
+    /// Per-agent context policy (issue #75): the auto-compact floor and inline
+    /// caps profile that previously came from the mode. `None` = not declared
+    /// (inherit the default 80 / `standard`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<ContextPolicy>,
     /// Parsed v2 declarative contract.  v2 never projects into the legacy
     /// runtime fields: a host must calculate and snapshot an
     /// [`EffectiveVnextGrant`] before a v2 definition can receive any
@@ -480,8 +584,13 @@ fn tool_family(name: &str) -> &'static str {
 /// JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolDescriptionSpec {
+    /// A single canonical description text, applied to every mode/steering.
+    /// Serialized as a bare string (issue #75): the per-mode trio collapses to
+    /// one text, with optional `verbose_text` carrying the defensive prose.
+    Text(String),
     /// Distinct per-mode text; either field may be omitted to fall back to the
-    /// tool's own base description for that mode.
+    /// tool's own base description for that mode. Retained while the
+    /// mode-keyed description engines still exist (collapsed in Stage 3).
     PerMode {
         normal: Option<String>,
         frontier: Option<String>,
@@ -493,6 +602,7 @@ impl Serialize for ToolDescriptionSpec {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         match self {
+            ToolDescriptionSpec::Text(text) => ser.serialize_str(text),
             ToolDescriptionSpec::PerMode {
                 normal,
                 frontier,
@@ -523,23 +633,19 @@ impl<'de> Deserialize<'de> for ToolDescriptionSpec {
         impl<'de> serde::de::Visitor<'de> for SpecVisitor {
             type Value = ToolDescriptionSpec;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a `{normal, frontier, defensive}` map")
+                f.write_str("a bare string or a `{normal, frontier, defensive}` map")
             }
             fn visit_str<E: serde::de::Error>(
                 self,
-                _v: &str,
+                v: &str,
             ) -> std::result::Result<Self::Value, E> {
-                Err(E::custom(
-                    "expected a {normal, frontier, defensive} map; a bare string is no longer accepted (set the modes you want to override)",
-                ))
+                Ok(ToolDescriptionSpec::Text(v.to_string()))
             }
             fn visit_string<E: serde::de::Error>(
                 self,
-                _v: String,
+                v: String,
             ) -> std::result::Result<Self::Value, E> {
-                Err(E::custom(
-                    "expected a {normal, frontier, defensive} map; a bare string is no longer accepted (set the modes you want to override)",
-                ))
+                Ok(ToolDescriptionSpec::Text(v))
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
@@ -573,10 +679,17 @@ impl<'de> Deserialize<'de> for ToolDescriptionSpec {
 
 impl ToolDescriptionSpec {
     /// Project to the engine-level [`crate::engine::tool::ToolDescOverride`].
-    /// Each per-mode field maps straight across; omitted modes remain `None`
-    /// so the tool's own description for that mode is preserved.
+    /// `Text` maps to all three legacy slots (so the single text overrides
+    /// every mode until the per-mode engine is collapsed). Each per-mode
+    /// field maps straight across; omitted modes remain `None` so the tool's
+    /// own description for that mode is preserved.
     pub fn to_override(&self) -> crate::engine::tool::ToolDescOverride {
         match self {
+            ToolDescriptionSpec::Text(text) => crate::engine::tool::ToolDescOverride {
+                normal: Some(text.clone()),
+                frontier: Some(text.clone()),
+                defensive: Some(text.clone()),
+            },
             ToolDescriptionSpec::PerMode {
                 normal,
                 frontier,
@@ -602,7 +715,7 @@ where
         type Value = BTreeMap<String, ToolDescriptionSpec>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a map of tool names to `{normal, frontier, defensive}` maps")
+            f.write_str("a map of tool names to bare strings or `{normal, frontier, defensive}` maps")
         }
 
         fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -796,6 +909,15 @@ impl AgentDef {
         if self.fork_eligible {
             fm.insert("forkEligible".into(), true.into());
         }
+        if let Some(caps) = &self.capabilities {
+            fm.insert("capabilities".into(), serde_yaml::to_value(caps)?);
+        }
+        if let Some(steering) = self.tool_steering {
+            fm.insert("toolSteering".into(), serde_yaml::to_value(steering)?);
+        }
+        if let Some(policy) = &self.context_policy {
+            fm.insert("contextPolicy".into(), serde_yaml::to_value(policy)?);
+        }
         let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(fm))?;
         let body = self.prompt.trim_end_matches('\n');
         Ok(format!("---\n{yaml}---\n\n{body}\n"))
@@ -977,6 +1099,12 @@ fn parse_agent_with_scope(
         permission: Option<serde_json::Value>,
         #[serde(rename = "forkEligible", default)]
         fork_eligible: bool,
+        #[serde(default)]
+        capabilities: Option<BTreeSet<AgentCapability>>,
+        #[serde(default)]
+        tool_steering: Option<ToolSteering>,
+        #[serde(default)]
+        context_policy: Option<ContextPolicy>,
     }
 
     if fm_raw.trim().is_empty() {
@@ -1123,6 +1251,9 @@ fn parse_agent_with_scope(
         goal_supervision: fm.goal_supervision,
         permission: fm.permission,
         fork_eligible: fm.fork_eligible,
+        capabilities: fm.capabilities,
+        tool_steering: fm.tool_steering,
+        context_policy: fm.context_policy,
         vnext,
         // Trim the blank line(s) the frontmatter fence leaves before the
         // body and any trailing newline, so the stored prompt matches the

@@ -98,6 +98,29 @@ pub fn fchmod(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
     Ok(())
 }
 
+/// Set the mode through a Linux `O_PATH` descriptor. This is the fail-closed
+/// fallback for a directory whose creation mode was reduced to `0000` by the
+/// process umask: ordinary `openat` cannot acquire a chmod-capable descriptor,
+/// while `fchmodat2(AT_EMPTY_PATH)` still names exactly the held inode.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn fchmodat_empty_path(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
+    // SAFETY: `fd` is live, the empty C string is NUL terminated, and
+    // `AT_EMPTY_PATH` directs the kernel to operate on `fd` itself.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_fchmodat2,
+            fd,
+            c"".as_ptr(),
+            mode,
+            libc::AT_EMPTY_PATH,
+        ) as libc::c_int
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `unlinkat(dir_fd, name, flags)` beneath the held fd. `flags` is `0` for a
 /// file or `AT_REMOVEDIR` for a directory.
 pub fn unlinkat(dir_fd: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()> {
@@ -164,14 +187,19 @@ pub fn fstatat_nofollow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
 /// fail (`EEXIST`) rather than overwriting an existing target, so there is no
 /// check-then-rename window. Callers on kernels/filesystems lacking `renameat2`
 /// see `ENOSYS`/`EINVAL` and fall back to a `linkat`+`unlinkat` two-step.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 pub fn rename_noreplace(
     from_dir_fd: RawFd,
     from: &CStr,
     to_dir_fd: RawFd,
     to: &CStr,
 ) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: both dir fds are live and both names outlive the call.
     let result = unsafe {
         libc::syscall(
@@ -183,7 +211,7 @@ pub fn rename_noreplace(
             1_u32, // RENAME_NOREPLACE
         ) as libc::c_int
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     // SAFETY: both dir fds are live and both names outlive the call.
     let result = unsafe {
         libc::renameatx_np(
@@ -198,4 +226,23 @@ pub fn rename_noreplace(
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Fail closed where the platform has no atomic no-replace directory rename.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+pub fn rename_noreplace(
+    _from_dir_fd: RawFd,
+    _from: &CStr,
+    _to_dir_fd: RawFd,
+    _to: &CStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
 }

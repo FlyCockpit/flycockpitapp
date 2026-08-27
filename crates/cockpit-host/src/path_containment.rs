@@ -112,7 +112,14 @@ mod tests {
                 &root,
                 &root.join("scope/link/escaped.txt")
             ));
-            assert!(nearest_existing_ancestor(&root.join("scope/link/escaped.txt")).is_err());
+            let linked_missing = root.join("scope/link/escaped.txt");
+            let (prefix, canonical) = nearest_existing_ancestor(&linked_missing).unwrap();
+            assert_eq!(prefix, root.join("scope/link"));
+            assert_eq!(canonical, std::fs::canonicalize(&sibling).unwrap());
+
+            std::os::unix::fs::symlink(root.join("missing-target"), root.join("scope/dangling"))
+                .unwrap();
+            assert!(nearest_existing_ancestor(&root.join("scope/dangling/escaped.txt")).is_err());
         }
     }
 }

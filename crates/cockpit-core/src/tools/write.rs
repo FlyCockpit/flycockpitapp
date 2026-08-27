@@ -5,12 +5,14 @@
 //! created without a read record, using create-new semantics so they are never
 //! overwritten by a stale absence check.
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 use std::io::Write as _;
 
 #[cfg(unix)]
 use anyhow::Context;
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(not(windows))]
+use anyhow::bail;
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -300,7 +302,7 @@ pub(crate) fn enforce_requested_write_scope(
 }
 
 /// Workspace parent directories created for a new file. Explicit rather than
-/// umask-derived; applied with `fchmod` on the held descriptor.
+/// umask-derived; applied through the held staged-directory descriptor.
 #[cfg(unix)]
 const CREATED_DIR_MODE: libc::mode_t = 0o755;
 #[cfg(unix)]
@@ -317,9 +319,12 @@ thread_local! {
     #[cfg(unix)]
     static AFTER_DIRECTORY_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static BEFORE_STAGED_DIRECTORY_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     static BEFORE_FILE_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     static AFTER_FILE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static FORCED_FILE_CREATE_ERROR: std::cell::RefCell<Option<std::io::Error>> =
@@ -342,11 +347,16 @@ fn set_after_directory_create_hook(hook: impl FnOnce() + 'static) {
 }
 
 #[cfg(all(test, unix))]
+fn set_before_staged_directory_open_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_STAGED_DIRECTORY_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(all(test, unix))]
 fn set_before_file_create_hook(hook: impl FnOnce() + 'static) {
     BEFORE_FILE_CREATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 fn set_after_file_open_hook(hook: impl FnOnce() + 'static) {
     AFTER_FILE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -386,6 +396,16 @@ fn run_after_directory_create_hook() {
     });
 }
 
+#[cfg(unix)]
+fn run_before_staged_directory_open_hook() {
+    #[cfg(test)]
+    BEFORE_STAGED_DIRECTORY_OPEN.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 fn run_before_file_create_hook() {
     #[cfg(test)]
     BEFORE_FILE_CREATE.with(|slot| {
@@ -395,7 +415,7 @@ fn run_before_file_create_hook() {
     });
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn run_after_file_open_hook() {
     #[cfg(test)]
     AFTER_FILE_OPEN.with(|slot| {
@@ -467,7 +487,6 @@ impl CreatedDirectories {
 #[cfg(unix)]
 fn rollback_created_directory_bindings(bindings: &[CreatedDirectoryBinding]) {
     use std::os::fd::AsRawFd as _;
-
     for binding in bindings.iter().rev() {
         let Ok(stat) = cockpit_host::private_fs::held_fd::fstatat_nofollow(
             binding.parent.as_raw_fd(),
@@ -475,7 +494,7 @@ fn rollback_created_directory_bindings(bindings: &[CreatedDirectoryBinding]) {
         ) else {
             continue;
         };
-        if stat.st_dev as u64 != binding.device || stat.st_ino as u64 != binding.inode {
+        if (stat.st_dev as u64, stat.st_ino as u64) != (binding.device, binding.inode) {
             continue;
         }
         let _ = cockpit_host::private_fs::held_fd::unlinkat(
@@ -487,7 +506,7 @@ fn rollback_created_directory_bindings(bindings: &[CreatedDirectoryBinding]) {
 }
 
 impl ParentPrep {
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     fn none() -> Self {
         Self {
             disclosure: None,
@@ -790,103 +809,139 @@ fn open_or_create_directory_child(
             Ok((directory, binding))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let we_created = match cockpit_host::private_fs::held_fd::mkdirat(
+            // Safety invariant: successful mkdirat under this unpredictable
+            // private staging name is the creation-ownership basis. The first
+            // no-follow identity observation anchors that claim; every later
+            // chmod, publication, and rollback is gated on the same identity.
+            let staged_name = std::ffi::CString::new(format!(
+                ".cockpit-create-{}",
+                uuid::Uuid::new_v4().simple()
+            ))?;
+            cockpit_host::private_fs::held_fd::mkdirat(
                 parent.as_raw_fd(),
-                &cname,
+                &staged_name,
                 CREATED_DIR_INITIAL_MODE,
+            )
+            .with_context(|| format!("staging directory component `{}`", child_path.display()))?;
+            let staged_entry = match cockpit_host::private_fs::held_fd::fstatat_nofollow(
+                parent.as_raw_fd(),
+                &staged_name,
             ) {
-                Ok(()) => true,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
-                Err(err) => {
-                    return Err(err).context(format!(
-                        "creating directory component `{}`",
-                        child_path.display()
-                    ));
+                Ok(entry) if entry.st_mode & libc::S_IFMT == libc::S_IFDIR => entry,
+                Ok(_) => bail!("refused: staged directory is not a directory"),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("identify staged directory `{}`", child_path.display())
+                    });
                 }
             };
-            let created_identity = if we_created {
-                // POSIX `mkdirat` does not return an fd or inode. This immediate
-                // no-follow stat is the earliest identity observation the API
-                // permits; all later open/chmod/rollback operations require the
-                // entry and held fd to keep matching it. A hostile process with
-                // directory-write authority can still win the irreducible
-                // mkdirat-to-fstatat interval, so callers must not share writable
-                // ancestors with an adversary when that stronger guarantee is
-                // required.
-                let stat = cockpit_host::private_fs::held_fd::fstatat_nofollow(
-                    parent.as_raw_fd(),
-                    &cname,
-                )?;
-                Some((stat.st_dev as u64, stat.st_ino as u64))
-            } else {
-                None
+            let staged_identity = (staged_entry.st_dev as u64, staged_entry.st_ino as u64);
+            run_before_staged_directory_open_hook();
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let staged = match cockpit_host::private_fs::held_fd::openat(
+                parent.as_raw_fd(),
+                &staged_name,
+                flags,
+            ) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    remove_directory_if_identity_matches(parent, &staged_name, staged_identity);
+                    return Err(refuse_symlink_or_non_dir(child_path, error));
+                }
             };
-            if we_created {
-                run_after_directory_create_hook();
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = match staged.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    remove_directory_if_identity_matches(parent, &staged_name, staged_identity);
+                    return Err(error).context("inspect held staged directory");
+                }
+            };
+            if (metadata.dev(), metadata.ino()) != staged_identity {
+                remove_directory_if_identity_matches(parent, &staged_name, staged_identity);
+                bail!("refused: staged directory changed identity while it was being acquired");
             }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let chmod = cockpit_host::private_fs::held_fd::fchmodat_empty_path(
+                staged.as_raw_fd(),
+                CREATED_DIR_MODE,
+            );
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let chmod =
+                cockpit_host::private_fs::held_fd::fchmod(staged.as_raw_fd(), CREATED_DIR_MODE);
+            if let Err(error) = chmod {
+                remove_directory_if_identity_matches(parent, &staged_name, staged_identity);
+                return Err(error).with_context(|| {
+                    format!(
+                        "setting mode of staged directory `{}`",
+                        child_path.display()
+                    )
+                });
+            }
+            if let Err(error) = cockpit_host::private_fs::held_fd::rename_noreplace(
+                parent.as_raw_fd(),
+                &staged_name,
+                parent.as_raw_fd(),
+                &cname,
+            ) {
+                remove_directory_if_identity_matches(parent, &staged_name, staged_identity);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    let directory = cockpit_host::private_fs::held_fd::openat(
+                        parent.as_raw_fd(),
+                        &cname,
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                    .map_err(|error| refuse_symlink_or_non_dir(child_path, error))?;
+                    let binding =
+                        verified_directory_binding(parent, &cname, &directory, None, child_path)?;
+                    return Ok((directory, binding));
+                }
+                return Err(error).with_context(|| {
+                    format!("publishing directory component `{}`", child_path.display())
+                });
+            }
+            run_after_directory_create_hook();
             let directory = match cockpit_host::private_fs::held_fd::openat(
                 parent.as_raw_fd(),
                 &cname,
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             ) {
                 Ok(directory) => directory,
-                Err(err) => {
-                    if we_created {
-                        remove_directory_if_identity_matches(parent, &cname, created_identity);
-                    }
-                    return Err(refuse_symlink_or_non_dir(child_path, err));
+                Err(error) => {
+                    remove_directory_if_identity_matches(parent, &cname, staged_identity);
+                    return Err(refuse_symlink_or_non_dir(child_path, error));
                 }
             };
             let binding = match verified_directory_binding(
                 parent,
                 &cname,
                 &directory,
-                created_identity,
+                Some(staged_identity),
                 child_path,
             ) {
                 Ok(binding) => binding,
                 Err(error) => {
-                    remove_directory_if_identity_matches(parent, &cname, created_identity);
+                    remove_directory_if_identity_matches(parent, &cname, staged_identity);
                     return Err(error);
                 }
             };
-            if we_created {
-                let rollback_parent = match parent.try_clone() {
-                    Ok(parent) => parent,
-                    Err(error) => {
-                        remove_directory_if_identity_matches(parent, &cname, created_identity);
-                        return Err(error).with_context(|| {
-                            format!(
-                                "retain rollback authority for created directory `{}`",
-                                child_path.display()
-                            )
-                        });
-                    }
-                };
-                if let Err(err) = cockpit_host::private_fs::held_fd::fchmod(
-                    directory.as_raw_fd(),
-                    CREATED_DIR_MODE,
-                ) {
-                    remove_directory_if_identity_matches(parent, &cname, created_identity);
-                    return Err(err).with_context(|| {
-                        format!(
-                            "setting mode of created directory `{}`",
-                            child_path.display()
-                        )
-                    });
+            let rollback_parent = match parent.try_clone() {
+                Ok(parent) => parent,
+                Err(error) => {
+                    remove_directory_if_identity_matches(parent, &cname, staged_identity);
+                    return Err(error).context("retain rollback authority for created directory");
                 }
-                let Some((device, inode)) = created_identity else {
-                    remove_directory_if_identity_matches(parent, &cname, created_identity);
-                    bail!("missing identity for directory created by this write");
-                };
-                created.paths.push(child_path.to_path_buf());
-                created.bindings.push(CreatedDirectoryBinding {
-                    parent: rollback_parent,
-                    name: cname.clone(),
-                    device,
-                    inode,
-                });
-            }
+            };
+            created.paths.push(child_path.to_path_buf());
+            created.bindings.push(CreatedDirectoryBinding {
+                parent: rollback_parent,
+                name: cname.clone(),
+                device: staged_identity.0,
+                inode: staged_identity.1,
+            });
             Ok((directory, binding))
         }
         Err(err) => Err(refuse_symlink_or_non_dir(child_path, err)),
@@ -929,18 +984,14 @@ fn verified_directory_binding(
 fn remove_directory_if_identity_matches(
     parent: &std::fs::File,
     name: &std::ffi::CStr,
-    identity: Option<(u64, u64)>,
+    identity: (u64, u64),
 ) {
     use std::os::fd::AsRawFd as _;
-
-    let Some((device, inode)) = identity else {
-        return;
-    };
     let Ok(stat) = cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), name)
     else {
         return;
     };
-    if stat.st_dev as u64 == device && stat.st_ino as u64 == inode {
+    if (stat.st_dev as u64, stat.st_ino as u64) == identity {
         let _ = cockpit_host::private_fs::held_fd::unlinkat(
             parent.as_raw_fd(),
             name,
@@ -1042,6 +1093,7 @@ fn create_new_file(
 #[cfg(windows)]
 mod windows_parent {
     use std::ffi::{OsStr, c_void};
+    use std::io::Write as _;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
@@ -1050,7 +1102,9 @@ mod windows_parent {
 
     use anyhow::{Context, Result, bail, ensure};
 
-    use super::{CreatedDirectories, ParentPrep, format_created_directories_line};
+    use super::{
+        CreatedDirectories, ParentPrep, format_created_directories_line, run_after_file_open_hook,
+    };
 
     type Handle = *mut c_void;
     const INVALID_HANDLE: Handle = -1_isize as Handle;
@@ -1509,6 +1563,11 @@ mod windows_parent {
                     return Err(error);
                 }
             };
+            run_after_file_open_hook();
+            if let Err(error) = revalidate(&prep.bindings) {
+                let _ = mark_delete(&file);
+                return Err(error);
+            }
             if let Err(error) = file.write_all(bytes) {
                 let _ = mark_delete(&file);
                 return Err(error.into());
@@ -2463,7 +2522,6 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-
         assert!(error.contains("changed identity"), "{error}");
         assert!(
             nested.is_dir(),
@@ -2478,6 +2536,53 @@ mod tests {
             parked.is_dir(),
             "the displaced created inode remains untouched"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn staged_directory_substitution_is_never_chmodded_published_or_rollback_owned() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let parked = tmp.path().join("parked-stage");
+        let foreign = tmp.path().join("foreign-stage");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o711)).unwrap();
+        set_before_staged_directory_open_hook(move || {
+            let stage = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".cockpit-create-")
+                })
+                .unwrap();
+            std::fs::rename(&stage, &parked).unwrap();
+            std::fs::rename(&foreign, &stage).unwrap();
+        });
+        let error = ensure_parent_dirs(&tmp.path().join("nested/file.txt"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("changed identity"), "{error}");
+        assert!(!tmp.path().join("nested").exists());
+        let replacement = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".cockpit-create-")
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(replacement).unwrap().permissions().mode() & 0o777,
+            0o711
+        );
+        assert!(tmp.path().join("parked-stage").is_dir());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2649,6 +2754,30 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn windows_leaf_open_revalidates_parent_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("nested");
+        let parked = tmp.path().join("parked-nested");
+        let path = parent.join("new.txt");
+        std::fs::create_dir(&parent).unwrap();
+        let prep = ensure_parent_dirs(&path).unwrap();
+        let parent_for_hook = parent.clone();
+        let parked_for_hook = parked.clone();
+        set_after_file_open_hook(move || {
+            std::fs::rename(parent_for_hook, parked_for_hook).unwrap();
+        });
+
+        let error = create_new_file(&prep, &path, b"must not be disclosed")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("changed"), "{error}");
+        assert!(!path.exists());
+        assert!(!parked.join("new.txt").exists());
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn failed_create_rolls_back_directories_this_call_created() {
@@ -2756,6 +2885,62 @@ mod tests {
             & 0o777;
         assert_eq!(nested_mode, 0o755);
         assert_eq!(deep_mode, 0o755);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn restrictive_umask_does_not_leak_or_block_staged_parent_creation() {
+        const CHILD_ROOT: &str = "COCKPIT_WRITE_RESTRICTIVE_UMASK_CHILD";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            struct UmaskRestore(libc::mode_t);
+            impl Drop for UmaskRestore {
+                fn drop(&mut self) {
+                    // SAFETY: this exact test is isolated in a child process.
+                    unsafe { libc::umask(self.0) };
+                }
+            }
+
+            let root = std::path::PathBuf::from(root);
+            std::fs::create_dir_all(&root).unwrap();
+            // SAFETY: the parent runs only this test in the child process.
+            let _restore = UmaskRestore(unsafe { libc::umask(0o700) });
+            let prep = ensure_parent_dirs(&root.join("nested/deep/file.txt")).unwrap();
+            create_new_file(&prep, &root.join("nested/deep/file.txt"), b"body").unwrap();
+            assert_eq!(
+                std::fs::read(root.join("nested/deep/file.txt")).unwrap(),
+                b"body"
+            );
+            assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".cockpit-create-")
+            }));
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let child_root = tmp.path().join("child");
+        let test_name = std::thread::current()
+            .name()
+            .expect("test thread has a name")
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CHILD_ROOT, &child_root)
+            .output()
+            .expect("spawn isolated restrictive-umask regression test");
+        assert!(
+            output.status.success(),
+            "isolated restrictive-umask test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(child_root.join("nested/deep/file.txt").is_file());
     }
 
     #[tokio::test(flavor = "current_thread")]

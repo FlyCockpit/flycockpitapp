@@ -214,6 +214,10 @@ impl App {
         self.pin_count_session = None;
         self.pinned_seqs_cache.clear();
         self.pinned_seqs_session = None;
+        // A session switch/resume is an explicit request for a fresh count, so
+        // drop any pending pin-state failure-retry gate — otherwise returning to
+        // a briefly-gated session within the backoff would show a stale count.
+        self.pin_state_retry_after = None;
     }
 
     pub(super) fn cancel_outgoing_turn_if_busy(&mut self) {

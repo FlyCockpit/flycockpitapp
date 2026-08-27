@@ -345,6 +345,13 @@ pub enum AsyncActionPayload {
         count: usize,
         pinned_seqs: Vec<i64>,
     },
+    /// A pin-state refresh RPC failed. Carries the originating session so the
+    /// handler retries the RIGHT session's stamp even if the user has since
+    /// navigated to another session (a bare `Err` would lose that identity).
+    PinStateRefreshFailed {
+        session_id: uuid::Uuid,
+        error: String,
+    },
     PinToggle {
         session_id: uuid::Uuid,
         seq: i64,

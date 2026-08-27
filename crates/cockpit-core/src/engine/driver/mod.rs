@@ -587,6 +587,15 @@ pub enum ParkedReplayOutcome {
 /// hit this cap, extras stay in the channel for the *next* fold.
 const MAX_FOLD: usize = 16;
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
+/// After a goal-supervision swarm spawn is refused, its control job stays leased
+/// for the 300s lease TTL. Wake the goal loop a bit past that so a QUIESCENT
+/// session (no completions to wake it) re-runs supervision, re-leases the
+/// now-expired job, and retries the refused spawn.
+const GOAL_REFUSED_SPAWN_RETRY_DELAY: Duration = Duration::from_secs(315);
+/// Max consecutive refused-spawn retries the goal watchdog attempts before
+/// giving up. A transient full queue usually drains within this; a permanent
+/// refusal (oversized prompt) then stops re-waking instead of looping forever.
+const GOAL_REFUSED_SPAWN_MAX_RETRIES: u8 = 4;
 /// Finite continuation cap for goals created without an explicit token budget.
 /// Large enough for ordinary multi-turn runs, but not unbounded if the agent
 /// repeatedly fails to make durable progress.
@@ -1129,6 +1138,16 @@ pub struct Driver {
     goal_was_active_recently: bool,
     goal_usage_limit_auto_resume_attempts: u8,
     goal_supervision_round: Option<GoalSupervisionRound>,
+    /// A goal-supervision swarm spawn was refused (full queue / oversized
+    /// prompt) during the current round, leaving a control job leased with no
+    /// tracked job to wake the loop. Arms the goal watchdog so a quiescent
+    /// session re-runs supervision after the lease TTL and retries.
+    goal_refused_spawn_retry_pending: bool,
+    /// Count of consecutive rounds whose swarm spawn was (re-)refused. Caps the
+    /// retry watchdog at [`GOAL_REFUSED_SPAWN_MAX_RETRIES`] so a permanently
+    /// failing refusal (e.g. an oversized control prompt) stops re-waking the
+    /// loop forever; reset to 0 when a round spawns cleanly.
+    goal_refused_spawn_retry_attempts: u8,
     goal_root_turn: Option<(uuid::Uuid, i64, uuid::Uuid)>,
     goal_scratch: Option<cockpit_host::goal_scratch::GoalScratchRoot>,
     pending_idle_reason: Option<crate::engine::IdleReason>,
@@ -1450,6 +1469,14 @@ impl Drop for Driver {
     }
 }
 
+/// Whether a subagent/child report is a HOST-generated failure sentinel. The
+/// harness formats every failed run as `format!("Error: {e}")`, so this is the
+/// single shared classifier for that sentinel — used by both the driver and the
+/// noninteractive delegation paths so a child's success/failure is judged by one
+/// consistent rule rather than several subtly different inline `starts_with`
+/// checks. It matches the exact host prefix (`"Error: "`, after any leading
+/// whitespace); a completed child whose report legitimately begins that way is a
+/// residual false positive that only true execution-provenance would remove.
 pub(crate) fn is_host_failure_sentinel(report: &str) -> bool {
     report.trim_start().starts_with("Error: ")
 }
@@ -1861,6 +1888,10 @@ impl Driver {
             goal_was_active_recently: self.goal_was_active_recently,
             goal_usage_limit_auto_resume_attempts: self.goal_usage_limit_auto_resume_attempts,
             goal_supervision_round: self.goal_supervision_round.clone(),
+            // A fork never runs the root's goal watchdog, so it carries no
+            // pending refused-spawn retry.
+            goal_refused_spawn_retry_pending: false,
+            goal_refused_spawn_retry_attempts: 0,
             goal_root_turn: self.goal_root_turn,
             // Forks never own or clean the root driver's supervised-goal scratch.
             goal_scratch: None,
@@ -2191,6 +2222,8 @@ impl Driver {
             goal_was_active_recently: false,
             goal_usage_limit_auto_resume_attempts: 0,
             goal_supervision_round: None,
+            goal_refused_spawn_retry_pending: false,
+            goal_refused_spawn_retry_attempts: 0,
             goal_root_turn: None,
             goal_scratch: None,
             pending_idle_reason: None,
@@ -5402,6 +5435,15 @@ impl Driver {
             total: 0,
             jobs: HashMap::new(),
         });
+        // Track this round's leasing outcome so the refused-spawn retry flag is
+        // recomputed WITHOUT clobbering a still-pending retry. A round driven by
+        // a fast panelist completion can run while a sibling's refused control
+        // job is still within its 300s lease (not yet re-leasable): that round
+        // leases nothing here, and must leave the flag armed so the watchdog
+        // fires once the lease expires — clearing it unconditionally would strand
+        // the leased job and re-stall the panel.
+        let mut leased_any = false;
+        let mut refused_any = false;
         while let Some(job) = self
             .session
             .db
@@ -5413,6 +5455,7 @@ impl Driver {
             )
             .await?
         {
+            leased_any = true;
             let job_id = job.job_id.to_string();
             let (worker, model) = match job.role {
                 crate::db::session_goals::GoalControlRole::Planner => (
@@ -5481,6 +5524,10 @@ impl Driver {
                     reason = refusal.trim(),
                     "goal-supervision swarm spawn refused; not tracking it in this round"
                 );
+                // Note the refusal; the post-loop recompute arms a watchdog-
+                // backed retry so a quiescent session eventually re-leases the
+                // (now-leased) control job instead of stalling on it.
+                refused_any = true;
                 continue;
             }
             let round = self
@@ -5489,6 +5536,27 @@ impl Driver {
                 .expect("initialized before leasing");
             round.total = round.total.saturating_add(1);
             round.jobs.insert(job_id, job);
+        }
+        // Recompute the refused-spawn retry state from THIS round's outcome, but
+        // only when the round actually leased work. A round that leased nothing
+        // (a prior refused job's 300s lease not yet expired) leaves any pending
+        // retry untouched so the watchdog stays armed until the lease expires.
+        if leased_any {
+            if refused_any {
+                // Bound the retries: a permanently-failing refusal (e.g. an
+                // oversized control prompt) stops re-waking after a few attempts
+                // instead of looping forever, while a transient full queue
+                // usually drains within the cap. `refresh_goal_watchdog` stops
+                // arming once the cap is reached.
+                self.goal_refused_spawn_retry_attempts =
+                    self.goal_refused_spawn_retry_attempts.saturating_add(1);
+                self.goal_refused_spawn_retry_pending = true;
+            } else {
+                // Everything leased this round spawned cleanly — the refusal
+                // condition cleared.
+                self.goal_refused_spawn_retry_pending = false;
+                self.goal_refused_spawn_retry_attempts = 0;
+            }
         }
         let total = self
             .goal_supervision_round
@@ -7440,11 +7508,22 @@ impl Driver {
             .flatten()
             .map(|g| (g.disposition, g.pause_reason));
         let delay = match status {
-            Some((crate::db::session_goals::GoalDisposition::Running, _))
-                if self.root_last_assistant_was_prose_without_tools()
-                    && !self.schedule.snapshot().is_empty() =>
-            {
-                Some(GOAL_WATCHDOG_DELAY)
+            Some((crate::db::session_goals::GoalDisposition::Running, _)) => {
+                // Idle root with pending background work — nudge the goal loop
+                // to re-evaluate once it settles.
+                let prose = (self.root_last_assistant_was_prose_without_tools()
+                    && !self.schedule.snapshot().is_empty())
+                .then_some(GOAL_WATCHDOG_DELAY);
+                // A refused swarm spawn left a control job leased with nothing to
+                // wake the loop; retry after the lease TTL so a quiescent session
+                // self-heals instead of stalling the panel indefinitely — but
+                // only up to the retry cap, so a permanently-failing refusal
+                // stops re-waking the loop.
+                let refused = (self.goal_refused_spawn_retry_pending
+                    && self.goal_refused_spawn_retry_attempts < GOAL_REFUSED_SPAWN_MAX_RETRIES)
+                    .then_some(GOAL_REFUSED_SPAWN_RETRY_DELAY);
+                // Arm for whichever fires first.
+                [prose, refused].into_iter().flatten().min()
             }
             Some((
                 crate::db::session_goals::GoalDisposition::InfraPaused,

@@ -36,6 +36,7 @@ pub(super) fn page_after_first_paint(cwd: PathBuf, sandbox_enabled: bool) -> Pag
         state: Mutex::new(state),
         refresh: Mutex::new(None),
         scroll: 0,
+        max_scroll: std::cell::Cell::new(0),
         cwd,
         sandbox_enabled,
         refresh_after_paint: false,
@@ -76,6 +77,7 @@ pub(super) fn page(cwd: PathBuf, sandbox_enabled: bool) -> PageBox {
         state: Mutex::new(state),
         refresh: Mutex::new(None),
         scroll: 0,
+        max_scroll: std::cell::Cell::new(0),
         cwd,
         sandbox_enabled,
         refresh_after_paint: true,
@@ -86,6 +88,10 @@ pub(super) struct DependenciesPage {
     state: Mutex<cockpit_core::external_runtime::DependenciesPageState>,
     refresh: Mutex<PendingDependencyRefresh>,
     scroll: u16,
+    /// Largest in-bounds scroll offset, recomputed from the wrapped content
+    /// height each render (interior-mutable so the `&self` render can update it).
+    /// `Down` clamps against it so the list can't scroll past its end into blank.
+    max_scroll: std::cell::Cell<u16>,
     cwd: PathBuf,
     sandbox_enabled: bool,
     refresh_after_paint: bool,
@@ -169,7 +175,9 @@ impl SettingsPage for DependenciesPage {
                 Nav::Stay
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.scroll = self.scroll.saturating_add(1);
+                // Clamp to the last-rendered max so the list can't scroll past
+                // its end into blank space.
+                self.scroll = self.scroll.saturating_add(1).min(self.max_scroll.get());
                 Nav::Stay
             }
             KeyCode::Char('r') => {
@@ -235,6 +243,21 @@ impl SettingsPage for DependenciesPage {
         if let Some(error) = &state.refresh_failure {
             lines.push(Line::from(format!("Refresh failed: {error}")));
         }
+        // Clamp the scroll to the wrapped content that actually overflows the
+        // bordered viewport, so a stale/over-run offset never shows blank space.
+        let inner_width = area.width.saturating_sub(2);
+        let inner_height = area.height.saturating_sub(2);
+        let content_rows = if inner_width == 0 {
+            lines.len()
+        } else {
+            Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner_width)
+        };
+        let max_scroll =
+            (content_rows.saturating_sub(inner_height as usize)).min(u16::MAX as usize) as u16;
+        self.max_scroll.set(max_scroll);
+        let scroll = self.scroll.min(max_scroll);
         frame.render_widget(
             Paragraph::new(lines)
                 .block(
@@ -243,7 +266,7 @@ impl SettingsPage for DependenciesPage {
                         .title(" Dependencies "),
                 )
                 .wrap(Wrap { trim: false })
-                .scroll((self.scroll, 0)),
+                .scroll((scroll, 0)),
             area,
         );
     }

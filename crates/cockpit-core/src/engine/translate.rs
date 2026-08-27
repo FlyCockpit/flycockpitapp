@@ -154,7 +154,7 @@ async fn try_translate(
 /// instructions, and is told to return only the translation.
 pub fn build_translation_prompt(source: &str, target: &str, text: &str) -> String {
     let text_json = serde_json::to_string(text)
-        .map(|json| json.replace("</", "<\\/"))
+        .map(|json| super::prompt_fence::neutralize_closing_tags(&json))
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "translation prompt text serialization failed");
             String::from("\"\"")

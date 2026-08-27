@@ -41,6 +41,7 @@ pub mod model;
 pub mod model_roles;
 pub mod predict;
 pub mod preflight;
+pub(crate) mod prompt_fence;
 pub mod prune;
 pub mod rehydrate;
 pub mod repair;

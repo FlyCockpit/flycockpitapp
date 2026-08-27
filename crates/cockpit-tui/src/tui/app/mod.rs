@@ -2845,6 +2845,12 @@ pub struct App {
     /// only; DB refreshes happen on session sync and pin mutations.
     pub(super) pinned_seqs_cache: HashSet<i64>,
     pub(super) pinned_seqs_session: Option<uuid::Uuid>,
+    /// After a pin-state refresh RPC fails, the failed session is un-stamped so
+    /// `sync_pin_count` retries (otherwise the eager stamp wedges the count at 0
+    /// forever). This `(session, monotonic-not-before)` gate throttles that
+    /// autonomous retry so a persistent daemon failure re-kicks at the backoff
+    /// interval rather than every event-loop tick. Cleared on the next success.
+    pub(super) pin_state_retry_after: Option<(uuid::Uuid, std::time::Duration)>,
     /// Active which-key overlay (`crate::tui::keys_overlay`, `which-key-overlay.md`).
     /// `Some` while the context-aware keybinding panel is open. Opened by the
     /// leader key (`Ctrl+K`) or `/keys`; informational + TUI-only — it never
@@ -3956,6 +3962,7 @@ impl App {
             pin_count_session: None,
             pinned_seqs_cache: HashSet::new(),
             pinned_seqs_session: None,
+            pin_state_retry_after: None,
             keys_overlay: None,
             keyboard_enhancement_active: false,
         };

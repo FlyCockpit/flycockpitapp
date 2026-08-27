@@ -1110,7 +1110,7 @@ fn render_recursive_vnext_batch_result(
             .map(|(_, label, child_agent, report)| serde_json::json!({
                 "label": label,
                 "agent": child_agent,
-                "failed": report.starts_with("Error:"),
+                "failed": super::is_host_failure_sentinel(report.as_str()),
                 "report": report,
             }))
             .collect::<Vec<_>>(),
@@ -7811,7 +7811,7 @@ async fn recover_pending_recursive_continuation(
                     recovered.label.clone(),
                     recovered.child_agent.clone(),
                     recovered.report.clone(),
-                    recovered.report.starts_with("Error:"),
+                    super::is_host_failure_sentinel(recovered.report.as_str()),
                     crate::agent_tree::system_now_unix_ms(),
                 )
                 .await?;
@@ -7828,7 +7828,7 @@ async fn recover_pending_recursive_continuation(
         .map(|(_, report)| {
             (
                 report.agent_instance_id,
-                report.report.starts_with("Error:"),
+                super::is_host_failure_sentinel(report.report.as_str()),
             )
         })
         .collect::<Vec<_>>();
@@ -9688,7 +9688,10 @@ pub(crate) async fn run_noninteractive_resumable(
                             session.id,
                             parent_agent_instance_id,
                             parent_snapshot,
-                            vec![(nested_agent_instance_id, result.starts_with("Error:"))],
+                            vec![(
+                                nested_agent_instance_id,
+                                super::is_host_failure_sentinel(result.as_str()),
+                            )],
                             crate::agent_tree::system_now_unix_ms(),
                         )
                         .await
@@ -9704,7 +9707,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     terminalize_recursive_noninteractive_agent(
                         &session,
                         nested_agent_instance_id,
-                        result.starts_with("Error:"),
+                        super::is_host_failure_sentinel(result.as_str()),
                     )
                     .await;
                 }
@@ -10205,7 +10208,7 @@ pub(crate) async fn run_noninteractive_resumable(
                                     entry.label.clone(),
                                     entry.child_agent.clone(),
                                     report.clone(),
-                                    report.starts_with("Error:"),
+                                    super::is_host_failure_sentinel(report.as_str()),
                                     crate::agent_tree::system_now_unix_ms(),
                                 )
                                 .await
@@ -10235,7 +10238,10 @@ pub(crate) async fn run_noninteractive_resumable(
                             .get(idx)
                             .and_then(|target| target.agent_instance_id)
                             .map(|agent_instance_id| {
-                                (agent_instance_id, report.starts_with("Error:"))
+                                (
+                                    agent_instance_id,
+                                    super::is_host_failure_sentinel(report.as_str()),
+                                )
                             })
                     })
                     .collect::<Vec<_>>();

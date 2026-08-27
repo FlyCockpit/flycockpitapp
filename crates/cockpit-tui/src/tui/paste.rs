@@ -22,6 +22,25 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+#[cfg(test)]
+thread_local! {
+    /// Counts how often [`PasteRegistry::reconcile_buffer`] actually scanned the
+    /// buffer for grapheme boundaries — i.e. did NOT take the empty-registry
+    /// fast path. Lets tests prove the per-keystroke scan is skipped when no
+    /// paste blocks are registered.
+    static RECONCILE_SCAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_reconcile_scan_calls() {
+    RECONCILE_SCAN_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn reconcile_scan_calls() -> usize {
+    RECONCILE_SCAN_CALLS.with(std::cell::Cell::get)
+}
+
 const USER_PASTE_TAG: &str = "user_paste";
 const DISPLAY_PASTE_RULE: &str = "---";
 const USER_PASTE_OPEN_PREFIX: &str = "<user_paste id=\"";
@@ -258,6 +277,16 @@ impl PasteRegistry {
     /// whose exact placeholder identity or semantic-grapheme boundaries were
     /// disturbed is retired rather than retaining corrupt payload authority.
     pub(super) fn reconcile_buffer(&mut self, buffer: &str) {
+        // No presentation blocks → nothing to reconcile. Skip the O(n) grapheme
+        // segmentation of the whole buffer (and the boundary set it builds) that
+        // would otherwise run on every full-buffer edit in the common no-paste
+        // path, making steady typing quadratic. With no blocks the `retain`,
+        // `reelect_image_references`, and the debug assertion are all no-ops.
+        if self.blocks.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        RECONCILE_SCAN_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut offset = 0usize;
         let mut boundaries = std::collections::BTreeSet::from([0usize]);
         for grapheme in crate::tui::markdown::semantic_graphemes(buffer) {
@@ -2261,6 +2290,32 @@ gamma",
                 "Hangul/virama seam invalidates block authority"
             );
         }
+    }
+
+    #[test]
+    fn reconcile_buffer_skips_scan_when_no_blocks() {
+        // The common no-paste path: reconcile must not scan the buffer for
+        // grapheme boundaries when no blocks are registered (otherwise every
+        // keystroke pays an O(n) segmentation, turning steady typing quadratic).
+        let mut registry = PasteRegistry::new();
+        reset_reconcile_scan_calls();
+        registry.reconcile_buffer("a long buffer with graphemes γ🙂 and lots more text");
+        assert_eq!(
+            reconcile_scan_calls(),
+            0,
+            "empty registry must skip the grapheme scan"
+        );
+        assert!(registry.is_empty());
+
+        // With a block registered, the scan runs.
+        let placeholder = registry.register_text(0, "payload".into(), 1);
+        reset_reconcile_scan_calls();
+        registry.reconcile_buffer(&placeholder);
+        assert_eq!(
+            reconcile_scan_calls(),
+            1,
+            "a registered block must be reconciled (scanned)"
+        );
     }
 
     #[test]

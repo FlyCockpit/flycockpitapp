@@ -324,6 +324,118 @@ pub(super) fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Maximum bytes a single background-output line may buffer while being read.
+/// One byte past the display cap so a genuinely over-long line still reaches
+/// the ring longer than [`BACKGROUND_LINE_BYTE_CAP`] and picks up the ring's
+/// truncation note, while a hostile or buggy child that emits a huge
+/// newline-free stream can never buffer without bound in the reader — the
+/// excess is consumed and discarded up to the next newline.
+const BACKGROUND_LINE_READ_CAP: usize = BACKGROUND_LINE_BYTE_CAP.saturating_add(1);
+
+/// Strip a trailing `\r` (CRLF) then drain `pending` into an owned `String`
+/// (lossy on invalid UTF-8, matching a hard byte cap that may split a char).
+///
+/// `strip_cr` peels a trailing `\r` ONLY for a complete, newline-terminated
+/// line (a real CRLF terminator). It must be false for a cap-truncated head or
+/// an unterminated final line, where a trailing `\r` is mid-line data: stripping
+/// it there would both lose a byte and, at the `BACKGROUND_LINE_READ_CAP`
+/// boundary, shrink the head to exactly `BACKGROUND_LINE_BYTE_CAP` so the ring
+/// silently drops the truncation note. (Not stripping at EOF also matches
+/// `tokio::io::Lines`, which strips `\r` only as part of `\r\n`.)
+fn take_capped_line(pending: &mut Vec<u8>, strip_cr: bool) -> String {
+    if strip_cr && pending.last() == Some(&b'\r') {
+        pending.pop();
+    }
+    let bytes = std::mem::take(pending);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// A `\n`-delimited line reader that never buffers more than `cap` bytes of a
+/// single line: an over-cap physical line yields its first `cap` bytes and the
+/// remainder is consumed and discarded up to the next newline. Drop-in shape
+/// for `tokio::io::Lines` (`next_line() -> io::Result<Option<String>>`) and
+/// cancel-safe: all partial state lives in `self` (the only await is
+/// `fill_buf`, which consumes nothing), so a `select!` losing the race and
+/// dropping the future keeps every already-read byte.
+struct CappedLineReader<R> {
+    reader: BufReader<R>,
+    pending: Vec<u8>,
+    cap: usize,
+    /// True while discarding the tail of an over-cap physical line (whose capped
+    /// head was already emitted) up to and including the next newline.
+    discarding: bool,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> CappedLineReader<R> {
+    fn new(reader: R, cap: usize) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            pending: Vec::new(),
+            cap: cap.max(1),
+            discarding: false,
+        }
+    }
+
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        loop {
+            let chunk = self.reader.fill_buf().await?;
+            if chunk.is_empty() {
+                // EOF. A pending discard has already emitted its capped head, so
+                // only its (dropped) tail remains — nothing more to yield.
+                if self.discarding {
+                    self.discarding = false;
+                    self.pending.clear();
+                    return Ok(None);
+                }
+                if self.pending.is_empty() {
+                    return Ok(None);
+                }
+                // Unterminated final line: a trailing `\r` is data, not a CRLF.
+                return Ok(Some(take_capped_line(&mut self.pending, false)));
+            }
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(nl) => {
+                    if self.discarding {
+                        // The newline closes the discarded tail; resume normally.
+                        self.reader.consume(nl + 1);
+                        self.discarding = false;
+                        continue;
+                    }
+                    let room = self.cap - self.pending.len();
+                    let take = nl.min(room);
+                    // The whole line fit within the cap iff we took all of it;
+                    // only then is a trailing `\r` a genuine CRLF terminator.
+                    let complete = take == nl;
+                    self.pending.extend_from_slice(&chunk[..take]);
+                    // Consume through the newline, dropping any bytes in
+                    // `chunk[take..nl]` that overflowed the cap.
+                    self.reader.consume(nl + 1);
+                    return Ok(Some(take_capped_line(&mut self.pending, complete)));
+                }
+                None => {
+                    let len = chunk.len();
+                    if self.discarding {
+                        self.reader.consume(len);
+                        continue;
+                    }
+                    let room = self.cap - self.pending.len();
+                    let take = len.min(room);
+                    self.pending.extend_from_slice(&chunk[..take]);
+                    // No newline in this chunk: the whole chunk belongs to the
+                    // current line, so consume all of it (bytes past `take` are
+                    // the start of the discarded over-cap tail).
+                    self.reader.consume(len);
+                    if self.pending.len() >= self.cap {
+                        self.discarding = true;
+                        // Cap-truncated head, no newline: never strip a `\r`.
+                        return Ok(Some(take_capped_line(&mut self.pending, false)));
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_background(
     job_id: String,
@@ -373,12 +485,13 @@ async fn run_background(
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let mut out_lines = stdout
-        .map(|s| BufReader::new(s).lines())
-        .expect("stdout piped");
-    let mut err_lines = stderr
-        .map(|s| BufReader::new(s).lines())
-        .expect("stderr piped");
+    // Capped readers so a child emitting a huge newline-free stream cannot
+    // buffer without bound (the ring's per-line cap only applies AFTER a full
+    // line is read, which is too late for memory safety).
+    let mut out_lines =
+        CappedLineReader::new(stdout.expect("stdout piped"), BACKGROUND_LINE_READ_CAP);
+    let mut err_lines =
+        CappedLineReader::new(stderr.expect("stderr piped"), BACKGROUND_LINE_READ_CAP);
 
     let push = |ring: &Arc<Mutex<BoundedOutputRing>>, line: String| {
         ring.lock().unwrap().push(line);
@@ -688,6 +801,119 @@ mod tests {
         let snapshot = ring.snapshot_all();
         assert_eq!(snapshot[0].len(), BACKGROUND_LINE_BYTE_CAP);
         assert!(snapshot[1].contains("line truncated"));
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_splits_lines_and_strips_crlf() {
+        let data = b"alpha\r\nbeta\ngamma";
+        let mut r = CappedLineReader::new(&data[..], 100);
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("alpha"));
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("beta"));
+        // A trailing line with no newline is flushed at EOF.
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("gamma"));
+        assert_eq!(r.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_bounds_overlong_newline_free_line() {
+        // A line far larger than the read cap AND larger than BufReader's
+        // internal buffer (forcing the multi-chunk discard path) is capped to
+        // the read cap; the following line is still read intact.
+        let cap = 8usize;
+        let mut data = vec![b'x'; 64 * 1024];
+        data.push(b'\n');
+        data.extend_from_slice(b"next\n");
+        let mut r = CappedLineReader::new(&data[..], cap);
+        let first = r.next_line().await.unwrap().unwrap();
+        assert_eq!(first.len(), cap, "overlong line capped at the read cap");
+        assert!(first.bytes().all(|b| b == b'x'));
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("next"));
+        assert_eq!(r.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn overlong_line_still_gets_ring_truncation_note() {
+        // End-to-end: a line past the READ cap, once pushed to the ring, still
+        // exceeds the display cap and picks up the truncation note — bounding
+        // reader memory does not lose the existing "[truncated]" behavior.
+        let mut data = vec![b'x'; BACKGROUND_LINE_BYTE_CAP + 5_000];
+        data.push(b'\n');
+        let mut r = CappedLineReader::new(&data[..], BACKGROUND_LINE_READ_CAP);
+        let line = r.next_line().await.unwrap().unwrap();
+        assert_eq!(
+            line.len(),
+            BACKGROUND_LINE_READ_CAP,
+            "reader caps at READ cap"
+        );
+        assert!(line.len() > BACKGROUND_LINE_BYTE_CAP);
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push(line);
+        let snapshot = ring.snapshot_all();
+        assert_eq!(snapshot[0].len(), BACKGROUND_LINE_BYTE_CAP);
+        assert!(snapshot[1].contains("line truncated"));
+    }
+
+    #[tokio::test]
+    async fn overlong_line_with_cr_at_cap_keeps_truncation_note() {
+        // Regression: the byte landing at the read-cap boundary is a `\r`. It is
+        // mid-line data (not a CRLF terminator), so it must NOT be stripped —
+        // otherwise the head shrinks to exactly the display cap and the ring
+        // silently drops the "[…line truncated…]" note.
+        let mut data = vec![b'a'; BACKGROUND_LINE_BYTE_CAP];
+        data.push(b'\r'); // index BACKGROUND_LINE_BYTE_CAP → the READ_CAP-th byte
+        data.extend(std::iter::repeat_n(b'z', 5_000));
+        data.push(b'\n');
+        let mut r = CappedLineReader::new(&data[..], BACKGROUND_LINE_READ_CAP);
+        let line = r.next_line().await.unwrap().unwrap();
+        assert_eq!(
+            line.len(),
+            BACKGROUND_LINE_READ_CAP,
+            "the \\r at the cap boundary must be kept, not stripped"
+        );
+        assert!(line.ends_with('\r'));
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push(line);
+        let snapshot = ring.snapshot_all();
+        assert_eq!(snapshot[0].len(), BACKGROUND_LINE_BYTE_CAP);
+        assert!(
+            snapshot[1].contains("line truncated"),
+            "truncation note must survive a \\r at the cap boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_while_discarding_yields_capped_head_then_none() {
+        // Over-cap, newline-free line at end of stream: the capped head is
+        // emitted, the tail discarded, and EOF then yields None (exercises the
+        // EOF-while-discarding branch).
+        let cap = 8usize;
+        let data = vec![b'x'; 64 * 1024]; // no trailing newline
+        let mut r = CappedLineReader::new(&data[..], cap);
+        let first = r.next_line().await.unwrap().unwrap();
+        assert_eq!(first.len(), cap);
+        assert!(first.bytes().all(|b| b == b'x'));
+        assert_eq!(r.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn empty_lines_yield_empty_strings() {
+        let data = b"\n\nx\n";
+        let mut r = CappedLineReader::new(&data[..], 8);
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some(""));
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some(""));
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("x"));
+        assert_eq!(r.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn exactly_cap_line_is_not_split() {
+        // A line of exactly `cap` bytes followed by '\n' yields one cap-length
+        // line, not a cap-length line plus a phantom empty line.
+        let data = b"xxxxxxxx\nnext\n"; // 8 x's, cap = 8
+        let mut r = CappedLineReader::new(&data[..], 8);
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("xxxxxxxx"));
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("next"));
+        assert_eq!(r.next_line().await.unwrap(), None);
     }
 
     #[test]

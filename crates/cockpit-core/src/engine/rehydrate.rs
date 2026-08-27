@@ -2368,7 +2368,39 @@ fn rebuild_history(
                     }
                 }
             }
-            // Everything else (inference_request, context_pruned,
+            // A root-agent `inference_request` marks an inference boundary.
+            // The primary per-inference event is recorded once by live dispatch
+            // (`turn_phases.rs`, "Part B") BEFORE that inference's assistant
+            // text and tool_call events, so flushing the pending turn here
+            // splits *sequential* inferences into distinct assistant messages —
+            // the live wire shape — even when an inference issued tool calls but
+            // produced no assistant text (so no `assistant_message` event fired
+            // to trigger the split). Parallel calls within ONE inference share a
+            // single `inference_request`, so they stay in one turn.
+            //
+            // Two utility inferences (`context_reduction.rs` compact-brief /
+            // compact-sample) ALSO record root-tagged `inference_request`
+            // events. They are safe here because they only run at a turn
+            // boundary: auto-compact runs synchronously while the agent is idle
+            // (and its `session_compacted` event clears history anyway), and a
+            // backgrounded shadow brief is preempted + joined
+            // (`preempt_shadow_brief_for_foreground`) before any foreground
+            // dispatch records a tool_call. So no root `inference_request` ever
+            // lands between an inference's `assistant_message` and its
+            // `tool_call`s; the flush they trigger is a no-op on empty `pending`
+            // or a correct complete-turn flush. INVARIANT for future work: a new
+            // foreground root-inference path that dispatches while a shadow
+            // brief is in flight WITHOUT that preempt would break this split.
+            //
+            // The flush is a no-op when `pending` is empty (e.g. the first
+            // inference of a turn, right after the user message), so pairing
+            // with the `assistant_message` flush above never double-splits an
+            // inference. Sessions predating this event fall back to the
+            // `assistant_message` split (text-ful inferences only).
+            "inference_request" if ev.agent.as_deref() == Some(root_agent) => {
+                std::mem::take(&mut pending).flush(&mut history);
+            }
+            // Everything else (non-root-agent inference_request, context_pruned,
             // permission_decision, subagent_report,
             // other agents' turns) is not part of the root model history.
             _ => {}
@@ -2966,6 +2998,29 @@ mod tests {
             Some("Build"),
             Some(call_id),
             &json!({ "text": text, "reasoning": reasoning }),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Record the `inference_request` timeline event the engine emits once per
+    /// inference (Part B), tagged with the root agent and marking an inference
+    /// boundary. Live dispatch emits this BEFORE that inference's assistant
+    /// text / tool_call events, so callers record it immediately before the
+    /// `record_assistant` / `record_tool` calls for that inference.
+    async fn record_inference_request(s: &Session, call_id: &str) {
+        record_inference_request_for_agent(s, "Build", call_id).await;
+    }
+
+    /// Same as [`record_inference_request`] but for an arbitrary agent, so a
+    /// subagent's inference boundary can be interleaved to prove the root-agent
+    /// guard on the flush arm.
+    async fn record_inference_request_for_agent(s: &Session, agent: &str, call_id: &str) {
+        s.record_event(
+            crate::db::session_log::SessionEventKind::InferenceRequest,
+            Some(agent),
+            Some(call_id),
+            &json!({ "ordinal": 0 }),
         )
         .await
         .unwrap();
@@ -3854,6 +3909,254 @@ mod tests {
         assert_eq!(tool_result_body(&h[2]), "A");
         assert_eq!(tool_result_body(&h[3]), "B");
         assert_eq!(assistant_text(&h[4]), "done");
+        validate_pairing(&h).expect("provider-valid");
+    }
+
+    #[tokio::test]
+    async fn rebuilds_sequential_textless_inferences_as_distinct_turns() {
+        // Two back-to-back inferences that each issued a tool call but produced
+        // NO assistant text. Without an `inference_request` boundary the two
+        // calls would merge into one assistant turn (breaking byte-identical
+        // reconstruction and the provider cache prefix); the boundary event
+        // splits them, matching the live wire shape.
+        let s = root_session();
+        record_user(&s, "do two things").await;
+
+        // Inference 1: text-less, one tool call.
+        record_inference_request(&s, "infer-1").await;
+        record_tool(
+            &s,
+            "tc-1",
+            "read",
+            json!({ "path": "a.rs" }),
+            json!({ "path": "a.rs" }),
+            "A",
+        )
+        .await;
+
+        // Inference 2: text-less, one tool call, informed by tc-1's result.
+        record_inference_request(&s, "infer-2").await;
+        record_tool(
+            &s,
+            "tc-2",
+            "read",
+            json!({ "path": "b.rs" }),
+            json!({ "path": "b.rs" }),
+            "B",
+        )
+        .await;
+
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
+        let h = r.history;
+        // user / assistant(tc-1) / user(A) / assistant(tc-2) / user(B):
+        // TWO distinct assistant turns, not one merged turn.
+        assert_eq!(h.len(), 5);
+        assert_eq!(user_text(&h[0]), "do two things");
+        let first = assistant_calls(&h[1]);
+        assert_eq!(
+            first.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["tc-1"]
+        );
+        assert_eq!(tool_result_body(&h[2]), "A");
+        let second = assistant_calls(&h[3]);
+        assert_eq!(
+            second.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["tc-2"]
+        );
+        assert_eq!(tool_result_body(&h[4]), "B");
+        validate_pairing(&h).expect("provider-valid");
+    }
+
+    #[tokio::test]
+    async fn inference_request_boundary_keeps_parallel_calls_in_one_turn() {
+        // A single inference issuing two parallel calls shares ONE
+        // `inference_request`; the boundary event must not split it.
+        let s = root_session();
+        record_user(&s, "read both files").await;
+        record_inference_request(&s, "infer-1").await;
+        record_assistant(&s, "infer-1", "reading both").await;
+        record_tool(
+            &s,
+            "tc-1",
+            "read",
+            json!({ "path": "a.rs" }),
+            json!({ "path": "a.rs" }),
+            "A",
+        )
+        .await;
+        record_tool(
+            &s,
+            "tc-2",
+            "read",
+            json!({ "path": "b.rs" }),
+            json!({ "path": "b.rs" }),
+            "B",
+        )
+        .await;
+        record_inference_request(&s, "infer-2").await;
+        record_assistant(&s, "infer-2", "done").await;
+
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
+        let h = r.history;
+        assert_eq!(h.len(), 5);
+        let calls = assistant_calls(&h[1]);
+        assert_eq!(
+            calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["tc-1", "tc-2"]
+        );
+        assert_eq!(assistant_text(&h[1]), "reading both");
+        assert_eq!(tool_result_body(&h[2]), "A");
+        assert_eq!(tool_result_body(&h[3]), "B");
+        assert_eq!(assistant_text(&h[4]), "done");
+        validate_pairing(&h).expect("provider-valid");
+    }
+
+    #[tokio::test]
+    async fn non_root_inference_request_does_not_split_root_turn() {
+        // A non-root-agent `inference_request` (e.g. a subagent's inference
+        // boundary) interleaves in the log but must NOT split the root agent's
+        // turn — the flush arm is guarded on `== Some(root_agent)`.
+        let s = root_session();
+        record_user(&s, "read both files").await;
+        record_inference_request(&s, "infer-1").await;
+        record_tool(
+            &s,
+            "tc-1",
+            "read",
+            json!({ "path": "a.rs" }),
+            json!({ "path": "a.rs" }),
+            "A",
+        )
+        .await;
+        // A CHILD-agent inference boundary lands between the root's two calls.
+        record_inference_request_for_agent(&s, "child", "child-infer").await;
+        record_tool(
+            &s,
+            "tc-2",
+            "read",
+            json!({ "path": "b.rs" }),
+            json!({ "path": "b.rs" }),
+            "B",
+        )
+        .await;
+
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
+        let h = r.history;
+        // Still ONE root turn holding both calls: user / assistant(tc-1,tc-2)
+        // / user(A) / user(B).
+        assert_eq!(h.len(), 4);
+        let calls = assistant_calls(&h[1]);
+        assert_eq!(
+            calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["tc-1", "tc-2"]
+        );
+        assert_eq!(tool_result_body(&h[2]), "A");
+        assert_eq!(tool_result_body(&h[3]), "B");
+        validate_pairing(&h).expect("provider-valid");
+    }
+
+    #[tokio::test]
+    async fn rebuilds_textless_then_textful_inferences_as_distinct_turns() {
+        // Asymmetric sequence: a text-less inference followed by a text-ful
+        // one. The boundary splits them; the second turn keeps its text.
+        let s = root_session();
+        record_user(&s, "go").await;
+        // Inference 1: text-less, one call.
+        record_inference_request(&s, "infer-1").await;
+        record_tool(
+            &s,
+            "tc-1",
+            "read",
+            json!({ "path": "a.rs" }),
+            json!({ "path": "a.rs" }),
+            "A",
+        )
+        .await;
+        // Inference 2: text-ful, one call.
+        record_inference_request(&s, "infer-2").await;
+        record_assistant(&s, "infer-2", "now editing").await;
+        record_tool(
+            &s,
+            "tc-2",
+            "edit",
+            json!({ "path": "a.rs" }),
+            json!({ "path": "a.rs" }),
+            "ok",
+        )
+        .await;
+
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
+        let h = r.history;
+        // user / assistant(tc-1) / user(A) / assistant("now editing"+tc-2) /
+        // user(ok).
+        assert_eq!(h.len(), 5);
+        assert_eq!(assistant_text(&h[1]), "");
+        assert_eq!(
+            assistant_calls(&h[1])
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tc-1"]
+        );
+        assert_eq!(tool_result_body(&h[2]), "A");
+        assert_eq!(assistant_text(&h[3]), "now editing");
+        assert_eq!(
+            assistant_calls(&h[3])
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tc-2"]
+        );
+        assert_eq!(tool_result_body(&h[4]), "ok");
+        validate_pairing(&h).expect("provider-valid");
+    }
+
+    #[tokio::test]
+    async fn trailing_inference_request_emits_no_spurious_turn() {
+        // A trailing inference boundary that never produced text or calls (the
+        // session ended, or the next inference failed before recording any
+        // content) must not emit a spurious empty assistant turn.
+        let s = root_session();
+        record_user(&s, "go").await;
+        record_inference_request(&s, "infer-1").await;
+        record_tool(
+            &s,
+            "tc-1",
+            "read",
+            json!({ "path": "a.rs" }),
+            json!({ "path": "a.rs" }),
+            "A",
+        )
+        .await;
+        record_inference_request(&s, "infer-2").await;
+
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
+        let h = r.history;
+        // user / assistant(tc-1) / user(A) — the trailing boundary adds nothing.
+        assert_eq!(h.len(), 3);
+        assert_eq!(
+            assistant_calls(&h[1])
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tc-1"]
+        );
+        assert_eq!(tool_result_body(&h[2]), "A");
         validate_pairing(&h).expect("provider-valid");
     }
 

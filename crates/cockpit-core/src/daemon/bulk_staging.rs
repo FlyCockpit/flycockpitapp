@@ -242,13 +242,13 @@ pub fn spawn_reaper(shutdown: crate::daemon::shutdown::ShutdownSignal) {
 
 /// Reclaim expired transfers. Exposed so the TTL is provable without sleeping.
 pub fn expire(now_ms: u64) -> usize {
-    let mut guard = store().lock().expect("bulk staging poisoned");
+    let mut guard = crate::sync::lock_or_recover(store());
     guard.expire(now_ms)
 }
 
 /// Bytes currently reserved across every staged transfer.
 pub fn staged_bytes() -> u64 {
-    store().lock().expect("bulk staging poisoned").staged_bytes
+    crate::sync::lock_or_recover(store()).staged_bytes
 }
 
 /// Transfers currently staged. Bounded by [`MAX_STAGED_TRANSFERS`].
@@ -324,7 +324,7 @@ fn stage_with_owner(
     }
     let sha256 = digest_of(bytes);
     let now = now_ms();
-    let mut guard = store().lock().expect("bulk staging poisoned");
+    let mut guard = crate::sync::lock_or_recover(store());
     guard.expire(now);
     let key = StagedTransferKey::new(transfer_id_bytes, owner);
     // A staged id is immutable identity *within this owner namespace*: refuse
@@ -412,7 +412,7 @@ fn write_chunk_with_owner(
     }
     let key = StagedTransferKey::new(*reference.transfer_id.as_bytes(), owner);
     let now = now_ms();
-    let mut guard = store().lock().expect("bulk staging poisoned");
+    let mut guard = crate::sync::lock_or_recover(store());
     guard.expire(now);
 
     if !guard.transfers.contains_key(&key) {
@@ -526,7 +526,7 @@ pub fn read_chunk(
     chunk_index: u32,
 ) -> Result<(Vec<u8>, bool), BulkStagingError> {
     let now = now_ms();
-    let mut guard = store().lock().expect("bulk staging poisoned");
+    let mut guard = crate::sync::lock_or_recover(store());
     guard.expire(now);
     let key = StagedTransferKey::new(transfer_id_bytes, None);
     let entry = guard
@@ -577,7 +577,7 @@ pub fn read_chunk_of_kind(
     expected: RemoteBulkMimeClass,
 ) -> Result<(Vec<u8>, bool), BulkStagingError> {
     let now = now_ms();
-    let mut guard = store().lock().expect("bulk staging poisoned");
+    let mut guard = crate::sync::lock_or_recover(store());
     guard.expire(now);
     let key = StagedTransferKey::new(transfer_id_bytes, None);
     let entry = guard
@@ -639,7 +639,7 @@ fn take_all_with_owner(
     owner: Option<&BulkTransferOwner>,
 ) -> Result<Vec<Vec<u8>>, BulkStagingError> {
     let now = now_ms();
-    let mut guard = store().lock().expect("bulk staging poisoned");
+    let mut guard = crate::sync::lock_or_recover(store());
     guard.expire(now);
     let mut keys = Vec::with_capacity(references.len());
     for reference in references {
@@ -700,13 +700,13 @@ pub fn take_owned(
 
 /// Drop a staged transfer without reading it (cancellation / cleanup).
 pub fn discard(transfer_id_bytes: [u8; 16]) {
-    let mut guard = store().lock().expect("bulk staging poisoned");
+    let mut guard = crate::sync::lock_or_recover(store());
     guard.remove(&StagedTransferKey::new(transfer_id_bytes, None));
 }
 
 /// Drop one owned opaque transfer without exposing an unscoped deletion path.
 pub fn discard_owned(transfer_id_bytes: [u8; 16], owner: &BulkTransferOwner) {
-    let mut guard = store().lock().expect("bulk staging poisoned");
+    let mut guard = crate::sync::lock_or_recover(store());
     guard.remove(&StagedTransferKey::new(transfer_id_bytes, Some(owner)));
 }
 

@@ -13,6 +13,12 @@ use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
 
 use super::{App, ToastKind, render};
 
+/// How long to wait before an autonomous retry of a failed pin-state refresh.
+/// The pin count is non-critical below-input chrome, so a coarse fixed backoff
+/// is enough to self-heal a transient daemon failure without re-kicking the RPC
+/// every event-loop tick on a persistent one.
+const PIN_STATE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn pin_rpc(
     endpoint: &cockpit_client::ClientEndpoint,
     request: cockpit_proto::Request,
@@ -83,6 +89,17 @@ impl App {
         if sid == self.pin_count_session && sid == self.pinned_seqs_session {
             return;
         }
+        // A prior refresh for THIS session failed and un-stamped it (see
+        // `note_pin_state_refresh_failed`); throttle the autonomous retry so a
+        // persistent daemon failure re-kicks at the backoff interval rather than
+        // every event-loop tick. A different or newly-attached session is never
+        // gated by a stale failure, so it refreshes immediately.
+        if let (Some(sid), Some((gated_sid, retry_after))) = (sid, self.pin_state_retry_after)
+            && sid == gated_sid
+            && self.event_loop_monotonic_now < retry_after
+        {
+            return;
+        }
         self.refresh_pin_count();
     }
 
@@ -107,6 +124,7 @@ impl App {
                 self.pin_count_session = Some(sid);
                 self.pinned_seqs_session = Some(sid);
                 self.pinned_seqs_cache.clear();
+                self.clear_pin_state_retry_gate(sid);
             }
         }
     }
@@ -126,13 +144,18 @@ impl App {
         self.async_actions.start_blocking(
             AsyncActionKind::Refresh("pins.state"),
             AsyncActionPolicy::Replace(AsyncActionKey::new(format!("pins.state:{sid}"))),
-            move || {
-                let (count, pinned_seqs) = load_pin_state(&endpoint, sid)?;
-                Ok(AsyncActionPayload::PinState {
+            move || match load_pin_state(&endpoint, sid) {
+                Ok((count, pinned_seqs)) => Ok(AsyncActionPayload::PinState {
                     session_id: sid,
                     count,
                     pinned_seqs,
-                })
+                }),
+                // Surface the failure WITH its session so the handler retries
+                // the right session even after the user navigates away.
+                Err(error) => Ok(AsyncActionPayload::PinStateRefreshFailed {
+                    session_id: sid,
+                    error,
+                }),
             },
         );
     }
@@ -145,6 +168,40 @@ impl App {
         self.pinned_seqs_session = Some(sid);
         self.pin_count = count;
         self.pinned_seqs_cache = pinned_seqs.into_iter().collect();
+        // A refresh landed: retire any pending failure-retry gate for it.
+        self.clear_pin_state_retry_gate(sid);
+    }
+
+    /// A pin-state refresh RPC failed for `sid`. Un-stamp that session so
+    /// `sync_pin_count` retries: `start_pin_state_refresh` stamps the session
+    /// eagerly (before the async result) to avoid re-kicking the RPC every tick,
+    /// so without this a single transient failure would wedge the pin count at 0
+    /// forever. Arm a backoff gate so the retry re-kicks at
+    /// [`PIN_STATE_RETRY_BACKOFF`], not on every event-loop tick.
+    pub(super) fn note_pin_state_refresh_failed(&mut self, sid: uuid::Uuid) {
+        // Act only while the eager stamp is still this session's. If the user
+        // navigated away (a newer refresh re-stamped) or a later attempt already
+        // succeeded, this failure is stale and must not perturb the now-current
+        // session's cache or gate.
+        if self.pin_count_session != Some(sid) && self.pinned_seqs_session != Some(sid) {
+            return;
+        }
+        if self.pin_count_session == Some(sid) {
+            self.pin_count_session = None;
+        }
+        if self.pinned_seqs_session == Some(sid) {
+            self.pinned_seqs_session = None;
+        }
+        self.pin_state_retry_after =
+            Some((sid, self.event_loop_monotonic_now + PIN_STATE_RETRY_BACKOFF));
+    }
+
+    /// Drop the failure-retry gate when it belongs to `sid` (a refresh for it
+    /// succeeded or its socketless path completed).
+    fn clear_pin_state_retry_gate(&mut self, sid: uuid::Uuid) {
+        if matches!(self.pin_state_retry_after, Some((gated, _)) if gated == sid) {
+            self.pin_state_retry_after = None;
+        }
     }
 
     /// Whether a history entry is a pinnable message with a resolved
@@ -1253,6 +1310,185 @@ mod tests {
         assert_eq!(app.pin_count, 0);
         assert!(app.pinned_seqs_cache.is_empty());
         assert!(!app.is_seq_pinned_for_render(42));
+    }
+
+    /// A failed pin-state refresh must un-stamp the session so `sync_pin_count`
+    /// retries (otherwise the eager stamp wedges the count forever), but the
+    /// retry is throttled: no re-kick within the backoff window, exactly one
+    /// once it elapses.
+    #[test]
+    fn failed_pin_state_refresh_retries_after_backoff_not_every_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(tmp.path());
+        let sid = uuid::Uuid::new_v4();
+        app.launch.session_id = Some(sid);
+        // Simulate the eager stamp `start_pin_state_refresh` sets before the RPC.
+        app.pin_count_session = Some(sid);
+        app.pinned_seqs_session = Some(sid);
+        app.event_loop_monotonic_now = std::time::Duration::from_secs(10);
+
+        // The refresh RPC fails: un-stamp + arm the backoff gate.
+        app.note_pin_state_refresh_failed(sid);
+        assert_eq!(app.pin_count_session, None);
+        assert_eq!(app.pinned_seqs_session, None);
+        assert!(app.pin_state_retry_after.is_some());
+
+        // Within the backoff window, sync does NOT re-kick the RPC (no storm).
+        reset_pin_refresh_call_count();
+        app.sync_pin_count();
+        assert_eq!(
+            pin_refresh_call_count(),
+            0,
+            "must not retry within the backoff window"
+        );
+
+        // Once the backoff elapses, sync retries exactly once.
+        app.event_loop_monotonic_now =
+            std::time::Duration::from_secs(10) + super::PIN_STATE_RETRY_BACKOFF;
+        app.sync_pin_count();
+        assert_eq!(
+            pin_refresh_call_count(),
+            1,
+            "must retry once the backoff elapsed"
+        );
+    }
+
+    /// A landed refresh retires the gate; a different (newly-attached) session
+    /// is never blocked by another session's stale failure.
+    #[test]
+    fn pin_state_success_clears_gate_and_other_session_not_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(tmp.path());
+        let sid1 = uuid::Uuid::new_v4();
+        let sid2 = uuid::Uuid::new_v4();
+        app.launch.session_id = Some(sid1);
+        app.pin_count_session = Some(sid1);
+        app.pinned_seqs_session = Some(sid1);
+        app.event_loop_monotonic_now = std::time::Duration::from_secs(5);
+        app.note_pin_state_refresh_failed(sid1);
+        assert!(app.pin_state_retry_after.is_some());
+
+        // A DIFFERENT current session refreshes immediately — sid1's stale gate
+        // does not apply to it.
+        app.launch.session_id = Some(sid2);
+        reset_pin_refresh_call_count();
+        app.sync_pin_count();
+        assert_eq!(
+            pin_refresh_call_count(),
+            1,
+            "a new session must refresh immediately"
+        );
+
+        // A landed refresh for the gated session retires its gate.
+        app.launch.session_id = Some(sid1);
+        app.apply_pin_state(sid1, 3, vec![7]);
+        assert!(
+            app.pin_state_retry_after.is_none(),
+            "success must retire the gate"
+        );
+        assert_eq!(app.pin_count, 3);
+        assert!(app.is_seq_pinned_for_render(7));
+    }
+
+    /// A pin-state failure that lands after the user has navigated to another
+    /// session must NOT un-stamp or gate the now-current session (the failure
+    /// carries its originating session id, guarded against the live stamp).
+    #[test]
+    fn stale_pin_state_failure_does_not_perturb_current_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(tmp.path());
+        let sid1 = uuid::Uuid::new_v4();
+        let sid2 = uuid::Uuid::new_v4();
+        // The user navigated to sid2, whose refresh already landed and stamped it.
+        app.launch.session_id = Some(sid2);
+        app.pin_count_session = Some(sid2);
+        app.pinned_seqs_session = Some(sid2);
+        app.pin_count = 4;
+        app.pinned_seqs_cache.insert(9);
+        app.event_loop_monotonic_now = std::time::Duration::from_secs(7);
+
+        // A late failure for the PREVIOUS session sid1 arrives: ignore it.
+        app.note_pin_state_refresh_failed(sid1);
+        assert_eq!(
+            app.pin_count_session,
+            Some(sid2),
+            "current session stamp must be untouched"
+        );
+        assert_eq!(app.pinned_seqs_session, Some(sid2));
+        assert!(
+            app.pin_state_retry_after.is_none(),
+            "no gate armed for a stale session"
+        );
+        assert_eq!(app.pin_count, 4);
+
+        // sync stays a no-op — the current session is still fully stamped.
+        reset_pin_refresh_call_count();
+        app.sync_pin_count();
+        assert_eq!(pin_refresh_call_count(), 0);
+    }
+
+    /// A persistently-failing session retries once per backoff cycle — the gate
+    /// re-arms after each retry rather than either wedging or re-kicking every
+    /// tick.
+    #[test]
+    fn persistent_pin_state_failure_retries_each_backoff_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(tmp.path());
+        let sid = uuid::Uuid::new_v4();
+        app.launch.session_id = Some(sid);
+        reset_pin_refresh_call_count();
+
+        let mut now = std::time::Duration::from_secs(0);
+        for cycle in 0..3 {
+            // The (re-)kicked refresh eagerly stamps, then fails.
+            app.pin_count_session = Some(sid);
+            app.pinned_seqs_session = Some(sid);
+            app.event_loop_monotonic_now = now;
+            app.note_pin_state_refresh_failed(sid);
+
+            // Still within the backoff window: no retry.
+            app.event_loop_monotonic_now =
+                now + super::PIN_STATE_RETRY_BACKOFF - std::time::Duration::from_millis(1);
+            app.sync_pin_count();
+            assert_eq!(
+                pin_refresh_call_count(),
+                cycle,
+                "no retry within backoff cycle {cycle}"
+            );
+
+            // Backoff elapsed: exactly one retry (socketless branch re-stamps
+            // and clears the gate, standing in for the next kicked attempt).
+            now += super::PIN_STATE_RETRY_BACKOFF;
+            app.event_loop_monotonic_now = now;
+            app.sync_pin_count();
+            assert_eq!(
+                pin_refresh_call_count(),
+                cycle + 1,
+                "one retry after backoff cycle {cycle}"
+            );
+        }
+    }
+
+    /// A session switch/resume drops any pending failure-retry gate so the new
+    /// (or returned-to) session refreshes immediately instead of showing a stale
+    /// count until the backoff self-expires.
+    #[test]
+    fn session_reset_clears_pin_state_retry_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(tmp.path());
+        let sid = uuid::Uuid::new_v4();
+        app.launch.session_id = Some(sid);
+        app.pin_count_session = Some(sid);
+        app.pinned_seqs_session = Some(sid);
+        app.event_loop_monotonic_now = std::time::Duration::from_secs(1);
+        app.note_pin_state_refresh_failed(sid);
+        assert!(app.pin_state_retry_after.is_some());
+
+        app.reset_session_live_state();
+        assert!(
+            app.pin_state_retry_after.is_none(),
+            "session reset must clear the failure-retry gate"
+        );
     }
 
     #[test]

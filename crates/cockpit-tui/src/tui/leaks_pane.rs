@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -186,6 +186,10 @@ pub struct LeaksPane {
     daemon_socket: Option<PathBuf>,
     reports: Vec<LeakReportMetadata>,
     selected: usize,
+    /// Vertical scroll offset (in list lines) of the report list, kept so the
+    /// selected report stays on-screen when the list is taller than the pane.
+    /// Persisted across frames for minimal (scrolloff-free) scrolling.
+    list_scroll: usize,
     next_cursor: Option<String>,
     has_more: bool,
     rotation_filter: Option<LeakRotationState>,
@@ -347,6 +351,7 @@ impl LeaksPane {
             daemon_socket,
             reports: Vec::new(),
             selected: 0,
+            list_scroll: 0,
             next_cursor: None,
             has_more: false,
             rotation_filter: None,
@@ -385,6 +390,7 @@ impl LeaksPane {
                 } else {
                     self.reports = res.reports;
                     self.selected = 0;
+                    self.list_scroll = 0;
                 }
                 self.next_cursor = res.next_cursor;
                 self.has_more = res.has_more;
@@ -478,6 +484,34 @@ impl LeaksPane {
         if self.selected >= self.reports.len() {
             self.selected = self.reports.len().saturating_sub(1);
         }
+    }
+
+    /// Reconcile [`Self::list_scroll`] so the selected report stays within a
+    /// `viewport_h`-row window over a `list_len`-line list, scrolling as little
+    /// as possible, and return the vertical offset to pass to the list
+    /// `Paragraph`. Stateless callers get correct behaviour too: the stored
+    /// offset is first clamped to the current content, then nudged to reveal
+    /// the selection.
+    fn reconcile_list_scroll(&mut self, list_len: usize, viewport_h: usize) -> u16 {
+        if viewport_h == 0 {
+            self.list_scroll = 0;
+            return 0;
+        }
+        let max_scroll = list_len.saturating_sub(viewport_h);
+        self.list_scroll = self.list_scroll.min(max_scroll);
+        // Keep `selected` on-screen (only meaningful in the Ready list; other
+        // states have a short list and `selected == 0`, so this is a no-op).
+        if self.selected < self.list_scroll {
+            self.list_scroll = self.selected;
+        } else if self.selected >= self.list_scroll + viewport_h {
+            self.list_scroll = self.selected + 1 - viewport_h;
+        }
+        // Load-bearing (not redundant with the clamp above): on the Err/
+        // `Unavailable` path `selected` is left stale while the list shrinks to a
+        // single message line, so the branch above can push `list_scroll` past
+        // `max_scroll` — this pulls it back so the message stays on row 0.
+        self.list_scroll = self.list_scroll.min(max_scroll);
+        self.list_scroll as u16
     }
 
     fn selected_report_id(&self) -> Option<String> {
@@ -591,92 +625,113 @@ impl LeaksPane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let mut lines: Vec<Line> = Vec::new();
-
+        // A live reveal owns the whole pane (three short lines, always fits).
         if let Some(plaintext) = self.reveal.plaintext() {
-            // The plaintext is rendered by borrowing the buffer — never copied
-            // into any cached Text/history/message.
-            lines.push(Line::from(Span::styled(
-                format!("revealed [{}]:", self.reveal.report_id().unwrap_or("")),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            // Borrow the plaintext straight from the zeroizing buffer — no owned
-            // `String`/`Span` copy is created (an owned copy would not be
-            // scrubbed when the `Line` drops, breaking sole-owner containment).
-            lines.push(Line::from(Span::styled(
-                plaintext.as_str(),
+            let lines = vec![
+                // The plaintext is rendered by borrowing the buffer — never
+                // copied into any cached Text/history/message.
+                Line::from(Span::styled(
+                    format!("revealed [{}]:", self.reveal.report_id().unwrap_or("")),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                // Borrow the plaintext straight from the zeroizing buffer — no
+                // owned `String`/`Span` copy is created (an owned copy would not
+                // be scrubbed when the `Line` drops, breaking sole-owner
+                // containment).
+                Line::from(Span::styled(
+                    plaintext.as_str(),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::from(Span::styled(
+                    "press any key to hide (auto-hides in 30s)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+            return;
+        }
+
+        // The scrollable report list (or a single status message for the
+        // non-Ready states).
+        let mut list_lines: Vec<Line> = Vec::new();
+        match &self.state {
+            LeaksPaneState::Loading => list_lines.push(Line::from("loading…")),
+            LeaksPaneState::Empty => list_lines.push(Line::from("no contained leak reports")),
+            LeaksPaneState::FilteredEmpty => {
+                list_lines.push(Line::from("no reports match the active filter"))
+            }
+            LeaksPaneState::Unavailable => {
+                list_lines.push(Line::from("daemon unavailable — reattach and retry"))
+            }
+            LeaksPaneState::Ready => {
+                for (i, report) in self.reports.iter().enumerate() {
+                    let marker = if i == self.selected { "▶ " } else { "  " };
+                    let style = if i == self.selected {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+                    list_lines.push(Line::from(Span::styled(
+                        format!(
+                            "{marker}{} | {} | {} | {} | {}",
+                            report.report_id,
+                            report.source,
+                            report.category,
+                            report.status,
+                            report.rotation
+                        ),
+                        style,
+                    )));
+                }
+                if self.has_more {
+                    list_lines.push(Line::from(Span::styled(
+                        "… more (scroll down)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+        }
+
+        // The footer is pinned to the bottom so the delete confirmation, reveal
+        // errors, status, and key help are never scrolled off with the list.
+        let mut footer_lines: Vec<Line> = Vec::new();
+        if let Some(report_id) = &self.confirm_delete {
+            footer_lines.push(Line::from(Span::styled(
+                format!("delete protected value for {report_id}? (y/N)"),
                 Style::default().fg(Color::Red),
             )));
-            lines.push(Line::from(Span::styled(
-                "press any key to hide (auto-hides in 30s)",
-                Style::default().fg(Color::DarkGray),
+        }
+        if let Some(err) = &self.reveal_error {
+            footer_lines.push(Line::from(Span::styled(
+                err.clone(),
+                Style::default().fg(Color::Red),
             )));
-        } else {
-            match &self.state {
-                LeaksPaneState::Loading => lines.push(Line::from("loading…")),
-                LeaksPaneState::Empty => lines.push(Line::from("no contained leak reports")),
-                LeaksPaneState::FilteredEmpty => {
-                    lines.push(Line::from("no reports match the active filter"))
-                }
-                LeaksPaneState::Unavailable => {
-                    lines.push(Line::from("daemon unavailable — reattach and retry"))
-                }
-                LeaksPaneState::Ready => {
-                    for (i, report) in self.reports.iter().enumerate() {
-                        let marker = if i == self.selected { "▶ " } else { "  " };
-                        let style = if i == self.selected {
-                            Style::default().add_modifier(Modifier::REVERSED)
-                        } else {
-                            Style::default()
-                        };
-                        lines.push(Line::from(Span::styled(
-                            format!(
-                                "{marker}{} | {} | {} | {} | {}",
-                                report.report_id,
-                                report.source,
-                                report.category,
-                                report.status,
-                                report.rotation
-                            ),
-                            style,
-                        )));
-                    }
-                    if self.has_more {
-                        lines.push(Line::from(Span::styled(
-                            "… more (scroll down)",
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                }
-            }
-
-            if let Some(report_id) = &self.confirm_delete {
-                lines.push(Line::from(Span::styled(
-                    format!("delete protected value for {report_id}? (y/N)"),
-                    Style::default().fg(Color::Red),
-                )));
-            }
-            if let Some(err) = &self.reveal_error {
-                lines.push(Line::from(Span::styled(
-                    err.clone(),
-                    Style::default().fg(Color::Red),
-                )));
-            }
-            if let Some(status) = &self.status {
-                lines.push(Line::from(Span::styled(
-                    status.clone(),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            lines.push(Line::from(Span::styled(
-                "enter/r reveal · a accept · d dismiss · m rotated · D delete · esc close",
+        }
+        if let Some(status) = &self.status {
+            footer_lines.push(Line::from(Span::styled(
+                status.clone(),
                 Style::default().fg(Color::DarkGray),
             )));
         }
+        footer_lines.push(Line::from(Span::styled(
+            "enter/r reveal · a accept · d dismiss · m rotated · D delete · esc close",
+            Style::default().fg(Color::DarkGray),
+        )));
 
-        frame.render_widget(Paragraph::new(lines), inner);
+        // Reserve the footer at the bottom, give the rest to the scrolling list,
+        // and scroll so the selected report — and therefore any destructive
+        // action taken on it — is always visible.
+        let footer_h = (footer_lines.len() as u16).min(inner.height);
+        let regions =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(footer_h)]).split(inner);
+        let list_area = regions[0];
+        let footer_area = regions[1];
+
+        let offset = self.reconcile_list_scroll(list_lines.len(), list_area.height as usize);
+        frame.render_widget(Paragraph::new(list_lines).scroll((offset, 0)), list_area);
+        frame.render_widget(Paragraph::new(footer_lines), footer_area);
     }
 }
 
@@ -787,5 +842,192 @@ mod tests {
         );
         // The flag is one-shot.
         assert!(!pane.take_pending_clear());
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    fn sample_report(id: &str) -> LeakReportMetadata {
+        LeakReportMetadata {
+            report_id: id.to_string(),
+            session_id: uuid::Uuid::nil(),
+            source: "src".into(),
+            category: "cat".into(),
+            provider_id: None,
+            model_id: None,
+            generation: None,
+            connector_id: None,
+            status: "contained".into(),
+            rotation: "pending".into(),
+            rotation_plan: None,
+            seen_count: 1,
+            first_reported_ms: 0,
+            last_reported_ms: 0,
+            contained_at_ms: None,
+        }
+    }
+
+    fn ready_pane(n: usize) -> LeaksPane {
+        let mut pane = LeaksPane::open(Some(PathBuf::from("/t.sock")));
+        let reports = (0..n)
+            .map(|i| sample_report(&format!("rpt-{i:02}")))
+            .collect();
+        pane.apply_rpc_result(Ok(LeaksRpcResult {
+            reports,
+            next_cursor: None,
+            has_more: false,
+            append: false,
+            filtered: false,
+            status: None,
+        }));
+        pane
+    }
+
+    fn render_rows(pane: &mut LeaksPane, width: u16, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, width, height)))
+            .expect("render leaks pane");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The scroll offset keeps the selected report inside the viewport window,
+    /// scrolling as little as possible and never past the content end.
+    #[test]
+    fn list_scroll_keeps_selection_visible() {
+        let mut pane = ready_pane(20);
+        let viewport = 6usize;
+
+        // A selection far past the fold scrolls down to reveal it.
+        pane.selected = 18;
+        let offset = pane.reconcile_list_scroll(20, viewport) as usize;
+        assert!(
+            offset <= 18 && 18 < offset + viewport,
+            "selected 18 must be within [{offset}, {})",
+            offset + viewport
+        );
+
+        // Selecting back near the top pulls the window up with it.
+        pane.selected = 1;
+        let offset = pane.reconcile_list_scroll(20, viewport) as usize;
+        assert!(offset <= 1 && 1 < offset + viewport);
+
+        // The last report clamps the offset to the content end (no overscroll).
+        pane.selected = 19;
+        let offset = pane.reconcile_list_scroll(20, viewport) as usize;
+        assert_eq!(offset, 20 - viewport);
+        assert!(offset <= 19 && 19 < offset + viewport);
+
+        // A list shorter than the viewport never scrolls.
+        pane.selected = 0;
+        assert_eq!(pane.reconcile_list_scroll(3, viewport), 0);
+
+        // A zero-height viewport (a pane too short to give the list any rows)
+        // takes the guard and never divides/underflows.
+        pane.selected = 25;
+        assert_eq!(pane.reconcile_list_scroll(30, 0), 0);
+    }
+
+    /// Regression: a selection past the fold — and the pinned key-help footer —
+    /// both stay on-screen when the report list overflows the pane.
+    #[test]
+    fn selected_report_and_footer_stay_on_screen_when_list_overflows() {
+        let mut pane = ready_pane(30);
+        pane.selected = 25;
+        let rows = render_rows(&mut pane, 60, 8);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("rpt-25"),
+            "selected report must be visible:\n{joined}"
+        );
+        assert!(
+            joined.contains("esc close"),
+            "key-help footer must stay pinned:\n{joined}"
+        );
+    }
+
+    /// Regression: pressing `D` on an off-screen selection surfaces the delete
+    /// confirmation (in the pinned footer) AND keeps the target report visible,
+    /// so the destructive action is never confirmed blind.
+    #[test]
+    fn delete_confirmation_visible_over_long_list() {
+        let mut pane = ready_pane(30);
+        pane.selected = 25;
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Char('D'))),
+            LeaksOutcome::Stay
+        ));
+        let rows = render_rows(&mut pane, 60, 8);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("(y/N)"),
+            "delete confirmation must be visible:\n{joined}"
+        );
+        // Assert the selected LIST row (marker + id) is co-visible — not merely
+        // the id echoed inside the footer confirmation text.
+        assert!(
+            joined.contains("▶ rpt-25"),
+            "the report being deleted must stay visible on a list row:\n{joined}"
+        );
+    }
+
+    /// Scope: a fresh (non-append) reload resets scroll + selection; an append
+    /// (pagination) preserves both so the user's place is not lost.
+    #[test]
+    fn reload_resets_scroll_but_append_preserves_it() {
+        let mut pane = ready_pane(30);
+        pane.selected = 25;
+        // Render once so `reconcile_list_scroll` populates `list_scroll`.
+        let _ = render_rows(&mut pane, 60, 8);
+        assert!(
+            pane.list_scroll > 0,
+            "a deep selection should have scrolled"
+        );
+        let scrolled = pane.list_scroll;
+
+        // Append (next page): selection and scroll are preserved.
+        pane.apply_rpc_result(Ok(LeaksRpcResult {
+            reports: (30..40)
+                .map(|i| sample_report(&format!("rpt-{i:02}")))
+                .collect(),
+            next_cursor: None,
+            has_more: false,
+            append: true,
+            filtered: false,
+            status: None,
+        }));
+        assert_eq!(pane.selected, 25, "append must not move the selection");
+        assert_eq!(pane.list_scroll, scrolled, "append must preserve scroll");
+
+        // Fresh reload: both reset to the top.
+        pane.apply_rpc_result(Ok(LeaksRpcResult {
+            reports: (0..5)
+                .map(|i| sample_report(&format!("new-{i:02}")))
+                .collect(),
+            next_cursor: None,
+            has_more: false,
+            append: false,
+            filtered: false,
+            status: None,
+        }));
+        assert_eq!(pane.selected, 0, "fresh reload resets the selection");
+        assert_eq!(pane.list_scroll, 0, "fresh reload resets the scroll");
     }
 }

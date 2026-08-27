@@ -575,6 +575,124 @@ mod tests {
         assert_eq!(fitted.coverage, CompactInputCoverage::Partial);
     }
 
+    /// AC5: a fitted suffix containing multi-call assistant turns and
+    /// multi-result runs must pass the provider-validity predicate.
+    #[test]
+    fn compact_history_selected_with_multi_call_and_multi_result_passes_pairing() {
+        let call_a = Message::Assistant {
+            id: None,
+            content: vec![
+                AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-a"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "a.txt"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                }),
+                AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-b"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "b.txt"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                }),
+            ],
+        };
+        let results_ab = Message::User {
+            content: vec![
+                UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-a"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text("content a")],
+                }),
+                UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-b"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text("content b")],
+                }),
+            ],
+        };
+        let history = vec![
+            Message::user("old request ".repeat(200)),
+            Message::assistant("old answer ".repeat(200)),
+            Message::user("new request"),
+            call_a,
+            results_ab,
+            Message::assistant("final answer"),
+        ];
+        // Fit only the newest exchange (user → assistant with tool calls).
+        let newest_tokens = wire_token_total(&history[2..]);
+        let fitted = fit_whole_exchange_suffix(&history, newest_tokens).unwrap();
+        assert_eq!(fitted.rung, CompactFitRung::HistorySelected);
+        // The fitted suffix must pass provider-valid tool pairing.
+        super::rehydrate::validate_pairing(&fitted.history).unwrap();
+        // The multi-call assistant turn and its multi-result run are intact.
+        let serialized = serde_json::to_string(&fitted.history).unwrap();
+        assert!(serialized.contains("call-a"));
+        assert!(serialized.contains("call-b"));
+        assert!(serialized.contains("content a"));
+        assert!(serialized.contains("content b"));
+    }
+
+    /// AC5: a split candidate that would begin at a tool-result user
+    /// message (without its owning assistant tool call) must be rejected
+    /// by the pair-validity predicate — the suffix snaps to a whole
+    /// exchange boundary instead.
+    #[test]
+    fn compact_history_selected_split_at_tool_result_is_rejected() {
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("call-x"),
+                provider: None,
+                function: ToolFunction {
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                },
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let result = Message::User {
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint("call-x"),
+                provider: None,
+                name: "bash".into(),
+                content: vec![ToolResultContent::text("file1\nfile2")],
+            })],
+        };
+        let history = vec![
+            Message::user("old request ".repeat(200)),
+            Message::assistant("old answer ".repeat(200)),
+            call,
+            result,
+            Message::user("newest real request"),
+            Message::assistant("newest response"),
+        ];
+        // An allowance that fits only the last two messages (user + assistant)
+        // would tempt a raw split at the tool-result boundary (index 3).
+        // The fitter must snap to a whole-exchange boundary instead.
+        let last_exchange_tokens = wire_token_total(&history[4..]);
+        let fitted = fit_whole_exchange_suffix(&history, last_exchange_tokens).unwrap();
+        // The fitted suffix must pass pairing validation.
+        super::rehydrate::validate_pairing(&fitted.history).unwrap();
+        // It must not begin at the orphaned tool result.
+        assert!(
+            !fitted.history.iter().any(|msg| {
+                serde_json::to_string(msg).unwrap().contains("file1\nfile2")
+            }),
+            "a split beginning at an orphaned tool result must be rejected"
+        );
+    }
+
     #[test]
     fn compact_unknown_window_attempts_only_verbatim() {
         let history = vec![Message::user("history")];
@@ -637,6 +755,67 @@ mod tests {
         }));
     }
 
+    /// AC6: when the newest user message is a tool-result user message (not a
+    /// real user turn), fitting must still preserve the newest *real* user
+    /// request as the boundary — it must not choose the tool-result user
+    /// message as the "newest real user turn".
+    #[test]
+    fn compact_fitting_keeps_newest_real_user_turn_not_tool_result() {
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("call-tr"),
+                provider: None,
+                function: ToolFunction {
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo hi"}),
+                },
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let tool_result = Message::User {
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint("call-tr"),
+                provider: None,
+                name: "bash".into(),
+                content: vec![ToolResultContent::text("hi")],
+            })],
+        };
+        let history = vec![
+            Message::user("old request ".repeat(100)),
+            Message::assistant("old response ".repeat(100)),
+            Message::user("real user request"),
+            Message::assistant("intermediate response"),
+            call,
+            tool_result,
+            Message::assistant("tool-based answer"),
+        ];
+        // The tool-result user message at index 5 is NOT a real user turn.
+        // `is_real_user_message` must return false for it.
+        assert!(
+            !is_real_user_message(&history[5]),
+            "a tool-result-only user message is not a real user turn"
+        );
+        // The real user message at index 2 IS a real user turn.
+        assert!(is_real_user_message(&history[2]));
+
+        // Fit a suffix that includes the whole exchange starting from the
+        // real user request.  The fitter must retain the real user message,
+        // not the tool-result user message as the boundary.
+        let suffix_tokens = wire_token_total(&history[2..]);
+        let fitted = fit_whole_exchange_suffix(&history, suffix_tokens).unwrap();
+        assert!(
+            fitted.history.iter().any(|message| {
+                is_real_user_message(message)
+                    && serde_json::to_string(message)
+                        .unwrap()
+                        .contains("real user request")
+            }),
+            "fitting must preserve the newest real user turn, not the tool-result user message"
+        );
+    }
+
     #[test]
     fn compact_fitting_ladder_is_monotonic_and_bounded() {
         let history = vec![
@@ -650,6 +829,90 @@ mod tests {
         assert!(wire_token_total(&selected.history) <= full);
         assert_eq!(selected.rung, CompactFitRung::HistorySelected);
         assert!(fit_compact_request(&history, "system", "instruction", Some(1)).is_err());
+    }
+
+    /// AC8: the full ladder (Verbatim → HistorySelected → ToolResultTruncated
+    /// → Emergency) is monotonic with tool-call-bearing exchanges.  Each
+    /// candidate is no larger than its predecessor, and an impossibly small
+    /// known window fails without sending malformed or raw-sliced history.
+    #[test]
+    fn compact_fitting_ladder_with_tool_calls_is_monotonic_and_bounded() {
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("call-ladder"),
+                provider: None,
+                function: ToolFunction {
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "big.json"}),
+                },
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let result = Message::User {
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint("call-ladder"),
+                provider: None,
+                name: "read".into(),
+                content: vec![ToolResultContent::text("x".repeat(2_000))],
+            })],
+        };
+        let history = vec![
+            Message::user("old request ".repeat(300)),
+            Message::assistant("old answer ".repeat(300)),
+            Message::user("real request"),
+            call,
+            result,
+            Message::assistant("response with tool data"),
+        ];
+        let full = wire_token_total(&history);
+
+        // Verbatim: fits a generous window.
+        let generous = fit_compact_request(&history, "s", "i", None).unwrap();
+        assert_eq!(generous.rung, CompactFitRung::Verbatim);
+        assert_eq!(generous.coverage, CompactInputCoverage::Full);
+        assert_eq!(wire_token_total(&generous.history), full);
+
+        // HistorySelected: a window that fits only the newest exchange.
+        let newest_exchange = wire_token_total(&history[2..]);
+        let selected = fit_compact_request(
+            &history,
+            "s",
+            "i",
+            Some(u32::try_from(newest_exchange + 100).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(selected.rung, CompactFitRung::HistorySelected);
+        assert!(wire_token_total(&selected.history) <= full);
+        // Tool pairing must survive the selection.
+        super::rehydrate::validate_pairing(&selected.history).unwrap();
+
+        // ToolResultTruncated: a window that fits only with truncated payloads.
+        let truncated = truncate_newest_exchange_to_fit(&history, newest_exchange / 2);
+        if let Some(fitted) = truncated {
+            assert_eq!(fitted.rung, CompactFitRung::ToolResultTruncated);
+            assert!(wire_token_total(&fitted.history) <= newest_exchange);
+            super::rehydrate::validate_pairing(&fitted.history).unwrap();
+            let serialized = serde_json::to_string(&fitted.history).unwrap();
+            assert!(serialized.contains("compaction omitted"));
+            assert!(serialized.contains("call-ladder"));
+            assert!(serialized.contains("big.json"));
+        }
+
+        // Emergency: an even smaller window.
+        let emergency = emergency_history_to_fit(&history, newest_exchange / 4);
+        if let Some(fitted) = emergency {
+            assert_eq!(fitted.rung, CompactFitRung::Emergency);
+            assert!(wire_token_total(&fitted.history) <= newest_exchange);
+            super::rehydrate::validate_pairing(&fitted.history).unwrap();
+        }
+
+        // Impossibly small known window fails without mutation.
+        assert!(
+            fit_compact_request(&history, "s", "i", Some(1)).is_err(),
+            "an impossibly small known window must fail"
+        );
     }
 
     #[test]
@@ -718,5 +981,50 @@ mod tests {
             plan_chunked_synthesis(&history, wire_token_total(&truncated.history)).is_err(),
             "full-coverage synthesis must fail instead of relabeling omitted bytes as full"
         );
+    }
+
+    #[test]
+    fn compact_diagnostic_is_bounded_to_240_chars_and_collapses_whitespace() {
+        // A long multi-line diagnostic must be collapsed to one line and
+        // truncated at exactly the 240-char diagnostic limit.
+        let long = format!("{} ", "word".repeat(200));
+        let bounded = bounded_diagnostic(&long);
+        assert!(
+            bounded.chars().count() <= DIAGNOSTIC_LIMIT,
+            "bounded diagnostic must not exceed {} chars, got {}",
+            DIAGNOSTIC_LIMIT,
+            bounded.chars().count()
+        );
+        assert_eq!(bounded.chars().count(), DIAGNOSTIC_LIMIT);
+        assert!(
+            !bounded.contains('\n'),
+            "bounded diagnostic must collapse whitespace to a single line"
+        );
+
+        // A short diagnostic passes through unchanged (modulo whitespace
+        // normalization).
+        let short = "compact model returned an error";
+        assert_eq!(bounded_diagnostic(short), short);
+
+        // A diagnostic with extra whitespace is normalized.
+        let messy = "  compact   model\n\n  returned   an  error  ";
+        assert_eq!(
+            bounded_diagnostic(messy),
+            "compact model returned an error"
+        );
+    }
+
+    #[test]
+    fn compact_diagnostic_preserves_utf8_boundary_on_truncation() {
+        // 240 ASCII chars + multi-byte UTF-8: the truncation must not split
+        // a UTF-8 code point.  Using chars().take() naturally respects char
+        // boundaries, so the result is always valid UTF-8.
+        let mut input = String::from("x".repeat(DIAGNOSTIC_LIMIT));
+        input.push_str("héllo wörld ☃ ");
+        let bounded = bounded_diagnostic(&input);
+        assert!(bounded.chars().count() <= DIAGNOSTIC_LIMIT);
+        // The result must be valid UTF-8 (String guarantees this, but verify
+        // the boundary case did not panic or produce mojibake).
+        assert!(bounded.starts_with(&"x".repeat(DIAGNOSTIC_LIMIT)));
     }
 }

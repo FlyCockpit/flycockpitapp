@@ -437,6 +437,92 @@ async fn idle_threshold_with_backup_warns_then_times_out() {
     }));
 }
 
+/// AC3: compact-utility dispatch sets `hard_timeout_on_stall = true` even
+/// without a configured backup model, so TTFT and idle deadlines are
+/// terminal (return typed transient errors) rather than advisory warnings.
+/// The compaction sampler exclusively owns retries; the general transport
+/// retry/probe/endpoint-swap loop is disabled for these calls.
+#[tokio::test(start_paused = true)]
+async fn compact_utility_dispatch_has_terminal_ttft_deadline() {
+    let mut stream = futures::stream::pending::<TestItem>();
+    let timeout = TimeoutConfig {
+        ttft_secs: 1,
+        idle_secs: 1,
+    };
+    // `hard_timeout_on_stall: true` is what `complete_captured_compact_utility`
+    // sets via `compact_utility || self.hard_timeout_on_stall()`.
+    let (res, phase, events) = run_drain(&mut stream, &timeout, true).await;
+
+    let err = res.expect_err("compact-utility TTFT must abort without a backup model");
+    assert_eq!(
+        classify_inference_failure(&err),
+        InferenceErrorClass::TimeoutTtft,
+        "TTFT expiration in compact-utility mode must be a typed transient outcome"
+    );
+    assert_eq!(phase, InferencePhase::Prep);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            TurnEvent::InferenceWarning {
+                phase,
+                waited_secs,
+                ..
+            } if phase == "ttft" && *waited_secs == 1
+        )
+    }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn compact_utility_dispatch_has_terminal_idle_deadline() {
+    let mut stream = Box::pin(
+        futures::stream::once(async { text_chunk("hi") })
+            .chain(futures::stream::pending::<TestItem>()),
+    );
+    let timeout = TimeoutConfig {
+        ttft_secs: 10,
+        idle_secs: 1,
+    };
+    let (res, phase, events) = run_drain(&mut stream, &timeout, true).await;
+
+    let err = res.expect_err("compact-utility idle must abort without a backup model");
+    assert_eq!(
+        classify_inference_failure(&err),
+        InferenceErrorClass::TimeoutIdle,
+        "idle expiration in compact-utility mode must be a typed transient outcome"
+    );
+    assert_eq!(phase, InferencePhase::FirstToken);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            TurnEvent::InferenceWarning {
+                phase,
+                waited_secs,
+                ..
+            } if phase == "idle" && *waited_secs == 1
+        )
+    }));
+}
+
+/// Without `hard_timeout_on_stall` (normal dispatch without a backup model),
+/// TTFT expiration is advisory only — proving compact-utility mode is what
+/// makes deadlines terminal, not a global dispatch-policy change.
+#[tokio::test(start_paused = true)]
+async fn normal_dispatch_without_backup_does_not_abort_on_ttft() {
+    let mut stream = Box::pin(futures::stream::once(async {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        text_chunk("late but accepted")
+    }));
+    let timeout = TimeoutConfig {
+        ttft_secs: 1,
+        idle_secs: 1,
+    };
+    let (res, _, _) = run_drain(&mut stream, &timeout, false).await;
+    assert!(
+        res.is_ok(),
+        "normal dispatch without backup must warn and continue, not abort"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn slow_stream_warnings_are_throttled_per_phase_and_token_boundary() {
     let timeout = TimeoutConfig {

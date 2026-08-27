@@ -1,26 +1,95 @@
 //! Production install seam for the image-generation runtime registry.
 //!
-//! There is no live daemon construction of the image runtime registry yet — the
-//! reconciliation worker that drives health refresh and dispatch is owned by the
-//! deferred `image-generation-job-daemon-integration` prompt. This module is the
-//! single, documented non-test entry point that worker will call at startup: it
-//! constructs the four standard production adapters
+//! Session workers construct their registries from their effective project
+//! configuration, while the daemon-lifecycle worker reaches those registries
+//! through the owner-session directory below. This module is the documented
+//! non-test construction point for the standard runtime adapters: it constructs
+//! the four standard production adapters
 //! ([`crate::image_generation_runtime::production_standard_image_runtime_adapters`]),
 //! builds the registry over the pinned/vetted connector
 //! ([`ImageRuntimeRegistry::production_standard`]), attaches the credential
 //! store, and applies the loaded image-generation configuration.
 //!
-//! Keeping this seam here (rather than test-only construction) is what makes
+//! Keeping this seam here (rather than test-only construction) keeps
 //! [`ImageRuntimeRegistry::standard`]/[`ImageRuntimeRegistry::production_standard`]
-//! a real production factory and not dead code.
+//! as real production factories.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use cockpit_config::config::image_generation::ImageGenerationConfig;
 
 use crate::credentials::CredentialStore;
 use crate::image_generation_runtime::{ImageRuntimeRegistry, RuntimeClock, RuntimeError};
+
+/// Routes worker revalidation to the live runtime authority that owns the
+/// queued plan's session. The weak entries are intentionally not durable: a
+/// terminated worker/session cannot keep its credentials or configuration alive
+/// merely because a job row remains queued.
+#[derive(Clone, Default)]
+pub struct DaemonImageDispatchRegistry {
+    services: Arc<
+        Mutex<
+            HashMap<uuid::Uuid, Weak<crate::image_generation_job::ImageGenerationDispatchService>>,
+        >,
+    >,
+}
+
+impl DaemonImageDispatchRegistry {
+    pub fn install(
+        &self,
+        session_id: uuid::Uuid,
+        service: &Arc<crate::image_generation_job::ImageGenerationDispatchService>,
+    ) {
+        self.services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id, Arc::downgrade(service));
+    }
+
+    pub fn remove(&self, session_id: uuid::Uuid) {
+        self.services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&session_id);
+    }
+}
+
+impl crate::image_generation_job::ImageDispatchProofSource for DaemonImageDispatchRegistry {
+    fn revalidate<'a>(
+        &'a self,
+        request: crate::image_generation_job::DispatchRevalidationRequest<'a>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        crate::image_generation_runtime::DispatchProofBinding,
+                        RuntimeError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let service = self
+                .services
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&request.owner_session_id)
+                .and_then(Weak::upgrade)
+                .ok_or_else(|| {
+                    RuntimeError::new(
+                        crate::image_generation_runtime::RuntimeErrorCode::Obsolete,
+                        "Refresh after the image generation session changes.",
+                    )
+                })?;
+            service.revalidate_dispatch(request).await
+        })
+    }
+}
 
 /// Daemon-wide monotonic origin used for both image runtime health TTLs and
 /// image-job deadlines. It carries no wall-clock data and cannot move backward.

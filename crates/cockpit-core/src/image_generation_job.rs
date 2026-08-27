@@ -443,6 +443,9 @@ pub struct ImageGenerationSchedulerPass {
 /// What a dispatch revalidation needs to identify the destination it must probe.
 /// Carries only the sealed plan target identity -- never credential material.
 pub struct DispatchRevalidationRequest<'a> {
+    /// Target names are scoped to the plan's durable owner session. The daemon
+    /// worker must never resolve one against another session's configuration.
+    pub owner_session_id: Uuid,
     pub target_id: &'a str,
     pub destination: &'a TargetDestinationV1,
 }
@@ -1097,6 +1100,7 @@ impl ImageGenerationDispatcher {
             .context("scheduler candidate slot is absent from immutable plan")?;
         let binding = proof_source
             .revalidate(DispatchRevalidationRequest {
+                owner_session_id: candidate.plan.owner_session_id,
                 target_id: &target.target_id,
                 destination: &target.destination,
             })
@@ -1940,6 +1944,9 @@ pub struct ImageGenerationDispatchService {
     config_generation: std::sync::atomic::AtomicU64,
     base_tier_known_cost_threshold_usd_micros: std::sync::atomic::AtomicU64,
     media_policy: std::sync::RwLock<MediaResourcePolicy>,
+    image_config:
+        std::sync::RwLock<cockpit_config::config::image_generation::ImageGenerationConfig>,
+    media_storage_recovery: Option<std::sync::Arc<crate::media_storage::MediaStorageRecovery>>,
     config_gate: tokio::sync::RwLock<()>,
     clock: std::sync::Arc<dyn crate::media_reservation::MonotonicClock>,
 }
@@ -1954,6 +1961,8 @@ impl ImageGenerationDispatchService {
         base_tier_known_cost_threshold_usd_micros: u64,
         media_policy: MediaResourcePolicy,
         clock: std::sync::Arc<dyn crate::media_reservation::MonotonicClock>,
+        media_storage_recovery: Option<std::sync::Arc<crate::media_storage::MediaStorageRecovery>>,
+        image_config: cockpit_config::config::image_generation::ImageGenerationConfig,
     ) -> Self {
         Self {
             db,
@@ -1965,6 +1974,8 @@ impl ImageGenerationDispatchService {
                 base_tier_known_cost_threshold_usd_micros,
             ),
             media_policy: std::sync::RwLock::new(media_policy),
+            image_config: std::sync::RwLock::new(image_config),
+            media_storage_recovery,
             config_gate: tokio::sync::RwLock::new(()),
             clock,
         }
@@ -1990,6 +2001,10 @@ impl ImageGenerationDispatchService {
         self.registry
             .refresh_configured_targets(config, generation, refresh_epoch)
             .await;
+        *self
+            .image_config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.clone();
         self.base_tier_known_cost_threshold_usd_micros.store(
             config.base_tier_known_cost_threshold_usd_micros(),
             std::sync::atomic::Ordering::Release,
@@ -2015,6 +2030,143 @@ impl ImageGenerationDispatchService {
         include_disabled: bool,
     ) -> Vec<crate::image_generation_agent_tools::ImageGenerationTargetProjection> {
         self.registry.list_target_projections(include_disabled)
+    }
+
+    /// Revalidate one queued plan through this session's reconciled runtime.
+    /// The daemon lifecycle worker reaches this only through its owner-session
+    /// directory, so provider credentials and destinations are never taken
+    /// from a process default or another project session.
+    pub async fn revalidate_dispatch(
+        &self,
+        request: DispatchRevalidationRequest<'_>,
+    ) -> std::result::Result<DispatchProofBinding, RuntimeError> {
+        let snapshot = self
+            .registry
+            .current_target_snapshot(request.target_id)
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::Obsolete,
+                    "Refresh after image generation target configuration changes.",
+                )
+            })?;
+        let endpoint = self
+            .image_config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .endpoints()
+            .iter()
+            .find(|endpoint| endpoint.id == snapshot.endpoint_id)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::Obsolete,
+                    "Refresh after image generation target configuration changes.",
+                )
+            })?;
+        let adapter_kind = match snapshot.adapter_kind {
+            ImageAdapterKind::OpenaiImages => "openai_images",
+            ImageAdapterKind::OpenrouterImages => "openrouter_images",
+            ImageAdapterKind::GeminiImages => "gemini_images",
+            ImageAdapterKind::Comfyui => "comfyui",
+        };
+        let endpoint_identity_digest = digest_fields(&[
+            &snapshot.endpoint_id,
+            &snapshot.endpoint_origin,
+            &snapshot.target_immutable_identity,
+        ]);
+        let credential = snapshot
+            .credential_identity_digest
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::Obsolete,
+                    "Refresh after image generation credentials change.",
+                )
+            })?;
+        if endpoint.origin != snapshot.endpoint_origin
+            || adapter_kind != request.destination.adapter_kind
+            || endpoint_identity_digest != request.destination.endpoint_identity_digest
+            || credential.plan_identity_hex() != request.destination.credential_identity_digest
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::Obsolete,
+                "Refresh after image generation destination identity changes.",
+            ));
+        }
+        self.registry
+            .revalidate_dispatch_binding(&endpoint, request.target_id, credential)
+            .await
+    }
+
+    /// Convert daemon-local paths that have already passed native read
+    /// authorization into owned typed attachments.  This is deliberately part
+    /// of the session dispatch authority: it has the same project identity,
+    /// media policy, and monotonic clock as the later lease/job transaction.
+    /// The durable image request receives only the resulting attachment ids.
+    pub async fn register_local_references(
+        &self,
+        session: &crate::session::Session,
+        references: &mut [ImageReferenceTag],
+    ) -> Result<()> {
+        let Some(storage) = self.media_storage_recovery.as_ref() else {
+            anyhow::bail!("image generation media storage is unavailable");
+        };
+        let canonical_project_digest = crate::intel::hex_lower(&Sha256::digest(
+            session.project_root.as_os_str().as_encoded_bytes(),
+        ));
+        let owner_principal_digest =
+            crate::intel::hex_lower(&Sha256::digest(serde_json::to_vec(&self.principal)?));
+        let policy = self
+            .media_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let now_monotonic_ms = self.clock.now_ms();
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        for reference in references {
+            let ImageReferenceTag::LocalPath { local_path } = reference else {
+                continue;
+            };
+            let canonical = Path::new(local_path);
+            let relative = canonical
+                .strip_prefix(&session.project_root)
+                .context("local image reference is outside the session project")?;
+            let path = relative
+                .to_str()
+                .context("local image reference is not valid UTF-8")?
+                .to_owned();
+            let receipt = storage
+                .register_local_path(
+                    cockpit_db::media_attachments::RegisterLocalPathMediaV1 {
+                        schema_version: 1,
+                        kind: "registerLocalPathMedia".into(),
+                        local_operation_id: Uuid::now_v7(),
+                        owner_principal_digest: owner_principal_digest.clone(),
+                        session_id: session.id,
+                        canonical_project_digest: canonical_project_digest.clone(),
+                        client_draft_id: Uuid::now_v7(),
+                        requested_media_kind:
+                            cockpit_db::media_attachments::RequestedLocalPathMediaKind::Image,
+                        path,
+                    },
+                    &session.project_root,
+                    &policy,
+                    now_monotonic_ms,
+                    now_unix_ms,
+                )
+                .await?;
+            let cockpit_db::media_attachments::LocalPathRegistrationResultV1::Registered {
+                attachment_id,
+                ..
+            } = receipt.result
+            else {
+                anyhow::bail!("local image reference could not be registered");
+            };
+            *reference = ImageReferenceTag::Attachment {
+                attachment_id: attachment_id.to_string(),
+            };
+        }
+        Ok(())
     }
 
     /// Authorize and (on `Allow`) commit a `generate_image` request.

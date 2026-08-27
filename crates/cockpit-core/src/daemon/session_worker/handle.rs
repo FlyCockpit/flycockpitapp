@@ -2319,6 +2319,8 @@ pub fn spawn(
     env_snapshot: EnvSnapshot,
     image_generation_boot_id: Uuid,
     image_generation_started_at: std::time::Instant,
+    media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
     config_snapshot: SessionConfigSnapshot,
 ) -> (
     SessionWorkerHandle,
@@ -2516,6 +2518,8 @@ pub fn spawn(
             terminal_cleanup_complete,
             image_generation_boot_id,
             image_generation_started_at,
+            media_storage_recovery,
+            image_generation_dispatch_registry,
         ));
         crate::config::trust::scope_shared_workspace_trust_policy(trust_policy, worker).await;
     });

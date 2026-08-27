@@ -993,10 +993,10 @@ impl Tool for GenerateImageTool {
         )));
 
         // `local_path` is not a durable attachment identity. Admit it through
-        // the normal read-path authority, then fail closed until it has been
-        // registered as a typed session attachment; this prevents the old path
-        // from being silently dropped while a provider still receives a request.
-        for reference in &dispatch_args.references {
+        // normal read-path authority first; the session dispatch service below
+        // then registers the checked daemon-local source as a typed attachment
+        // before preflight, approval, leasing, or durable job creation.
+        for reference in &mut dispatch_args.references {
             if let ImageReferenceTag::LocalPath { local_path } = reference {
                 let requested = crate::tools::common::resolve(local_path, &ctx.cwd);
                 let checked = crate::tools::sandbox::check_native_access(
@@ -1010,10 +1010,7 @@ impl Tool for GenerateImageTool {
                     crate::tools::shell_sandbox::SandboxPathAccess::Read,
                 )
                 .await?;
-                return Ok(ToolOutput::text(
-                    "Local image paths must be registered as session attachments before image generation; no job was created."
-                        .to_string(),
-                ));
+                *local_path = checked.display().to_string();
             }
         }
 
@@ -1034,6 +1031,17 @@ impl Tool for GenerateImageTool {
                     .to_string(),
             ));
         };
+
+        if service
+            .register_local_references(&ctx.session, &mut dispatch_args.references)
+            .await
+            .is_err()
+        {
+            return Ok(ToolOutput::text(
+                "Image generation references are unavailable; no job was created and no provider was contacted."
+                    .to_string(),
+            ));
+        }
 
         match service
             .dispatch_generate_image(&ctx.session, approver, &dispatch_args)

@@ -2607,6 +2607,7 @@ impl DaemonContext {
                 crate::media_storage::MediaStorageRecovery::open_or_create(db.clone(), &root).ok()
             })
             .map(Arc::new);
+        registry.set_media_storage_recovery(media_storage_recovery.clone());
         // One stable, nonzero daemon boot UUID drives every image-generation
         // scheduler pass and deadline observation. The lifecycle worker below
         // uses it as `worker_boot_id`; a job-creation caller uses it as the
@@ -2616,53 +2617,23 @@ impl DaemonContext {
             boot_id: image_generation_boot_id,
             started_at,
         });
+        let image_generation_dispatch_registry = registry.image_generation_dispatch_registry();
         // Spawn the daemon-lifecycle image-generation worker on NON-ephemeral
         // start only (same gating as the scheduler / media-ledger install). It
         // shares `started_at` so its monotonic clock matches the media ledger and
-        // sealed plan deadlines. This increment ships an empty adapter map and no
-        // resolved destinations; concrete provider adapters + the destination map
-        // install with the wire-adapters / real-dispatch prompts, so a queued job
-        // records a typed `adapter_missing` skip rather than dispatching.
+        // sealed plan deadlines. Dispatch proof is resolved through the owning
+        // session's live registry, not through a daemon-default configuration.
         #[cfg(feature = "extended")]
-        let image_generation_worker = (!paths.ephemeral)
-            .then(|| {
-                match crate::daemon::image_runtime::install_standard_image_runtime_registry(
-                    &cockpit_config::config::image_generation::ImageGenerationConfig::default(),
-                    1,
-                    1,
-                    None,
-                    Arc::new(crate::daemon::image_runtime::DaemonImageRuntimeClock::new(
-                        started_at,
-                    )),
-                ) {
-                    Ok(registry) => {
-                        let proof_source = Arc::new(
-                            crate::image_generation_job::RegistryDispatchProofSource::new(
-                                registry,
-                                std::collections::HashMap::new(),
-                            ),
-                        );
-                        Some(
-                            crate::daemon::image_generation_worker::spawn_image_generation_worker(
-                                db.clone(),
-                                image_generation_boot_id,
-                                started_at,
-                                crate::image_generation_job::ImageGenerationAdapterMap::new(),
-                                proof_source,
-                                shutdown.clone(),
-                            ),
-                        )
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            %error,
-                            "image generation runtime registry unavailable; worker not started"
-                        );
-                        None
-                    }
-                }
-            })
-            .flatten();
+        let image_generation_worker = (!paths.ephemeral).then(|| {
+            crate::daemon::image_generation_worker::spawn_image_generation_worker(
+                db.clone(),
+                image_generation_boot_id,
+                started_at,
+                crate::image_generation_job::ImageGenerationAdapterMap::new(),
+                Arc::new(image_generation_dispatch_registry.clone()),
+                shutdown.clone(),
+            )
+        });
         #[cfg(not(feature = "extended"))]
         let image_generation_worker = None;
         Self {

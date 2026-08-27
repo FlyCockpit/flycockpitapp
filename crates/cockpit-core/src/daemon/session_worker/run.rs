@@ -4663,6 +4663,8 @@ pub(super) async fn run_worker(
     terminal_cleanup_complete: Arc<AtomicBool>,
     image_generation_boot_id: uuid::Uuid,
     image_generation_started_at: std::time::Instant,
+    media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
 ) {
     let session_id = session.id;
     let mut startup_inbox = StartupWorkInbox::default();
@@ -5324,8 +5326,12 @@ pub(super) async fn run_worker(
                         .base_tier_known_cost_threshold_usd_micros(),
                     (*extended_cfg.media_resources).clone(),
                     Arc::new(SessionImageClock(image_generation_started_at)),
+                    media_storage_recovery,
+                    extended_cfg.image_generation.clone(),
                 );
-                session.set_image_generation_dispatch(Arc::new(service));
+                let service = Arc::new(service);
+                image_generation_dispatch_registry.install(session.id, &service);
+                session.set_image_generation_dispatch(service);
             }
             Err(error) => {
                 tracing::error!(%error, "image generation dispatch service unavailable");

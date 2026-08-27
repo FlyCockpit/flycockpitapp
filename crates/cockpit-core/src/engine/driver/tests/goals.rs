@@ -957,6 +957,54 @@ async fn billing_quota_does_not_pause_active_goal() {
     );
 }
 
+/// A refused goal-supervision swarm spawn arms the goal watchdog, so a quiescent
+/// session re-runs supervision after the control-job lease TTL (re-leasing the
+/// expired job) instead of stalling the panel indefinitely.
+#[tokio::test]
+async fn refused_swarm_spawn_arms_goal_retry_watchdog() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "ship the feature despite a full swarm queue",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Baseline: a Running goal with no pending retry and no idle background work
+    // does not arm the watchdog.
+    let mut watchdog = None;
+    driver.refresh_goal_watchdog(&mut watchdog).await;
+    assert!(
+        watchdog.is_none(),
+        "no watchdog should arm without a pending refused-spawn retry"
+    );
+
+    // A refused swarm spawn set the flag → the retry watchdog arms.
+    driver.goal_refused_spawn_retry_pending = true;
+    driver.refresh_goal_watchdog(&mut watchdog).await;
+    assert!(
+        watchdog.is_some(),
+        "a refused swarm spawn must arm the goal retry watchdog"
+    );
+
+    // Once the retry cap is exhausted, it stops arming so a permanently-failing
+    // refusal (e.g. an oversized control prompt) does not re-wake the loop
+    // forever.
+    let mut watchdog = None;
+    driver.goal_refused_spawn_retry_attempts = 100;
+    driver.refresh_goal_watchdog(&mut watchdog).await;
+    assert!(
+        watchdog.is_none(),
+        "the retry watchdog must give up once the retry cap is reached"
+    );
+}
+
 /// Behavior 9 fail-closed omission: EVERY failure-detail sink routes the raw
 /// provider text through the single `safe_provider_detail` funnel, so the fixed
 /// `provider_detail_omitted` marker crosses each channel instead of the body —
@@ -1223,6 +1271,34 @@ async fn refused_goal_supervision_spawn_does_not_wedge_round() {
     assert!(
         rx.try_recv().is_err(),
         "all-refused round should emit no supervision progress"
+    );
+    // The refused round armed a bounded retry so a quiescent session self-heals
+    // (the watchdog re-runs supervision after the lease TTL).
+    assert!(
+        driver.goal_refused_spawn_retry_pending,
+        "an all-refused round must arm the retry flag"
+    );
+    assert_eq!(
+        driver.goal_refused_spawn_retry_attempts, 1,
+        "the first refused round counts as one retry attempt"
+    );
+
+    // Re-entering supervision while the refused control job's lease is still
+    // valid (the mixed-round case: a fast sibling completion re-triggers the
+    // loop before the 300s lease expires) leases NOTHING, so it must LEAVE the
+    // pending retry untouched — clearing it here would strand the leased job and
+    // re-stall the panel.
+    driver
+        .maybe_start_goal_supervision_round(&goal, &tx)
+        .await
+        .unwrap();
+    assert!(
+        driver.goal_refused_spawn_retry_pending,
+        "an empty re-entry (lease still valid) must not clear the pending retry"
+    );
+    assert_eq!(
+        driver.goal_refused_spawn_retry_attempts, 1,
+        "an empty re-entry must not change the attempt count"
     );
 }
 

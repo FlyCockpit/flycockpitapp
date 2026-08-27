@@ -5280,6 +5280,53 @@ pub(super) async fn run_worker(
     ));
     driver.set_approver(approver);
 
+    // Install the session's live image-generation registry before any agent
+    // turn can construct a ToolCtx. Keeping the service on Session also makes
+    // parked-interrupt recovery and delegated turns share the same authority.
+    #[cfg(feature = "extended")]
+    {
+        struct SessionImageClock(std::time::Instant);
+        impl crate::media_reservation::MonotonicClock for SessionImageClock {
+            fn now_ms(&self) -> u64 {
+                u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }
+        }
+        let credential_store = session
+            .provider_credential_store(&start_config.providers)
+            .ok();
+        match crate::daemon::image_runtime::install_standard_image_runtime_registry(
+            &extended_cfg.image_generation,
+            start_config.generation,
+            1,
+            credential_store,
+        ) {
+            Ok(registry) => {
+                registry
+                    .refresh_configured_targets(
+                        &extended_cfg.image_generation,
+                        start_config.generation,
+                        1,
+                    )
+                    .await;
+                let service = crate::image_generation_job::ImageGenerationDispatchService::new(
+                    session.db.clone(),
+                    Arc::new(registry),
+                    uuid::Uuid::now_v7(),
+                    crate::daemon::principal::ClientPrincipal::owner(),
+                    start_config.generation,
+                    extended_cfg
+                        .image_generation
+                        .base_tier_known_cost_threshold_usd_micros(),
+                    Arc::new(SessionImageClock(std::time::Instant::now())),
+                );
+                session.set_image_generation_dispatch(Arc::new(service));
+            }
+            Err(error) => {
+                tracing::error!(%error, "image generation dispatch service unavailable");
+            }
+        }
+    }
+
     // Loop-guard threshold (GOALS §1/§12) from the layered config, same
     // discovery the jobs cap uses. Clamped to ≥ 2 by the setter.
     driver.set_loop_guard_threshold(loop_guard_threshold_for(&extended_cfg));

@@ -400,6 +400,9 @@ pub enum AuthorizationRequest<'a> {
         /// raw string unrepresentable here (its only prod constructor is the
         /// projection-digest computation).
         plan_digest: &'a crate::image_generation_agent_tools::PlanDigest,
+        /// Digest of the sealed endpoint/credential/target/workflow authority
+        /// identities resolved by preflight. It contains no raw identity.
+        destination_grant_binding_digest: &'a str,
         /// Redacted per-destination facts (target id, location class, adapter
         /// kind). No endpoint URLs, credentials, or workflow bytes.
         destinations: &'a [crate::image_generation_agent_tools::ProjectionDestination],
@@ -529,6 +532,7 @@ pub(super) struct MediaEgressAuthzFacts<'a> {
 /// text, provider secret, or workflow bytes.
 pub(super) struct ImageGenerationAuthzFacts<'a> {
     pub plan_digest: &'a crate::image_generation_agent_tools::PlanDigest,
+    pub destination_grant_binding_digest: &'a str,
     pub destinations: &'a [crate::image_generation_agent_tools::ProjectionDestination],
     pub fanout: u32,
     pub total_outputs: u32,
@@ -644,6 +648,7 @@ impl Approver {
             }
             AuthorizationRequest::ImageGeneration {
                 plan_digest,
+                destination_grant_binding_digest,
                 destinations,
                 fanout,
                 total_outputs,
@@ -665,6 +670,7 @@ impl Approver {
                 // seam, and the session approval mode. Never a faked allow.
                 self.approve_image_generation_inner(ImageGenerationAuthzFacts {
                     plan_digest,
+                    destination_grant_binding_digest,
                     destinations,
                     fanout,
                     total_outputs,
@@ -2671,6 +2677,7 @@ mod tests {
     struct ImgGenScenario {
         destinations: Vec<crate::image_generation_agent_tools::ProjectionDestination>,
         plan_digest: crate::image_generation_agent_tools::PlanDigest,
+        destination_grant_binding_digest: String,
         output_path_authority: crate::image_generation_job::OutputPathAuthorityId,
         fanout: u32,
         total_outputs: u32,
@@ -2705,6 +2712,7 @@ mod tests {
                 plan_digest: crate::image_generation_agent_tools::PlanDigest::from_raw_for_test(
                     "0123456789abcdef0123",
                 ),
+                destination_grant_binding_digest: "a".repeat(64),
                 output_path_authority:
                     crate::image_generation_job::OutputPathAuthorityId::from_raw_for_test(
                         "session-write-scope",
@@ -2729,6 +2737,7 @@ mod tests {
         fn request(&self) -> AuthorizationRequest<'_> {
             AuthorizationRequest::ImageGeneration {
                 plan_digest: &self.plan_digest,
+                destination_grant_binding_digest: &self.destination_grant_binding_digest,
                 destinations: &self.destinations,
                 fanout: self.fanout,
                 total_outputs: self.total_outputs,

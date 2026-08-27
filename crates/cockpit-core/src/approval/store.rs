@@ -868,15 +868,20 @@ impl GrantStore {
         &self,
         project_id: &str,
         plan_digest: &str,
+        destination_binding_digest: &str,
     ) -> Option<Scope> {
         if self
-            .session_image_generation_grant_allows(plan_digest)
+            .session_image_generation_grant_allows(plan_digest, destination_binding_digest)
             .await
         {
             return Some(Scope::Session);
         }
         if self
-            .project_image_generation_grant_allows(project_id, plan_digest)
+            .project_image_generation_grant_allows(
+                project_id,
+                plan_digest,
+                destination_binding_digest,
+            )
             .await
         {
             return Some(Scope::Project);
@@ -898,6 +903,7 @@ impl GrantStore {
         scope: Scope,
         project_id: &str,
         plan_digest: &str,
+        destination_binding_digest: &str,
         output_path_authority: &str,
     ) -> Result<(), StoreError> {
         match scope {
@@ -908,6 +914,7 @@ impl GrantStore {
                     scope,
                     project_id,
                     plan_digest,
+                    destination_binding_digest,
                     output_path_authority,
                 )
                 .await
@@ -924,11 +931,17 @@ impl GrantStore {
         scope: Scope,
         project_id: &str,
         plan_digest: &str,
+        destination_binding_digest: &str,
     ) -> usize {
         match scope {
             Scope::Once | Scope::Global => 0,
             Scope::Session | Scope::Project => self
-                .image_generation_grant_revoke(scope, project_id, plan_digest)
+                .image_generation_grant_revoke(
+                    scope,
+                    project_id,
+                    plan_digest,
+                    destination_binding_digest,
+                )
                 .await
                 .unwrap_or_else(|error| {
                     tracing::warn!(?error, "image generation grant revoke failed");
@@ -938,16 +951,26 @@ impl GrantStore {
     }
 
     /// Session-scope allow lookup against `image_generation_grants`.
-    async fn session_image_generation_grant_allows(&self, plan_digest: &str) -> bool {
+    async fn session_image_generation_grant_allows(
+        &self,
+        plan_digest: &str,
+        destination_binding_digest: &str,
+    ) -> bool {
         let session_id = self.session_id;
         let plan_digest = plan_digest.to_owned();
+        let destination_binding_digest = destination_binding_digest.to_owned();
         self.db
             .read(move |conn| {
                 let n: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM image_generation_grants \
                      WHERE scope = 'session' AND session_id = ?1 AND plan_digest = ?2 \
+                       AND destination_binding_digest = ?3 \
                        AND verdict = 'allow' AND revoked_at_unix_ms IS NULL",
-                    rusqlite::params![session_id.to_string(), plan_digest],
+                    rusqlite::params![
+                        session_id.to_string(),
+                        plan_digest,
+                        destination_binding_digest
+                    ],
                     |row| row.get(0),
                 )?;
                 Ok(n > 0)
@@ -963,16 +986,27 @@ impl GrantStore {
         &self,
         project_id: &str,
         plan_digest: &str,
+        destination_binding_digest: &str,
     ) -> bool {
+        let session_id = self.session_id.to_string();
         let project_id = project_id.to_owned();
         let plan_digest = plan_digest.to_owned();
+        let destination_binding_digest = destination_binding_digest.to_owned();
         self.db
             .read(move |conn| {
                 let n: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM image_generation_grants \
                      WHERE scope = 'project' AND project_id = ?1 AND plan_digest = ?2 \
+                       AND destination_binding_digest = ?3 \
+                       AND EXISTS (SELECT 1 FROM sessions s \
+                                   WHERE s.session_id = ?4 AND s.project_id = ?1) \
                        AND verdict = 'allow' AND revoked_at_unix_ms IS NULL",
-                    rusqlite::params![project_id, plan_digest],
+                    rusqlite::params![
+                        project_id,
+                        plan_digest,
+                        destination_binding_digest,
+                        session_id
+                    ],
                     |row| row.get(0),
                 )?;
                 Ok(n > 0)
@@ -989,11 +1023,13 @@ impl GrantStore {
         scope: Scope,
         project_id: &str,
         plan_digest: &str,
+        destination_binding_digest: &str,
         output_path_authority: &str,
     ) -> Result<()> {
         let session_id = self.session_id.to_string();
         let project_id = project_id.to_owned();
         let plan_digest = plan_digest.to_owned();
+        let destination_binding_digest = destination_binding_digest.to_owned();
         let output_path_authority = output_path_authority.to_owned();
         let scope_str = scope.as_str().to_owned();
         let session_param: Option<String> = match scope {
@@ -1009,15 +1045,16 @@ impl GrantStore {
                 let grant_id = uuid::Uuid::new_v4().to_string();
                 conn.execute(
                     "INSERT OR REPLACE INTO image_generation_grants \
-                     (grant_id, scope, session_id, project_id, plan_digest, \
+                     (grant_id, scope, session_id, project_id, plan_digest, destination_binding_digest, \
                       output_path_authority, verdict, granted_at_unix_ms, revoked_at_unix_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'allow', ?7, NULL)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'allow', ?8, NULL)",
                     rusqlite::params![
                         &grant_id,
                         &scope_str,
                         session_param.as_deref(),
                         &project_id,
                         &plan_digest,
+                        &destination_binding_digest,
                         &output_path_authority,
                         now,
                     ],
@@ -1035,10 +1072,12 @@ impl GrantStore {
         scope: Scope,
         project_id: &str,
         plan_digest: &str,
+        destination_binding_digest: &str,
     ) -> Result<usize> {
         let session_id = self.session_id.to_string();
         let project_id = project_id.to_owned();
         let plan_digest = plan_digest.to_owned();
+        let destination_binding_digest = destination_binding_digest.to_owned();
         let scope_str = scope.as_str().to_owned();
         let session_param: Option<String> = match scope {
             Scope::Session => Some(session_id.clone()),
@@ -1055,6 +1094,7 @@ impl GrantStore {
                         "UPDATE image_generation_grants SET revoked_at_unix_ms = ?1 \
                      WHERE scope = ?2 AND ifnull(session_id, '') = ifnull(?3, '') \
                        AND project_id = ?4 AND plan_digest = ?5 \
+                       AND destination_binding_digest = ?6 \
                        AND revoked_at_unix_ms IS NULL",
                         rusqlite::params![
                             now,
@@ -1062,6 +1102,7 @@ impl GrantStore {
                             session_param.as_deref(),
                             &project_id,
                             &plan_digest,
+                            &destination_binding_digest,
                         ],
                     )
                     .context("revoking image-generation grant")?;
@@ -3859,16 +3900,23 @@ mod mcp_server_connect_grant_tests {
         let (store, _sid, project_id) =
             ig_test_store(tmp.path(), global.path().to_path_buf()).await;
         let plan = "a".repeat(64);
+        let binding = "c".repeat(64);
         let authority = "out-authority-digest";
         assert_eq!(
             store
-                .record_image_generation_grant(Scope::Once, &project_id, &plan, authority)
+                .record_image_generation_grant(Scope::Once, &project_id, &plan, &binding, authority)
                 .await,
             Err(StoreError::OnceNotPersistable)
         );
         assert_eq!(
             store
-                .record_image_generation_grant(Scope::Global, &project_id, &plan, authority)
+                .record_image_generation_grant(
+                    Scope::Global,
+                    &project_id,
+                    &plan,
+                    &binding,
+                    authority
+                )
                 .await,
             Err(StoreError::ImageGenerationNoGlobalScope)
         );
@@ -3881,60 +3929,77 @@ mod mcp_server_connect_grant_tests {
         let (store, _sid, project_id) =
             ig_test_store(tmp.path(), global.path().to_path_buf()).await;
         let plan = "b".repeat(64);
+        let binding = "d".repeat(64);
         let authority = "out-authority-digest";
 
         // No grant initially.
         assert_eq!(
-            store.image_generation_grant_scope(&project_id, &plan).await,
+            store
+                .image_generation_grant_scope(&project_id, &plan, &binding)
+                .await,
             None
         );
 
         // Session-scope grant round-trips and matches the current session.
         store
-            .record_image_generation_grant(Scope::Session, &project_id, &plan, authority)
+            .record_image_generation_grant(Scope::Session, &project_id, &plan, &binding, authority)
             .await
             .unwrap();
         assert_eq!(
-            store.image_generation_grant_scope(&project_id, &plan).await,
+            store
+                .image_generation_grant_scope(&project_id, &plan, &binding)
+                .await,
             Some(Scope::Session)
+        );
+        assert_eq!(
+            store
+                .image_generation_grant_scope(&project_id, &plan, &"e".repeat(64))
+                .await,
+            None
         );
         // Revoking the session grant prevents reuse.
         assert_eq!(
             store
-                .revoke_image_generation_grant(Scope::Session, &project_id, &plan)
+                .revoke_image_generation_grant(Scope::Session, &project_id, &plan, &binding)
                 .await,
             1
         );
         assert_eq!(
-            store.image_generation_grant_scope(&project_id, &plan).await,
+            store
+                .image_generation_grant_scope(&project_id, &plan, &binding)
+                .await,
             None
         );
 
         // Project-scope grant round-trips and matches via project_id.
         store
-            .record_image_generation_grant(Scope::Project, &project_id, &plan, authority)
+            .record_image_generation_grant(Scope::Project, &project_id, &plan, &binding, authority)
             .await
             .unwrap();
         assert_eq!(
-            store.image_generation_grant_scope(&project_id, &plan).await,
+            store
+                .image_generation_grant_scope(&project_id, &plan, &binding)
+                .await,
             Some(Scope::Project)
         );
         // Membership audit: a foreign project_id never matches a project grant.
         assert_eq!(
             store
-                .image_generation_grant_scope("other-project", &plan)
+                .image_generation_grant_scope("other-project", &plan, &binding)
                 .await,
             None
         );
         // Revoking the project grant prevents reuse.
         assert_eq!(
             store
-                .revoke_image_generation_grant(Scope::Project, &project_id, &plan)
+                .revoke_image_generation_grant(Scope::Project, &project_id, &plan, &binding)
                 .await,
             1
         );
         assert_eq!(
-            store.image_generation_grant_scope(&project_id, &plan).await,
+            store
+                .image_generation_grant_scope(&project_id, &plan, &binding)
+                .await,
             None
         );
     }

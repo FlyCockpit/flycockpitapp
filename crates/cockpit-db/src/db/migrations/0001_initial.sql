@@ -3075,6 +3075,11 @@ CREATE TABLE image_generation_grants (
         length(plan_digest) = 64 AND plan_digest = lower(plan_digest)
         AND plan_digest NOT GLOB '*[^0-9a-f]*'
     ),
+    destination_binding_digest TEXT NOT NULL CHECK (
+        length(destination_binding_digest) = 64
+        AND destination_binding_digest = lower(destination_binding_digest)
+        AND destination_binding_digest NOT GLOB '*[^0-9a-f]*'
+    ),
     output_path_authority TEXT    NOT NULL CHECK (length(CAST(output_path_authority AS BLOB)) BETWEEN 1 AND 255),
     verdict               TEXT    NOT NULL DEFAULT 'allow'
         CHECK (verdict IN ('allow', 'reject')),
@@ -3087,7 +3092,7 @@ CREATE TABLE image_generation_grants (
 -- `ifnull` collapses the NULL session_id of project-scope rows so two
 -- project-scope allow grants for the same plan cannot coexist.
 CREATE UNIQUE INDEX uq_image_generation_grants_match
-    ON image_generation_grants (scope, ifnull(session_id, ''), project_id, plan_digest, verdict);
+    ON image_generation_grants (scope, ifnull(session_id, ''), project_id, plan_digest, destination_binding_digest, verdict);
 
 CREATE INDEX idx_image_generation_grants_session ON image_generation_grants (session_id);
 CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (project_id, plan_digest);

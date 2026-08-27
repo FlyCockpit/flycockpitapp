@@ -273,6 +273,10 @@ pub struct Session {
     /// daemon's skill inventory reads this snapshot so conditional Hermes
     /// activation matches execution, including config tools and grants.
     active_tool_names: Mutex<std::collections::HashSet<String>>,
+    /// Session-owned image-generation dispatch funnel installed by the daemon
+    /// worker before agent turns begin. Isolated/test sessions leave it absent.
+    image_generation_dispatch:
+        Mutex<Option<Arc<crate::image_generation_job::ImageGenerationDispatchService>>>,
     active_sandbox_escalate_eligible: AtomicBool,
     /// 6-char human-display id, unique within `project_id`
     /// (GOALS §17b). Populated at create-time; backfilled lazily for
@@ -449,6 +453,18 @@ pub(crate) fn test_redaction_key_resolver()
 }
 
 impl Session {
+    pub(crate) fn set_image_generation_dispatch(
+        &self,
+        service: Arc<crate::image_generation_job::ImageGenerationDispatchService>,
+    ) {
+        *crate::sync::lock_or_recover(&self.image_generation_dispatch) = Some(service);
+    }
+
+    pub(crate) fn image_generation_dispatch(
+        &self,
+    ) -> Option<Arc<crate::image_generation_job::ImageGenerationDispatchService>> {
+        crate::sync::lock_or_recover(&self.image_generation_dispatch).clone()
+    }
     /// Durable 6-char display id. Collision retry at persist can replace the
     /// value assigned at `create_deferred`.
     pub fn short_id(&self) -> String {

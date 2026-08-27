@@ -966,6 +966,7 @@ struct CurrentIdentity {
     immutable: String,
     location: ImageLocationClass,
     adapter_kind: ImageAdapterKind,
+    allow_insecure_transport: bool,
     enabled: bool,
     refresh_authority: Option<RefreshAuthority>,
 }
@@ -1050,6 +1051,52 @@ impl ImageRuntimeRegistry {
             }
         }
         None
+    }
+
+    /// Refresh every enabled configured target against the exact registry
+    /// revision. Individual target failures are retained as health snapshots;
+    /// they do not prevent other targets from becoming discoverable.
+    pub async fn refresh_configured_targets(
+        &self,
+        config: &ImageGenerationConfig,
+        generation: u64,
+        epoch: u64,
+    ) {
+        let endpoints: HashMap<&str, &ImageEndpoint> = config
+            .endpoints()
+            .iter()
+            .map(|endpoint| (endpoint.id.as_str(), endpoint))
+            .collect();
+        for (index, target) in config.targets().iter().enumerate() {
+            let Some(endpoint) = endpoints.get(target.endpoint_id.as_str()) else {
+                continue;
+            };
+            if !target.enabled || !endpoint.enabled {
+                continue;
+            }
+            let credential_material = endpoint
+                .credential_ref
+                .as_deref()
+                .and_then(|name| self.secret_lookup(name))
+                .unwrap_or_default();
+            let credential_identity_digest = CredentialIdentityDigest::from_sha256(
+                Sha256::digest(credential_material.as_bytes()).into(),
+            );
+            let request_id = u64::try_from(index + 1).unwrap_or(u64::MAX);
+            if let Err(error) = self
+                .refresh(
+                    (*endpoint).clone(),
+                    target.id.clone(),
+                    ConfigRevision::new(generation, epoch),
+                    request_id,
+                    RefreshKind::Capabilities,
+                    credential_identity_digest,
+                )
+                .await
+            {
+                tracing::warn!(target_id = %target.id, %error, "image generation target refresh failed");
+            }
+        }
     }
 
     pub(crate) fn resolve_ephemeral_headers(
@@ -1192,6 +1239,7 @@ impl ImageRuntimeRegistry {
             immutable: endpoint.immutable_identity(),
             location: endpoint.location,
             adapter_kind: endpoint.adapter,
+            allow_insecure_transport: endpoint.allow_insecure_transport,
             enabled: endpoint.enabled,
             refresh_authority: None,
         };
@@ -1503,6 +1551,105 @@ impl ImageRuntimeRegistry {
         // Stable ordering by target_id so discovery output is deterministic.
         out.sort_by(|a, b| a.target_id.cmp(&b.target_id));
         out
+    }
+
+    /// Digest the current sealed authority identity for a resolved destination
+    /// set. This binds standing approvals to the endpoint origin, credential,
+    /// target configuration, and discovered model/workflow identities without
+    /// exposing any of those values to the approval prompt or grant table.
+    pub fn destination_grant_binding_digest(&self, target_ids: &[String]) -> Option<String> {
+        let now = self.clock.now_millis();
+        let mut target_ids = target_ids.to_vec();
+        target_ids.sort();
+        target_ids.dedup();
+        let mut digest = Sha256::new();
+        for target_id in target_ids {
+            let target = self
+                .inner
+                .current_targets
+                .lock()
+                .unwrap()
+                .get(&target_id)
+                .cloned()?;
+            let snapshot = self.snapshot(&target.endpoint, &target_id)?;
+            if !snapshot.dispatchable_at(now)
+                || snapshot.target_immutable_identity != target.immutable
+                || snapshot.config_generation != target.generation
+                || snapshot.refresh_epoch != target.epoch
+            {
+                return None;
+            }
+            let credential = snapshot.credential_identity_digest.as_ref()?;
+            let workflow = snapshot.model_or_workflow_digest.as_deref()?;
+            let credential_digest = credential.plan_identity_hex();
+            for field in [
+                target_id.as_str(),
+                snapshot.endpoint_origin.as_str(),
+                snapshot.target_immutable_identity.as_str(),
+                workflow,
+                credential_digest.as_str(),
+            ] {
+                digest.update((field.len() as u64).to_be_bytes());
+                digest.update(field.as_bytes());
+            }
+        }
+        Some(crate::intel::hex_lower(&digest.finalize()))
+    }
+
+    /// Resolve a configured target into the redacted authorization projection
+    /// and hard-gate facts backed by its current sealed health snapshot.
+    pub fn resolve_dispatch_target(
+        &self,
+        target_id: &str,
+    ) -> Option<(
+        crate::image_generation_agent_tools::ProjectionDestination,
+        bool,
+        bool,
+        bool,
+    )> {
+        use crate::image_generation_agent_tools::{LocationClass, ProjectionDestination};
+        let target = self
+            .inner
+            .current_targets
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .cloned()?;
+        let endpoint = self
+            .inner
+            .current
+            .lock()
+            .unwrap()
+            .get(&target.endpoint)
+            .cloned()?;
+        let snapshot = self.snapshot(&target.endpoint, target_id);
+        let current_snapshot = snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.target_immutable_identity == target.immutable
+                && snapshot.config_generation == target.generation
+                && snapshot.refresh_epoch == target.epoch
+        });
+        let capability_fresh = current_snapshot
+            && snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.dispatchable_at(self.clock.now_millis()));
+        let location_class = match endpoint.location {
+            ImageLocationClass::Local => LocationClass::Local,
+            ImageLocationClass::PrivateNetwork => LocationClass::PrivateNetwork,
+            ImageLocationClass::PublicCloud => LocationClass::PublicCloud,
+        };
+        let secure_transport = snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.endpoint_origin.starts_with("https://"));
+        Some((
+            ProjectionDestination {
+                target_id: target_id.to_owned(),
+                location_class,
+                adapter_kind: adapter_kind_str(endpoint.adapter_kind).to_owned(),
+            },
+            target.enabled && endpoint.enabled,
+            capability_fresh,
+            secure_transport || endpoint.allow_insecure_transport,
+        ))
     }
     pub async fn refresh(
         &self,

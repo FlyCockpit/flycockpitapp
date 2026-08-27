@@ -1194,7 +1194,11 @@ impl Approver {
             return false;
         };
         self.store
-            .image_generation_grant_scope(&session.project_id, facts.plan_digest.as_str())
+            .image_generation_grant_scope(
+                &session.project_id,
+                facts.plan_digest.as_str(),
+                facts.destination_grant_binding_digest,
+            )
             .await
             .is_some()
     }
@@ -1295,27 +1299,25 @@ impl Approver {
                 },
             )
             .await?;
-        // Persist a standing grant for a non-Once allow so a future matching
-        // request short-circuits the prompt. Best-effort: a persistence failure
-        // is logged but does not strand the already-authorized turn — the next
-        // matching request simply re-prompts (fail-closed on the match seam).
+        // Persist a standing grant for a non-Once allow before returning the
+        // decision. A persistence failure must not silently turn the user's
+        // session/project choice into a one-time allow.
         if let Decision::Allow {
             scope: scope @ (Scope::Session | Scope::Project),
         } = decision
         {
             if let Some(session) = self.session.as_deref() {
-                if let Err(error) = self
-                    .store
+                self.store
                     .record_image_generation_grant(
                         scope,
                         &session.project_id,
                         &plan_digest,
+                        facts.destination_grant_binding_digest,
                         &output_path_authority,
                     )
-                    .await
-                {
-                    tracing::warn!(?error, "image generation grant persistence failed");
-                }
+                    .await?;
+            } else {
+                anyhow::bail!("image generation standing grant requires an attached session");
             }
         }
         Ok(decision)

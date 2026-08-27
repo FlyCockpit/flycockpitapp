@@ -4004,7 +4004,7 @@ impl Driver {
             cancel: tokio_util::sync::CancellationToken::new(),
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
-            image_generation_dispatch: None,
+            image_generation_dispatch: self.session.image_generation_dispatch(),
             deferred_log: self
                 .stack
                 .last()

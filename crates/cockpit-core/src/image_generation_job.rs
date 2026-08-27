@@ -1834,6 +1834,7 @@ pub struct ImageGenerationDispatchService {
     boot_id: uuid::Uuid,
     principal: ClientPrincipal,
     config_generation: u64,
+    base_tier_known_cost_threshold_usd_micros: u64,
     clock: std::sync::Arc<dyn crate::media_reservation::MonotonicClock>,
 }
 
@@ -1844,6 +1845,7 @@ impl ImageGenerationDispatchService {
         boot_id: uuid::Uuid,
         principal: ClientPrincipal,
         config_generation: u64,
+        base_tier_known_cost_threshold_usd_micros: u64,
         clock: std::sync::Arc<dyn crate::media_reservation::MonotonicClock>,
     ) -> Self {
         Self {
@@ -1852,6 +1854,7 @@ impl ImageGenerationDispatchService {
             boot_id,
             principal,
             config_generation,
+            base_tier_known_cost_threshold_usd_micros,
             clock,
         }
     }
@@ -2012,6 +2015,19 @@ impl ImageGenerationDispatchService {
         };
         let plan_digest = plan_projection_digest(&projection)?;
 
+        let target_ids: Vec<String> = args
+            .targets
+            .iter()
+            .map(|target| target.target_id.clone())
+            .collect();
+        let Some(destination_grant_binding_digest) =
+            self.registry.destination_grant_binding_digest(&target_ids)
+        else {
+            return Ok(GenerateImageDispatchOutcome::Refused {
+                reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+            });
+        };
+
         // (5) Hard gates sourced from the registry health / capability /
         // transport snapshot per resolved destination.
         let (destination_enabled, capability_fresh, insecure_transport_allowed) =
@@ -2021,12 +2037,13 @@ impl ImageGenerationDispatchService {
         let decision = approver
             .authorize(AuthorizationRequest::ImageGeneration {
                 plan_digest: &plan_digest,
+                destination_grant_binding_digest: &destination_grant_binding_digest,
                 destinations: destinations.as_slice(),
                 fanout,
                 total_outputs,
                 cost_maximum,
                 reference_egress_unmatched,
-                base_threshold_usd_micros: BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS,
+                base_threshold_usd_micros: self.base_tier_known_cost_threshold_usd_micros,
                 spend_request,
                 spend_session,
                 spend_project,
@@ -2205,17 +2222,14 @@ impl ImageGenerationDispatchService {
         &self,
         args: &GenerateImageDispatchArgs,
     ) -> Result<Option<Vec<ProjectionDestination>>> {
-        // Bind preflight to the live registry adapter set.
-        let _registry = self.registry.as_ref();
         let mut destinations = Vec::with_capacity(args.targets.len());
         for target in &args.targets {
-            // No sealed destination is resolvable until the daemon destination
-            // map is installed (see the method-level TODO).
-            let resolved: Option<ProjectionDestination> = None;
-            if let Some(destination) = resolved {
-                destinations.push(destination);
-            }
-            let _ = target;
+            let Some((destination, _, _, _)) =
+                self.registry.resolve_dispatch_target(&target.target_id)
+            else {
+                return Ok(None);
+            };
+            destinations.push(destination);
         }
         if destinations.len() != args.targets.len() {
             return Ok(None);
@@ -2236,8 +2250,21 @@ impl ImageGenerationDispatchService {
         &self,
         destinations: &[ProjectionDestination],
     ) -> Result<(bool, bool, bool)> {
-        let _ = (self.registry.as_ref(), destinations);
-        Ok((false, false, false))
+        let mut enabled = true;
+        let mut fresh = true;
+        let mut transport_allowed = true;
+        for destination in destinations {
+            let Some((_, target_enabled, capability_fresh, insecure_transport_allowed)) = self
+                .registry
+                .resolve_dispatch_target(&destination.target_id)
+            else {
+                return Ok((false, false, false));
+            };
+            enabled &= target_enabled;
+            fresh &= capability_fresh;
+            transport_allowed &= insecure_transport_allowed;
+        }
+        Ok((enabled, fresh, transport_allowed))
     }
 
     /// Map the three [`BudgetPolicy`] scopes onto [`SpendPolicyChoice`]. An

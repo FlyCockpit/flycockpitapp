@@ -2940,7 +2940,7 @@ async fn handle_send_user_message_v2(
                         tracing::warn!(%error, %session_id, "terminal V2 replay media ownership cleanup remains retryable");
                     }
                     return Err(ErrorPayload {
-                        code: ErrorCode::UserMessageNotAccepted,
+                        code: ErrorCode::UserMessageTerminated,
                         message: "message was durably rejected after acceptance".into(),
                     });
                 }
@@ -2953,7 +2953,7 @@ async fn handle_send_user_message_v2(
                         tracing::warn!(%error, %session_id, "removed V2 replay media ownership cleanup remains retryable");
                     }
                     return Err(ErrorPayload {
-                        code: ErrorCode::UserMessageNotAccepted,
+                        code: ErrorCode::UserMessageTerminated,
                         message: "message was durably removed after acceptance".into(),
                     });
                 }
@@ -2998,7 +2998,7 @@ async fn handle_send_user_message_v2(
                     tracing::warn!(%cleanup_error, %session_id, "rejected V2 media ownership cleanup remains retryable");
                 }
                 return Err(ErrorPayload {
-                    code: ErrorCode::UserMessageNotAccepted,
+                    code: ErrorCode::UserMessageTerminated,
                     message: "message was durably rejected after acceptance".into(),
                 });
             }
@@ -3056,7 +3056,7 @@ async fn handle_send_user_message_v2(
                 tracing::warn!(%cleanup_error, %session_id, "failed V2 handoff media ownership cleanup remains retryable");
             }
             Err(ErrorPayload {
-                code: ErrorCode::UserMessageNotAccepted,
+                code: ErrorCode::UserMessageTerminated,
                 message: "message was durably rejected after acceptance".into(),
             })
         }

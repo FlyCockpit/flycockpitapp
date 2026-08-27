@@ -27777,7 +27777,7 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     drop(respond_to);
     let (mut state, result) = first.await.unwrap();
     let error = result.expect_err("lost worker response is durably rejected");
-    assert_eq!(error.code, ErrorCode::UserMessageNotAccepted);
+    assert_eq!(error.code, ErrorCode::UserMessageTerminated);
     let terminal = ctx
         .db
         .message_receipt_status(session_id, *first_operation_id.as_bytes())
@@ -27823,7 +27823,7 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     let retry_result = handle_request(request(first_operation_id, first_id), &mut state, &ctx)
         .await
         .expect_err("same-UUID retry replays the durable terminal rejection");
-    assert_eq!(retry_result.code, ErrorCode::UserMessageNotAccepted);
+    assert_eq!(retry_result.code, ErrorCode::UserMessageTerminated);
 }
 
 #[tokio::test]

@@ -223,9 +223,12 @@ fn classify_bulk_user_message_upload_error(
 
 fn classify_user_message_response(
     response: Result<Response, proto::ErrorPayload>,
-) -> Result<Vec<proto::QueueItem>, UserSubmissionSendError> {
+) -> Result<Option<Vec<proto::QueueItem>>, UserSubmissionSendError> {
     match response {
-        Ok(Response::UserMessageQueued { queue, .. }) => Ok(queue),
+        Ok(Response::UserMessageQueued { queue, .. }) => Ok(Some(queue)),
+        // A materialized durable receipt replays as Ack. It is final success,
+        // but carries no authoritative queue snapshot to publish.
+        Ok(Response::Ack) => Ok(None),
         Ok(_) => Err(UserSubmissionSendError::Ambiguous(
             "daemon returned an unexpected response to send_user_message".to_string(),
         )),
@@ -2634,8 +2637,12 @@ async fn try_spawn_inner(
                     };
                     match response {
                         Ok(response) => {
-                            let queue = classify_user_message_response(response)?;
-                            if let Some(operation_id) = dispatched_operation_id {
+                            let classified = classify_user_message_response(response);
+                            if matches!(
+                                &classified,
+                                Ok(_) | Err(UserSubmissionSendError::Rejected(_))
+                            ) && let Some(operation_id) = dispatched_operation_id
+                            {
                                 let mut operations = local_message_operation_ids
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2647,14 +2654,20 @@ async fn try_spawn_inner(
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                                     .remove(&client_submission_id);
                             }
-                            push_turn_event(
-                                &events,
-                                &event_notify,
-                                intended_attachment_epoch,
-                                TurnEvent::QueueUpdated {
-                                    queue: queue.into_iter().map(queue_item_from_proto).collect(),
-                                },
-                            );
+                            let queue = classified?;
+                            if let Some(queue) = queue {
+                                push_turn_event(
+                                    &events,
+                                    &event_notify,
+                                    intended_attachment_epoch,
+                                    TurnEvent::QueueUpdated {
+                                        queue: queue
+                                            .into_iter()
+                                            .map(queue_item_from_proto)
+                                            .collect(),
+                                    },
+                                );
+                            }
                             Ok(())
                         }
                         Err(error) => {
@@ -5514,7 +5527,9 @@ mod tests {
                             }
                         }
                         if !first_response_dropped.swap(true, Ordering::SeqCst) {
-                            classify_user_message_response(Ok(Response::Ack)).map(|_| ())
+                            Err(UserSubmissionSendError::Ambiguous(
+                                "response was lost after durable acceptance".to_string(),
+                            ))
                         } else {
                             Ok(())
                         }
@@ -5841,6 +5856,28 @@ mod tests {
                 Err(UserSubmissionSendError::Ambiguous(_))
             ));
         }
+    }
+
+    #[test]
+    fn durable_message_terminal_and_replay_outcomes_are_final() {
+        assert!(matches!(
+            classify_user_message_response(Ok(Response::Ack)),
+            Ok(None)
+        ));
+        assert!(matches!(
+            classify_user_message_response(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageTerminated,
+                message: "durably terminal".to_string(),
+            })),
+            Err(UserSubmissionSendError::Rejected(_))
+        ));
+        assert!(matches!(
+            classify_user_message_response(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageNotAccepted,
+                message: "retry after repair".to_string(),
+            })),
+            Err(UserSubmissionSendError::NotAccepted(_))
+        ));
     }
 
     #[tokio::test]

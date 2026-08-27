@@ -4630,9 +4630,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_name_repaired_write_reconciles_after_a_newer_assistant_exists() {
+    async fn signed_name_repaired_write_is_not_elided_by_later_ordinary_dispatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolBox::new().with(Arc::new(crate::tools::write::WriteTool));
+        let tools = ToolBox::new()
+            .with(Arc::new(crate::tools::write::WriteTool))
+            .with(Arc::new(crate::tools::read::ReadTool));
         let agent = test_agent(tools.clone());
         let session = test_session(tmp.path());
         let model = test_model();
@@ -4681,10 +4683,26 @@ mod tests {
             content
         );
 
-        history.push(Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::text("next turn")],
-        });
+        let follow_up = tool_call("read", serde_json::json!({ "path": "signed.rs" }));
+        push_assistant_call(&mut history, &follow_up);
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &follow_up,
+            "read",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_tool_call(&history).function.name, "Write");
+        assert_eq!(
+            first_tool_call(&history).function.arguments["content"],
+            serde_json::json!(content),
+            "ordinary dispatch must defer settled signed calls to canonical inference reconciliation"
+        );
+
         assert_eq!(
             crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
                 &session,

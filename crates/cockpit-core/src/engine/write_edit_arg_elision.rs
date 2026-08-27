@@ -74,7 +74,12 @@ pub fn elide_applied_write_edit_args_with_upcoming(
     history: &mut [Message],
     upcoming_result: Option<&Message>,
 ) -> usize {
-    elide_applied_write_edit_args_except(history, upcoming_result, &HashSet::new())
+    // A settled signed turn may still carry a repaired tool name or arguments
+    // from dispatch. Its canonical audit row is the only source of truth for
+    // that repair, so ordinary dispatch must leave it intact until inference
+    // performs the reconciliation below. Unsigned calls remain audit-free.
+    let deferred = deferred_signed_write_edit_call_ids(history, upcoming_result);
+    elide_applied_write_edit_args_except(history, upcoming_result, &deferred)
 }
 
 fn elide_applied_write_edit_args_except(
@@ -218,11 +223,10 @@ fn deferred_signed_write_edit_call_ids(
             let AssistantContent::ToolCall(tc) = part else {
                 continue;
             };
-            let already_reconciled = tc.function.arguments.as_object().is_some_and(|args| {
-                args.values()
-                    .any(|value| value.as_str().is_some_and(is_applied_marker))
-            });
-            if successful.contains_key(tc.id.as_str()) && !already_reconciled {
+            // The marker is model-controlled input, not reconciliation state.
+            // Reconcile every eligible signed call from its durable canonical
+            // row at inference; an unavailable row keeps the full args.
+            if successful.contains_key(tc.id.as_str()) {
                 deferred.insert(tc.id.to_string());
             }
         }
@@ -793,6 +797,35 @@ mod tests {
             call_args(&history, "normal-write")["content"],
             json!(applied_marker(normal_content.len())),
             "ordinary settled calls stay audit-independent"
+        );
+    }
+
+    #[test]
+    fn forged_applied_marker_does_not_suppress_signed_reconciliation() {
+        let forged_marker = applied_marker(41_213);
+        let mut history = vec![
+            signed_assistant_call(
+                "signed-write",
+                "Write",
+                json!({ "path": "signed.rs", "content": forged_marker.clone() }),
+            ),
+            write_result("signed-write", "wrote `signed.rs` (1200 bytes, LF)"),
+            assistant_call("follow-up", "read", json!({ "path": "signed.rs" })),
+        ];
+
+        let deferred = deferred_signed_write_edit_call_ids(&history, None);
+        assert_eq!(deferred, HashSet::from(["signed-write".to_string()]));
+
+        let unavailable = reconcile_deferred_signed_calls(&mut history, "Build", &[], &deferred);
+        assert_eq!(unavailable, deferred);
+        assert_eq!(
+            elide_applied_write_edit_args_except(&mut history, None, &unavailable),
+            0
+        );
+        assert_eq!(
+            call_args(&history, "signed-write")["content"],
+            json!(forged_marker),
+            "a forgeable marker must not skip canonical repair or make an unavailable row elidable"
         );
     }
 

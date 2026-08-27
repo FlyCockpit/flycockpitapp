@@ -1038,6 +1038,116 @@ async fn begin_delegation_shrink_eager_on_no_cache() {
 }
 
 #[tokio::test]
+async fn compact_delegation_draft_elides_a_settled_large_write_before_model_inference() {
+    use crate::config::providers::{ShrinkConfig, ShrinkStrategy};
+    use rig::message::{AssistantContent, ToolCall, ToolFunction};
+
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("delegation compact draft".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+    driver
+        .session
+        .set_active_model("lmstudio", "local")
+        .unwrap();
+    let (mut providers, provider_id, model_id) = driver
+        .active_providers_config()
+        .expect("test driver has an active provider and model");
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("test provider")
+        .shrink = ShrinkConfig {
+        strategy: ShrinkStrategy::Compact,
+        margin_secs: 30,
+    };
+    driver.test_providers_override = Some((providers, provider_id, model_id));
+
+    let mut content = String::new();
+    while crate::tokens::count(&content) < 140 {
+        content.push_str("fn large_write_payload() { preserve_this_exact_source(); }\n");
+    }
+    let call = |id: &str, name: &str, arguments| Message::Assistant {
+        id: None,
+        content: vec![AssistantContent::ToolCall(ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+            provider: None,
+            function: ToolFunction {
+                name: name.to_string(),
+                arguments,
+            },
+            signature: None,
+            additional_params: None,
+        })],
+    };
+    driver.stack[0].history = vec![
+        call(
+            "write-large",
+            "write",
+            serde_json::json!({ "path": "big.rs", "content": content.clone() }),
+        ),
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "write-large".to_string(),
+            None,
+            None,
+            "write",
+            "wrote `big.rs` (1200 bytes, LF)".to_string(),
+        ),
+        call(
+            "spawn-child",
+            "task",
+            serde_json::json!({ "agent": "explore", "prompt": "inspect big.rs" }),
+        ),
+    ];
+    let parent_full = driver.stack[0].history.clone();
+
+    let (tracker, handle) = driver.begin_delegation_shrink(parent_full);
+    assert_eq!(tracker.strategy(), ShrinkStrategy::Compact);
+    let shrunk = handle.expect("eager compact shrink task").await.unwrap();
+    assert_eq!(
+        shrunk,
+        vec![Message::user(
+            "[delegation-shrink — parent context summarized while a sub-agent ran]\n\ndelegation compact draft"
+        )]
+    );
+
+    let captured: Vec<_> = provider
+        .captured()
+        .into_iter()
+        .filter(|request| request.request_line.starts_with("POST "))
+        .collect();
+    assert_eq!(captured.len(), 1, "one compact draft inference");
+    let request = serde_json::to_string(&captured[0].body).unwrap();
+    assert!(
+        request.contains(&crate::engine::write_edit_arg_elision::applied_marker(
+            content.len()
+        )),
+        "compact draft must receive the common projected history"
+    );
+    assert!(
+        !request.contains(&content),
+        "the large applied write must not reach the compact draft model"
+    );
+    let Message::Assistant {
+        content: full_content,
+        ..
+    } = &driver.stack[0].history[0]
+    else {
+        panic!("write call must stay in the paused parent history");
+    };
+    let AssistantContent::ToolCall(full_call) = &full_content[0] else {
+        panic!("paused parent history must keep the write tool call");
+    };
+    assert_eq!(
+        full_call.function.arguments["content"],
+        serde_json::json!(content),
+        "the paused parent history remains full fidelity"
+    );
+}
+
+#[tokio::test]
 async fn resolve_child_cwd_accepts_relative_dot_and_absolute_inside_workspace() {
     let (driver, tmp) = test_driver(8);
     let child_dir = tmp.path().join("child");

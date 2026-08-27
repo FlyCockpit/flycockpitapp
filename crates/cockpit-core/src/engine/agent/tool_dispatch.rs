@@ -697,7 +697,6 @@ async fn execute_ordinary_call_unscoped(
     let mut tool_was_dispatched = false;
     let mut verification_disclosure: Option<String> = None;
     let mut verification_blocked = false;
-    let verification_original_args = args.clone();
     let mut verification_dispatch_plan: Option<
         crate::engine::verification::intercept::VerificationDispatchPlan,
     > = None;
@@ -869,18 +868,16 @@ async fn execute_ordinary_call_unscoped(
                     Some(crate::db::needs_attention::InterruptVerificationMemo {
                         operation_id,
                         dispatch_attempt_revision: -1,
-                        on_failure_dispatch_original: false,
                         outcome: crate::db::needs_attention::InterruptVerificationOutcome::Block {
                             message: message.clone(),
                         },
                     });
-                (Ok(ToolOutput::text(message)), 0)
+                (Err(invalid_input(message)), 0)
             }
             crate::engine::verification::VerificationOutcome::Revise {
                 args: revised_args,
                 disclosure,
                 mut plan,
-                on_failure_dispatch_original,
             } => {
                 let operation_id = plan.operation_id;
                 match env
@@ -907,7 +904,6 @@ async fn execute_ordinary_call_unscoped(
                     Some(crate::db::needs_attention::InterruptVerificationMemo {
                         operation_id,
                         dispatch_attempt_revision: plan.attempt_revision,
-                        on_failure_dispatch_original,
                         outcome: crate::db::needs_attention::InterruptVerificationOutcome::Revise {
                             args: revised_args.clone(),
                             disclosure: disclosure.clone(),
@@ -936,18 +932,17 @@ async fn execute_ordinary_call_unscoped(
                         Some(crate::db::needs_attention::InterruptVerificationMemo {
                             operation_id,
                             dispatch_attempt_revision: -1,
-                            on_failure_dispatch_original: false,
                             outcome:
                                 crate::db::needs_attention::InterruptVerificationOutcome::Block {
                                     message: message.clone(),
                                 },
                         });
-                    (Ok(ToolOutput::text(message)), 0)
+                    (Err(invalid_input(message)), 0)
                 } else {
                     args = revised_args;
                     payload.args = args.clone();
                     tool_was_dispatched = true;
-                    let mut dispatched =
+                    let dispatched =
                         crate::engine::interrupt::with_interrupt_park_payload(payload, async {
                             dispatch_one_timed(
                                 env.active_tools,
@@ -959,53 +954,8 @@ async fn execute_ordinary_call_unscoped(
                             .await
                         })
                         .await;
-                    let revised_failed = dispatched.0.is_err();
-                    if revised_failed && on_failure_dispatch_original {
-                        let failure_digest = crate::db::verification_ledger::VerificationDigest::of(
-                            dispatched
-                                .0
-                                .as_ref()
-                                .err()
-                                .map(ToString::to_string)
-                                .unwrap_or_default()
-                                .as_bytes(),
-                        );
-                        if let Err(error) = env.session.db.settle_verification_dispatch(
-                            env.session.id,
-                            plan.operation_id,
-                            plan.attempt_revision,
-                            crate::db::verification_ledger::DispatchSettlement::Failed,
-                            crate::db::verification_ledger::RedactedVerificationJson::dispatch_final_error(failure_digest),
-                            chrono::Utc::now().timestamp_millis(),
-                        ).await {
-                            tracing::warn!(%error, operation_id = %plan.operation_id, "failed revised verification attempt could not settle before fallback");
-                        }
-                        rewrite_assistant_tool_call(
-                            history,
-                            tc.id.as_str(),
-                            &verification_original_args,
-                        );
-                        args = verification_original_args.clone();
-                        dispatched = dispatch_one_timed(
-                            env.active_tools,
-                            resolved_name,
-                            args.clone(),
-                            env.ctx,
-                            Some(&tc.id),
-                        )
-                        .await;
-                    }
-                    verification_disclosure = Some(
-                        if revised_failed && on_failure_dispatch_original {
-                            "[cockpit] verification's selected revision failed validation; the original change was attempted under onAdjudicationFailure=dispatch_original"
-                            .to_string()
-                        } else {
-                            disclosure
-                        },
-                    );
-                    if !(revised_failed && on_failure_dispatch_original) {
-                        verification_dispatch_plan = Some(plan);
-                    }
+                    verification_disclosure = Some(disclosure);
+                    verification_dispatch_plan = Some(plan);
                     dispatched
                 }
             }
@@ -1039,7 +989,6 @@ async fn execute_ordinary_call_unscoped(
                     crate::db::needs_attention::InterruptVerificationMemo {
                         operation_id,
                         dispatch_attempt_revision: plan.attempt_revision,
-                        on_failure_dispatch_original: false,
                         outcome: crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal,
                     },
                 );

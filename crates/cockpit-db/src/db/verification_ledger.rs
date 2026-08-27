@@ -1759,8 +1759,16 @@ impl Db {
         now_unix_ms: i64,
     ) -> Result<VerificationDispatchAttemptRow> {
         self.transaction(move |conn| {
+            let operation = required_operation(conn, session_id, operation_id)?;
+            ensure!(
+                operation.state == VerificationOperationState::Dispatching,
+                "terminal verification operation cannot enter host execution"
+            );
             let attempt = load_attempt(conn, session_id, operation_id)?.context("verification dispatch attempt is missing")?;
-            if attempt.state.is_terminal() { return Ok(attempt); }
+            ensure!(
+                !attempt.state.is_terminal(),
+                "terminal verification dispatch attempt cannot re-enter host execution"
+            );
             if attempt.state == VerificationDispatchState::Executing {
                 return Ok(attempt);
             }
@@ -3303,6 +3311,40 @@ mod tests {
         db.close_verification_collection(session_id, created.operation_id, collecting.revision, 9)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verification_ledger_db_terminal_dispatch_cannot_reenter_execution() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, agent_id) = owner(&db, "terminal-dispatch-reentry").await;
+        let (operation_id, executing) =
+            prepared_selected_dispatch(&db, session_id, agent_id, 100).await;
+        let terminal = db
+            .settle_verification_dispatch(
+                session_id,
+                operation_id,
+                executing.revision,
+                DispatchSettlement::Failed,
+                redacted(
+                    VerificationRedactionClass::DispatchFinalError,
+                    "terminal-dispatch-failure",
+                ),
+                109,
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.state, VerificationOperationState::Failed);
+        assert!(
+            db.mark_verification_dispatch_executing(
+                session_id,
+                operation_id,
+                executing.revision + 1,
+                110,
+            )
+            .await
+            .is_err(),
+            "a terminal attempt must never authorize parked replay execution"
+        );
     }
 
     #[tokio::test]

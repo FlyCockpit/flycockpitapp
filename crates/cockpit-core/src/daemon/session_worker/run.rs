@@ -7465,6 +7465,52 @@ pub(super) async fn run_worker(
     // same one terminal boundary as live answers, resolver results, and
     // deadlines; a recovery must not have a second replay implementation.
     for row in terminal_tree_interrupt_replays {
+        if let Some(memo) = row
+            .parked
+            .as_ref()
+            .and_then(|payload| payload.verification.as_ref())
+        {
+            match session
+                .db
+                .host_verification_operation(session_id, memo.operation_id)
+                .await
+            {
+                Ok(Some(operation)) if operation.state.is_terminal() => {
+                    settle_unrecoverable_interrupt(
+                        &session,
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        row.interrupt_id,
+                        true,
+                        format!(
+                            "Interrupted request {}: its verification operation was terminalized during restart recovery.",
+                            row.interrupt_id
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::error!(
+                        interrupt_id = %row.interrupt_id,
+                        operation_id = %memo.operation_id,
+                        "verification parked replay references a missing operation; retaining exact claim for repair"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        interrupt_id = %row.interrupt_id,
+                        operation_id = %memo.operation_id,
+                        "verification parked replay state could not be proven nonterminal; retaining exact claim for repair"
+                    );
+                    continue;
+                }
+            }
+        }
         let decision_request_id = match session
             .db
             .decision_request_for_interrupt(session_id, row.interrupt_id)

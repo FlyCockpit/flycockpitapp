@@ -101,8 +101,6 @@ pub struct InterruptGateMemo {
 pub struct InterruptVerificationMemo {
     pub operation_id: uuid::Uuid,
     pub dispatch_attempt_revision: i64,
-    #[serde(default)]
-    pub on_failure_dispatch_original: bool,
     pub outcome: InterruptVerificationOutcome,
 }
 

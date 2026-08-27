@@ -13,8 +13,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::agents::{
-    EffectiveVnextGrant, ToolClass, VerificationAction, VerificationDispatch, VerificationEstimate,
-    VerificationSessionReduction, VerificationSubject,
+    GeneratorSpec, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate, ToolClass,
+    VerificationAction, VerificationBudget, VerificationEstimate, VerificationMode,
+    VerificationRecipe, VerificationRule, VerificationSelector, VerificationSubject,
 };
 use crate::db::stats::PriceTable;
 use crate::db::verification_ledger::{
@@ -50,7 +51,6 @@ pub(crate) enum VerificationOutcome {
         args: Value,
         disclosure: String,
         plan: VerificationDispatchPlan,
-        on_failure_dispatch_original: bool,
     },
 }
 
@@ -69,6 +69,92 @@ pub(crate) struct InterceptInput<'a> {
     pub resolved_name: &'a str,
     pub args: &'a Value,
     pub call_id: &'a str,
+}
+
+fn snapshot_budget(
+    region: &crate::db::agent_installations::RedactedVerificationRegion,
+) -> Result<VerificationBudget> {
+    Ok(VerificationBudget {
+        max_candidates: u16::try_from(
+            region
+                .count_ceiling
+                .context("verification snapshot lacks candidate ceiling")?,
+        )
+        .context("verification snapshot candidate ceiling exceeds u16")?,
+        max_total_tokens: region
+            .token_ceiling
+            .context("verification snapshot lacks token ceiling")?,
+        max_estimated_cost_microusd: region
+            .cost_ceiling_micros
+            .context("verification snapshot lacks cost ceiling")?,
+        max_collection_millis: region
+            .max_collection_duration_ms
+            .context("verification snapshot lacks collection duration")?,
+    })
+}
+
+fn rule_from_snapshot(
+    region: &crate::db::agent_installations::RedactedVerificationRegion,
+) -> Result<VerificationRule> {
+    let plan = region
+        .execution_plan
+        .as_ref()
+        .context("enabled verification snapshot lacks its execution plan")?;
+    let mode = match plan.mode.as_str() {
+        "gate" => VerificationMode::Gate,
+        "revise" => VerificationMode::Revise,
+        _ => anyhow::bail!("verification snapshot has an invalid mode"),
+    };
+    let on_budget_exceeded = match plan.on_budget_exceeded.as_str() {
+        "refuse" => OnBudgetExceeded::Refuse,
+        "dispatch_original" => OnBudgetExceeded::DispatchOriginal,
+        _ => anyhow::bail!("verification snapshot has an invalid budget failure policy"),
+    };
+    let on_adjudication_failure = match plan.on_adjudication_failure.as_str() {
+        "refuse" => OnAdjudicationFailure::Refuse,
+        "dispatch_original" => OnAdjudicationFailure::DispatchOriginal,
+        _ => anyhow::bail!("verification snapshot has an invalid adjudication failure policy"),
+    };
+    let generators = plan
+        .generators
+        .iter()
+        .map(|generator| GeneratorSpec {
+            slot: generator.slot.clone(),
+            recipe: match &generator.recipe {
+                crate::db::agent_installations::RedactedVerificationRecipe::Inherit => {
+                    VerificationRecipe::Inherit
+                }
+                crate::db::agent_installations::RedactedVerificationRecipe::CleanRoom {
+                    include_linked_files,
+                    last_n_reads,
+                } => VerificationRecipe::CleanRoom {
+                    include_linked_files: *include_linked_files,
+                    last_n_reads: *last_n_reads,
+                },
+            },
+            max_turns: generator.max_turns,
+        })
+        .collect();
+    let budget = snapshot_budget(region)?;
+    Ok(VerificationRule {
+        selector: VerificationSelector {
+            all_of: vec![SelectorPredicate::ToolClass {
+                tool_class: ToolClass::ArtifactWrite,
+            }],
+            any_of: Vec::new(),
+        },
+        action: VerificationAction::Verify,
+        max_candidates: Some(budget.max_candidates),
+        max_total_tokens: Some(budget.max_total_tokens),
+        max_estimated_cost_microusd: Some(budget.max_estimated_cost_microusd),
+        max_collection_millis: Some(budget.max_collection_millis),
+        adjudicator_slot: region.adjudicator_slot.clone(),
+        on_budget_exceeded: Some(on_budget_exceeded),
+        mode: Some(mode),
+        generators,
+        profile: None,
+        on_adjudication_failure: Some(on_adjudication_failure),
+    })
 }
 
 /// Resolve the dispatching agent's compiled verification policy and, in
@@ -105,21 +191,17 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
                     operation_id: memo.operation_id,
                     attempt_revision: memo.dispatch_attempt_revision,
                 },
-                on_failure_dispatch_original: memo.on_failure_dispatch_original,
             },
         };
     }
     let Some(tool_class) = classify_tool(input.resolved_name) else {
         return VerificationOutcome::Skip;
     };
-    let Some(grant) = input.agent.vnext_grant.as_ref() else {
-        return VerificationOutcome::Skip;
-    };
     let Some(instance_id) = input.ctx.agent_instance_id else {
         return VerificationOutcome::Skip;
     };
 
-    match run_verification(input, grant, tool_class, instance_id).await {
+    match run_verification(input, tool_class, instance_id).await {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(
@@ -138,7 +220,6 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
 
 async fn run_verification(
     input: InterceptInput<'_>,
-    grant: &EffectiveVnextGrant,
     tool_class: ToolClass,
     agent_instance_id: Uuid,
 ) -> Result<VerificationOutcome> {
@@ -147,83 +228,64 @@ async fn run_verification(
         tool_id: input.resolved_name,
         namespace: "host",
     };
-    let Some(rule) = grant
-        .verification
-        .as_ref()
-        .and_then(|policy| policy.select(&subject))
-    else {
-        return Ok(VerificationOutcome::Skip);
-    };
-    if rule.action == VerificationAction::Off {
-        return Ok(VerificationOutcome::Skip);
-    }
     let instance = input
         .session
         .db
         .agent_instance(input.session.id, agent_instance_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("verification agent instance is absent"))?;
-    let profile_snapshot_id = match instance.resolved_profile_snapshot_id {
-        Some(id) => id,
-        None => {
+    let (profile_snapshot_id, rule, profile_budget) =
+        if let Some(profile_snapshot_id) = instance.resolved_profile_snapshot_id {
+            let snapshot = input
+                .session
+                .db
+                .agent_profile_snapshot_by_id(input.session.id, profile_snapshot_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("verification profile snapshot is absent"))?
+                .reconstruct()?;
+            let redacted_subject = crate::db::agent_installations::RedactedVerificationSubject {
+                tool_class: Some("artifact_write".into()),
+                tool_id: Some(subject.tool_id.into()),
+                namespace: Some(subject.namespace.into()),
+            };
+            let Some(region) = snapshot
+                .verification_regions
+                .into_iter()
+                .find(|region| region.matches(&redacted_subject))
+            else {
+                return Ok(VerificationOutcome::Skip);
+            };
+            if !region.enabled {
+                return Ok(VerificationOutcome::Skip);
+            }
+            let budget = snapshot_budget(&region)?;
+            (profile_snapshot_id, rule_from_snapshot(&region)?, budget)
+        } else {
             #[cfg(test)]
             {
-                Uuid::nil()
+                let Some(grant) = input.agent.vnext_grant.as_ref() else {
+                    return Ok(VerificationOutcome::Skip);
+                };
+                let Some(rule) = grant
+                    .verification
+                    .as_ref()
+                    .and_then(|policy| policy.select(&subject))
+                    .cloned()
+                else {
+                    return Ok(VerificationOutcome::Skip);
+                };
+                if rule.action == VerificationAction::Off {
+                    return Ok(VerificationOutcome::Skip);
+                }
+                let budget = rule.requested_budget(grant.host_policy.verification_ceiling)?;
+                (Uuid::nil(), rule, budget)
             }
             #[cfg(not(test))]
             {
                 anyhow::bail!("verification requires an immutable agent profile snapshot")
             }
-        }
-    };
-    let profile_region = if profile_snapshot_id.is_nil() {
-        None
-    } else {
-        let snapshot = input
-            .session
-            .db
-            .agent_profile_snapshot_by_id(input.session.id, profile_snapshot_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("verification profile snapshot is absent"))?
-            .reconstruct()?;
-        let redacted_subject = crate::db::agent_installations::RedactedVerificationSubject {
-            tool_class: Some("artifact_write".into()),
-            tool_id: Some(input.resolved_name.into()),
-            namespace: Some("host".into()),
         };
-        snapshot
-            .verification_regions
-            .into_iter()
-            .find(|region| region.matches(&redacted_subject))
-    };
-    if !profile_snapshot_id.is_nil() && profile_region.is_none() {
-        return Ok(VerificationOutcome::Skip);
-    }
-    if profile_region
-        .as_ref()
-        .is_some_and(|region| !region.enabled)
-    {
-        return Ok(VerificationOutcome::Skip);
-    }
-    if let Some(region) = &profile_region {
-        anyhow::ensure!(
-            region.adjudicator_slot.as_deref() == rule.adjudicator_slot.as_deref()
-                && region.mode.as_deref()
-                    == Some(match rule.resolved_mode() {
-                        crate::agents::VerificationMode::Gate => "gate",
-                        crate::agents::VerificationMode::Revise => "revise",
-                    })
-                && region.generator_count == Some(rule.generators.len() as u64)
-                && region.generator_slots
-                    == rule
-                        .generators
-                        .iter()
-                        .map(|generator| generator.slot.clone())
-                        .collect::<Vec<_>>(),
-            "running verification policy disagrees with immutable profile snapshot"
-        );
-    }
-    let requested = rule.requested_budget(grant.host_policy.verification_ceiling)?;
+    let requested = profile_budget;
     let assembled = serde_json::to_string(&serde_json::json!({
         "tool": input.resolved_name,
         "args": input.args,
@@ -292,12 +354,12 @@ async fn run_verification(
             } else {
                 recipe.prompt
             };
-        let price = prices.get(model.model_id_ref());
+        let price = super::estimate::model_prices(&prices, model.model_id_ref());
         let estimate = estimate_candidate_set(CandidateSetEstimateInput {
             assembled_texts: std::slice::from_ref(&assembled_generator),
             encoding: encoding_for_model_id(model.model_id_ref()),
-            input_price_per_mtok: price.map(|price| price.input_per_mtok),
-            output_price_per_mtok: price.map(|price| price.output_per_mtok),
+            input_price_per_mtok: price.map(|price| price.0),
+            output_price_per_mtok: price.map(|price| price.1),
             max_candidates: 1,
             max_collection_millis: requested.max_collection_millis,
         });
@@ -323,12 +385,12 @@ async fn run_verification(
         None
     };
     if let Some(model) = &adjudicator_model {
-        let price = prices.get(model.model_id_ref());
+        let price = super::estimate::model_prices(&prices, model.model_id_ref());
         let estimate = estimate_candidate_set(CandidateSetEstimateInput {
             assembled_texts: std::slice::from_ref(&assembled),
             encoding: encoding_for_model_id(model.model_id_ref()),
-            input_price_per_mtok: price.map(|price| price.input_per_mtok),
-            output_price_per_mtok: price.map(|price| price.output_per_mtok),
+            input_price_per_mtok: price.map(|price| price.0),
+            output_price_per_mtok: price.map(|price| price.1),
             max_candidates: 1,
             max_collection_millis: requested.max_collection_millis,
         });
@@ -347,62 +409,26 @@ async fn run_verification(
             max_estimated_cost_microusd: cost,
             max_collection_millis: requested.max_collection_millis,
         }),
-        None if rule.max_estimated_cost_microusd.is_none() => {
-            VerificationEstimate::Known(crate::agents::VerificationBudget {
-                max_candidates: u16::try_from(rule.generators.len()).unwrap_or(u16::MAX),
-                max_total_tokens: estimated_tokens,
-                max_estimated_cost_microusd: 0,
-                max_collection_millis: requested.max_collection_millis,
-            })
-        }
         None => VerificationEstimate::UnknownPrice,
     };
     let estimate_known = matches!(estimate, VerificationEstimate::Known(_));
-    let profile_budget = profile_region
-        .as_ref()
-        .map(|region| crate::agents::VerificationBudget {
-            max_candidates: u16::try_from(region.count_ceiling.unwrap_or_default())
-                .unwrap_or(u16::MAX),
-            max_total_tokens: region.token_ceiling.unwrap_or_default(),
-            max_estimated_cost_microusd: region.cost_ceiling_micros.unwrap_or_default(),
-            max_collection_millis: region.max_collection_duration_ms.unwrap_or_default(),
-        });
-    let session_reduction =
-        profile_region
-            .as_ref()
-            .map_or(VerificationSessionReduction::Inherit, |region| {
-                VerificationSessionReduction::Restrict {
-                    selector: crate::agents::VerificationSelector {
-                        all_of: vec![
-                            crate::agents::SelectorPredicate::ToolClass { tool_class },
-                            crate::agents::SelectorPredicate::ToolId {
-                                tool_id: input.resolved_name.into(),
-                            },
-                            crate::agents::SelectorPredicate::Namespace {
-                                namespace: "host".into(),
-                            },
-                        ],
-                        any_of: Vec::new(),
-                    },
-                    budget: profile_budget,
-                }
-            });
-    let dispatch = grant.resolve_verification(&subject, session_reduction, None, estimate)?;
-    match dispatch {
-        VerificationDispatch::Off => return Ok(VerificationOutcome::Skip),
-        VerificationDispatch::Refuse
-        | VerificationDispatch::DispatchOriginal
-        | VerificationDispatch::Verify { .. } => {}
-    }
     let generators = rule.generators.clone();
-    let recorded_action = match dispatch {
-        VerificationDispatch::Verify { .. } => None,
-        VerificationDispatch::Refuse => Some(VerificationBudgetAction::Refuse),
-        VerificationDispatch::DispatchOriginal => Some(VerificationBudgetAction::DispatchOriginal),
-        VerificationDispatch::Off => return Ok(VerificationOutcome::Skip),
+    let estimate_exceeds = match estimate {
+        VerificationEstimate::Known(estimated) => !profile_budget.contains(estimated),
+        VerificationEstimate::UnknownTokens | VerificationEstimate::UnknownPrice => true,
+    };
+    let recorded_action = if estimate_exceeds {
+        Some(
+            match rule.on_budget_exceeded.unwrap_or(OnBudgetExceeded::Refuse) {
+                OnBudgetExceeded::Refuse => VerificationBudgetAction::Refuse,
+                OnBudgetExceeded::DispatchOriginal => VerificationBudgetAction::DispatchOriginal,
+            },
+        )
+    } else {
+        None
     };
     let now = chrono::Utc::now().timestamp_millis();
-    let ledger = budget_to_ledger(profile_budget.unwrap_or(requested));
+    let ledger = budget_to_ledger(profile_budget);
     let generator_count = i64::try_from(generators.len()).unwrap_or(0);
     let effective_candidate_count = if recorded_action.is_some() {
         0
@@ -482,7 +508,6 @@ async fn run_verification(
         collect_candidates(CollectionInput {
             session: input.session,
             agent: input.agent,
-            model: input.model,
             ctx: input.ctx,
             history: input.history,
             resolved_name: input.resolved_name,
@@ -729,8 +754,6 @@ async fn run_verification(
                         args: applied,
                         disclosure,
                         plan,
-                        on_failure_dispatch_original: rule.resolved_on_adjudication_failure()
-                            == crate::agents::OnAdjudicationFailure::DispatchOriginal,
                     });
                 }
                 if rule.resolved_on_adjudication_failure()
@@ -854,9 +877,9 @@ fn redact_json(value: Value, table: &crate::redact::RedactionTable) -> Value {
 mod tests {
     use super::*;
     use crate::agents::{
-        ExecutionKind, ModelCapability, ModelLocality, ModelSlot, OnBudgetExceeded,
-        SelectorPredicate, ToolClass, VerificationAction, VerificationPolicy, VerificationRule,
-        VerificationSelector, VnextAgentDef, VnextHostPolicy,
+        EffectiveVnextGrant, ExecutionKind, ModelCapability, ModelLocality, ModelSlot,
+        OnBudgetExceeded, SelectorPredicate, ToolClass, VerificationAction, VerificationPolicy,
+        VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
     };
     use crate::db::agent_tree_decisions::NewAgentInstance;
     use crate::db::tool_calls::Recovery;
@@ -872,12 +895,46 @@ mod tests {
     use rig::message::{AssistantContent, ToolFunction};
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
     struct NamedFixtureTool {
         name: String,
         called: Arc<AtomicBool>,
+    }
+
+    struct RevisionFailureTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for RevisionFailureTool {
+        fn name(&self) -> &str {
+            "write"
+        }
+
+        fn description(&self) -> &str {
+            "Reject the selected revision while accepting the original fixture."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"]
+            })
+        }
+
+        async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if args.get("content").and_then(Value::as_str) == Some("revision") {
+                anyhow::bail!("selected revision failed host validation")
+            }
+            Ok(ToolOutput::text("original applied"))
+        }
     }
 
     #[async_trait]
@@ -1123,6 +1180,8 @@ mod tests {
         bool,
         String,
         Vec<crate::db::verification_ledger::VerificationOperationRow>,
+        Vec<crate::db::tool_calls::ToolCallEvent>,
+        Vec<TurnEvent>,
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let called = Arc::new(AtomicBool::new(false));
@@ -1133,7 +1192,7 @@ mod tests {
         let agent = test_agent(tools.clone(), grant);
         let (session, instance_id) = prepared_session(tmp.path()).await;
         let model = test_model();
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         let ctx = tool_ctx(session.clone(), tmp.path(), &tx, instance_id);
         let env = DispatchEnv {
             agent: &agent,
@@ -1161,16 +1220,27 @@ mod tests {
             .list_verification_operations_for_session(session.id)
             .await
             .unwrap();
+        let tool_calls = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
         (
             called.load(Ordering::SeqCst),
             last_tool_result_text(&history),
             rows,
+            tool_calls,
+            events,
         )
     }
 
     #[tokio::test]
     async fn matching_edit_records_one_dispatch_original_row_and_executes() {
-        let (called, wire, rows) =
+        let (called, wire, rows, _, _) =
             dispatch_named("edit", Some(verify_grant(VerificationAction::Verify))).await;
         assert!(called, "shadow mode must still execute the original edit");
         assert_eq!(wire, "applied");
@@ -1187,7 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_matching_tool_produces_no_verification_row() {
-        let (called, wire, rows) =
+        let (called, wire, rows, _, _) =
             dispatch_named("read", Some(verify_grant(VerificationAction::Verify))).await;
         assert!(called);
         assert_eq!(wire, "applied");
@@ -1199,7 +1269,7 @@ mod tests {
 
     #[tokio::test]
     async fn off_rule_produces_no_verification_row() {
-        let (called, wire, rows) =
+        let (called, wire, rows, _, _) =
             dispatch_named("edit", Some(verify_grant(VerificationAction::Off))).await;
         assert!(called);
         assert_eq!(wire, "applied");
@@ -1208,7 +1278,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_policy_produces_no_verification_row() {
-        let (called, wire, rows) = dispatch_named("edit", None).await;
+        let (called, wire, rows, _, _) = dispatch_named("edit", None).await;
         assert!(called);
         assert_eq!(wire, "applied");
         assert!(
@@ -1218,7 +1288,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_price_refusal_is_terminal_and_a_failed_tool_call() {
+        let mut grant = verify_grant(VerificationAction::Verify);
+        grant
+            .verification
+            .as_mut()
+            .expect("compiled verification policy")
+            .regions[0]
+            .rule
+            .on_budget_exceeded = Some(OnBudgetExceeded::Refuse);
+        let (called, wire, rows, tool_calls, events) = dispatch_named("edit", Some(grant)).await;
+        assert!(!called);
+        assert!(wire.contains("verification budget was exceeded"), "{wire}");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            crate::db::verification_ledger::VerificationOperationState::SkippedBudgetRefused
+        );
+        assert_eq!(
+            rows[0].budget_action,
+            Some(VerificationBudgetAction::Refuse)
+        );
+        assert_eq!(
+            rows[0].estimate_state,
+            VerificationEstimateState::EstimateUnavailable
+        );
+        assert_eq!(tool_calls.len(), 1);
+        assert!(tool_calls[0].hard_fail);
+        assert_eq!(tool_calls[0].output, wire);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnEvent::ToolError { error, .. } if error == &wire
+        )));
+    }
+
+    #[tokio::test]
     async fn verify_generators_record_candidates_then_dispatch_original() {
+        crate::engine::verification::estimate::set_test_model_price(Some((0.0, 0.0)));
         crate::engine::verification::generate::set_generator_override(vec![
             crate::engine::verification::generate::GeneratorAnswer {
                 kind: crate::engine::verification::generate::CandidateKind::Revision,
@@ -1287,6 +1393,7 @@ mod tests {
             .await
             .unwrap();
         crate::engine::verification::generate::clear_generator_override();
+        crate::engine::verification::estimate::set_test_model_price(None);
         assert!(called.load(Ordering::SeqCst));
         assert_eq!(last_tool_result_text(&history), "applied");
         let ops = session
@@ -1333,8 +1440,42 @@ mod tests {
         definition.resolve_grant(&host()).unwrap()
     }
 
+    fn revise_grant() -> EffectiveVnextGrant {
+        let definition = VnextAgentDef {
+            schema_version: crate::agents::SCHEMA_VERSION,
+            agent_id: "authored/reviewer".to_string(),
+            execution_kind: ExecutionKind::Coding,
+            model_slots: BTreeMap::from([("primary".to_string(), slot())]),
+            delegation: crate::agents::DelegationPolicy::default(),
+            questions: None,
+            verification: Some(VerificationPolicy {
+                rules: vec![VerificationRule {
+                    selector: VerificationSelector {
+                        all_of: vec![SelectorPredicate::ToolClass {
+                            tool_class: ToolClass::ArtifactWrite,
+                        }],
+                        any_of: vec![],
+                    },
+                    action: VerificationAction::Verify,
+                    adjudicator_slot: Some("primary".into()),
+                    on_budget_exceeded: Some(OnBudgetExceeded::Refuse),
+                    mode: Some(VerificationMode::Revise),
+                    generators: vec![GeneratorSpec {
+                        slot: "primary".into(),
+                        recipe: VerificationRecipe::Inherit,
+                        max_turns: 1,
+                    }],
+                    on_adjudication_failure: Some(OnAdjudicationFailure::DispatchOriginal),
+                    ..Default::default()
+                }],
+            }),
+        };
+        definition.resolve_grant(&host()).unwrap()
+    }
+
     #[tokio::test]
     async fn gate_block_does_not_execute_and_returns_structured_refusal() {
+        crate::engine::verification::estimate::set_test_model_price(Some((0.0, 0.0)));
         crate::engine::verification::adjudicate::set_adjudicator_override(
             crate::engine::verification::adjudicate::AdjudicatorVerdict {
                 decision: crate::engine::verification::adjudicate::AdjudicatorDecision::Block,
@@ -1342,14 +1483,95 @@ mod tests {
                 feedback: "style mismatch".into(),
             },
         );
-        let (called, wire, rows) =
+        let (called, wire, rows, tool_calls, events) =
             dispatch_named("edit", Some(verify_grant_inheriting_cost())).await;
         crate::engine::verification::adjudicate::clear_adjudicator_override();
+        crate::engine::verification::estimate::set_test_model_price(None);
         assert!(!called, "blocked verification must not execute the tool");
         assert!(
             wire.contains("verification blocked this edit: style mismatch"),
             "{wire}"
         );
         assert_eq!(rows.len(), 1);
+        assert_eq!(tool_calls.len(), 1);
+        assert!(tool_calls[0].hard_fail);
+        assert_eq!(tool_calls[0].output, wire);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnEvent::ToolError { error, .. } if error == &wire
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::ToolEnd { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_revision_host_failure_never_dispatches_original() {
+        crate::engine::verification::estimate::set_test_model_price(Some((0.0, 0.0)));
+        crate::engine::verification::generate::set_generator_override(vec![
+            crate::engine::verification::generate::GeneratorAnswer {
+                kind: crate::engine::verification::generate::CandidateKind::Revision,
+                args: Some(serde_json::json!({"path": "a.rs", "content": "revision"})),
+                critique: "selected revision".into(),
+            },
+        ]);
+        crate::engine::verification::adjudicate::set_adjudicator_override(
+            crate::engine::verification::adjudicate::AdjudicatorVerdict {
+                decision: crate::engine::verification::adjudicate::AdjudicatorDecision::Select,
+                selected: Some(Uuid::nil()),
+                feedback: String::new(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = ToolBox::new().with(Arc::new(RevisionFailureTool {
+            calls: calls.clone(),
+        }));
+        let agent = test_agent(tools.clone(), Some(revise_grant()));
+        let (session, instance_id) = prepared_session(tmp.path()).await;
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx, instance_id);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call(
+            "write",
+            serde_json::json!({"path": "a.rs", "content": "original"}),
+        );
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(&env, &mut history, &call, "write", Recovery::Clean, None)
+            .await
+            .unwrap();
+        crate::engine::verification::adjudicate::clear_adjudicator_override();
+        crate::engine::verification::generate::clear_generator_override();
+        crate::engine::verification::estimate::set_test_model_price(None);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            last_tool_result_text(&history).contains("selected revision failed host validation")
+        );
+        let operations = session
+            .db
+            .list_verification_operations_for_session(session.id)
+            .await
+            .unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(
+            operations[0].state,
+            crate::db::verification_ledger::VerificationOperationState::Failed
+        );
     }
 }

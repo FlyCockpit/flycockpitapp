@@ -18,8 +18,9 @@ use cockpit_db::db::agent_installations::{
     PrepareAgentSessionOutcome, ProviderAlias as SnapshotProviderAlias, QuestionResolverOrder,
     RedactedAgentProfileSnapshot, RedactedAllowedChild, RedactedBindingEvidence,
     RedactedEffectiveDelegation, RedactedQuestionPolicy, RedactedRecommendation,
-    RedactedVerificationPredicate, RedactedVerificationRegion, RedactedVerificationSelector,
-    VerificationEffectiveAction,
+    RedactedVerificationExecutionPlan, RedactedVerificationGenerator,
+    RedactedVerificationPredicate, RedactedVerificationRecipe, RedactedVerificationRegion,
+    RedactedVerificationSelector, VerificationEffectiveAction,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -1319,29 +1320,49 @@ fn snapshot_verification_regions(
                 token_ceiling: budget.map(|budget| budget.max_total_tokens),
                 cost_ceiling_micros: budget.map(|budget| budget.max_estimated_cost_microusd),
                 max_collection_duration_ms: budget.map(|budget| budget.max_collection_millis),
-                mode: if off {
-                    None
-                } else {
-                    Some(match region.rule.resolved_mode() {
+                execution_plan: (!off).then(|| RedactedVerificationExecutionPlan {
+                    mode: match region.rule.resolved_mode() {
                         crate::agents::VerificationMode::Gate => "gate".to_string(),
                         crate::agents::VerificationMode::Revise => "revise".to_string(),
-                    })
-                },
-                generator_count: if off {
-                    None
-                } else {
-                    Some(region.rule.generators.len() as u64)
-                },
-                generator_slots: if off {
-                    Vec::new()
-                } else {
-                    region
+                    },
+                    generators: region
                         .rule
                         .generators
                         .iter()
-                        .map(|generator| generator.slot.clone())
-                        .collect()
-                },
+                        .map(|generator| RedactedVerificationGenerator {
+                            slot: generator.slot.clone(),
+                            recipe: match &generator.recipe {
+                                crate::agents::VerificationRecipe::Inherit => {
+                                    RedactedVerificationRecipe::Inherit
+                                }
+                                crate::agents::VerificationRecipe::CleanRoom {
+                                    include_linked_files,
+                                    last_n_reads,
+                                } => RedactedVerificationRecipe::CleanRoom {
+                                    include_linked_files: *include_linked_files,
+                                    last_n_reads: *last_n_reads,
+                                },
+                            },
+                            max_turns: generator.max_turns,
+                        })
+                        .collect(),
+                    on_budget_exceeded: match region
+                        .rule
+                        .on_budget_exceeded
+                        .unwrap_or(crate::agents::OnBudgetExceeded::Refuse)
+                    {
+                        crate::agents::OnBudgetExceeded::Refuse => "refuse".to_string(),
+                        crate::agents::OnBudgetExceeded::DispatchOriginal => {
+                            "dispatch_original".to_string()
+                        }
+                    },
+                    on_adjudication_failure: match region.rule.resolved_on_adjudication_failure() {
+                        crate::agents::OnAdjudicationFailure::Refuse => "refuse".to_string(),
+                        crate::agents::OnAdjudicationFailure::DispatchOriginal => {
+                            "dispatch_original".to_string()
+                        }
+                    },
+                }),
             })
         })
         .collect()
@@ -1484,9 +1505,12 @@ fn validate_snapshot_self_contained(snapshot: &RedactedAgentProfileSnapshot) -> 
             );
             ensure!(
                 region
-                    .generator_slots
+                    .execution_plan
+                    .as_ref()
+                    .context("enabled verification region lacks an execution plan")?
+                    .generators
                     .iter()
-                    .all(|generator_slot| slots.contains(generator_slot.as_str())),
+                    .all(|generator| slots.contains(generator.slot.as_str())),
                 "verification generator region must reference snapshot bindings"
             );
         }
@@ -2379,7 +2403,7 @@ mod tests {
     #[test]
     fn agent_profile_resolution_verification_first_match_off_and_narrowing_are_pinned_on_reload() {
         let definition = definition(
-            "verification:\n  rules:\n    - selector:\n        allOf: [{ toolClass: shell }]\n      action: off\n    - selector:\n        allOf: [{ toolClass: shell }]\n        anyOf: [{ toolId: bash }, { namespace: terminal }]\n      action: verify\n      adjudicatorSlot: primary\n      maxCandidates: 1\n      maxTotalTokens: 20\n      maxEstimatedCostMicrousd: 30\n      maxCollectionMillis: 40\n",
+            "verification:\n  rules:\n    - selector:\n        allOf: [{ toolClass: shell }]\n      action: off\n    - selector:\n        allOf: [{ toolClass: shell }]\n        anyOf: [{ toolId: bash }, { namespace: terminal }]\n      action: verify\n      adjudicatorSlot: primary\n      maxCandidates: 1\n      maxTotalTokens: 20\n      maxEstimatedCostMicrousd: 30\n      maxCollectionMillis: 40\n      mode: revise\n      onBudgetExceeded: dispatch_original\n      onAdjudicationFailure: refuse\n      generators:\n        - slot: primary\n          recipe:\n            cleanRoom:\n              includeLinkedFiles: true\n              lastNReads: 4\n          maxTurns: 3\n",
         );
         let (catalog, installation_id, digest) = catalog(definition);
         let providers = providers();
@@ -2449,6 +2473,23 @@ mod tests {
             profile.snapshot.verification_regions[1].token_ceiling,
             Some(10)
         );
+        let execution = profile.snapshot.verification_regions[1]
+            .execution_plan
+            .as_ref()
+            .expect("enabled region pins its complete execution plan");
+        assert_eq!(execution.mode, "revise");
+        assert_eq!(execution.on_budget_exceeded, "dispatch_original");
+        assert_eq!(execution.on_adjudication_failure, "refuse");
+        assert_eq!(execution.generators.len(), 1);
+        assert_eq!(execution.generators[0].slot, "primary");
+        assert_eq!(execution.generators[0].max_turns, 3);
+        assert_eq!(
+            execution.generators[0].recipe,
+            RedactedVerificationRecipe::CleanRoom {
+                include_linked_files: true,
+                last_n_reads: 4,
+            }
+        );
         let persisted = persisted_snapshot_row(&profile);
         let reloaded = ResolvedAgentProfile::reload_persisted(
             &persisted,
@@ -2466,6 +2507,10 @@ mod tests {
         assert_eq!(
             reloaded.snapshot.verification_regions[1].enabled_intersection_mask,
             vec!["all:tool_class:shell", "any:tool_id:bash"]
+        );
+        assert_eq!(
+            reloaded.snapshot.verification_regions[1].execution_plan,
+            profile.snapshot.verification_regions[1].execution_plan
         );
         assert_eq!(
             reloaded.snapshot.verification_regions[1].explicit_off_remainder_mask,

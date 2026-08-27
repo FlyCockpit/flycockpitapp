@@ -80,7 +80,6 @@ fn take_override_answer() -> Option<GeneratorAnswer> {
 pub struct CollectionInput<'a> {
     pub session: &'a Session,
     pub agent: &'a Agent,
-    pub model: &'a Model,
     pub ctx: &'a ToolCtx,
     pub history: &'a [Message],
     pub resolved_name: &'a str,
@@ -92,6 +91,18 @@ pub struct CollectionInput<'a> {
     pub profile_snapshot_id: Uuid,
     pub collection_deadline_unix_ms: i64,
     pub original_digest: VerificationDigest,
+}
+
+fn is_author_slot(slot: &str) -> bool {
+    slot == "primary"
+}
+
+fn candidate_is_adjudicable(
+    terminal: VerificationCandidateState,
+    accepted: &Result<CandidateTransitionOutcome>,
+) -> bool {
+    terminal == VerificationCandidateState::Valid
+        && matches!(accepted, Ok(CandidateTransitionOutcome::Transitioned))
 }
 
 pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<CollectedCandidate>> {
@@ -180,8 +191,10 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         else {
             continue;
         };
-        let same_as_author = generator_model.provider_id() == input.model.provider_id()
-            && generator_model.model_id_ref() == input.model.model_id_ref();
+        // Slot identity, not provider/model equality, decides cache-prefix
+        // inheritance. Two distinct slots may intentionally bind the same
+        // provider model but have different custody and prompt identities.
+        let same_as_author = is_author_slot(&spec.slot);
         let reservation_body = if matches!(spec.recipe, VerificationRecipe::Inherit) {
             let Ok(body) = serde_json::to_string(&serde_json::json!({
                 "history": input.history,
@@ -196,13 +209,13 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         };
         let reservation_digest = VerificationDigest::of(reservation_body.as_bytes());
         let prices = crate::db::stats::PriceTable::load_default();
-        let price = prices.get(generator_model.model_id_ref());
+        let price = super::estimate::model_prices(&prices, generator_model.model_id_ref());
         let reservation =
             super::estimate::estimate_candidate_set(super::estimate::CandidateSetEstimateInput {
                 assembled_texts: std::slice::from_ref(&reservation_body),
                 encoding: super::estimate::encoding_for_model_id(generator_model.model_id_ref()),
-                input_price_per_mtok: price.map(|price| price.input_per_mtok),
-                output_price_per_mtok: price.map(|price| price.output_per_mtok),
+                input_price_per_mtok: price.map(|price| price.0),
+                output_price_per_mtok: price.map(|price| price.1),
                 max_candidates: 1,
                 max_collection_millis: 1,
             });
@@ -323,7 +336,7 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
                 continue;
             }
         };
-        let _ = input
+        let accepted = input
             .session
             .db
             .transition_verification_candidate(
@@ -336,7 +349,7 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
                 now + 2,
             )
             .await;
-        if terminal == VerificationCandidateState::Valid {
+        if candidate_is_adjudicable(terminal, &accepted) {
             collected.push(CollectedCandidate {
                 candidate_id: reserved.candidate_id,
                 answer,
@@ -407,6 +420,10 @@ async fn generate_with_turns(
     } else {
         Vec::new()
     };
+    // Keep the author's definitions byte-for-byte and in their original order;
+    // the private terminal tool is additive. Calls to an author tool remain
+    // execution-disabled unless the bounded read-only investigation branch
+    // explicitly admits them below.
     tools.push(candidate_tool.clone());
     let params = if matches!(spec.recipe, VerificationRecipe::Inherit) && same_as_author {
         input.agent.params.clone()
@@ -648,6 +665,62 @@ mod tests {
             investigation_turn_budget(u8::MAX).count(),
             usize::from(crate::agents::MAX_GENERATOR_TURNS)
         );
+    }
+
+    #[test]
+    fn inherit_cache_identity_is_the_author_slot_not_a_model_alias() {
+        assert!(is_author_slot("primary"));
+        assert!(!is_author_slot("reviewer"));
+        assert!(!is_author_slot("same-model-different-slot"));
+    }
+
+    #[test]
+    fn structured_candidate_tool_preserves_the_exact_author_tool_prefix() {
+        let author_tools = vec![
+            ToolDefinition {
+                name: "read".into(),
+                description: "read".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "write".into(),
+                description: "write".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let mut verification_tools = author_tools.clone();
+        verification_tools.push(candidate_tool_definition());
+        for (actual, expected) in verification_tools.iter().zip(&author_tools) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.description, expected.description);
+            assert_eq!(actual.parameters, expected.parameters);
+        }
+        assert_eq!(
+            verification_tools.last().map(|tool| tool.name.as_str()),
+            Some("verification_candidate")
+        );
+    }
+
+    #[test]
+    fn only_db_accepted_terminal_valid_candidates_enter_adjudication() {
+        for discarded in [
+            CandidateTransitionOutcome::LateResult,
+            CandidateTransitionOutcome::AlreadyTerminal,
+            CandidateTransitionOutcome::RevisionConflict,
+        ] {
+            assert!(!candidate_is_adjudicable(
+                VerificationCandidateState::Valid,
+                &Ok(discarded)
+            ));
+        }
+        assert!(!candidate_is_adjudicable(
+            VerificationCandidateState::Invalid,
+            &Ok(CandidateTransitionOutcome::Transitioned)
+        ));
+        assert!(candidate_is_adjudicable(
+            VerificationCandidateState::Valid,
+            &Ok(CandidateTransitionOutcome::Transitioned)
+        ));
     }
 
     #[test]

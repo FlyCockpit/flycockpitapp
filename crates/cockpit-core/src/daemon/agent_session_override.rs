@@ -461,9 +461,7 @@ mod tests {
             token_ceiling,
             cost_ceiling_micros: None,
             max_collection_duration_ms: None,
-            mode: None,
-            generator_count: None,
-            generator_slots: Vec::new(),
+            execution_plan: None,
         }
     }
 

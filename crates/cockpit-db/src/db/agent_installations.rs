@@ -428,6 +428,37 @@ impl RedactedVerificationPredicate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RedactedVerificationGenerator {
+    pub slot: String,
+    pub recipe: RedactedVerificationRecipe,
+    pub max_turns: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactedVerificationRecipe {
+    Inherit,
+    CleanRoom {
+        include_linked_files: bool,
+        last_n_reads: u8,
+    },
+}
+
+/// Complete non-secret execution policy for one enabled verification region.
+/// Keeping recipes, turn bounds, and failure policies in the immutable profile
+/// snapshot prevents a changed or missing authored definition from changing a
+/// live session's behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedVerificationExecutionPlan {
+    pub mode: String,
+    pub generators: Vec<RedactedVerificationGenerator>,
+    pub on_budget_exceeded: String,
+    pub on_adjudication_failure: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedactedVerificationRegion {
     pub source_rule_id: String,
     /// The source rule selector before first-match subtraction.
@@ -462,14 +493,8 @@ pub struct RedactedVerificationRegion {
     /// resolver has no clock input, so persisting this as a Unix timestamp
     /// would misrepresent its semantics on reload.
     pub max_collection_duration_ms: Option<u64>,
-    /// Gate/revise mode. Redacted to the lowercase name only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-    /// Generator count after redaction. Slot names only, never recipes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generator_count: Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub generator_slots: Vec<String>,
+    pub execution_plan: Option<RedactedVerificationExecutionPlan>,
 }
 
 impl RedactedVerificationRegion {
@@ -2147,14 +2172,23 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
     );
     ensure!(
         value.verification_regions.iter().all(|region| {
-            region.adjudicator_slot.as_ref().is_none_or(|slot| {
-                value
-                    .bindings
-                    .iter()
-                    .any(|binding| binding.slot_id == *slot)
-            })
+            region
+                .adjudicator_slot
+                .iter()
+                .chain(
+                    region
+                        .execution_plan
+                        .iter()
+                        .flat_map(|plan| plan.generators.iter().map(|generator| &generator.slot)),
+                )
+                .all(|slot| {
+                    value
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.slot_id == *slot)
+                })
         }),
-        "verification adjudicator slots must reference snapshot bindings"
+        "verification executor slots must reference snapshot bindings"
     );
     validate_recommendations(&value.recommendations)?;
     ensure!(
@@ -2300,6 +2334,28 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
         Some(selector) => verification_selector_mask(selector) == region.enabled_intersection_mask,
         None => region.enabled_intersection_mask == source_mask,
     };
+    let execution_plan_valid = region.execution_plan.as_ref().is_some_and(|plan| {
+        matches!(plan.mode.as_str(), "gate" | "revise")
+            && matches!(
+                plan.on_budget_exceeded.as_str(),
+                "refuse" | "dispatch_original"
+            )
+            && matches!(
+                plan.on_adjudication_failure.as_str(),
+                "refuse" | "dispatch_original"
+            )
+            && plan.generators.len() <= 64
+            && plan.generators.iter().all(|generator| {
+                !generator.slot.is_empty()
+                    && (1..=4).contains(&generator.max_turns)
+                    && match &generator.recipe {
+                        RedactedVerificationRecipe::Inherit => true,
+                        RedactedVerificationRecipe::CleanRoom { last_n_reads, .. } => {
+                            *last_n_reads > 0
+                        }
+                    }
+            })
+    });
     match (
         region.enabled,
         region.whole_region_off,
@@ -2315,6 +2371,7 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
                     .adjudicator_slot
                     .as_deref()
                     .is_some_and(|slot| !slot.is_empty())
+                && execution_plan_valid
         }
         (false, true, VerificationEffectiveAction::Off) => {
             region.whole_region_off_mask == source_mask
@@ -2324,6 +2381,7 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
                 && region.cost_ceiling_micros.is_none()
                 && region.max_collection_duration_ms.is_none()
                 && region.adjudicator_slot.is_none()
+                && region.execution_plan.is_none()
         }
         _ => false,
     }
@@ -2717,6 +2775,19 @@ mod tests {
         }
     }
 
+    fn verification_execution_plan() -> RedactedVerificationExecutionPlan {
+        RedactedVerificationExecutionPlan {
+            mode: "gate".into(),
+            generators: vec![RedactedVerificationGenerator {
+                slot: "primary".into(),
+                recipe: RedactedVerificationRecipe::Inherit,
+                max_turns: 1,
+            }],
+            on_budget_exceeded: "refuse".into(),
+            on_adjudication_failure: "dispatch_original".into(),
+        }
+    }
+
     async fn prepared_fixture(db: &Db) -> (Uuid, Uuid, String) {
         let install = installation(AgentInstallationScope::Global, None);
         let installation_id = install.installation_id;
@@ -2813,9 +2884,7 @@ mod tests {
                 token_ceiling: Some(1),
                 cost_ceiling_micros: Some(1),
                 max_collection_duration_ms: Some(12),
-                mode: None,
-                generator_count: None,
-                generator_slots: Vec::new(),
+                execution_plan: Some(verification_execution_plan()),
             }],
             bindings: vec![RedactedBindingEvidence {
                 slot_id: "primary".into(),
@@ -3363,9 +3432,7 @@ mod tests {
                 token_ceiling: Some(1),
                 cost_ceiling_micros: Some(1),
                 max_collection_duration_ms: Some(1),
-                mode: None,
-                generator_count: None,
-                generator_slots: Vec::new(),
+                execution_plan: Some(verification_execution_plan()),
             }],
             bindings: vec![RedactedBindingEvidence {
                 slot_id: "primary".into(),
@@ -3574,9 +3641,7 @@ mod tests {
                     token_ceiling: Some(100),
                     cost_ceiling_micros: Some(42),
                     max_collection_duration_ms: Some(999),
-                    mode: None,
-                    generator_count: None,
-                    generator_slots: Vec::new(),
+                    execution_plan: Some(verification_execution_plan()),
                 },
                 RedactedVerificationRegion {
                     source_rule_id: "source-deny".into(),
@@ -3594,9 +3659,7 @@ mod tests {
                     token_ceiling: None,
                     cost_ceiling_micros: None,
                     max_collection_duration_ms: None,
-                    mode: None,
-                    generator_count: None,
-                    generator_slots: Vec::new(),
+                    execution_plan: None,
                 },
             ],
             bindings: vec![RedactedBindingEvidence {

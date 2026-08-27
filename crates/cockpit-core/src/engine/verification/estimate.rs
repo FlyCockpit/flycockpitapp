@@ -10,6 +10,35 @@
 use crate::agents::{VerificationBudget, VerificationEstimate};
 use crate::tokens::{TokenizerStrategy, count_with};
 
+#[cfg(test)]
+thread_local! {
+    static TEST_PRICE: std::cell::Cell<Option<(f64, f64)>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn model_prices(
+    prices: &crate::db::stats::PriceTable,
+    model_id: &str,
+) -> Option<(f64, f64)> {
+    prices
+        .get(model_id)
+        .map(|price| (price.input_per_mtok, price.output_per_mtok))
+        .or_else(|| {
+            #[cfg(test)]
+            {
+                TEST_PRICE.with(std::cell::Cell::get)
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_model_price(price: Option<(f64, f64)>) {
+    TEST_PRICE.with(|slot| slot.set(price));
+}
+
 /// Conservative inflation applied after the raw token count so the estimate
 /// is at least the tokenizer's actual count on the same text.
 const SAFETY_NUM: u64 = 5;

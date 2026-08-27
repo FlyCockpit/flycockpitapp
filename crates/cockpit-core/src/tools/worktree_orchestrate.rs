@@ -4,9 +4,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
-use crate::worktree_orchestration::OrchestrationAction;
+use crate::worktree_orchestration::{
+    FanOutSpec, OrchestrationAction, OrchestratorInit, WorktreeOrchestrator,
+};
 
 pub struct WorktreeOrchestrateTool;
 
@@ -46,7 +49,7 @@ impl Tool for WorktreeOrchestrateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["edit_in_place", "fan_out", "merge_selected", "apply_uncommitted"],
+                    "enum": ["edit_in_place", "fan_out", "produce_artifact", "merge_selected", "apply_uncommitted"],
                     "description": "Orchestration action"
                 },
                 "labels": {
@@ -58,6 +61,11 @@ impl Tool for WorktreeOrchestrateTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Selected artifact ids"
+                },
+                "conflict_choice": {
+                    "type": "string",
+                    "enum": ["combined", "choose_left", "choose_right", "unresolved"],
+                    "description": "Explicit parent decision for an overlapping ordered merge"
                 }
             },
             "required": ["action"]
@@ -70,7 +78,7 @@ impl Tool for WorktreeOrchestrateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["edit_in_place", "fan_out", "merge_selected", "apply_uncommitted"],
+                    "enum": ["edit_in_place", "fan_out", "produce_artifact", "merge_selected", "apply_uncommitted"],
                     "description": "Use edit_in_place for the current tree, fan_out to isolate orthogonal work, merge_selected for ordered commitless composition, apply_uncommitted to land patches without creating a commit"
                 },
                 "labels": {
@@ -82,6 +90,11 @@ impl Tool for WorktreeOrchestrateTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Artifact ids to merge or apply, in the exact order they must compose"
+                },
+                "conflict_choice": {
+                    "type": "string",
+                    "enum": ["combined", "choose_left", "choose_right", "unresolved"],
+                    "description": "Optional explicit parent decision after reviewing an overlapping merge"
                 }
             },
             "required": ["action"]
@@ -100,6 +113,7 @@ impl Tool for WorktreeOrchestrateTool {
                 "edit_in_place: continue in the current worktree. Commit remains an explicit user/agent action; cancelling preserves already-visible edits.",
             )),
             OrchestrationAction::FanOut
+            | OrchestrationAction::ProduceArtifact
             | OrchestrationAction::MergeSelected
             | OrchestrationAction::ApplyUncommitted => {
                 if ctx.agent_instance_id.is_none() {
@@ -107,40 +121,204 @@ impl Tool for WorktreeOrchestrateTool {
                         "worktree_orchestrate requires a host-issued agent instance",
                     ));
                 }
-                if ctx.workspace_lease.is_none() {
-                    return Err(invalid_input(
-                        "worktree_orchestrate fan_out/merge/apply requires a live workspace lease",
-                    ));
-                }
                 // Launch scope is local CLI/TUI only. Remote/web/relay surfaces
                 // are not wired here.
                 // TODO: remote-facing worktree orchestration (relay/web) is out of launch scope.
-                let labels = args
-                    .get("labels")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
+                let labels =
+                    args.get("labels")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .map(|value| {
+                                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                                        invalid_input("every label must be a string")
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
                 let ids = args
                     .get("artifact_ids")
                     .and_then(Value::as_array)
                     .map(|items| {
                         items
                             .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .ok_or_else(|| {
+                                        invalid_input("every artifact id must be a string")
+                                    })
+                                    .and_then(|raw| {
+                                        Uuid::parse_str(raw).map_err(|_| {
+                                            invalid_input("artifact ids must be UUIDs")
+                                        })
+                                    })
+                            })
+                            .collect::<Result<Vec<_>>>()
                     })
+                    .transpose()?
                     .unwrap_or_default();
-                Ok(ToolOutput::text(format!(
-                    "{} accepted for local orchestration (labels=[{labels}] artifact_ids=[{ids}]). No commit will be created.",
-                    action.as_str()
-                )))
+                let issued_root;
+                let lease = if let Some(lease) = ctx.workspace_lease.as_ref() {
+                    lease
+                } else if action == OrchestrationAction::FanOut {
+                    let agent = ctx.agent_instance_id.expect("checked above");
+                    let scopes = ctx
+                        .session
+                        .db
+                        .list_write_scope_leases_for_session(ctx.session.id)
+                        .await?;
+                    let scope = scopes
+                        .into_iter()
+                        .find(|scope| {
+                            scope.state == "active"
+                                && scope.owner_id == agent.to_string()
+                                && std::path::Path::new(&scope.scope_path) == ctx.cwd
+                        })
+                        .ok_or_else(|| {
+                            invalid_input("root write-scope lease is unavailable for fan_out")
+                        })?;
+                    let receipt =
+                        crate::worktree_orchestration::capture_workspace_receipt(&ctx.cwd)?;
+                    let row = ctx.session.db.create_workspace_lease(crate::db::workspace_lease_artifacts::NewWorkspaceLease {
+                        session_id: ctx.session.id, agent_instance_id: agent, write_scope_lease_id: scope.lease_id,
+                        canonical_repository_id: crate::worktree_orchestration::receipt_repository_id(&ctx.cwd)?,
+                        canonical_root: ctx.cwd.to_string_lossy().into_owned(),
+                        kind: crate::db::workspace_lease_artifacts::WorkspaceLeaseKind::SameRoot,
+                        base_sha_digest: receipt.head_digest, base_ref_digest: receipt.ref_digest,
+                        managed_path: String::new(), private_ref_digest: crate::db::workspace_lease_artifacts::WorkspaceDigest::of(b"same_root"),
+                        expires_at_unix_ms: crate::workspace_lease::now_unix_ms().saturating_add(24 * 60 * 60 * 1000),
+                    }, crate::workspace_lease::now_unix_ms()).await?;
+                    issued_root =
+                        std::sync::Arc::new(crate::workspace_lease::WorkspaceLease::from_row(
+                            &row,
+                            crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+                        )?);
+                    &issued_root
+                } else {
+                    return Err(invalid_input(
+                        "worktree_orchestrate merge/apply/produce requires a live workspace lease",
+                    ));
+                };
+                if lease.session_id != ctx.session.id {
+                    return Err(invalid_input(
+                        "workspace lease is not owned by this session",
+                    ));
+                }
+                if !lease.allowed_ops.write || !lease.covers_path(&ctx.cwd) {
+                    return Err(invalid_input(
+                        "workspace lease does not grant writes to the current worktree",
+                    ));
+                }
+                let durable_lease = ctx
+                    .session
+                    .db
+                    .workspace_lease(ctx.session.id, lease.owner_agent_instance_id, lease.id)
+                    .await?
+                    .ok_or_else(|| invalid_input("workspace lease is not durable"))?;
+                let now = crate::workspace_lease::now_unix_ms();
+                if durable_lease.state
+                    != crate::db::workspace_lease_artifacts::WorkspaceLeaseState::Active
+                    || durable_lease.expires_at_unix_ms <= now
+                    || durable_lease.revision != lease.revision
+                {
+                    return Err(invalid_input(
+                        "workspace lease is stale, expired, or revoked",
+                    ));
+                }
+                let scope = ctx
+                    .session
+                    .db
+                    .get_write_scope_lease(lease.write_scope_lease_id)
+                    .await?
+                    .ok_or_else(|| invalid_input("workspace write-scope lease is missing"))?;
+                if scope.state != "active"
+                    || scope.session_id != ctx.session.id
+                    || scope.owner_id != lease.owner_agent_instance_id.to_string()
+                {
+                    return Err(invalid_input(
+                        "workspace write-scope lease is not active and owned",
+                    ));
+                }
+                let state_dir = cockpit_config::config::resolve::cockpit_state_dir()?;
+                let mut orchestrator = WorktreeOrchestrator::new(OrchestratorInit {
+                    db: ctx.session.db.clone(),
+                    locks: ctx.locks.clone(),
+                    state_dir,
+                    session_id: ctx.session.id,
+                    agent_instance_id: lease.owner_agent_instance_id,
+                    lock_identity: ctx.lock_identity.clone(),
+                    primary_repo: ctx.cwd.clone(),
+                    write_scope_lease_id: scope.lease_id,
+                    write_scope_generation: scope.generation,
+                    write_scope_revision: scope.version,
+                })?
+                .with_cancel(ctx.cancel.clone());
+                if let Some(raw) = args.get("conflict_choice").and_then(Value::as_str) {
+                    let verdict =
+                        crate::worktree_orchestration::ConflictSpecialistVerdict::parse(raw)
+                            .map_err(|error| invalid_input(error.to_string()))?;
+                    let specialist = orchestrator
+                        .conflict_specialist_for((**lease).clone())
+                        .with_injected_verdict(verdict);
+                    orchestrator = orchestrator.with_specialist(specialist);
+                }
+                match action {
+                    OrchestrationAction::FanOut => {
+                        if labels.is_empty() {
+                            return Err(invalid_input("fan_out requires at least one label"));
+                        }
+                        let children = orchestrator
+                            .fan_out(
+                                labels
+                                    .into_iter()
+                                    .map(|label| FanOutSpec { label })
+                                    .collect(),
+                                now,
+                            )
+                            .await?;
+                        Ok(ToolOutput::text(serde_json::to_string(&children.iter().map(|child| serde_json::json!({"label": child.label, "path": child.path, "workspace_lease_id": child.lease.workspace_lease_id})).collect::<Vec<_>>())?))
+                    }
+                    OrchestrationAction::ProduceArtifact => {
+                        if lease.kind != crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree
+                        {
+                            return Err(invalid_input(
+                                "produce_artifact is only valid inside a host-issued managed child worktree",
+                            ));
+                        }
+                        let mut base =
+                            crate::worktree_orchestration::capture_workspace_receipt(&ctx.cwd)?;
+                        base.head_digest = lease.base_sha_digest.clone();
+                        base.ref_digest = lease.base_ref_digest.clone();
+                        let produced = crate::worktree_orchestration::produce_artifact(
+                            &ctx.session.db,
+                            orchestrator.store(),
+                            &ctx.cwd,
+                            lease.id,
+                            ctx.session.id,
+                            lease.owner_agent_instance_id,
+                            now,
+                            crate::db::workspace_lease_artifacts::WorkspaceDigest::of(
+                                b"validation_not_requested",
+                            ),
+                            Some(&base),
+                        )
+                        .await?;
+                        Ok(ToolOutput::text(serde_json::json!({"artifact_id": produced.row.artifact_id, "state": produced.row.state.as_str()}).to_string()))
+                    }
+                    OrchestrationAction::MergeSelected => Ok(ToolOutput::text(format!(
+                        "{:?}",
+                        orchestrator.merge_selected(ids, now).await?
+                    ))),
+                    OrchestrationAction::ApplyUncommitted => Ok(ToolOutput::text(format!(
+                        "{:?}",
+                        orchestrator.apply_uncommitted(ids, now).await?
+                    ))),
+                    OrchestrationAction::EditInPlace => unreachable!(),
+                }
             }
         }
     }

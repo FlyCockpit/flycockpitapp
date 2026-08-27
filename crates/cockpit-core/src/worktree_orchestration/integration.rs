@@ -1,6 +1,6 @@
 //! Pre-integration target lock, receipt comparison, and commitless apply.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -84,11 +84,17 @@ pub async fn integrate_artifacts(
     cancel: &CancellationToken,
 ) -> Result<IntegrationResult> {
     let target = git::resolve_git_path(&request.target)?;
-    let before = git::byte_identical_receipt(&target)?;
     locks
         .acquire(&target, lock_identity, session_id)
         .await
         .context("acquiring target workspace lock")?;
+    let before = match git::byte_identical_receipt(&target) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let _ = locks.release(&target, lock_identity, session_id).await;
+            return Err(error);
+        }
+    };
     let result = integrate_locked(
         db,
         store,
@@ -134,7 +140,8 @@ async fn integrate_locked(
             )
             .await;
         };
-        loaded.push((row, store.load_patch(*id)?));
+        let patch = store.load_patch(&row)?;
+        loaded.push((row, patch));
     }
 
     let mut begun = Vec::new();
@@ -220,7 +227,7 @@ async fn integrate_locked(
         });
     }
 
-    let composed = match compose_patches(&begun, specialist) {
+    let (composed, contributors) = match compose_patches(&begun, specialist) {
         Ok(patch) => patch,
         Err(verdict) => {
             let mut finished = Vec::new();
@@ -247,6 +254,24 @@ async fn integrate_locked(
             });
         }
     };
+    let mut selected = Vec::new();
+    for (row, patch) in begun {
+        if contributors.contains(&row.artifact_id) {
+            selected.push((row, patch));
+        } else {
+            finish_state(
+                db,
+                session_id,
+                agent_instance_id,
+                row.artifact_id,
+                row.revision,
+                now_ms,
+                TaskArtifactState::Conflict,
+            )
+            .await?;
+        }
+    }
+    let begun = selected;
 
     if cancel.is_cancelled() {
         return abort_cancel(
@@ -303,52 +328,19 @@ async fn integrate_locked(
         )
         .await;
     }
-
-    let changed = git::manifest_digest(target, composed.touched_paths.iter().map(String::as_str))?;
-    let repo_id = receipt::repository_id(target)?;
-    let root = target.to_string_lossy().into_owned();
-    let after_receipt = receipt::capture_workspace_receipt(target)?;
-    let mut integrated = Vec::new();
-    for (row, _) in &begun {
-        let target_spec = IntegrationTarget {
-            target_canonical_repository_id: repo_id.clone(),
-            target_canonical_root: root.clone(),
-            target_head_digest: after_receipt.head_digest.clone(),
-            target_ref_digest: after_receipt.ref_digest.clone(),
-            target_index_digest: after_receipt.index_digest.clone(),
-            changed_path_manifest_digest: changed.clone(),
-            target_write_scope_lease_id: request.target_write_scope_lease_id,
-            expected_target_generation: request.expected_target_generation,
-            expected_target_revision: request.expected_target_revision,
-        };
-        match db
-            .integrate_task_artifact(
-                session_id,
-                agent_instance_id,
-                row.artifact_id,
-                row.revision,
-                target_spec,
-                now_ms,
-            )
-            .await?
-        {
-            ArtifactCasOutcome::Transitioned(updated) => integrated.push(updated),
-            other => {
-                restore_paths(target, &touched_snapshot)?;
-                return finish_failed(
-                    db,
-                    session_id,
-                    agent_instance_id,
-                    now_ms,
-                    begun.into_iter().map(|(row, _)| row).collect(),
-                    target,
-                    before,
-                    Some(&touched_snapshot),
-                    format!("integrate CAS failed: {other:?}"),
-                )
-                .await;
-            }
-        }
+    if cancel.is_cancelled() {
+        git::reverse_uncommitted_patch(target, &composed.diff)?;
+        return abort_cancel(
+            db,
+            session_id,
+            agent_instance_id,
+            now_ms,
+            begun,
+            target,
+            before,
+            None,
+        )
+        .await;
     }
 
     let private_ref = if request.mode == IntegrationMode::OrderedMerge {
@@ -360,10 +352,109 @@ async fn integrate_locked(
                 .copied()
                 .unwrap_or_else(Uuid::nil)
         );
-        git::store_private_blob_ref(target, &name, composed.diff.as_bytes())?;
+        if let Err(error) = git::store_private_blob_ref(target, &name, composed.diff.as_bytes()) {
+            git::reverse_uncommitted_patch(target, &composed.diff)?;
+            return finish_failed(
+                db,
+                session_id,
+                agent_instance_id,
+                now_ms,
+                begun.into_iter().map(|(row, _)| row).collect(),
+                target,
+                before,
+                None,
+                error.to_string(),
+            )
+            .await;
+        }
         Some(name)
     } else {
         None
+    };
+
+    let prepared = (|| -> Result<IntegrationTarget> {
+        let changed =
+            git::manifest_digest(target, composed.touched_paths.iter().map(String::as_str))?;
+        let repo_id = receipt::repository_id(target)?;
+        let after_receipt = receipt::capture_workspace_receipt(target)?;
+        Ok(IntegrationTarget {
+            target_canonical_repository_id: repo_id,
+            target_canonical_root: target.to_string_lossy().into_owned(),
+            target_head_digest: after_receipt.head_digest,
+            target_ref_digest: after_receipt.ref_digest,
+            target_index_digest: after_receipt.index_digest,
+            changed_path_manifest_digest: changed,
+            target_write_scope_lease_id: request.target_write_scope_lease_id,
+            expected_target_generation: request.expected_target_generation,
+            expected_target_revision: request.expected_target_revision,
+        })
+    })();
+    let target_spec = match prepared {
+        Ok(spec) => spec,
+        Err(error) => {
+            git::reverse_uncommitted_patch(target, &composed.diff)?;
+            if let Some(name) = &private_ref {
+                let _ = git::delete_private_ref(target, name);
+            }
+            return finish_failed(
+                db,
+                session_id,
+                agent_instance_id,
+                now_ms,
+                begun.into_iter().map(|(row, _)| row).collect(),
+                target,
+                before,
+                None,
+                error.to_string(),
+            )
+            .await;
+        }
+    };
+    let expected = begun
+        .iter()
+        .map(|(row, _)| (row.artifact_id, row.revision))
+        .collect();
+    let integrated = match db
+        .integrate_task_artifacts(session_id, agent_instance_id, expected, target_spec, now_ms)
+        .await
+    {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
+            git::reverse_uncommitted_patch(target, &composed.diff)?;
+            if let Some(name) = &private_ref {
+                let _ = git::delete_private_ref(target, name);
+            }
+            return finish_failed(
+                db,
+                session_id,
+                agent_instance_id,
+                now_ms,
+                begun.into_iter().map(|(row, _)| row).collect(),
+                target,
+                before,
+                None,
+                "atomic integration CAS failed".into(),
+            )
+            .await;
+        }
+        Err(error) => {
+            git::reverse_uncommitted_patch(target, &composed.diff)?;
+            if let Some(name) = &private_ref {
+                let _ = git::delete_private_ref(target, name);
+            }
+            return finish_failed(
+                db,
+                session_id,
+                agent_instance_id,
+                now_ms,
+                begun.into_iter().map(|(row, _)| row).collect(),
+                target,
+                before,
+                None,
+                error.to_string(),
+            )
+            .await;
+        }
     };
 
     Ok(IntegrationResult::Integrated {
@@ -387,13 +478,13 @@ fn stale_reason(
         if live.index_digest != row.base_index_digest {
             return Ok(Some(StaleReason::Index));
         }
-        let touched = receipt::live_manifest(target, &patch.touched_paths)?;
-        if touched != row.touched_manifest_digest {
-            return Ok(Some(StaleReason::TouchedPaths));
-        }
         let untracked = receipt::live_manifest(target, &patch.untracked_paths)?;
         if untracked != row.untracked_manifest_digest {
             return Ok(Some(StaleReason::UntrackedPaths));
+        }
+        let touched = receipt::live_manifest(target, &patch.touched_paths)?;
+        if touched != row.touched_manifest_digest {
+            return Ok(Some(StaleReason::TouchedPaths));
         }
     }
     Ok(None)
@@ -402,16 +493,20 @@ fn stale_reason(
 fn compose_patches(
     begun: &[(TaskArtifactRow, UncommittedPatch)],
     specialist: Option<&ConflictSpecialist>,
-) -> Result<UncommittedPatch, ConflictSpecialistVerdict> {
+) -> Result<(UncommittedPatch, BTreeSet<Uuid>), ConflictSpecialistVerdict> {
     if begun.is_empty() {
-        return Ok(UncommittedPatch {
-            diff: String::new(),
-            touched_paths: Vec::new(),
-            untracked_paths: Vec::new(),
-        });
+        return Ok((
+            UncommittedPatch {
+                diff: String::new(),
+                touched_paths: Vec::new(),
+                untracked_paths: Vec::new(),
+            },
+            BTreeSet::new(),
+        ));
     }
     let mut acc = begun[0].1.clone();
-    for (_, next) in begun.iter().skip(1) {
+    let mut contributors = BTreeSet::from([begun[0].0.artifact_id]);
+    for (row, next) in begun.iter().skip(1) {
         if paths_overlap(&acc, next) {
             let Some(specialist) = specialist else {
                 return Err(ConflictSpecialistVerdict::Unresolved);
@@ -420,11 +515,23 @@ fn compose_patches(
             acc = specialist
                 .compose(&acc, next, verdict)
                 .map_err(|_| verdict)?;
+            match verdict {
+                ConflictSpecialistVerdict::Combined => {
+                    contributors.insert(row.artifact_id);
+                }
+                ConflictSpecialistVerdict::ChooseLeft => {}
+                ConflictSpecialistVerdict::ChooseRight => {
+                    contributors.clear();
+                    contributors.insert(row.artifact_id);
+                }
+                ConflictSpecialistVerdict::Unresolved => unreachable!(),
+            }
         } else {
             acc = concatenate(&acc, next);
+            contributors.insert(row.artifact_id);
         }
     }
-    Ok(acc)
+    Ok((acc, contributors))
 }
 
 fn paths_overlap(left: &UncommittedPatch, right: &UncommittedPatch) -> bool {

@@ -726,6 +726,20 @@ impl Db {
         self.read(move |c| lease_for_owner(c, session, agent, id))
             .await
     }
+
+    pub async fn workspace_lease_for_session(
+        &self,
+        session: Uuid,
+        id: Uuid,
+    ) -> Result<Option<WorkspaceLeaseRow>> {
+        self.read(move |c| {
+            c.query_row(
+                &format!("SELECT {LEASE_COLS} FROM workspace_leases WHERE session_id=?1 AND workspace_lease_id=?2"),
+                params![session.to_string(), id.to_string()],
+                map_lease,
+            ).optional().context("loading session workspace lease")
+        }).await
+    }
     /// Tool admission is read-only and refuses grace, uncertain, cleaned and
     /// expired-active rows. Pinning intentionally does not change this rule.
     pub async fn workspace_lease_for_tools(
@@ -906,7 +920,16 @@ impl Db {
         input: NewTaskArtifact,
         now: i64,
     ) -> Result<TaskArtifactRow> {
-        let id = Uuid::new_v4();
+        self.create_task_artifact_with_id(Uuid::new_v4(), input, now)
+            .await
+    }
+
+    pub async fn create_task_artifact_with_id(
+        &self,
+        id: Uuid,
+        input: NewTaskArtifact,
+        now: i64,
+    ) -> Result<TaskArtifactRow> {
         self.transaction(move |c| { let lease=lease_for_owner(c,input.session_id,input.agent_instance_id,input.source_workspace_lease_id)?.context("source workspace lease is not owned")?; if !workspace_lease_lineage_is_live(c,&lease,now)? { bail!("source workspace lease is unavailable for artifact production"); } let parent=input.parent_result.encode()?; c.execute("INSERT INTO task_artifacts (artifact_id,source_workspace_lease_id,session_id,agent_instance_id,base_head_digest,base_ref_digest,base_index_digest,touched_manifest_digest,untracked_manifest_digest,ordered_patch_digest,validation_receipt_digest,parent_result_json,state,revision,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'produced',0,?13,?13)",params![id.to_string(),input.source_workspace_lease_id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.base_head_digest.as_str(),input.base_ref_digest.as_str(),input.base_index_digest.as_str(),input.touched_manifest_digest.as_str(),input.untracked_manifest_digest.as_str(),input.ordered_patch_digest.as_str(),input.validation_receipt_digest.as_str(),parent,now])?; artifact_for_owner(c,input.session_id,input.agent_instance_id,id)?.context("created artifact missing") }).await
     }
     pub async fn task_artifact(
@@ -1051,6 +1074,75 @@ impl Db {
         )?;
         bounded_identity(&target.target_canonical_root, "target canonical root")?;
         self.transaction(move |c| { let Some(current)=artifact_for_owner(c,session,agent,id)? else{return Ok(ArtifactCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(ArtifactCasOutcome::AlreadyTerminal(current))}; if current.state != TaskArtifactState::Integrating || current.revision != expected{return Ok(ArtifactCasOutcome::RevisionConflict)}; let source=lease_for_owner(c,session,agent,current.source_workspace_lease_id)?.context("artifact source workspace lease missing")?; if target.target_canonical_repository_id != source.canonical_repository_id || !scope_is_owned_active(c,session,agent,target.target_write_scope_lease_id,&target.target_canonical_root,Some((target.expected_target_generation,target.expected_target_revision)))? { return Ok(ArtifactCasOutcome::RevisionConflict); } let changed=target.changed_path_manifest_digest.as_str().to_owned(); let inserted=c.execute("INSERT OR IGNORE INTO task_artifact_integration_receipts (artifact_id,session_id,target_canonical_repository_id,target_canonical_root,target_head_digest,target_ref_digest,target_index_digest,changed_path_manifest_digest,target_write_scope_lease_id,expected_target_generation,expected_target_revision,result_state,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'integrated',?12)",params![id.to_string(),session.to_string(),target.target_canonical_repository_id,target.target_canonical_root,target.target_head_digest.as_str(),target.target_ref_digest.as_str(),target.target_index_digest.as_str(),changed,target.target_write_scope_lease_id.to_string(),target.expected_target_generation as i64,target.expected_target_revision as i64,now])?; if inserted != 1 { bail!("integration receipt already exists for a nonterminal artifact"); } c.execute("UPDATE task_artifacts SET state='integrated',revision=revision+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND revision=?3 AND state='integrating'",params![now,id.to_string(),expected])?; Ok(ArtifactCasOutcome::Transitioned(artifact_for_owner(c,session,agent,id)?.context("integrated artifact missing")?)) }).await
+    }
+
+    /// Atomically publishes one ordered integration attempt. Either every
+    /// selected artifact receives its immutable receipt and becomes integrated,
+    /// or no artifact state changes.
+    pub async fn integrate_task_artifacts(
+        &self,
+        session: Uuid,
+        agent: Uuid,
+        artifacts: Vec<(Uuid, i64)>,
+        target: IntegrationTarget,
+        now: i64,
+    ) -> Result<Option<Vec<TaskArtifactRow>>> {
+        bounded_identity(
+            &target.target_canonical_repository_id,
+            "target repository identity",
+        )?;
+        bounded_identity(&target.target_canonical_root, "target canonical root")?;
+        self.transaction(move |c| {
+            if artifacts.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            if !scope_is_owned_active(
+                c,
+                session,
+                agent,
+                target.target_write_scope_lease_id,
+                &target.target_canonical_root,
+                Some((target.expected_target_generation, target.expected_target_revision)),
+            )? {
+                return Ok(None);
+            }
+            for (id, expected) in &artifacts {
+                let Some(current) = artifact_for_owner(c, session, agent, *id)? else {
+                    return Ok(None);
+                };
+                if current.state != TaskArtifactState::Integrating || current.revision != *expected {
+                    return Ok(None);
+                }
+                let source = lease_for_owner(c, session, agent, current.source_workspace_lease_id)?
+                    .context("artifact source workspace lease missing")?;
+                if source.canonical_repository_id != target.target_canonical_repository_id {
+                    return Ok(None);
+                }
+                let exists: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_artifact_integration_receipts WHERE artifact_id=?1 AND session_id=?2)",
+                    params![id.to_string(), session.to_string()],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(None);
+                }
+            }
+            for (id, expected) in &artifacts {
+                c.execute(
+                    "INSERT INTO task_artifact_integration_receipts (artifact_id,session_id,target_canonical_repository_id,target_canonical_root,target_head_digest,target_ref_digest,target_index_digest,changed_path_manifest_digest,target_write_scope_lease_id,expected_target_generation,expected_target_revision,result_state,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'integrated',?12)",
+                    params![id.to_string(),session.to_string(),target.target_canonical_repository_id,target.target_canonical_root,target.target_head_digest.as_str(),target.target_ref_digest.as_str(),target.target_index_digest.as_str(),target.changed_path_manifest_digest.as_str(),target.target_write_scope_lease_id.to_string(),target.expected_target_generation as i64,target.expected_target_revision as i64,now],
+                )?;
+                c.execute(
+                    "UPDATE task_artifacts SET state='integrated',revision=revision+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND revision=?3 AND state='integrating'",
+                    params![now, id.to_string(), expected],
+                )?;
+            }
+            let rows = artifacts
+                .iter()
+                .map(|(id, _)| artifact_for_owner(c, session, agent, *id)?.context("integrated artifact missing"))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(rows))
+        }).await
     }
     pub async fn task_artifact_integration_receipt(
         &self,

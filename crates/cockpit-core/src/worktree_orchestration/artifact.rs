@@ -37,34 +37,46 @@ impl ArtifactStore {
         preconditions: &ArtifactPreconditions,
     ) -> Result<()> {
         let dir = self.artifact_dir(id);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating artifact store `{}`", dir.display()))?;
-        std::fs::write(dir.join("patch.diff"), patch.diff.as_bytes())
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("creating artifact store `{}`", self.root.display()))?;
+        let pending = self.root.join(format!(".{id}.pending"));
+        if pending.exists() {
+            std::fs::remove_dir_all(&pending).context("removing abandoned artifact publication")?;
+        }
+        std::fs::create_dir(&pending).context("creating pending artifact publication")?;
+        std::fs::write(pending.join("patch.diff"), patch.diff.as_bytes())
             .context("writing artifact patch")?;
         std::fs::write(
-            dir.join("touched.txt"),
+            pending.join("touched.txt"),
             preconditions.touched_paths.join("\n"),
         )
         .context("writing touched manifest")?;
         std::fs::write(
-            dir.join("untracked.txt"),
+            pending.join("untracked.txt"),
             preconditions.untracked_paths.join("\n"),
         )
         .context("writing untracked manifest")?;
+        std::fs::rename(&pending, &dir).context("publishing artifact payload atomically")?;
         Ok(())
     }
 
-    pub fn load_patch(&self, id: Uuid) -> Result<UncommittedPatch> {
+    pub fn load_patch(&self, row: &TaskArtifactRow) -> Result<UncommittedPatch> {
+        let id = row.artifact_id;
         let dir = self.artifact_dir(id);
         let diff = std::fs::read_to_string(dir.join("patch.diff"))
             .with_context(|| format!("loading patch for artifact `{id}`"))?;
         let touched = read_path_list(&dir.join("touched.txt"))?;
         let untracked = read_path_list(&dir.join("untracked.txt"))?;
-        Ok(UncommittedPatch {
+        let patch = UncommittedPatch {
             diff,
             touched_paths: touched,
             untracked_paths: untracked,
-        })
+        };
+        patch.validate_paths()?;
+        if patch.digest() != row.ordered_patch_digest {
+            bail!("artifact `{id}` payload digest does not match its durable receipt");
+        }
+        Ok(patch)
     }
 }
 
@@ -108,8 +120,14 @@ pub async fn produce_artifact(
         ArtifactResultClass::Produced,
         WorkspaceDigest::of(patch.diff.as_bytes()),
     );
+    let artifact_id = Uuid::new_v4();
+    store.write_payload(artifact_id, &patch, &preconditions)?;
+    let ref_name = format!("refs/cockpit/artifacts/{artifact_id}");
+    git::store_private_blob_ref(source_worktree, &ref_name, patch.diff.as_bytes())
+        .context("storing private artifact blob ref")?;
     let row = db
-        .create_task_artifact(
+        .create_task_artifact_with_id(
+            artifact_id,
             NewTaskArtifact {
                 source_workspace_lease_id,
                 session_id,
@@ -127,10 +145,6 @@ pub async fn produce_artifact(
         )
         .await
         .context("persisting task artifact")?;
-    store.write_payload(row.artifact_id, &patch, &preconditions)?;
-    let ref_name = format!("refs/cockpit/artifacts/{}", row.artifact_id);
-    git::store_private_blob_ref(source_worktree, &ref_name, patch.diff.as_bytes())
-        .context("storing private artifact blob ref")?;
     Ok(ProducedArtifact {
         row,
         patch,
@@ -153,10 +167,8 @@ pub async fn surface_for_parent(
             .iter()
             .find(|row| row.artifact_id == artifact.artifact_id)
             .cloned();
-        let (touched_paths, untracked_paths) = match store.load_patch(artifact.artifact_id) {
-            Ok(patch) => (patch.touched_paths, patch.untracked_paths),
-            Err(_) => (Vec::new(), Vec::new()),
-        };
+        let patch = store.load_patch(&artifact)?;
+        let (touched_paths, untracked_paths) = (patch.touched_paths, patch.untracked_paths);
         out.push(ParentVisibleArtifact {
             artifact,
             receipt,

@@ -54,12 +54,10 @@ fi
 cargo_bin=${WT_TEST_CARGO:-cargo}
 lock_root=${CARGO_TARGET_DIR:-$primary/target}
 mkdir -p "$lock_root"
-lock=$lock_root/wt-test.lock
-
 cd "$primary"
 
-if command -v flock >/dev/null 2>&1; then
-  exec flock "$lock" "$cargo_bin" "$@"
+if [[ "${WT_TEST_LOCK_HELD:-}" == "1" ]]; then
+  exec "$cargo_bin" "$@"
 fi
 
 lockdir=$lock_root/wt-test.lock.dir
@@ -67,4 +65,4 @@ while ! mkdir "$lockdir" 2>/dev/null; do
   sleep 0.05
 done
 trap 'rmdir "$lockdir"' EXIT
-exec "$cargo_bin" "$@"
+"$cargo_bin" "$@"

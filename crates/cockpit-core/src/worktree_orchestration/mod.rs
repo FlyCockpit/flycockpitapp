@@ -30,6 +30,7 @@ pub use integration::{
 pub use lifecycle::{
     CleanupDenial, CleanupOutcome, cleanup_managed_worktree, pin_managed_worktree,
 };
+pub use receipt::repository_id as receipt_repository_id;
 pub use receipt::{ArtifactPreconditions, WorkspaceReceipt, capture_workspace_receipt};
 pub use validation::{
     CandidateValidation, ValidationEvidence, worker_must_not_invoke_cargo, wt_test_wrapper_path,

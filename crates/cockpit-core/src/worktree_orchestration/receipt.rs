@@ -103,16 +103,16 @@ fn head_path_digest(dir: &Path, relative: &str) -> Result<WorkspaceDigest> {
         anyhow::bail!("refusing escaped path `{relative}`");
     }
     let spec = format!("HEAD:{relative}");
-    let out = git::run_git(dir, &["show", &spec]).with_context(|| {
+    let exists = git::run_git(dir, &["cat-file", "-e", &spec])?;
+    if !exists.success {
+        return Ok(WorkspaceDigest::of(b"absent"));
+    }
+    let out = git::run_git_checked_bytes(dir, &["show", &spec]).with_context(|| {
         format!(
             "reading HEAD blob for `{}` in `{}`",
             relative,
             dir.display()
         )
     })?;
-    if out.success {
-        Ok(WorkspaceDigest::of(out.stdout.as_bytes()))
-    } else {
-        Ok(WorkspaceDigest::of(b"absent"))
-    }
+    Ok(WorkspaceDigest::of(&out))
 }

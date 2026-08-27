@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -45,6 +46,7 @@ impl CandidateValidation {
         cargo_args: &[&str],
     ) -> Result<ValidationEvidence> {
         worker_must_not_invoke_cargo(&self.primary)?;
+        let _lock = ValidationLock::acquire(&self.primary)?;
         let snapshot = PathOverlaySnapshot::capture(&self.primary, overlay.keys().cloned())?;
         let pre = git::byte_identical_receipt(&self.primary)?;
         let run = (|| {
@@ -100,6 +102,7 @@ fn run_wrapper(
         .current_dir(&validation.primary)
         .env("WT_TEST_PRIMARY", &validation.primary)
         .env("WT_TEST_CARGO", &validation.cargo_bin)
+        .env("WT_TEST_LOCK_HELD", "1")
         .output()
         .with_context(|| {
             format!(
@@ -117,6 +120,35 @@ fn run_wrapper(
     })
 }
 
+struct ValidationLock {
+    path: PathBuf,
+}
+
+impl ValidationLock {
+    fn acquire(primary: &Path) -> Result<Self> {
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| primary.join("target"));
+        std::fs::create_dir_all(&target)?;
+        let path = target.join("wt-test.lock.dir");
+        loop {
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error).context("acquiring candidate-validation lock"),
+            }
+        }
+    }
+}
+
+impl Drop for ValidationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
 struct PathOverlaySnapshot {
     files: BTreeMap<PathBuf, Option<Vec<u8>>>,
 }
@@ -125,6 +157,7 @@ impl PathOverlaySnapshot {
     fn capture(root: &Path, paths: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
         let mut files = BTreeMap::new();
         for rel in paths {
+            validate_overlay_path(root, &rel)?;
             let abs = root.join(&rel);
             let bytes = if abs.exists() {
                 Some(std::fs::read(&abs).with_context(|| format!("snapshot `{}`", abs.display()))?)
@@ -160,12 +193,57 @@ impl PathOverlaySnapshot {
 
 fn apply_overlay(root: &Path, overlay: &BTreeMap<PathBuf, Vec<u8>>) -> Result<()> {
     for (rel, bytes) in overlay {
+        validate_overlay_path(root, rel)?;
         let abs = root.join(rel);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&abs, bytes)
             .with_context(|| format!("applying overlay `{}`", abs.display()))?;
+    }
+    Ok(())
+}
+
+fn validate_overlay_path(root: &Path, rel: &Path) -> Result<()> {
+    if rel.as_os_str().is_empty()
+        || rel.is_absolute()
+        || rel.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!(
+            "validation overlay path `{}` is not a confined relative path",
+            rel.display()
+        );
+    }
+    let canonical_root = std::fs::canonicalize(root)
+        .with_context(|| format!("canonicalizing validation root `{}`", root.display()))?;
+    let mut parent = root
+        .join(rel)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.to_path_buf());
+    while !parent.exists() {
+        let Some(next) = parent.parent() else {
+            bail!("validation overlay parent escaped its root");
+        };
+        parent = next.to_path_buf();
+    }
+    let canonical_parent = std::fs::canonicalize(&parent)?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        bail!(
+            "validation overlay path `{}` escapes the primary tree",
+            rel.display()
+        );
+    }
+    let target = root.join(rel);
+    if target.exists() && std::fs::symlink_metadata(&target)?.file_type().is_symlink() {
+        bail!("validation overlay target `{}` is a symlink", rel.display());
     }
     Ok(())
 }

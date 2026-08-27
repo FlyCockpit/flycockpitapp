@@ -27,6 +27,7 @@ use super::validation::CandidateValidation;
 pub enum OrchestrationAction {
     EditInPlace,
     FanOut,
+    ProduceArtifact,
     MergeSelected,
     ApplyUncommitted,
 }
@@ -36,6 +37,7 @@ impl OrchestrationAction {
         match value {
             "edit_in_place" => Ok(Self::EditInPlace),
             "fan_out" => Ok(Self::FanOut),
+            "produce_artifact" => Ok(Self::ProduceArtifact),
             "merge_selected" => Ok(Self::MergeSelected),
             "apply_uncommitted" => Ok(Self::ApplyUncommitted),
             other => bail!("unknown orchestration action `{other}`"),
@@ -46,6 +48,7 @@ impl OrchestrationAction {
         match self {
             Self::EditInPlace => "edit_in_place",
             Self::FanOut => "fan_out",
+            Self::ProduceArtifact => "produce_artifact",
             Self::MergeSelected => "merge_selected",
             Self::ApplyUncommitted => "apply_uncommitted",
         }
@@ -191,13 +194,12 @@ impl WorktreeOrchestrator {
             let lease_id = Uuid::new_v4();
             let path = workspace_lease::managed_worktree_path(&self.state_dir, lease_id);
             git::assert_worktree_destination_under(&worktrees, &path)?;
-            git::worktree_add_detached(&self.primary_repo, &path, &base)?;
             let scope = Uuid::new_v4();
             let root = path.to_string_lossy().into_owned();
             self.db
                 .insert_write_scope_lease(WriteScopeLeaseRow {
                     lease_id: scope,
-                    parent_lease_id: None,
+                    parent_lease_id: Some(self.write_scope_lease_id),
                     session_id: self.session_id,
                     task_id: None,
                     scope_path: root.clone(),
@@ -211,7 +213,6 @@ impl WorktreeOrchestrator {
                 })
                 .await
                 .context("inserting child write-scope lease")?;
-            let receipt = receipt::capture_workspace_receipt(&path)?;
             let row = self
                 .db
                 .create_workspace_lease(
@@ -222,8 +223,8 @@ impl WorktreeOrchestrator {
                         canonical_repository_id: repo_id.clone(),
                         canonical_root: root,
                         kind: WorkspaceLeaseKind::ManagedWorktree,
-                        base_sha_digest: receipt.head_digest,
-                        base_ref_digest: receipt.ref_digest,
+                        base_sha_digest: base_receipt.head_digest.clone(),
+                        base_ref_digest: base_receipt.ref_digest.clone(),
                         managed_path: path.to_string_lossy().into_owned(),
                         private_ref_digest: WorkspaceDigest::of(lease_id.as_bytes()),
                         expires_at_unix_ms: now_ms.saturating_add(24 * 60 * 60 * 1000),
@@ -232,6 +233,11 @@ impl WorktreeOrchestrator {
                 )
                 .await
                 .context("creating managed worktree lease")?;
+            // Publish authority before the filesystem object. If checkout
+            // fails or the host crashes, recovery sees a durable lease and
+            // marks the missing path uncertain instead of stranding an
+            // unowned linked worktree.
+            git::worktree_add_detached(&self.primary_repo, &path, &base)?;
             created.push(ManagedChildWorktree {
                 label: spec.label,
                 lease: row,

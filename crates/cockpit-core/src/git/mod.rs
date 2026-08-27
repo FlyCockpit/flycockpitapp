@@ -215,6 +215,27 @@ pub fn run_git_checked(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(out.stdout)
 }
 
+pub(crate) fn run_git_checked_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GIT,
+        dir,
+    )
+    .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("launching `git {}`", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`git {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
 /// Resolve a git path through symlink-aware containment. A dangling symlink
 /// or `..` escape fails closed.
 pub fn resolve_git_path(path: &Path) -> Result<PathBuf> {
@@ -625,6 +646,30 @@ pub(crate) fn apply_uncommitted_patch(dir: &Path, diff: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reverse a previously applied uncommitted patch, preserving Git modes and
+/// symlink objects as well as file contents.
+pub(crate) fn reverse_uncommitted_patch(dir: &Path, diff: &str) -> Result<()> {
+    if diff.trim().is_empty() {
+        return Ok(());
+    }
+    let tmp = tempfile::NamedTempFile::new().context("creating temporary reverse patch file")?;
+    std::fs::write(tmp.path(), diff.as_bytes()).context("writing temporary reverse patch")?;
+    let path = tmp.path().to_string_lossy().into_owned();
+    let out = run_git(dir, &["apply", "--reverse", "--", &path])?;
+    if !out.success {
+        anyhow::bail!("`git apply --reverse` failed: {}", out.stderr.trim());
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_private_ref(dir: &Path, ref_name: &str) -> Result<()> {
+    if !ref_name.starts_with("refs/cockpit/") {
+        anyhow::bail!("private ref `{ref_name}` must be under refs/cockpit/");
+    }
+    run_git_checked(dir, &["update-ref", "-d", "--", ref_name])?;
+    Ok(())
+}
+
 /// Dry-run `git apply --check`. A conflict is `Ok(false)`; launch failure is
 /// `Err`.
 pub(crate) fn apply_uncommitted_patch_check(dir: &Path, diff: &str) -> Result<bool> {
@@ -675,6 +720,12 @@ pub(crate) fn byte_identical_receipt(dir: &Path) -> Result<ByteIdenticalReceipt>
         paths.push_str(digest.as_str());
         paths.push('\n');
     }
+    // Include Git's raw worktree delta so type and executable-bit changes are
+    // part of the byte-identical proof, not just regular-file contents.
+    paths.push_str(&run_git_checked(
+        dir,
+        &["diff", "--raw", "--no-renames", "HEAD"],
+    )?);
     Ok(ByteIdenticalReceipt {
         head,
         git_ref,
@@ -701,6 +752,13 @@ pub(crate) struct UncommittedPatch {
 impl UncommittedPatch {
     pub fn digest(&self) -> crate::db::workspace_lease_artifacts::WorkspaceDigest {
         crate::db::workspace_lease_artifacts::WorkspaceDigest::of(self.diff.as_bytes())
+    }
+
+    pub(crate) fn validate_paths(&self) -> Result<()> {
+        for path in self.touched_paths.iter().chain(&self.untracked_paths) {
+            reject_relative_escape(path)?;
+        }
+        Ok(())
     }
 }
 

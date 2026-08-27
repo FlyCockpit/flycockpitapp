@@ -6933,4 +6933,3 @@ CREATE TABLE tool_media_authorization_epochs (
     updated_at             INTEGER NOT NULL,
     PRIMARY KEY (issuer_kind, principal_digest, session_id, project_digest)
 );
-

@@ -397,6 +397,13 @@ pub(crate) fn accept_conn(
         );
     }
     let session = input.session_id.to_string();
+    if let Some(binding) = &input.tool_media_subject_binding {
+        ensure!(
+            binding.session_id == input.session_id
+                && binding.client_submission_id == input.client_submission_id,
+            "tool-media-subject binding identity does not match accepted message"
+        );
+    }
     let existing = conn.query_row(
         "SELECT o.actor_kind,o.actor_id,o.actor_generation,o.request_hash,o.message_request_digest,o.client_submission_id,o.safe_outcome,s.attachment_set_digest
            FROM message_operation_receipts o LEFT JOIN message_submission_receipts s ON s.session_id=o.session_id AND s.operation_id=o.operation_id
@@ -423,6 +430,7 @@ pub(crate) fn accept_conn(
             && message_digest == input.message_request_digest
             && submission == input.client_submission_id
             && attachment_digest.as_deref() == Some(input.attachment_set_digest.as_slice())
+            && tool_media_binding_replay_matches_conn(conn, &session, input)?
         {
             return Ok(AcceptMessageResult::Replayed {
                 safe_outcome: MessageSafeOutcome::decode(&outcome)?,
@@ -526,6 +534,20 @@ pub(crate) fn accept_conn(
     Ok(AcceptMessageResult::Accepted)
 }
 
+fn tool_media_binding_replay_matches_conn(
+    conn: &Connection,
+    session_id: &str,
+    input: &AcceptMessageInput,
+) -> Result<bool> {
+    let stored =
+        Db::load_tool_media_subject_binding_conn(conn, session_id, &input.client_submission_id)?;
+    match (&input.tool_media_subject_binding, stored) {
+        (None, None) => Ok(true),
+        (Some(expected), Some(actual)) => Ok(expected.receipt_bytes == actual.receipt_bytes),
+        _ => Ok(false),
+    }
+}
+
 fn actor_parts(actor: MessageActor) -> (&'static str, Option<Vec<u8>>, Vec<u8>) {
     match actor {
         MessageActor::LocalOwner => ("local_owner", None, 0u64.to_be_bytes().to_vec()),
@@ -540,6 +562,16 @@ fn actor_parts(actor: MessageActor) -> (&'static str, Option<Vec<u8>>, Vec<u8>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_binding_receipt(session_id: Uuid, version: u8) -> Vec<u8> {
+        let mut bytes = vec![version, 1];
+        bytes.extend_from_slice(&[0xAA; 32]);
+        bytes.extend_from_slice(&[0xBB; 32]);
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.extend_from_slice(&0_u64.to_be_bytes());
+        bytes.extend_from_slice(&[0xCC; 32]);
+        bytes
+    }
 
     struct Allow;
     impl MessageAcceptanceJoin for Allow {
@@ -915,7 +947,7 @@ mod tests {
                     session.session_id,
                     submission_hex(&input.client_submission_id)
                 ),
-                receipt_bytes: vec![0xFF; 122],
+                receipt_bytes: test_binding_receipt(session.session_id, 1),
                 now_ms: 20,
             },
         );
@@ -976,7 +1008,7 @@ mod tests {
                 nonce: [0xDD; 24],
                 ciphertext: vec![0xEE; 48],
                 secure_key_reference_id: "tool-media-subject-binding/missing/1".to_string(),
-                receipt_bytes: vec![0xFF; 122],
+                receipt_bytes: test_binding_receipt(session.session_id, 1),
                 now_ms: 20,
             },
         );
@@ -1038,7 +1070,7 @@ mod tests {
                 nonce: [0xDD; 24],
                 ciphertext: vec![0xEE; 48],
                 secure_key_reference_id: ref_id.clone(),
-                receipt_bytes: vec![0xFF; 122],
+                receipt_bytes: test_binding_receipt(session.session_id, 2),
                 now_ms: 20,
             },
         );

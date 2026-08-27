@@ -191,7 +191,7 @@ impl ConsumerReconciler for ToolMediaSubjectBindingDbProbe {
                 let exists: bool = conn
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM message_tool_media_subject_bindings
-                         WHERE secure_key_reference_id = ?1)",
+                         WHERE session_id || '/' || lower(hex(client_submission_id)) = ?1)",
                         rusqlite::params![&consumer_id],
                         |row| row.get(0),
                     )

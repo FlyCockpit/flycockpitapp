@@ -1168,7 +1168,9 @@ pub struct ToolCtx {
 impl ToolCtx {
     /// Access the server-private media authority. Returns `None` in
     /// stripped/MCP/Monty contexts — media tools fail closed.
-    pub fn media_authority(&self) -> Option<&crate::tool_media_authority::SessionMediaAuthority> {
+    pub(crate) fn media_authority(
+        &self,
+    ) -> Option<&crate::tool_media_authority::SessionMediaAuthority> {
         self.media_authority.as_deref()
     }
 
@@ -1379,6 +1381,12 @@ pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
             | "defer_to_orchestrator"
             | "start_build"
             | "mcp"
+            | "read_image"
+            | "inspect_audio"
+            | "inspect_video"
+            | "extract_video_clip"
+            | "extract_audio"
+            | "transcribe_audio"
     )
 }
 

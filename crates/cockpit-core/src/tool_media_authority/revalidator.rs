@@ -70,7 +70,11 @@ pub enum RevalidatorError {
 /// authority-free so the local-only launch scope compiles without it.
 pub trait RemoteStatusProjection: Send + Sync {
     /// Whether the device is currently verified and not revoked.
-    fn device_active(&self, device_uuid: &[u8; 16]) -> Result<bool, RevalidatorError>;
+    fn device_active(
+        &self,
+        device_uuid: &[u8; 16],
+        generation: u64,
+    ) -> Result<bool, RevalidatorError>;
     /// Current authority status for the principal. `Ok(true)` means active.
     fn authority_active(&self, principal_digest: &[u8; 32]) -> Result<bool, RevalidatorError>;
     /// The current authorization epoch for the key tuple.
@@ -83,15 +87,19 @@ pub trait RemoteStatusProjection: Send + Sync {
     ) -> Result<u64, RevalidatorError>;
 }
 
-/// A no-op projection for local-only launch scope.
-///
-/// Remote device revalidation is stubbed: `device_active` returns `Ok(false)`
-/// (fail-closed for remote issuers) and `authority_active` returns `Ok(true)`
-/// for local owners. The epoch is always 0 for local owners.
+/// Test-only projection. Production must inject the persisted installation,
+/// authorization, and epoch projection; there is deliberately no Owner
+/// fallback implementation.
+#[cfg(test)]
 pub struct LocalOnlyProjection;
 
+#[cfg(test)]
 impl RemoteStatusProjection for LocalOnlyProjection {
-    fn device_active(&self, _device_uuid: &[u8; 16]) -> Result<bool, RevalidatorError> {
+    fn device_active(
+        &self,
+        _device_uuid: &[u8; 16],
+        _generation: u64,
+    ) -> Result<bool, RevalidatorError> {
         // Remote devices are not supported in local-only launch scope.
         Ok(false)
     }
@@ -142,7 +150,7 @@ impl std::fmt::Debug for ToolMediaSubjectRevalidator {
 }
 
 impl ToolMediaSubjectRevalidator {
-    pub fn new(
+    pub(crate) fn new(
         projection: Arc<dyn RemoteStatusProjection>,
         key_resolver: Arc<dyn SecureKeyResolver>,
     ) -> Self {
@@ -204,10 +212,13 @@ impl ToolMediaSubjectRevalidator {
         }
 
         // 5. Check live identity via the projection.
-        let session_hex = hex::encode(receipt.session_id);
+        let session_id = uuid::Uuid::from_bytes(receipt.session_id).to_string();
 
         match receipt.issuer_kind {
             IssuerKind::LocalOwner => {
+                if !locator.is_local_owner() {
+                    return Err(RevalidatorError::IssuerMismatch);
+                }
                 // Local owner must be active.
                 if !self
                     .projection
@@ -227,7 +238,12 @@ impl ToolMediaSubjectRevalidator {
                 let device_uuid: [u8; 16] = raw[1..17]
                     .try_into()
                     .map_err(|_| RevalidatorError::Internal("device uuid".into()))?;
-                if !self.projection.device_active(&device_uuid)? {
+                let generation = u64::from_be_bytes(
+                    raw[17..25]
+                        .try_into()
+                        .map_err(|_| RevalidatorError::Internal("device generation".into()))?,
+                );
+                if !self.projection.device_active(&device_uuid, generation)? {
                     return Err(RevalidatorError::DeviceRevoked);
                 }
                 if !self
@@ -243,7 +259,7 @@ impl ToolMediaSubjectRevalidator {
         let current_epoch = self.projection.current_epoch(
             receipt.issuer_kind,
             &receipt.principal_digest,
-            &session_hex,
+            &session_id,
             &receipt.project_digest,
         )?;
         if receipt.authorization_epoch != current_epoch {
@@ -262,14 +278,6 @@ impl ToolMediaSubjectRevalidator {
             session_id: receipt.session_id,
             authorization_epoch: current_epoch,
         })
-    }
-}
-
-/// Minimal hex encoding (avoids pulling in a hex crate dependency just for
-/// the session-id string used in epoch lookups).
-pub(crate) mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
@@ -307,7 +315,11 @@ mod tests {
     }
 
     impl RemoteStatusProjection for FakeProjection {
-        fn device_active(&self, _device_uuid: &[u8; 16]) -> Result<bool, RevalidatorError> {
+        fn device_active(
+            &self,
+            _device_uuid: &[u8; 16],
+            _generation: u64,
+        ) -> Result<bool, RevalidatorError> {
             Ok(self.device_active)
         }
         fn authority_active(&self, _principal_digest: &[u8; 32]) -> Result<bool, RevalidatorError> {

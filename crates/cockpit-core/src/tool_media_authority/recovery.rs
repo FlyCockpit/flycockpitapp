@@ -488,7 +488,11 @@ mod tests {
     }
 
     impl RemoteStatusProjection for FakeProjection {
-        fn device_active(&self, _device_uuid: &[u8; 16]) -> Result<bool, RevalidatorError> {
+        fn device_active(
+            &self,
+            _device_uuid: &[u8; 16],
+            _generation: u64,
+        ) -> Result<bool, RevalidatorError> {
             Ok(self.device_active)
         }
         fn authority_active(&self, _principal_digest: &[u8; 32]) -> Result<bool, RevalidatorError> {

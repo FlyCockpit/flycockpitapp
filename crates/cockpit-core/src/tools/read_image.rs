@@ -660,12 +660,11 @@ impl Tool for ReadImageTool {
         }
 
         let authority = ctx.media_authority().unwrap();
-        let session_hex =
-            crate::tool_media_authority::revalidator::hex::encode(&authority.subject().session_id);
+        let session_id = uuid::Uuid::from_bytes(authority.subject().session_id).to_string();
 
         if let Some(path) = parsed.path.as_ref() {
             let _handle = authority
-                .admit_local_path(&session_hex, path)
+                .admit_local_path(&session_id, path)
                 .map_err(|e| invalid_input(format!("local path denied: {e}")))?;
             // TODO: image processing and consumer behavior landed in
             // `typed-media-attachment-authority-wiring` — not in this prompt.
@@ -676,7 +675,7 @@ impl Tool for ReadImageTool {
 
         if let Some(url) = parsed.url.as_ref() {
             let _source = authority
-                .admit_retained_https(&session_hex, url)
+                .admit_retained_https(&session_id, url)
                 .map_err(|e| invalid_input(format!("HTTPS source denied: {e}")))?;
             // TODO: image processing and consumer behavior landed in
             // `typed-media-attachment-authority-wiring` — not in this prompt.

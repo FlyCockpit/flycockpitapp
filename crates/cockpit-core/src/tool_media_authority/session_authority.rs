@@ -24,6 +24,9 @@ use super::revalidator::RevalidatedSubject;
 pub struct AdmittedLocalHandle {
     /// The canonical absolute path that was authorized.
     canonical_path: PathBuf,
+    /// The already-opened no-follow source. Consumers read this descriptor and
+    /// never reopen `canonical_path`.
+    held_file: Arc<std::fs::File>,
     /// Opaque evidence that the handle was held by the authority at admission
     /// time (e.g. inode/device metadata). Never exposed to the model.
     evidence: HandleEvidence,
@@ -39,6 +42,10 @@ impl AdmittedLocalHandle {
     /// The handle evidence — internal only.
     pub(crate) fn evidence(&self) -> &HandleEvidence {
         &self.evidence
+    }
+
+    pub(crate) fn held_file(&self) -> &std::fs::File {
+        &self.held_file
     }
 }
 
@@ -157,7 +164,13 @@ pub trait LocalPathPolicy: Send + Sync {
         &self,
         session_id: &str,
         path: &str,
-    ) -> Result<(PathBuf, HandleEvidence), AdmissionDenial>;
+    ) -> Result<(PathBuf, Arc<std::fs::File>, HandleEvidence), AdmissionDenial>;
+}
+
+/// Reopens and live-revalidates the persisted sealed binding. This is invoked
+/// before every source policy, so revocation and epoch changes deny before I/O.
+pub(crate) trait SubjectLiveness: Send + Sync {
+    fn revalidate(&self) -> Result<RevalidatedSubject, AdmissionDenial>;
 }
 
 /// The retained-HTTPS admission policy trait.
@@ -173,6 +186,7 @@ pub trait RetainedHttpsPolicy: Send + Sync {
 /// carried in private `ToolCtx`. Tests construct it with fakes.
 pub struct SessionMediaAuthority {
     subject: RevalidatedSubject,
+    liveness: Arc<dyn SubjectLiveness>,
     attachment_resolver: Arc<dyn AttachmentResolver>,
     local_path_policy: Arc<dyn LocalPathPolicy>,
     retained_https_policy: Arc<dyn RetainedHttpsPolicy>,
@@ -189,14 +203,16 @@ impl std::fmt::Debug for SessionMediaAuthority {
 }
 
 impl SessionMediaAuthority {
-    pub fn new(
+    pub(crate) fn new(
         subject: RevalidatedSubject,
+        liveness: Arc<dyn SubjectLiveness>,
         attachment_resolver: Arc<dyn AttachmentResolver>,
         local_path_policy: Arc<dyn LocalPathPolicy>,
         retained_https_policy: Arc<dyn RetainedHttpsPolicy>,
     ) -> Self {
         Self {
             subject,
+            liveness,
             attachment_resolver,
             local_path_policy,
             retained_https_policy,
@@ -209,6 +225,16 @@ impl SessionMediaAuthority {
         &self.subject
     }
 
+    fn revalidate_subject(&self, session_id: &str) -> Result<(), AdmissionDenial> {
+        let live = self.liveness.revalidate()?;
+        if live.receipt.canonical_bytes() != self.subject.receipt.canonical_bytes()
+            || uuid::Uuid::from_bytes(live.session_id).to_string() != session_id
+        {
+            return Err(AdmissionDenial::SubjectMismatch);
+        }
+        Ok(())
+    }
+
     /// Resolve a session attachment by id.
     ///
     /// Existence-hiding: a denial does not reveal whether the attachment
@@ -219,11 +245,12 @@ impl SessionMediaAuthority {
         attachment_id: &[u8; 16],
     ) -> Result<AdmittedAttachment, AdmissionDenial> {
         // Validate session matches the subject.
-        let session_hex = super::revalidator::hex::encode(&self.subject.session_id);
-        if session_id != session_hex {
+        let subject_session = uuid::Uuid::from_bytes(self.subject.session_id).to_string();
+        if session_id != subject_session {
             // Existence-hiding denial — no resolver call.
             return Err(AdmissionDenial::SubjectMismatch);
         }
+        self.revalidate_subject(session_id)?;
 
         match self
             .attachment_resolver
@@ -244,20 +271,17 @@ impl SessionMediaAuthority {
         session_id: &str,
         path: &str,
     ) -> Result<AdmittedLocalHandle, AdmissionDenial> {
-        let session_hex = super::revalidator::hex::encode(&self.subject.session_id);
-        if session_id != session_hex {
+        let subject_session = uuid::Uuid::from_bytes(self.subject.session_id).to_string();
+        if session_id != subject_session {
             return Err(AdmissionDenial::SubjectMismatch);
         }
+        self.revalidate_subject(session_id)?;
 
-        let (canonical_path, evidence) = self.local_path_policy.authorize(session_id, path)?;
-
-        // Validate handle identity/evidence against the canonical path.
-        // A replacement/symlink/reparse after authorization is rejected.
-        // In the real implementation this re-stats the held handle; the
-        // policy is responsible for returning evidence that the authority
-        // can validate. Here we trust the policy's evidence.
+        let (canonical_path, held_file, evidence) =
+            self.local_path_policy.authorize(session_id, path)?;
         Ok(AdmittedLocalHandle {
             canonical_path,
+            held_file,
             evidence,
         })
     }
@@ -271,10 +295,11 @@ impl SessionMediaAuthority {
         session_id: &str,
         url: &str,
     ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
-        let session_hex = super::revalidator::hex::encode(&self.subject.session_id);
-        if session_id != session_hex {
+        let subject_session = uuid::Uuid::from_bytes(self.subject.session_id).to_string();
+        if session_id != subject_session {
             return Err(AdmissionDenial::SubjectMismatch);
         }
+        self.revalidate_subject(session_id)?;
 
         self.retained_https_policy.admit(session_id, url)
     }
@@ -313,16 +338,25 @@ mod tests {
             &self,
             _session_id: &str,
             path: &str,
-        ) -> Result<(PathBuf, HandleEvidence), AdmissionDenial> {
+        ) -> Result<(PathBuf, Arc<std::fs::File>, HandleEvidence), AdmissionDenial> {
             if path.contains("denied") {
                 return Err(AdmissionDenial::LocalPathDenied);
             }
             Ok((
                 PathBuf::from(path),
+                Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap()),
                 HandleEvidence {
                     metadata_fingerprint: [0xAA; 32],
                 },
             ))
+        }
+    }
+
+    struct AlwaysLive(RevalidatedSubject);
+
+    impl SubjectLiveness for AlwaysLive {
+        fn revalidate(&self) -> Result<RevalidatedSubject, AdmissionDenial> {
+            Ok(self.0.clone())
         }
     }
 
@@ -372,7 +406,8 @@ mod tests {
             },
         );
         SessionMediaAuthority::new(
-            subject,
+            subject.clone(),
+            Arc::new(AlwaysLive(subject)),
             Arc::new(FakeAttachmentResolver { attachments }),
             Arc::new(FakeLocalPathPolicy),
             Arc::new(FakeRetainedHttpsPolicy),
@@ -383,7 +418,7 @@ mod tests {
     fn resolve_attachment_succeeds() {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
-        let session_hex = super::super::revalidator::hex::encode(&session_id);
+        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
         let result = auth.resolve_attachment(&session_hex, &[0x44; 16]);
         assert!(result.is_ok());
     }
@@ -392,7 +427,7 @@ mod tests {
     fn resolve_attachment_not_found() {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
-        let session_hex = super::super::revalidator::hex::encode(&session_id);
+        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
         let result = auth.resolve_attachment(&session_hex, &[0x99; 16]);
         assert!(matches!(result, Err(AdmissionDenial::AttachmentNotFound)));
     }
@@ -409,7 +444,7 @@ mod tests {
     fn admit_local_path_succeeds() {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
-        let session_hex = super::super::revalidator::hex::encode(&session_id);
+        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
         let result = auth.admit_local_path(&session_hex, "/tmp/image.png");
         assert!(result.is_ok());
     }
@@ -418,7 +453,7 @@ mod tests {
     fn admit_local_path_denied() {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
-        let session_hex = super::super::revalidator::hex::encode(&session_id);
+        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
         let result = auth.admit_local_path(&session_hex, "/tmp/denied.png");
         assert!(matches!(result, Err(AdmissionDenial::LocalPathDenied)));
     }
@@ -427,7 +462,7 @@ mod tests {
     fn admit_https_succeeds() {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
-        let session_hex = super::super::revalidator::hex::encode(&session_id);
+        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
         let result = auth.admit_retained_https(&session_hex, "https://example.com/image.png");
         assert!(result.is_ok());
     }
@@ -436,7 +471,7 @@ mod tests {
     fn admit_https_denied() {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
-        let session_hex = super::super::revalidator::hex::encode(&session_id);
+        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
         let result =
             auth.admit_retained_https(&session_hex, "https://denied.example.com/image.png");
         assert!(matches!(result, Err(AdmissionDenial::HttpsDenied)));
@@ -446,7 +481,7 @@ mod tests {
     fn denial_counters_zero() {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
-        let session_hex = super::super::revalidator::hex::encode(&session_id);
+        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
 
         // Denials should not perform any I/O.
         let _ = auth.resolve_attachment(&session_hex, &[0x99; 16]);

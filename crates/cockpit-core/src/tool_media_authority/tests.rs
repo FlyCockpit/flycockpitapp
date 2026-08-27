@@ -56,7 +56,11 @@ struct FakeProjection {
 }
 
 impl RemoteStatusProjection for FakeProjection {
-    fn device_active(&self, _device_uuid: &[u8; 16]) -> Result<bool, RevalidatorError> {
+    fn device_active(
+        &self,
+        _device_uuid: &[u8; 16],
+        _generation: u64,
+    ) -> Result<bool, RevalidatorError> {
         Ok(self.device_active)
     }
     fn authority_active(&self, _principal_digest: &[u8; 32]) -> Result<bool, RevalidatorError> {
@@ -502,17 +506,32 @@ impl LocalPathPolicy for FakeLocalPathPolicy {
         &self,
         _session_id: &str,
         path: &str,
-    ) -> Result<(std::path::PathBuf, super::session_authority::HandleEvidence), AdmissionDenial>
-    {
+    ) -> Result<
+        (
+            std::path::PathBuf,
+            Arc<std::fs::File>,
+            super::session_authority::HandleEvidence,
+        ),
+        AdmissionDenial,
+    > {
         if path.contains("denied") {
             return Err(AdmissionDenial::LocalPathDenied);
         }
         Ok((
             std::path::PathBuf::from(path),
+            Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap()),
             super::session_authority::HandleEvidence {
                 metadata_fingerprint: [0xAA; 32],
             },
         ))
+    }
+}
+
+struct AlwaysLive(RevalidatedSubject);
+
+impl super::session_authority::SubjectLiveness for AlwaysLive {
+    fn revalidate(&self) -> Result<RevalidatedSubject, AdmissionDenial> {
+        Ok(self.0.clone())
     }
 }
 
@@ -562,7 +581,8 @@ fn make_session_authority(session_id: [u8; 16]) -> SessionMediaAuthority {
         },
     );
     SessionMediaAuthority::new(
-        subject,
+        subject.clone(),
+        Arc::new(AlwaysLive(subject)),
         Arc::new(FakeAttachmentResolver { attachments }),
         Arc::new(FakeLocalPathPolicy),
         Arc::new(FakeRetainedHttpsPolicy),
@@ -573,7 +593,7 @@ fn make_session_authority(session_id: [u8; 16]) -> SessionMediaAuthority {
 fn tool_media_source_authority() {
     let session_id = [0xCD; 16];
     let auth = make_session_authority(session_id);
-    let session_hex = super::revalidator::hex::encode(&session_id);
+    let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
 
     // Attachment admission — only matching subject.
     let att = auth.resolve_attachment(&session_hex, &[0x44; 16]).unwrap();

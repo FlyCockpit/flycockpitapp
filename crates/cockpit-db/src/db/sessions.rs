@@ -916,11 +916,30 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
     // descendant deleted without one loses the owner-visible marker for its
     // unresolved external operations, which survive the deletion.
     let now_ms = crate::db::session_log::now_ms();
-    for member in collect_subtree(conn, session_id)? {
+    let subtree = collect_subtree(conn, session_id)?;
+    for member in &subtree {
         crate::db::external_journal::tombstone_external_journal_session_id_conn(
-            conn, member, now_ms,
+            conn, *member, now_ms,
         )
         .context("recording external journal session tombstone")?;
+    }
+    for member in &subtree {
+        let reference_ids = {
+            let mut statement = conn.prepare(
+                "SELECT secure_key_reference_id
+                   FROM message_tool_media_subject_bindings
+                  WHERE session_id = ?1",
+            )?;
+            statement
+                .query_map([member.to_string()], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for reference_id in reference_ids {
+            anyhow::ensure!(
+                crate::db::secure_key::begin_release_consumer_ref_conn(conn, &reference_id)?,
+                "tool-media-subject binding has no active secure-key reference"
+            );
+        }
     }
     let changes_before = conn.total_changes();
     conn.execute(

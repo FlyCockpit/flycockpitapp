@@ -63,7 +63,8 @@ pub const MEDIA_TOOL_NAMES: &[&str] = &[
     "read_image",
     "inspect_audio",
     "inspect_video",
-    "extract_audio_clip",
+    "extract_video_clip",
+    "extract_audio",
     "transcribe_audio",
 ];
 

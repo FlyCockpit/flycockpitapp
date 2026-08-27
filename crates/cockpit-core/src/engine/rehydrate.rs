@@ -2413,6 +2413,10 @@ fn rebuild_history(
     // Flush the final assistant turn (+ results), if any.
     pending.flush(&mut history);
     crate::engine::delegation_prompt_prune::prune_completed_delegation_prompts(&mut history);
+    // Same projection as the live path: rehydrate rebuilds args from
+    // `tool_call_events.wire_input_json` (full durable form), then stubs
+    // applied write/edit fields for the model-visible history.
+    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut history);
 
     Ok(history)
 }

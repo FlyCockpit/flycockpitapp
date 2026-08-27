@@ -71,7 +71,10 @@ pub(crate) async fn authorize_monty_native_call(
     }
 
     if let Some(approver) = ctx.approver.as_ref() {
-        let signature = crate::approval::store::GrantStore::loop_signature(tool.name(), args);
+        let signature = crate::approval::store::GrantStore::loop_signature(
+            tool.name(),
+            &crate::engine::write_edit_arg_elision::args_for_loop_hash(tool.name(), args),
+        );
         let consecutive = ctx.session.bump_consecutive_call(&signature);
         let threshold = ctx.config.extended().loop_guard.effective_threshold();
         if consecutive >= threshold {
@@ -430,8 +433,12 @@ async fn execute_ordinary_call_unscoped(
     // to the wire-history collapse site (`loop-collapse-structural-
     // dedup.md`) so the synthesized message can state "called N times".
     let mut loop_guard_count: u32 = 0;
-    let call_signature = (repair_outcome.valid && !placeholder_blocked)
-        .then(|| crate::approval::store::GrantStore::loop_signature(resolved_name, &args));
+    let call_signature = (repair_outcome.valid && !placeholder_blocked).then(|| {
+        crate::approval::store::GrantStore::loop_signature(
+            resolved_name,
+            &crate::engine::write_edit_arg_elision::args_for_loop_hash(resolved_name, &args),
+        )
+    });
     let repeated_recoverable_tool_call = if let Some(signature) = call_signature.as_deref() {
         env.session
             .repeated_recoverable_tool_call_message(signature)
@@ -1008,10 +1015,12 @@ async fn execute_ordinary_call_unscoped(
     {
         rewrite_assistant_tool_call(history, &tc.id, canonical);
     }
-    if let Some(signature) = repair_outcome
-        .valid
-        .then(|| crate::approval::store::GrantStore::loop_signature(resolved_name, &args))
-    {
+    if let Some(signature) = repair_outcome.valid.then(|| {
+        crate::approval::store::GrantStore::loop_signature(
+            resolved_name,
+            &crate::engine::write_edit_arg_elision::args_for_loop_hash(resolved_name, &args),
+        )
+    }) {
         if let Some(RepeatGuard { message }) = repeat_guard.clone() {
             env.session
                 .remember_recoverable_tool_call(signature, message);
@@ -1653,6 +1662,11 @@ async fn execute_ordinary_call_unscoped(
         resolved_name,
         wire_output,
     ));
+    // Model-visible write/edit args: stub large applied fields now that the
+    // matching result is in history. Durable rows above already stored the
+    // full `wire_input_json`. Signed-thinking latest assistant messages are
+    // left intact until a later turn settles them.
+    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(history);
     Ok(())
 }
 
@@ -4470,6 +4484,98 @@ mod tests {
         assert_eq!(
             live, replay,
             "live and restart/replay tool-result bytes must use one frame composition"
+        );
+    }
+
+    fn long_write_content() -> String {
+        let mut s = String::new();
+        while crate::tokens::count(&s) < 140 {
+            s.push_str(
+                "fn example() { let value = expensive_computation(); println!(\"{value}\"); }\n",
+            );
+        }
+        s
+    }
+
+    fn write_call_args(history: &[Message]) -> Value {
+        for msg in history {
+            let Message::Assistant { content, .. } = msg else {
+                continue;
+            };
+            for part in content {
+                if let AssistantContent::ToolCall(tc) = part
+                    && tc.function.name == "write"
+                {
+                    return tc.function.arguments.clone();
+                }
+            }
+        }
+        panic!("write tool call not found in history: {history:?}");
+    }
+
+    #[tokio::test]
+    async fn write_arg_elision_live_projection_is_byte_identical_to_rehydrate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(crate::tools::write::WriteTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let content = long_write_content();
+        let args = serde_json::json!({ "path": "big.rs", "content": content });
+        let call = tool_call("write", args.clone());
+        let mut live_history = Vec::new();
+        push_assistant_call(&mut live_history, &call);
+
+        execute_ordinary_call(&env, &mut live_history, &call, "write", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let live_args = write_call_args(&live_history);
+        assert_eq!(live_args["path"], serde_json::json!("big.rs"));
+        assert_eq!(
+            live_args["content"],
+            serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(
+                content.len()
+            ))
+        );
+
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].wire_input_json["content"],
+            serde_json::json!(content),
+            "durable audit rows keep full args"
+        );
+        assert_eq!(rows[0].original_input_json["content"], serde_json::json!(content));
+
+        let replayed =
+            crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
+                .await
+                .unwrap()
+                .expect("the durable write turn rehydrates");
+        let replay_args = write_call_args(&replayed.history);
+        assert_eq!(
+            serde_json::to_vec(&live_args).unwrap(),
+            serde_json::to_vec(&replay_args).unwrap(),
+            "live and restart/replay write args must use one projection"
         );
     }
 

@@ -1382,6 +1382,15 @@ pub(crate) async fn run_turn(
         )
         .await;
 
+    // Continue pops the just-produced tool result into `prompt`, so pass it
+    // as the upcoming result: a write/edit that settled last turn is eligible
+    // even though its result is not currently in `history`. Catches signed-
+    // thinking turns once a newer assistant message exists.
+    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args_with_upcoming(
+        history,
+        Some(&prompt),
+    );
+
     let mut prepared_request = model.prepare_completion_request(
         &agent.system,
         history,

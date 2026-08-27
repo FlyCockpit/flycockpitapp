@@ -8896,6 +8896,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     d.extended.tui.render_user_markdown = true;
     d.extended.tui.mouse_capture = false;
     d.extended.tui.rich_text_copy = false;
+    d.extended.tui.sticky_user_message = false;
     d.extended.tui.use_emojis = true;
     d.extended.tui.caffeinate_display_awake = true;
     // Set NON-display fields the Interface reset must preserve.
@@ -8939,6 +8940,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     );
     assert_eq!(d.extended.tui.mouse_capture, def.mouse_capture);
     assert_eq!(d.extended.tui.rich_text_copy, def.rich_text_copy);
+    assert_eq!(d.extended.tui.sticky_user_message, def.sticky_user_message);
     assert_eq!(d.extended.tui.use_emojis, def.use_emojis);
     assert_eq!(
         d.extended.tui.caffeinate_display_awake,

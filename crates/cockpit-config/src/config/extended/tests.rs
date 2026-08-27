@@ -1892,6 +1892,44 @@ fn web_custom_migration_drops_legacy_descriptions() {
 }
 
 #[test]
+fn sticky_user_message_defaults_true_when_omitted() {
+    let empty: ExtendedConfig = serde_json::from_str("{}").unwrap();
+    assert!(empty.tui.sticky_user_message);
+
+    let partial: ExtendedConfig =
+        serde_json::from_str(r#"{"tui":{"mouse_capture":false}}"#).unwrap();
+    assert!(partial.tui.sticky_user_message);
+    assert!(!partial.tui.mouse_capture);
+}
+
+#[test]
+fn sticky_user_message_struct_default_is_true() {
+    assert!(TuiConfig::default().sticky_user_message);
+    assert!(ExtendedConfig::default().tui.sticky_user_message);
+}
+
+#[test]
+fn sticky_user_message_false_round_trips() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = doc.config();
+    cfg.tui.sticky_user_message = false;
+    doc.write(&cfg).unwrap();
+
+    let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert!(!reloaded.tui.sticky_user_message);
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("\"sticky_user_message\": false")
+            || on_disk.contains("\"sticky_user_message\":false"),
+        "{on_disk}"
+    );
+}
+
+#[test]
 fn copy_on_release_defaults_true_when_omitted() {
     // Absent tui block.
     let empty: ExtendedConfig = serde_json::from_str("{}").unwrap();
@@ -1992,6 +2030,10 @@ fn copy_on_release_omission_preserves_sibling_tui_values() {
     .unwrap();
     let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
     assert!(cfg.tui.copy_on_release, "omitted key defaults true");
+    assert!(
+        cfg.tui.sticky_user_message,
+        "omitted sticky_user_message defaults true"
+    );
     assert!(!cfg.tui.mouse_capture);
     assert!(!cfg.tui.rich_text_copy);
     assert!(!cfg.tui.hyperlinks);

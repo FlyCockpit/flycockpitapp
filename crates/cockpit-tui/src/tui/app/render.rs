@@ -220,7 +220,7 @@ impl ChatGeometry {
         self.entry_range_for_rows(start_row, start_row + visible)
     }
 
-    fn entry_count(&self) -> usize {
+    pub(super) fn entry_count(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
 
@@ -618,6 +618,7 @@ fn history_render_signature(
     md: crate::tui::history::MarkdownOpts,
     diff_style: cockpit_config::extended::DiffStyle,
     emojis: bool,
+    sticky_user_message: bool,
     elided: &std::collections::HashSet<String>,
     preflight_dots_ms: u128,
     pin: Option<crate::tui::history::PinControl>,
@@ -630,6 +631,7 @@ fn history_render_signature(
     md.user.hash(&mut hasher);
     diff_style_id(diff_style).hash(&mut hasher);
     emojis.hash(&mut hasher);
+    sticky_user_message.hash(&mut hasher);
 
     if let HistoryEntry::User {
         preflight_pending: true,
@@ -1455,10 +1457,14 @@ impl App {
                     let chat_rect = self.render_pane(frame, rects.body);
                     match chat_rect {
                         Some(chat) => {
-                            self.render_history(frame, chat);
+                            self.render_chat_history_pane(frame, chat);
                             self.paint_transcript_control_buttons(frame);
                         }
-                        None => self.chat_area = None,
+                        None => {
+                            self.chat_area = None;
+                            self.sticky_header_area = None;
+                            self.sticky_header_history_index = None;
+                        }
                     }
                     if geom.indicator > 0 {
                         self.render_status_indicator(frame, rects.indicator);
@@ -2169,7 +2175,7 @@ impl App {
         })
     }
 
-    fn history_prefix_rows_len(&self) -> usize {
+    pub(super) fn history_prefix_rows_len(&self) -> usize {
         usize::from(self.older_history_marker_text().is_some())
     }
 
@@ -2617,6 +2623,10 @@ impl App {
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
+        // Publish the carved (or full) height before scroll-anchor
+        // recapture so a header appear/disappear keeps offset-from-bottom
+        // stable instead of compensating with a stale last-frame height.
+        self.chat_visible_lines = area_h;
         self.enforce_history_window();
         self.sync_history_render_versions();
 
@@ -2667,6 +2677,7 @@ impl App {
                     self.markdown_opts,
                     self.diff_style,
                     self.use_emojis,
+                    self.sticky_user_message,
                     &self.elided_event_ids,
                     preflight_dots_ms,
                     pin,

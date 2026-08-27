@@ -54,6 +54,7 @@ mod side_conversation;
 mod skills_pane_actions;
 pub(super) mod slash;
 mod startup_layout;
+mod sticky_header;
 mod subagent_view;
 mod terminal_controls;
 mod terminal_display;
@@ -2164,8 +2165,18 @@ pub struct App {
     startup_dependency_notice: Option<String>,
     /// Last-rendered chat area `Rect`. Used to translate absolute
     /// terminal mouse coordinates into chat-relative coordinates so
-    /// click-to-expand works on thinking blocks.
+    /// click-to-expand works on thinking blocks. This is the history
+    /// viewport after the sticky user-message header (if any) has been
+    /// carved out of the pane, so mouse `rel = row - area.y` math stays
+    /// aligned with `chat_row_meta`.
     pub(super) chat_area: Option<Rect>,
+    /// Rect of the sticky previous-user-message header, when visible.
+    /// Lives *outside* `chat_area` so history clamps, selection grid,
+    /// and row-meta tables never see it.
+    pub(super) sticky_header_area: Option<Rect>,
+    /// History index of the user message currently shown in the sticky
+    /// header. `None` when the header is hidden.
+    pub(super) sticky_header_history_index: Option<usize>,
     /// Last-rendered composer-input `Rect` (the outer rect — block
     /// border included). Used by `handle_mouse` to route clicks into
     /// click-to-position-cursor (plan.md T8.d).
@@ -2579,6 +2590,10 @@ pub struct App {
     /// keybind that copies the last agent message as HTML to the
     /// system clipboard (plan.md T8.g).
     pub(super) rich_text_copy: bool,
+    /// User's `tui.sticky_user_message` setting. When true, the most
+    /// recent user message scrolled above the viewport is pinned as a
+    /// two-line header at the top of the chat pane.
+    pub(super) sticky_user_message: bool,
     /// User's `tui.copy_on_release` setting. When true, a finalized drag
     /// or explicit double/triple selection schedules a copy through the
     /// centralized clipboard service. When false, the same gestures
@@ -3633,6 +3648,7 @@ impl App {
         let hyperlinks = tui_cfg.hyperlinks;
         let exit_tail_lines = tui_cfg.exit_tail_lines;
         let rich_text_copy = tui_cfg.rich_text_copy;
+        let sticky_user_message = tui_cfg.sticky_user_message;
         let copy_on_release = tui_cfg.copy_on_release;
         let clipboard_recovery = tui_cfg.clipboard_recovery;
         // Startup reconciliation (spec: "startup retains newest/removes
@@ -3753,6 +3769,8 @@ impl App {
             startup_daemon_notice: daemon_state.notice,
             startup_dependency_notice,
             chat_area: None,
+            sticky_header_area: None,
+            sticky_header_history_index: None,
             input_area: None,
             suggestion_box_area: None,
             suggestion_row_hits: Vec::new(),
@@ -3883,6 +3901,7 @@ impl App {
             pending_link_activation: None,
             exit_tail_lines,
             rich_text_copy,
+            sticky_user_message,
             copy_on_release,
             clipboard_recovery,
             copy_file_cancel: None,

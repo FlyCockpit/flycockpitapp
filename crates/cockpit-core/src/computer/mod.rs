@@ -2658,6 +2658,7 @@ impl std::fmt::Debug for OpenAiComputerCallResult {
     }
 }
 
+#[cfg(test)]
 pub async fn execute_openai_computer_call<B: ComputerBackend>(
     backend: &mut B,
     call_id: impl Into<String>,
@@ -2719,6 +2720,7 @@ pub async fn execute_openai_computer_call<B: ComputerBackend>(
     }
 }
 
+#[cfg(test)]
 pub async fn execute_openai_computer_call_json<B: ComputerBackend>(
     backend: &mut B,
     call: &serde_json::Value,

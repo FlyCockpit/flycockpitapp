@@ -2388,11 +2388,11 @@ impl ComputerActionCoordinator {
         actions: &[ComputerAction],
         _action_label: &str,
     ) -> CoordinatedOutcome {
-        // Commit dispatching state immediately before backend handoff.
-        self.dispatch_states
-            .insert(call_id.to_string(), DispatchState::Dispatching);
-
-        // Generation-check again immediately before each backend handoff.
+        // Generation-check BEFORE committing dispatching state, so a cancel
+        // between the check and the irreversible dispatching commit is still
+        // pre-handoff (zero input).  The `Dispatching` state is committed
+        // only after every pre-handoff gate passes, immediately before the
+        // backend handoff (AC10).
         if let Err(reason) = self.pre_handoff_check() {
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
@@ -2431,6 +2431,13 @@ impl ComputerActionCoordinator {
             };
         }
 
+        // Commit dispatching state immediately before the backend handoff —
+        // after every pre-handoff gate has passed.  This is the irreversible
+        // boundary: a cancel past this point is `DispatchUnknown`, never an
+        // auto-retry (AC10).
+        self.dispatch_states
+            .insert(call_id.to_string(), DispatchState::Dispatching);
+
         // Execute through the backend.
         let report: ComputerBatchReport = self.backend.execute(actions).await;
 
@@ -2441,6 +2448,17 @@ impl ComputerActionCoordinator {
         if let Some(failure) = report.failure {
             return CoordinatedOutcome::Failed {
                 failure,
+                screenshot: None,
+            };
+        }
+
+        // Post-action recheck: validate the host lease and target evidence
+        // are still current before capturing a screenshot.  Capture failure
+        // after successful input → `Completed` with `screenshot: None` (and
+        // no live frame).  No second input dispatch (AC11).
+        if self.pre_handoff_check().is_err() {
+            return CoordinatedOutcome::Completed {
+                completed: report.completed,
                 screenshot: None,
             };
         }

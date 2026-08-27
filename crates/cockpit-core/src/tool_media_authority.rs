@@ -17,6 +17,26 @@
 //!   authority for attachment/local/HTTPS admission.
 //! - [`availability`] — `MediaToolAvailability` data-free tool-presence
 //!   snapshot created before `ToolCtx`.
+//!
+//! # Remaining wiring (TODO for follow-up)
+//!
+//! The following pieces are scaffolded but not yet wired into the full
+//! daemon flow in this rough draft:
+//!
+//! - **Queue recovery/materialization** loads the binding for every accepted
+//!   `UserSubmission` via `Db::load_tool_media_subject_bindings_for_session`.
+//! - **Folded root** gets a subject only if all contributors have
+//!   byte-identical canonical receipts and each live revalidation succeeds;
+//!   otherwise it remains folded with no authority.
+//! - **Scheduled/background/headless roots** and children without inherited
+//!   valid root authority get none.
+//! - **Secure-key ref lifecycle** in `accept_message_with_attachments`:
+//!   reserve → activate after reachable binding insert in the same
+//!   transaction (the binding insert is wired; the ref lifecycle needs the
+//!   secure-key actor integration).
+//! - **Epoch increment** on control-state changes (device revocation,
+//!   authority status transition, local membership/read-path change) in the
+//!   authoritative write transaction.
 
 pub mod availability;
 pub mod locator;

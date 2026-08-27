@@ -178,14 +178,9 @@ impl PostureResolution {
     /// `Some`, the declared set is authoritative; when `None`, the `standard`
     /// fallback (no capabilities) applies.
     pub fn from_def(def: &AgentDef) -> Self {
-        let mut grants = def.capabilities.clone().unwrap_or_default();
-        // `forkEligible` is the temporary parse alias retained for embedded
-        // legacy definitions. Normalize it at the sole posture-construction
-        // seam so it cannot remain a second runtime policy gate.
-        if def.capabilities.is_none() && def.fork_eligible {
-            grants.insert(AgentCapability::ForkContext);
+        Self {
+            grants: def.capabilities.clone().unwrap_or_default(),
         }
-        Self { grants }
     }
 
     /// The `standard` fallback posture: no capability grants (issue #75,
@@ -277,10 +272,6 @@ pub struct AgentDef {
     pub goal_supervision: GoalSettingsOverride,
     #[serde(default)]
     pub permission: Option<serde_json::Value>,
-    /// Opt-in guard for `task.context="fork"`. False by default so embedded
-    /// and user-authored agents do not inherit fork eligibility accidentally.
-    #[serde(rename = "forkEligible", default)]
-    pub fork_eligible: bool,
     /// Explicit per-agent capability grants (issue #75). `None` = "not
     /// declared" (resolves to the `standard` fallback grant set — none of
     /// the four capabilities); `Some(empty)` = explicitly none. The four
@@ -1021,9 +1012,6 @@ impl AgentDef {
         if let Some(perm) = &self.permission {
             fm.insert("permission".into(), serde_yaml::to_value(perm)?);
         }
-        if self.fork_eligible {
-            fm.insert("forkEligible".into(), true.into());
-        }
         if let Some(caps) = &self.capabilities {
             fm.insert("capabilities".into(), serde_yaml::to_value(caps)?);
         }
@@ -1224,8 +1212,6 @@ fn parse_agent_with_scope(
         goal_supervision: GoalSettingsOverride,
         #[serde(default)]
         permission: Option<serde_json::Value>,
-        #[serde(rename = "forkEligible", default)]
-        fork_eligible: bool,
         #[serde(default)]
         capabilities: Option<BTreeSet<AgentCapability>>,
         #[serde(rename = "toolSteering", default)]
@@ -1377,7 +1363,6 @@ fn parse_agent_with_scope(
         scan_tool_results: fm.scan_tool_results,
         goal_supervision: fm.goal_supervision,
         permission: fm.permission,
-        fork_eligible: fm.fork_eligible,
         capabilities: fm.capabilities,
         tool_steering: fm.tool_steering,
         context_policy: fm.context_policy,

@@ -62,7 +62,9 @@ pub enum RecoveryError {
 pub fn receipt_from_binding_row(
     row: &crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingRowV1,
 ) -> Result<ToolMediaSubjectReceiptV1, RecoveryError> {
-    let issuer_kind = IssuerKind::from_u8(row.issuer_kind as u8)
+    let issuer_kind = u8::try_from(row.issuer_kind)
+        .ok()
+        .and_then(IssuerKind::from_u8)
         .ok_or(RecoveryError::InvalidIssuerKind(row.issuer_kind))?;
 
     let session_uuid = Uuid::parse_str(&row.session_id)
@@ -77,7 +79,13 @@ pub fn receipt_from_binding_row(
     bytes.extend_from_slice(&row.principal_digest);
     bytes.extend_from_slice(&row.project_digest);
     bytes.extend_from_slice(&session_id);
-    bytes.extend_from_slice(&(row.authorization_epoch as u64).to_be_bytes());
+    let authorization_epoch = u64::try_from(row.authorization_epoch).map_err(|_| {
+        RecoveryError::ReceiptReconstruction(format!(
+            "negative authorization_epoch: {}",
+            row.authorization_epoch
+        ))
+    })?;
+    bytes.extend_from_slice(&authorization_epoch.to_be_bytes());
     bytes.extend_from_slice(&row.subject_digest);
 
     debug_assert_eq!(bytes.len(), CANONICAL_LEN);
@@ -429,7 +437,7 @@ pub fn apply_control_state_change_conn(
 
     crate::db::Db::increment_tool_media_authorization_epoch_conn(
         conn,
-        issuer_kind,
+        i64::from(issuer_kind.as_u8()),
         principal_digest,
         &session_id,
         project_digest,
@@ -1086,8 +1094,8 @@ mod tests {
         assert_eq!(change.issuer_kind(), IssuerKind::LocalOwner);
     }
 
-    #[test]
-    fn apply_control_state_change_increments_epoch() {
+    #[tokio::test]
+    async fn apply_control_state_change_increments_epoch() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Uuid::from_bytes([0xCD; 16]);
         let principal = [0x11; 32];
@@ -1122,8 +1130,8 @@ mod tests {
         assert_eq!(current, Some(2));
     }
 
-    #[test]
-    fn apply_control_state_change_device_revocation_increments_epoch() {
+    #[tokio::test]
+    async fn apply_control_state_change_device_revocation_increments_epoch() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Uuid::from_bytes([0xCD; 16]);
         let principal = [0x11; 32];
@@ -1150,8 +1158,8 @@ mod tests {
         assert_eq!(current, Some(1));
     }
 
-    #[test]
-    fn apply_control_state_change_local_membership_increments_epoch() {
+    #[tokio::test]
+    async fn apply_control_state_change_local_membership_increments_epoch() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Uuid::from_bytes([0xCD; 16]);
         let principal = [0x11; 32];
@@ -1410,9 +1418,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Recover with LocalOnlyProjection (epoch 0) — the binding at epoch 0
-        // should still revalidate since LocalOnlyProjection always returns
-        // epoch 0. But if we use a projection that returns epoch 1, it fails.
+        // Recover with a projection that returns epoch 1. The binding was
+        // stored at epoch 0, so live revalidation must fail closed.
         let stale_revalidator = ToolMediaSubjectRevalidator::new(
             Arc::new(FakeProjection {
                 device_active: true,

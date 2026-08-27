@@ -433,13 +433,14 @@ mod tests {
         assert!(e.is_none());
 
         // Increment creates epoch 1.
+        let session_str = session.to_string();
         let new_epoch = db
             .transaction(move |conn| {
                 Db::increment_tool_media_authorization_epoch_conn(
                     conn,
                     1,
                     principal,
-                    &session.to_string(),
+                    &session_str,
                     project,
                     100,
                 )
@@ -449,13 +450,14 @@ mod tests {
         assert_eq!(new_epoch, 1);
 
         // Increment advances to 2.
+        let session_str = session.to_string();
         let new_epoch = db
             .transaction(move |conn| {
                 Db::increment_tool_media_authorization_epoch_conn(
                     conn,
                     1,
                     principal,
-                    &session.to_string(),
+                    &session_str,
                     project,
                     200,
                 )

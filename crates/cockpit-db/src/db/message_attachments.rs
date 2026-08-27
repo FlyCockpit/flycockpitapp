@@ -510,9 +510,7 @@ pub(crate) fn accept_conn(
         }
 
         // 2. Insert the binding row — this makes the consumer data reachable.
-        crate::db::tool_media_subject_bindings::Db::insert_tool_media_subject_binding_conn(
-            conn, binding,
-        )?;
+        Db::insert_tool_media_subject_binding_conn(conn, binding)?;
 
         // 3. Activate the consumer ref now that the binding is reachable.
         use crate::db::secure_key::activate_consumer_ref_conn;
@@ -1007,7 +1005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_with_binding_rollback_on_join_failure_releases_ref() {
+    async fn accept_with_binding_rollback_on_insert_failure_releases_ref() {
         let db = Db::open_in_memory().unwrap();
         let session = db
             .create_session("project", "/workspace", "Build")
@@ -1026,7 +1024,9 @@ mod tests {
             crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
                 session_id: session.session_id,
                 client_submission_id: input.client_submission_id,
-                receipt_version: 1,
+                // Invalid: validate_insert rejects receipt_version != 1
+                // *after* the consumer ref is reserved.
+                receipt_version: 2,
                 issuer_kind: 1,
                 principal_digest: [0xAA; 32],
                 project_digest: [0xBB; 32],
@@ -1043,12 +1043,16 @@ mod tests {
             },
         );
 
-        // The Deny join fails after the ref is reserved — the entire
-        // transaction (including the ref) must roll back.
+        // Reserve succeeds (key version exists), then binding insert fails
+        // validation — the entire transaction, including the reserved ref
+        // and the submission receipts, must roll back.
         let result = db
-            .accept_message_with_attachments(input.clone(), Arc::new(Deny))
+            .accept_message_with_attachments(input.clone(), Arc::new(Allow))
             .await;
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "acceptance must fail when binding insert is invalid — no partial binding"
+        );
 
         // No binding, no ref, no receipt.
         let row = db
@@ -1056,6 +1060,12 @@ mod tests {
             .await
             .unwrap();
         assert!(row.is_none());
+
+        let receipts = db
+            .message_attachment_receipts(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(receipts.is_empty());
 
         let ref_exists = db
             .read(move |conn| Ok(get_ref_by_id_conn(conn, &ref_id)?.is_some()))

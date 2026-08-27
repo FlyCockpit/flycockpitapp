@@ -656,6 +656,8 @@ pub enum Request {
     SetQueuedUserMessageClass {
         queue_item_id: Uuid,
         delivery_class: QueueDeliveryClass,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement: Option<crate::QueueItemReplacement>,
     },
 
     /// Set the delivery class of every pending queued user message.
@@ -4294,9 +4296,9 @@ macro_rules! command {
             (Request::RemoveQueuedUserMessage { queue_item_id }, "remove_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "queue_item_id:Uuid", [queue_item_id: Uuid => queue]);
             (Request::RemoveNewestQueuedUserMessage { target_id }, "remove_newest_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>", [target_id: Option<String> => param]);
             (Request::RemoveEditableQueuedUserMessages { target_id }, "remove_editable_queued_user_messages", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>", [target_id: Option<String> => param]);
-            (Request::SetQueuedUserMessageClass { queue_item_id, delivery_class }, "set_queued_user_message_class", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "queue_item_id:Uuid|delivery_class:QueueDeliveryClass", [queue_item_id: Uuid => queue, delivery_class: QueueDeliveryClass => param]);
-            (Request::PromoteQueuedUserMessages { delivery_class }, "promote_queued_user_messages", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "delivery_class:QueueDeliveryClass", [delivery_class: QueueDeliveryClass => param]);
-            (Request::SendNowQueuedUserMessage { queue_item_id }, "send_now_queued_user_message", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "queue_item_id:Uuid", [queue_item_id: Uuid => queue]);
+            (Request::SetQueuedUserMessageClass { queue_item_id, delivery_class, replacement }, "set_queued_user_message_class", session_writer, attached, true, local_only, none, serialized, none, "queue_item_id:Uuid|delivery_class:QueueDeliveryClass|replacement:Option<QueueItemReplacement>", [queue_item_id: Uuid => queue, delivery_class: QueueDeliveryClass => param, replacement: Option<QueueItemReplacement> => param]);
+            (Request::PromoteQueuedUserMessages { delivery_class }, "promote_queued_user_messages", session_writer, attached, true, local_only, none, serialized, none, "delivery_class:QueueDeliveryClass", [delivery_class: QueueDeliveryClass => param]);
+            (Request::SendNowQueuedUserMessage { queue_item_id }, "send_now_queued_user_message", session_writer, attached, true, local_only, none, serialized, none, "queue_item_id:Uuid", [queue_item_id: Uuid => queue]);
             (Request::ResumePausedWork { session_id }, "resume_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
@@ -4915,6 +4917,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Vec<ImageAttachmentRef>" => "list<struct:ImageAttachmentRef:v1>",
         "Vec<TagExpansionMeta>" => "list<struct:TagExpansionMeta:v1>",
         "UserMessageOrigin" => "enum16",
+        "Option<QueueItemReplacement>" => "option<struct:QueueItemReplacement:v1>",
         "Option<EnvSnapshotWire>" => "option<struct:EnvSnapshotWire:v1>",
         "Option<RunInvocationOptions>" => "option<struct:RunInvocationOptions:v1>",
         "Option<LeakRotationState>" => "option<enum16:LeakRotationState>",

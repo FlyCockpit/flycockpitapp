@@ -3965,6 +3965,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
             ),
             run_invocation_id,
+            delivery_class: Default::default(),
         };
         let fingerprint = submission.client_fingerprint();
         submission
@@ -4221,6 +4222,7 @@ async fn probe_user_message(
                     text: String::new(),
                     display_text: None,
                     target: proto::QueueTarget::default(),
+                    delivery_class: Default::default(),
                 });
             UserMessageProbeResult::Duplicate { item, queue }
         }
@@ -8342,6 +8344,7 @@ pub(super) async fn run_worker(
                                         text: submission.text.clone(),
                                         display_text: submission.display_text.clone(),
                                         target: queue_target_to_proto(target),
+        delivery_class: Default::default(),
                                     },
                                     queue,
                                 )));
@@ -8726,14 +8729,20 @@ pub(super) async fn run_worker(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    submission.delivery_class = {
-                        let snapshot = config_snapshot
-                            .read()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        proto::QueueDeliveryClass::from_steering_setting(
-                            snapshot.extended.queued_messages_as_steering,
-                        )
-                    };
+                    let delivery_class_explicit =
+                        submission.queue_item_ids.as_slice() == [Uuid::nil()];
+                    if delivery_class_explicit {
+                        submission.queue_item_ids.clear();
+                    } else {
+                        submission.delivery_class = {
+                            let snapshot = config_snapshot
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            proto::QueueDeliveryClass::from_steering_setting(
+                                snapshot.extended.queued_messages_as_steering,
+                            )
+                        };
+                    }
                     let receipt = submission
                         .client_submissions
                         .first()
@@ -8799,6 +8808,7 @@ pub(super) async fn run_worker(
                                     text: submission.text.clone(),
                                     display_text: submission.display_text.clone(),
                                     target: queue_target_to_proto(target),
+                                    delivery_class: Default::default(),
                                 },
                                 queue,
                             )));
@@ -8896,6 +8906,7 @@ pub(super) async fn run_worker(
                                                 text: submission.text.clone(),
                                                 display_text: submission.display_text.clone(),
                                                 target: queue_target_to_proto(target),
+                                                delivery_class: submission.delivery_class,
                                             });
                                         let _ = respond_to.send(Ok((item, queue)));
                                     }
@@ -8967,6 +8978,7 @@ pub(super) async fn run_worker(
                             text: String::new(),
                             display_text: None,
                             target: proto::QueueTarget::default(),
+                            delivery_class: Default::default(),
                         },
                     );
                     let _ = respond_to.send(Ok((item, queue)));
@@ -9345,10 +9357,11 @@ pub(super) async fn run_worker(
                 SessionWork::SetQueuedUserMessageClass {
                     queue_item_id,
                     delivery_class,
+                    replacement,
                     respond_to,
                 } => {
                     let (result, item, snapshot) = driver_input_queue
-                        .set_delivery_class(queue_item_id, delivery_class)
+                        .set_delivery_class(queue_item_id, delivery_class, replacement)
                         .await;
                     let reason = remove_reason_to_proto(result);
                     let _ = respond_to.send(Ok(proto::SetQueuedUserMessageClassResult {

@@ -380,6 +380,9 @@ impl App {
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
+        if key.code == KeyCode::Esc && self.cancel_queued_message_edit() {
+            return false;
+        }
         let composer_before = self.composer.text().to_string();
         let exit = self.handle_key_inner(key);
         let clears_or_recalls_without_editing =
@@ -2802,6 +2805,11 @@ impl App {
             .into_iter()
             .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
+        if self.pending_queue_edit_item_id.is_some() && !self.pending_queue_edit_reserved {
+            self.show_toast("reserving queued message for edit…", super::ToastKind::Info);
+            return false;
+        }
+        let delivery_class_explicit = self.pending_queue_edit_class.is_some();
         let delivery_class = self.pending_queue_edit_class.take().unwrap_or_else(|| {
             cockpit_proto::QueueDeliveryClass::from_steering_setting(
                 self.extended.queued_messages_as_steering,
@@ -2811,6 +2819,35 @@ impl App {
             .foreground_input_target
             .clone()
             .unwrap_or_else(|| cockpit_proto::QueueTarget::root(""));
+        if let Some(queue_item_id) = self.pending_queue_edit_item_id {
+            if !paste_images.is_empty() {
+                self.pending_queue_edit_item_id = Some(queue_item_id);
+                self.pending_queue_edit_class = Some(delivery_class);
+                self.show_toast(
+                    "queued-message edits cannot add images",
+                    super::ToastKind::Info,
+                );
+                return false;
+            }
+            let replacement = cockpit_proto::QueueItemReplacement {
+                text: wire.clone(),
+                display_text: Some(submitted.clone()),
+                tag_expansions,
+                editing: false,
+            };
+            if let Some(item) = self.queue.iter_mut().find(|item| item.id == queue_item_id) {
+                item.text = replacement.text.clone();
+                item.display_text = replacement.display_text.clone();
+                item.delivery_class = delivery_class;
+            }
+            self.send_queue_request(Request::SetQueuedUserMessageClass {
+                queue_item_id,
+                delivery_class,
+                replacement: Some(replacement),
+            });
+            self.pending_queue_edit_commit = true;
+            return false;
+        }
         let submission = cockpit_client::submission::ClientUserSubmission {
             expected_model_state_generation: self
                 .active_model_state_confirmed
@@ -2827,6 +2864,14 @@ impl App {
             images: paste_images,
             forced_skill: None,
             delivery_class,
+            // A nil queue id is an acceptance-only marker that tells the
+            // worker this edit-all submission carries an explicit preserved
+            // class. The worker consumes it before the submission enters the
+            // real queue, whose ids are always generated UUIDs.
+            queue_item_ids: delivery_class_explicit
+                .then_some(uuid::Uuid::nil())
+                .into_iter()
+                .collect(),
             queue_target: Some(queue_target.clone()),
             ..Default::default()
         };
@@ -3386,6 +3431,12 @@ impl App {
 
     pub(super) fn replace_queue_from_proto(&mut self, queue: Vec<proto::QueueItem>) {
         self.queue = queue.into_iter().map(queue_item_from_proto).collect();
+        if self
+            .queue_focus
+            .is_some_and(|id| !self.queue.iter().any(|item| item.id == id))
+        {
+            self.queue_focus = None;
+        }
     }
 
     #[cfg(test)]
@@ -4616,6 +4667,7 @@ mod queued_message_edit_tests {
             text: text.to_string(),
             display_text: None,
             target,
+            delivery_class: Default::default(),
         }
     }
 
@@ -4641,6 +4693,7 @@ mod queued_message_edit_tests {
                     text: older.text,
                     display_text: None,
                     target: cockpit_proto::QueueTarget::default(),
+                    delivery_class: Default::default(),
                 },
                 QueueItem {
                     id: newer.id,
@@ -4648,6 +4701,7 @@ mod queued_message_edit_tests {
                     text: newer.text,
                     display_text: Some("edit @a.rs".to_string()),
                     target: cockpit_proto::QueueTarget::default(),
+                    delivery_class: Default::default(),
                 },
             ],
             queue: Vec::new(),
@@ -4713,6 +4767,7 @@ mod queued_message_edit_tests {
                 text: editable.text,
                 display_text: Some("editable @compact".to_string()),
                 target: cockpit_proto::QueueTarget::default(),
+                delivery_class: Default::default(),
             }],
             queue: Vec::new(),
         });

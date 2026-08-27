@@ -1251,14 +1251,13 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v20 adds the attached-session, daemon-owned
-/// setup inventory. v19's entry-mode attach contract and every older fixture
-/// remain frozen migration evidence, not a compatibility window.
-pub const PROTOCOL_VERSION: u32 = 21;
+/// Current wire schema version. v22 adds queued-message delivery classes and
+/// local queue controls. v21 and every older fixture remain frozen migration
+/// evidence, not a compatibility window.
+pub const PROTOCOL_VERSION: u32 = 22;
 
-/// Oldest wire schema version this binary accepts. v20 is current-only: setup
-/// inventory is an explicit contract with no compatibility shim.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
+/// Oldest wire schema version this binary accepts. v22 is current-only.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 22;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3438,7 +3437,19 @@ pub struct QueueItem {
     /// snapshots and struct literals stay valid; enqueue overwrites this
     /// from `queuedMessagesAsSteering`.
     #[serde(default)]
-    pub delivery_class: QueueDeliveryClass = QueueDeliveryClass::Steering,
+    pub delivery_class: QueueDeliveryClass,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueItemReplacement {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
+    #[serde(default)]
+    pub tag_expansions: Vec<TagExpansionMeta>,
+    /// Reserve the queue slot while its text is open in the composer.
+    #[serde(default)]
+    pub editing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4059,8 +4070,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[21];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[22];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -5580,7 +5591,7 @@ mod errorcode_forward_tests {
 /// not support. Keep this separate from the remote-gated supported-version
 /// table: fixture retention must never widen the live compatibility window.
 #[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
+const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
 
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
@@ -6794,6 +6805,7 @@ mod tests {
             Request::SetQueuedUserMessageClass {
                 queue_item_id: item_id,
                 delivery_class: QueueDeliveryClass::Held,
+                replacement: None,
             },
         );
         let back: Envelope =
@@ -6804,6 +6816,7 @@ mod tests {
                     Request::SetQueuedUserMessageClass {
                         queue_item_id,
                         delivery_class,
+                        replacement: _,
                     },
                 ..
             } => {
@@ -8078,13 +8091,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 21);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v20 config_refreshed fixture")
+                .expect("current v22 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -8099,20 +8112,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 21);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v20 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v22 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v20 {response_name} must freeze the inclusive verification cap"
+                "current v22 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v20 {response_name} must deserialize: {error}")
+                panic!("current v22 {response_name} must deserialize: {error}")
             });
         }
     }

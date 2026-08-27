@@ -17,8 +17,13 @@ impl App {
     }
 
     pub(super) fn queue_has_held(&self) -> bool {
+        let target_id = self
+            .foreground_input_target
+            .as_ref()
+            .map(|target| target.id.as_str());
         self.queue
             .iter()
+            .filter(|item| target_id.is_none_or(|target_id| item.target.id == target_id))
             .any(|item| item.delivery_class == QueueDeliveryClass::Held)
     }
 
@@ -137,7 +142,17 @@ impl App {
     pub(super) fn queue_action_send_now(&mut self, item_id: Option<Uuid>) {
         let ids: Vec<Uuid> = match item_id {
             Some(id) => vec![id],
-            None => self.queue.iter().map(|item| item.id).collect(),
+            None => {
+                let target_id = self
+                    .foreground_input_target
+                    .as_ref()
+                    .map(|target| target.id.as_str());
+                self.queue
+                    .iter()
+                    .filter(|item| target_id.is_none_or(|target_id| item.target.id == target_id))
+                    .map(|item| item.id)
+                    .collect()
+            }
         };
         for id in ids {
             self.send_queue_request(Request::SendNowQueuedUserMessage { queue_item_id: id });
@@ -154,10 +169,8 @@ impl App {
                 self.send_queue_request(Request::SetQueuedUserMessageClass {
                     queue_item_id: id,
                     delivery_class,
+                    replacement: None,
                 });
-                if let Some(item) = self.queue.iter_mut().find(|item| item.id == id) {
-                    item.delivery_class = delivery_class;
-                }
             }
             None => {
                 let delivery_class = if self.queue_has_held() {
@@ -165,16 +178,45 @@ impl App {
                 } else {
                     QueueDeliveryClass::Held
                 };
-                self.queue_promote_all(delivery_class);
+                let target_id = self
+                    .foreground_input_target
+                    .as_ref()
+                    .map(|target| target.id.as_str());
+                let ids = self
+                    .queue
+                    .iter()
+                    .filter(|item| target_id.is_none_or(|target_id| item.target.id == target_id))
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>();
+                for queue_item_id in ids {
+                    self.send_queue_request(Request::SetQueuedUserMessageClass {
+                        queue_item_id,
+                        delivery_class,
+                        replacement: None,
+                    });
+                }
             }
         }
     }
 
     pub(super) fn queue_promote_all(&mut self, delivery_class: QueueDeliveryClass) {
-        for item in &mut self.queue {
-            item.delivery_class = delivery_class;
+        let target_id = self
+            .foreground_input_target
+            .as_ref()
+            .map(|target| target.id.as_str());
+        let ids = self
+            .queue
+            .iter()
+            .filter(|item| target_id.is_none_or(|target_id| item.target.id == target_id))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        for queue_item_id in ids {
+            self.send_queue_request(Request::SetQueuedUserMessageClass {
+                queue_item_id,
+                delivery_class,
+                replacement: None,
+            });
         }
-        self.send_queue_request(Request::PromoteQueuedUserMessages { delivery_class });
     }
 
     pub(super) fn queue_action_edit(&mut self, item_id: Option<Uuid>) {
@@ -189,15 +231,9 @@ impl App {
     pub(super) fn queue_action_cancel(&mut self, item_id: Option<Uuid>) {
         match item_id {
             Some(id) => {
-                self.queue.retain(|item| item.id != id);
-                if self.queue_focus == Some(id) {
-                    self.queue_focus = self.queue_visual_ids().last().copied();
-                }
                 self.send_queue_request(Request::RemoveQueuedUserMessage { queue_item_id: id });
             }
             None => {
-                self.queue.clear();
-                self.queue_focus = None;
                 self.send_queue_request(Request::RemoveEditableQueuedUserMessages {
                     target_id: None,
                 });
@@ -206,21 +242,55 @@ impl App {
     }
 
     fn edit_one_queued_message(&mut self, id: Uuid) {
-        let Some(index) = self.queue.iter().position(|item| item.id == id) else {
+        let Some(item) = self.queue.iter().find(|item| item.id == id).cloned() else {
             return;
         };
-        let item = self.queue.remove(index);
         self.pending_queue_edit_class = Some(item.delivery_class);
+        self.pending_queue_edit_item_id = Some(id);
+        self.pending_queue_edit_commit = false;
+        self.pending_queue_edit_reserved = false;
+        self.send_queue_request(Request::SetQueuedUserMessageClass {
+            queue_item_id: id,
+            delivery_class: item.delivery_class,
+            replacement: Some(cockpit_proto::QueueItemReplacement {
+                text: item.text.clone(),
+                display_text: item.display_text.clone(),
+                tag_expansions: Vec::new(),
+                editing: true,
+            }),
+        });
         let text = item
             .display_text
             .filter(|value| !value.is_empty())
             .unwrap_or(item.text);
         self.replace_composer_buffer(text);
         self.blur_queue_focus();
-        self.send_queue_request(Request::RemoveQueuedUserMessage { queue_item_id: id });
     }
 
-    fn send_queue_request(&mut self, request: Request) {
+    pub(super) fn cancel_queued_message_edit(&mut self) -> bool {
+        let Some(id) = self.pending_queue_edit_item_id.take() else {
+            return false;
+        };
+        if let Some(item) = self.queue.iter().find(|item| item.id == id).cloned() {
+            self.send_queue_request(Request::SetQueuedUserMessageClass {
+                queue_item_id: id,
+                delivery_class: item.delivery_class,
+                replacement: Some(cockpit_proto::QueueItemReplacement {
+                    text: item.text,
+                    display_text: item.display_text,
+                    tag_expansions: Vec::new(),
+                    editing: false,
+                }),
+            });
+        }
+        self.pending_queue_edit_class = None;
+        self.pending_queue_edit_commit = false;
+        self.pending_queue_edit_reserved = false;
+        self.clear_composer_buffer();
+        true
+    }
+
+    pub(super) fn send_queue_request(&mut self, request: Request) {
         let Some(attached) = self
             .agent_runner
             .as_ref()
@@ -229,9 +299,17 @@ impl App {
         else {
             return;
         };
+        let action_key = match &request {
+            Request::SetQueuedUserMessageClass { queue_item_id, .. }
+            | Request::SendNowQueuedUserMessage { queue_item_id }
+            | Request::RemoveQueuedUserMessage { queue_item_id } => {
+                format!("queue.control.{queue_item_id}")
+            }
+            _ => "queue.control".to_string(),
+        };
         self.async_actions.start_serialized(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("queue.control"),
-            crate::tui::async_action::AsyncActionKey::new("queue.control"),
+            crate::tui::async_action::AsyncActionKey::new(action_key),
             async move {
                 attached.request(request).await.map(|response| {
                     crate::tui::async_action::AsyncActionPayload::DaemonResponse(Box::new(response))
@@ -259,6 +337,35 @@ impl App {
     }
 
     pub(super) fn apply_queue_control_response(&mut self, response: cockpit_proto::Response) {
+        if let cockpit_proto::Response::SetQueuedUserMessageClassResult {
+            applied,
+            item,
+            reason,
+            ..
+        } = &response
+            && self.pending_queue_edit_item_id.is_some()
+        {
+            if !self.pending_queue_edit_commit && *applied {
+                self.pending_queue_edit_reserved = true;
+            } else if self.pending_queue_edit_commit
+                && *applied
+                && item
+                    .as_ref()
+                    .is_some_and(|item| Some(item.id) == self.pending_queue_edit_item_id)
+            {
+                self.pending_queue_edit_item_id = None;
+                self.pending_queue_edit_class = None;
+                self.pending_queue_edit_commit = false;
+                self.pending_queue_edit_reserved = false;
+                self.clear_composer_buffer();
+                self.draft_generation = self.draft_generation.saturating_add(1);
+            } else if !*applied {
+                self.show_toast(
+                    format!("queued-message edit was not applied: {reason:?}"),
+                    super::ToastKind::Info,
+                );
+            }
+        }
         match response {
             cockpit_proto::Response::SetQueuedUserMessageClassResult { queue, .. }
             | cockpit_proto::Response::PromoteQueuedUserMessagesResult { queue, .. }
@@ -293,6 +400,15 @@ mod tests {
         }
     }
 
+    fn apply_snapshot(app: &mut App, queue: Vec<cockpit_proto::QueueItem>) {
+        app.apply_queue_control_response(
+            cockpit_proto::Response::PromoteQueuedUserMessagesResult {
+                applied: true,
+                queue,
+            },
+        );
+    }
+
     #[test]
     fn toggle_one_moves_class_and_cancel_leaves_others() {
         let tmp = tempfile::tempdir().unwrap();
@@ -302,9 +418,19 @@ mod tests {
         let first_id = first.id;
         app.queue.extend([first, second]);
         app.queue_action_toggle(Some(first_id));
+        let mut queue = app.queue.clone();
+        queue[0].delivery_class = QueueDeliveryClass::Held;
+        apply_snapshot(&mut app, queue);
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
         assert_eq!(app.queue[1].delivery_class, QueueDeliveryClass::Steering);
         app.queue_action_cancel(Some(first_id));
+        let queue = app
+            .queue
+            .iter()
+            .filter(|item| item.id != first_id)
+            .cloned()
+            .collect();
+        apply_snapshot(&mut app, queue);
         assert_eq!(app.queue.len(), 1);
         assert_eq!(app.queue[0].text, "two");
     }
@@ -317,6 +443,11 @@ mod tests {
         app.queue.push(item("steer", QueueDeliveryClass::Steering));
         assert_eq!(app.queue_box_toggle_label(), "steer all");
         app.queue_action_toggle(None);
+        let mut queue = app.queue.clone();
+        for item in &mut queue {
+            item.delivery_class = QueueDeliveryClass::Steering;
+        }
+        apply_snapshot(&mut app, queue);
         assert!(
             app.queue
                 .iter()
@@ -335,8 +466,10 @@ mod tests {
         app.queue.extend([first, second]);
         app.queue_action_edit(Some(first_id));
         assert_eq!(app.composer.text(), "one");
-        assert_eq!(app.queue.len(), 1);
-        assert_eq!(app.queue[0].text, "two");
+        assert_eq!(app.queue.len(), 2);
+        assert_eq!(app.queue[0].text, "one");
+        assert_eq!(app.queue[1].text, "two");
+        assert_eq!(app.pending_queue_edit_item_id, Some(first_id));
         assert_eq!(
             app.pending_queue_edit_class,
             Some(QueueDeliveryClass::Steering)
@@ -354,6 +487,9 @@ mod tests {
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Steering);
         app.focus_queue_from_composer();
         assert!(app.handle_queue_key(key));
+        let mut queue = app.queue.clone();
+        queue[0].delivery_class = QueueDeliveryClass::Held;
+        apply_snapshot(&mut app, queue);
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
     }
 
@@ -368,10 +504,20 @@ mod tests {
         app.dispatch_button(crate::tui::button::ButtonDispatch::QueueToggleClass {
             item_id: Some(first_id),
         });
+        let mut queue = app.queue.clone();
+        queue[0].delivery_class = QueueDeliveryClass::Held;
+        apply_snapshot(&mut app, queue);
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
         app.dispatch_button(crate::tui::button::ButtonDispatch::QueueCancel {
             item_id: Some(first_id),
         });
+        let queue = app
+            .queue
+            .iter()
+            .filter(|item| item.id != first_id)
+            .cloned()
+            .collect();
+        apply_snapshot(&mut app, queue);
         assert_eq!(app.queue.len(), 1);
         assert_eq!(app.queue[0].text, "two");
     }
@@ -383,6 +529,9 @@ mod tests {
         app.extended.queued_messages_as_steering = false;
         app.queue.push(item("held", QueueDeliveryClass::Held));
         app.queue_promote_all(QueueDeliveryClass::Steering);
+        let mut queue = app.queue.clone();
+        queue[0].delivery_class = QueueDeliveryClass::Steering;
+        apply_snapshot(&mut app, queue);
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Steering);
     }
 

@@ -223,6 +223,7 @@ fn complete_submission(index: usize) -> UserSubmission {
         pending_terminal_disposition: None,
         run_invocation_id: None,
         queue_target: Some(cockpit_proto::QueueTarget::root("Build")),
+        delivery_class: Default::default(),
     }
 }
 

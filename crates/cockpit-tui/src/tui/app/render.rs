@@ -1511,6 +1511,10 @@ impl App {
                     let cursor_pos = self.render_input(frame, rects.input);
                     if geom.queue > 0 {
                         self.render_queue(frame, rects.queue);
+                    } else {
+                        self.queue_row_hits.clear();
+                        self.queue_hover = None;
+                        self.queue_focus = None;
                     }
                     if geom.suggestions > 0 {
                         self.render_suggestion_box(frame, rects.suggestions);

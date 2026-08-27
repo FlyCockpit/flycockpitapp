@@ -211,6 +211,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
                 depth: 1,
                 task_call_id: Some("task-1".to_string()),
             }),
+            delivery_class: Default::default(),
         },
         tag_expansions: vec![tag],
     }

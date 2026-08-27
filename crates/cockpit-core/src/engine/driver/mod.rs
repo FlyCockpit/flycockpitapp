@@ -6854,6 +6854,7 @@ impl Driver {
             queue_target: None,
             pending_terminal_disposition: None,
             run_invocation_id: None,
+            delivery_class: Default::default(),
         })
     }
 
@@ -7101,6 +7102,7 @@ impl Driver {
                         queue_target: prepared.queue_target,
                         pending_terminal_disposition: None,
                         run_invocation_id: prepared.run_invocation_id,
+                        delivery_class: prepared.delivery_class,
                     });
                     if let Some(previous) = next_prompt.replace(message)
                         && let Some(frame) = self.stack.last_mut()
@@ -7230,6 +7232,7 @@ impl Driver {
             queue_target: None,
             pending_terminal_disposition: None,
             run_invocation_id: None,
+            delivery_class: prepared.delivery_class,
         })
     }
 
@@ -7654,6 +7657,7 @@ impl Driver {
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
             ),
             run_invocation_id: submission.run_invocation_id,
+            delivery_class: submission.delivery_class,
         })
     }
 
@@ -7795,6 +7799,7 @@ impl Driver {
                 queue_target: None,
                 pending_terminal_disposition: None,
                 run_invocation_id: None,
+                delivery_class: Default::default(),
             }));
         }
         let result = self
@@ -10164,6 +10169,7 @@ impl Driver {
                                 queue_target,
                                 pending_terminal_disposition,
                                 run_invocation_id,
+                                delivery_class: Default::default(),
                             },
                             self.active_queue_target(),
                             DURABLE_SUBMISSION_RETRY_BACKOFF,
@@ -10460,6 +10466,7 @@ impl Driver {
                 queue_target: None,
                 pending_terminal_disposition: None,
                 run_invocation_id: None,
+                delivery_class: Default::default(),
             })
         };
         let max_primary_rounds = self.max_primary_rounds;
@@ -10941,6 +10948,27 @@ impl Driver {
                     continue;
                 }
                 TurnOutcome::Return { fields } => {
+                    // Child completion is a delivery boundary for messages
+                    // routed to that focused child. Drain before popping the
+                    // frame; afterward its target id is no longer active and
+                    // those messages could never be selected by the parent.
+                    let child_target_id = self.active_queue_target_id();
+                    let mut queued = Vec::new();
+                    drain_group_order_queue(input_rx, &mut queued, &child_target_id, MAX_FOLD)
+                        .await;
+                    if !queued.is_empty() {
+                        match self
+                            .inject_steering_user_submissions(queued, input_rx, tx)
+                            .await
+                        {
+                            SteeringInject::NextPrompt(message) => {
+                                next_prompt = message;
+                                continue;
+                            }
+                            SteeringInject::Requeued => {}
+                            SteeringInject::Aborted => return Ok(()),
+                        }
+                    }
                     // A delegated interactive subagent (`builder` +
                     // custom) finished via the structural `return` tool. Pop it
                     // and inject the structured envelope as the parent's tool
@@ -10990,6 +11018,23 @@ impl Driver {
                 }
                 TurnOutcome::Done => {
                     if self.stack.len() > 1 {
+                        let child_target_id = self.active_queue_target_id();
+                        let mut queued = Vec::new();
+                        drain_group_order_queue(input_rx, &mut queued, &child_target_id, MAX_FOLD)
+                            .await;
+                        if !queued.is_empty() {
+                            match self
+                                .inject_steering_user_submissions(queued, input_rx, tx)
+                                .await
+                            {
+                                SteeringInject::NextPrompt(message) => {
+                                    next_prompt = message;
+                                    continue;
+                                }
+                                SteeringInject::Requeued => {}
+                                SteeringInject::Aborted => return Ok(()),
+                            }
+                        }
                         // Genuine child completion with no `return` call. Consult
                         // the child's frame-owned `subagentStop` gate (the single
                         // firing for this stop) before popping; a blocking stop
@@ -11043,8 +11088,7 @@ impl Driver {
                         // Run completion is a delivery boundary: remaining
                         // steering then held items deliver in group order so
                         // nothing is stranded.
-                        drain_group_order_queue(input_rx, &mut queued, &target_id, usize::MAX)
-                            .await;
+                        drain_group_order_queue(input_rx, &mut queued, &target_id, MAX_FOLD).await;
                         if queued
                             .first()
                             .is_some_and(|item| item.kind == UserSubmissionKind::Compact)

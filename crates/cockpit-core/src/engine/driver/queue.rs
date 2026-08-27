@@ -29,9 +29,19 @@ pub(super) async fn drain_steering_queue(
         into,
         max,
         Some(target_id),
-        crate::engine::message::QueueDrainFilter::SteeringOrSendNow,
+        crate::engine::message::QueueDrainFilter::Steering,
     )
     .await;
+    let remaining = max.saturating_sub(into.len());
+    if remaining > 0 {
+        rx.drain_into_for_filtered(
+            into,
+            remaining,
+            Some(target_id),
+            crate::engine::message::QueueDrainFilter::SendNowHeld,
+        )
+        .await;
+    }
 }
 
 /// Run-end / idle: steering (and send-now) first, then held. No item is

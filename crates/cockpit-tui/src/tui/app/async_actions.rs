@@ -1850,6 +1850,12 @@ impl App {
                 Ok(AsyncActionPayload::DaemonResponse(response)) => {
                     self.apply_queue_control_response(*response);
                 }
+                Err(error) => {
+                    self.show_toast(
+                        format!("queue control failed: {error}"),
+                        super::ToastKind::Info,
+                    );
+                }
                 _ => {}
             },
             AsyncActionKind::Blocking("btw.teardown") => match result.payload {

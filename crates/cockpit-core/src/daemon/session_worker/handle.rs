@@ -2151,6 +2151,7 @@ pub enum SessionWork {
     SetQueuedUserMessageClass {
         queue_item_id: Uuid,
         delivery_class: proto::QueueDeliveryClass,
+        replacement: Option<proto::QueueItemReplacement>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::SetQueuedUserMessageClassResult, proto::ErrorPayload>,
         >,

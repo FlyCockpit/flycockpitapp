@@ -2939,6 +2939,7 @@ async fn handle_send_user_message(
         run_invocation_id: run_invocation_options
             .as_ref()
             .map(|_| client_submission_id),
+        delivery_class: Default::default(),
     };
     let fingerprint = submission.client_fingerprint();
     submission
@@ -5052,6 +5053,7 @@ async fn handle_serialized_request_impl(
         Request::SetQueuedUserMessageClass {
             queue_item_id,
             delivery_class,
+            replacement,
         } => {
             let att = require_attached(state)?;
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
@@ -5059,6 +5061,7 @@ async fn handle_serialized_request_impl(
                 .send_work(SessionWork::SetQueuedUserMessageClass {
                     queue_item_id,
                     delivery_class,
+                    replacement,
                     respond_to,
                 })
                 .await

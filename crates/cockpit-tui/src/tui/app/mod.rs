@@ -1917,6 +1917,9 @@ pub struct App {
     pub(super) queue_row_hits: Vec<(uuid::Uuid, ratatui::layout::Rect)>,
     /// Class to apply on the next submit after an edit-all merge.
     pub(super) pending_queue_edit_class: Option<cockpit_proto::QueueDeliveryClass>,
+    pub(super) pending_queue_edit_item_id: Option<uuid::Uuid>,
+    pub(super) pending_queue_edit_commit: bool,
+    pub(super) pending_queue_edit_reserved: bool,
     /// User submissions accepted by the TUI while a session switch is in
     /// flight. They are held locally until the new daemon attachment is
     /// accepted, so they cannot be sent to the outgoing session.
@@ -3635,6 +3638,9 @@ impl App {
             queue_hover: None,
             queue_row_hits: Vec::new(),
             pending_queue_edit_class: None,
+            pending_queue_edit_item_id: None,
+            pending_queue_edit_commit: false,
+            pending_queue_edit_reserved: false,
             pending_session_switch_submissions: Vec::new(),
             pending_session_switch_target: None,
             pending_ephemeral_session_switch_intent: None,

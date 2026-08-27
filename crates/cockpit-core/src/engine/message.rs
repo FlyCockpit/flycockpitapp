@@ -561,16 +561,30 @@ impl UserSubmissionQueue {
         &self,
         id: Uuid,
         delivery_class: QueueDeliveryClass,
+        replacement: Option<cockpit_proto::QueueItemReplacement>,
     ) -> (
         RemoveQueuedMessageResult,
         Option<QueuedUserMessage>,
         Vec<QueuedUserMessage>,
     ) {
+        let edit_lease = replacement
+            .as_ref()
+            .is_some_and(|replacement| replacement.editing);
+        const EDIT_LEASE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
         let (result, item, snapshot) = {
             let mut state = self.inner.lock().await;
             if let Some(pending) = state.pending.iter_mut().find(|item| item.id == id) {
                 pending.delivery_class = delivery_class;
                 pending.submission.delivery_class = delivery_class;
+                if let Some(replacement) = replacement {
+                    pending.submission.text = replacement.text;
+                    pending.submission.display_text = replacement.display_text;
+                    pending.submission.tag_expansions = replacement.tag_expansions;
+                    pending.submission.images.clear();
+                    pending.not_before = replacement
+                        .editing
+                        .then(|| tokio::time::Instant::now() + EDIT_LEASE);
+                }
                 let item = queued_message_from_submission(pending);
                 (
                     RemoveQueuedMessageResult::Removed,
@@ -593,6 +607,13 @@ impl UserSubmissionQueue {
         };
         if matches!(result, RemoveQueuedMessageResult::Removed) {
             self.publish(snapshot.clone());
+            if edit_lease {
+                let notify = self.notify.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(EDIT_LEASE).await;
+                    notify.notify_one();
+                });
+            }
         }
         (result, item, snapshot)
     }
@@ -862,9 +883,13 @@ impl UserSubmissionQueue {
         max: usize,
         target_id: Option<&str>,
     ) {
-        self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::SteeringOrSendNow)
+        self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::Steering)
             .await;
-        self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::Held)
+        let remaining = max.saturating_sub(into.len());
+        self.drain_into_for_filtered(into, remaining, target_id, QueueDrainFilter::SendNowHeld)
+            .await;
+        let remaining = max.saturating_sub(into.len());
+        self.drain_into_for_filtered(into, remaining, target_id, QueueDrainFilter::Held)
             .await;
     }
 
@@ -984,7 +1009,13 @@ impl UserSubmissionQueue {
             submission.queue_item_ids.push(item.id);
         }
         submission.queue_target = Some(item.target);
-        submission.delivery_class = item.delivery_class;
+        submission.delivery_class = if item.send_now {
+            // Retain escalation if durable recording fails and this submission
+            // is requeued after the safe-boundary attempt.
+            QueueDeliveryClass::Steering
+        } else {
+            item.delivery_class
+        };
         QueuePop::Item(Box::new(submission))
     }
 
@@ -1012,6 +1043,8 @@ enum QueuePop {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueDrainFilter {
     Any,
+    Steering,
+    SendNowHeld,
     SteeringOrSendNow,
     Held,
 }
@@ -1020,6 +1053,8 @@ impl QueueDrainFilter {
     fn matches(self, item: &QueuedSubmission) -> bool {
         match self {
             Self::Any => true,
+            Self::Steering => item.delivery_class.is_steering(),
+            Self::SendNowHeld => item.send_now && item.delivery_class == QueueDeliveryClass::Held,
             Self::SteeringOrSendNow => item.send_now || item.delivery_class.is_steering(),
             Self::Held => !item.send_now && item.delivery_class == QueueDeliveryClass::Held,
         }
@@ -2564,7 +2599,7 @@ mod tests {
         assert_eq!(snapshot[1].id, hold_id);
 
         let (result, item, snapshot) = queue
-            .set_delivery_class(hold_id, QueueDeliveryClass::Steering)
+            .set_delivery_class(hold_id, QueueDeliveryClass::Steering, None)
             .await;
         assert_eq!(result, RemoveQueuedMessageResult::Removed);
         assert_eq!(

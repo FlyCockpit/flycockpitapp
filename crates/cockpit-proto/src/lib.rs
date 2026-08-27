@@ -2428,9 +2428,9 @@ pub use cockpit_db::db::session_goals::{
     GoalContract, GoalDisposition, GoalLifecycleHistoryEntry, GoalPauseReason, GoalPhase,
 };
 pub use cockpit_db::stats::{
-    HardFailShapeRow, LanguageRow, LanguageSection, NonFileRow, PriceTable, RecoveryModeRow,
-    RecoveryRow, RecoverySection, RecoveryStageRow, RecoveryToolRow, StatsRollup, StatsScope,
-    TokenRow, TokenSpend,
+    HardFailShapeRow, LanguageRow, LanguageSection, NonFileRow, PriceTable, RecoveryRow,
+    RecoverySection, RecoveryStageRow, RecoveryToolRow, StatsRollup, StatsScope, TokenRow,
+    TokenSpend,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -45,6 +45,10 @@ const SAFETY_NUM: u64 = 5;
 const SAFETY_DEN: u64 = 4;
 const FALLBACK_CHARS_PER_TOKEN: u64 = 4;
 const CONSERVATIVE_OUTPUT_TOKENS_PER_CANDIDATE: u64 = crate::engine::model::UTILITY_MAX_TOKENS_CAP;
+/// Maximum read-only tool output appended to a generator's private history in
+/// one investigation turn. The cap is shared with `generate.rs`; without it a
+/// later request has no finite pre-dispatch budget bound.
+pub const PRIVATE_READ_OUTPUT_BYTES_PER_TURN: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CandidateSetEstimateInput<'a> {
@@ -128,6 +132,68 @@ pub fn estimate_candidate_set(input: CandidateSetEstimateInput<'_>) -> PreCollec
         cost_microusd,
         candidates: input.max_candidates.max(1),
         collection_millis: input.max_collection_millis,
+    }
+}
+
+/// Conservative reservation for a bounded multi-turn generator. Each turn
+/// repeats the base request and output allowance. Every later turn also pays
+/// for all earlier model output plus the bounded private read output that was
+/// appended to history.
+pub fn estimate_multi_turn_candidate(
+    base_request: &str,
+    encoding: Option<TokenizerStrategy>,
+    input_price_per_mtok: Option<f64>,
+    output_price_per_mtok: Option<f64>,
+    max_turns: u8,
+) -> PreCollectionEstimate {
+    let turns = u64::from(max_turns.max(1).min(crate::agents::MAX_GENERATOR_TURNS));
+    let base = estimate_candidate_set(CandidateSetEstimateInput {
+        assembled_texts: &[base_request.to_string()],
+        encoding,
+        input_price_per_mtok,
+        output_price_per_mtok,
+        max_candidates: 1,
+        max_collection_millis: 1,
+    });
+    // BPE tokens cannot outnumber the bytes supplied. Inflate that byte bound
+    // by the same safety margin used by the ordinary estimator.
+    let read_growth = (PRIVATE_READ_OUTPUT_BYTES_PER_TURN as u64)
+        .saturating_mul(SAFETY_NUM)
+        .div_ceil(SAFETY_DEN);
+    let prior_turn_growth = CONSERVATIVE_OUTPUT_TOKENS_PER_CANDIDATE.saturating_add(read_growth);
+    let accumulated_prior_turns = turns.saturating_mul(turns.saturating_sub(1)) / 2;
+    let accumulated_input_growth = prior_turn_growth.saturating_mul(accumulated_prior_turns);
+    let tokens = base
+        .tokens
+        .saturating_mul(turns)
+        .saturating_add(accumulated_input_growth);
+    let cost_microusd = match (
+        base.cost_microusd,
+        input_price_per_mtok,
+        output_price_per_mtok,
+    ) {
+        (Some(base_cost), Some(input_price), Some(_)) if input_price >= 0.0 => {
+            let growing_input_cost = (1..turns).fold(0_u64, |total, prior_turns| {
+                total.saturating_add(cost_microusd(
+                    prior_turn_growth.saturating_mul(prior_turns),
+                    input_price,
+                    0,
+                    0.0,
+                ))
+            });
+            Some(
+                base_cost
+                    .saturating_mul(turns)
+                    .saturating_add(growing_input_cost),
+            )
+        }
+        _ => None,
+    };
+    PreCollectionEstimate {
+        tokens,
+        cost_microusd,
+        candidates: 1,
+        collection_millis: 1,
     }
 }
 
@@ -232,6 +298,26 @@ mod tests {
             }
             other => panic!("expected Known, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn multi_turn_estimate_charges_accumulating_private_history() {
+        let one = estimate_multi_turn_candidate(
+            "base request",
+            Some(TokenizerStrategy::Cl100k),
+            Some(1.0),
+            Some(1.0),
+            1,
+        );
+        let three = estimate_multi_turn_candidate(
+            "base request",
+            Some(TokenizerStrategy::Cl100k),
+            Some(1.0),
+            Some(1.0),
+            3,
+        );
+        assert!(three.tokens > one.tokens.saturating_mul(3));
+        assert!(three.cost_microusd.unwrap() > one.cost_microusd.unwrap().saturating_mul(3));
     }
 
     fn routing_definition(on_budget: OnBudgetExceeded) -> VnextAgentDef {

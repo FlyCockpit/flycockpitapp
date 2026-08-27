@@ -26,6 +26,225 @@ pub(crate) struct DispatchEnv<'a> {
     /// hook set changes between `preToolUse` and its matching post event.
     pub(crate) hooks: &'a crate::config::extended::hooks::HookRegistry,
 }
+
+enum RepeatCallAuthorization {
+    Run,
+    RecoverableRefusal(String),
+    ConfirmationDenied { consecutive: u32 },
+}
+
+/// Apply the argument-dependent repeat authorities to one canonical call.
+/// Revised calls use this same seam after substitution, while parked replays
+/// naturally run it once through the ordinary pipeline with their memoized
+/// selected arguments.
+async fn authorize_repeat_call(
+    env: &DispatchEnv<'_>,
+    resolved_name: &str,
+    args: &Value,
+    eligible: bool,
+) -> Result<RepeatCallAuthorization> {
+    if !eligible {
+        env.session.clear_recoverable_tool_call();
+        return Ok(RepeatCallAuthorization::Run);
+    }
+    let signature = crate::approval::store::GrantStore::loop_signature(resolved_name, args);
+    if let Some(message) = env
+        .session
+        .repeated_recoverable_tool_call_message(&signature)
+    {
+        return Ok(RepeatCallAuthorization::RecoverableRefusal(message));
+    }
+    let Some(approver) = env.ctx.approver.as_ref() else {
+        return Ok(RepeatCallAuthorization::Run);
+    };
+    let consecutive = env.session.bump_consecutive_call(&signature);
+    if consecutive < env.loop_guard_threshold.max(1) {
+        return Ok(RepeatCallAuthorization::Run);
+    }
+    let interactive = env.ctx.interrupts.is_interactive_attached();
+    if approver
+        .approve_repeat(resolved_name, args, interactive)
+        .await?
+        .is_accept()
+    {
+        Ok(RepeatCallAuthorization::Run)
+    } else {
+        Ok(RepeatCallAuthorization::ConfirmationDenied { consecutive })
+    }
+}
+
+enum BtwNativeAuthorization {
+    Run,
+    Refused {
+        message: String,
+        permission_kind: &'static str,
+    },
+}
+
+/// `/btw` is a separate native-tool approval authority. It must see the exact
+/// arguments headed to the host, including verification-selected arguments.
+async fn authorize_btw_native_call(
+    env: &DispatchEnv<'_>,
+    resolved_name: &str,
+    args: &Value,
+) -> Result<BtwNativeAuthorization> {
+    let Some(tool) = env.active_tools.get(resolved_name) else {
+        return Ok(BtwNativeAuthorization::Run);
+    };
+    if !env.session.is_btw_fork() || !crate::engine::tool::tool_requires_permission(tool.as_ref()) {
+        return Ok(BtwNativeAuthorization::Run);
+    }
+    let label = format!("`{resolved_name}` in /btw side conversation");
+    let decision = if let Some(approver) = env.ctx.approver.as_ref() {
+        approver
+            .authorize(crate::approval::AuthorizationRequest::NativeTool {
+                label: &label,
+                input: args,
+            })
+            .await?
+    } else {
+        crate::approval::Decision::NoninteractiveDeny
+    };
+    Ok(match decision {
+        crate::approval::Decision::Allow { .. } => BtwNativeAuthorization::Run,
+        crate::approval::Decision::NoninteractiveDeny => BtwNativeAuthorization::Refused {
+            message: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+            permission_kind: "approval_noninteractive_denied",
+        },
+        crate::approval::Decision::Deny => BtwNativeAuthorization::Refused {
+            message: "btw side conversation: mutating tool call denied".to_string(),
+            permission_kind: "approval_denied",
+        },
+        crate::approval::Decision::StandingReject { scope } => BtwNativeAuthorization::Refused {
+            message: crate::approval::standing_reject_refusal(resolved_name, scope),
+            permission_kind: "blocked_standing_reject",
+        },
+    })
+}
+
+enum RevisedCallAuthorization {
+    Ready { args: Value, recheck_result: bool },
+    Refused(String),
+}
+
+/// Re-enter every pre-host boundary whose decision depended on substituted
+/// arguments. Verification itself is deliberately not called from here: the
+/// selected candidate already has a memoized durable decision, while schema
+/// repair/path normalization, the safety gate, and pre-tool hooks must all see
+/// the exact call that will reach the tool.
+async fn authorize_revised_call(
+    env: &DispatchEnv<'_>,
+    resolved_name: &str,
+    call_id: &str,
+    schema: &Value,
+    proposed_args: Value,
+    payload: &mut InterruptParkPayload,
+) -> Result<RevisedCallAuthorization> {
+    let mut canonical =
+        crate::engine::model::wire_schema::strip_wire_nulls(schema, proposed_args.clone());
+    let repaired = repair(&mut canonical, schema, resolved_name);
+    if !repaired.valid {
+        return Ok(RevisedCallAuthorization::Refused(format!(
+            "verification selected invalid replacement arguments: {}",
+            repaired
+                .error
+                .unwrap_or_else(|| "schema validation failed".into())
+        )));
+    }
+    let normalized = repair::normalize_paths(&mut canonical, schema, env.cwd);
+    if let Some(error) = normalized.error {
+        return Ok(RevisedCallAuthorization::Refused(format!(
+            "verification selected invalid replacement arguments: {error}"
+        )));
+    }
+    // Collection canonicalizes before adjudication. A mismatch here means the
+    // selected bytes and reserved envelope disagree, so do not silently apply
+    // a different call under the selected candidate's digest.
+    if canonical != proposed_args {
+        return Ok(RevisedCallAuthorization::Refused(
+            "verification selected replacement arguments that changed during final normalization; revise and re-emit"
+                .into(),
+        ));
+    }
+    if let Err(error) =
+        guard_redaction_placeholder_tool_args(resolved_name, &canonical, env.ctx).await
+    {
+        return Ok(RevisedCallAuthorization::Refused(error.to_string()));
+    }
+
+    let replay_gate_memo = crate::engine::interrupt::current_interrupt_park_payload()
+        .filter(|parked| {
+            parked.tool == resolved_name && parked.call_id == call_id && parked.args == canonical
+        })
+        .and_then(|parked| parked.gate);
+    payload.args = canonical.clone();
+    payload.gate = replay_gate_memo;
+    match authorize_repeat_call(env, resolved_name, &canonical, true).await? {
+        RepeatCallAuthorization::Run => {}
+        RepeatCallAuthorization::RecoverableRefusal(message) => {
+            return Ok(RevisedCallAuthorization::Refused(message));
+        }
+        RepeatCallAuthorization::ConfirmationDenied { consecutive } => {
+            return Ok(RevisedCallAuthorization::Refused(loop_guard_message(
+                resolved_name,
+                &canonical,
+                consecutive,
+                &env.active_tools.names(),
+            )));
+        }
+    }
+    let mut recheck_result = false;
+    if super::is_gated_tool(resolved_name) {
+        match crate::engine::interrupt::with_interrupt_park_payload(
+            payload.clone(),
+            safety_gate_decision(resolved_name, &canonical, env.ctx, env.tx),
+        )
+        .await
+        {
+            GateOutcome::Run { recheck } => {
+                recheck_result = recheck;
+                payload.gate = Some(crate::db::needs_attention::InterruptGateMemo {
+                    recheck_result: recheck,
+                });
+            }
+            GateOutcome::Parked => return Err(crate::engine::interrupt::InterruptParked.into()),
+            GateOutcome::Block(block) => {
+                return Ok(RevisedCallAuthorization::Refused(block.message));
+            }
+        }
+    }
+
+    if let BtwNativeAuthorization::Refused {
+        message,
+        permission_kind,
+    } = authorize_btw_native_call(env, resolved_name, &canonical).await?
+    {
+        fire_permission_denied_hook(env, resolved_name, call_id, permission_kind).await;
+        return Ok(RevisedCallAuthorization::Refused(message));
+    }
+
+    let pre_hook = super::hooks::run_pre_tool_hooks(
+        &super::hooks::TokioCommandRunner::with_optional_containment(
+            env.session.process_containment(),
+        ),
+        &super::hooks::DefaultProcessEnv,
+        env.hooks,
+        resolved_name,
+        &canonical,
+        call_id,
+        env.session.id,
+        env.cwd,
+        &env.session.db,
+    )
+    .await;
+    if let super::hooks::PreHookOutcome::Deny { reason } = pre_hook {
+        return Ok(RevisedCallAuthorization::Refused(reason));
+    }
+    Ok(RevisedCallAuthorization::Ready {
+        args: canonical,
+        recheck_result,
+    })
+}
 /// The authorization portion of ordinary dispatch, reused by Monty's builtin
 /// adapter. Monty is a transport, not a second tool-execution authority: a
 /// host invocation must consume the same safety gate, standing rejects,
@@ -430,39 +649,23 @@ async fn execute_ordinary_call_unscoped(
     // to the wire-history collapse site (`loop-collapse-structural-
     // dedup.md`) so the synthesized message can state "called N times".
     let mut loop_guard_count: u32 = 0;
-    let call_signature = (repair_outcome.valid && !placeholder_blocked)
-        .then(|| crate::approval::store::GrantStore::loop_signature(resolved_name, &args));
-    let repeated_recoverable_tool_call = if let Some(signature) = call_signature.as_deref() {
-        env.session
-            .repeated_recoverable_tool_call_message(signature)
-    } else {
-        env.session.clear_recoverable_tool_call();
-        None
+    let repeat_authorization = authorize_repeat_call(
+        env,
+        resolved_name,
+        &args,
+        repair_outcome.valid && !placeholder_blocked,
+    )
+    .await?;
+    let repeated_recoverable_tool_call = match &repeat_authorization {
+        RepeatCallAuthorization::RecoverableRefusal(message) => Some(message.clone()),
+        _ => None,
     };
-    let loop_guard_reject = if repeated_recoverable_tool_call.is_none()
-        && !placeholder_blocked
-        && repair_outcome.valid
-        && let Some(approver) = env.ctx.approver.as_ref()
-    {
-        let signature = call_signature
-            .as_deref()
-            .expect("valid tool calls have a loop signature");
-        let consecutive = env.session.bump_consecutive_call(signature);
-        if consecutive >= env.loop_guard_threshold.max(1) {
-            let interactive = env.ctx.interrupts.is_interactive_attached();
-            let decision = approver
-                .approve_repeat(resolved_name, &args, interactive)
-                .await?;
-            let reject = !decision.is_accept();
-            if reject {
-                loop_guard_count = consecutive;
-            }
-            reject
-        } else {
-            false
+    let loop_guard_reject = match repeat_authorization {
+        RepeatCallAuthorization::ConfirmationDenied { consecutive } => {
+            loop_guard_count = consecutive;
+            true
         }
-    } else {
-        false
+        RepeatCallAuthorization::Run | RepeatCallAuthorization::RecoverableRefusal(_) => false,
     };
 
     // Command-safety gate (implementation note):
@@ -739,59 +942,18 @@ async fn execute_ordinary_call_unscoped(
     } else if let Some(msg) = cage_block {
         (Err(invalid_input(msg)), 0)
     } else if repair_outcome.valid {
-        if let Some(tool) = env.active_tools.get(resolved_name)
-            && env.session.is_btw_fork()
-            && crate::engine::tool::tool_requires_permission(tool.as_ref())
+        if let BtwNativeAuthorization::Refused {
+            message,
+            permission_kind,
+        } = authorize_btw_native_call(env, resolved_name, &args).await?
         {
-            let label = format!("`{resolved_name}` in /btw side conversation");
-            let decision = if let Some(approver) = env.ctx.approver.as_ref() {
-                approver
-                    .authorize(crate::approval::AuthorizationRequest::NativeTool {
-                        label: &label,
-                        input: &args,
-                    })
-                    .await?
-            } else {
-                crate::approval::Decision::NoninteractiveDeny
-            };
             // A /btw approval denial early-returns before the common deny-audit
             // site below, so `permissionDenied` must fire here (observe-only /
             // fail-open) with the matching deny kind — otherwise a real
             // approval / standing-reject denial of a mutating ordinary tool in a
             // side conversation would fire no hook.
-            match decision {
-                crate::approval::Decision::Allow { .. } => {}
-                crate::approval::Decision::NoninteractiveDeny => {
-                    fire_permission_denied_hook(
-                        env,
-                        resolved_name,
-                        &tc.id,
-                        "approval_noninteractive_denied",
-                    )
-                    .await;
-                    return Err(invalid_input(crate::approval::NONINTERACTIVE_RUN_DENIAL));
-                }
-                crate::approval::Decision::Deny => {
-                    fire_permission_denied_hook(env, resolved_name, &tc.id, "approval_denied")
-                        .await;
-                    return Err(invalid_input(
-                        "btw side conversation: mutating tool call denied",
-                    ));
-                }
-                crate::approval::Decision::StandingReject { scope } => {
-                    fire_permission_denied_hook(
-                        env,
-                        resolved_name,
-                        &tc.id,
-                        "blocked_standing_reject",
-                    )
-                    .await;
-                    return Err(invalid_input(crate::approval::standing_reject_refusal(
-                        resolved_name,
-                        scope,
-                    )));
-                }
-            }
+            fire_permission_denied_hook(env, resolved_name, &tc.id, permission_kind).await;
+            return Err(invalid_input(message));
         }
         let mut payload = InterruptParkPayload {
             tool: resolved_name.to_string(),
@@ -880,26 +1042,20 @@ async fn execute_ordinary_call_unscoped(
                 mut plan,
             } => {
                 let operation_id = plan.operation_id;
-                match env
-                    .session
-                    .db
-                    .mark_verification_dispatch_executing(
-                        env.session.id,
-                        operation_id,
-                        plan.attempt_revision,
-                        chrono::Utc::now().timestamp_millis(),
-                    )
-                    .await
-                {
-                    Ok(attempt) => plan.attempt_revision = attempt.revision,
-                    Err(error) => {
-                        verification_blocked = true;
-                        tracing::warn!(%error, %operation_id, "verification dispatch reservation could not enter executing");
-                        return Err(invalid_input(
-                            "verification dispatch could not be reserved safely; revise and re-emit",
-                        ));
-                    }
-                }
+                let replaying_selected_args = crate::engine::interrupt::current_interrupt_park_payload()
+                    .is_some_and(|parked| {
+                        parked.tool == resolved_name
+                            && parked.call_id == tc.id.as_str()
+                            && parked.args == revised_args
+                            && parked.verification.as_ref().is_some_and(|memo| {
+                                memo.operation_id == operation_id
+                                    && matches!(
+                                        &memo.outcome,
+                                        crate::db::needs_attention::InterruptVerificationOutcome::Revise { args, .. }
+                                            if args == &revised_args
+                                    )
+                            })
+                    });
                 payload.verification =
                     Some(crate::db::needs_attention::InterruptVerificationMemo {
                         operation_id,
@@ -909,54 +1065,130 @@ async fn execute_ordinary_call_unscoped(
                             disclosure: disclosure.clone(),
                         },
                     });
-                if !super::rewrite_assistant_tool_call(history, tc.id.as_str(), &revised_args) {
-                    verification_blocked = true;
-                    let _ = env
-                        .session
-                        .db
-                        .cancel_verification_dispatch_no_submission(
-                            env.session.id,
-                            operation_id,
-                            plan.attempt_revision,
-                            crate::db::verification_ledger::NoSubmissionProof::from_digest(
-                                crate::db::verification_ledger::VerificationDigest::of(
-                                    b"verification-provider-signature-rewrite-refused",
-                                ),
-                            ),
-                            chrono::Utc::now().timestamp_millis(),
-                        )
-                        .await;
-                    let message = "verification produced a revision, but this provider-signed assistant turn cannot be rewritten safely; revise and re-emit"
-                        .to_string();
-                    payload.verification =
-                        Some(crate::db::needs_attention::InterruptVerificationMemo {
-                            operation_id,
-                            dispatch_attempt_revision: -1,
-                            outcome:
-                                crate::db::needs_attention::InterruptVerificationOutcome::Block {
-                                    message: message.clone(),
-                                },
-                        });
-                    (Err(invalid_input(message)), 0)
+                let authorization = if replaying_selected_args {
+                    // Replay has already entered this ordinary pipeline with
+                    // the selected args, so its validation, repeat and /btw
+                    // approvals, safety gate, and pre-tool hooks ran above
+                    // before the memo was consumed.
+                    RevisedCallAuthorization::Ready {
+                        args: revised_args.clone(),
+                        recheck_result: false,
+                    }
                 } else {
-                    args = revised_args;
-                    payload.args = args.clone();
-                    tool_was_dispatched = true;
-                    let dispatched =
-                        crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                            dispatch_one_timed(
-                                env.active_tools,
-                                resolved_name,
-                                args.clone(),
-                                env.ctx,
-                                Some(&tc.id),
+                    authorize_revised_call(
+                        env,
+                        resolved_name,
+                        tc.id.as_str(),
+                        &schema,
+                        revised_args.clone(),
+                        &mut payload,
+                    )
+                    .await?
+                };
+                match authorization {
+                    RevisedCallAuthorization::Refused(message) => {
+                        verification_blocked = true;
+                        let _ = env
+                            .session
+                            .db
+                            .cancel_verification_dispatch_no_submission(
+                                env.session.id,
+                                operation_id,
+                                plan.attempt_revision,
+                                crate::db::verification_ledger::NoSubmissionProof::from_digest(
+                                    crate::db::verification_ledger::VerificationDigest::of(
+                                        b"verification-revised-call-authorization-refused",
+                                    ),
+                                ),
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await;
+                        (Err(invalid_input(message)), 0)
+                    }
+                    RevisedCallAuthorization::Ready {
+                        args: authorized_args,
+                        recheck_result: revised_recheck,
+                    } => {
+                        recheck_result |= revised_recheck;
+                        match env
+                            .session
+                            .db
+                            .mark_verification_dispatch_executing(
+                                env.session.id,
+                                operation_id,
+                                plan.attempt_revision,
+                                chrono::Utc::now().timestamp_millis(),
                             )
                             .await
-                        })
-                        .await;
-                    verification_disclosure = Some(disclosure);
-                    verification_dispatch_plan = Some(plan);
-                    dispatched
+                        {
+                            Ok(attempt) => plan.attempt_revision = attempt.revision,
+                            Err(error) => {
+                                verification_blocked = true;
+                                tracing::warn!(%error, %operation_id, "verification dispatch reservation could not enter executing");
+                                return Err(invalid_input(
+                                    "verification dispatch could not be reserved safely; revise and re-emit",
+                                ));
+                            }
+                        }
+                        payload.verification = payload.verification.map(|mut memo| {
+                            memo.dispatch_attempt_revision = plan.attempt_revision;
+                            memo
+                        });
+                        if !super::rewrite_assistant_tool_call(
+                            history,
+                            tc.id.as_str(),
+                            &authorized_args,
+                        ) {
+                            verification_blocked = true;
+                            let _ = env
+                                .session
+                                .db
+                                .cancel_verification_dispatch_no_submission(
+                                    env.session.id,
+                                    operation_id,
+                                    plan.attempt_revision,
+                                    crate::db::verification_ledger::NoSubmissionProof::from_digest(
+                                        crate::db::verification_ledger::VerificationDigest::of(
+                                            b"verification-provider-signature-rewrite-refused",
+                                        ),
+                                    ),
+                                    chrono::Utc::now().timestamp_millis(),
+                                )
+                                .await;
+                            let message = "verification produced a revision, but this provider-signed assistant turn cannot be rewritten safely; revise and re-emit"
+                                .to_string();
+                            payload.verification =
+                                Some(crate::db::needs_attention::InterruptVerificationMemo {
+                                    operation_id,
+                                    dispatch_attempt_revision: -1,
+                                    outcome: crate::db::needs_attention::InterruptVerificationOutcome::Block {
+                                        message: message.clone(),
+                                    },
+                                });
+                            (Err(invalid_input(message)), 0)
+                        } else {
+                            args = authorized_args;
+                            payload.args = args.clone();
+                            tool_was_dispatched = true;
+                            let dispatched = crate::engine::interrupt::with_interrupt_park_payload(
+                                payload,
+                                async {
+                                    dispatch_one_timed(
+                                        env.active_tools,
+                                        resolved_name,
+                                        args.clone(),
+                                        env.ctx,
+                                        Some(&tc.id),
+                                    )
+                                    .await
+                                },
+                            )
+                            .await;
+                            verification_disclosure = Some(disclosure);
+                            verification_dispatch_plan = Some(plan);
+                            dispatched
+                        }
+                    }
                 }
             }
             crate::engine::verification::VerificationOutcome::Skip => {
@@ -1041,42 +1273,6 @@ async fn execute_ordinary_call_unscoped(
             unreachable!("checked error branch above");
         };
         return Err(err);
-    }
-
-    if let Some(plan) = verification_dispatch_plan {
-        let (settlement, receipt) = match &result {
-            Ok(output) => (
-                crate::db::verification_ledger::DispatchSettlement::Succeeded,
-                crate::db::verification_ledger::RedactedVerificationJson::dispatch_success(
-                    crate::db::verification_ledger::VerificationDigest::of(
-                        output.content.as_bytes(),
-                    ),
-                ),
-            ),
-            Err(error) => (
-                crate::db::verification_ledger::DispatchSettlement::Failed,
-                crate::db::verification_ledger::RedactedVerificationJson::dispatch_final_error(
-                    crate::db::verification_ledger::VerificationDigest::of(
-                        error.to_string().as_bytes(),
-                    ),
-                ),
-            ),
-        };
-        if let Err(error) = env
-            .session
-            .db
-            .settle_verification_dispatch(
-                env.session.id,
-                plan.operation_id,
-                plan.attempt_revision,
-                settlement,
-                receipt,
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .await
-        {
-            tracing::warn!(%error, operation_id = %plan.operation_id, "verification dispatch settlement failed; recovery will reconcile it");
-        }
     }
 
     // Defensive bash-routing nudge self-suppression
@@ -1674,7 +1870,55 @@ async fn execute_ordinary_call_unscoped(
             }
         }
     };
-    if hard_fail {
+    // The verification projection is an audit relation to this exact durable
+    // ordinary ToolCall event. It must never create a second synthetic
+    // `verification:*` tool-call pair. If the canonical event could not be
+    // persisted after a host effect, settle unknown/suppressed rather than
+    // claiming a committed projection without its source event.
+    if let Some(plan) = verification_dispatch_plan.take() {
+        let output_digest =
+            crate::db::verification_ledger::VerificationDigest::of(output_str.as_bytes());
+        let (settlement, receipt, projection_event_seq) = match tool_call_seq {
+            Some(seq) if hard_fail => (
+                crate::db::verification_ledger::DispatchSettlement::Failed,
+                crate::db::verification_ledger::RedactedVerificationJson::dispatch_final_error(
+                    output_digest,
+                ),
+                Some(seq),
+            ),
+            Some(seq) => (
+                crate::db::verification_ledger::DispatchSettlement::Succeeded,
+                crate::db::verification_ledger::RedactedVerificationJson::dispatch_success(
+                    output_digest,
+                ),
+                Some(seq),
+            ),
+            None => (
+                crate::db::verification_ledger::DispatchSettlement::Unknown,
+                crate::db::verification_ledger::RedactedVerificationJson::dispatch_unknown(
+                    output_digest,
+                ),
+                None,
+            ),
+        };
+        if let Err(error) = env
+            .session
+            .db
+            .settle_verification_dispatch(
+                env.session.id,
+                plan.operation_id,
+                plan.attempt_revision,
+                settlement,
+                receipt,
+                projection_event_seq,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+        {
+            tracing::warn!(%error, operation_id = %plan.operation_id, "verification dispatch settlement failed; recovery will reconcile it");
+        }
+    }
+    if hard_fail && !verification_blocked {
         let _ = env
             .tx
             .send(TurnEvent::ToolError {
@@ -1779,7 +2023,7 @@ async fn execute_ordinary_call_unscoped(
     // (`ToolEnd`) and persisted unchanged above; only the model's history
     // copy carries the notes. Off / no-hint → `wire_output` == `output_str`,
     // byte-identical to today.
-    let mut wire_output = if repair_hints.is_empty() {
+    let mut wire_output = if repair_hints.is_empty() || verification_blocked {
         output_str
     } else {
         let mut prefixed = String::new();
@@ -3609,6 +3853,86 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "denied pre-approval call must not be audited as executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn revised_args_are_the_btw_native_authorization_target() {
+        const REVISED_SENTINEL: &str = "verification-selected-btw-args";
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "dynamic_tool",
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_btw_session(tmp.path()).await;
+        session.set_approval_mode(ApprovalMode::Manual);
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let revised = serde_json::json!({"text": REVISED_SENTINEL});
+        assert!(matches!(
+            authorize_btw_native_call(&env, "dynamic_tool", &revised)
+                .await
+                .unwrap(),
+            BtwNativeAuthorization::Refused { .. }
+        ));
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn revised_args_are_the_repeat_confirmation_target() {
+        const REVISED_SENTINEL: &str = "verification-selected-repeat-args";
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(ReadOnlyEchoTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Manual);
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 1,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let revised = serde_json::json!({"text": REVISED_SENTINEL});
+        assert!(matches!(
+            authorize_repeat_call(&env, "readonly_echo", &revised, true)
+                .await
+                .unwrap(),
+            RepeatCallAuthorization::ConfirmationDenied { consecutive: 1 }
+        ));
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        let decisions = events
+            .iter()
+            .filter(|event| event.kind == "permission_decision")
+            .map(|event| event.data.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            decisions
+                .iter()
+                .any(|event| event.contains(REVISED_SENTINEL))
         );
     }
 

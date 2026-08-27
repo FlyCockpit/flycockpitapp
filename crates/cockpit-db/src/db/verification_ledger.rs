@@ -19,7 +19,6 @@ use crate::db::Db;
 
 const MAX_REDACTED_JSON_BYTES: usize = 16 * 1024;
 const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
-const MAX_PROJECTED_EVENTS: usize = 16;
 const MAX_CANDIDATES: i64 = 64;
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -114,8 +113,6 @@ pub enum VerificationRedactionClass {
     DispatchFinalError,
     DispatchUnknown,
     NoSubmission,
-    RecoverySuccess,
-    RecoveryFinalError,
 }
 
 impl VerificationRedactionClass {
@@ -136,8 +133,6 @@ impl VerificationRedactionClass {
             Self::DispatchFinalError => "dispatch_final_error",
             Self::DispatchUnknown => "dispatch_unknown",
             Self::NoSubmission => "no_submission",
-            Self::RecoverySuccess => "recovery_success",
-            Self::RecoveryFinalError => "recovery_final_error",
         }
     }
 
@@ -158,8 +153,6 @@ impl VerificationRedactionClass {
             "dispatch_final_error" => Ok(Self::DispatchFinalError),
             "dispatch_unknown" => Ok(Self::DispatchUnknown),
             "no_submission" => Ok(Self::NoSubmission),
-            "recovery_success" => Ok(Self::RecoverySuccess),
-            "recovery_final_error" => Ok(Self::RecoveryFinalError),
             _ => bail!("verification redaction classification is not allowed"),
         }
     }
@@ -406,6 +399,36 @@ impl VerificationCandidateState {
 pub enum VerificationArtifactKind {
     ProposedCall,
     WriteChangeSet,
+}
+
+/// Exact provenance of the model-visible dispatch surrogate. This is distinct
+/// from [`VerificationArtifactKind`]: both an approved original and a selected
+/// candidate are complete proposed calls, but only the latter is a
+/// `selected_call`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationSurrogateKind {
+    NormalizedOriginal,
+    SelectedCall,
+    SynthesizedWrite,
+}
+
+impl VerificationSurrogateKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NormalizedOriginal => "normalized_original",
+            Self::SelectedCall => "selected_call",
+            Self::SynthesizedWrite => "synthesized_write",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "normalized_original" => Ok(Self::NormalizedOriginal),
+            "selected_call" => Ok(Self::SelectedCall),
+            "synthesized_write" => Ok(Self::SynthesizedWrite),
+            _ => bail!("persisted verification envelope has an invalid surrogate kind"),
+        }
+    }
 }
 
 impl VerificationArtifactKind {
@@ -675,45 +698,10 @@ impl NoSubmissionProof {
     }
 }
 
+/// Validator for the strict, bounded normal-call payload retained in a
+/// prepared envelope. The value may contain only operation/arguments/patch.
 #[derive(Debug, Clone)]
-struct VerificationProjectionEvent {
-    /// A normal session event discriminant. Only safe ordinary projection
-    /// kinds are allowed here; provider/verifier event classes never reach the
-    /// model-visible history.
-    event_kind: &'static str,
-    /// Correlates a normal surrogate call with its terminal result. Recovery
-    /// derives this from the durable prepared-projection identity.
-    call_id: Option<String>,
-    data: VerificationProjectionPayload,
-}
-
-/// A projection payload is either a classified result or a model-safe
-/// surrogate call reconstructed by this module. The call representation has
-/// no public constructor: callers cannot smuggle arbitrary event JSON into a
-/// committed session event.
-#[derive(Debug, Clone)]
-enum VerificationProjectionPayload {
-    Redacted(RedactedVerificationJson),
-    SurrogateCall(VerificationSurrogateCall),
-}
-
-impl VerificationProjectionPayload {
-    fn as_json(&self) -> Result<Value> {
-        match self {
-            Self::Redacted(value) => serde_json::from_str(value.as_str())
-                .context("stored verification projection result is invalid"),
-            Self::SurrogateCall(call) => call.as_json(),
-        }
-    }
-}
-
-/// Strict, bounded normal-call payload retained in a prepared envelope. The
-/// encoded value contains only operation/arguments/patch and is built only
-/// after envelope validation.
-#[derive(Debug, Clone)]
-struct VerificationSurrogateCall {
-    encoded: String,
-}
+struct VerificationSurrogateCall;
 
 impl VerificationSurrogateCall {
     fn from_model_visible(value: &Value) -> Result<Self> {
@@ -751,29 +739,15 @@ impl VerificationSurrogateCall {
             );
         }
         validate_redacted_value(value, true)?;
-        let mut call = serde_json::Map::new();
-        call.insert("verification_surrogate".to_owned(), Value::Bool(true));
-        call.insert("operation".to_owned(), Value::String(operation.to_owned()));
-        if let Some(arguments) = object.get("arguments") {
-            call.insert("arguments".to_owned(), arguments.clone());
-        }
-        if let Some(patch) = object.get("patch") {
-            call.insert("patch".to_owned(), patch.clone());
-        }
-        Ok(Self {
-            encoded: canonical_model_visible_json(&Value::Object(call))?,
-        })
-    }
-
-    fn as_json(&self) -> Result<Value> {
-        serde_json::from_str(&self.encoded).context("stored verification surrogate call is invalid")
+        canonical_model_visible_json(value)?;
+        Ok(Self)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct NewVerificationEnvelope {
     pub batch_digest: VerificationDigest,
-    pub surrogate_kind: VerificationArtifactKind,
+    pub surrogate_kind: VerificationSurrogateKind,
     /// This is the one intentionally bounded model-visible payload. It may
     /// carry selected call arguments or a patch body, but cannot carry receipt,
     /// provider, verifier, or evidence fields.
@@ -1381,11 +1355,7 @@ impl Db {
             );
             ensure!(
                 candidate.artifact_kind == VerificationArtifactKind::ProposedCall,
-                "write candidates require synthesized-write adjudication"
-            );
-            ensure!(
-                candidate.canonical_call_digest == operation.original_operation_digest,
-                "selected non-write candidate changes canonical call bytes"
+                "selected verification candidate must be a complete proposed call"
             );
             transition_synthesis_conn(
                 conn,
@@ -1620,11 +1590,7 @@ impl Db {
                 ),
                 now_unix_ms,
             )?;
-            let terminal = match state {
-                VerificationSynthesisTerminal::Refused => VerificationOperationState::Cancelled,
-                VerificationSynthesisTerminal::NoValidCandidate
-                | VerificationSynthesisTerminal::Failed => VerificationOperationState::Failed,
-            };
+            let terminal = VerificationOperationState::Failed;
             set_operation_state(
                 conn,
                 session_id,
@@ -1665,15 +1631,7 @@ impl Db {
             let operation = required_operation(conn, session_id, operation_id)?;
             let envelope_json = canonical_model_visible_json(&envelope.model_visible_projection)?;
             let prepared_projection_digest = VerificationDigest::of(envelope_json.as_bytes());
-            let surrogate_kind = if operation.budget_action
-                == Some(VerificationBudgetAction::DispatchOriginal)
-            {
-                "normalized_original"
-            } else if envelope.surrogate_kind == VerificationArtifactKind::ProposedCall {
-                "selected_call"
-            } else {
-                "synthesized_write"
-            };
+            let surrogate_kind = envelope.surrogate_kind.as_str();
             if let Some(existing) = load_attempt(conn, session_id, operation_id)? {
                 ensure!(
                     existing.host_idempotency_key == host_idempotency_key,
@@ -1784,8 +1742,9 @@ impl Db {
     }
 
     /// Settles a proven host receipt. Success and final-error insert the one
-    /// committed projection and its ordered ordinary session events in the
-    /// same transaction. Uncertain and no-submission outcomes are suppressed.
+    /// committed projection and bind it to the canonical ordinary tool-call
+    /// event already persisted by the dispatcher. Uncertain and no-submission
+    /// outcomes are suppressed.
     pub async fn settle_verification_dispatch(
         &self,
         session_id: Uuid,
@@ -1793,6 +1752,7 @@ impl Db {
         expected_attempt_revision: i64,
         settlement: DispatchSettlement,
         receipt: RedactedVerificationJson,
+        projection_event_seq: Option<i64>,
         now_unix_ms: i64,
     ) -> Result<VerificationOperationRow> {
         ensure!(
@@ -1824,17 +1784,14 @@ impl Db {
             if attempt.state.is_terminal() {
                 return required_operation(conn, session_id, operation_id);
             }
-            let projected_events = envelope_projection_events_conn(
+            validate_envelope_for_settlement_conn(
                 conn,
                 session_id,
                 operation_id,
                 &attempt,
                 settlement,
-                &receipt,
-                VerificationRedactionClass::DispatchSuccess,
-                VerificationRedactionClass::DispatchFinalError,
             )?;
-            validate_projected_events(&projected_events, settlement)?;
+            validate_projection_event_ref_conn(conn, session_id, projection_event_seq, settlement)?;
             settle_dispatch_conn(
                 conn,
                 session_id,
@@ -1842,7 +1799,7 @@ impl Db {
                 expected_attempt_revision,
                 settlement,
                 &receipt,
-                &projected_events,
+                projection_event_seq,
                 false,
                 now_unix_ms,
             )?;
@@ -1867,7 +1824,7 @@ impl Db {
                 expected_attempt_revision,
                 DispatchSettlement::CancelledNoSubmission,
                 proof.receipt(),
-                &[],
+                None,
                 true,
                 now_unix_ms,
             )?;
@@ -1885,6 +1842,7 @@ impl Db {
         operation_id: Uuid,
         host_outcome: Option<DispatchSettlement>,
         receipt: RedactedVerificationJson,
+        projection_event_seq: Option<i64>,
         now_unix_ms: i64,
     ) -> Result<VerificationOperationRow> {
         self.transaction(move |conn| {
@@ -1944,17 +1902,15 @@ impl Db {
                 ),
                 "verification recovery receipt class does not match host outcome"
             );
-            let projected_events = envelope_projection_events_conn(
+            validate_envelope_for_settlement_conn(
                 conn,
                 session_id,
                 operation_id,
                 &attempt,
                 outcome,
-                &receipt,
-                VerificationRedactionClass::RecoverySuccess,
-                VerificationRedactionClass::RecoveryFinalError,
             )?;
-            settle_dispatch_conn(conn, session_id, operation_id, attempt.revision, outcome, &receipt, &projected_events, false, now_unix_ms)?;
+            validate_projection_event_ref_conn(conn, session_id, projection_event_seq, outcome)?;
+            settle_dispatch_conn(conn, session_id, operation_id, attempt.revision, outcome, &receipt, projection_event_seq, false, now_unix_ms)?;
             required_operation(conn, session_id, operation_id)
         }).await
     }
@@ -2162,66 +2118,44 @@ fn validate_redacted_value(value: &Value, model_visible: bool) -> Result<()> {
     }
 }
 
-fn validate_projected_events(
-    events: &[VerificationProjectionEvent],
+fn validate_projection_event_ref_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    event_seq: Option<i64>,
     settlement: DispatchSettlement,
 ) -> Result<()> {
     match settlement {
         DispatchSettlement::Succeeded | DispatchSettlement::Failed => ensure!(
-            !events.is_empty() && events.len() <= MAX_PROJECTED_EVENTS,
-            "proved verification dispatch settlement requires bounded projected events"
+            event_seq.is_some(),
+            "proved verification dispatch settlement requires its one durable tool-call event"
         ),
         DispatchSettlement::Unknown | DispatchSettlement::CancelledNoSubmission => ensure!(
-            events.is_empty(),
+            event_seq.is_none(),
             "uncertain or no-submission verification settlement cannot project events"
         ),
     }
-    let mut surrogate_call_id: Option<String> = None;
-    for (ordinal, event) in events.iter().enumerate() {
-        if let Some(call_id) = &event.call_id {
-            ensure!(
-                !call_id.is_empty()
-                    && call_id.len() <= 128
-                    && call_id.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-                    }),
-                "verification projected event call id is unsafe"
-            );
-        }
-        match (event.event_kind, &event.data) {
-            ("tool_call", VerificationProjectionPayload::SurrogateCall(_)) => {
-                ensure!(
-                    ordinal == 0,
-                    "verification surrogate call must be the first event"
-                );
-                surrogate_call_id = event.call_id.clone();
-                ensure!(
-                    surrogate_call_id.is_some(),
-                    "verification surrogate call needs a correlation id"
-                );
-            }
-            ("tool_call_completed", VerificationProjectionPayload::Redacted(_)) => {
-                if let Some(call_id) = surrogate_call_id.as_deref() {
-                    ensure!(
-                        event.call_id.as_deref() == Some(call_id),
-                        "verification surrogate result call id does not match"
-                    );
-                    ensure!(
-                        ordinal == 1 && events.len() == 2,
-                        "verification surrogate recovery must emit one call and one result"
-                    );
-                }
-            }
-            _ => bail!("verification projected event does not match the strict safe schema"),
-        }
-    }
-    if surrogate_call_id.is_some() {
+    if let Some(seq) = event_seq {
+        ensure!(seq > 0, "verification projection event sequence is invalid");
+        let (kind, data_json): (String, String) = conn
+            .query_row(
+                "SELECT type, data_json FROM session_events WHERE session_id = ?1 AND seq = ?2",
+                params![session_id.to_string(), seq],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("verification projection references a missing durable session event")?;
         ensure!(
-            events.len() == 2
-                && events
-                    .get(1)
-                    .is_some_and(|event| event.event_kind == "tool_call_completed"),
-            "verification surrogate call requires exactly one terminal result"
+            kind == "tool_call",
+            "verification projection must bind to the actual durable tool-call event"
+        );
+        let data: Value = serde_json::from_str(&data_json)
+            .context("verification tool-call projection event is invalid JSON")?;
+        let hard_fail = data
+            .get("hard_fail")
+            .and_then(Value::as_bool)
+            .context("verification tool-call projection lacks hard-fail semantics")?;
+        ensure!(
+            hard_fail == (settlement == DispatchSettlement::Failed),
+            "verification settlement disagrees with its durable tool-call event"
         );
     }
     Ok(())
@@ -2342,7 +2276,6 @@ fn load_attempt(
 }
 
 struct VerificationEnvelopeIdentity {
-    prepared_projection_id: Uuid,
     prepared_projection_digest: VerificationDigest,
     batch_digest: VerificationDigest,
     surrogate_kind: String,
@@ -2355,18 +2288,17 @@ fn load_envelope_identity(
     operation_id: Uuid,
 ) -> Result<Option<VerificationEnvelopeIdentity>> {
     conn.query_row(
-        "SELECT prepared_projection_id, prepared_projection_digest, batch_digest, surrogate_kind, model_visible_projection_json
+        "SELECT prepared_projection_digest, batch_digest, surrogate_kind, model_visible_projection_json
          FROM verification_projection_envelopes WHERE operation_id = ?1 AND session_id = ?2",
         params![operation_id.to_string(), session_id.to_string()],
         |row| {
             Ok(VerificationEnvelopeIdentity {
-                prepared_projection_id: parse_uuid(row.get(0)?)?,
-                prepared_projection_digest: VerificationDigest::parse(&row.get::<_, String>(1)?)
+                prepared_projection_digest: VerificationDigest::parse(&row.get::<_, String>(0)?)
                     .map_err(anyhow_to_sql_error)?,
-                batch_digest: VerificationDigest::parse(&row.get::<_, String>(2)?)
+                batch_digest: VerificationDigest::parse(&row.get::<_, String>(1)?)
                     .map_err(anyhow_to_sql_error)?,
-                surrogate_kind: row.get(3)?,
-                model_visible_projection_json: row.get(4)?,
+                surrogate_kind: row.get(2)?,
+                model_visible_projection_json: row.get(3)?,
             })
         },
     )
@@ -2621,12 +2553,12 @@ fn validate_dispatch_precondition(
     session_id: Uuid,
     operation_id: Uuid,
     operation: &VerificationOperationRow,
-    surrogate_kind: VerificationArtifactKind,
+    surrogate_kind: VerificationSurrogateKind,
     batch_digest: &VerificationDigest,
 ) -> Result<()> {
     if operation.budget_action == Some(VerificationBudgetAction::DispatchOriginal) {
         ensure!(
-            surrogate_kind == VerificationArtifactKind::ProposedCall,
+            surrogate_kind == VerificationSurrogateKind::NormalizedOriginal,
             "original dispatch must use a call surrogate"
         );
         ensure!(
@@ -2646,18 +2578,39 @@ fn validate_dispatch_precondition(
         );
         return Ok(());
     }
-    let synthesis: (String, Option<String>, Option<String>, Option<String>) = conn
+    let synthesis: (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT state, artifact_kind, canonical_call_digest, write_union_receipt_digest FROM verification_syntheses
+            "SELECT state, artifact_kind, canonical_call_digest, write_union_receipt_digest,
+                    selected_candidate_id
+             FROM verification_syntheses
          WHERE operation_id = ?1 AND session_id = ?2",
             params![operation_id.to_string(), session_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .context("verification dispatch requires selected or synthesized adjudication")?;
     match synthesis.0.as_str() {
         "selected" => {
+            let expected_surrogate = if synthesis.4.is_some() {
+                VerificationSurrogateKind::SelectedCall
+            } else {
+                VerificationSurrogateKind::NormalizedOriginal
+            };
             ensure!(
-                surrogate_kind == VerificationArtifactKind::ProposedCall
+                surrogate_kind == expected_surrogate
                     && synthesis.1.as_deref() == Some("proposed_call"),
                 "selected verification dispatch kind mismatch"
             );
@@ -2666,17 +2619,13 @@ fn validate_dispatch_precondition(
                 .as_deref()
                 .context("selected verification has no canonical call digest")?;
             ensure!(
-                selected_digest == operation.original_operation_digest.as_str(),
-                "selected verification call digest changed"
-            );
-            ensure!(
                 batch_digest.as_str() == selected_digest,
                 "selected dispatch batch digest must equal the canonical call digest"
             );
         }
         "synthesized_write" => {
             ensure!(
-                surrogate_kind == VerificationArtifactKind::WriteChangeSet
+                surrogate_kind == VerificationSurrogateKind::SynthesizedWrite
                     && synthesis.1.as_deref() == Some("write_change_set"),
                 "synthesized write dispatch kind mismatch"
             );
@@ -2745,25 +2694,18 @@ fn insert_suppressed_projection_with_receipt_conn(
     Ok(())
 }
 
-/// Derives the sole model-visible call/result pair from a durable validated
-/// envelope plus a typed host receipt. Neither normal settlement nor restart
-/// recovery accepts caller-supplied projected events.
-// Recovery and live settlement share this exact envelope/receipt derivation
-// boundary. The independently typed classes prevent a recovery receipt from
-// being rendered as a live one.
-#[allow(clippy::too_many_arguments)]
-fn envelope_projection_events_conn(
+/// Revalidates the prepared envelope before binding the projection to the
+/// ordinary tool-call event already persisted by the canonical dispatch path.
+/// Verification must never manufacture a second surrogate event stream.
+fn validate_envelope_for_settlement_conn(
     conn: &Connection,
     session_id: Uuid,
     operation_id: Uuid,
     attempt: &VerificationDispatchAttemptRow,
     outcome: DispatchSettlement,
-    receipt: &RedactedVerificationJson,
-    success_class: VerificationRedactionClass,
-    final_error_class: VerificationRedactionClass,
-) -> Result<Vec<VerificationProjectionEvent>> {
+) -> Result<()> {
     match outcome {
-        DispatchSettlement::Unknown => return Ok(Vec::new()),
+        DispatchSettlement::Unknown => return Ok(()),
         DispatchSettlement::CancelledNoSubmission => {
             bail!("restart cancellation requires a persisted no-submission terminal receipt")
         }
@@ -2777,17 +2719,13 @@ fn envelope_projection_events_conn(
     );
     let model_visible: Value = serde_json::from_str(&envelope.model_visible_projection_json)
         .context("persisted verification envelope is not valid JSON")?;
-    let surrogate_kind = match envelope.surrogate_kind.as_str() {
-        "selected_call" | "normalized_original" => VerificationArtifactKind::ProposedCall,
-        "synthesized_write" => VerificationArtifactKind::WriteChangeSet,
-        _ => bail!("persisted verification envelope has an invalid surrogate kind"),
-    };
+    let surrogate_kind = VerificationSurrogateKind::parse(&envelope.surrogate_kind)?;
     validate_envelope(&NewVerificationEnvelope {
         batch_digest: envelope.batch_digest.clone(),
         surrogate_kind,
         model_visible_projection: model_visible.clone(),
     })?;
-    let recovered_call = VerificationSurrogateCall::from_model_visible(&model_visible)?;
+    VerificationSurrogateCall::from_model_visible(&model_visible)?;
     let canonical = canonical_model_visible_json(&model_visible)?;
     ensure!(
         VerificationDigest::of(canonical.as_bytes()) == envelope.prepared_projection_digest,
@@ -2802,36 +2740,7 @@ fn envelope_projection_events_conn(
         surrogate_kind,
         &envelope.batch_digest,
     )?;
-    let outcome_classification = match outcome {
-        DispatchSettlement::Succeeded => success_class,
-        DispatchSettlement::Failed => final_error_class,
-        DispatchSettlement::Unknown | DispatchSettlement::CancelledNoSubmission => unreachable!(),
-    };
-    let event_digest = VerificationDigest::of(
-        canonical_model_visible_json(&json!({
-            "prepared_projection_id": envelope.prepared_projection_id.to_string(),
-            "prepared_projection_digest": envelope.prepared_projection_digest.as_str(),
-            "batch_digest": envelope.batch_digest.as_str(),
-            "outcome": outcome_classification.as_str(),
-            "receipt_digest": receipt.digest().as_str(),
-        }))?
-        .as_bytes(),
-    );
-    Ok(vec![
-        VerificationProjectionEvent {
-            event_kind: "tool_call",
-            call_id: Some(format!("verification:{}", envelope.prepared_projection_id)),
-            data: VerificationProjectionPayload::SurrogateCall(recovered_call),
-        },
-        VerificationProjectionEvent {
-            event_kind: "tool_call_completed",
-            call_id: Some(format!("verification:{}", envelope.prepared_projection_id)),
-            data: VerificationProjectionPayload::Redacted(RedactedVerificationJson::closed(
-                outcome_classification,
-                event_digest,
-            )),
-        },
-    ])
+    Ok(())
 }
 
 // All parameters are independent CAS/effect predicates required to atomically
@@ -2845,7 +2754,7 @@ fn settle_dispatch_conn(
     expected_attempt_revision: i64,
     settlement: DispatchSettlement,
     receipt: &RedactedVerificationJson,
-    events: &[VerificationProjectionEvent],
+    event_seq: Option<i64>,
     no_submission_proven: bool,
     now_unix_ms: i64,
 ) -> Result<()> {
@@ -2925,7 +2834,7 @@ fn settle_dispatch_conn(
                 operation_id,
                 attempt.dispatch_digest,
                 receipt,
-                events,
+                event_seq,
                 now_unix_ms,
             )
         }
@@ -2947,7 +2856,7 @@ fn insert_committed_projection_conn(
     operation_id: Uuid,
     batch_digest: VerificationDigest,
     receipt: &RedactedVerificationJson,
-    events: &[VerificationProjectionEvent],
+    event_seq: Option<i64>,
     now_unix_ms: i64,
 ) -> Result<()> {
     let projection_id = Uuid::new_v4();
@@ -2957,21 +2866,11 @@ fn insert_committed_projection_conn(
          ) VALUES (?1, ?2, ?3, 'committed', ?4, ?5, ?6)",
         params![projection_id.to_string(), operation_id.to_string(), session_id.to_string(), batch_digest.as_str(), receipt.as_str(), now_unix_ms],
     )?;
-    for (ordinal, event) in events.iter().enumerate() {
-        let data_json = serde_json::to_string(&json!({
-            "verification_projection": true,
-            "ordinal": ordinal,
-            "data": event.data.as_json()?,
-        }))?;
-        conn.execute(
-            "INSERT INTO session_events (session_id, ts_ms, type, call_id, data_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id.to_string(), now_unix_ms, event.event_kind, event.call_id.as_deref(), data_json],
-        )?;
-        let seq = conn.last_insert_rowid();
+    if let Some(seq) = event_seq {
         conn.execute(
             "INSERT INTO verification_projection_events (projection_id, ordinal, session_id, session_event_seq)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![projection_id.to_string(), ordinal as i64, session_id.to_string(), seq],
+             VALUES (?1, 0, ?2, ?3)",
+            params![projection_id.to_string(), session_id.to_string(), seq],
         )?;
     }
     Ok(())
@@ -3056,6 +2955,35 @@ mod tests {
         RedactedVerificationJson::closed(class, digest(label))
     }
 
+    async fn projection_event(
+        db: &Db,
+        session_id: Uuid,
+        settlement: DispatchSettlement,
+        ts_ms: i64,
+    ) -> Option<i64> {
+        if !matches!(
+            settlement,
+            DispatchSettlement::Succeeded | DispatchSettlement::Failed
+        ) {
+            return None;
+        }
+        let hard_fail = settlement == DispatchSettlement::Failed;
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO session_events (session_id, ts_ms, type, call_id, data_json)
+                 VALUES (?1, ?2, 'tool_call', 'verification-test-call', ?3)",
+                params![
+                    session_id.to_string(),
+                    ts_ms,
+                    json!({"hard_fail": hard_fail}).to_string()
+                ],
+            )?;
+            Ok(Some(conn.last_insert_rowid()))
+        })
+        .await
+        .unwrap()
+    }
+
     fn operation(session_id: Uuid, agent_instance_id: Uuid) -> NewVerificationOperation {
         NewVerificationOperation {
             session_id,
@@ -3112,11 +3040,23 @@ mod tests {
     fn envelope() -> NewVerificationEnvelope {
         NewVerificationEnvelope {
             batch_digest: digest("original"),
-            surrogate_kind: VerificationArtifactKind::ProposedCall,
+            surrogate_kind: VerificationSurrogateKind::NormalizedOriginal,
             model_visible_projection: json!({
                 "operation":"call",
                 "arguments":{"path":"src/lib.rs"},
                 "patch":"safe patch body"
+            }),
+        }
+    }
+
+    fn selected_envelope() -> NewVerificationEnvelope {
+        NewVerificationEnvelope {
+            batch_digest: digest("selected-call"),
+            surrogate_kind: VerificationSurrogateKind::SelectedCall,
+            model_visible_projection: json!({
+                "operation":"call",
+                "arguments":{"path":"src/selected.rs"},
+                "patch":"selected candidate body"
             }),
         }
     }
@@ -3140,8 +3080,16 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut selected_candidate = candidate();
+        selected_candidate.canonical_call_digest = digest("selected-call");
+        selected_candidate.artifact_union_digest = digest("selected-call");
         let candidate = db
-            .reserve_verification_candidate(session_id, created.operation_id, candidate(), base + 2)
+            .reserve_verification_candidate(
+                session_id,
+                created.operation_id,
+                selected_candidate,
+                base + 2,
+            )
             .await
             .unwrap();
         db.transition_verification_candidate(
@@ -3192,7 +3140,7 @@ mod tests {
                 created.operation_id,
                 dispatching.revision,
                 &host_key,
-                envelope(),
+                selected_envelope(),
                 base + 7,
             )
             .await
@@ -3203,7 +3151,7 @@ mod tests {
                 created.operation_id,
                 dispatching.revision,
                 &host_key,
-                envelope(),
+                selected_envelope(),
                 base + 7,
             )
             .await
@@ -3217,7 +3165,7 @@ mod tests {
                 &host_key,
                 NewVerificationEnvelope {
                     batch_digest: digest("original"),
-                    surrogate_kind: VerificationArtifactKind::ProposedCall,
+                    surrogate_kind: VerificationSurrogateKind::SelectedCall,
                     model_visible_projection: json!({"operation":"different", "arguments": {}}),
                 },
                 10,
@@ -3235,6 +3183,28 @@ mod tests {
             .await
             .unwrap();
         (created.operation_id, executing)
+    }
+
+    #[tokio::test]
+    async fn verification_ledger_db_selected_candidate_is_not_synthesized_write() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, agent_id) = owner(&db, "selected-call-kind").await;
+        let (operation_id, attempt) =
+            prepared_selected_dispatch(&db, session_id, agent_id, 10).await;
+        assert_eq!(attempt.dispatch_digest, digest("selected-call"));
+        assert_ne!(attempt.dispatch_digest, digest("original"));
+        let surrogate_kind: String = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT surrogate_kind FROM verification_projection_envelopes WHERE operation_id = ?1",
+                    [operation_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(surrogate_kind, "selected_call");
     }
 
     #[tokio::test]
@@ -3329,6 +3299,7 @@ mod tests {
                     VerificationRedactionClass::DispatchFinalError,
                     "terminal-dispatch-failure",
                 ),
+                projection_event(&db, session_id, DispatchSettlement::Failed, 109).await,
                 109,
             )
             .await
@@ -3379,6 +3350,23 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            db.reserve_verification_dispatch(
+                session_id,
+                created.operation_id,
+                dispatching.revision,
+                "adjudicator-only-mislabeled",
+                NewVerificationEnvelope {
+                    batch_digest: digest("original"),
+                    surrogate_kind: VerificationSurrogateKind::SelectedCall,
+                    model_visible_projection: envelope().model_visible_projection,
+                },
+                7,
+            )
+            .await
+            .is_err(),
+            "an approved original cannot be mislabeled as a selected candidate"
+        );
         let reserved = db
             .reserve_verification_dispatch(
                 session_id,
@@ -3409,6 +3397,7 @@ mod tests {
                     VerificationRedactionClass::DispatchSuccess,
                     "original-success",
                 ),
+                projection_event(&db, session_id, DispatchSettlement::Succeeded, 9).await,
                 9,
             )
             .await
@@ -3420,11 +3409,20 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let (selected_candidate_id, projection_events): (Option<String>, i64) = db
+        let (selected_candidate_id, surrogate_kind, projection_events): (
+            Option<String>,
+            String,
+            i64,
+        ) = db
             .read(move |conn| {
                 Ok((
                     conn.query_row(
                         "SELECT selected_candidate_id FROM verification_syntheses WHERE operation_id = ?1",
+                        [created.operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT surrogate_kind FROM verification_projection_envelopes WHERE operation_id = ?1",
                         [created.operation_id.to_string()],
                         |row| row.get(0),
                     )?,
@@ -3438,6 +3436,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected_candidate_id, None);
+        assert_eq!(surrogate_kind, "normalized_original");
         assert_eq!(projection_events, 2);
     }
 
@@ -3659,12 +3658,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let expected_operation = match synthesis_terminal {
-                VerificationSynthesisTerminal::Refused => VerificationOperationState::Cancelled,
-                VerificationSynthesisTerminal::NoValidCandidate
-                | VerificationSynthesisTerminal::Failed => VerificationOperationState::Failed,
-            };
-            assert_eq!(terminal.state, expected_operation);
+            assert_eq!(terminal.state, VerificationOperationState::Failed);
             let (state, projections, events): (String, i64, i64) = db
                 .read(move |conn| {
                     Ok((
@@ -3765,7 +3759,15 @@ mod tests {
                 collecting.operation_id,
                 dispatching.revision,
                 "host-key",
-                envelope(),
+                NewVerificationEnvelope {
+                    batch_digest: digest("original"),
+                    surrogate_kind: VerificationSurrogateKind::SelectedCall,
+                    model_visible_projection: json!({
+                        "operation":"call",
+                        "arguments":{"path":"src/lib.rs"},
+                        "patch":"safe patch body"
+                    }),
+                },
                 10,
             )
             .await
@@ -3786,6 +3788,7 @@ mod tests {
                 executing.revision,
                 DispatchSettlement::Succeeded,
                 redacted(VerificationRedactionClass::DispatchSuccess, "host-success"),
+                projection_event(&db, session_id, DispatchSettlement::Succeeded, 12).await,
                 12,
             )
             .await
@@ -3796,7 +3799,7 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM verification_projections WHERE operation_id = ?1 AND state = 'committed'", [created.operation_id.to_string()], |row| row.get(0))?,
             conn.query_row("SELECT COUNT(*) FROM verification_projection_events p JOIN verification_projections v ON v.projection_id = p.projection_id WHERE v.operation_id = ?1", [created.operation_id.to_string()], |row| row.get(0))?,
         ))).await.unwrap();
-        assert_eq!((projections, committed, events), (1, 1, 2));
+        assert_eq!((projections, committed, events), (1, 1, 1));
         let ordered: Vec<(i64, i64)> = db
             .read(move |conn| {
                 let mut statement = conn.prepare(
@@ -3818,9 +3821,8 @@ mod tests {
                 .iter()
                 .map(|(ordinal, _)| *ordinal)
                 .collect::<Vec<_>>(),
-            vec![0, 1]
+            vec![0]
         );
-        assert!(ordered[0].1 < ordered[1].1);
         let replay = db
             .settle_verification_dispatch(
                 session_id,
@@ -3828,6 +3830,7 @@ mod tests {
                 executing.revision,
                 DispatchSettlement::Succeeded,
                 redacted(VerificationRedactionClass::DispatchSuccess, "different"),
+                projection_event(&db, session_id, DispatchSettlement::Succeeded, 13).await,
                 13,
             )
             .await
@@ -3876,6 +3879,7 @@ mod tests {
                 reserved.revision,
                 DispatchSettlement::Unknown,
                 redacted(VerificationRedactionClass::DispatchUnknown, "unknown"),
+                None,
                 7,
             )
             .await
@@ -3923,6 +3927,7 @@ mod tests {
                 executing.revision,
                 settlement,
                 receipt.clone(),
+                projection_event(&db, session_id, settlement, base + 20).await,
                 base + 20,
             )
             .await
@@ -3934,7 +3939,7 @@ mod tests {
                     operation_id,
                     -1,
                     &format!("prepared-{base}"),
-                    envelope(),
+                    selected_envelope(),
                     base + 21,
                 )
                 .await
@@ -3948,7 +3953,7 @@ mod tests {
                     operation_id,
                     -1,
                     &format!("mismatched-{base}"),
-                    envelope(),
+                    selected_envelope(),
                     base + 22,
                 )
                 .await
@@ -3962,7 +3967,7 @@ mod tests {
                     &format!("prepared-{base}"),
                     NewVerificationEnvelope {
                         batch_digest: digest("original"),
-                        surrogate_kind: VerificationArtifactKind::ProposedCall,
+                        surrogate_kind: VerificationSurrogateKind::SelectedCall,
                         model_visible_projection: json!({"operation": "different", "arguments": {}}),
                     },
                     base + 23,
@@ -4018,6 +4023,7 @@ mod tests {
                 executing.revision,
                 DispatchSettlement::Succeeded,
                 RedactedVerificationJson::dispatch_success(digest("close-replay-success")),
+                projection_event(&db, session_id, DispatchSettlement::Succeeded, 31).await,
                 31,
             )
             .await
@@ -4632,6 +4638,7 @@ mod tests {
                 created.operation_id,
                 None,
                 redacted(VerificationRedactionClass::RestartAborted, "restart"),
+                None,
                 7,
             )
             .await
@@ -4678,7 +4685,7 @@ mod tests {
         assert!(
             validate_envelope(&NewVerificationEnvelope {
                 batch_digest: digest("x"),
-                surrogate_kind: VerificationArtifactKind::ProposedCall,
+                surrogate_kind: VerificationSurrogateKind::NormalizedOriginal,
                 model_visible_projection: json!({"provider_receipt":"raw"})
             })
             .is_err()
@@ -4712,6 +4719,7 @@ mod tests {
                     VerificationRedactionClass::RestartAborted,
                     "ignored-pre-dispatch-receipt",
                 ),
+                None,
                 6,
             )
             .await
@@ -4857,7 +4865,7 @@ mod tests {
                 "write-batch",
                 NewVerificationEnvelope {
                     batch_digest: digest("wrong-write-batch"),
-                    surrogate_kind: VerificationArtifactKind::WriteChangeSet,
+                    surrogate_kind: VerificationSurrogateKind::SynthesizedWrite,
                     model_visible_projection: json!({"operation":"write", "patch":"safe patch"}),
                 },
                 13,
@@ -4873,7 +4881,7 @@ mod tests {
                 "write-batch",
                 NewVerificationEnvelope {
                     batch_digest: dispatching.canonical_output_batch_digest,
-                    surrogate_kind: VerificationArtifactKind::WriteChangeSet,
+                    surrogate_kind: VerificationSurrogateKind::SynthesizedWrite,
                     model_visible_projection: json!({"operation":"write", "patch":"safe patch"}),
                 },
                 14,
@@ -5183,6 +5191,7 @@ mod tests {
                     VerificationRedactionClass::DispatchSuccess,
                     "must-not-replace-cancel",
                 ),
+                None,
                 7,
             )
             .await
@@ -5283,6 +5292,7 @@ mod tests {
                         },
                         label,
                     ),
+                    projection_event(&db, session_id, settlement, now + 3).await,
                     now + 3,
                 )
                 .await
@@ -5308,7 +5318,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(kind, "normalized_original");
-            assert_eq!((candidates, syntheses, committed, events), (0, 0, 1, 2));
+            assert_eq!((candidates, syntheses, committed, events), (0, 0, 1, 1));
         }
     }
 
@@ -5327,6 +5337,7 @@ mod tests {
                 VerificationRedactionClass::DispatchSuccess,
                 "projection-success",
             ),
+            projection_event(&db, session_id, DispatchSettlement::Succeeded, 20).await,
             20,
         )
         .await
@@ -5378,6 +5389,7 @@ mod tests {
                     VerificationRedactionClass::DispatchFinalError,
                     "effect-before-crash"
                 ),
+                projection_event(&db, session_id, DispatchSettlement::Failed, 19).await,
                 19,
             )
             .await
@@ -5407,6 +5419,7 @@ mod tests {
                 operation_id,
                 Some(DispatchSettlement::Failed),
                 redacted(VerificationRedactionClass::DispatchFinalError, "safe"),
+                projection_event(&db, session_id, DispatchSettlement::Failed, 20).await,
                 20,
             )
             .await
@@ -5421,21 +5434,14 @@ mod tests {
                     VerificationRedactionClass::DispatchSuccess,
                     "ignored-replay",
                 ),
+                None,
                 21,
             )
             .await
             .unwrap();
         assert_eq!(terminal.state, VerificationOperationState::Failed);
-        let (
-            attempt_revision,
-            committed,
-            event_count,
-            secret_count,
-            recovery_call,
-            recovery_result,
-            recovery_call_id,
-            recovery_result_call_id,
-        ): (i64, i64, i64, i64, String, String, String, String) = db
+        let (attempt_revision, committed, event_count, secret_count, recovery_call, recovery_call_id):
+            (i64, i64, i64, i64, String, String) = db
             .read(move |conn| {
                 Ok((
                     conn.query_row(
@@ -5469,16 +5475,6 @@ mod tests {
                         |row| row.get(0),
                     )?,
                     conn.query_row(
-                        "SELECT e.data_json
-                         FROM session_events e
-                         JOIN verification_projection_events p
-                           ON p.session_id = e.session_id AND p.session_event_seq = e.seq
-                         JOIN verification_projections v ON v.projection_id = p.projection_id
-                         WHERE v.operation_id = ?1 AND p.ordinal = 1",
-                        [operation_id.to_string()],
-                        |row| row.get(0),
-                    )?,
-                    conn.query_row(
                         "SELECT e.call_id
                          FROM session_events e
                          JOIN verification_projection_events p
@@ -5488,37 +5484,18 @@ mod tests {
                         [operation_id.to_string()],
                         |row| row.get(0),
                     )?,
-                    conn.query_row(
-                        "SELECT e.call_id
-                         FROM session_events e
-                         JOIN verification_projection_events p
-                           ON p.session_id = e.session_id AND p.session_event_seq = e.seq
-                         JOIN verification_projections v ON v.projection_id = p.projection_id
-                         WHERE v.operation_id = ?1 AND p.ordinal = 1",
-                        [operation_id.to_string()],
-                        |row| row.get(0),
-                    )?,
                 ))
             })
             .await
             .unwrap();
         assert_eq!(
             (attempt_revision, committed, event_count, secret_count),
-            (2, 1, 2, 0)
+            (2, 1, 1, 0)
         );
         let recovery_call: Value = serde_json::from_str(&recovery_call).unwrap();
-        assert_eq!(recovery_call["data"]["operation"], "call");
-        assert_eq!(recovery_call["data"]["arguments"]["path"], "src/lib.rs");
-        assert_eq!(recovery_call["data"]["patch"], "safe patch body");
-        assert!(recovery_call_id.starts_with("verification:"));
-        assert_eq!(recovery_call_id, recovery_result_call_id);
+        assert_eq!(recovery_call["hard_fail"], true);
+        assert_eq!(recovery_call_id, "verification-test-call");
         assert!(!recovery_call.to_string().contains("effect-before-crash"));
-        let recovery_result: Value = serde_json::from_str(&recovery_result).unwrap();
-        assert_eq!(
-            recovery_result["data"]["classification"],
-            "recovery_final_error"
-        );
-        assert!(!recovery_result.to_string().contains("effect-before-crash"));
         let (success_operation, success_attempt) =
             prepared_selected_dispatch(&db, session_id, agent_id, 30).await;
         inject_settlement_fault_once(success_operation);
@@ -5532,6 +5509,7 @@ mod tests {
                     VerificationRedactionClass::DispatchSuccess,
                     "success-before-crash"
                 ),
+                projection_event(&db, session_id, DispatchSettlement::Succeeded, 40).await,
                 40,
             )
             .await
@@ -5543,6 +5521,7 @@ mod tests {
                 success_operation,
                 Some(DispatchSettlement::Succeeded),
                 redacted(VerificationRedactionClass::DispatchSuccess, "success"),
+                projection_event(&db, session_id, DispatchSettlement::Succeeded, 41).await,
                 41,
             )
             .await
@@ -5594,7 +5573,7 @@ mod tests {
                 success_calls,
                 success_completions
             ),
-            (1, 2, 1, 1)
+            (1, 1, 1, 0)
         );
     }
 
@@ -5630,6 +5609,7 @@ mod tests {
                     VerificationRedactionClass::DispatchSuccess,
                     "safe-host-proof"
                 ),
+                projection_event(&db, session_id, DispatchSettlement::Succeeded, 20).await,
                 20,
             )
             .await
@@ -5664,7 +5644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verification_ledger_db_normal_settlement_derives_only_envelope_events_and_rejects_tampering()
+    async fn verification_ledger_db_normal_settlement_binds_actual_tool_event_and_rejects_envelope_tampering()
      {
         let db = Db::open_in_memory().unwrap();
         let (session_id, agent_id) = owner(&db, "normal-envelope-projection").await;
@@ -5693,6 +5673,7 @@ mod tests {
                 executing.revision,
                 DispatchSettlement::Succeeded,
                 RedactedVerificationJson::dispatch_success(digest("normal-safe-host-receipt")),
+                projection_event(&db, session_id, DispatchSettlement::Succeeded, 20).await,
                 20,
             )
             .await
@@ -5740,6 +5721,7 @@ mod tests {
             clean_executing.revision,
             DispatchSettlement::Succeeded,
             RedactedVerificationJson::dispatch_success(digest("normal-clean-host-receipt")),
+            projection_event(&db, session_id, DispatchSettlement::Succeeded, 40).await,
             40,
         )
         .await
@@ -5763,17 +5745,12 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "tool_call");
-        assert_eq!(events[1].0, "tool_call_completed");
-        assert_eq!(events[0].1, events[1].1);
         let call: Value = serde_json::from_str(&events[0].2).unwrap();
-        let result: Value = serde_json::from_str(&events[1].2).unwrap();
-        assert_eq!(call["data"]["operation"], "call");
-        assert_eq!(call["data"]["arguments"]["path"], "src/lib.rs");
-        assert_eq!(call["data"]["patch"], "safe patch body");
-        assert_eq!(result["data"]["classification"], "dispatch_success");
-        assert!(!result.to_string().contains("normal-clean-host-receipt"));
+        assert_eq!(call["hard_fail"], false);
+        assert_eq!(events[0].1.as_deref(), Some("verification-test-call"));
+        assert!(!call.to_string().contains("normal-clean-host-receipt"));
     }
 
     #[tokio::test]
@@ -5789,6 +5766,7 @@ mod tests {
                 operation_id,
                 None,
                 RedactedVerificationJson::invalid_original(digest("wrong-recovery-role")),
+                None,
                 20,
             )
             .await
@@ -5830,6 +5808,7 @@ mod tests {
                 operation_id,
                 None,
                 RedactedVerificationJson::dispatch_unknown(digest("unknown-host-proof")),
+                None,
                 21,
             )
             .await

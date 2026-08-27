@@ -19,9 +19,8 @@ use crate::agents::{
 };
 use crate::db::stats::PriceTable;
 use crate::db::verification_ledger::{
-    NewVerificationEnvelope, NewVerificationOperation, VerificationArtifactKind,
-    VerificationBudgetAction, VerificationDigest, VerificationSynthesisArtifactSource,
-    VerificationSynthesisTerminal,
+    NewVerificationEnvelope, NewVerificationOperation, VerificationBudgetAction,
+    VerificationDigest, VerificationSurrogateKind, VerificationSynthesisTerminal,
 };
 use crate::engine::agent::Agent;
 use crate::engine::model::Model;
@@ -197,6 +196,29 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
     let Some(tool_class) = classify_tool(input.resolved_name) else {
         return VerificationOutcome::Skip;
     };
+    // A durable AgentTree instance is not itself verification policy. Legacy
+    // and no-profile agents have instance IDs too, so resolve the immutable
+    // grant first and preserve the ordinary byte-identical dispatch path when
+    // policy is absent, off, or does not match this write class.
+    let subject = VerificationSubject {
+        tool_class,
+        tool_id: input.resolved_name,
+        namespace: "host",
+    };
+    let Some(compiled_policy) = input
+        .agent
+        .vnext_grant
+        .as_ref()
+        .and_then(|grant| grant.verification.as_ref())
+    else {
+        return VerificationOutcome::Skip;
+    };
+    let Some(compiled_rule) = compiled_policy.select(&subject) else {
+        return VerificationOutcome::Skip;
+    };
+    if compiled_rule.action == VerificationAction::Off {
+        return VerificationOutcome::Skip;
+    }
     let Some(instance_id) = input.ctx.agent_instance_id else {
         return VerificationOutcome::Skip;
     };
@@ -282,7 +304,10 @@ async fn run_verification(
             }
             #[cfg(not(test))]
             {
-                anyhow::bail!("verification requires an immutable agent profile snapshot")
+                // A profile-less/legacy agent has no immutable verification
+                // authority. Treat the absent snapshot as absent policy so
+                // the ordinary write/edit path remains exactly unchanged.
+                return Ok(VerificationOutcome::Skip);
             }
         };
     let requested = profile_budget;
@@ -344,29 +369,28 @@ async fn run_verification(
             include_linked_files,
             inherit_framing: "Produce an alternative implementation of the proposed write/edit. Answer through verification_candidate.",
         }).await?;
-        let assembled_generator =
+        let generator_history =
             if matches!(generator.recipe, crate::agents::VerificationRecipe::Inherit) {
-                serde_json::to_string(&serde_json::json!({
-                    "history": input.history,
-                    "tools": input.agent.tools.definitions(input.agent.tool_steering),
-                    "prompt": recipe.prompt,
-                }))?
+                input.history
             } else {
-                recipe.prompt
+                &[]
             };
+        let assembled_generator = super::generate::conservative_generator_budget_text(
+            input.agent,
+            &recipe.prompt,
+            generator_history,
+        )?;
         let price = super::estimate::model_prices(&prices, model.model_id_ref());
-        let estimate = estimate_candidate_set(CandidateSetEstimateInput {
-            assembled_texts: std::slice::from_ref(&assembled_generator),
-            encoding: encoding_for_model_id(model.model_id_ref()),
-            input_price_per_mtok: price.map(|price| price.0),
-            output_price_per_mtok: price.map(|price| price.1),
-            max_candidates: 1,
-            max_collection_millis: requested.max_collection_millis,
-        });
-        let turns = u64::from(generator.max_turns.max(1));
-        estimated_tokens = estimated_tokens.saturating_add(estimate.tokens.saturating_mul(turns));
+        let estimate = super::estimate::estimate_multi_turn_candidate(
+            &assembled_generator,
+            encoding_for_model_id(model.model_id_ref()),
+            price.map(|price| price.0),
+            price.map(|price| price.1),
+            generator.max_turns,
+        );
+        estimated_tokens = estimated_tokens.saturating_add(estimate.tokens);
         estimated_cost = match (estimated_cost, estimate.cost_microusd) {
-            (Some(total), Some(cost)) => Some(total.saturating_add(cost.saturating_mul(turns))),
+            (Some(total), Some(cost)) => Some(total.saturating_add(cost)),
             _ => None,
         };
     }
@@ -498,7 +522,7 @@ async fn run_verification(
             dispatching.operation_id,
             dispatching.revision,
             original_digest,
-            VerificationArtifactKind::ProposedCall,
+            VerificationSurrogateKind::NormalizedOriginal,
             input.args,
         )
         .await?;
@@ -671,7 +695,7 @@ async fn run_verification(
                     created.operation_id,
                     dispatching.revision,
                     original_digest.clone(),
-                    VerificationArtifactKind::ProposedCall,
+                    VerificationSurrogateKind::NormalizedOriginal,
                     input.args,
                 )
                 .await?;
@@ -707,8 +731,37 @@ async fn run_verification(
                     operation_id: created.operation_id,
                 });
             }
-            (crate::agents::VerificationMode::Revise, AdjudicatorDecision::Select)
-            | (crate::agents::VerificationMode::Revise, AdjudicatorDecision::Block) => {
+            (crate::agents::VerificationMode::Revise, AdjudicatorDecision::Block) => {
+                let feedback = if verdict.feedback.is_empty() {
+                    "verification rejected this change".to_string()
+                } else {
+                    verdict.feedback
+                };
+                let op = input
+                    .session
+                    .db
+                    .host_verification_operation(input.session.id, created.operation_id)
+                    .await?
+                    .context("verification operation disappeared")?;
+                input
+                    .session
+                    .db
+                    .suppress_verification_synthesis(
+                        input.session.id,
+                        created.operation_id,
+                        op.revision,
+                        VerificationSynthesisTerminal::Refused,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                return Ok(VerificationOutcome::Block {
+                    message: format!(
+                        "verification blocked this edit: {feedback}; revise and re-emit"
+                    ),
+                    operation_id: created.operation_id,
+                });
+            }
+            (crate::agents::VerificationMode::Revise, AdjudicatorDecision::Select) => {
                 if let Some(answer) = selected_revision(&verdict, &collected)
                     && let Some(applied) = answer.args.clone()
                 {
@@ -721,26 +774,23 @@ async fn run_verification(
                         .host_verification_operation(input.session.id, created.operation_id)
                         .await?
                         .context("verification operation disappeared")?;
-                    let synthesized = input
+                    let selected = input
                         .session
                         .db
-                        .synthesize_verification_write(
+                        .select_verification_candidate(
                             input.session.id,
                             created.operation_id,
                             op.revision,
-                            vec![VerificationSynthesisArtifactSource {
-                                candidate_id: selected_id,
-                                artifact_ordinal: 0,
-                            }],
+                            selected_id,
                             chrono::Utc::now().timestamp_millis(),
                         )
                         .await?;
                     let plan = reserve_dispatch(
                         &input,
                         created.operation_id,
-                        synthesized.operation.revision,
-                        synthesized.canonical_output_batch_digest,
-                        VerificationArtifactKind::WriteChangeSet,
+                        selected.revision,
+                        VerificationDigest::of(applied.to_string().as_bytes()),
+                        VerificationSurrogateKind::SelectedCall,
                         &applied,
                     )
                     .await?;
@@ -780,7 +830,7 @@ async fn run_verification(
                         created.operation_id,
                         dispatching.revision,
                         original_digest.clone(),
-                        VerificationArtifactKind::ProposedCall,
+                        VerificationSurrogateKind::NormalizedOriginal,
                         input.args,
                     )
                     .await?;
@@ -826,7 +876,7 @@ async fn reserve_dispatch(
     operation_id: Uuid,
     operation_revision: i64,
     batch_digest: VerificationDigest,
-    surrogate_kind: VerificationArtifactKind,
+    surrogate_kind: VerificationSurrogateKind,
     args: &Value,
 ) -> Result<VerificationDispatchPlan> {
     let attempt = input
@@ -1318,7 +1368,7 @@ mod tests {
         assert_eq!(tool_calls[0].output, wire);
         assert!(events.iter().any(|event| matches!(
             event,
-            TurnEvent::ToolError { error, .. } if error == &wire
+            TurnEvent::ToolEnd { output, .. } if output == &wire
         )));
     }
 
@@ -1493,18 +1543,64 @@ mod tests {
             "{wire}"
         );
         assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            crate::db::verification_ledger::VerificationOperationState::Failed
+        );
         assert_eq!(tool_calls.len(), 1);
         assert!(tool_calls[0].hard_fail);
         assert_eq!(tool_calls[0].output, wire);
         assert!(events.iter().any(|event| matches!(
             event,
-            TurnEvent::ToolError { error, .. } if error == &wire
+            TurnEvent::ToolEnd { output, .. } if output == &wire
         )));
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, TurnEvent::ToolEnd { .. }))
+                .any(|event| matches!(event, TurnEvent::ToolError { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn revise_mode_block_refuses_even_when_adjudication_failures_dispatch_original() {
+        crate::engine::verification::estimate::set_test_model_price(Some((0.0, 0.0)));
+        crate::engine::verification::generate::set_generator_override(vec![
+            crate::engine::verification::generate::GeneratorAnswer {
+                kind: crate::engine::verification::generate::CandidateKind::Revision,
+                args: Some(serde_json::json!({"path": "a.rs", "content": "candidate"})),
+                critique: "candidate must not override an explicit block".into(),
+            },
+        ]);
+        crate::engine::verification::adjudicate::set_adjudicator_override(
+            crate::engine::verification::adjudicate::AdjudicatorVerdict {
+                decision: crate::engine::verification::adjudicate::AdjudicatorDecision::Block,
+                selected: None,
+                feedback: "do not apply".into(),
+            },
+        );
+        let (called, wire, rows, tool_calls, events) =
+            dispatch_named("edit", Some(revise_grant())).await;
+        crate::engine::verification::adjudicate::clear_adjudicator_override();
+        crate::engine::verification::generate::clear_generator_override();
+        crate::engine::verification::estimate::set_test_model_price(None);
+
+        assert!(
+            !called,
+            "a revise-mode block is a refusal, not an adjudication failure"
+        );
+        assert!(wire.contains("verification blocked this edit: do not apply"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            crate::db::verification_ledger::VerificationOperationState::Failed
+        );
+        assert_eq!(tool_calls.len(), 1);
+        assert!(tool_calls[0].hard_fail);
+        assert_eq!(tool_calls[0].output, wire);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnEvent::ToolEnd { output, .. } if output == &wire
+        )));
     }
 
     #[tokio::test]

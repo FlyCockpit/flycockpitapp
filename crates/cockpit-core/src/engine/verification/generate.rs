@@ -9,8 +9,7 @@ use uuid::Uuid;
 use crate::agents::{GeneratorSpec, VerificationRecipe};
 use crate::db::verification_ledger::{
     CandidateTransitionOutcome, NewVerificationCandidate, RedactedVerificationJson,
-    VerificationArtifactKind, VerificationArtifactMember, VerificationArtifactOperation,
-    VerificationCandidateState, VerificationDigest,
+    VerificationArtifactKind, VerificationCandidateState, VerificationDigest,
 };
 use crate::engine::agent::Agent;
 use crate::engine::message::Message;
@@ -22,6 +21,10 @@ use crate::session::Session;
 
 use super::inference::{VerificationInferenceInput, journaled_verification_inference};
 use super::recipe::{RecipeAssemblyInput, assemble_recipe};
+
+const GENERATOR_SYSTEM: &str = "Independently verify the proposed file change. You may use only \
+    the advertised read-only investigation tools. Return exactly one structured candidate through \
+    verification_candidate; no other tool can produce a final answer.";
 
 #[derive(Debug, Clone)]
 pub struct CollectedCandidate {
@@ -41,6 +44,65 @@ pub struct GeneratorAnswer {
     pub kind: CandidateKind,
     pub args: Option<Value>,
     pub critique: String,
+}
+
+enum GenerationOutcome {
+    Answer(GeneratorAnswer),
+    TimedOut,
+    BudgetExhausted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GeneratorTurnBudget {
+    remaining_tokens: u64,
+    remaining_cost_microusd: u64,
+}
+
+impl GeneratorTurnBudget {
+    fn debit(&mut self, estimate: super::estimate::PreCollectionEstimate) -> bool {
+        let Some(cost) = estimate.cost_microusd else {
+            return false;
+        };
+        if estimate.tokens > self.remaining_tokens || cost > self.remaining_cost_microusd {
+            return false;
+        }
+        self.remaining_tokens -= estimate.tokens;
+        self.remaining_cost_microusd -= cost;
+        true
+    }
+}
+
+fn materialize_generation(
+    generated: GenerationOutcome,
+) -> (GeneratorAnswer, Option<VerificationCandidateState>) {
+    match generated {
+        GenerationOutcome::Answer(answer) => (answer, None),
+        GenerationOutcome::TimedOut => (
+            GeneratorAnswer {
+                kind: CandidateKind::Flag,
+                args: None,
+                critique: "generator timed out".into(),
+            },
+            Some(VerificationCandidateState::TimedOut),
+        ),
+        GenerationOutcome::BudgetExhausted => (
+            GeneratorAnswer {
+                kind: CandidateKind::Flag,
+                args: None,
+                critique: "generator budget exhausted".into(),
+            },
+            Some(VerificationCandidateState::Cancelled),
+        ),
+        GenerationOutcome::Failed => (
+            GeneratorAnswer {
+                kind: CandidateKind::Flag,
+                args: None,
+                critique: "generator failed".into(),
+            },
+            Some(VerificationCandidateState::Malformed),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -195,33 +257,29 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         // inheritance. Two distinct slots may intentionally bind the same
         // provider model but have different custody and prompt identities.
         let same_as_author = is_author_slot(&spec.slot);
-        let reservation_body = if matches!(spec.recipe, VerificationRecipe::Inherit) {
-            let Ok(body) = serde_json::to_string(&serde_json::json!({
-                "history": input.history,
-                "tools": input.agent.tools.definitions(input.agent.tool_steering),
-                "prompt": assembled.prompt,
-            })) else {
-                continue;
-            };
-            body
+        let tools = generator_tools(&input, spec, same_as_author);
+        let initial_history = if matches!(spec.recipe, VerificationRecipe::Inherit) {
+            input.history
         } else {
-            assembled.prompt.clone()
+            &[]
+        };
+        let Ok(reservation_body) =
+            generator_budget_text(&assembled.prompt, initial_history, &tools)
+        else {
+            continue;
         };
         let reservation_digest = VerificationDigest::of(reservation_body.as_bytes());
         let prices = crate::db::stats::PriceTable::load_default();
         let price = super::estimate::model_prices(&prices, generator_model.model_id_ref());
-        let reservation =
-            super::estimate::estimate_candidate_set(super::estimate::CandidateSetEstimateInput {
-                assembled_texts: std::slice::from_ref(&reservation_body),
-                encoding: super::estimate::encoding_for_model_id(generator_model.model_id_ref()),
-                input_price_per_mtok: price.map(|price| price.0),
-                output_price_per_mtok: price.map(|price| price.1),
-                max_candidates: 1,
-                max_collection_millis: 1,
-            });
-        let turns = u64::from(spec.max_turns.max(1));
-        let reservation_tokens = reservation.tokens.saturating_mul(turns);
-        let reserved_cost = reservation.cost_microusd.unwrap_or(0).saturating_mul(turns);
+        let reservation = super::estimate::estimate_multi_turn_candidate(
+            &reservation_body,
+            super::estimate::encoding_for_model_id(generator_model.model_id_ref()),
+            price.map(|price| price.0),
+            price.map(|price| price.1),
+            spec.max_turns,
+        );
+        let reservation_tokens = reservation.tokens;
+        let reserved_cost = reservation.cost_microusd.unwrap_or(0);
         let now = chrono::Utc::now().timestamp_millis();
         let reserved = match input
             .session
@@ -266,21 +324,39 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         if running != CandidateTransitionOutcome::Transitioned {
             continue;
         }
-        let answer = if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
-            GeneratorAnswer {
-                kind: CandidateKind::Flag,
-                args: None,
-                critique: "generator timed out".into(),
+        let generated =
+            if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
+                GenerationOutcome::TimedOut
+            } else {
+                generate_with_turns(
+                    input,
+                    &generator_model,
+                    spec,
+                    &assembled.prompt,
+                    same_as_author,
+                    reservation_tokens,
+                    reserved_cost,
+                )
+                .await
+            };
+        let (mut answer, forced_terminal) = materialize_generation(generated);
+        // Candidate arguments cross the same schema-repair/path-normalization
+        // boundary as an authored call before they can become adjudicable.
+        // Dispatch repeats this check as a TOCTOU defense; canonicalizing here
+        // also makes the candidate digest describe the exact selected call.
+        let invalid_arguments = if answer.kind == CandidateKind::Revision {
+            match answer.args.take() {
+                Some(args) => match canonical_candidate_args(&input, args) {
+                    Ok(args) => {
+                        answer.args = Some(args);
+                        false
+                    }
+                    Err(_) => true,
+                },
+                None => true,
             }
         } else {
-            generate_with_turns(
-                input,
-                &generator_model,
-                spec,
-                &assembled.prompt,
-                same_as_author,
-            )
-            .await
+            false
         };
         let answer_json = serde_json::to_string(&serde_json::json!({
             "args": &answer.args,
@@ -295,10 +371,10 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
             .unwrap_or_default();
         let digest = VerificationDigest::of(args_json.as_bytes());
         let now = chrono::Utc::now().timestamp_millis();
-        let terminal = if invalid_placeholder {
+        let terminal = if let Some(terminal) = forced_terminal {
+            terminal
+        } else if invalid_placeholder || invalid_arguments {
             VerificationCandidateState::Invalid
-        } else if answer.critique == "generator timed out" {
-            VerificationCandidateState::TimedOut
         } else if answer.args.is_none() && answer.kind != CandidateKind::ApproveOriginal {
             VerificationCandidateState::Malformed
         } else {
@@ -384,23 +460,15 @@ fn is_private_investigation_tool(tool: &dyn crate::engine::tool::Tool) -> bool {
         && !name.contains("generation")
 }
 
-async fn generate_with_turns(
+fn generator_tools(
     input: &CollectionInput<'_>,
-    model: &Model,
     spec: &GeneratorSpec,
-    prompt: &str,
     same_as_author: bool,
-) -> GeneratorAnswer {
+) -> Vec<ToolDefinition> {
     let turns = spec
         .max_turns
         .max(1)
         .min(crate::agents::MAX_GENERATOR_TURNS);
-    let mut private_history = if matches!(spec.recipe, VerificationRecipe::Inherit) {
-        input.history.to_vec()
-    } else {
-        Vec::new()
-    };
-    let candidate_tool = candidate_tool_definition();
     let mut tools = if matches!(spec.recipe, VerificationRecipe::Inherit) && same_as_author {
         input.agent.tools.definitions(input.agent.tool_steering)
     } else if turns > 1 {
@@ -421,18 +489,99 @@ async fn generate_with_turns(
         Vec::new()
     };
     // Keep the author's definitions byte-for-byte and in their original order;
-    // the private terminal tool is additive. Calls to an author tool remain
-    // execution-disabled unless the bounded read-only investigation branch
-    // explicitly admits them below.
-    tools.push(candidate_tool.clone());
+    // the private terminal tool is additive.
+    tools.push(candidate_tool_definition());
+    tools
+}
+
+fn generator_budget_text(
+    prompt: &str,
+    history: &[Message],
+    tools: &[ToolDefinition],
+) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "system": GENERATOR_SYSTEM,
+        "history": history,
+        "prompt": prompt,
+        "tools": tools,
+    }))?)
+}
+
+/// Pre-collection callers do not yet have the runtime's curated tool subset.
+/// Charging the complete author tool definitions is a safe superset and keeps
+/// the operation estimate conservative for every recipe/slot combination.
+pub(super) fn conservative_generator_budget_text(
+    agent: &Agent,
+    prompt: &str,
+    history: &[Message],
+) -> Result<String> {
+    let mut tools = agent.tools.definitions(agent.tool_steering);
+    tools.push(candidate_tool_definition());
+    generator_budget_text(prompt, history, &tools)
+}
+
+fn take_bounded_private_output(output: String, remaining: &mut usize) -> String {
+    if output.len() <= *remaining {
+        *remaining -= output.len();
+        return output;
+    }
+    let mut end = (*remaining).min(output.len());
+    while end > 0 && !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    *remaining = 0;
+    output[..end].to_string()
+}
+
+async fn generate_with_turns(
+    input: &CollectionInput<'_>,
+    model: &Model,
+    spec: &GeneratorSpec,
+    prompt: &str,
+    same_as_author: bool,
+    reserved_tokens: u64,
+    reserved_cost_microusd: u64,
+) -> GenerationOutcome {
+    let turns = spec
+        .max_turns
+        .max(1)
+        .min(crate::agents::MAX_GENERATOR_TURNS);
+    let mut private_history = if matches!(spec.recipe, VerificationRecipe::Inherit) {
+        input.history.to_vec()
+    } else {
+        Vec::new()
+    };
+    let tools = generator_tools(input, spec, same_as_author);
     let params = if matches!(spec.recipe, VerificationRecipe::Inherit) && same_as_author {
         input.agent.params.clone()
     } else {
         crate::engine::model::ModelParams::default()
     };
+    let prices = crate::db::stats::PriceTable::load_default();
+    let price = super::estimate::model_prices(&prices, model.model_id_ref());
+    let encoding = super::estimate::encoding_for_model_id(model.model_id_ref());
+    let mut budget = GeneratorTurnBudget {
+        remaining_tokens: reserved_tokens,
+        remaining_cost_microusd: reserved_cost_microusd,
+    };
     for turn in investigation_turn_budget(turns) {
         if let Some(answer) = take_override_answer() {
-            return answer;
+            return GenerationOutcome::Answer(answer);
+        }
+        let Ok(turn_body) = generator_budget_text(prompt, &private_history, &tools) else {
+            return GenerationOutcome::Failed;
+        };
+        let turn_estimate =
+            super::estimate::estimate_candidate_set(super::estimate::CandidateSetEstimateInput {
+                assembled_texts: std::slice::from_ref(&turn_body),
+                encoding,
+                input_price_per_mtok: price.map(|price| price.0),
+                output_price_per_mtok: price.map(|price| price.1),
+                max_candidates: 1,
+                max_collection_millis: 1,
+            });
+        if !budget.debit(turn_estimate) {
+            return GenerationOutcome::BudgetExhausted;
         }
         match generate_one_shot(
             input,
@@ -444,14 +593,15 @@ async fn generate_with_turns(
         )
         .await
         {
-            Ok(GeneratorTurn::Answer(answer)) => return answer,
+            Ok(GeneratorTurn::Answer(answer)) => return GenerationOutcome::Answer(answer),
             Ok(GeneratorTurn::Investigate(choice, calls)) if turn + 1 < turns => {
                 private_history.push(Message::Assistant {
                     id: None,
                     content: choice,
                 });
+                let mut remaining_read_output = super::estimate::PRIVATE_READ_OUTPUT_BYTES_PER_TURN;
                 for call in calls {
-                    let text = match input.agent.tools.get(&call.function.name) {
+                    let raw_text = match input.agent.tools.get(&call.function.name) {
                         Some(tool) if is_private_investigation_tool(tool.as_ref()) => {
                             let remaining = input
                                 .collection_deadline_unix_ms
@@ -480,6 +630,7 @@ async fn generate_with_turns(
                         }
                         None => "Error: unknown investigation tool".to_string(),
                     };
+                    let text = take_bounded_private_output(raw_text, &mut remaining_read_output);
                     private_history.push(crate::engine::message::tool_result_message_for(
                         &call,
                         &call.function.name,
@@ -488,32 +639,27 @@ async fn generate_with_turns(
                 }
             }
             Ok(GeneratorTurn::Investigate(_, _)) => {
-                return GeneratorAnswer {
+                return GenerationOutcome::Answer(GeneratorAnswer {
                     kind: CandidateKind::Flag,
                     args: None,
                     critique: "generator exhausted its investigation turn cap".to_string(),
-                };
+                });
             }
             Err(_) => {
-                return GeneratorAnswer {
-                    kind: CandidateKind::Flag,
-                    args: None,
-                    critique: if chrono::Utc::now().timestamp_millis()
-                        >= input.collection_deadline_unix_ms
-                    {
-                        "generator timed out".to_string()
-                    } else {
-                        "generator failed".to_string()
-                    },
+                return if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms
+                {
+                    GenerationOutcome::TimedOut
+                } else {
+                    GenerationOutcome::Failed
                 };
             }
         }
     }
-    GeneratorAnswer {
+    GenerationOutcome::Answer(GeneratorAnswer {
         kind: CandidateKind::Flag,
         args: None,
         critique: "generator produced no candidate".to_string(),
-    }
+    })
 }
 
 fn investigation_turn_budget(max_turns: u8) -> std::ops::Range<u8> {
@@ -559,7 +705,7 @@ async fn generate_one_shot(
         session: input.ctx.session.clone(),
         model,
         config: &input.ctx.config,
-        system: "Independently verify the proposed file change. You may use only the advertised read-only investigation tools. Return exactly one structured candidate through verification_candidate; no other tool can produce a final answer.",
+        system: GENERATOR_SYSTEM,
         history,
         prompt,
         tools,
@@ -568,7 +714,8 @@ async fn generate_one_shot(
         site: UtilityCallSite::VerificationVariant,
         cancel: &input.ctx.cancel,
         deadline_unix_ms: Some(input.collection_deadline_unix_ms),
-    }).await?;
+    })
+    .await?;
     let calls = crate::engine::message::collect_tool_calls(&choice);
     let call = calls
         .iter()
@@ -600,39 +747,41 @@ fn candidate_descriptor(
             artifact_members: Vec::new(),
         };
     }
-    let args = answer.args.as_ref().unwrap_or(input.args);
-    let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
-    let content = args
-        .get("content")
-        .or_else(|| args.get("new_string"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let target = if std::path::Path::new(path).is_absolute() {
-        std::path::PathBuf::from(path)
-    } else {
-        input.ctx.cwd.join(path)
-    };
-    let operation_kind = if input.resolved_name.contains("write") && !target.exists() {
-        VerificationArtifactOperation::Add
-    } else {
-        VerificationArtifactOperation::Modify
-    };
+    // A generator supplied a full substituted tool call, not a host-composed
+    // union of write artifacts. Preserve that distinction in the ledger so a
+    // verbatim selection is `selected_call`, never `synthesized_write`.
     NewVerificationCandidate {
-        artifact_kind: VerificationArtifactKind::WriteChangeSet,
+        artifact_kind: VerificationArtifactKind::ProposedCall,
         canonical_call_digest: digest.clone(),
         artifact_union_digest: digest.clone(),
         redacted_summary: RedactedVerificationJson::candidate_summary(digest),
         reserved_tokens: 0,
         reserved_cost_microunits: 0,
-        artifact_members: vec![VerificationArtifactMember {
-            operation_kind,
-            affected_path_digest: VerificationDigest::of(path.as_bytes()),
-            prior_path_digest: None,
-            content_digest: Some(VerificationDigest::of(content.as_bytes())),
-            binary_metadata_digest: None,
-            mode_digest: None,
-        }],
+        artifact_members: Vec::new(),
     }
+}
+
+fn canonical_candidate_args(input: &CollectionInput<'_>, args: Value) -> Result<Value> {
+    let schema = input
+        .agent
+        .tools
+        .get(input.resolved_name)
+        .map(|tool| tool.parameters())
+        .unwrap_or(Value::Null);
+    let mut canonical = crate::engine::model::wire_schema::strip_wire_nulls(&schema, args);
+    let repaired = crate::engine::repair::repair(&mut canonical, &schema, input.resolved_name);
+    if !repaired.valid {
+        anyhow::bail!(
+            "verification candidate arguments failed schema validation: {}",
+            repaired.error.unwrap_or_else(|| "invalid arguments".into())
+        );
+    }
+    let normalized =
+        crate::engine::repair::normalize_paths(&mut canonical, &schema, input.ctx.cwd.as_path());
+    if let Some(error) = normalized.error {
+        anyhow::bail!("verification candidate path normalization failed: {error}");
+    }
+    Ok(canonical)
 }
 
 pub fn parse_candidate_payload(value: &Value) -> Result<GeneratorAnswer> {
@@ -665,6 +814,38 @@ mod tests {
             investigation_turn_budget(u8::MAX).count(),
             usize::from(crate::agents::MAX_GENERATOR_TURNS)
         );
+    }
+
+    #[test]
+    fn multi_turn_generator_budget_exhaustion_terminalizes_mid_loop() {
+        let per_turn = super::super::estimate::PreCollectionEstimate {
+            tokens: 10,
+            cost_microusd: Some(4),
+            candidates: 1,
+            collection_millis: 1,
+        };
+        let mut budget = GeneratorTurnBudget {
+            remaining_tokens: 15,
+            remaining_cost_microusd: 8,
+        };
+        assert!(budget.debit(per_turn), "the first turn is admitted");
+        assert!(
+            !budget.debit(per_turn),
+            "the growing second turn is refused before provider handoff"
+        );
+        let (answer, terminal) = materialize_generation(GenerationOutcome::BudgetExhausted);
+        assert_eq!(answer.critique, "generator budget exhausted");
+        assert_eq!(terminal, Some(VerificationCandidateState::Cancelled));
+    }
+
+    #[test]
+    fn private_read_output_is_utf8_safe_and_bounded_across_a_turn() {
+        let mut remaining = 7;
+        let first = take_bounded_private_output("éééé".to_string(), &mut remaining);
+        let second = take_bounded_private_output("tail".to_string(), &mut remaining);
+        assert!(first.is_char_boundary(first.len()));
+        assert!(first.len() + second.len() <= 7);
+        assert_eq!(remaining, 0);
     }
 
     #[test]

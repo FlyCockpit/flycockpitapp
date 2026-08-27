@@ -658,6 +658,34 @@ pub fn resolve_agent_profile(
         "selected installation has a binding for an unknown vNext slot"
     );
 
+    // Binding resolution is the first validation boundary that knows the
+    // actual provider/model trust of every slot. Surface the custody warning
+    // through the same advisory tracing channel as other definition-load
+    // warnings; it never mutates or rejects the resolved grant.
+    let untrusted_slots = slots
+        .iter()
+        .filter(|(_, slot)| {
+            !input
+                .providers
+                .resolve_trust(
+                    &slot.choice.offering.provider_id,
+                    &slot.choice.offering.model_id,
+                )
+                .is_trusted()
+        })
+        .map(|(slot_id, _)| slot_id.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(policy) = &vnext.verification {
+        for region in policy.compile_with_slots(&vnext.model_slots).regions {
+            for warning in region
+                .rule
+                .inherit_untrusted_slot_warnings(&untrusted_slots)
+            {
+                tracing::warn!(agent = %vnext.agent_id, %warning, "agent definition loaded with warning");
+            }
+        }
+    }
+
     let resolved_children = resolve_children(selected, input.catalog, &input.host_policy)?;
     let child_installation_ids = resolved_children
         .iter()

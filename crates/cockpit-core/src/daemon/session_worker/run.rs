@@ -5578,6 +5578,20 @@ pub(super) async fn run_worker(
         tracing::error!(%error, %session_id, "reconciling stranded host approval dispatches failed");
         return;
     }
+    // A parked row carrying a completed verification memo is the durable,
+    // safely replayable continuation. Do not terminalize that operation before
+    // the exact parked replay consumes it. Every other nonterminal operation
+    // still recovers fail-closed: without the parked continuation, a dispatching
+    // attempt may have crossed an uncertain host-effect boundary.
+    let replayable_verification_operations: HashSet<Uuid> = terminal_tree_interrupt_replays
+        .iter()
+        .filter_map(|row| {
+            row.parked
+                .as_ref()
+                .and_then(|payload| payload.verification.as_ref())
+                .map(|memo| memo.operation_id)
+        })
+        .collect();
     match session
         .db
         .list_nonterminal_verification_operations_for_session(session_id)
@@ -5585,6 +5599,9 @@ pub(super) async fn run_worker(
     {
         Ok(operations) => {
             for operation in operations {
+                if replayable_verification_operations.contains(&operation.operation_id) {
+                    continue;
+                }
                 let digest = crate::db::verification_ledger::VerificationDigest::of(
                     format!("verification-restart:{}", operation.operation_id).as_bytes(),
                 );
@@ -5597,6 +5614,7 @@ pub(super) async fn run_worker(
                         crate::db::verification_ledger::RedactedVerificationJson::dispatch_unknown(
                             digest,
                         ),
+                        None,
                         tree_now,
                     )
                     .await

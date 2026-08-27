@@ -1,6 +1,8 @@
 //! Verification inference through the same durable-before-handoff barrier as
 //! an ordinary agent turn. Candidate bodies remain private, but every provider
 //! request has a normal immutable inference row and external-journal ticket.
+//! Verification rows store a digest-only audit projection because raw
+//! candidate bodies are intentionally non-durable.
 
 use std::sync::Arc;
 
@@ -18,6 +20,27 @@ use crate::engine::agent::{
 use crate::engine::message::{AssistantContent, Message, ToolDefinition};
 use crate::engine::model::{Model, ModelParams, UtilityCallSite};
 use crate::session::{Session, SessionEventModelFrame};
+
+fn verification_audit_projection(
+    provider_payload: &serde_json::Value,
+    site: UtilityCallSite,
+    history_len: usize,
+    tool_count: usize,
+) -> Result<serde_json::Value> {
+    let encoded = serde_json::to_vec(provider_payload)?;
+    let classification = match site {
+        UtilityCallSite::VerificationVariant => "verification_variant",
+        UtilityCallSite::VerificationAdjudication => "verification_adjudication",
+        _ => "verification_investigation",
+    };
+    Ok(serde_json::json!({
+        "projection": "verification_inference_v1",
+        "classification": classification,
+        "request_digest": crate::db::verification_ledger::VerificationDigest::of(&encoded).as_str(),
+        "history_message_count": history_len,
+        "tool_definition_count": tool_count,
+    }))
+}
 
 pub(crate) struct VerificationInferenceInput<'a> {
     pub session: Arc<Session>,
@@ -61,15 +84,32 @@ pub(crate) async fn journaled_verification_inference(
         input.tools,
         &params,
     )?;
-    let mut journal =
-        prepare_inference_journal(&input.session, input.model, &payload, call_id, ordinal).await?;
+    // Verification prompts intentionally contain raw candidate args and
+    // critiques. They are provider-visible but must never become an ordinary
+    // inference payload row or a protected-redaction-history literal. The
+    // normal durable-before-handoff barrier receives this digest-only audit
+    // projection; the provider call below still receives the raw inputs.
+    let audit_projection = verification_audit_projection(
+        &payload,
+        input.site,
+        input.history.len(),
+        input.tools.len(),
+    )?;
+    let mut journal = prepare_inference_journal(
+        &input.session,
+        input.model,
+        &audit_projection,
+        call_id,
+        ordinal,
+    )
+    .await?;
     let table = input.model.session_redact_table();
     let primary_failed = input
         .session
         .insert_inference_attempt(
             call_id,
             ordinal,
-            &payload,
+            &audit_projection,
             InferenceAttemptMeta {
                 provider: Some(input.model.provider_id()),
                 model: Some(input.model.model_id_ref()),
@@ -210,4 +250,97 @@ pub(crate) async fn journaled_verification_inference(
         tracing::warn!(%error, "record verification inference_request event failed");
     }
     Ok(choice)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CANDIDATE_SENTINEL: &str = "candidate-body-S3NT1N3L-must-not-persist";
+
+    #[test]
+    fn verification_audit_projection_contains_only_classification_digest_and_counts() {
+        let raw = serde_json::json!({
+            "prompt": {
+                "candidates": [{
+                    "args": {"content": CANDIDATE_SENTINEL},
+                    "critique": format!("do not persist {CANDIDATE_SENTINEL}"),
+                }]
+            }
+        });
+        let projected =
+            verification_audit_projection(&raw, UtilityCallSite::VerificationAdjudication, 0, 1)
+                .unwrap();
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert!(!encoded.contains(CANDIDATE_SENTINEL));
+        assert_eq!(projected["projection"], "verification_inference_v1");
+        assert_eq!(projected["classification"], "verification_adjudication");
+        assert_eq!(projected["request_digest"].as_str().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn candidate_body_is_absent_from_durable_request_and_protected_history() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let redact_config = crate::config::extended::RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 4,
+            ..crate::config::extended::RedactConfig::default()
+        };
+        let table = crate::redact::RedactionTable::build_with_env_and_secrets(
+            &redact_config,
+            root.path(),
+            &std::collections::HashMap::from([(
+                "CANDIDATE_SENTINEL".to_string(),
+                CANDIDATE_SENTINEL.to_string(),
+            )]),
+            Vec::<(String, String)>::new(),
+        )
+        .unwrap();
+        let raw = serde_json::json!({
+            "prompt": {
+                "candidate_args": {"content": CANDIDATE_SENTINEL},
+                "candidate_critique": format!("critique: {CANDIDATE_SENTINEL}"),
+            },
+        });
+        let projection =
+            verification_audit_projection(&raw, UtilityCallSite::VerificationAdjudication, 0, 1)
+                .unwrap();
+        let call_id = Uuid::now_v7();
+        session
+            .insert_inference_attempt(
+                call_id,
+                0,
+                &projection,
+                InferenceAttemptMeta::default(),
+                None,
+                &table,
+                true,
+            )
+            .await
+            .unwrap();
+        let stored = db
+            .get_inference_request(&call_id.to_string(), 0)
+            .await
+            .unwrap()
+            .expect("verification inference audit row");
+        assert!(!stored.payload.to_string().contains(CANDIDATE_SENTINEL));
+        assert!(
+            db.protected_redaction_history_list(&session.id.to_string())
+                .await
+                .unwrap()
+                .is_empty(),
+            "verification candidate bodies must not enter protected history"
+        );
+    }
 }

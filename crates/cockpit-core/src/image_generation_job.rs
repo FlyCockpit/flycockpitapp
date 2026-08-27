@@ -112,6 +112,13 @@ pub(crate) mod image_generation_adapter_sealed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationHandoffRequest {
     pub job_id: Uuid,
+    /// Durable owner of the plan. Provider adapters use this only to select the
+    /// live session-owned configuration authority; it is never provider data.
+    pub owner_session_id: Uuid,
+    /// The exact configured target containing `slot_id`. One adapter kind may
+    /// have several targets with different endpoint credentials, so this is
+    /// part of the dispatch routing identity.
+    pub target_id: String,
     pub slot_id: Uuid,
     pub attempt_number: u32,
     pub external_operation_id: Uuid,
@@ -585,6 +592,8 @@ fn parse_image_adapter_kind(adapter_kind: &str) -> Option<ImageAdapterKind> {
 #[derive(Clone, Default)]
 pub struct ImageGenerationAdapterMap {
     adapters: HashMap<ImageAdapterKind, std::sync::Arc<dyn ImageGenerationAdapter>>,
+    target_adapters:
+        HashMap<(ImageAdapterKind, String), std::sync::Arc<dyn ImageGenerationAdapter>>,
 }
 
 impl ImageGenerationAdapterMap {
@@ -611,6 +620,20 @@ impl ImageGenerationAdapterMap {
         self.adapters.insert(kind, adapter);
     }
 
+    /// Register an adapter for one configured target. This is the production
+    /// form: targets of the same provider kind may use different origins,
+    /// credentials, and provider-specific sealed-plan sources. The kind-only
+    /// registration above remains the intentionally broad test seam.
+    pub fn insert_target(
+        &mut self,
+        kind: ImageAdapterKind,
+        target_id: impl Into<String>,
+        adapter: std::sync::Arc<dyn ImageGenerationAdapter>,
+    ) {
+        self.target_adapters
+            .insert((kind, target_id.into()), adapter);
+    }
+
     pub fn get(
         &self,
         kind: ImageAdapterKind,
@@ -618,12 +641,22 @@ impl ImageGenerationAdapterMap {
         self.adapters.get(&kind)
     }
 
+    pub fn get_target(
+        &self,
+        kind: ImageAdapterKind,
+        target_id: &str,
+    ) -> Option<&std::sync::Arc<dyn ImageGenerationAdapter>> {
+        self.target_adapters
+            .get(&(kind, target_id.to_owned()))
+            .or_else(|| self.get(kind))
+    }
+
     pub fn len(&self) -> usize {
-        self.adapters.len()
+        self.adapters.len() + self.target_adapters.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.adapters.is_empty()
+        self.adapters.is_empty() && self.target_adapters.is_empty()
     }
 }
 
@@ -671,7 +704,7 @@ impl CandidateDispatch for MapAdapterDispatch<'_> {
             .find(|target| target.slots.iter().any(|slot| slot.slot_id == slot_id))
             .context("scheduler candidate slot is absent from immutable plan")?;
         Ok(parse_image_adapter_kind(&target.destination.adapter_kind)
-            .and_then(|kind| self.0.get(kind))
+            .and_then(|kind| self.0.get_target(kind, &target.target_id))
             .map(std::sync::Arc::as_ref))
     }
 }
@@ -1487,7 +1520,7 @@ impl ImageGenerationDispatcher {
         let (job_id, slot_id, attempt_number, _) = dispatching.identity();
         let (provider_request_identity, provider_idempotency_identity) =
             dispatching.provider_dispatch_identity();
-        let sealed_prompt = self
+        let (owner_session_id, target_id, sealed_prompt) = self
             .db
             .read(move |conn| {
                 let (canonical, digest): (Vec<u8>, String) = conn.query_row(
@@ -1495,11 +1528,23 @@ impl ImageGenerationDispatcher {
                     [job_id.to_string()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                Ok(ImageGenerationPlanV1::from_canonical(&canonical, &digest)?.sealed_prompt)
+                let plan = ImageGenerationPlanV1::from_canonical(&canonical, &digest)?;
+                let target = plan
+                    .targets
+                    .iter()
+                    .find(|target| target.slots.iter().any(|slot| slot.slot_id == slot_id))
+                    .context("image generation handoff slot is absent from immutable plan")?;
+                Ok((
+                    plan.owner_session_id,
+                    target.target_id.clone(),
+                    plan.sealed_prompt,
+                ))
             })
             .await?;
         let request = ImageGenerationHandoffRequest {
             job_id,
+            owner_session_id,
+            target_id,
             slot_id,
             attempt_number,
             external_operation_id: dispatching.operation().operation_id,
@@ -6435,6 +6480,8 @@ mod tests {
         ]);
         let request = ImageGenerationHandoffRequest {
             job_id: Uuid::now_v7(),
+            owner_session_id: Uuid::now_v7(),
+            target_id: "fixture-target".into(),
             slot_id: Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: Uuid::now_v7(),

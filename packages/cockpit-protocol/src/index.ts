@@ -247,10 +247,14 @@ export type PromptCacheRetention = z.infer<typeof promptCacheRetentionSchema>;
 // ---------------------------------------------------------------------------
 
 /**
- * Canonical media kind, mirroring Rust `CanonicalMediaKind`.
+ * Canonical media kind, mirroring Rust `MediaKind` (the sole discriminant
+ * across storage, FCM2 message attachments, and tool-result `MediaReference`).
+ * `canonicalMediaKindSchema` is retained as a path-stability alias.
  */
-export const canonicalMediaKindSchema = z.enum(["image", "audio", "video"]);
-export type CanonicalMediaKind = z.infer<typeof canonicalMediaKindSchema>;
+export const mediaKindSchema = z.enum(["image", "audio", "video"]);
+export type MediaKind = z.infer<typeof mediaKindSchema>;
+export const canonicalMediaKindSchema = mediaKindSchema;
+export type CanonicalMediaKind = MediaKind;
 
 /**
  * Availability snapshot at recording time, mirroring Rust

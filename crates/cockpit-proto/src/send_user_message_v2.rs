@@ -21,31 +21,12 @@ pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
 const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v2\0";
 const ATTACHMENT_SET_DIGEST_DOMAIN: &[u8] = b"flycockpit-message-attachment-set-v1\0";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageAttachmentKind {
-    Image,
-    Audio,
-    Video,
-}
-
-impl MessageAttachmentKind {
-    fn code(self) -> u8 {
-        match self {
-            Self::Image => 1,
-            Self::Audio => 2,
-            Self::Video => 3,
-        }
-    }
-    fn from_code(code: u8) -> Result<Self> {
-        match code {
-            1 => Ok(Self::Image),
-            2 => Ok(Self::Audio),
-            3 => Ok(Self::Video),
-            _ => bail!("unknown attachment kind"),
-        }
-    }
-}
+/// Canonical media-kind discriminant. This is the sole kind enum across
+/// storage, FCM2, and tool-result surfaces; `MessageAttachmentKind` is a
+/// path-stability alias for [`cockpit_db::media_attachments::MediaKind`],
+/// which carries the exact FCM2 wire codes (`image=1, audio=2, video=3`) and
+/// the `snake_case` serde form shared with TypeScript.
+pub use cockpit_db::media_attachments::MediaKind as MessageAttachmentKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageAttachmentIdentity {

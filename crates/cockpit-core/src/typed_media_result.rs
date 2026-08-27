@@ -155,14 +155,11 @@ impl CanonicalToolResultContent {
     }
 }
 
-/// The media kind (image, audio, video). Mirrors the attachment-level kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CanonicalMediaKind {
-    Image,
-    Audio,
-    Video,
-}
+/// The media kind (image, audio, video). This is the sole canonical
+/// [`cockpit_db::media_attachments::MediaKind`] discriminant; the
+/// `CanonicalMediaKind` alias is retained for path stability and carries the
+/// same `snake_case` serde form and FCM2 wire codes as storage/FCM2.
+pub use cockpit_db::media_attachments::MediaKind as CanonicalMediaKind;
 
 /// The availability state of a media reference at the time it was recorded.
 /// This is a snapshot — the resolver re-checks live availability before

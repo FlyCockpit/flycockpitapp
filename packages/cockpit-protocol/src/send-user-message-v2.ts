@@ -8,7 +8,9 @@ export const FCM2_SCHEMA_VERSION = 2;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
-export type MessageAttachmentKind = "image" | "audio" | "video";
+import type { MediaKind } from "./index";
+/** Canonical media kind; sole discriminant across storage/FCM2/tool results. */
+export type MessageAttachmentKind = MediaKind;
 export interface MessageAttachmentIdentity {
   attachment_id: string;
   attachment_version: bigint;

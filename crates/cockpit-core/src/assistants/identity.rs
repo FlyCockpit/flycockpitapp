@@ -556,7 +556,8 @@ mod tests {
                 lsp: None,
                 resource_scheduler: None,
                 media_authority: None,
-                media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+                media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(
+                ),
                 config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     &home,
                 ),

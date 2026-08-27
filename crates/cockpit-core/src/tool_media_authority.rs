@@ -18,19 +18,19 @@
 //! - [`availability`] — `MediaToolAvailability` data-free tool-presence
 //!   snapshot created before `ToolCtx`.
 
-pub mod receipt;
-pub mod locator;
-pub mod seal;
-pub mod revalidator;
-pub mod session_authority;
 pub mod availability;
+pub mod locator;
+pub mod receipt;
+pub mod revalidator;
+pub mod seal;
+pub mod session_authority;
 
 // Re-export the primary public types for ergonomic access from within core.
 pub use availability::MediaToolAvailability;
 pub use receipt::ToolMediaSubjectReceiptV1;
 pub use revalidator::{RevalidatorError, ToolMediaSubjectRevalidator};
-pub use seal::{SealedLocator, SealError, UnsealedLocator};
-pub use session_authority::{AdmittedHandle, AdmissionDenial, SessionMediaAuthority};
+pub use seal::{SealError, SealedLocator, UnsealedLocator};
+pub use session_authority::{AdmissionDenial, AdmittedHandle, SessionMediaAuthority};
 
 /// The secure-key namespace used by tool-media-subject-binding sealed locators.
 pub const TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE: &str = "tool_media_subject_binding";
@@ -46,9 +46,7 @@ pub fn binding_key_reference_id(
     client_submission_hex: &str,
     key_version: i64,
 ) -> String {
-    format!(
-        "tool-media-subject-binding/{session_id}/{client_submission_hex}/{key_version}"
-    )
+    format!("tool-media-subject-binding/{session_id}/{client_submission_hex}/{key_version}")
 }
 
 /// Build the secure-key consumer id for a binding.

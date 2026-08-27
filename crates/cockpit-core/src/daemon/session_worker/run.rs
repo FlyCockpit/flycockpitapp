@@ -5004,9 +5004,9 @@ pub(super) async fn run_worker(
         // (provider, this session's workspace), never a foreign workspace's. See
         // `named-secret-ownership-boundary`.
         credential_store: session
-        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             .provider_credential_store(&start_config.providers)
             .ok(),
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     };
     let tool_surface_override = stored_tool_surface_override(&session);
     let _goal_settings_override = stored_goal_settings_override(&session);

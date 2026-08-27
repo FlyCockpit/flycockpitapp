@@ -12289,10 +12289,10 @@ impl Driver {
             // resolve a `$secret:` owned by (provider, this workspace). See
             // `named-secret-ownership-boundary`.
             credential_store: self
-            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
                 .session
                 .provider_credential_store(&self.config.providers())
                 .ok(),
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         }
     }
 

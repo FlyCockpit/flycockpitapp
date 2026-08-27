@@ -275,10 +275,10 @@ pub(crate) mod hex {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::locator::LocatorV1;
     use super::super::receipt::ToolMediaSubjectReceiptV1;
     use super::super::seal;
+    use super::*;
     use std::sync::Mutex;
 
     struct FakeKeyResolver {
@@ -310,10 +310,7 @@ mod tests {
         fn device_active(&self, _device_uuid: &[u8; 16]) -> Result<bool, RevalidatorError> {
             Ok(self.device_active)
         }
-        fn authority_active(
-            &self,
-            _principal_digest: &[u8; 32],
-        ) -> Result<bool, RevalidatorError> {
+        fn authority_active(&self, _principal_digest: &[u8; 32]) -> Result<bool, RevalidatorError> {
             Ok(self.authority_active)
         }
         fn current_epoch(
@@ -327,15 +324,7 @@ mod tests {
         }
     }
 
-    fn make_local_binding(
-        key: &[u8; 32],
-        epoch: u64,
-    ) -> (
-        Vec<u8>,
-        [u8; 24],
-        Vec<u8>,
-        [u8; 16],
-    ) {
+    fn make_local_binding(key: &[u8; 32], epoch: u64) -> (Vec<u8>, [u8; 24], Vec<u8>, [u8; 16]) {
         let locator = LocatorV1::local_owner();
         let project_uuid = [0xAB; 16];
         let project_digest = LocatorV1::project_digest(&project_uuid);
@@ -357,14 +346,18 @@ mod tests {
             &locator,
         )
         .unwrap();
-        (receipt_bytes, sealed.nonce, sealed.ciphertext, client_submission_id)
+        (
+            receipt_bytes,
+            sealed.nonce,
+            sealed.ciphertext,
+            client_submission_id,
+        )
     }
 
     #[test]
     fn revalidate_succeeds_local_owner() {
         let key = [0x42; 32];
-        let (receipt_bytes, nonce, ciphertext, submission) =
-            make_local_binding(&key, 0);
+        let (receipt_bytes, nonce, ciphertext, submission) = make_local_binding(&key, 0);
 
         let revalidator = ToolMediaSubjectRevalidator::new(
             Arc::new(FakeProjection {
@@ -395,8 +388,7 @@ mod tests {
     #[test]
     fn revalidate_fails_stale_epoch() {
         let key = [0x42; 32];
-        let (receipt_bytes, nonce, ciphertext, submission) =
-            make_local_binding(&key, 0);
+        let (receipt_bytes, nonce, ciphertext, submission) = make_local_binding(&key, 0);
 
         let revalidator = ToolMediaSubjectRevalidator::new(
             Arc::new(FakeProjection {
@@ -424,8 +416,7 @@ mod tests {
     #[test]
     fn revalidate_fails_key_unavailable() {
         let key = [0x42; 32];
-        let (receipt_bytes, nonce, ciphertext, submission) =
-            make_local_binding(&key, 0);
+        let (receipt_bytes, nonce, ciphertext, submission) = make_local_binding(&key, 0);
 
         let revalidator = ToolMediaSubjectRevalidator::new(
             Arc::new(FakeProjection {
@@ -453,8 +444,7 @@ mod tests {
     #[test]
     fn revalidate_fails_authority_inactive() {
         let key = [0x42; 32];
-        let (receipt_bytes, nonce, ciphertext, submission) =
-            make_local_binding(&key, 0);
+        let (receipt_bytes, nonce, ciphertext, submission) = make_local_binding(&key, 0);
 
         let revalidator = ToolMediaSubjectRevalidator::new(
             Arc::new(FakeProjection {
@@ -476,14 +466,16 @@ mod tests {
             1,
             &submission,
         );
-        assert!(matches!(result, Err(RevalidatorError::AuthorityStatusInvalid)));
+        assert!(matches!(
+            result,
+            Err(RevalidatorError::AuthorityStatusInvalid)
+        ));
     }
 
     #[test]
     fn revalidate_fails_tampered_receipt() {
         let key = [0x42; 32];
-        let (mut receipt_bytes, nonce, ciphertext, submission) =
-            make_local_binding(&key, 0);
+        let (mut receipt_bytes, nonce, ciphertext, submission) = make_local_binding(&key, 0);
         receipt_bytes[5] ^= 1; // tamper
 
         let revalidator = ToolMediaSubjectRevalidator::new(
@@ -512,8 +504,7 @@ mod tests {
     #[test]
     fn revalidate_fails_wrong_key() {
         let key = [0x42; 32];
-        let (receipt_bytes, nonce, ciphertext, submission) =
-            make_local_binding(&key, 0);
+        let (receipt_bytes, nonce, ciphertext, submission) = make_local_binding(&key, 0);
 
         let revalidator = ToolMediaSubjectRevalidator::new(
             Arc::new(FakeProjection {

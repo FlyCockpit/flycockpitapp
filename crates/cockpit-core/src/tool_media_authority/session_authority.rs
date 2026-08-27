@@ -163,11 +163,8 @@ pub trait LocalPathPolicy: Send + Sync {
 /// The retained-HTTPS admission policy trait.
 pub trait RetainedHttpsPolicy: Send + Sync {
     /// Fetch and retain an HTTPS source.
-    fn admit(
-        &self,
-        session_id: &str,
-        url: &str,
-    ) -> Result<AdmittedRetainedSource, AdmissionDenial>;
+    fn admit(&self, session_id: &str, url: &str)
+    -> Result<AdmittedRetainedSource, AdmissionDenial>;
 }
 
 /// `SessionMediaAuthority` — the private direct-native media authority.
@@ -228,7 +225,10 @@ impl SessionMediaAuthority {
             return Err(AdmissionDenial::SubjectMismatch);
         }
 
-        match self.attachment_resolver.resolve(session_id, attachment_id)? {
+        match self
+            .attachment_resolver
+            .resolve(session_id, attachment_id)?
+        {
             Some(att) => Ok(att),
             None => Err(AdmissionDenial::AttachmentNotFound),
         }
@@ -288,9 +288,9 @@ impl SessionMediaAuthority {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::revalidator::{RevalidatedSubject, RevalidatorError};
     use super::super::receipt::IssuerKind;
+    use super::super::revalidator::{RevalidatedSubject, RevalidatorError};
+    use super::*;
 
     struct FakeAttachmentResolver {
         attachments: std::collections::HashMap<[u8; 16], AdmittedAttachment>,
@@ -437,7 +437,8 @@ mod tests {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
         let session_hex = super::super::revalidator::hex::encode(&session_id);
-        let result = auth.admit_retained_https(&session_hex, "https://denied.example.com/image.png");
+        let result =
+            auth.admit_retained_https(&session_hex, "https://denied.example.com/image.png");
         assert!(matches!(result, Err(AdmissionDenial::HttpsDenied)));
     }
 

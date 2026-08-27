@@ -9467,7 +9467,8 @@ pub(crate) async fn run_noninteractive_resumable(
                     lock_identity: None,
                     write_scope: resolved_write_scope,
                     credential_store: session.provider_credential_store(&config.providers()).ok(),
-                    media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+                    media_availability:
+                        crate::tool_media_authority::MediaToolAvailability::unavailable(),
                 };
                 let nested_steer_target = match (agent_instance_id, steer_target.as_ref()) {
                     (Some(parent_agent_instance_id), Some(parent_target)) => {
@@ -9823,9 +9824,10 @@ pub(crate) async fn run_noninteractive_resumable(
                         lock_identity: None,
                         write_scope: resolved_write_scope,
                         credential_store: session
-                        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
                             .provider_credential_store(&config.providers())
                             .ok(),
+                        media_availability:
+                            crate::tool_media_authority::MediaToolAvailability::unavailable(),
                     };
                     let child = match crate::engine::builtin::load(&entry.child_agent, &child_args)
                     {

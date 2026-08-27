@@ -444,9 +444,7 @@ async fn fail_closed(args: Value, kind: ToolKind, ctx: &ToolCtx) -> Result<ToolO
     }
     // TODO: A/V schema, runtime execution, and output processing land in
     // the audio-video batch — not in this prompt.
-    bail!(
-        "media_attachment_authority_unavailable: A/V processing not yet wired in this build"
-    )
+    bail!("media_attachment_authority_unavailable: A/V processing not yet wired in this build")
 }
 
 macro_rules! media_tool {

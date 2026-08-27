@@ -660,9 +660,8 @@ impl Tool for ReadImageTool {
         }
 
         let authority = ctx.media_authority().unwrap();
-        let session_hex = crate::tool_media_authority::revalidator::hex::encode(
-            &authority.subject().session_id,
-        );
+        let session_hex =
+            crate::tool_media_authority::revalidator::hex::encode(&authority.subject().session_id);
 
         if let Some(path) = parsed.path.as_ref() {
             let _handle = authority

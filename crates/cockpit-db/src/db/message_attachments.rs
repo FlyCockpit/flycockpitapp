@@ -48,7 +48,8 @@ pub struct AcceptMessageInput {
     /// Optional tool-media-subject binding to insert atomically with the
     /// accepted message. Core owns receipt/seal encoding and passes the
     /// opaque byte DTO through here.
-    pub tool_media_subject_binding: Option<crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1>,
+    pub tool_media_subject_binding:
+        Option<crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

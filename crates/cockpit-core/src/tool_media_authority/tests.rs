@@ -17,7 +17,7 @@ use super::availability::MediaToolAvailability;
 use super::locator::LocatorV1;
 use super::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
 use super::revalidator::{
-    LocalOnlyProjection, RevalidatedSubject, RevalidatorError, RemoteStatusProjection,
+    LocalOnlyProjection, RemoteStatusProjection, RevalidatedSubject, RevalidatorError,
     SecureKeyResolver, ToolMediaSubjectRevalidator,
 };
 use super::seal;
@@ -59,10 +59,7 @@ impl RemoteStatusProjection for FakeProjection {
     fn device_active(&self, _device_uuid: &[u8; 16]) -> Result<bool, RevalidatorError> {
         Ok(self.device_active)
     }
-    fn authority_active(
-        &self,
-        _principal_digest: &[u8; 32],
-    ) -> Result<bool, RevalidatorError> {
+    fn authority_active(&self, _principal_digest: &[u8; 32]) -> Result<bool, RevalidatorError> {
         Ok(self.authority_active)
     }
     fn current_epoch(
@@ -81,12 +78,7 @@ fn make_sealed_local_binding(
     epoch: u64,
     session_id: [u8; 16],
     client_submission_id: [u8; 16],
-) -> (
-    ToolMediaSubjectReceiptV1,
-    Vec<u8>,
-    [u8; 24],
-    Vec<u8>,
-) {
+) -> (ToolMediaSubjectReceiptV1, Vec<u8>, [u8; 24], Vec<u8>) {
     let locator = LocatorV1::local_owner();
     let project_uuid = [0xAB; 16];
     let project_digest = LocatorV1::project_digest(&project_uuid);
@@ -116,12 +108,7 @@ fn make_sealed_remote_binding(
     device_generation: u64,
     session_id: [u8; 16],
     client_submission_id: [u8; 16],
-) -> (
-    ToolMediaSubjectReceiptV1,
-    Vec<u8>,
-    [u8; 24],
-    Vec<u8>,
-) {
+) -> (ToolMediaSubjectReceiptV1, Vec<u8>, [u8; 24], Vec<u8>) {
     let locator = LocatorV1::remote_device(device_uuid, device_generation);
     let project_uuid = [0xAB; 16];
     let project_digest = LocatorV1::project_digest(&project_uuid);
@@ -144,10 +131,7 @@ fn make_sealed_remote_binding(
     (receipt, receipt_bytes, sealed.nonce, sealed.ciphertext)
 }
 
-fn make_revalidator(
-    key: &[u8; 32],
-    projection: FakeProjection,
-) -> ToolMediaSubjectRevalidator {
+fn make_revalidator(key: &[u8; 32], projection: FakeProjection) -> ToolMediaSubjectRevalidator {
     ToolMediaSubjectRevalidator::new(
         Arc::new(projection),
         Arc::new(FakeKeyResolver {
@@ -193,10 +177,24 @@ fn tool_media_subject_binding_replay_and_propagation() {
     );
 
     let subject_a = revalidator
-        .revalidate(&bytes_a, &nonce_a, &ct_a, "tool_media_subject_binding", 1, &submission_a)
+        .revalidate(
+            &bytes_a,
+            &nonce_a,
+            &ct_a,
+            "tool_media_subject_binding",
+            1,
+            &submission_a,
+        )
         .unwrap();
     let subject_b = revalidator
-        .revalidate(&bytes_b, &nonce_b, &ct_b, "tool_media_subject_binding", 1, &submission_b)
+        .revalidate(
+            &bytes_b,
+            &nonce_b,
+            &ct_b,
+            "tool_media_subject_binding",
+            1,
+            &submission_b,
+        )
         .unwrap();
 
     // Both subjects are byte-identical in receipt.
@@ -214,7 +212,12 @@ fn tool_media_subject_binding_replay_and_propagation() {
         },
     );
     let result = bad_revalidator.revalidate(
-        &bytes_a, &nonce_a, &ct_a, "tool_media_subject_binding", 1, &submission_a,
+        &bytes_a,
+        &nonce_a,
+        &ct_a,
+        "tool_media_subject_binding",
+        1,
+        &submission_a,
     );
     assert!(
         matches!(result, Err(RevalidatorError::Unseal(_))),
@@ -231,7 +234,12 @@ fn tool_media_subject_binding_replay_and_propagation() {
         },
     );
     let result = stale_revalidator.revalidate(
-        &bytes_a, &nonce_a, &ct_a, "tool_media_subject_binding", 1, &submission_a,
+        &bytes_a,
+        &nonce_a,
+        &ct_a,
+        "tool_media_subject_binding",
+        1,
+        &submission_a,
     );
     assert!(
         matches!(result, Err(RevalidatorError::StaleEpoch { .. })),
@@ -248,7 +256,12 @@ fn tool_media_subject_binding_replay_and_propagation() {
         },
     );
     let result = inactive_revalidator.revalidate(
-        &bytes_a, &nonce_a, &ct_a, "tool_media_subject_binding", 1, &submission_a,
+        &bytes_a,
+        &nonce_a,
+        &ct_a,
+        "tool_media_subject_binding",
+        1,
+        &submission_a,
     );
     assert!(
         matches!(result, Err(RevalidatorError::AuthorityStatusInvalid)),
@@ -268,7 +281,12 @@ fn tool_media_subject_binding_replay_and_propagation() {
         }),
     );
     let result = nokey_revalidator.revalidate(
-        &bytes_a, &nonce_a, &ct_a, "tool_media_subject_binding", 1, &submission_a,
+        &bytes_a,
+        &nonce_a,
+        &ct_a,
+        "tool_media_subject_binding",
+        1,
+        &submission_a,
     );
     assert!(
         matches!(result, Err(RevalidatorError::KeyUnavailable)),
@@ -302,14 +320,18 @@ fn tool_media_secure_key_lifecycle() {
     let composite = helpers::CompositeProbe::new(external, probe);
 
     // tool_media_subject_binding kind → routed to the probe (exists).
-    assert!(composite
-        .consumer_exists("tool_media_subject_binding", "session/sub")
-        .unwrap());
+    assert!(
+        composite
+            .consumer_exists("tool_media_subject_binding", "session/sub")
+            .unwrap()
+    );
 
     // external_journal_spool kind → routed to external (fail closed).
-    assert!(composite
-        .consumer_exists("external_journal_spool", "v5")
-        .is_err());
+    assert!(
+        composite
+            .consumer_exists("external_journal_spool", "v5")
+            .is_err()
+    );
 
     // Unknown kind → fail closed.
     assert!(composite.consumer_exists("unknown_kind", "id").is_err());
@@ -334,20 +356,12 @@ fn tool_media_mixed_principal_fold() {
     let submission_c = [0x03; 16];
 
     // Same binding (same receipt) for a and b.
-    let (_, bytes_a, nonce_a, ct_a) =
-        make_sealed_local_binding(&key, 0, session_id, submission_a);
-    let (_, bytes_b, nonce_b, ct_b) =
-        make_sealed_local_binding(&key, 0, session_id, submission_b);
+    let (_, bytes_a, nonce_a, ct_a) = make_sealed_local_binding(&key, 0, session_id, submission_a);
+    let (_, bytes_b, nonce_b, ct_b) = make_sealed_local_binding(&key, 0, session_id, submission_b);
 
     // Mixed issuer: c is a remote device.
-    let (_, bytes_c, nonce_c, ct_c) = make_sealed_remote_binding(
-        &key,
-        0,
-        [0xFF; 16],
-        1,
-        session_id,
-        submission_c,
-    );
+    let (_, bytes_c, nonce_c, ct_c) =
+        make_sealed_remote_binding(&key, 0, [0xFF; 16], 1, session_id, submission_c);
 
     let revalidator = make_revalidator(
         &key,
@@ -361,17 +375,38 @@ fn tool_media_mixed_principal_fold() {
     // a and b have byte-identical canonical receipts → same valid set.
     assert_eq!(bytes_a, bytes_b);
     let subject_a = revalidator
-        .revalidate(&bytes_a, &nonce_a, &ct_a, "tool_media_subject_binding", 1, &submission_a)
+        .revalidate(
+            &bytes_a,
+            &nonce_a,
+            &ct_a,
+            "tool_media_subject_binding",
+            1,
+            &submission_a,
+        )
         .unwrap();
     let subject_b = revalidator
-        .revalidate(&bytes_b, &nonce_b, &ct_b, "tool_media_subject_binding", 1, &submission_b)
+        .revalidate(
+            &bytes_b,
+            &nonce_b,
+            &ct_b,
+            "tool_media_subject_binding",
+            1,
+            &submission_b,
+        )
         .unwrap();
     assert_eq!(subject_a.receipt, subject_b.receipt);
 
     // c has a different issuer → mixed principal fold. Only the same valid
     // set (a, b) receives authority; c is a different subject.
     let subject_c = revalidator
-        .revalidate(&bytes_c, &nonce_c, &ct_c, "tool_media_subject_binding", 1, &submission_c)
+        .revalidate(
+            &bytes_c,
+            &nonce_c,
+            &ct_c,
+            "tool_media_subject_binding",
+            1,
+            &submission_c,
+        )
         .unwrap();
     assert_ne!(
         subject_a.receipt, subject_c.receipt,
@@ -382,7 +417,12 @@ fn tool_media_mixed_principal_fold() {
     let mut tampered = bytes_a.clone();
     tampered[5] ^= 1;
     let result = revalidator.revalidate(
-        &tampered, &nonce_a, &ct_a, "tool_media_subject_binding", 1, &submission_a,
+        &tampered,
+        &nonce_a,
+        &ct_a,
+        "tool_media_subject_binding",
+        1,
+        &submission_a,
     );
     assert!(
         result.is_err(),
@@ -399,7 +439,12 @@ fn tool_media_mixed_principal_fold() {
         },
     );
     let result = stale.revalidate(
-        &bytes_a, &nonce_a, &ct_a, "tool_media_subject_binding", 1, &submission_a,
+        &bytes_a,
+        &nonce_a,
+        &ct_a,
+        "tool_media_subject_binding",
+        1,
+        &submission_a,
     );
     assert!(
         matches!(result, Err(RevalidatorError::StaleEpoch { .. })),
@@ -416,7 +461,12 @@ fn tool_media_mixed_principal_fold() {
         },
     );
     let result = recovered.revalidate(
-        &bytes_a, &nonce_a, &ct_a, "tool_media_subject_binding", 1, &submission_a,
+        &bytes_a,
+        &nonce_a,
+        &ct_a,
+        "tool_media_subject_binding",
+        1,
+        &submission_a,
     );
     assert!(
         result.is_ok(),
@@ -452,7 +502,8 @@ impl LocalPathPolicy for FakeLocalPathPolicy {
         &self,
         _session_id: &str,
         path: &str,
-    ) -> Result<(std::path::PathBuf, super::session_authority::HandleEvidence), AdmissionDenial> {
+    ) -> Result<(std::path::PathBuf, super::session_authority::HandleEvidence), AdmissionDenial>
+    {
         if path.contains("denied") {
             return Err(AdmissionDenial::LocalPathDenied);
         }
@@ -537,7 +588,9 @@ fn tool_media_source_authority() {
     assert!(matches!(result, Err(AdmissionDenial::AttachmentNotFound)));
 
     // Local path admission — exact canonical authorization.
-    let handle = auth.admit_local_path(&session_hex, "/tmp/image.png").unwrap();
+    let handle = auth
+        .admit_local_path(&session_hex, "/tmp/image.png")
+        .unwrap();
     assert_eq!(
         handle.canonical_path(),
         &std::path::PathBuf::from("/tmp/image.png")
@@ -605,7 +658,11 @@ fn tool_media_context_stripping() {
     assert!(omitted.contains(&"transcribe_audio"));
 
     // 4. When available, no tools are omitted.
-    assert!(MediaToolAvailability::available().omitted_tool_names().is_empty());
+    assert!(
+        MediaToolAvailability::available()
+            .omitted_tool_names()
+            .is_empty()
+    );
 
     // 5. The media tool names are absent from MCP/Monty registries even
     // when direct-native tools are enabled. This is enforced structurally:
@@ -620,10 +677,7 @@ fn tool_media_context_stripping() {
         // from MCP/Monty paths. The structural guarantee is that
         // HostContext::from_tool_ctx strips media_authority, so even if a
         // media tool were reachable, it would fail closed.
-        assert!(
-            !media_name.is_empty(),
-            "media tool name must be non-empty"
-        );
+        assert!(!media_name.is_empty(), "media tool name must be non-empty");
     }
 
     // 6. HostContext::empty_for_tests() has no native_tool_ctx with media
@@ -672,13 +726,9 @@ fn media_tool_availability_materialization() {
     // LocalOnlyProjection is the local-only launch scope default.
     let projection = LocalOnlyProjection;
     // Remote devices are not active in local-only scope.
-    assert!(!projection
-        .device_active(&[0xFF; 16])
-        .unwrap());
+    assert!(!projection.device_active(&[0xFF; 16]).unwrap());
     // Local owner authority is active.
-    assert!(projection
-        .authority_active(&[0x11; 32])
-        .unwrap());
+    assert!(projection.authority_active(&[0x11; 32]).unwrap());
     // Epoch is 0 for local owners.
     assert_eq!(
         projection

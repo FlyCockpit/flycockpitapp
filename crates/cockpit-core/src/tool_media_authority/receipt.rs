@@ -118,32 +118,37 @@ impl ToolMediaSubjectReceiptV1 {
         if bytes[0] != RECEIPT_VERSION {
             return Err(ReceiptDecodeError::Version(bytes[0]));
         }
-        let issuer_kind = IssuerKind::from_u8(bytes[1]).ok_or(ReceiptDecodeError::Issuer(bytes[1]))?;
-        let principal_digest: [u8; 32] = bytes[2..34]
-            .try_into()
-            .map_err(|_| ReceiptDecodeError::Length {
-                expected: CANONICAL_LEN,
-                actual: bytes.len(),
-            })?;
-        let project_digest: [u8; 32] = bytes[34..66]
-            .try_into()
-            .map_err(|_| ReceiptDecodeError::Length {
-                expected: CANONICAL_LEN,
-                actual: bytes.len(),
-            })?;
-        let session_id: [u8; 16] = bytes[66..82]
-            .try_into()
-            .map_err(|_| ReceiptDecodeError::Length {
-                expected: CANONICAL_LEN,
-                actual: bytes.len(),
-            })?;
+        let issuer_kind =
+            IssuerKind::from_u8(bytes[1]).ok_or(ReceiptDecodeError::Issuer(bytes[1]))?;
+        let principal_digest: [u8; 32] =
+            bytes[2..34]
+                .try_into()
+                .map_err(|_| ReceiptDecodeError::Length {
+                    expected: CANONICAL_LEN,
+                    actual: bytes.len(),
+                })?;
+        let project_digest: [u8; 32] =
+            bytes[34..66]
+                .try_into()
+                .map_err(|_| ReceiptDecodeError::Length {
+                    expected: CANONICAL_LEN,
+                    actual: bytes.len(),
+                })?;
+        let session_id: [u8; 16] =
+            bytes[66..82]
+                .try_into()
+                .map_err(|_| ReceiptDecodeError::Length {
+                    expected: CANONICAL_LEN,
+                    actual: bytes.len(),
+                })?;
         let authorization_epoch = u64::from_be_bytes(bytes[82..90].try_into().unwrap());
-        let subject_digest: [u8; 32] = bytes[90..122]
-            .try_into()
-            .map_err(|_| ReceiptDecodeError::Length {
-                expected: CANONICAL_LEN,
-                actual: bytes.len(),
-            })?;
+        let subject_digest: [u8; 32] =
+            bytes[90..122]
+                .try_into()
+                .map_err(|_| ReceiptDecodeError::Length {
+                    expected: CANONICAL_LEN,
+                    actual: bytes.len(),
+                })?;
 
         let preceding = &bytes[..90];
         let expected = subject_digest(preceding);

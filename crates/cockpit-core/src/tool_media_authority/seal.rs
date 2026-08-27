@@ -176,10 +176,7 @@ pub fn unseal_locator(
 
     let cipher = XChaCha20Poly1305::new(derived.as_ref().into());
     let plaintext = cipher
-        .decrypt(
-            &sealed.nonce.into(),
-            aead_payload(&sealed.ciphertext, &aad),
-        )
+        .decrypt(&sealed.nonce.into(), aead_payload(&sealed.ciphertext, &aad))
         .map_err(|_| SealError::Decrypt)?;
 
     // Reconstruct the locator from decrypted bytes.
@@ -193,9 +190,7 @@ fn reconstruct_locator(bytes: &[u8]) -> Result<LocatorV1, SealError> {
         return Ok(LocatorV1::local_owner());
     }
     if bytes.len() == 25 && bytes[0] == 2 {
-        let device_uuid: [u8; 16] = bytes[1..17]
-            .try_into()
-            .map_err(|_| SealError::Decrypt)?;
+        let device_uuid: [u8; 16] = bytes[1..17].try_into().map_err(|_| SealError::Decrypt)?;
         let device_generation = u64::from_be_bytes(bytes[17..25].try_into().unwrap());
         return Ok(LocatorV1::remote_device(device_uuid, device_generation));
     }
@@ -209,9 +204,9 @@ fn aead_payload<'a>(msg: &'a [u8], aad: &'a [u8]) -> Payload<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::locator::LocatorV1;
     use super::super::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
+    use super::*;
 
     fn make_receipt(locator: &LocatorV1) -> (ToolMediaSubjectReceiptV1, [u8; 16], [u8; 16]) {
         let project_uuid = [0xAB; 16];

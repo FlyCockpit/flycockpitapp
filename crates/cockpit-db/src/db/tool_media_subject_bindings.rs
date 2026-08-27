@@ -122,10 +122,8 @@ impl Db {
         client_submission_id: [u8; 16],
     ) -> Result<Option<ToolMediaSubjectBindingRowV1>> {
         let session = session_id.to_string();
-        self.read(move |conn| {
-            load_binding_conn(conn, &session, &client_submission_id)
-        })
-        .await
+        self.read(move |conn| load_binding_conn(conn, &session, &client_submission_id))
+            .await
     }
 
     /// Load all bindings for a session (used in queue recovery).
@@ -151,17 +149,27 @@ impl Db {
                 let nonce: Vec<u8> = row.get(11)?;
                 Ok(ToolMediaSubjectBindingRowV1 {
                     session_id: row.get(0)?,
-                    client_submission_id: submission.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    client_submission_id: submission
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     receipt_version: row.get(2)?,
                     issuer_kind: row.get(3)?,
-                    principal_digest: principal.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    project_digest: project.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    principal_digest: principal
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    project_digest: project
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     authorization_epoch: row.get(6)?,
-                    subject_digest: subject.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    subject_digest: subject
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     seal_version: row.get(8)?,
                     key_namespace: row.get(9)?,
                     key_version: row.get(10)?,
-                    nonce: nonce.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    nonce: nonce
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     ciphertext: row.get(12)?,
                     secure_key_reference_id: row.get(13)?,
                     receipt_bytes: Vec::new(), // loaded separately if needed
@@ -169,7 +177,8 @@ impl Db {
                     updated_at: row.get(15)?,
                 })
             })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
         })
         .await
     }
@@ -184,15 +193,23 @@ impl Db {
     ) -> Result<Option<i64>> {
         let session = session_id.to_string();
         self.read(move |conn| {
-            let epoch: Option<i64> = conn.query_row(
-                "SELECT epoch FROM tool_media_authorization_epochs
+            let epoch: Option<i64> = conn
+                .query_row(
+                    "SELECT epoch FROM tool_media_authorization_epochs
                  WHERE issuer_kind = ?1 AND principal_digest = ?2
                    AND session_id = ?3 AND project_digest = ?4",
-                params![issuer_kind, principal_digest.as_slice(), session, project_digest.as_slice()],
-                |row| row.get(0),
-            ).optional()?;
+                    params![
+                        issuer_kind,
+                        principal_digest.as_slice(),
+                        session,
+                        project_digest.as_slice()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
             Ok(epoch)
-        }).await
+        })
+        .await
     }
 
     /// Increment the authorization epoch for a key tuple inside the caller's
@@ -209,13 +226,20 @@ impl Db {
             issuer_kind == 1 || issuer_kind == 2,
             "issuer_kind must be 1 or 2"
         );
-        let existing: Option<i64> = conn.query_row(
-            "SELECT epoch FROM tool_media_authorization_epochs
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT epoch FROM tool_media_authorization_epochs
              WHERE issuer_kind = ?1 AND principal_digest = ?2
                AND session_id = ?3 AND project_digest = ?4",
-            params![issuer_kind, principal_digest.as_slice(), session_id, project_digest.as_slice()],
-            |row| row.get(0),
-        ).optional()?;
+                params![
+                    issuer_kind,
+                    principal_digest.as_slice(),
+                    session_id,
+                    project_digest.as_slice()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
 
         let new_epoch = match existing {
             Some(e) => e + 1,
@@ -340,50 +364,53 @@ fn load_binding_conn(
     session: &str,
     client_submission_id: &[u8; 16],
 ) -> Result<Option<ToolMediaSubjectBindingRowV1>> {
-    let row = conn.query_row(
-        "SELECT session_id, client_submission_id, receipt_version, issuer_kind,
+    let row = conn
+        .query_row(
+            "SELECT session_id, client_submission_id, receipt_version, issuer_kind,
                 principal_digest, project_digest, authorization_epoch,
                 subject_digest, seal_version, key_namespace, key_version,
                 nonce, ciphertext, secure_key_reference_id, created_at, updated_at
          FROM message_tool_media_subject_bindings
          WHERE session_id = ?1 AND client_submission_id = ?2",
-        params![session, client_submission_id.as_slice()],
-        |row| {
-            let submission: Vec<u8> = row.get(1)?;
-            let principal: Vec<u8> = row.get(4)?;
-            let project: Vec<u8> = row.get(5)?;
-            let subject: Vec<u8> = row.get(7)?;
-            let nonce: Vec<u8> = row.get(11)?;
-            Ok(ToolMediaSubjectBindingRowV1 {
-                session_id: row.get(0)?,
-                client_submission_id: submission
-                    .try_into()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                receipt_version: row.get(2)?,
-                issuer_kind: row.get(3)?,
-                principal_digest: principal
-                    .try_into()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                project_digest: project
-                    .try_into()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                authorization_epoch: row.get(6)?,
-                subject_digest: subject
-                    .try_into()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                seal_version: row.get(8)?,
-                key_namespace: row.get(9)?,
-                key_version: row.get(10)?,
-                nonce: nonce.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
-                ciphertext: row.get(12)?,
-                secure_key_reference_id: row.get(13)?,
-                receipt_bytes: Vec::new(),
-                created_at: row.get(14)?,
-                updated_at: row.get(15)?,
-            })
-        },
-    )
-    .optional()?;
+            params![session, client_submission_id.as_slice()],
+            |row| {
+                let submission: Vec<u8> = row.get(1)?;
+                let principal: Vec<u8> = row.get(4)?;
+                let project: Vec<u8> = row.get(5)?;
+                let subject: Vec<u8> = row.get(7)?;
+                let nonce: Vec<u8> = row.get(11)?;
+                Ok(ToolMediaSubjectBindingRowV1 {
+                    session_id: row.get(0)?,
+                    client_submission_id: submission
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    receipt_version: row.get(2)?,
+                    issuer_kind: row.get(3)?,
+                    principal_digest: principal
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    project_digest: project
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    authorization_epoch: row.get(6)?,
+                    subject_digest: subject
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    seal_version: row.get(8)?,
+                    key_namespace: row.get(9)?,
+                    key_version: row.get(10)?,
+                    nonce: nonce
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    ciphertext: row.get(12)?,
+                    secure_key_reference_id: row.get(13)?,
+                    receipt_bytes: Vec::new(),
+                    created_at: row.get(14)?,
+                    updated_at: row.get(15)?,
+                })
+            },
+        )
+        .optional()?;
     Ok(row)
 }
 
@@ -499,17 +526,16 @@ mod tests {
             key_version: 1,
             nonce: [0xDD; 24],
             ciphertext: vec![0xEE; 48],
-            secure_key_reference_id: "tool-media-subject-binding/test/05050505050505050505050505050505/1".to_string(),
+            secure_key_reference_id:
+                "tool-media-subject-binding/test/05050505050505050505050505050505/1".to_string(),
             receipt_bytes: vec![0xFF; 122],
             now_ms: 20,
             tool_media_subject_binding: None,
         };
 
-        db.transaction(|conn| {
-            Db::insert_tool_media_subject_binding_conn(conn, &insert)
-        })
-        .await
-        .unwrap();
+        db.transaction(|conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
+            .await
+            .unwrap();
 
         // Load it back.
         let row = db
@@ -538,7 +564,7 @@ mod tests {
             actor: crate::db::message_attachments::MessageActor::LocalOwner,
             request_hash: [2; 32],
             message_request_digest: [3; 32],
-            attachment_set_digest: [4;  32],
+            attachment_set_digest: [4; 32],
             client_submission_id: [7; 16],
             queue_item_id: [8; 16],
             canonical_message: b"FCM2\x02".to_vec(),
@@ -577,17 +603,16 @@ mod tests {
             key_version: 1,
             nonce: [0xDD; 24],
             ciphertext: vec![0xEE; 48],
-            secure_key_reference_id: "tool-media-subject-binding/test/07070707070707070707070707070707/1".to_string(),
+            secure_key_reference_id:
+                "tool-media-subject-binding/test/07070707070707070707070707070707/1".to_string(),
             receipt_bytes: vec![0xFF; 122],
             now_ms: 20,
             tool_media_subject_binding: None,
         };
 
-        db.transaction(|conn| {
-            Db::insert_tool_media_subject_binding_conn(conn, &insert)
-        })
-        .await
-        .unwrap();
+        db.transaction(|conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
+            .await
+            .unwrap();
 
         // Verify binding exists.
         let row = db
@@ -678,9 +703,7 @@ mod tests {
         };
 
         let result = db
-            .transaction(|conn| {
-                Db::insert_tool_media_subject_binding_conn(conn, &insert)
-            })
+            .transaction(|conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
             .await;
         assert!(result.is_err());
 
@@ -688,9 +711,7 @@ mod tests {
         insert.receipt_version = 1;
         insert.issuer_kind = 3; // invalid
         let result = db
-            .transaction(|conn| {
-                Db::insert_tool_media_subject_binding_conn(conn, &insert)
-            })
+            .transaction(|conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
             .await;
         assert!(result.is_err());
     }

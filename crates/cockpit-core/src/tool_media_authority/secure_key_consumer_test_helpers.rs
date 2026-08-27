@@ -46,13 +46,14 @@ pub struct CompositeProbe<A: ConsumerReconciler, B: ConsumerReconciler> {
 
 impl<A: ConsumerReconciler, B: ConsumerReconciler> CompositeProbe<A, B> {
     pub fn new(external: A, tool_media: B) -> Self {
-        Self { external, tool_media }
+        Self {
+            external,
+            tool_media,
+        }
     }
 }
 
-impl<A: ConsumerReconciler, B: ConsumerReconciler> ConsumerReconciler
-    for CompositeProbe<A, B>
-{
+impl<A: ConsumerReconciler, B: ConsumerReconciler> ConsumerReconciler for CompositeProbe<A, B> {
     fn consumer_exists(&self, kind: &str, id: &str) -> Result<bool, SecureKeyError> {
         match kind {
             crate::tool_media_authority::TOOL_MEDIA_SUBJECT_BINDING_CONSUMER_KIND => {

@@ -2696,31 +2696,44 @@ fn source_snapshot_parts(
     name: &str,
 ) -> Result<(AgentSourceLayer, String, String, bool), ErrorPayload> {
     let project_override = project_agent_path(root, name)?;
-    let target_exists = nofollow_read(&project_override)?.is_some();
+    let write_target = project_agent_write_path(root, name)?;
+    let target_exists = nofollow_read(&project_override)?.is_some()
+        || nofollow_read(&write_target)?.is_some();
     match crate::agents::find_override(root, name) {
         Some(source) => {
-            if std::fs::symlink_metadata(&source)
-                .map_err(internal)?
-                .file_type()
-                .is_dir()
-            {
-                return Err(bad_request(
-                    "directory-form agents are read-only in the settings editor",
-                ));
+            let meta = std::fs::symlink_metadata(&source).map_err(internal)?;
+            if meta.file_type().is_symlink() {
+                return Err(conflict("agent source became a symlink while snapshotting"));
             }
-            let raw = nofollow_read(&source)?.ok_or_else(|| {
-                conflict("agent source changed while the snapshot was being acquired")
-            })?;
-            if raw.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES {
+            let (markdown, identity_bytes) = if meta.file_type().is_dir() {
+                let def = crate::agents::resolve(root, name)
+                    .map_err(bad_config)?
+                    .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?;
+                let markdown = match def.package_files.as_ref().and_then(|files| {
+                    files.get("agent.md").cloned()
+                }) {
+                    Some(bytes) => String::from_utf8(bytes)
+                        .map_err(|_| bad_request("agent definition is not valid UTF-8"))?,
+                    None => def.to_markdown().map_err(bad_config)?,
+                };
+                let identity_bytes = def.vnext_digest_bytes().map_err(bad_config)?;
+                (markdown, identity_bytes)
+            } else {
+                let raw = nofollow_read(&source)?.ok_or_else(|| {
+                    conflict("agent source changed while the snapshot was being acquired")
+                })?;
+                let markdown = String::from_utf8(raw.clone())
+                    .map_err(|_| bad_request("agent definition is not valid UTF-8"))?;
+                (markdown, raw)
+            };
+            if markdown.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES {
                 return Err(bad_request(format!(
                     "agent definition exceeds the {}-byte local editor limit",
                     cockpit_proto::MAX_AGENT_MARKDOWN_BYTES
                 )));
             }
-            let markdown = String::from_utf8(raw)
-                .map_err(|_| bad_request("agent definition is not valid UTF-8"))?;
             let layer = classify_source_layer(root, &source, &project_override);
-            let identity = opaque_source_identity(root, &source, layer, markdown.as_bytes())?;
+            let identity = opaque_source_identity(root, &source, layer, &identity_bytes)?;
             Ok((layer, identity, markdown, target_exists))
         }
         None => {
@@ -2801,7 +2814,7 @@ fn mutate_sync_locked(
                 crate::agents::parse_agent(&markdown, &name, PathBuf::from("<daemon-agent-edit>"))
                     .map_err(bad_config)?;
             crate::agents::validate_invariants(&parsed).map_err(bad_config)?;
-            let target = project_agent_path(root, &name)?;
+            let target = project_agent_write_path(root, &name)?;
             std::fs::create_dir_all(target.parent().expect("agent path has parent"))
                 .map_err(internal)?;
             let old = nofollow_read(&target)?;
@@ -2856,12 +2869,19 @@ fn mutate_sync_locked(
                 return Err(conflict("custom agent is not owned by the workspace layer"));
             }
             let target = project_agent_path(root, &name)?;
-            if !target.is_file() {
+            let package_dir = target
+                .parent()
+                .map(|parent| parent.join(&name))
+                .filter(|dir| dir.is_dir());
+            if let Some(dir) = package_dir {
+                std::fs::remove_dir_all(&dir).map_err(internal)?;
+            } else if target.is_file() {
+                cockpit_config::config::remove_config_file_atomic(&target).map_err(internal)?;
+            } else {
                 return Err(bad_request(
                     "custom agent is not owned by this workspace layer",
                 ));
             }
-            cockpit_config::config::remove_config_file_atomic(&target).map_err(internal)?;
             (true, 1, None)
         }
         AgentMutation::ResetBuiltin { name } => {
@@ -3022,6 +3042,26 @@ fn project_agent_path(root: &Path, name: &str) -> Result<PathBuf, ErrorPayload> 
     )
 }
 
+/// Write target for a workspace mutation: `agents/<name>/agent.md` when a
+/// package already exists, otherwise the single-file `agents/<name>.md`.
+fn project_agent_write_path(root: &Path, name: &str) -> Result<PathBuf, ErrorPayload> {
+    validate_name(name)?;
+    let package_dir_rel = format!(".cockpit/agents/{name}");
+    if let Ok(dir) = crate::daemon::fs_api::resolve_authorized_canonical_path(
+        root.to_string_lossy().as_ref(),
+        &package_dir_rel,
+        crate::daemon::fs_api::AuthorizedCanonicalPathMode::WriteTarget,
+    ) && dir.is_dir()
+    {
+        return crate::daemon::fs_api::resolve_authorized_canonical_path(
+            root.to_string_lossy().as_ref(),
+            &format!(".cockpit/agents/{name}/agent.md"),
+            crate::daemon::fs_api::AuthorizedCanonicalPathMode::WriteTarget,
+        );
+    }
+    project_agent_path(root, name)
+}
+
 fn validate_name(name: &str) -> Result<(), ErrorPayload> {
     if name.is_empty()
         || name.len() > cockpit_proto::MAX_AGENT_NAME_BYTES
@@ -3042,6 +3082,18 @@ fn nofollow_read(path: &Path) -> Result<Option<Vec<u8>>, ErrorPayload> {
 
 fn classify_source_layer(root: &Path, source: &Path, target: &Path) -> AgentSourceLayer {
     if source == target {
+        return AgentSourceLayer::Workspace;
+    }
+    // A workspace package lives at `.cockpit/agents/<name>/` while the
+    // historical write target is `.cockpit/agents/<name>.md`. Treat the
+    // package directory (or its `agent.md`) as workspace-owned.
+    if source.is_dir() {
+        if source.join("agent.md") == target || source.parent() == target.parent() {
+            return AgentSourceLayer::Workspace;
+        }
+    } else if source.file_name().and_then(|n| n.to_str()) == Some("agent.md")
+        && source.parent().is_some_and(|parent| parent.parent() == target.parent())
+    {
         return AgentSourceLayer::Workspace;
     }
     // Flat definitions are owned by their exact parent directory. Prefix

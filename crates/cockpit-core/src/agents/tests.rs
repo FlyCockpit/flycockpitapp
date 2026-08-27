@@ -700,6 +700,8 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         vnext: None,
         prompt: "body".into(),
         prompt_overrides: std::collections::BTreeMap::new(),
+        package_files: None,
+        private_subagents: std::collections::BTreeMap::new(),
         source: "x.md".into(),
     }
 }
@@ -1985,4 +1987,155 @@ fn agent_def_digest_changes_iff_posture_fields_change() {
     let reparsed = parse_agent(&markdown, "custom", "custom.md".into())
         .expect("canonical vNext posture fields reparse");
     assert_eq!(reparsed.context_policy, with_policy.context_policy);
+}
+
+#[test]
+fn single_file_vnext_digest_bytes_are_to_markdown_preimage() {
+    // Existing installations must not flip to rebind_required: a single-file
+    // def's digest preimage stays byte-identical to to_markdown().
+    let def = parse_agent(
+        &vnext_agent_document("Reviewer", "body"),
+        "reviewer",
+        "reviewer.md".into(),
+    )
+    .unwrap();
+    assert!(def.package_files.is_none());
+    assert_eq!(
+        def.vnext_digest_bytes().unwrap(),
+        def.to_markdown().unwrap().into_bytes()
+    );
+}
+
+#[test]
+fn package_digest_changes_iff_any_tree_file_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    let pkg = agents.join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    fs::write(
+        pkg.join("agent.md"),
+        vnext_agent_document("Package root", "ROOT BODY"),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        vnext_agent_document("Helper", "HELPER BODY"),
+    )
+    .unwrap();
+    fs::write(pkg.join("mcp.json"), "{\"mcpServers\":{}}").unwrap();
+
+    let def = trusted_resolve(tmp.path(), "pack")
+        .unwrap()
+        .expect("package resolves");
+    assert!(def.is_package());
+    assert_eq!(def.prompt, "ROOT BODY");
+    assert_eq!(def.private_subagents.len(), 1);
+    assert_eq!(
+        def.private_subagents["helper"].prompt, "HELPER BODY",
+        "private subagent body is loaded"
+    );
+    let digest = def.vnext_digest_bytes().unwrap();
+    assert_ne!(
+        digest,
+        def.to_markdown().unwrap().into_bytes(),
+        "package digest is whole-tree, not the root markdown alone"
+    );
+
+    fs::write(pkg.join("mcp.json"), "{\"mcpServers\":{\"x\":{}}}").unwrap();
+    let after_mcp = trusted_resolve(tmp.path(), "pack")
+        .unwrap()
+        .expect("package resolves");
+    assert_ne!(
+        digest,
+        after_mcp.vnext_digest_bytes().unwrap(),
+        "mcp.json participates in the package digest"
+    );
+
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        vnext_agent_document("Helper", "CHANGED HELPER"),
+    )
+    .unwrap();
+    let after_child = trusted_resolve(tmp.path(), "pack")
+        .unwrap()
+        .expect("package resolves");
+    assert_ne!(
+        after_mcp.vnext_digest_bytes().unwrap(),
+        after_child.vnext_digest_bytes().unwrap(),
+        "private subagent contents participate in the package digest"
+    );
+}
+
+#[test]
+fn package_rejects_mode_primary_private_subagent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    let pkg = agents.join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    fs::write(
+        pkg.join("agent.md"),
+        vnext_agent_document("Package root", "ROOT"),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        "---\ndescription: Helper\nmode: primary\n---\nbody\n",
+    )
+    .unwrap();
+    let err = trusted_resolve(tmp.path(), "pack").unwrap_err().to_string();
+    assert!(
+        err.contains("mode") || err.contains("primary") || err.contains("schemaVersion"),
+        "mode: primary under subagents/ is a validation error: {err}"
+    );
+}
+
+#[test]
+fn nearest_project_wins_over_outer_project_agent_def() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outer = tmp.path();
+    let inner = outer.join("inner");
+    fs::create_dir_all(inner.join(".cockpit").join("agents")).unwrap();
+    fs::create_dir_all(outer.join(".cockpit").join("agents")).unwrap();
+    fs::write(
+        outer.join(".cockpit").join("agents").join("rev.md"),
+        vnext_agent_document("Outer", "OUTER BODY"),
+    )
+    .unwrap();
+    fs::write(
+        inner.join(".cockpit").join("agents").join("rev.md"),
+        vnext_agent_document("Inner", "INNER BODY"),
+    )
+    .unwrap();
+
+    let def = trusted_resolve(&inner, "rev")
+        .unwrap()
+        .expect("agent resolves");
+    assert_eq!(
+        def.prompt, "INNER BODY",
+        "nearest project definition wins over an outer ancestor"
+    );
+    assert_eq!(def.description, "Inner");
+}
+
+#[test]
+fn configured_agent_dirs_extend_across_config_layers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    fs::create_dir_all(first.join("agents-a")).unwrap();
+    fs::create_dir_all(second.join("agents-b")).unwrap();
+    fs::write(first.join("config.json"), r#"{"agent_dirs":["agents-a"]}"#).unwrap();
+    fs::write(second.join("config.json"), r#"{"agent_dirs":["agents-b"]}"#).unwrap();
+
+    let dirs = crate::config::trust::with_workspace_trust_policy(trusted_policy(tmp.path()), || {
+        configured_agent_dirs_for_paths(&[first.join("config.json"), second.join("config.json")])
+    });
+    assert!(
+        dirs.iter().any(|dir| dir.ends_with("agents-a")),
+        "earlier layer agent_dirs must be kept: {dirs:?}"
+    );
+    assert!(
+        dirs.iter().any(|dir| dir.ends_with("agents-b")),
+        "later layer agent_dirs must extend rather than replace: {dirs:?}"
+    );
 }

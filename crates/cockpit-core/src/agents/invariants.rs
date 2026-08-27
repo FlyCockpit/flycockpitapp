@@ -497,6 +497,8 @@ mod grant_tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }

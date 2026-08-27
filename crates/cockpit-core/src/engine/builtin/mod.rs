@@ -3882,6 +3882,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("graph-user.md"),
         };
 
@@ -3929,6 +3931,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
@@ -4049,6 +4053,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-with-disabled-tool.md"),
         };
 
@@ -4149,6 +4155,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("Build.md"),
         };
 
@@ -4208,6 +4216,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
 
@@ -4249,6 +4259,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
 
@@ -4297,6 +4309,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
 
@@ -4391,6 +4405,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
@@ -4808,6 +4824,8 @@ mod tests {
                 vnext: None,
                 prompt: "body".to_string(),
                 prompt_overrides: std::collections::BTreeMap::new(),
+                package_files: None,
+                private_subagents: std::collections::BTreeMap::new(),
                 source: tmp.path().join(format!("user-{tool}.md")),
             };
             let err = crate::agents::validate_invariants(&def)
@@ -6207,6 +6225,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::from("builder.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
@@ -6258,6 +6278,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-reader.md"),
         };
 
@@ -6457,6 +6479,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }

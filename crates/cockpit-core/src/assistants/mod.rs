@@ -245,6 +245,8 @@ fn create_assistant_with_installation_id_sync(
         vnext: Some(vnext_for_private_assistant(installation_id)),
         prompt: spec.prompt,
         prompt_overrides: std::collections::BTreeMap::new(),
+        package_files: None,
+        private_subagents: std::collections::BTreeMap::new(),
         source: path.clone(),
     };
     crate::agents::validate_invariants(&agent)?;

@@ -2231,6 +2231,8 @@ mod tests {
             vnext: Some(selected.clone()),
             prompt: "body".into(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         })
         .unwrap();
@@ -2260,6 +2262,8 @@ mod tests {
             vnext: Some(selected),
             prompt: "body".into(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         };
         assert!(resolver.matches_definition(installation_id, "trusted-helper", &definition));

@@ -629,6 +629,8 @@ mod agent_tiering {
             vnext: None,
             prompt: String::new(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }

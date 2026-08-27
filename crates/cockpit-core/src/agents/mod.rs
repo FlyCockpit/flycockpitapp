@@ -25,6 +25,11 @@
 //! "Reset" deletes the override. Custom agents (any non-built-in name)
 //! live only on disk and are never touched by reset.
 //!
+//! Single-file defs (`agents/<name>.md`) remain fully valid. A directory
+//! package (`agents/<name>/agent.md` plus optional `subagents/`, `mcp.json`,
+//! and per-slot prompt overrides) is opt-in. Resolution is nearest-project-
+//! wins: a workspace def is not silently shadowed by a home def.
+//!
 //! The docs two-stage pipeline (Docs.1 / Docs.2) is **not** an [`AgentDef`]
 //! — it stays entirely hardcoded in [`crate::engine::builtin`] and
 //! [`crate::engine::docs_pipeline`] and is never exposed here.
@@ -70,6 +75,11 @@ pub use vnext::{
 };
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
+/// Whole-tree cap for an agent definition package (`agents/<name>/`).
+const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
+const PACKAGE_ROOT_FILE: &str = "agent.md";
+const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
+const PACKAGE_MCP_FILE: &str = "mcp.json";
 
 /// Per-agent capability grants (issue #75). These replace the four
 /// mode-gated [`crate::engine::tool::Capability`] variants: a grant is now
@@ -312,6 +322,16 @@ pub struct AgentDef {
     /// when no override matches.
     #[serde(skip)]
     pub prompt_overrides: BTreeMap<String, String>,
+    /// Whole-tree package files (`relative/posix/path` → bytes) when this
+    /// definition was loaded from `agents/<name>/`. `None` for a single-file
+    /// def so [`AgentDef::vnext_digest_bytes`] stays byte-identical to the
+    /// pre-package `to_markdown()` preimage.
+    #[serde(skip)]
+    pub package_files: Option<BTreeMap<String, Vec<u8>>>,
+    /// Private subagent definitions loaded from `subagents/<child>.md`.
+    /// Resolvable only through this parent's `allowed_children` (Stage 3).
+    #[serde(skip)]
+    pub private_subagents: BTreeMap<String, AgentDef>,
     /// Path the definition was loaded from (`<dir>/<name>.md` or the
     /// `<dir>/<name>/` directory), or empty for an embedded default. Used
     /// for diagnostics and override detection.
@@ -1034,10 +1054,21 @@ impl AgentDef {
     /// than raw authored YAML, so mapping insertion order cannot change the
     /// identity of an otherwise equivalent closed-schema definition.
     pub fn vnext_digest_bytes(&self) -> Result<Vec<u8>> {
+        if let Some(files) = &self.package_files {
+            // Package identity is whole-tree: sorted relative paths plus the
+            // exact contents of every file. Single-file defs must not take
+            // this branch — their preimage stays `to_markdown()` bytes.
+            return Ok(package_digest_preimage(files));
+        }
         // The prompt body is part of the definition's authority-free but
         // behaviorally material contract.  Hash the complete canonical
         // markdown document rather than frontmatter alone.
         self.to_markdown().map(String::into_bytes)
+    }
+
+    /// True when this definition was loaded from a directory package.
+    pub fn is_package(&self) -> bool {
+        self.package_files.is_some()
     }
 
     fn vnext_canonical_frontmatter(&self) -> Result<String> {
@@ -1375,8 +1406,25 @@ fn parse_agent_with_scope(
         // embedded-default form (the composer re-adds a single newline).
         prompt: body.trim_start_matches('\n').trim_end().to_string(),
         prompt_overrides: std::collections::BTreeMap::new(),
+        package_files: None,
+        private_subagents: BTreeMap::new(),
         source,
     })
+}
+
+/// Canonical whole-tree digest preimage: each file is length-prefixed path
+/// then length-prefixed contents, in sorted relative-path order. Changing any
+/// file, adding one, or renaming one changes the preimage.
+fn package_digest_preimage(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (path, content) in files {
+        let path_bytes = path.as_bytes();
+        out.extend_from_slice(&(path_bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(path_bytes);
+        out.extend_from_slice(&(content.len() as u64).to_be_bytes());
+        out.extend_from_slice(content);
+    }
+    out
 }
 
 pub fn default_scan_tool_results(name: &str) -> bool {
@@ -1522,25 +1570,188 @@ pub fn load_profile_definition_from_owned_path(
     })
 }
 
-/// Load a directory-form agent (implementation note): `<dir>/<name>/<key>.md`,
-/// one file per model-slot override. Each override file is a full agent markdown
-/// with frontmatter and body; only the **prompt body** is used as a
-/// per-model override (keyed by the file stem), the frontmatter is read from
-/// the flat `<dir>/<name>.md` sibling. The invariant validation runs once on
-/// the resulting def. The per-model bodies land in
-/// [`AgentDef::prompt_overrides`]; [`AgentDef::prompt`] is set to the flat
-/// `<dir>/<name>.md` sibling when one exists (the canonical body), else to a
-/// present override body so a partial directory still loads.
+/// Load a directory-form agent. Two layouts share this entry:
+///
+/// * **Package** (`<dir>/<name>/agent.md`): root def plus optional
+///   `subagents/<child>.md`, reserved `mcp.json`, and per-slot prompt
+///   override `*.md` files. Whole-tree digest applies.
+/// * **Legacy prompt-override dir** (`<dir>/<name>/<key>.md` plus optional
+///   flat sibling `<dir>/<name>.md`): existing per-model bodies. Digest stays
+///   the single-file `to_markdown()` preimage of the canonical def.
 ///
 /// `dir` is the search directory, `name` the agent name; the directory
 /// `<dir>/<name>/` must exist (caller checks).
 fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
     let agent_dir = dir.join(name);
+    if agent_dir.join(PACKAGE_ROOT_FILE).is_file() {
+        return load_package(&agent_dir, name);
+    }
+    load_legacy_prompt_override_dir(dir, name, &agent_dir)
+}
 
-    // Read each per-model override file present in the directory. Model IDs
-    // commonly contain `/`, so nested paths such as
-    // `anthropic/claude-opus.md` are reconstructed as the key
-    // `anthropic/claude-opus`. Symlinked directories are not followed.
+fn load_package(agent_dir: &Path, name: &str) -> Result<AgentDef> {
+    let files = collect_package_files(agent_dir)?;
+    let root_bytes = files.get(PACKAGE_ROOT_FILE).ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent package `{}` ({}) is missing {PACKAGE_ROOT_FILE}",
+            name,
+            agent_dir.display()
+        )
+    })?;
+    let text = std::str::from_utf8(root_bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "agent package `{}` ({PACKAGE_ROOT_FILE}) is not UTF-8: {e}",
+            name
+        )
+    })?;
+    let mut base = parse_agent(text, name, agent_dir.join(PACKAGE_ROOT_FILE))?;
+
+    let mut overrides = BTreeMap::new();
+    let mut private_subagents = BTreeMap::new();
+    let mut seen_subagent_ids = BTreeSet::new();
+    for (rel, bytes) in &files {
+        if rel == PACKAGE_ROOT_FILE || rel == PACKAGE_MCP_FILE {
+            continue;
+        }
+        if let Some(child) = rel
+            .strip_prefix(&format!("{PACKAGE_SUBAGENTS_DIR}/"))
+            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+            .and_then(|rest| rest.strip_suffix(".md"))
+        {
+            if child == name {
+                bail!(
+                    "agent package `{name}` ({}) has a private subagent that reuses the package name",
+                    agent_dir.display()
+                );
+            }
+            if !seen_subagent_ids.insert(child.to_string()) {
+                bail!(
+                    "agent package `{name}` ({}) has duplicate private subagent `{child}`",
+                    agent_dir.display()
+                );
+            }
+            let child_text = std::str::from_utf8(bytes).map_err(|e| {
+                anyhow::anyhow!(
+                    "agent package `{name}` private subagent `{child}` is not UTF-8: {e}"
+                )
+            })?;
+            let child_def = parse_agent(
+                child_text,
+                child,
+                agent_dir.join(PACKAGE_SUBAGENTS_DIR).join(format!("{child}.md")),
+            )?;
+            if child_def.mode == AgentMode::Primary {
+                bail!(
+                    "agent package `{name}` private subagent `{child}` cannot declare mode: primary"
+                );
+            }
+            validate_invariants(&child_def)?;
+            if private_subagents.insert(child.to_string(), child_def).is_some() {
+                bail!(
+                    "agent package `{name}` ({}) has duplicate private subagent `{child}`",
+                    agent_dir.display()
+                );
+            }
+            continue;
+        }
+        if rel.contains('/') {
+            // Nested support files (mcp.json already skipped) are digested
+            // but not interpreted by this stage.
+            continue;
+        }
+        if let Some(key) = rel.strip_suffix(".md").filter(|k| !k.is_empty()) {
+            let text = std::str::from_utf8(bytes).map_err(|e| {
+                anyhow::anyhow!("agent package `{name}` prompt override `{rel}` is not UTF-8: {e}")
+            })?;
+            let parsed = parse_agent(text, name, agent_dir.join(rel))?;
+            overrides.insert(key.to_string(), parsed.prompt);
+        }
+    }
+
+    base.source = agent_dir.to_path_buf();
+    base.prompt_overrides = overrides;
+    base.package_files = Some(files);
+    base.private_subagents = private_subagents;
+    validate_invariants(&base)?;
+    Ok(base)
+}
+
+fn collect_package_files(agent_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut files = BTreeMap::new();
+    let mut total = 0u64;
+    collect_package_files_inner(agent_dir, agent_dir, &mut files, &mut total)?;
+    Ok(files)
+}
+
+fn collect_package_files_inner(
+    root: &Path,
+    dir: &Path,
+    files: &mut BTreeMap<String, Vec<u8>>,
+    total: &mut u64,
+) -> Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| anyhow::anyhow!("reading agent package {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+            anyhow::anyhow!("statting agent package file {}: {e}", path.display())
+        })?;
+        if meta.file_type().is_symlink() {
+            bail!(
+                "agent package {} contains a symlink ({})",
+                root.display(),
+                path.display()
+            );
+        }
+        if meta.is_dir() {
+            collect_package_files_inner(root, &path, files, total)?;
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.is_empty() {
+            continue;
+        }
+        let len = meta.len();
+        if len > MAX_MARKDOWN_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                size = len,
+                limit = MAX_MARKDOWN_BYTES,
+                "skipping oversized agent package file"
+            );
+            bail!(
+                "agent package file {} exceeds {} byte limit",
+                path.display(),
+                MAX_MARKDOWN_BYTES
+            );
+        }
+        *total = total.saturating_add(len);
+        if *total > MAX_PACKAGE_BYTES {
+            bail!(
+                "agent package {} exceeds {} byte package limit",
+                root.display(),
+                MAX_PACKAGE_BYTES
+            );
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|e| anyhow::anyhow!("reading agent package file {}: {e}", path.display()))?;
+        files.insert(rel, bytes);
+    }
+    Ok(())
+}
+
+fn load_legacy_prompt_override_dir(dir: &Path, name: &str, agent_dir: &Path) -> Result<AgentDef> {
+    // Model IDs commonly contain `/`, so nested paths such as
+    // `anthropic/claude-opus.md` become the key `anthropic/claude-opus`.
+    // Symlinked directories are not followed.
     let mut overrides: BTreeMap<String, String> = BTreeMap::new();
     let mut first_override_def: Option<AgentDef> = None;
     fn collect_override_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -1561,10 +1772,10 @@ fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
         Ok(())
     }
     let mut override_files = Vec::new();
-    collect_override_files(&agent_dir, &mut override_files)?;
+    collect_override_files(agent_dir, &mut override_files)?;
     override_files.sort();
     for path in override_files {
-        let relative = path.strip_prefix(&agent_dir)?;
+        let relative = path.strip_prefix(agent_dir)?;
         let mut key = relative.with_extension("").to_string_lossy().into_owned();
         if std::path::MAIN_SEPARATOR != '/' {
             key = key.replace(std::path::MAIN_SEPARATOR, "/");
@@ -1600,7 +1811,7 @@ fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
         ),
     };
 
-    base.source = agent_dir;
+    base.source = agent_dir.to_path_buf();
     base.prompt_overrides = overrides;
     // The canonical flat body: the flat sibling when present, else the first
     // override file's own body.
@@ -1657,15 +1868,13 @@ fn agents_subdir(config_dir: &Path) -> PathBuf {
 }
 
 /// Every directory to search for on-disk agent files, in left-to-right
-/// override precedence: the layered config dirs (home/global, machine-
-/// local, then project ancestors — see [`crate::config::dirs`]) each
-/// contribute their `agents/` subdir, followed by configured
-/// `extended.agent_dirs`. Unlike skills scan dirs, these entries are
-/// resolved relative to the config file that defined them, not the process
-/// cwd and not through ancestor-walk. This makes a checked-in project config
-/// mean the same thing from every launch directory.
+/// override precedence. Nearest project wins (matching `mcp.json` load
+/// layering, most-specific first), then machine-local and home, then
+/// configured `extended.agent_dirs`. Unlike skills scan dirs, configured
+/// entries are resolved relative to the config file that defined them, not
+/// the process cwd and not through ancestor-walk.
 pub fn agent_search_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = crate::config::dirs::discover_config_dirs(cwd)
+    let mut dirs: Vec<PathBuf> = crate::config::dirs::config_dirs_most_specific_first(cwd)
         .into_iter()
         .map(|d| agents_subdir(&d.path))
         .collect();
@@ -1699,11 +1908,12 @@ fn configured_agent_dirs_for_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
                 continue;
             }
         };
-        dirs = parsed
-            .into_iter()
-            .filter_map(|dir| resolve_agent_dir_entry(path, &dir))
-            .filter(|dir| !crate::config::trust::path_blocked_by_workspace_trust(dir))
-            .collect();
+        dirs.extend(
+            parsed
+                .into_iter()
+                .filter_map(|dir| resolve_agent_dir_entry(path, &dir))
+                .filter(|dir| !crate::config::trust::path_blocked_by_workspace_trust(dir)),
+        );
     }
     dirs
 }
@@ -1747,17 +1957,31 @@ pub fn agent_path_in(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// Find the first existing on-disk override file for `name`, scanning
-/// [`agent_search_dirs`] in precedence order. Returns the path (flat-file
-/// or — once supported — the dir form) of the highest-precedence match,
-/// or `None` when no override exists (the embedded default applies).
+/// [`agent_search_dirs`] in precedence order (nearest project first).
+/// Returns the path (flat-file or directory package) of the highest-
+/// precedence match, or `None` when no override exists (the embedded
+/// default applies). A lower-precedence same-named def is logged as
+/// shadowed rather than silently winning.
 pub fn find_override(cwd: &Path, name: &str) -> Option<PathBuf> {
+    let mut found = None;
     for dir in agent_search_dirs(cwd) {
         let candidate = agent_path_in(&dir, name);
-        if candidate.exists() {
-            return Some(candidate);
+        if !candidate.exists() {
+            continue;
+        }
+        match &found {
+            Some(winner) => {
+                tracing::warn!(
+                    agent = name,
+                    winning = %winner.display(),
+                    shadowed = %candidate.display(),
+                    "project agent definition shadows a lower-precedence definition"
+                );
+            }
+            None => found = Some(candidate),
         }
     }
-    None
+    found
 }
 
 /// Resolve the effective [`AgentDef`] for `name` at `cwd`: the highest-
@@ -1898,22 +2122,22 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
 }
 
 fn agent_markdown_oversized(path: &Path, dir: &Path, name: &str) -> bool {
-    let paths: Vec<PathBuf> = if path.is_dir() {
-        // Per-model override files (`<name>/<key>.md`) plus the flat sibling.
-        std::fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
-            .chain(std::iter::once(dir.join(format!("{name}.md"))))
-            .filter(|p| p.is_file())
-            .collect()
-    } else {
-        vec![path.to_path_buf()]
-    };
+    if path.is_dir() {
+        return match collect_package_files(path) {
+            Ok(_) => false,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "skipping oversized or unreadable agent package"
+                );
+                true
+            }
+        };
+    }
+    let paths = [path.to_path_buf(), dir.join(format!("{name}.md"))];
     paths.into_iter().any(|p| match std::fs::metadata(&p) {
-        Ok(meta) if meta.len() > MAX_MARKDOWN_BYTES => {
+        Ok(meta) if p.is_file() && meta.len() > MAX_MARKDOWN_BYTES => {
             tracing::warn!(
                 path = %p.display(),
                 size = meta.len(),

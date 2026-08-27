@@ -45,6 +45,10 @@ pub struct AcceptMessageInput {
     pub attachments: Vec<MessageAttachmentReferenceInput>,
     pub outbox_sequence: i64,
     pub now_ms: i64,
+    /// Optional tool-media-subject binding to insert atomically with the
+    /// accepted message. Core owns receipt/seal encoding and passes the
+    /// opaque byte DTO through here.
+    pub tool_media_subject_binding: Option<crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +453,12 @@ pub(crate) fn accept_conn(
     for (ordinal, attachment) in input.attachments.iter().enumerate() {
         conn.execute("INSERT INTO message_attachment_references (session_id,client_submission_id,ordinal,attachment_id,attachment_version,checksum,kind,acquired_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![session,input.client_submission_id.as_slice(),ordinal as i64,attachment.attachment_id.as_slice(),attachment.attachment_version.to_be_bytes().as_slice(),attachment.checksum.as_slice(),attachment.kind,input.now_ms])?;
     }
+    // Atomically insert the tool-media-subject binding if present.
+    if let Some(binding) = &input.tool_media_subject_binding {
+        crate::db::tool_media_subject_bindings::Db::insert_tool_media_subject_binding_conn(
+            conn, binding,
+        )?;
+    }
     Ok(AcceptMessageResult::Accepted)
 }
 
@@ -493,6 +503,7 @@ mod tests {
             }],
             outbox_sequence: 1,
             now_ms: 10,
+            tool_media_subject_binding: None,
         }
     }
 

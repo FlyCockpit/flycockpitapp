@@ -3399,6 +3399,7 @@ mod tests {
                     attachments: Vec::new(),
                     outbox_sequence: 0,
                     now_ms: 10,
+                    tool_media_subject_binding: None,
                 },
                 Arc::new(AllowJoin),
                 crate::db::text_artifacts::source_digest(&source),
@@ -3441,6 +3442,7 @@ mod tests {
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),
                 now_ms: 11,
+                tool_media_subject_binding: None,
             },
         )
         .await
@@ -3512,6 +3514,7 @@ mod tests {
                     attachments: Vec::new(),
                     outbox_sequence: 0,
                     now_ms: 10,
+                    tool_media_subject_binding: None,
                 },
                 Arc::new(AllowJoin),
                 crate::db::text_artifacts::source_digest(&source),
@@ -3548,6 +3551,7 @@ mod tests {
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),
                 now_ms: 11,
+                tool_media_subject_binding: None,
             },
         )
         .await

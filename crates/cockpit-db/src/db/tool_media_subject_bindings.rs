@@ -467,6 +467,7 @@ mod tests {
             attachments: vec![],
             outbox_sequence: 1,
             now_ms: 10,
+            tool_media_subject_binding: None,
         };
         use crate::db::message_attachments::MessageAcceptanceJoin;
         struct Allow;
@@ -501,6 +502,7 @@ mod tests {
             secure_key_reference_id: "tool-media-subject-binding/test/05050505050505050505050505050505/1".to_string(),
             receipt_bytes: vec![0xFF; 122],
             now_ms: 20,
+            tool_media_subject_binding: None,
         };
 
         db.transaction(|conn| {
@@ -543,6 +545,7 @@ mod tests {
             attachments: vec![],
             outbox_sequence: 1,
             now_ms: 10,
+            tool_media_subject_binding: None,
         };
         use crate::db::message_attachments::MessageAcceptanceJoin;
         struct Allow;
@@ -577,6 +580,7 @@ mod tests {
             secure_key_reference_id: "tool-media-subject-binding/test/07070707070707070707070707070707/1".to_string(),
             receipt_bytes: vec![0xFF; 122],
             now_ms: 20,
+            tool_media_subject_binding: None,
         };
 
         db.transaction(|conn| {
@@ -635,6 +639,7 @@ mod tests {
             attachments: vec![],
             outbox_sequence: 1,
             now_ms: 10,
+            tool_media_subject_binding: None,
         };
         use crate::db::message_attachments::MessageAcceptanceJoin;
         struct Allow;
@@ -669,6 +674,7 @@ mod tests {
             secure_key_reference_id: "test-ref-2".to_string(),
             receipt_bytes: vec![0xFF; 122],
             now_ms: 20,
+            tool_media_subject_binding: None,
         };
 
         let result = db

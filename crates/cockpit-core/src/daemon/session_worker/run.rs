@@ -8351,6 +8351,7 @@ pub(super) async fn run_worker(
                             attachments: Vec::new(),
                             outbox_sequence: 0,
                             now_ms,
+                            tool_media_subject_binding: None,
                         };
                         let source_digest =
                             crate::db::db::text_artifacts::source_digest(&canonical.request.text);

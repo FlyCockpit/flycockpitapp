@@ -3805,9 +3805,18 @@ pub(crate) async fn boot_with_db(
         match std::thread::Builder::new()
             .name("cockpit-secure-key-boot".into())
             .spawn(move || {
-                let reconciler = std::sync::Arc::new(
+                let external =
                     crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
                         db_for_keys.clone(),
+                    );
+                let tool_media =
+                    crate::secure_key::ToolMediaSubjectBindingDbProbe::new(
+                        db_for_keys.clone(),
+                    );
+                let reconciler = std::sync::Arc::new(
+                    crate::secure_key::CompositeConsumerReconciler::new(
+                        external,
+                        tool_media,
                     ),
                 );
                 let result = crate::secure_key::SecureKeyActor::start_production_resolved(

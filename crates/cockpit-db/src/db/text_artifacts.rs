@@ -3563,6 +3563,7 @@ mod tests {
             attachments: Vec::new(),
             outbox_sequence: i64::from(seed),
             now_ms,
+            tool_media_subject_binding: None,
         }
     }
 

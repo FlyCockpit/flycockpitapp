@@ -15282,6 +15282,7 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
                 attachments: Vec::new(),
                 outbox_sequence: 0,
                 now_ms: 1_000,
+                tool_media_subject_binding: None,
             },
             Arc::new(AllowOversizedUserArtifactReceipt),
             crate::db::text_artifacts::source_digest(&source),
@@ -15467,6 +15468,7 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
                 attachments: Vec::new(),
                 outbox_sequence: 0,
                 now_ms: 1_000,
+                tool_media_subject_binding: None,
             },
             Arc::new(AllowOversizedUserArtifactReceipt),
             crate::db::text_artifacts::source_digest(&source),
@@ -15556,6 +15558,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             attachments: Vec::new(),
             outbox_sequence: 0,
             now_ms: 1_000,
+            tool_media_subject_binding: None,
         }
     }
 

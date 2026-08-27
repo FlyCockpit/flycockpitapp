@@ -1,0 +1,1871 @@
+//! TUI image-sidecar selection, egress-grant, and accounting settings.
+//!
+//! This module is presentation-only. It consumes typed projections and
+//! constructs typed save/grant requests. It does not run selection, grant
+//! matching, dispatch, or journal internals.
+
+use std::any::Any;
+use std::collections::BTreeSet;
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+
+use cockpit_config::config::media_budget::MediaResourceLimits;
+use cockpit_core::image_sidecar::{
+    ApprovalMode, GrantScope, InvocationDisposition, InvocationState, MediaClass, Purpose,
+    SidecarInvocationCapProvenance, SidecarProviderModel, SidecarSelectionConfig,
+};
+
+use super::pointer_actions::{
+    ConfirmationChoice, SettingsPointerAction, SidecarAction, SidecarGrantId, SidecarInvocationId,
+    SidecarModeChoice, SidecarModelRef, SidecarNodeId,
+};
+use super::shell::SettingsScrollRegionId;
+use super::{Nav, PageBox, SettingsCx, SettingsPage, SettingsPointerSurfaceKind};
+
+#[cfg(test)]
+mod tests;
+
+const PROJECT_GRANT_WARNING: &str = "Each use still requires this session's current project authorization and is audited separately.";
+
+const REASON_STALE_CAPABILITY: &str = "stale_capability";
+const REASON_MISSING_SELECTION: &str = "missing_selection";
+const REASON_INVALID_OVERRIDE: &str = "invalid_override";
+const REASON_CAP_EXHAUSTED: &str = "cap_exhausted";
+const REASON_DESTINATION_DENIED: &str = "destination_denied";
+const REASON_PROJECT_SESSION_MISMATCH: &str = "project_session_mismatch";
+const REASON_REVOKED_GRANT: &str = "revoked_grant";
+const REASON_MISSING_CREDENTIAL: &str = "missing_credential";
+const REASON_PROVIDER_FAILURE: &str = "provider_failure";
+const REASON_REVOKE_REQUIRES_AUTHORIZATION: &str = "revoke_requires_current_authorization";
+const REASON_YOLO_NO_GRANT: &str = "yolo_no_standing_grant";
+const REASON_SAVE_PENDING: &str = "save_pending";
+const REASON_FORBIDDEN_SIDECAR_ADMIN: &str = "forbidden_requires_sidecar_admin";
+
+const SIDECAR_NODE_TITLES: &[&str] = &[
+    "Mode",
+    "Trusted / untrusted defaults",
+    "Per-primary override",
+    "Central invocation policy",
+    "Resolver trace",
+    "Health",
+    "Destination grants",
+    "Invocation history",
+];
+
+// ---------------------------------------------------------------------------
+// Viewport
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SidecarViewportMode {
+    Full,
+    Compact,
+    Reduced,
+    Blocked,
+}
+
+pub(crate) fn sidecar_viewport_mode(width: u16, height: u16) -> SidecarViewportMode {
+    if width >= 100 && height >= 30 {
+        SidecarViewportMode::Full
+    } else if width >= 80 && height >= 24 {
+        SidecarViewportMode::Compact
+    } else if width >= 60 && height >= 16 {
+        SidecarViewportMode::Reduced
+    } else {
+        SidecarViewportMode::Blocked
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Principal
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SidecarPrincipal {
+    pub local_owner: bool,
+    pub project_read: bool,
+    pub session_read: bool,
+    pub session_write: bool,
+}
+
+impl SidecarPrincipal {
+    pub(crate) fn from_session(
+        snapshot: &super::image_generation::SessionCapabilitySnapshot,
+    ) -> Self {
+        Self {
+            local_owner: snapshot.local_owner,
+            project_read: snapshot.local_owner || snapshot.project_read,
+            session_read: snapshot.local_owner || snapshot.session_read,
+            session_write: snapshot.local_owner || snapshot.session_write,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_owner() -> Self {
+        Self {
+            local_owner: true,
+            project_read: true,
+            session_read: true,
+            session_write: true,
+        }
+    }
+
+    pub(crate) fn can_mutate(&self) -> bool {
+        self.local_owner
+    }
+
+    pub(crate) fn can_revoke(&self) -> bool {
+        self.local_owner || self.session_write
+    }
+
+    pub(crate) fn config_reason(&self) -> Option<&'static str> {
+        if self.can_mutate() {
+            None
+        } else {
+            Some(REASON_FORBIDDEN_SIDECAR_ADMIN)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// View models (typed projections the UI consumes)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidecarModelOption {
+    pub provider: String,
+    pub model: String,
+    pub image_capable: bool,
+    pub fresh: bool,
+}
+
+impl SidecarModelOption {
+    pub(crate) fn is_selectable(&self) -> bool {
+        self.image_capable && self.fresh
+    }
+}
+
+pub(crate) fn filter_selectable_sidecar_models(
+    catalog: &[SidecarModelOption],
+) -> Vec<&SidecarModelOption> {
+    catalog.iter().filter(|m| m.is_selectable()).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidecarEffectiveTrace {
+    pub primary_provider: String,
+    pub primary_model: String,
+    pub primary_trust: String,
+    pub matched_source: String,
+    pub sidecar_provider: Option<String>,
+    pub sidecar_model: Option<String>,
+    pub origin: String,
+    pub location: String,
+    pub credential_fingerprint: String,
+    pub capability_source: String,
+    pub capability_freshness: String,
+    pub config_generation: u64,
+    pub mode: SidecarModeChoice,
+    pub available: bool,
+    pub fallback_outcome: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CentralPolicyView {
+    pub value: u64,
+    pub source: SidecarInvocationCapProvenance,
+    pub hard_ceiling: u64,
+}
+
+impl CentralPolicyView {
+    pub(crate) fn source_label(&self) -> &'static str {
+        match self.source {
+            SidecarInvocationCapProvenance::CompiledCeiling => "compiled_ceiling",
+            SidecarInvocationCapProvenance::Configured => "configured",
+            SidecarInvocationCapProvenance::Profile => "profile",
+            SidecarInvocationCapProvenance::Adapter => "adapter",
+            SidecarInvocationCapProvenance::Request => "request",
+        }
+    }
+
+    pub(crate) fn render_line(&self) -> String {
+        format!(
+            "Effective: {} source={} hard_ceiling={}",
+            self.value,
+            self.source_label(),
+            self.hard_ceiling
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HealthView {
+    pub available: bool,
+    pub capability_source: String,
+    pub freshness: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantView {
+    pub grant_id: String,
+    pub version: u64,
+    pub project: String,
+    pub destination: String,
+    pub media_class: String,
+    pub purpose: String,
+    pub scope: GrantScope,
+    pub session_binding: Option<String>,
+    pub invocation_binding: Option<String>,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub revoked: bool,
+    pub consumed: bool,
+}
+
+impl GrantView {
+    pub(crate) fn project_warning(&self) -> Option<&'static str> {
+        if self.scope == GrantScope::Project {
+            Some(PROJECT_GRANT_WARNING)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn row_text(&self) -> String {
+        format!(
+            "{} | project={} dest={} media={} purpose={} scope={}{}{} created={} used={} revoked={} consumed={}",
+            self.grant_id,
+            self.project,
+            self.destination,
+            self.media_class,
+            self.purpose,
+            self.scope.as_str(),
+            self.session_binding
+                .as_deref()
+                .map(|s| format!(" session={s}"))
+                .unwrap_or_default(),
+            self.invocation_binding
+                .as_deref()
+                .map(|s| format!(" invocation={s}"))
+                .unwrap_or_default(),
+            self.created_at,
+            self.last_used_at.as_deref().unwrap_or("-"),
+            self.revoked,
+            self.consumed,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnerTechnicalDetail {
+    pub purpose: String,
+    pub instruction_version: u8,
+    pub body_digest_hex: String,
+    pub unicode_scalar_len: usize,
+    pub utf8_byte_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InvocationView {
+    pub invocation_id: String,
+    pub parent_operation: String,
+    pub session: String,
+    pub purpose_label: String,
+    pub provider: String,
+    pub model: String,
+    pub location: String,
+    pub state: InvocationState,
+    pub created_at: String,
+    pub dispatched_at: Option<String>,
+    pub terminal_at: Option<String>,
+    pub grant_id: Option<String>,
+    pub disposition: InvocationDisposition,
+    pub usage_input_tokens: Option<u64>,
+    pub usage_output_tokens: Option<u64>,
+    pub usage_cost_micro_usd: Option<u64>,
+    pub sidecar_invocation_charged: bool,
+    pub media_reservation_id: Option<String>,
+    pub provider_concurrency_slot: Option<String>,
+    pub safe_error: Option<String>,
+    pub owner_detail: Option<OwnerTechnicalDetail>,
+}
+
+impl InvocationView {
+    pub(crate) fn row_text(&self) -> String {
+        format!(
+            "{} | purpose={} parent={} session={} {}:{} loc={} state={} grant={} disposition={} charged={}",
+            self.invocation_id,
+            self.purpose_label,
+            self.parent_operation,
+            self.session,
+            self.provider,
+            self.model,
+            self.location,
+            self.state.as_str(),
+            self.grant_id.as_deref().unwrap_or("-"),
+            self.disposition.as_str(),
+            self.sidecar_invocation_charged,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrustDisclosure {
+    pub trust_class: &'static str,
+    pub redaction: String,
+}
+
+impl TrustDisclosure {
+    pub(crate) fn for_trust(trusted: bool) -> Self {
+        if trusted {
+            Self {
+                trust_class: "trusted",
+                redaction: "Standard redaction. Trust does not grant egress.".into(),
+            }
+        } else {
+            Self {
+                trust_class: "untrusted",
+                redaction: "Additional redaction applies. Trust does not grant egress.".into(),
+            }
+        }
+    }
+
+    pub(crate) fn lines(&self) -> Vec<String> {
+        vec![
+            format!("Trust class: {}", self.trust_class),
+            self.redaction.clone(),
+            "Egress authority is independent of trust class.".into(),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EgressAuthorityView {
+    pub grant_required: bool,
+    pub destination: String,
+    pub scopes: Vec<GrantScope>,
+}
+
+impl EgressAuthorityView {
+    pub(crate) fn shared(destination: impl Into<String>) -> Self {
+        Self {
+            grant_required: true,
+            destination: destination.into(),
+            scopes: vec![GrantScope::Once, GrantScope::Session, GrantScope::Project],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FirstUseView {
+    pub mode: ApprovalMode,
+    pub grant_choices: Vec<GrantScope>,
+    pub yolo_label: Option<&'static str>,
+    pub standing_grant: bool,
+    pub prompt: bool,
+}
+
+impl FirstUseView {
+    pub(crate) fn for_mode(mode: ApprovalMode) -> Self {
+        match mode {
+            ApprovalMode::Ask => Self {
+                mode,
+                grant_choices: vec![GrantScope::Once, GrantScope::Session, GrantScope::Project],
+                yolo_label: None,
+                standing_grant: false,
+                prompt: true,
+            },
+            ApprovalMode::Yolo => Self {
+                mode,
+                grant_choices: Vec::new(),
+                yolo_label: Some("agent_discretion"),
+                standing_grant: false,
+                prompt: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidecarRowView {
+    pub label: String,
+    pub value: String,
+    pub state: String,
+    pub destination: Option<String>,
+    pub scope: Option<String>,
+    pub error: Option<String>,
+    pub busy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidecarA11yProjection {
+    pub focused_label: String,
+    pub focused_value: String,
+    pub effective_policy: String,
+    pub effective_value: String,
+    pub effective_source: String,
+    pub destination: String,
+    pub scope: String,
+    pub non_color_state: String,
+    pub busy: bool,
+    pub error: Option<String>,
+    pub project_grant_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidecarRemediation {
+    MissingSelection,
+    InvalidOverride,
+    StaleCapability,
+    CapExhausted,
+    DestinationDenied,
+    ProjectSessionMismatch,
+    RevokedGrant,
+    MissingCredential,
+    ProviderFailure,
+}
+
+impl SidecarRemediation {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::MissingSelection => REASON_MISSING_SELECTION,
+            Self::InvalidOverride => REASON_INVALID_OVERRIDE,
+            Self::StaleCapability => REASON_STALE_CAPABILITY,
+            Self::CapExhausted => REASON_CAP_EXHAUSTED,
+            Self::DestinationDenied => REASON_DESTINATION_DENIED,
+            Self::ProjectSessionMismatch => REASON_PROJECT_SESSION_MISMATCH,
+            Self::RevokedGrant => REASON_REVOKED_GRANT,
+            Self::MissingCredential => REASON_MISSING_CREDENTIAL,
+            Self::ProviderFailure => REASON_PROVIDER_FAILURE,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::MissingSelection => "Missing selection — choose a sidecar model.",
+            Self::InvalidOverride => "Invalid override — pick a freshly image-capable model.",
+            Self::StaleCapability => "Stale capability — refresh health, then retry.",
+            Self::CapExhausted => "Cap exhausted — wait for the session or raise the central cap.",
+            Self::DestinationDenied => {
+                "Destination denied — review grants or destination identity."
+            }
+            Self::ProjectSessionMismatch => {
+                "Project/session mismatch — rebind to the current session."
+            }
+            Self::RevokedGrant => "Grant revoked — create a new grant to continue.",
+            Self::MissingCredential => "Missing credential — configure provider credentials.",
+            Self::ProviderFailure => "Provider failure — retry after the provider recovers.",
+        }
+    }
+}
+
+pub(crate) fn strip_query_and_fragment(origin: &str) -> String {
+    origin
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(origin)
+        .to_string()
+}
+
+pub(crate) fn offered_grant_scopes() -> [GrantScope; 3] {
+    [GrantScope::Once, GrantScope::Session, GrantScope::Project]
+}
+
+// ---------------------------------------------------------------------------
+// Form + reducer
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidecarFormState {
+    pub mode: SidecarModeChoice,
+    pub trusted_default: Option<SidecarModelRef>,
+    pub untrusted_default: Option<SidecarModelRef>,
+    pub override_pair: Option<SidecarModelRef>,
+    pub central_cap: u64,
+    pub models: Vec<SidecarModelOption>,
+    pub draft_scope: GrantScope,
+    pub local_edits_preserved: bool,
+}
+
+impl Default for SidecarFormState {
+    fn default() -> Self {
+        Self {
+            mode: SidecarModeChoice::Automatic,
+            trusted_default: None,
+            untrusted_default: None,
+            override_pair: None,
+            central_cap: MediaResourceLimits::defaults().sidecar_invocations_per_session,
+            models: Vec::new(),
+            draft_scope: GrantScope::Once,
+            local_edits_preserved: false,
+        }
+    }
+}
+
+impl SidecarFormState {
+    pub(crate) fn to_selection_config(&self) -> SidecarSelectionConfig {
+        let to_pair = |r: &SidecarModelRef| SidecarProviderModel {
+            provider: r.provider.clone(),
+            model: r.model.clone(),
+        };
+        SidecarSelectionConfig {
+            mode: self.mode.to_core(),
+            trusted_primary_default: self.trusted_default.as_ref().map(to_pair),
+            untrusted_primary_default: self.untrusted_default.as_ref().map(to_pair),
+            per_primary_override: self.override_pair.as_ref().map(to_pair),
+        }
+    }
+
+    pub(crate) fn selectable_models(&self) -> Vec<&SidecarModelOption> {
+        filter_selectable_sidecar_models(&self.models)
+    }
+
+    pub(crate) fn set_central_cap(&mut self, value: u64) {
+        let ceiling = MediaResourceLimits::hard_ceilings().sidecar_invocations_per_session;
+        self.central_cap = value.min(ceiling).max(1);
+        self.local_edits_preserved = true;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidecarEventOutcome {
+    Applied,
+    Discarded,
+    RehydrateRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SidecarEventPayload {
+    Health(HealthView),
+    Grant(GrantView),
+    Invocation(InvocationView),
+    Resolution(SidecarEffectiveTrace),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidecarEvent {
+    pub daemon_instance: String,
+    pub project_id: String,
+    pub session_id: String,
+    pub selection_id: String,
+    pub config_generation: u64,
+    pub entity_version: u64,
+    pub payload: SidecarEventPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidecarReducer {
+    pub daemon_instance: String,
+    pub project_id: String,
+    pub session_id: String,
+    pub selection_id: String,
+    pub config_generation: u64,
+    pub entity_version: u64,
+    pub grants: Vec<GrantView>,
+    pub invocations: Vec<InvocationView>,
+    pub health: Option<HealthView>,
+    pub resolution: Option<SidecarEffectiveTrace>,
+    pub charged_invocation_ids: BTreeSet<String>,
+    pub charged_count: u64,
+    pub stale: bool,
+}
+
+impl SidecarReducer {
+    pub(crate) fn new(
+        daemon_instance: String,
+        project_id: String,
+        session_id: String,
+        selection_id: String,
+    ) -> Self {
+        Self {
+            daemon_instance,
+            project_id,
+            session_id,
+            selection_id,
+            config_generation: 0,
+            entity_version: 0,
+            grants: Vec::new(),
+            invocations: Vec::new(),
+            health: None,
+            resolution: None,
+            charged_invocation_ids: BTreeSet::new(),
+            charged_count: 0,
+            stale: false,
+        }
+    }
+
+    pub(crate) fn apply(&mut self, event: SidecarEvent) -> SidecarEventOutcome {
+        if self.daemon_instance != event.daemon_instance
+            || self.project_id != event.project_id
+            || self.session_id != event.session_id
+            || self.selection_id != event.selection_id
+        {
+            return SidecarEventOutcome::Discarded;
+        }
+        if self.config_generation == 0 {
+            self.config_generation = event.config_generation;
+        } else if self.config_generation != event.config_generation {
+            return SidecarEventOutcome::Discarded;
+        }
+        if event.entity_version < self.entity_version {
+            return SidecarEventOutcome::Discarded;
+        }
+        if event.entity_version == self.entity_version && self.entity_version > 0 {
+            return SidecarEventOutcome::Discarded;
+        }
+        if event.entity_version > self.entity_version + 1 && self.entity_version > 0 {
+            return SidecarEventOutcome::RehydrateRequired;
+        }
+        match event.payload {
+            SidecarEventPayload::Health(health) => self.health = Some(health),
+            SidecarEventPayload::Grant(grant) => {
+                if let Some(existing) = self
+                    .grants
+                    .iter_mut()
+                    .find(|g| g.grant_id == grant.grant_id)
+                {
+                    if existing.version <= grant.version {
+                        *existing = grant;
+                    }
+                } else {
+                    self.grants.push(grant);
+                }
+            }
+            SidecarEventPayload::Invocation(inv) => {
+                if !self.commit_invocation(inv) {
+                    return SidecarEventOutcome::Discarded;
+                }
+            }
+            SidecarEventPayload::Resolution(trace) => self.resolution = Some(trace),
+        }
+        self.entity_version = event.entity_version;
+        SidecarEventOutcome::Applied
+    }
+
+    fn commit_invocation(&mut self, inv: InvocationView) -> bool {
+        if let Some(existing) = self
+            .invocations
+            .iter()
+            .find(|i| i.invocation_id == inv.invocation_id)
+        {
+            if invocation_rank(existing.state) > invocation_rank(inv.state)
+                && is_terminal(existing.state)
+            {
+                return false;
+            }
+        }
+        if inv.sidecar_invocation_charged
+            && self
+                .charged_invocation_ids
+                .insert(inv.invocation_id.clone())
+        {
+            self.charged_count = self.charged_count.saturating_add(1);
+        }
+        if let Some(existing) = self
+            .invocations
+            .iter_mut()
+            .find(|i| i.invocation_id == inv.invocation_id)
+        {
+            *existing = inv;
+        } else {
+            self.invocations.push(inv);
+        }
+        true
+    }
+
+    pub(crate) fn mark_stale(&mut self) {
+        self.stale = true;
+        self.health = None;
+        self.resolution = None;
+    }
+
+    pub(crate) fn rebind(
+        &mut self,
+        daemon_instance: String,
+        project_id: String,
+        session_id: String,
+        selection_id: String,
+    ) {
+        *self = Self::new(daemon_instance, project_id, session_id, selection_id);
+    }
+
+    pub(crate) fn revoke_grant(&mut self, grant_id: &str, expected_version: u64) -> bool {
+        if let Some(grant) = self.grants.iter_mut().find(|g| g.grant_id == grant_id)
+            && grant.version == expected_version
+            && !grant.revoked
+        {
+            grant.revoked = true;
+            grant.version = grant.version.saturating_add(1);
+            return true;
+        }
+        false
+    }
+}
+
+fn is_terminal(state: InvocationState) -> bool {
+    matches!(
+        state,
+        InvocationState::Completed
+            | InvocationState::Failed
+            | InvocationState::Cancelled
+            | InvocationState::Ambiguous
+    )
+}
+
+fn invocation_rank(state: InvocationState) -> u8 {
+    match state {
+        InvocationState::Pending => 0,
+        InvocationState::Authorized => 1,
+        InvocationState::Dispatched => 2,
+        InvocationState::Accepted => 3,
+        InvocationState::Completed
+        | InvocationState::Failed
+        | InvocationState::Cancelled
+        | InvocationState::Ambiguous => 4,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session + page
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SidecarPageKind {
+    Overview,
+    ModeEditor,
+    DefaultEditor,
+    OverrideEditor,
+    CentralPolicyEditor,
+    ResolverDetail,
+    HealthDetail,
+    GrantList,
+    GrantEditor,
+    InvocationList,
+    InvocationDetail,
+}
+
+impl SidecarPageKind {
+    pub(crate) fn surface(self) -> SettingsPointerSurfaceKind {
+        match self {
+            Self::Overview => SettingsPointerSurfaceKind::SidecarOverview,
+            Self::ModeEditor => SettingsPointerSurfaceKind::SidecarModeEditor,
+            Self::DefaultEditor => SettingsPointerSurfaceKind::SidecarDefaultEditor,
+            Self::OverrideEditor => SettingsPointerSurfaceKind::SidecarOverrideEditor,
+            Self::CentralPolicyEditor => SettingsPointerSurfaceKind::SidecarCentralPolicyEditor,
+            Self::ResolverDetail => SettingsPointerSurfaceKind::SidecarResolverDetail,
+            Self::HealthDetail => SettingsPointerSurfaceKind::SidecarHealthDetail,
+            Self::GrantList => SettingsPointerSurfaceKind::SidecarGrantList,
+            Self::GrantEditor => SettingsPointerSurfaceKind::SidecarGrantEditor,
+            Self::InvocationList => SettingsPointerSurfaceKind::SidecarInvocationList,
+            Self::InvocationDetail => SettingsPointerSurfaceKind::SidecarInvocationDetail,
+        }
+    }
+
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::Overview => "Image Sidecar",
+            Self::ModeEditor => "Sidecar mode",
+            Self::DefaultEditor => "Sidecar defaults",
+            Self::OverrideEditor => "Sidecar override",
+            Self::CentralPolicyEditor => "Central invocation policy",
+            Self::ResolverDetail => "Resolver trace",
+            Self::HealthDetail => "Sidecar health",
+            Self::GrantList => "Destination grants",
+            Self::GrantEditor => "Grant editor",
+            Self::InvocationList => "Invocation history",
+            Self::InvocationDetail => "Invocation detail",
+        }
+    }
+
+    pub(crate) const ALL: [Self; 11] = [
+        Self::Overview,
+        Self::ModeEditor,
+        Self::DefaultEditor,
+        Self::OverrideEditor,
+        Self::CentralPolicyEditor,
+        Self::ResolverDetail,
+        Self::HealthDetail,
+        Self::GrantList,
+        Self::GrantEditor,
+        Self::InvocationList,
+        Self::InvocationDetail,
+    ];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRevoke {
+    pub grant_id: String,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SidecarSession {
+    pub principal: SidecarPrincipal,
+    pub viewport: SidecarViewportMode,
+    pub form: SidecarFormState,
+    pub reducer: SidecarReducer,
+    pub approval_mode: ApprovalMode,
+    pub policy: CentralPolicyView,
+    pub confirm_revoke: Option<PendingRevoke>,
+    pub selected_invocation: Option<String>,
+    pub cursor: usize,
+    pub busy: bool,
+    pub error: Option<String>,
+    pub conflict: Option<String>,
+    pub save_pending: bool,
+    pub health_refresh_pending: bool,
+    pub remediation: Option<SidecarRemediation>,
+}
+
+impl SidecarSession {
+    pub(crate) fn new(principal: SidecarPrincipal) -> Self {
+        Self {
+            principal,
+            viewport: SidecarViewportMode::Full,
+            form: SidecarFormState::default(),
+            reducer: SidecarReducer::new(
+                "local".into(),
+                "project".into(),
+                "session".into(),
+                "selection".into(),
+            ),
+            approval_mode: ApprovalMode::Ask,
+            policy: CentralPolicyView {
+                value: MediaResourceLimits::defaults().sidecar_invocations_per_session,
+                source: SidecarInvocationCapProvenance::Configured,
+                hard_ceiling: MediaResourceLimits::hard_ceilings().sidecar_invocations_per_session,
+            },
+            confirm_revoke: None,
+            selected_invocation: None,
+            cursor: 0,
+            busy: false,
+            error: None,
+            conflict: None,
+            save_pending: false,
+            health_refresh_pending: false,
+            remediation: None,
+        }
+    }
+
+    pub(crate) fn first_use(&self) -> FirstUseView {
+        FirstUseView::for_mode(self.approval_mode)
+    }
+
+    pub(crate) fn cancel_confirm(&mut self) {
+        self.confirm_revoke = None;
+    }
+
+    pub(crate) fn rebind_identity(
+        &mut self,
+        daemon_instance: String,
+        project_id: String,
+        session_id: String,
+        selection_id: String,
+    ) {
+        self.reducer
+            .rebind(daemon_instance, project_id, session_id, selection_id);
+        self.confirm_revoke = None;
+        self.selected_invocation = None;
+        self.error = None;
+        self.conflict = None;
+        self.busy = false;
+        self.remediation = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SidecarPage {
+    pub(super) kind: SidecarPageKind,
+    pub(super) session: SidecarSession,
+}
+
+fn boxed(page: SidecarPage) -> PageBox {
+    Box::new(page)
+}
+
+pub(super) fn sidecar_overview_page(principal: SidecarPrincipal) -> PageBox {
+    boxed(SidecarPage {
+        kind: SidecarPageKind::Overview,
+        session: SidecarSession::new(principal),
+    })
+}
+
+pub(super) fn sidecar_page(kind: SidecarPageKind, session: SidecarSession) -> PageBox {
+    boxed(SidecarPage { kind, session })
+}
+
+fn open_node(node: SidecarNodeId, session: SidecarSession) -> PageBox {
+    let kind = match node {
+        SidecarNodeId::Mode => SidecarPageKind::ModeEditor,
+        SidecarNodeId::Defaults => SidecarPageKind::DefaultEditor,
+        SidecarNodeId::Override => SidecarPageKind::OverrideEditor,
+        SidecarNodeId::CentralPolicy => SidecarPageKind::CentralPolicyEditor,
+        SidecarNodeId::Resolver => SidecarPageKind::ResolverDetail,
+        SidecarNodeId::Health => SidecarPageKind::HealthDetail,
+        SidecarNodeId::Grants => SidecarPageKind::GrantList,
+        SidecarNodeId::Invocations => SidecarPageKind::InvocationList,
+    };
+    sidecar_page(kind, session)
+}
+
+type SidecarBinding = Option<(SidecarAction, bool, Option<&'static str>)>;
+
+fn sidecar_layout(frame: &mut Frame, area: Rect, mode: SidecarViewportMode) -> Rect {
+    match mode {
+        SidecarViewportMode::Full => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(26)])
+                .split(area);
+            let info = Paragraph::new(vec![
+                Line::from("Layout: Full"),
+                Line::from(""),
+                Line::from("Trust is not consent."),
+                Line::from("Grants: once/session/project."),
+                Line::from("No global option."),
+            ])
+            .block(Block::default().borders(Borders::ALL).title(" Context "))
+            .wrap(Wrap { trim: false });
+            frame.render_widget(info, cols[1]);
+            cols[0]
+        }
+        SidecarViewportMode::Compact => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(area);
+            frame.render_widget(
+                Paragraph::new(Line::from("Layout: Compact — trust is not consent")),
+                rows[0],
+            );
+            rows[1]
+        }
+        SidecarViewportMode::Reduced | SidecarViewportMode::Blocked => area,
+    }
+}
+
+fn render_resize_blocker(frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from("Terminal too small for Image Sidecar settings."),
+        Line::from("Minimum: 60 columns × 16 rows."),
+        Line::from(""),
+        Line::from("q: quit  ?: help"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" Resize "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_sidecar_page(
+    cx: &SettingsCx,
+    frame: &mut Frame,
+    area: Rect,
+    key: &'static str,
+    title: &str,
+    rows: Vec<(String, SidecarBinding)>,
+    selected: Option<usize>,
+) {
+    let mode = sidecar_viewport_mode(area.width, area.height);
+    if mode == SidecarViewportMode::Blocked {
+        render_resize_blocker(frame, area);
+        return;
+    }
+    let content = sidecar_layout(frame, area, mode);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(content);
+    frame.render_widget(block, content);
+    let mut lines = Vec::with_capacity(rows.len());
+    let mut controls = Vec::with_capacity(rows.len());
+    for (text, binding) in rows {
+        lines.push(Line::from(text));
+        controls.push(binding.map(|(action, enabled, reason)| {
+            (SettingsPointerAction::Sidecar(action), enabled, reason)
+        }));
+    }
+    cx.scroll_states.render_control_lines(
+        frame,
+        inner,
+        key,
+        (lines, selected),
+        controls,
+        (&cx.pointer_surface, SettingsScrollRegionId(key)).into(),
+    );
+}
+
+fn accept_or_back(action: &SettingsPointerAction, accepted: bool) -> Nav {
+    if accepted {
+        return Nav::Stay;
+    }
+    if matches!(
+        action,
+        SettingsPointerAction::Sidecar(SidecarAction::Cancel)
+    ) {
+        return Nav::Back;
+    }
+    Nav::Stay
+}
+
+impl SidecarPage {
+    pub(crate) fn visible_rows(&self) -> Vec<SidecarRowView> {
+        let mut rows = Vec::new();
+        let policy = self.session.policy.render_line();
+        rows.push(SidecarRowView {
+            label: "effective_policy".into(),
+            value: policy,
+            state: if self.session.busy {
+                "busy".into()
+            } else {
+                "idle".into()
+            },
+            destination: self
+                .session
+                .reducer
+                .resolution
+                .as_ref()
+                .map(|t| t.origin.clone()),
+            scope: None,
+            error: self.session.error.clone(),
+            busy: self.session.busy,
+        });
+        match self.kind {
+            SidecarPageKind::Overview => {
+                for title in SIDECAR_NODE_TITLES {
+                    rows.push(SidecarRowView {
+                        label: (*title).into(),
+                        value: String::new(),
+                        state: "nav".into(),
+                        destination: None,
+                        scope: None,
+                        error: None,
+                        busy: false,
+                    });
+                }
+            }
+            SidecarPageKind::ModeEditor => {
+                rows.push(SidecarRowView {
+                    label: "mode".into(),
+                    value: self.session.form.mode.as_str().into(),
+                    state: "edit".into(),
+                    destination: None,
+                    scope: None,
+                    error: None,
+                    busy: false,
+                });
+            }
+            SidecarPageKind::GrantList | SidecarPageKind::GrantEditor => {
+                for grant in &self.session.reducer.grants {
+                    rows.push(SidecarRowView {
+                        label: grant.grant_id.clone(),
+                        value: grant.row_text(),
+                        state: if grant.revoked {
+                            "revoked".into()
+                        } else {
+                            "active".into()
+                        },
+                        destination: Some(grant.destination.clone()),
+                        scope: Some(grant.scope.as_str().into()),
+                        error: None,
+                        busy: false,
+                    });
+                }
+            }
+            SidecarPageKind::InvocationList | SidecarPageKind::InvocationDetail => {
+                for inv in &self.session.reducer.invocations {
+                    rows.push(SidecarRowView {
+                        label: inv.invocation_id.clone(),
+                        value: inv.row_text(),
+                        state: inv.state.as_str().into(),
+                        destination: Some(format!("{}:{}", inv.provider, inv.model)),
+                        scope: inv.grant_id.clone(),
+                        error: inv.safe_error.clone(),
+                        busy: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+        if let Some(r) = self.session.remediation {
+            rows.push(SidecarRowView {
+                label: "remediation".into(),
+                value: r.label().into(),
+                state: r.code().into(),
+                destination: None,
+                scope: None,
+                error: Some(r.code().into()),
+                busy: false,
+            });
+        }
+        rows
+    }
+
+    pub(crate) fn a11y(&self) -> SidecarA11yProjection {
+        let rows = self.visible_rows();
+        let focused = rows.get(self.session.cursor).or_else(|| rows.first());
+        let grant_warning = self
+            .session
+            .reducer
+            .grants
+            .iter()
+            .find_map(|g| g.project_warning().map(str::to_string));
+        SidecarA11yProjection {
+            focused_label: focused.map(|r| r.label.clone()).unwrap_or_default(),
+            focused_value: focused.map(|r| r.value.clone()).unwrap_or_default(),
+            effective_policy: "sidecar_invocations_per_session".into(),
+            effective_value: self.session.policy.value.to_string(),
+            effective_source: self.session.policy.source_label().into(),
+            destination: focused
+                .and_then(|r| r.destination.clone())
+                .or_else(|| {
+                    self.session
+                        .reducer
+                        .resolution
+                        .as_ref()
+                        .map(|t| t.origin.clone())
+                })
+                .unwrap_or_default(),
+            scope: focused.and_then(|r| r.scope.clone()).unwrap_or_default(),
+            non_color_state: focused
+                .map(|r| r.state.clone())
+                .unwrap_or_else(|| "idle".into()),
+            busy: self.session.busy,
+            error: self.session.error.clone(),
+            project_grant_warning: grant_warning,
+        }
+    }
+
+    pub(crate) fn named_actions(&self) -> Vec<(SidecarAction, bool, Option<&'static str>)> {
+        build_rows(self)
+            .into_iter()
+            .filter_map(|(_, binding)| binding)
+            .collect()
+    }
+
+    fn push_kind(&self, kind: SidecarPageKind) -> Nav {
+        Nav::Push(sidecar_page(kind, self.session.clone()))
+    }
+}
+
+fn sample_model() -> SidecarModelRef {
+    SidecarModelRef {
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+    }
+}
+
+fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
+    let mut rows: Vec<(String, SidecarBinding)> = Vec::new();
+    let can_mutate = page.session.principal.can_mutate();
+    let mutate_reason = page.session.principal.config_reason();
+    match page.kind {
+        SidecarPageKind::Overview => {
+            for (i, title) in SIDECAR_NODE_TITLES.iter().enumerate() {
+                let marker = if i == page.session.cursor {
+                    "▸ "
+                } else {
+                    "  "
+                };
+                let node = match i {
+                    0 => SidecarNodeId::Mode,
+                    1 => SidecarNodeId::Defaults,
+                    2 => SidecarNodeId::Override,
+                    3 => SidecarNodeId::CentralPolicy,
+                    4 => SidecarNodeId::Resolver,
+                    5 => SidecarNodeId::Health,
+                    6 => SidecarNodeId::Grants,
+                    _ => SidecarNodeId::Invocations,
+                };
+                rows.push((
+                    format!("{marker}{title}"),
+                    Some((SidecarAction::OpenNode(node), true, None)),
+                ));
+            }
+            rows.push((String::new(), None));
+            rows.push((
+                "[open resolver detail]".into(),
+                Some((SidecarAction::OpenResolverDetail, true, None)),
+            ));
+            rows.push((
+                "[open health detail]".into(),
+                Some((SidecarAction::OpenHealthDetail, true, None)),
+            ));
+            rows.push((page.session.policy.render_line(), None));
+        }
+        SidecarPageKind::ModeEditor => {
+            rows.push((
+                format!("Current mode: {}", page.session.form.mode.as_str()),
+                None,
+            ));
+            for choice in [
+                SidecarModeChoice::Automatic,
+                SidecarModeChoice::Always,
+                SidecarModeChoice::Never,
+            ] {
+                rows.push((
+                    format!("[{}]", choice.as_str()),
+                    Some((SidecarAction::SetMode(choice), can_mutate, mutate_reason)),
+                ));
+            }
+            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        }
+        SidecarPageKind::DefaultEditor => {
+            let model = page
+                .session
+                .form
+                .selectable_models()
+                .first()
+                .map(|m| SidecarModelRef {
+                    provider: m.provider.clone(),
+                    model: m.model.clone(),
+                })
+                .unwrap_or_else(sample_model);
+            rows.push(("Trusted-primary default".into(), None));
+            rows.push((
+                "[set trusted default]".into(),
+                Some((
+                    SidecarAction::SetTrustedDefault(model.clone()),
+                    can_mutate,
+                    mutate_reason,
+                )),
+            ));
+            rows.push(("Untrusted-primary default".into(), None));
+            rows.push((
+                "[set untrusted default]".into(),
+                Some((
+                    SidecarAction::SetUntrustedDefault(model),
+                    can_mutate,
+                    mutate_reason,
+                )),
+            ));
+            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        }
+        SidecarPageKind::OverrideEditor => {
+            let model = page
+                .session
+                .form
+                .selectable_models()
+                .first()
+                .map(|m| SidecarModelRef {
+                    provider: m.provider.clone(),
+                    model: m.model.clone(),
+                })
+                .unwrap_or_else(sample_model);
+            rows.push(("Optional per-primary override".into(), None));
+            rows.push((
+                "[set override]".into(),
+                Some((SidecarAction::SetOverride(model), can_mutate, mutate_reason)),
+            ));
+            rows.push((
+                "[clear override]".into(),
+                Some((SidecarAction::ClearOverride, can_mutate, mutate_reason)),
+            ));
+            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        }
+        SidecarPageKind::CentralPolicyEditor => {
+            rows.push((page.session.policy.render_line(), None));
+            rows.push((
+                format!(
+                    "Draft sidecar_invocations_per_session={}",
+                    page.session.form.central_cap
+                ),
+                None,
+            ));
+            rows.push(("No sidecar-local cap is stored.".into(), None));
+            let save_reason = if !can_mutate {
+                mutate_reason
+            } else if page.session.save_pending {
+                Some(REASON_SAVE_PENDING)
+            } else {
+                None
+            };
+            rows.push((
+                "[Save]".into(),
+                Some((
+                    SidecarAction::SaveCentralPolicy,
+                    can_mutate && !page.session.save_pending,
+                    save_reason,
+                )),
+            ));
+            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        }
+        SidecarPageKind::ResolverDetail => {
+            if let Some(trace) = &page.session.reducer.resolution {
+                rows.push((
+                    format!(
+                        "primary={}:{} trust={}",
+                        trace.primary_provider, trace.primary_model, trace.primary_trust
+                    ),
+                    None,
+                ));
+                rows.push((format!("matched={}", trace.matched_source), None));
+                rows.push((
+                    format!(
+                        "sidecar={}:{}",
+                        trace.sidecar_provider.as_deref().unwrap_or("-"),
+                        trace.sidecar_model.as_deref().unwrap_or("-")
+                    ),
+                    None,
+                ));
+                rows.push((format!("origin={}", trace.origin), None));
+                rows.push((format!("location={}", trace.location), None));
+                rows.push((
+                    format!("credential_fingerprint={}", trace.credential_fingerprint),
+                    None,
+                ));
+                rows.push((
+                    format!(
+                        "capability source={} freshness={}",
+                        trace.capability_source, trace.capability_freshness
+                    ),
+                    None,
+                ));
+                rows.push((
+                    format!(
+                        "config_generation={} mode={} available={} reason={}",
+                        trace.config_generation,
+                        trace.mode.as_str(),
+                        trace.available,
+                        trace.reason
+                    ),
+                    None,
+                ));
+                if let Some(fb) = &trace.fallback_outcome {
+                    rows.push((format!("fallback={fb}"), None));
+                }
+            } else {
+                rows.push(("No resolver projection.".into(), None));
+            }
+            rows.push((page.session.policy.render_line(), None));
+            rows.push((
+                "[refresh health]".into(),
+                Some((
+                    SidecarAction::RefreshHealth,
+                    can_mutate && !page.session.health_refresh_pending,
+                    if page.session.health_refresh_pending {
+                        Some("health_refresh_pending")
+                    } else {
+                        mutate_reason
+                    },
+                )),
+            ));
+            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        }
+        SidecarPageKind::HealthDetail => {
+            if let Some(health) = &page.session.reducer.health {
+                let state = if health.available {
+                    "available"
+                } else {
+                    "unavailable"
+                };
+                rows.push((format!("Health: {state} (non-color)"), None));
+                rows.push((
+                    format!(
+                        "source={} freshness={} reason={}",
+                        health.capability_source, health.freshness, health.reason
+                    ),
+                    None,
+                ));
+            } else {
+                rows.push(("No health projection.".into(), None));
+            }
+            rows.push((
+                "[refresh health]".into(),
+                Some((
+                    SidecarAction::RefreshHealth,
+                    can_mutate && !page.session.health_refresh_pending,
+                    if page.session.health_refresh_pending {
+                        Some("health_refresh_pending")
+                    } else {
+                        mutate_reason
+                    },
+                )),
+            ));
+            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        }
+        SidecarPageKind::GrantList => {
+            let first_use = page.session.first_use();
+            if page.session.approval_mode == ApprovalMode::Yolo {
+                rows.push((
+                    format!(
+                        "Yolo: {}",
+                        first_use.yolo_label.unwrap_or("agent_discretion")
+                    ),
+                    None,
+                ));
+                rows.push(("No standing grant is created automatically.".into(), None));
+            }
+            if page.session.reducer.grants.is_empty() {
+                rows.push(("No destination grants.".into(), None));
+            } else {
+                for grant in &page.session.reducer.grants {
+                    rows.push((grant.row_text(), None));
+                    if let Some(warning) = grant.project_warning() {
+                        rows.push((warning.into(), None));
+                    }
+                }
+            }
+            let create_enabled = can_mutate && page.session.approval_mode == ApprovalMode::Ask;
+            let create_reason = if page.session.approval_mode == ApprovalMode::Yolo {
+                Some(REASON_YOLO_NO_GRANT)
+            } else {
+                mutate_reason
+            };
+            rows.push((
+                "[create grant]".into(),
+                Some((SidecarAction::CreateGrant, create_enabled, create_reason)),
+            ));
+            rows.push((
+                "[open grant editor]".into(),
+                Some((SidecarAction::OpenGrantEditor, true, None)),
+            ));
+            if let Some(grant) = page.session.reducer.grants.first() {
+                let revoke_ok = page.session.principal.can_revoke() && !grant.revoked;
+                rows.push((
+                    "[revoke grant]".into(),
+                    Some((
+                        SidecarAction::RevokeGrant(SidecarGrantId(grant.grant_id.clone())),
+                        revoke_ok,
+                        if revoke_ok {
+                            None
+                        } else {
+                            Some(REASON_REVOKE_REQUIRES_AUTHORIZATION)
+                        },
+                    )),
+                ));
+            }
+            if let Some(pending) = &page.session.confirm_revoke {
+                rows.push(("Revoke grant? [Revoke grant] [Cancel]".into(), None));
+                rows.push((
+                    "[Revoke grant]".into(),
+                    Some((
+                        SidecarAction::ConfirmRevokeGrant(
+                            SidecarGrantId(pending.grant_id.clone()),
+                            ConfirmationChoice::Confirm,
+                        ),
+                        true,
+                        None,
+                    )),
+                ));
+                rows.push((
+                    "[Cancel]".into(),
+                    Some((
+                        SidecarAction::ConfirmRevokeGrant(
+                            SidecarGrantId(pending.grant_id.clone()),
+                            ConfirmationChoice::Cancel,
+                        ),
+                        true,
+                        None,
+                    )),
+                ));
+            }
+            rows.push((page.session.policy.render_line(), None));
+        }
+        SidecarPageKind::GrantEditor => {
+            let first_use = page.session.first_use();
+            if first_use.prompt {
+                rows.push(("First use — choose a grant scope.".into(), None));
+                for scope in first_use.grant_choices {
+                    rows.push((
+                        format!("[{}]", scope.as_str()),
+                        Some((SidecarAction::SelectGrantScope(scope), true, None)),
+                    ));
+                }
+            } else {
+                rows.push((
+                    format!(
+                        "Yolo: {}",
+                        first_use.yolo_label.unwrap_or("agent_discretion")
+                    ),
+                    None,
+                ));
+                rows.push(("No approval prompt. No standing grant.".into(), None));
+            }
+            rows.push((
+                "[create grant]".into(),
+                Some((
+                    SidecarAction::CreateGrant,
+                    can_mutate && first_use.prompt,
+                    if first_use.prompt {
+                        mutate_reason
+                    } else {
+                        Some(REASON_YOLO_NO_GRANT)
+                    },
+                )),
+            ));
+            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        }
+        SidecarPageKind::InvocationList => {
+            if page.session.reducer.invocations.is_empty() {
+                rows.push(("No invocations.".into(), None));
+            } else {
+                for (i, inv) in page.session.reducer.invocations.iter().enumerate() {
+                    let marker = if i == page.session.cursor {
+                        "▸ "
+                    } else {
+                        "  "
+                    };
+                    rows.push((format!("{marker}{}", inv.row_text()), None));
+                }
+                if let Some(inv) = page.session.reducer.invocations.get(page.session.cursor) {
+                    rows.push((
+                        "[open invocation detail]".into(),
+                        Some((
+                            SidecarAction::OpenInvocationDetail(SidecarInvocationId(
+                                inv.invocation_id.clone(),
+                            )),
+                            true,
+                            None,
+                        )),
+                    ));
+                }
+            }
+            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        }
+        SidecarPageKind::InvocationDetail => {
+            if let Some(inv) = page
+                .session
+                .selected_invocation
+                .as_ref()
+                .and_then(|id| {
+                    page.session
+                        .reducer
+                        .invocations
+                        .iter()
+                        .find(|i| i.invocation_id == *id)
+                })
+                .or_else(|| page.session.reducer.invocations.first())
+            {
+                rows.push((inv.row_text(), None));
+                rows.push((
+                    format!(
+                        "timestamps created={} dispatched={} terminal={}",
+                        inv.created_at,
+                        inv.dispatched_at.as_deref().unwrap_or("-"),
+                        inv.terminal_at.as_deref().unwrap_or("-")
+                    ),
+                    None,
+                ));
+                rows.push((
+                    format!(
+                        "usage in={} out={} cost_us={}",
+                        inv.usage_input_tokens.unwrap_or(0),
+                        inv.usage_output_tokens.unwrap_or(0),
+                        inv.usage_cost_micro_usd.unwrap_or(0)
+                    ),
+                    None,
+                ));
+                rows.push((
+                    format!(
+                        "resource charged={} reservation={} slot={}",
+                        inv.sidecar_invocation_charged,
+                        inv.media_reservation_id.as_deref().unwrap_or("-"),
+                        inv.provider_concurrency_slot.as_deref().unwrap_or("-")
+                    ),
+                    None,
+                ));
+                if let Some(err) = &inv.safe_error {
+                    rows.push((format!("error={err}"), None));
+                }
+                if let Some(detail) = &inv.owner_detail {
+                    rows.push((
+                        format!(
+                            "owner purpose={} version={} digest={} scalars={} bytes={}",
+                            detail.purpose,
+                            detail.instruction_version,
+                            detail.body_digest_hex,
+                            detail.unicode_scalar_len,
+                            detail.utf8_byte_len
+                        ),
+                        None,
+                    ));
+                }
+            } else {
+                rows.push(("Invocation not found.".into(), None));
+            }
+            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        }
+    }
+    if let Some(conflict) = &page.session.conflict {
+        rows.push((format!("Conflict: {conflict} Reload or reapply."), None));
+    }
+    if let Some(r) = page.session.remediation {
+        rows.push((format!("{} ({})", r.label(), r.code()), None));
+    }
+    rows
+}
+
+impl SettingsPage for SidecarPage {
+    fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind {
+        self.kind.surface()
+    }
+
+    fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        if self.session.viewport == SidecarViewportMode::Blocked {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
+                _ => Nav::Stay,
+            };
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {
+                if self.session.confirm_revoke.is_some() {
+                    self.session.cancel_confirm();
+                    Nav::Stay
+                } else {
+                    Nav::Back
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.session.confirm_revoke.is_some() {
+                    self.session.cancel_confirm();
+                    return Nav::Stay;
+                }
+                self.session.cursor = self.session.cursor.saturating_sub(1);
+                Nav::Stay
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.session.confirm_revoke.is_some() {
+                    self.session.cancel_confirm();
+                    return Nav::Stay;
+                }
+                self.session.cursor = self.session.cursor.saturating_add(1);
+                Nav::Stay
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if self.kind == SidecarPageKind::Overview {
+                    let node = match self.session.cursor {
+                        0 => SidecarNodeId::Mode,
+                        1 => SidecarNodeId::Defaults,
+                        2 => SidecarNodeId::Override,
+                        3 => SidecarNodeId::CentralPolicy,
+                        4 => SidecarNodeId::Resolver,
+                        5 => SidecarNodeId::Health,
+                        6 => SidecarNodeId::Grants,
+                        _ => SidecarNodeId::Invocations,
+                    };
+                    return Nav::Push(open_node(node, self.session.clone()));
+                }
+                Nav::Stay
+            }
+            _ => Nav::Stay,
+        }
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        let SettingsPointerAction::Sidecar(action) = action else {
+            return Nav::Stay;
+        };
+        match action {
+            SidecarAction::OpenNode(node) => Nav::Push(open_node(node, self.session.clone())),
+            SidecarAction::OpenResolverDetail => self.push_kind(SidecarPageKind::ResolverDetail),
+            SidecarAction::OpenHealthDetail => self.push_kind(SidecarPageKind::HealthDetail),
+            SidecarAction::OpenGrantEditor => self.push_kind(SidecarPageKind::GrantEditor),
+            SidecarAction::OpenInvocationDetail(id) => {
+                self.session.selected_invocation = Some(id.0);
+                self.push_kind(SidecarPageKind::InvocationDetail)
+            }
+            SidecarAction::SetMode(mode) => {
+                self.session.form.mode = mode;
+                Nav::Stay
+            }
+            SidecarAction::SetTrustedDefault(model) => {
+                self.session.form.trusted_default = Some(model);
+                Nav::Stay
+            }
+            SidecarAction::SetUntrustedDefault(model) => {
+                self.session.form.untrusted_default = Some(model);
+                Nav::Stay
+            }
+            SidecarAction::SetOverride(model) => {
+                if self
+                    .session
+                    .form
+                    .selectable_models()
+                    .iter()
+                    .any(|m| m.provider == model.provider && m.model == model.model)
+                    || self.session.form.models.is_empty()
+                {
+                    self.session.form.override_pair = Some(model);
+                    self.session.remediation = None;
+                } else {
+                    self.session.remediation = Some(SidecarRemediation::InvalidOverride);
+                }
+                Nav::Stay
+            }
+            SidecarAction::ClearOverride => {
+                self.session.form.override_pair = None;
+                Nav::Stay
+            }
+            SidecarAction::SaveCentralPolicy => {
+                // TODO: persist via daemon typed-document edit once sidecar
+                // config is a first-class extended-config field.
+                if self.session.principal.can_mutate() && !self.session.save_pending {
+                    self.session.policy.value = self.session.form.central_cap;
+                    self.session.policy.source = SidecarInvocationCapProvenance::Configured;
+                    self.session.save_pending = false;
+                }
+                Nav::Stay
+            }
+            SidecarAction::RefreshHealth => {
+                // TODO: request a daemon health projection; commit only when
+                // selection/config/project/session identities match.
+                self.session.health_refresh_pending = true;
+                Nav::Stay
+            }
+            SidecarAction::SelectGrantScope(scope) => {
+                self.session.form.draft_scope = scope;
+                Nav::Stay
+            }
+            SidecarAction::CreateGrant => {
+                if self.kind == SidecarPageKind::GrantList {
+                    if self.session.approval_mode == ApprovalMode::Yolo {
+                        return Nav::Stay;
+                    }
+                    return self.push_kind(SidecarPageKind::GrantEditor);
+                }
+                if self.session.approval_mode == ApprovalMode::Yolo
+                    || !self.session.principal.can_mutate()
+                {
+                    return Nav::Stay;
+                }
+                let grant = GrantView {
+                    grant_id: format!("grant-{}", self.session.reducer.grants.len() + 1),
+                    version: 1,
+                    project: self.session.reducer.project_id.clone(),
+                    destination: self
+                        .session
+                        .reducer
+                        .resolution
+                        .as_ref()
+                        .map(|t| t.origin.clone())
+                        .unwrap_or_else(|| "https://example.invalid".into()),
+                    media_class: MediaClass::Image.as_str().into(),
+                    purpose: Purpose::AskImage.as_str().into(),
+                    scope: self.session.form.draft_scope,
+                    session_binding: (self.session.form.draft_scope == GrantScope::Session)
+                        .then(|| self.session.reducer.session_id.clone()),
+                    invocation_binding: (self.session.form.draft_scope == GrantScope::Once)
+                        .then(|| "invocation-pending".into()),
+                    created_at: "0".into(),
+                    last_used_at: None,
+                    revoked: false,
+                    consumed: false,
+                };
+                self.session.reducer.grants.push(grant);
+                Nav::Stay
+            }
+            SidecarAction::RevokeGrant(id) => {
+                if !self.session.principal.can_revoke() {
+                    return Nav::Stay;
+                }
+                if let Some(grant) = self
+                    .session
+                    .reducer
+                    .grants
+                    .iter()
+                    .find(|g| g.grant_id == id.0)
+                {
+                    self.session.confirm_revoke = Some(PendingRevoke {
+                        grant_id: grant.grant_id.clone(),
+                        version: grant.version,
+                    });
+                }
+                Nav::Stay
+            }
+            SidecarAction::ConfirmRevokeGrant(id, ConfirmationChoice::Confirm) => {
+                let Some(pending) = self.session.confirm_revoke.take() else {
+                    return Nav::Stay;
+                };
+                if pending.grant_id != id.0 {
+                    return Nav::Stay;
+                }
+                let _ = self
+                    .session
+                    .reducer
+                    .revoke_grant(&pending.grant_id, pending.version);
+                Nav::Stay
+            }
+            SidecarAction::ConfirmRevokeGrant(_, ConfirmationChoice::Cancel) => {
+                self.session.cancel_confirm();
+                Nav::Stay
+            }
+            SidecarAction::Cancel => Nav::Back,
+        }
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        _region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if self.session.confirm_revoke.is_some() {
+            self.session.cancel_confirm();
+            return Nav::Stay;
+        }
+        let key = if delta < 0 {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        for _ in 0..delta.unsigned_abs() {
+            let nav = self.handle_key(cx, KeyEvent::new(key, crossterm::event::KeyModifiers::NONE));
+            if !matches!(nav, Nav::Stay) {
+                return nav;
+            }
+        }
+        Nav::Stay
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        self.session.cancel_confirm();
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        let rows = build_rows(self);
+        render_sidecar_page(
+            cx,
+            frame,
+            area,
+            "sidecar",
+            self.kind.title(),
+            rows,
+            Some(self.session.cursor),
+        );
+    }
+
+    fn title(&self, _cx: &SettingsCx) -> String {
+        self.kind.title().to_owned()
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        "↑/↓: navigate  enter: open  h/esc: back"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        self.kind.title()
+    }
+}

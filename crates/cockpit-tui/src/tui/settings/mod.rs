@@ -8,7 +8,7 @@
 //!   - `Dialog::CreateConfig`    no config yet — pick a location to scaffold
 //!   - `Dialog::Settings`        navigate the settings tree
 //!
-//! The Settings page tree has 15 default-profile nodes and one additional
+//! The Settings page tree has 16 default-profile nodes and one additional
 //! extended-profile node; see `root_nodes()`:
 //!
 //! ```text
@@ -27,6 +27,7 @@
 //!  ├── Profile            ┘
 //!  ├── Image spend budgets
 //!  ├── Generation
+//!  ├── Image Sidecar
 //!  ├── Tools
 //!  ├── Harnesses
 //!  ├── Skills
@@ -49,6 +50,7 @@ pub(crate) mod disk_daemon_fake;
 mod grab;
 mod harnesses_page;
 mod image_generation;
+mod image_sidecar;
 #[cfg(feature = "extended")]
 mod image_spend;
 mod lsp_page;
@@ -2417,10 +2419,21 @@ pub(super) enum SettingsPointerSurfaceKind {
     JobList,
     JobDetail,
     LateResultAction,
+    SidecarOverview,
+    SidecarModeEditor,
+    SidecarDefaultEditor,
+    SidecarOverrideEditor,
+    SidecarCentralPolicyEditor,
+    SidecarResolverDetail,
+    SidecarHealthDetail,
+    SidecarGrantList,
+    SidecarGrantEditor,
+    SidecarInvocationList,
+    SidecarInvocationDetail,
 }
 
 impl SettingsPointerSurfaceKind {
-    pub(super) const ALL: [Self; 23] = [
+    pub(super) const ALL: [Self; 34] = [
         Self::Root,
         Self::DefaultModel,
         Self::Agents,
@@ -2444,6 +2457,17 @@ impl SettingsPointerSurfaceKind {
         Self::JobList,
         Self::JobDetail,
         Self::LateResultAction,
+        Self::SidecarOverview,
+        Self::SidecarModeEditor,
+        Self::SidecarDefaultEditor,
+        Self::SidecarOverrideEditor,
+        Self::SidecarCentralPolicyEditor,
+        Self::SidecarResolverDetail,
+        Self::SidecarHealthDetail,
+        Self::SidecarGrantList,
+        Self::SidecarGrantEditor,
+        Self::SidecarInvocationList,
+        Self::SidecarInvocationDetail,
     ];
 }
 
@@ -2704,6 +2728,7 @@ pub(crate) enum TestPageRef<'a> {
     JobList(&'a image_generation::JobListPage),
     JobDetail(&'a image_generation::JobDetailPage),
     LateResultAction(&'a image_generation::LateResultActionPage),
+    Sidecar(&'a image_sidecar::SidecarPage),
 }
 
 #[cfg(test)]
@@ -2733,6 +2758,7 @@ enum TestPageMut<'a> {
     JobList(&'a mut image_generation::JobListPage),
     JobDetail(&'a mut image_generation::JobDetailPage),
     LateResultAction(&'a mut image_generation::LateResultActionPage),
+    Sidecar(&'a mut image_sidecar::SidecarPage),
 }
 
 #[cfg(test)]
@@ -2763,6 +2789,7 @@ impl std::fmt::Debug for TestPageRef<'_> {
             Self::JobList(_) => f.write_str("JobList"),
             Self::JobDetail(_) => f.write_str("JobDetail"),
             Self::LateResultAction(_) => f.write_str("LateResultAction"),
+            Self::Sidecar(_) => f.write_str("Sidecar"),
         }
     }
 }
@@ -2794,6 +2821,7 @@ impl std::fmt::Debug for TestPageMut<'_> {
             Self::JobList(_) => f.write_str("JobList"),
             Self::JobDetail(_) => f.write_str("JobDetail"),
             Self::LateResultAction(_) => f.write_str("LateResultAction"),
+            Self::Sidecar(_) => f.write_str("Sidecar"),
         }
     }
 }
@@ -6354,6 +6382,9 @@ impl SettingsDialog {
         {
             return TestPageRef::LateResultAction(p);
         }
+        if let Some(p) = self.page.downcast_ref::<image_sidecar::SidecarPage>() {
+            return TestPageRef::Sidecar(p);
+        }
         unreachable!("unknown settings page")
     }
 
@@ -6494,6 +6525,13 @@ impl SettingsDialog {
             return TestPageMut::LateResultAction(
                 self.page
                     .downcast_mut::<image_generation::LateResultActionPage>()
+                    .unwrap(),
+            );
+        }
+        if self.page.as_any().is::<image_sidecar::SidecarPage>() {
+            return TestPageMut::Sidecar(
+                self.page
+                    .downcast_mut::<image_sidecar::SidecarPage>()
                     .unwrap(),
             );
         }
@@ -7530,6 +7568,11 @@ impl SettingsPage for RootPage {
                             &cx.image_generation_session_snapshot(),
                         ),
                     )),
+                    "Image Sidecar" => Some(image_sidecar::sidecar_overview_page(
+                        image_sidecar::SidecarPrincipal::from_session(
+                            &cx.image_generation_session_snapshot(),
+                        ),
+                    )),
                     "Privacy & Safety" => {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Privacy)))
@@ -7673,9 +7716,9 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 /// MCP/LSP are kept as extra nodes so integration settings stay reachable
 /// from the menu.
 #[cfg(feature = "extended")]
-const ROOT_NODE_COUNT: usize = 16;
+const ROOT_NODE_COUNT: usize = 17;
 #[cfg(not(feature = "extended"))]
-const ROOT_NODE_COUNT: usize = 15;
+const ROOT_NODE_COUNT: usize = 16;
 
 fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
     [
@@ -7719,6 +7762,11 @@ fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
             id: pointer_actions::RootNodeId::Generation,
             title: "Generation",
             description: "Image-generation endpoints, targets, workflows, budget, destination grants, and job management. Visibility follows the control-plane authorization matrix.",
+        },
+        NavNode {
+            id: pointer_actions::RootNodeId::ImageSidecar,
+            title: "Image Sidecar",
+            description: "Image-sidecar mode, trust-class defaults, per-primary override, central invocation policy, destination grants, and invocation accounting.",
         },
         NavNode {
             id: pointer_actions::RootNodeId::Privacy,

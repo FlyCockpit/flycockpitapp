@@ -1,0 +1,736 @@
+use super::super::pointer_actions::SettingsPointerAction;
+use super::super::{SettingsPage, SettingsPointerSurfaceKind};
+use super::*;
+use cockpit_config::config::media_budget::MediaResourceLimits;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+fn press(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::empty(),
+        kind: KeyEventKind::Press,
+        state: KeyEventState::empty(),
+    }
+}
+
+fn test_dialog() -> crate::tui::settings::SettingsDialog {
+    use tempfile::TempDir;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    std::mem::forget(tmp);
+    super::super::tests::open_fixture_dialog(&path)
+}
+
+fn render_page_lines(
+    page: &dyn SettingsPage,
+    dialog: &crate::tui::settings::SettingsDialog,
+    width: u16,
+    height: u16,
+) -> Vec<String> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let cx: &SettingsCx = dialog;
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            page.render(cx, frame, area);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    buffer
+        .content()
+        .iter()
+        .collect::<Vec<_>>()
+        .chunks(width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn sample_trace(mode: SidecarModeChoice) -> SidecarEffectiveTrace {
+    SidecarEffectiveTrace {
+        primary_provider: "openai".into(),
+        primary_model: "gpt-4o".into(),
+        primary_trust: "trusted".into(),
+        matched_source: "trust_class_default".into(),
+        sidecar_provider: Some("openai".into()),
+        sidecar_model: Some("gpt-4o".into()),
+        origin: strip_query_and_fragment("https://api.openai.com/v1?sig=secret"),
+        location: "public_cloud".into(),
+        credential_fingerprint: "abcd".repeat(8),
+        capability_source: "configured".into(),
+        capability_freshness: "fresh".into(),
+        config_generation: 1,
+        mode,
+        available: true,
+        fallback_outcome: None,
+        reason: "selected".into(),
+    }
+}
+
+fn sample_grant(scope: GrantScope) -> GrantView {
+    GrantView {
+        grant_id: "grant-1".into(),
+        version: 1,
+        project: "project".into(),
+        destination: "https://api.openai.com".into(),
+        media_class: "image".into(),
+        purpose: "ask_image".into(),
+        scope,
+        session_binding: (scope == GrantScope::Session).then(|| "session".into()),
+        invocation_binding: (scope == GrantScope::Once).then(|| "inv-1".into()),
+        created_at: "1".into(),
+        last_used_at: None,
+        revoked: false,
+        consumed: false,
+    }
+}
+
+fn sample_invocation() -> InvocationView {
+    InvocationView {
+        invocation_id: "inv-1".into(),
+        parent_operation: "ask_image".into(),
+        session: "session".into(),
+        purpose_label: "ask_image".into(),
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+        location: "public_cloud".into(),
+        state: InvocationState::Completed,
+        created_at: "1".into(),
+        dispatched_at: Some("2".into()),
+        terminal_at: Some("3".into()),
+        grant_id: Some("grant-1".into()),
+        disposition: InvocationDisposition::Granted,
+        usage_input_tokens: Some(10),
+        usage_output_tokens: Some(4),
+        usage_cost_micro_usd: Some(12),
+        sidecar_invocation_charged: true,
+        media_reservation_id: Some("res-1".into()),
+        provider_concurrency_slot: Some("slot-1".into()),
+        safe_error: None,
+        owner_detail: Some(OwnerTechnicalDetail {
+            purpose: "ask_image".into(),
+            instruction_version: 1,
+            body_digest_hex: "ab".repeat(32),
+            unicode_scalar_len: 12,
+            utf8_byte_len: 12,
+        }),
+    }
+}
+
+fn page_with(kind: SidecarPageKind) -> SidecarPage {
+    let mut session = SidecarSession::new(SidecarPrincipal::local_owner());
+    session.form.models = vec![
+        SidecarModelOption {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            image_capable: true,
+            fresh: true,
+        },
+        SidecarModelOption {
+            provider: "openai".into(),
+            model: "gpt-text".into(),
+            image_capable: false,
+            fresh: true,
+        },
+        SidecarModelOption {
+            provider: "openai".into(),
+            model: "stale-vision".into(),
+            image_capable: true,
+            fresh: false,
+        },
+    ];
+    session.reducer.resolution = Some(sample_trace(SidecarModeChoice::Automatic));
+    session.reducer.health = Some(HealthView {
+        available: true,
+        capability_source: "configured".into(),
+        freshness: "fresh".into(),
+        reason: "ok".into(),
+    });
+    SidecarPage { kind, session }
+}
+
+#[test]
+fn image_sidecar_settings_resolver_form_matrix() {
+    let mut form = SidecarFormState::default();
+    form.models = vec![
+        SidecarModelOption {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            image_capable: true,
+            fresh: true,
+        },
+        SidecarModelOption {
+            provider: "openai".into(),
+            model: "gpt-text".into(),
+            image_capable: false,
+            fresh: true,
+        },
+        SidecarModelOption {
+            provider: "openai".into(),
+            model: "stale-vision".into(),
+            image_capable: true,
+            fresh: false,
+        },
+    ];
+    let selectable = form.selectable_models();
+    assert_eq!(selectable.len(), 1);
+    assert_eq!(selectable[0].model, "gpt-4o");
+
+    for mode in [
+        SidecarModeChoice::Automatic,
+        SidecarModeChoice::Always,
+        SidecarModeChoice::Never,
+    ] {
+        form.mode = mode;
+        let pair = SidecarModelRef {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+        };
+        form.trusted_default = Some(pair.clone());
+        form.untrusted_default = Some(pair.clone());
+        form.override_pair = Some(pair);
+        let config = form.to_selection_config();
+        assert_eq!(config.mode, mode.to_core());
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(
+            json.get("sidecar_invocations_per_session").is_none(),
+            "selection config must not serialize a sidecar-local cap: {json}"
+        );
+        assert!(json.get("invocation_cap").is_none());
+        let encoded = serde_json::to_string(&config).unwrap();
+        assert!(!encoded.contains("sidecar_invocations_per_session"));
+    }
+
+    form.set_central_cap(32);
+    assert_eq!(form.central_cap, 32);
+    form.set_central_cap(10_000);
+    assert_eq!(
+        form.central_cap,
+        MediaResourceLimits::hard_ceilings().sidecar_invocations_per_session
+    );
+
+    let mut page = page_with(SidecarPageKind::CentralPolicyEditor);
+    page.session.form = form.clone();
+    page.session.policy = CentralPolicyView {
+        value: 32,
+        source: SidecarInvocationCapProvenance::Configured,
+        hard_ceiling: MediaResourceLimits::hard_ceilings().sidecar_invocations_per_session,
+    };
+    let dialog = test_dialog();
+    let lines = render_page_lines(&page, &dialog, 100, 30);
+    let joined = lines.join("\n");
+    assert!(joined.contains("Effective: 32 source=configured hard_ceiling=128"));
+    assert!(joined.contains("Draft sidecar_invocations_per_session="));
+    assert!(joined.contains("No sidecar-local cap is stored."));
+
+    let mut resolver = page_with(SidecarPageKind::ResolverDetail);
+    resolver.session.reducer.resolution = Some(sample_trace(SidecarModeChoice::Always));
+    resolver.session.policy = CentralPolicyView {
+        value: 32,
+        source: SidecarInvocationCapProvenance::Configured,
+        hard_ceiling: 128,
+    };
+    let lines = render_page_lines(&resolver, &dialog, 100, 30);
+    let joined = lines.join("\n");
+    assert!(joined.contains("primary=openai:gpt-4o trust=trusted"));
+    assert!(joined.contains("matched=trust_class_default"));
+    assert!(joined.contains("origin=https://api.openai.com/v1"));
+    assert!(!joined.contains("sig=secret"));
+    assert!(joined.contains("credential_fingerprint="));
+    assert!(joined.contains("config_generation=1 mode=always"));
+    assert!(joined.contains("Effective: 32 source=configured hard_ceiling=128"));
+}
+
+#[test]
+fn image_sidecar_settings_grant_scope_and_revoke() {
+    let scopes = offered_grant_scopes();
+    assert_eq!(
+        scopes,
+        [GrantScope::Once, GrantScope::Session, GrantScope::Project]
+    );
+    let mut page = page_with(SidecarPageKind::GrantEditor);
+    page.session.approval_mode = ApprovalMode::Ask;
+    let dialog = test_dialog();
+    let lines = render_page_lines(&page, &dialog, 100, 30);
+    let joined = lines.join("\n").to_lowercase();
+    assert!(joined.contains("[once]"));
+    assert!(joined.contains("[session]"));
+    assert!(joined.contains("[project]"));
+    assert!(!joined.contains("global"));
+    assert!(!joined.contains("wildcard"));
+    for row in &lines {
+        assert!(
+            !row.to_lowercase().contains("max") && !row.to_lowercase().contains("ceiling"),
+            "grant editor must not show maxima: {row}"
+        );
+    }
+
+    let mut list = page_with(SidecarPageKind::GrantList);
+    list.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
+    let lines = render_page_lines(&list, &dialog, 100, 30);
+    let joined = lines.join("\n");
+    assert!(joined.contains(PROJECT_GRANT_WARNING));
+    assert!(joined.contains("project=project"));
+    assert!(joined.contains("dest=https://api.openai.com"));
+    assert!(joined.contains("media=image"));
+    assert!(joined.contains("purpose=ask_image"));
+    assert!(joined.contains("scope=project"));
+    assert!(joined.contains("Effective:"));
+    assert!(joined.contains("hard_ceiling="));
+    assert!(!joined.to_lowercase().contains("global"));
+
+    let mut dialog = test_dialog();
+    list.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
+            "grant-1".into(),
+        ))),
+    );
+    assert!(list.session.confirm_revoke.is_some());
+    let lines = render_page_lines(&list, &dialog, 100, 30);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Revoke grant? [Revoke grant] [Cancel]"))
+    );
+
+    list.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::ConfirmRevokeGrant(
+            SidecarGrantId("stale".into()),
+            ConfirmationChoice::Confirm,
+        )),
+    );
+    assert!(!list.session.reducer.grants[0].revoked);
+
+    list.session.confirm_revoke = Some(PendingRevoke {
+        grant_id: "grant-1".into(),
+        version: 1,
+    });
+    list.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::ConfirmRevokeGrant(
+            SidecarGrantId("grant-1".into()),
+            ConfirmationChoice::Confirm,
+        )),
+    );
+    assert!(list.session.reducer.grants[0].revoked);
+    assert!(list.session.confirm_revoke.is_none());
+}
+
+#[test]
+fn image_sidecar_settings_ask_yolo_first_use() {
+    let ask = FirstUseView::for_mode(ApprovalMode::Ask);
+    assert_eq!(
+        ask.grant_choices,
+        vec![GrantScope::Once, GrantScope::Session, GrantScope::Project]
+    );
+    assert!(ask.prompt);
+    assert!(!ask.standing_grant);
+    assert!(ask.yolo_label.is_none());
+
+    let yolo = FirstUseView::for_mode(ApprovalMode::Yolo);
+    assert!(yolo.grant_choices.is_empty());
+    assert!(!yolo.prompt);
+    assert!(!yolo.standing_grant);
+    assert_eq!(yolo.yolo_label, Some("agent_discretion"));
+
+    let dialog = test_dialog();
+    let mut ask_page = page_with(SidecarPageKind::GrantEditor);
+    ask_page.session.approval_mode = ApprovalMode::Ask;
+    let joined = render_page_lines(&ask_page, &dialog, 100, 30).join("\n");
+    assert!(joined.contains("[once]"));
+    assert!(joined.contains("First use"));
+
+    let mut yolo_page = page_with(SidecarPageKind::GrantList);
+    yolo_page.session.approval_mode = ApprovalMode::Yolo;
+    let joined = render_page_lines(&yolo_page, &dialog, 100, 30).join("\n");
+    assert!(joined.contains("agent_discretion"));
+    assert!(joined.contains("No standing grant"));
+    assert!(!joined.contains("First use"));
+    assert!(!joined.to_lowercase().contains("[once]"));
+}
+
+#[test]
+fn image_sidecar_settings_trust_vs_egress_disclosure() {
+    let trusted = TrustDisclosure::for_trust(true);
+    let untrusted = TrustDisclosure::for_trust(false);
+    assert_eq!(trusted.trust_class, "trusted");
+    assert_eq!(untrusted.trust_class, "untrusted");
+    let trusted_auth = EgressAuthorityView::shared("https://api.openai.com");
+    let untrusted_auth = EgressAuthorityView::shared("https://api.openai.com");
+    assert_eq!(trusted_auth, untrusted_auth);
+    assert_eq!(trusted_auth.scopes, offered_grant_scopes());
+    for disclosure in [&trusted, &untrusted] {
+        let text = disclosure.lines().join(" ");
+        assert!(text.contains("Trust does not grant egress"));
+        assert!(!text.to_lowercase().contains("consent"));
+        assert!(!text.to_lowercase().contains("trusted therefore"));
+        assert!(!text.to_lowercase().contains("implies"));
+    }
+    assert_ne!(trusted.redaction, untrusted.redaction);
+
+    let dialog = test_dialog();
+    let page = page_with(SidecarPageKind::ResolverDetail);
+    let joined = render_page_lines(&page, &dialog, 100, 30)
+        .join("\n")
+        .to_lowercase();
+    assert!(!joined.contains("consent"));
+}
+
+#[test]
+fn image_sidecar_settings_invocation_accounting_redaction() {
+    let mut page = page_with(SidecarPageKind::InvocationDetail);
+    page.session.reducer.invocations = vec![sample_invocation()];
+    page.session.selected_invocation = Some("inv-1".into());
+    let dialog = test_dialog();
+    let joined = render_page_lines(&page, &dialog, 100, 40).join("\n");
+    assert!(joined.contains("purpose=ask_image"));
+    assert!(joined.contains("parent=ask_image"));
+    assert!(joined.contains("session=session"));
+    assert!(joined.contains("openai:gpt-4o"));
+    assert!(joined.contains("state=completed"));
+    assert!(joined.contains("disposition=granted"));
+    assert!(joined.contains("charged=true"));
+    assert!(joined.contains("owner purpose=ask_image version=1 digest="));
+    for forbidden in [
+        "pixels",
+        "prompt",
+        "question text",
+        "preview",
+        "transcript",
+        "authorization: Bearer",
+        "api_key",
+        "signed",
+        "?sig=",
+        "raw payload",
+        "attachment metadata",
+    ] {
+        assert!(
+            !joined.to_lowercase().contains(&forbidden.to_lowercase()),
+            "invocation view leaked {forbidden}: {joined}"
+        );
+    }
+}
+
+#[test]
+fn image_sidecar_settings_reducer_rejects_stale_events() {
+    let mut reducer = SidecarReducer::new("d1".into(), "p1".into(), "s1".into(), "sel1".into());
+    let inv = sample_invocation();
+    let mk = |version: u64, payload: SidecarEventPayload| SidecarEvent {
+        daemon_instance: "d1".into(),
+        project_id: "p1".into(),
+        session_id: "s1".into(),
+        selection_id: "sel1".into(),
+        config_generation: 1,
+        entity_version: version,
+        payload,
+    };
+    assert_eq!(
+        reducer.apply(mk(1, SidecarEventPayload::Invocation(inv.clone()))),
+        SidecarEventOutcome::Applied
+    );
+    assert_eq!(reducer.charged_count, 1);
+    assert_eq!(
+        reducer.apply(mk(1, SidecarEventPayload::Invocation(inv.clone()))),
+        SidecarEventOutcome::Discarded
+    );
+    assert_eq!(reducer.charged_count, 1);
+    assert_eq!(
+        reducer.apply(mk(10, SidecarEventPayload::Invocation(inv.clone()))),
+        SidecarEventOutcome::RehydrateRequired
+    );
+    let mut late = inv.clone();
+    late.state = InvocationState::Pending;
+    assert_eq!(
+        reducer.apply(mk(2, SidecarEventPayload::Invocation(late))),
+        SidecarEventOutcome::Discarded
+    );
+    assert_eq!(reducer.invocations[0].state, InvocationState::Completed);
+
+    let mut wrong = mk(
+        3,
+        SidecarEventPayload::Health(HealthView {
+            available: false,
+            capability_source: "x".into(),
+            freshness: "stale".into(),
+            reason: "late".into(),
+        }),
+    );
+    wrong.selection_id = "other".into();
+    assert_eq!(reducer.apply(wrong), SidecarEventOutcome::Discarded);
+
+    let mut wrong = mk(
+        3,
+        SidecarEventPayload::Health(HealthView {
+            available: false,
+            capability_source: "x".into(),
+            freshness: "stale".into(),
+            reason: "late".into(),
+        }),
+    );
+    wrong.config_generation = 9;
+    assert_eq!(reducer.apply(wrong), SidecarEventOutcome::Discarded);
+
+    let mut wrong = mk(
+        3,
+        SidecarEventPayload::Resolution(sample_trace(SidecarModeChoice::Never)),
+    );
+    wrong.project_id = "p2".into();
+    assert_eq!(reducer.apply(wrong), SidecarEventOutcome::Discarded);
+
+    let mut wrong = mk(
+        3,
+        SidecarEventPayload::Grant(sample_grant(GrantScope::Once)),
+    );
+    wrong.session_id = "s2".into();
+    assert_eq!(reducer.apply(wrong), SidecarEventOutcome::Discarded);
+
+    let mut wrong = mk(
+        3,
+        SidecarEventPayload::Grant(sample_grant(GrantScope::Once)),
+    );
+    wrong.daemon_instance = "d2".into();
+    assert_eq!(reducer.apply(wrong), SidecarEventOutcome::Discarded);
+
+    let mut gap = mk(
+        3,
+        SidecarEventPayload::Grant(sample_grant(GrantScope::Once)),
+    );
+    gap.entity_version = 0;
+    assert_eq!(reducer.apply(gap), SidecarEventOutcome::Discarded);
+}
+
+#[test]
+fn image_sidecar_settings_a11y_and_layout_snapshots() {
+    let dialog = test_dialog();
+    let mut page = page_with(SidecarPageKind::GrantList);
+    page.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
+    page.session.error = Some("cap_exhausted".into());
+    page.session.busy = true;
+    page.session.conflict = Some("config generation moved".into());
+    page.session.remediation = Some(SidecarRemediation::CapExhausted);
+
+    let a11y = page.a11y();
+    let rows = page.visible_rows();
+    assert_eq!(a11y.effective_policy, "sidecar_invocations_per_session");
+    assert_eq!(a11y.effective_value, page.session.policy.value.to_string());
+    assert_eq!(a11y.effective_source, page.session.policy.source_label());
+    assert_eq!(a11y.busy, true);
+    assert_eq!(a11y.error.as_deref(), Some("cap_exhausted"));
+    assert_eq!(
+        a11y.project_grant_warning.as_deref(),
+        Some(PROJECT_GRANT_WARNING)
+    );
+    let focused = rows.get(page.session.cursor).unwrap();
+    assert_eq!(a11y.focused_label, focused.label);
+    assert_eq!(a11y.focused_value, focused.value);
+    assert_eq!(a11y.non_color_state, focused.state);
+    assert_eq!(
+        a11y.destination,
+        focused.destination.clone().unwrap_or_default()
+    );
+    assert_eq!(a11y.scope, focused.scope.clone().unwrap_or_default());
+
+    for (w, h, token) in [
+        (100, 30, "Layout: Full"),
+        (80, 24, "Layout: Compact"),
+        (60, 16, "Destination grants"),
+        (40, 10, "too small"),
+    ] {
+        let joined = render_page_lines(&page, &dialog, w, h).join("\n");
+        assert!(
+            joined.contains(token),
+            "expected {token} at {w}x{h}: {joined}"
+        );
+    }
+
+    page.session
+        .rebind_identity("d2".into(), "p2".into(), "s2".into(), "sel2".into());
+    assert!(page.session.reducer.grants.is_empty());
+    assert!(page.session.confirm_revoke.is_none());
+    assert!(page.session.error.is_none());
+
+    let empty = page_with(SidecarPageKind::GrantList);
+    let joined = render_page_lines(&empty, &dialog, 80, 24).join("\n");
+    assert!(joined.contains("No destination grants"));
+
+    let mut err = page_with(SidecarPageKind::Overview);
+    err.session.remediation = Some(SidecarRemediation::MissingCredential);
+    let joined = render_page_lines(&err, &dialog, 80, 24).join("\n");
+    assert!(joined.contains(REASON_MISSING_CREDENTIAL));
+
+    let mut page = page_with(SidecarPageKind::Overview);
+    page.handle_key(&mut test_dialog(), press(KeyCode::Down));
+    assert_eq!(page.session.cursor, 1);
+    page.handle_key(&mut test_dialog(), press(KeyCode::Up));
+    assert_eq!(page.session.cursor, 0);
+}
+
+#[test]
+fn image_sidecar_settings_no_policy_logic_in_ui() {
+    let src = include_str!("mod.rs");
+    for needle in [
+        "SidecarResolver::",
+        "evaluate_egress_authority",
+        "DestinationGrantStore",
+        "DestinationGrant::authorizes",
+        ".authorizes(",
+    ] {
+        assert!(
+            !src.contains(needle),
+            "sidecar settings UI must not contain policy symbol {needle}"
+        );
+    }
+    let _ = SidecarFormState::default().to_selection_config();
+}
+
+#[test]
+fn image_sidecar_settings_pointer_surface_contract() {
+    let dialog = test_dialog();
+    for kind in SidecarPageKind::ALL {
+        let page = page_with(kind);
+        assert_eq!(page.pointer_surface_kind(), kind.surface());
+        let _ = render_page_lines(&page, &dialog, 100, 40);
+    }
+
+    let mut overview = page_with(SidecarPageKind::Overview);
+    let before = overview.session.form.mode;
+    let mut dialog = test_dialog();
+    overview.handle_pointer_scroll(
+        &mut dialog,
+        crate::tui::settings::shell::SettingsScrollRegionId("sidecar"),
+        1,
+    );
+    assert_eq!(overview.session.form.mode, before);
+    assert_eq!(overview.session.cursor, 1);
+
+    let mut grants = page_with(SidecarPageKind::GrantList);
+    grants.session.reducer.grants = vec![sample_grant(GrantScope::Once)];
+    grants.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
+            "grant-1".into(),
+        ))),
+    );
+    assert!(grants.session.confirm_revoke.is_some());
+    grants.handle_pointer_scroll(
+        &mut dialog,
+        crate::tui::settings::shell::SettingsScrollRegionId("sidecar"),
+        1,
+    );
+    assert!(grants.session.confirm_revoke.is_none());
+    assert!(!grants.session.reducer.grants[0].revoked);
+
+    grants.handle_key(&mut dialog, press(KeyCode::Enter));
+    assert!(!grants.session.reducer.grants[0].revoked);
+    assert!(grants.session.confirm_revoke.is_none());
+
+    grants.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
+            "grant-1".into(),
+        ))),
+    );
+    grants.cancel_pointer_transients();
+    assert!(grants.session.confirm_revoke.is_none());
+
+    let surfaces: std::collections::HashSet<_> =
+        SettingsPointerSurfaceKind::ALL.into_iter().collect();
+    for kind in SidecarPageKind::ALL {
+        assert!(surfaces.contains(&kind.surface()));
+    }
+}
+
+#[test]
+fn image_sidecar_settings_state_action_registry() {
+    let dialog = test_dialog();
+    let mut seen_surfaces = std::collections::HashSet::new();
+    let mut seen_actions = std::collections::HashSet::new();
+    for kind in SidecarPageKind::ALL {
+        for (w, h) in [(100, 30), (80, 24), (60, 16)] {
+            let mut page = page_with(kind);
+            page.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
+            page.session.reducer.invocations = vec![sample_invocation()];
+            page.session.form.models = vec![SidecarModelOption {
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+                image_capable: true,
+                fresh: true,
+            }];
+            if kind == SidecarPageKind::GrantList {
+                page.session.confirm_revoke = Some(PendingRevoke {
+                    grant_id: "grant-1".into(),
+                    version: 1,
+                });
+            }
+            seen_surfaces.insert(page.pointer_surface_kind());
+            let joined = render_page_lines(&page, &dialog, w, h).join("\n");
+            if kind == SidecarPageKind::GrantList && w >= 60 {
+                assert!(
+                    joined.contains("Revoke grant? [Revoke grant] [Cancel]"),
+                    "missing confirmation at {w}x{h}: {joined}"
+                );
+            }
+            for (action, enabled, reason) in page.named_actions() {
+                seen_actions.insert(std::mem::discriminant(&action));
+                if !enabled {
+                    assert!(
+                        reason.is_some(),
+                        "disabled action {:?} needs a stable reason",
+                        action
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(seen_surfaces.len(), 11);
+
+    let mut grants = page_with(SidecarPageKind::GrantList);
+    grants.session.reducer.grants = vec![sample_grant(GrantScope::Once)];
+    let mut dialog = test_dialog();
+    grants.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
+            "grant-1".into(),
+        ))),
+    );
+    grants.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::ConfirmRevokeGrant(
+            SidecarGrantId("other".into()),
+            ConfirmationChoice::Confirm,
+        )),
+    );
+    assert!(!grants.session.reducer.grants[0].revoked);
+
+    grants.session.confirm_revoke = Some(PendingRevoke {
+        grant_id: "grant-1".into(),
+        version: 1,
+    });
+    grants
+        .session
+        .rebind_identity("d".into(), "p".into(), "s".into(), "sel".into());
+    assert!(grants.session.confirm_revoke.is_none());
+
+    grants.session.confirm_revoke = Some(PendingRevoke {
+        grant_id: "grant-1".into(),
+        version: 1,
+    });
+    grants.session.reducer.grants = vec![sample_grant(GrantScope::Once)];
+    grants.cancel_pointer_transients();
+    assert!(grants.session.confirm_revoke.is_none());
+    assert!(!grants.session.reducer.grants[0].revoked);
+
+    let _ = seen_actions;
+}

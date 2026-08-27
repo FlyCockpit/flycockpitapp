@@ -854,6 +854,7 @@ fn is_destructive_settings_action(action: &super::pointer_actions::SettingsPoint
             | SettingsPointerAction::Generation(GenerationAction::DeleteTarget(_))
             | SettingsPointerAction::Generation(GenerationAction::DeleteWorkflow(_))
             | SettingsPointerAction::Generation(GenerationAction::CancelJob(_))
+            | SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(_))
             | SettingsPointerAction::DefaultModel(DefaultModelAction::Clear)
     )
 }

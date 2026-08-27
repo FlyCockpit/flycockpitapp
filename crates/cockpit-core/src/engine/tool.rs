@@ -1503,7 +1503,7 @@ mod capability_tests {
             context_policy: None,
             vnext: None,
             prompt: String::new(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         };
         let posture = PostureResolution::from_def(&def, LlmMode::Defensive);

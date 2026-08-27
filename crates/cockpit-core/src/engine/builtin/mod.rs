@@ -79,51 +79,23 @@ pub fn configured_recursion_context(
 // (weak-model-first, priority #1). `<name>.normal.md` is the terser
 // strong-model body. Optional frontier bodies are the most autonomous
 // variant.
-// [`builtin_prompt_for`] selects between them; an agent lacking the frontier
-// file falls back to normal, and one lacking normal falls back to the flat
-// body, so the flat-fallback contract holds belt-and-suspenders.
+// Issue #75: each bundled agent has a single canonical prompt body (the
+// former `.normal.md` body, adopted as the flat `<name>.md`). The per-mode
+// defensive/frontier body trios are gone; per-model overrides live on the
+// AgentDef as `prompt_overrides`.
 pub(crate) const BUILD_PROMPT: &str = include_str!("build.md");
-pub(crate) const BUILD_PROMPT_NORMAL: &str = include_str!("build.normal.md");
-pub(crate) const BUILD_PROMPT_FRONTIER: &str = include_str!("build.frontier.md");
 pub(crate) const CAREFUL_PROMPT: &str = include_str!("careful.md");
 pub(crate) const BUILDER_PROMPT: &str = include_str!("builder.md");
-pub(crate) const BUILDER_PROMPT_NORMAL: &str = include_str!("builder.normal.md");
-#[allow(dead_code)]
-pub(crate) const BUILDER_PROMPT_FRONTIER: &str = include_str!("builder.frontier.md");
 pub(crate) const EXPLORE_PROMPT: &str = include_str!("explore.md");
-pub(crate) const EXPLORE_PROMPT_NORMAL: &str = include_str!("explore.normal.md");
 pub(crate) const HISTORY_PROMPT: &str = include_str!("history.md");
-pub(crate) const HISTORY_PROMPT_NORMAL: &str = include_str!("history.normal.md");
 pub(crate) const DEEPTHINK_PROMPT: &str = include_str!("deepthink.md");
 pub(crate) const SCOUT_PROMPT: &str = include_str!("scout.md");
-pub(crate) const SCOUT_PROMPT_NORMAL: &str = include_str!("scout.normal.md");
 pub(crate) const PLAN_PROMPT: &str = include_str!("plan.md");
-pub(crate) const PLAN_PROMPT_NORMAL: &str = include_str!("plan.normal.md");
 pub(crate) const MULTIREVIEW_PROMPT: &str = include_str!("multireview.md");
-pub(crate) const MULTIREVIEW_PROMPT_NORMAL: &str = include_str!("multireview.normal.md");
 // `bee` — `Swarm`'s recursive parallel worker (GOALS §24/§26).
 pub(crate) const BEE_PROMPT: &str = include_str!("bee.md");
-pub(crate) const BEE_PROMPT_NORMAL: &str = include_str!("bee.normal.md");
-pub(crate) const BEE_PROMPT_FRONTIER: &str = include_str!("bee.frontier.md");
 pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
 
-/// Select a bundled agent's prompt body for the active `llm_mode`: defensive
-/// uses the flat body; normal uses the normal body when present; frontier uses
-/// an explicit frontier body when present, else normal, else the flat body.
-/// This mirrors [`crate::agents::AgentDef::resolved_prompt_for`].
-fn builtin_prompt_for(
-    defensive: &'static str,
-    normal: Option<&'static str>,
-    frontier: Option<&'static str>,
-    mode: crate::config::extended::LlmMode,
-) -> &'static str {
-    use crate::config::extended::LlmMode;
-    match mode {
-        LlmMode::Defensive => defensive,
-        LlmMode::Normal => normal.unwrap_or(defensive),
-        LlmMode::Frontier => frontier.or(normal).unwrap_or(defensive),
-    }
-}
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
 pub(crate) const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
 pub(crate) const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
@@ -167,10 +139,10 @@ pub struct SpawnArgs {
     pub interactive: bool,
     /// The active LLM-strength mode (implementation note).
     /// Threaded onto every spawned [`Agent`] so the centralized tool-
-    /// description rendering seam ([`ToolBox::definitions`]) and the per-mode
-    /// agent-prompt resolution ([`crate::agents::AgentDef::resolved_prompt_for`])
+    /// description rendering seam ([`ToolBox::definitions`]) and the per-agent
+    /// prompt resolution ([`crate::agents::AgentDef::resolved_prompt`])
     /// both read one value. Resolved from the layered `config.json`
-    /// at session start; live-switched via `/llm-mode`.
+    /// at session start.
     pub llm_mode: crate::config::extended::LlmMode,
     /// Plan-level model override (prompt
     /// `plan-duplication-and-model-override.md`): when a plan pins a `model`,
@@ -2083,7 +2055,7 @@ pub(crate) async fn reposture_agent_for_candidate(
                     agent.name
                 )
             })?;
-        def.resolved_prompt_for(candidate_mode).to_string()
+        def.resolved_prompt(None).to_string()
     };
     // Recompose the system for the ACTUAL candidate model (its own model-specific
     // system prompt), applying the SAME assistant identity prefix the initial
@@ -2359,7 +2331,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         if let Some(temp) = def.temperature {
             params.temperature = Some(temp as f64);
         }
-        let role = def.resolved_prompt_for(llm_mode);
+        let role = def.resolved_prompt(None);
         return Ok(Agent {
             name: def.name.clone(),
             system: compose_system_prompt_for_model(role, &model, args),
@@ -2498,7 +2470,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         params.temperature = Some(temp as f64);
     }
 
-    let role = def.resolved_prompt_for(llm_mode);
+    let role = def.resolved_prompt(None);
     Ok(Agent {
         name: def.name.clone(),
         system: compose_system_prompt_for_model(role, &model, args),
@@ -2932,12 +2904,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
 
     let model = args.effective_model();
     let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(
-        BUILD_PROMPT,
-        Some(BUILD_PROMPT_NORMAL),
-        Some(BUILD_PROMPT_FRONTIER),
-        llm_mode,
-    );
+    let role = BUILD_PROMPT;
     let params = params_with_direct_computer(args, &model);
     Agent {
         name: "Build".to_string(),
@@ -3124,7 +3091,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
 
     let model = args.effective_model();
     let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(SCOUT_PROMPT, Some(SCOUT_PROMPT_NORMAL), None, llm_mode);
+    let role = SCOUT_PROMPT;
     Agent {
         name: "scout".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
@@ -3238,7 +3205,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
 
     let model = args.effective_model();
     let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(PLAN_PROMPT, Some(PLAN_PROMPT_NORMAL), None, llm_mode);
+    let role = PLAN_PROMPT;
     Agent {
         name: "Plan".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
@@ -3290,12 +3257,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
 
     let model = args.effective_model();
     let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(
-        MULTIREVIEW_PROMPT,
-        Some(MULTIREVIEW_PROMPT_NORMAL),
-        None,
-        llm_mode,
-    );
+    let role = MULTIREVIEW_PROMPT;
     Agent {
         name: "Multireview".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
@@ -3364,12 +3326,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
 
     let model = args.effective_model();
     let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(
-        BEE_PROMPT,
-        Some(BEE_PROMPT_NORMAL),
-        Some(BEE_PROMPT_FRONTIER),
-        llm_mode,
-    );
+    let role = BEE_PROMPT;
     Agent {
         name: "bee".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
@@ -3914,7 +3871,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("graph-user.md"),
         };
 
@@ -3962,7 +3919,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
@@ -4083,7 +4040,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-with-disabled-tool.md"),
         };
 
@@ -4184,7 +4141,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("Build.md"),
         };
 
@@ -4244,7 +4201,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
 
@@ -4286,7 +4243,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
 
@@ -4335,7 +4292,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
 
@@ -4430,7 +4387,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
@@ -4472,25 +4429,19 @@ mod tests {
     #[test]
     fn tool_tier_prompt_files_do_not_name_moved_tools_as_direct() {
         let explore = include_str!("explore.md");
-        let explore_normal = include_str!("explore.normal.md");
-        for body in [explore, explore_normal] {
-            for direct_list_line in body
-                .lines()
-                .filter(|line| line.contains("tools") || line.starts_with("- `"))
-            {
-                for moved in ["`word`", "`hot`", "`circular`", "`impact`"] {
-                    assert!(
-                        !direct_list_line.contains(moved),
-                        "moved tool {moved} appears in direct-list line: {direct_list_line}"
-                    );
-                }
+        for direct_list_line in explore
+            .lines()
+            .filter(|line| line.contains("tools") || line.starts_with("- `"))
+        {
+            for moved in ["`word`", "`hot`", "`circular`", "`impact`"] {
+                assert!(
+                    !direct_list_line.contains(moved),
+                    "moved tool {moved} appears in direct-list line: {direct_list_line}"
+                );
             }
         }
 
-        for body in [
-            include_str!("multireview.md"),
-            include_str!("multireview.normal.md"),
-        ] {
+        for body in [include_str!("multireview.md")] {
             assert!(
                 !body.contains("`harness_invoke`"),
                 "multireview prompt must refer to the MCP harness advert"
@@ -4856,7 +4807,7 @@ mod tests {
                 context_policy: None,
                 vnext: None,
                 prompt: "body".to_string(),
-                prompt_variants: std::collections::HashMap::new(),
+                prompt_overrides: std::collections::BTreeMap::new(),
                 source: tmp.path().join(format!("user-{tool}.md")),
             };
             let err = crate::agents::validate_invariants(&def)
@@ -5016,12 +4967,8 @@ mod tests {
         const RETIRED_LOCK_VERBS: &[&str] = &["readlock", "writeunlock", "editunlock"];
         let prompts = [
             ("builder", BUILDER_PROMPT),
-            ("builder.normal", BUILDER_PROMPT_NORMAL),
-            ("builder.frontier", BUILDER_PROMPT_FRONTIER),
             ("bee", BEE_PROMPT),
-            ("bee.normal", BEE_PROMPT_NORMAL),
-            ("bee.frontier", BEE_PROMPT_FRONTIER),
-            ("build.frontier", BUILD_PROMPT_FRONTIER),
+            ("build", BUILD_PROMPT),
         ];
 
         for (name, prompt) in prompts {
@@ -5402,60 +5349,21 @@ mod tests {
     }
 
     #[test]
-    fn builtin_prompt_for_resolves_frontier_then_normal_then_defensive() {
-        use crate::config::extended::LlmMode;
-        // A single-mode agent resolves to the flat defensive body in every
-        // mode — the belt-and-suspenders fallback.
-        assert_eq!(
-            builtin_prompt_for(DEEPTHINK_PROMPT, None, None, LlmMode::Normal),
-            DEEPTHINK_PROMPT
-        );
-        assert_eq!(
-            builtin_prompt_for(DEEPTHINK_PROMPT, None, None, LlmMode::Frontier),
-            DEEPTHINK_PROMPT
-        );
-        assert_eq!(
-            builtin_prompt_for(DEEPTHINK_PROMPT, None, None, LlmMode::Defensive),
-            DEEPTHINK_PROMPT
-        );
-        // With a normal variant present, Normal selects it, Frontier falls
-        // back to it, and Defensive keeps the flat body.
-        assert_eq!(
-            builtin_prompt_for(
-                BUILD_PROMPT,
-                Some(BUILD_PROMPT_NORMAL),
-                None,
-                LlmMode::Normal
-            ),
-            BUILD_PROMPT_NORMAL
-        );
-        assert_eq!(
-            builtin_prompt_for(
-                BUILD_PROMPT,
-                Some(BUILD_PROMPT_NORMAL),
-                None,
-                LlmMode::Frontier
-            ),
-            BUILD_PROMPT_NORMAL
-        );
-        assert_eq!(
-            builtin_prompt_for(
-                BUILD_PROMPT,
-                Some(BUILD_PROMPT_NORMAL),
-                None,
-                LlmMode::Defensive
-            ),
-            BUILD_PROMPT
-        );
-        assert_eq!(
-            builtin_prompt_for(
-                BUILD_PROMPT,
-                Some(BUILD_PROMPT_NORMAL),
-                Some("FRONTIER BODY"),
-                LlmMode::Frontier
-            ),
-            "FRONTIER BODY"
-        );
+    fn builtin_prompts_have_no_mode_suffixed_files() {
+        // Issue #75 ratchet: the per-mode `.normal.md`/`.frontier.md` prompt
+        // bodies are gone; each bundled agent has a single canonical body.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/engine/builtin");
+        let entries = std::fs::read_dir(&dir).unwrap();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".normal.md") || name.ends_with(".frontier.md") {
+                panic!(
+                    "builtin prompt dir still contains mode-suffixed file `{name}` — issue #75 requires a single canonical body"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5492,9 +5400,9 @@ mod tests {
             );
         }
         for (name, body) in [
-            ("build.normal", BUILD_PROMPT_NORMAL),
-            ("builder.normal", BUILDER_PROMPT_NORMAL),
-            ("bee.normal", BEE_PROMPT_NORMAL),
+            ("build", BUILD_PROMPT),
+            ("builder", BUILDER_PROMPT),
+            ("bee", BEE_PROMPT),
         ] {
             let low = body.to_lowercase();
             assert!(low.contains("docs"), "`{name}` must name docs");
@@ -5508,23 +5416,7 @@ mod tests {
             );
             assert!(
                 low.contains("guess") || low.contains("web-search") || low.contains("web search"),
-                "`{name}` normal body must steer away from guessing/web-searching uncertain APIs"
-            );
-        }
-        for (name, body) in [
-            ("build.frontier", BUILD_PROMPT_FRONTIER),
-            ("builder.frontier", BUILDER_PROMPT_FRONTIER),
-            ("bee.frontier", BEE_PROMPT_FRONTIER),
-        ] {
-            let low = body.to_lowercase();
-            assert!(low.contains("docs"), "`{name}` must name docs");
-            assert!(
-                low.contains("unfamiliar") || low.contains("version-specific"),
-                "`{name}` frontier body must describe when docs is useful"
-            );
-            assert!(
-                !low.contains("first move"),
-                "`{name}` frontier body must not force docs as first move"
+                "`{name}` body must steer away from guessing/web-searching uncertain APIs"
             );
         }
     }
@@ -5945,7 +5837,7 @@ mod tests {
     fn explore_prompts_advertise_native_intel_tools() {
         for (name, prompt) in [
             ("explore", EXPLORE_PROMPT),
-            ("explore.normal", EXPLORE_PROMPT_NORMAL),
+            ("explore", EXPLORE_PROMPT),
         ] {
             for tool in ["context_pack", "code", "search", "graph", "bash"] {
                 assert!(
@@ -6016,7 +5908,7 @@ mod tests {
         local_child.prompt = "authenticated local snapshot".to_string();
         // The authenticated snapshot replaces the full authored body; do not
         // retain embedded per-mode prompt variants that would mask it.
-        local_child.prompt_variants.clear();
+        local_child.prompt_overrides.clear();
         local_child.vnext.as_mut().unwrap().agent_id =
             "local/00000000-0000-0000-0000-000000000004".to_string();
 
@@ -6468,7 +6360,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::from("builder.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
@@ -6520,7 +6412,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-reader.md"),
         };
 
@@ -6720,7 +6612,7 @@ mod tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }

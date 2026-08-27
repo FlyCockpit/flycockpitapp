@@ -6,10 +6,10 @@
 
 use super::AcpTransportCounters;
 use super::codec::ACP_FORWARDED_MCP_VECTOR_MAX_BYTES_V1;
-use super::raw_json::{RawKind, RawNode};
+use super::raw_json::RawNode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DtoError {
+pub(crate) enum DtoError {
     ParamsNotObject,
     MissingField(&'static str),
     FieldType(&'static str),
@@ -43,13 +43,13 @@ impl std::fmt::Display for DtoError {
 impl std::error::Error for DtoError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionAdmissionDto {
+pub(crate) enum SessionAdmissionDto {
     New(SessionNewDto),
     Load(SessionLoadDto),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionNewDto {
+pub(crate) struct SessionNewDto {
     pub cwd: String,
     pub mcp_servers: Vec<McpServerDto>,
     pub additional_directories: Vec<String>,
@@ -57,7 +57,7 @@ pub struct SessionNewDto {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionLoadDto {
+pub(crate) struct SessionLoadDto {
     pub cwd: String,
     pub session_id: String,
     pub mcp_servers: Vec<McpServerDto>,
@@ -66,7 +66,7 @@ pub struct SessionLoadDto {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum McpServerDto {
+pub(crate) enum McpServerDto {
     Stdio {
         name: String,
         command: String,
@@ -86,12 +86,12 @@ pub enum McpServerDto {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NameValueDto {
+pub(crate) struct NameValueDto {
     pub name: String,
     pub value: String,
 }
 
-pub fn decode_session_new(
+pub(crate) fn decode_session_new(
     raw_params: &str,
     params: &RawNode,
     counters: &mut AcpTransportCounters,
@@ -103,7 +103,7 @@ pub fn decode_session_new(
     Ok(dto)
 }
 
-pub fn decode_session_load(
+pub(crate) fn decode_session_load(
     raw_params: &str,
     params: &RawNode,
     counters: &mut AcpTransportCounters,
@@ -254,7 +254,7 @@ fn consistency_check_load(raw_params: &str) -> Result<(), DtoError> {
 }
 
 impl SessionAdmissionDto {
-    pub fn mcp_servers(&self) -> &[McpServerDto] {
+    pub(crate) fn mcp_servers(&self) -> &[McpServerDto] {
         match self {
             Self::New(dto) => &dto.mcp_servers,
             Self::Load(dto) => &dto.mcp_servers,
@@ -262,21 +262,11 @@ impl SessionAdmissionDto {
     }
 }
 
-pub fn initialize_result() -> serde_json::Value {
+pub(crate) fn initialize_result() -> serde_json::Value {
     serde_json::json!({
         "protocolVersion": 1,
         "agentCapabilities": {
-            "loadSession": true,
-            "promptCapabilities": {
-                "image": false,
-                "audio": false,
-                "embeddedContext": false
-            },
-            "mcpCapabilities": {
-                "http": true,
-                "sse": true
-            },
-            "sessionCapabilities": {}
+            "loadSession": false
         },
         "agentInfo": {
             "name": "cockpit",
@@ -285,9 +275,4 @@ pub fn initialize_result() -> serde_json::Value {
         },
         "authMethods": []
     })
-}
-
-/// Touch `RawKind` so admission keeps the lossless node, not a map.
-pub fn raw_kind_is_object(node: &RawNode) -> bool {
-    matches!(node.kind, RawKind::Object(_))
 }

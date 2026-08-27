@@ -1,7 +1,7 @@
 //! Classify an inbound ACP line without losing raw `params` bytes.
 
 use super::raw_json::{
-    JsonRpcId, ParsedFrame, RawJsonError, RawJsonErrorKind, RawNode, parse_frame,
+    JsonRpcId, ParsedFrame, RawJsonError, RawJsonErrorKind, RawKind, RawNode, parse_frame,
 };
 
 pub const JSON_RPC_VERSION: &str = "2.0";
@@ -19,6 +19,9 @@ pub enum ClassifyError {
     InvalidJsonrpc {
         request_id: Option<JsonRpcId>,
     },
+    InvalidParams {
+        request_id: Option<JsonRpcId>,
+    },
     MissingMethod {
         request_id: Option<JsonRpcId>,
     },
@@ -33,6 +36,7 @@ impl ClassifyError {
             Self::DuplicateMember { request_id, .. }
             | Self::InvalidJson { request_id }
             | Self::InvalidJsonrpc { request_id }
+            | Self::InvalidParams { request_id }
             | Self::MissingMethod { request_id }
             | Self::BothRequestAndResponse { request_id } => request_id.as_ref(),
         }
@@ -120,6 +124,14 @@ fn classify_parsed(frame: &str, parsed: ParsedFrame) -> Result<InboundMessage, C
     }
 
     let params = parsed.root.member("params").cloned();
+    if params
+        .as_ref()
+        .is_some_and(|params| !matches!(&params.kind, RawKind::Object(_) | RawKind::Array(_)))
+    {
+        return Err(ClassifyError::InvalidParams {
+            request_id: parsed.unambiguous_request_id,
+        });
+    }
     let raw_params = params.as_ref().map(|node| node.raw(frame).to_string());
 
     if has_method {

@@ -54,6 +54,22 @@ pub enum PermissionStateName {
     Cancelling,
 }
 
+/// Bounded state/ACK diagnostics for one permission request.
+///
+/// These values are connection-local identifiers and accounting metadata, not
+/// an externally exposed ACP response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PermissionEntryDiagnostics {
+    pub request_id: String,
+    pub attention_id: String,
+    pub state: PermissionStateName,
+    /// The exact issued option selected by the peer, retained across terminal
+    /// release for connection-local state diagnostics.
+    pub selected_choice: Option<String>,
+    pub frame_bytes: usize,
+    pub charge: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PermissionEntry {
     request_id: String,
@@ -222,6 +238,22 @@ impl OutboundPermissionRegistry {
             .map(|entry| entry.state)
     }
 
+    pub(crate) fn diagnostics_of(&self, request_id: &str) -> Option<PermissionEntryDiagnostics> {
+        self.inner
+            .lock()
+            .expect("registry")
+            .entries
+            .get(request_id)
+            .map(|entry| PermissionEntryDiagnostics {
+                request_id: entry.request_id.clone(),
+                attention_id: entry.attention_id.clone(),
+                state: entry.state,
+                selected_choice: entry.selected_choice.clone(),
+                frame_bytes: entry.frame.len(),
+                charge: entry.charge,
+            })
+    }
+
     pub fn connection_closed(&self) -> bool {
         self.inner.lock().expect("registry").connection_closed
     }
@@ -346,13 +378,13 @@ impl OutboundPermissionRegistry {
         ack: &mut dyn ApprovalAck,
         sink: &mut dyn FrameSink,
         counters: &mut AcpTransportCounters,
-    ) -> bool {
+    ) -> Option<ResolveCodeRootInterruptResultV1> {
         let JsonRpcId::String(request_id) = id else {
-            return false;
+            return None;
         };
         let parsed = match result.and_then(|node| parse_permission_outcome(node, input)) {
             Some(parsed) => parsed,
-            None => return false,
+            None => return None,
         };
         let resolve_request = {
             let _gate = self.gate.lock().expect("registry gate");
@@ -366,7 +398,7 @@ impl OutboundPermissionRegistry {
                     if issued {
                         inner.release_by_id(request_id);
                     }
-                    return false;
+                    return None;
                 }
                 PermissionOutcome::Selected(choice) => {
                     let admissible = inner.entries.get(request_id).is_some_and(|entry| {
@@ -374,10 +406,10 @@ impl OutboundPermissionRegistry {
                             && entry.issued_options.contains(&choice)
                     });
                     if !admissible {
-                        return false;
+                        return None;
                     }
                     let Some(entry) = inner.entries.get_mut(request_id) else {
-                        return false;
+                        return None;
                     };
                     entry.state = PermissionStateName::TerminalReserved;
                     entry.selected_choice = Some(choice.clone());
@@ -391,7 +423,7 @@ impl OutboundPermissionRegistry {
             }
         };
         let Some(resolve_request) = resolve_request else {
-            return false;
+            return None;
         };
         {
             let _gate = self.gate.lock().expect("registry gate");
@@ -400,10 +432,10 @@ impl OutboundPermissionRegistry {
                 if entry.state == PermissionStateName::TerminalReserved {
                     entry.state = PermissionStateName::Resolving;
                 } else {
-                    return false;
+                    return None;
                 }
             } else {
-                return false;
+                return None;
             }
         }
         counters.resolve_calls += 1;
@@ -411,10 +443,10 @@ impl OutboundPermissionRegistry {
         let _gate = self.gate.lock().expect("registry gate");
         let mut inner = self.inner.lock().expect("registry");
         let Some(entry) = inner.entries.get_mut(request_id) else {
-            return false;
+            return None;
         };
         if entry.state != PermissionStateName::Resolving {
-            return false;
+            return None;
         }
         entry.daemon_outcome = Some(outcome);
         entry.state = PermissionStateName::Terminal;
@@ -425,13 +457,13 @@ impl OutboundPermissionRegistry {
                 counters.approval_acks += 1;
                 ack.ack_approval_delivery(&delivery_id);
                 inner.release_by_id(request_id);
-                false
+                None
             }
             ResolveCodeRootInterruptResultV1::AlreadyResolvedOther
             | ResolveCodeRootInterruptResultV1::Cancelled
             | ResolveCodeRootInterruptResultV1::Expired => {
                 inner.release_by_id(request_id);
-                true
+                Some(outcome)
             }
         };
         let _ = sink;

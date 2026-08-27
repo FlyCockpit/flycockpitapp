@@ -9,7 +9,7 @@
 // depth of 128. 256 matches the compiler's own suggestion for this crate.
 #![recursion_limit = "256"]
 
-pub mod acp;
+pub(crate) mod acp;
 mod cli;
 mod commands;
 pub use cockpit_config as config;

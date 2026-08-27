@@ -1,7 +1,11 @@
 //! jsonrpsee inbound method dispatch for the ACP v1 peer.
 //!
 //! Cockpit's parser gates each frame and retains raw `params`; the admitted
-//! request is then routed through jsonrpsee's raw-request dispatch API.
+//! request is then routed through jsonrpsee's raw-request dispatch API. The
+//! production transport deliberately has no session ingress owner yet, so its
+//! session methods fail closed. Tests can inject a recording owner to exercise
+//! the DTO-to-bridge conversion seam without pretending that a daemon API
+//! exists.
 
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +13,6 @@ use jsonrpsee::RpcModule;
 use jsonrpsee_types::{ErrorObjectOwned, Params};
 
 use super::AcpTransportCounters;
-use super::bridge::BridgeFacade;
 use super::classify::InboundRequest;
 use super::dto::{SessionAdmissionDto, decode_session_load, decode_session_new, initialize_result};
 use super::raw_json::parse_frame;
@@ -25,18 +28,100 @@ const INBOUND_METHODS: &[&str] = &[
     "session/prompt",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionIngressError {
+    Unavailable,
+}
+
+impl SessionIngressError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "ACP session adaptation is unavailable",
+        }
+    }
+}
+
+/// The deliberately narrow downstream boundary. No production implementation
+/// is supplied until editor-session adaptation and its daemon API are owned.
+pub trait SessionIngress: Send {
+    fn is_available(&self) -> bool;
+
+    fn admit(
+        &mut self,
+        admission: SessionAdmissionDto,
+        counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError>;
+
+    fn cancel(
+        &mut self,
+        raw_params: &str,
+        counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError>;
+
+    fn prompt(
+        &mut self,
+        raw_params: &str,
+        counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError>;
+}
+
+/// The only production owner until the out-of-scope daemon adaptation lands.
 #[derive(Debug, Default)]
-pub struct DispatchContext {
+pub struct UnavailableSessionIngress;
+
+impl SessionIngress for UnavailableSessionIngress {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn admit(
+        &mut self,
+        _admission: SessionAdmissionDto,
+        _counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError> {
+        Err(SessionIngressError::Unavailable)
+    }
+
+    fn cancel(
+        &mut self,
+        _raw_params: &str,
+        _counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError> {
+        Err(SessionIngressError::Unavailable)
+    }
+
+    fn prompt(
+        &mut self,
+        _raw_params: &str,
+        _counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError> {
+        Err(SessionIngressError::Unavailable)
+    }
+}
+
+pub struct DispatchContext<I: SessionIngress> {
     counters: Mutex<AcpTransportCounters>,
-    cancelled_sessions: Mutex<Vec<String>>,
+    session_ingress: Arc<Mutex<I>>,
     raw_params: Option<String>,
 }
 
-pub fn build_rpc_module() -> RpcModule<DispatchContext> {
-    build_rpc_module_from_arc(Arc::new(DispatchContext::default()))
+pub fn build_rpc_module() -> RpcModule<DispatchContext<UnavailableSessionIngress>> {
+    build_rpc_module_with_ingress(Arc::new(Mutex::new(UnavailableSessionIngress)))
 }
 
-fn build_rpc_module_from_arc(context: Arc<DispatchContext>) -> RpcModule<DispatchContext> {
+pub fn build_rpc_module_with_ingress<I: SessionIngress + 'static>(
+    session_ingress: Arc<Mutex<I>>,
+) -> RpcModule<DispatchContext<I>> {
+    build_rpc_module_from_arc(Arc::new(DispatchContext {
+        counters: Mutex::new(AcpTransportCounters::default()),
+        session_ingress,
+        raw_params: None,
+    }))
+}
+
+fn build_rpc_module_from_arc<I: SessionIngress + 'static>(
+    context: Arc<DispatchContext<I>>,
+) -> RpcModule<DispatchContext<I>> {
     let mut module = RpcModule::from_arc(context);
     module
         .register_method("initialize", |params, _, _| {
@@ -47,56 +132,67 @@ fn build_rpc_module_from_arc(context: Arc<DispatchContext>) -> RpcModule<Dispatc
     module
         .register_method("session/new", |params, context, _| {
             let raw = required_raw_params(&params, context)?;
+            ensure_session_ingress_available(context)?;
             let parsed = parse_frame(&raw).map_err(|err| invalid_params(err.to_string()))?;
             let mut counters = context.counters.lock().expect("dispatch counters");
             let dto = decode_session_new(&raw, &parsed.root, &mut counters)
                 .map_err(|err| invalid_params(err.to_string()))?;
-            let receipt = BridgeFacade.admit(&SessionAdmissionDto::New(dto), &mut counters);
-            Ok(serde_json::json!({
-                "sessionId": format!("acp-session-{}", receipt.server_count)
-            }))
+            context
+                .session_ingress
+                .lock()
+                .expect("session ingress")
+                .admit(SessionAdmissionDto::New(dto), &mut counters)
+                .map_err(ingress_error)
         })
         .expect("session/new is unique");
     module
         .register_method("session/load", |params, context, _| {
             let raw = required_raw_params(&params, context)?;
+            ensure_session_ingress_available(context)?;
             let parsed = parse_frame(&raw).map_err(|err| invalid_params(err.to_string()))?;
             let mut counters = context.counters.lock().expect("dispatch counters");
             let dto = decode_session_load(&raw, &parsed.root, &mut counters)
                 .map_err(|err| invalid_params(err.to_string()))?;
-            BridgeFacade.admit(&SessionAdmissionDto::Load(dto), &mut counters);
-            Ok(serde_json::json!({}))
+            context
+                .session_ingress
+                .lock()
+                .expect("session ingress")
+                .admit(SessionAdmissionDto::Load(dto), &mut counters)
+                .map_err(ingress_error)
         })
         .expect("session/load is unique");
     module
         .register_method("session/cancel", |params, context, _| {
             let raw = required_raw_params(&params, context)?;
-            let value: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|err| invalid_params(err.to_string()))?;
-            let session_id = value
-                .get("sessionId")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| invalid_params("missing sessionId"))?;
+            ensure_session_ingress_available(context)?;
+            let mut counters = context.counters.lock().expect("dispatch counters");
             context
-                .cancelled_sessions
+                .session_ingress
                 .lock()
-                .expect("cancelled sessions")
-                .push(session_id.to_string());
-            Ok(serde_json::Value::Null)
+                .expect("session ingress")
+                .cancel(&raw, &mut counters)
+                .map_err(ingress_error)
         })
         .expect("session/cancel is unique");
     module
-        .register_method("session/prompt", |params, _, _| {
-            let _ = JSONRPSEE_RAW_PARAMS_API(&params);
-            Ok::<_, ErrorObjectOwned>(serde_json::json!({ "stopReason": "end_turn" }))
+        .register_method("session/prompt", |params, context, _| {
+            let raw = required_raw_params(&params, context)?;
+            ensure_session_ingress_available(context)?;
+            let mut counters = context.counters.lock().expect("dispatch counters");
+            context
+                .session_ingress
+                .lock()
+                .expect("session ingress")
+                .prompt(&raw, &mut counters)
+                .map_err(ingress_error)
         })
         .expect("session/prompt is unique");
     module
 }
 
-fn required_raw_params(
+fn required_raw_params<I: SessionIngress>(
     params: &Params<'_>,
-    context: &DispatchContext,
+    context: &DispatchContext<I>,
 ) -> Result<String, ErrorObjectOwned> {
     context
         .raw_params
@@ -109,8 +205,34 @@ fn invalid_params(message: impl Into<String>) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(-32602, message.into(), None::<()>)
 }
 
+fn ensure_session_ingress_available<I: SessionIngress>(
+    context: &DispatchContext<I>,
+) -> Result<(), ErrorObjectOwned> {
+    if context
+        .session_ingress
+        .lock()
+        .expect("session ingress")
+        .is_available()
+    {
+        Ok(())
+    } else {
+        Err(ingress_error(SessionIngressError::Unavailable))
+    }
+}
+
+fn ingress_error(error: SessionIngressError) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32601, error.message(), None::<()>)
+}
+
 pub fn registered_method_names() -> Vec<&'static str> {
     INBOUND_METHODS.to_vec()
+}
+
+pub fn is_session_method(method: &str) -> bool {
+    matches!(
+        method,
+        "session/new" | "session/load" | "session/cancel" | "session/prompt"
+    )
 }
 
 pub fn elicitation_is_rejected(method: &str) -> bool {
@@ -126,15 +248,15 @@ pub enum DispatchResult {
     NoResponse,
 }
 
-pub fn dispatch_request(
+pub fn dispatch_request<I: SessionIngress + 'static>(
     request: &InboundRequest,
-    _bridge: &BridgeFacade,
+    session_ingress: Arc<Mutex<I>>,
     counters: &mut AcpTransportCounters,
-    cancelled: &mut Vec<String>,
 ) -> DispatchResult {
     let context = Arc::new(DispatchContext {
+        counters: Mutex::new(AcpTransportCounters::default()),
+        session_ingress,
         raw_params: request.raw_params.clone(),
-        ..DispatchContext::default()
     });
     let module = build_rpc_module_from_arc(Arc::clone(&context));
     let response = futures::executor::block_on(module.raw_json_request(&request.raw, 1));
@@ -147,20 +269,14 @@ pub fn dispatch_request(
     counters.catalog_mutations += dispatch_counters.catalog_mutations;
     counters.dto_produced += dispatch_counters.dto_produced;
     counters.schema_decode_attempts += dispatch_counters.schema_decode_attempts;
-    cancelled.extend(
-        context
-            .cancelled_sessions
-            .lock()
-            .expect("cancelled sessions")
-            .drain(..),
-    );
     DispatchResult::Response(response)
 }
 
-pub fn dispatch_notification(
+pub fn dispatch_notification<I: SessionIngress + 'static>(
     method: &str,
     raw: &str,
-    cancelled: &mut Vec<String>,
+    session_ingress: Arc<Mutex<I>>,
+    counters: &mut AcpTransportCounters,
 ) -> DispatchResult {
     if method == "$/cancel_request" {
         return DispatchResult::NotificationHandled;
@@ -180,20 +296,20 @@ pub fn dispatch_notification(
         ),
     };
     let context = Arc::new(DispatchContext {
+        counters: Mutex::new(AcpTransportCounters::default()),
+        session_ingress,
         raw_params: raw_params.map(str::to_string),
-        ..DispatchContext::default()
     });
     let module = build_rpc_module_from_arc(Arc::clone(&context));
     let response = futures::executor::block_on(module.raw_json_request(&routed, 1));
     if response.is_err() {
         return DispatchResult::NoResponse;
     }
-    cancelled.extend(
-        context
-            .cancelled_sessions
-            .lock()
-            .expect("cancelled sessions")
-            .drain(..),
-    );
+    let dispatch_counters = context.counters.lock().expect("dispatch counters").clone();
+    counters.daemon_mutations += dispatch_counters.daemon_mutations;
+    counters.bridge_conversions += dispatch_counters.bridge_conversions;
+    counters.catalog_mutations += dispatch_counters.catalog_mutations;
+    counters.dto_produced += dispatch_counters.dto_produced;
+    counters.schema_decode_attempts += dispatch_counters.schema_decode_attempts;
     DispatchResult::NotificationHandled
 }

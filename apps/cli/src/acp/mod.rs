@@ -5,28 +5,28 @@
 //! bridge facade, and the outbound permission registry. HTTP/WebSocket ACP
 //! transports are out of launch scope.
 
-pub mod adapter;
-pub mod boundary;
-pub mod bridge;
-pub mod classify;
-pub mod codec;
-pub mod dispatch;
-pub mod dto;
-pub mod envelope;
-pub mod raw_json;
-pub mod registry;
+pub(crate) mod adapter;
+pub(crate) mod boundary;
+mod bridge;
+pub(crate) mod classify;
+pub(crate) mod codec;
+pub(crate) mod dispatch;
+mod dto;
+pub(crate) mod envelope;
+pub(crate) mod raw_json;
+pub(crate) mod registry;
 
-pub use codec::{
+pub(crate) use codec::{
     ACP_FORWARDED_MCP_VECTOR_MAX_BYTES_V1, ACP_JSON_FRAME_MAX_BYTES_V1, AcpFrame, AcpFrameError,
     AcpLineReader, AcpLineWriter,
 };
-pub use registry::{
+pub(crate) use registry::{
     ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1, ACP_OUTBOUND_PERMISSION_MAX_ENTRIES_V1,
     OutboundPermissionRegistry,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct AcpTransportCounters {
+pub(crate) struct AcpTransportCounters {
     pub daemon_mutations: u64,
     pub bridge_conversions: u64,
     pub catalog_mutations: u64,
@@ -40,13 +40,16 @@ pub struct AcpTransportCounters {
 }
 
 impl AcpTransportCounters {
-    pub fn zero_side_effects(&self) -> bool {
+    pub(crate) fn zero_side_effects(&self) -> bool {
         self.daemon_mutations == 0
             && self.bridge_conversions == 0
             && self.catalog_mutations == 0
             && self.dto_produced == 0
+            && self.schema_decode_attempts == 0
             && self.resolve_calls == 0
             && self.approval_acks == 0
+            && self.cancel_notifications_queued == 0
+            && self.stdout_non_protocol_writes == 0
     }
 }
 

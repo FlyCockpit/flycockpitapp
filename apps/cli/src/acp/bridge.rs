@@ -13,21 +13,22 @@ use super::AcpTransportCounters;
 use super::dto::{McpServerDto, NameValueDto, SessionAdmissionDto, SessionLoadDto, SessionNewDto};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionAdmissionReceipt {
+pub(crate) struct SessionAdmissionReceipt {
     pub method: AcpSessionAdmissionMethodV1,
     pub server_count: usize,
+    pub ingress: AcpForwardedMcpIngressV1,
 }
 
 #[derive(Debug, Default)]
-pub struct BridgeFacade;
+pub(crate) struct BridgeFacade;
 
 impl BridgeFacade {
-    pub fn admit(
+    pub(crate) fn admit(
         &self,
         dto: &SessionAdmissionDto,
         counters: &mut AcpTransportCounters,
     ) -> SessionAdmissionReceipt {
-        let _ingress = self.to_ingress(dto);
+        let ingress = self.to_ingress(dto);
         counters.bridge_conversions += 1;
         SessionAdmissionReceipt {
             method: match dto {
@@ -35,10 +36,11 @@ impl BridgeFacade {
                 SessionAdmissionDto::Load(_) => AcpSessionAdmissionMethodV1::SessionLoad,
             },
             server_count: dto.mcp_servers().len(),
+            ingress,
         }
     }
 
-    pub fn to_ingress(&self, dto: &SessionAdmissionDto) -> AcpForwardedMcpIngressV1 {
+    pub(crate) fn to_ingress(&self, dto: &SessionAdmissionDto) -> AcpForwardedMcpIngressV1 {
         match dto {
             SessionAdmissionDto::New(new) => self.from_new(new),
             SessionAdmissionDto::Load(load) => self.from_load(load),

@@ -134,7 +134,11 @@ registry, and they assume jsonrpsee-owned transports.
    up in that registry *before* jsonrpsee method routing.
 4. jsonrpsee `RpcModule` handles only **inbound** client → agent requests
    and notifications (`initialize`, `session/new`, `session/load`,
-   `session/cancel`, …).
+   `session/cancel`, …). Until editor-session adaptation has an owned daemon
+   API, the session methods fail closed through an unavailable ingress seam;
+   `initialize` does not advertise load, prompt, or MCP capabilities, and an
+   unsupported session notification closes the peer rather than being treated
+   as a successful cancellation.
 
 This extension is the documented bidirectional gap, not a silent substitute
 for jsonrpsee. Unstable elicitation (`elicitation/create`,
@@ -150,8 +154,9 @@ registered.
 - **Cancellation.** ACP `$/cancel_request` is a JSON-RPC notification, not a
   jsonrpsee subscription unsubscribe. Daemon terminality queues that
   notification through the owned writer before registry release. Client
-  `session/cancel` is an inbound notification dispatched without a response
-  body.
+  `session/cancel` remains unavailable until it has an owner; a notification
+  for it therefore closes the peer without a daemon mutation or fabricated
+  success response.
 - **Errors.** Standard JSON-RPC error objects (`code`, `message`, optional
   `data`) with `"jsonrpc":"2.0"`. Capacity refusal uses the closed local
   error `outbound_request_capacity_exhausted` and never emits a partial

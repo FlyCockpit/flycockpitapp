@@ -5,43 +5,77 @@
 //! and does not call catalog `Install*` / `Release*` lifecycle methods.
 
 use std::io::{self, Read, Write};
+use std::sync::{Arc, Mutex};
 
 use super::AcpTransportCounters;
-use super::bridge::BridgeFacade;
 use super::classify::{ClassifyError, InboundMessage, classify};
 use super::codec::{AcpFrameError, AcpLineReader, AcpLineWriter, FrameSink, write_diagnostic};
 use super::dispatch::{
-    DispatchResult, dispatch_notification, dispatch_request, elicitation_is_rejected,
+    DispatchResult, SessionIngress, UnavailableSessionIngress, dispatch_notification,
+    dispatch_request, elicitation_is_rejected, is_session_method,
 };
 use super::envelope::{invalid_request, parse_error};
 use super::registry::{ApprovalAck, OutboundPermissionRegistry, ResolveCodeRootInterrupt};
 
-pub struct AcpAdapter<S, R, A> {
+/// The only protocol-semantic non-success stdio exit. It means the editor
+/// selected an issued permission option, but its durable delivery had already
+/// reached a conflicting closed state, so the ACP session must fail rather
+/// than acknowledge or fabricate a response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcpPeerExitError {
+    ClosedPermissionRefusal(cockpit_proto::ResolveCodeRootInterruptResultV1),
+}
+
+impl std::fmt::Display for AcpPeerExitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClosedPermissionRefusal(outcome) => {
+                write!(f, "ACP permission delivery was closed: {outcome:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AcpPeerExitError {}
+
+pub struct AcpAdapter<S, R, A, I = UnavailableSessionIngress> {
     pub counters: AcpTransportCounters,
     pub registry: OutboundPermissionRegistry,
-    pub bridge: BridgeFacade,
     pub resolve: R,
     pub ack: A,
     pub sink: S,
-    pub cancelled_sessions: Vec<String>,
+    pub(crate) session_ingress: Arc<Mutex<I>>,
+    closed_refusal: Option<AcpPeerExitError>,
     pub connection_closed: bool,
 }
 
-impl<S, R, A> AcpAdapter<S, R, A>
+impl<S, R, A> AcpAdapter<S, R, A, UnavailableSessionIngress>
 where
     S: FrameSink,
     R: ResolveCodeRootInterrupt,
     A: ApprovalAck,
 {
     pub fn new(sink: S, resolve: R, ack: A) -> Self {
+        Self::new_with_session_ingress(sink, resolve, ack, UnavailableSessionIngress)
+    }
+}
+
+impl<S, R, A, I> AcpAdapter<S, R, A, I>
+where
+    S: FrameSink,
+    R: ResolveCodeRootInterrupt,
+    A: ApprovalAck,
+    I: SessionIngress + 'static,
+{
+    pub fn new_with_session_ingress(sink: S, resolve: R, ack: A, session_ingress: I) -> Self {
         Self {
             counters: AcpTransportCounters::default(),
             registry: OutboundPermissionRegistry::new(),
-            bridge: BridgeFacade,
             resolve,
             ack,
             sink,
-            cancelled_sessions: Vec::new(),
+            session_ingress: Arc::new(Mutex::new(session_ingress)),
+            closed_refusal: None,
             connection_closed: false,
         }
     }
@@ -57,13 +91,14 @@ where
                 parse_error(request_id.as_ref())
             }
             Err(ClassifyError::InvalidJsonrpc { request_id })
+            | Err(ClassifyError::InvalidParams { request_id })
             | Err(ClassifyError::MissingMethod { request_id })
             | Err(ClassifyError::BothRequestAndResponse { request_id }) => {
                 self.counters.frames_rejected += 1;
                 invalid_request(request_id.as_ref())
             }
             Ok(InboundMessage::Response(response)) => {
-                let closed_refusal = self.registry.on_inbound_response(
+                if let Some(outcome) = self.registry.on_inbound_response(
                     &response.id,
                     response.result.as_ref(),
                     &response.raw,
@@ -71,8 +106,8 @@ where
                     &mut self.ack,
                     &mut self.sink,
                     &mut self.counters,
-                );
-                if closed_refusal {
+                ) {
+                    self.closed_refusal = Some(AcpPeerExitError::ClosedPermissionRefusal(outcome));
                     self.connection_closed = true;
                     self.registry.on_disconnect(&mut self.counters);
                 }
@@ -84,19 +119,30 @@ where
                 }
                 match dispatch_request(
                     &request,
-                    &self.bridge,
+                    Arc::clone(&self.session_ingress),
                     &mut self.counters,
-                    &mut self.cancelled_sessions,
                 ) {
                     DispatchResult::Response(frame) => Some(frame),
                     DispatchResult::NotificationHandled | DispatchResult::NoResponse => None,
                 }
             }
             Ok(InboundMessage::Notification(notification)) => {
+                if is_session_method(&notification.method)
+                    && !self
+                        .session_ingress
+                        .lock()
+                        .expect("session ingress")
+                        .is_available()
+                {
+                    self.counters.frames_rejected += 1;
+                    self.disconnect();
+                    return None;
+                }
                 dispatch_notification(
                     &notification.method,
                     &notification.raw,
-                    &mut self.cancelled_sessions,
+                    Arc::clone(&self.session_ingress),
+                    &mut self.counters,
                 );
                 None
             }
@@ -129,7 +175,7 @@ where
 pub fn run_stdio_peer<In, Out, ErrOut, R, A>(
     stdin: In,
     stdout: Out,
-    mut stderr: ErrOut,
+    stderr: ErrOut,
     resolve: R,
     ack: A,
 ) -> io::Result<()>
@@ -140,9 +186,24 @@ where
     R: ResolveCodeRootInterrupt,
     A: ApprovalAck,
 {
-    let mut reader = AcpLineReader::new(stdin);
     let writer = AcpLineWriter::new(stdout);
-    let mut adapter = AcpAdapter::new(writer, resolve, ack);
+    run_stdio_peer_with_adapter(stdin, stderr, AcpAdapter::new(writer, resolve, ack))
+}
+
+pub(crate) fn run_stdio_peer_with_adapter<In, ErrOut, S, R, A, I>(
+    stdin: In,
+    mut stderr: ErrOut,
+    mut adapter: AcpAdapter<S, R, A, I>,
+) -> io::Result<()>
+where
+    In: Read,
+    ErrOut: Write,
+    S: FrameSink,
+    R: ResolveCodeRootInterrupt,
+    A: ApprovalAck,
+    I: SessionIngress + 'static,
+{
+    let mut reader = AcpLineReader::new(stdin);
     loop {
         match reader.read_frame(&mut adapter.counters) {
             Ok(None) => {
@@ -170,6 +231,9 @@ where
             }
         }
         if adapter.connection_closed || adapter.registry.connection_closed() {
+            if let Some(exit) = adapter.closed_refusal {
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, exit));
+            }
             return Ok(());
         }
     }

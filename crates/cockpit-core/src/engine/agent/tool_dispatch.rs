@@ -4579,6 +4579,76 @@ mod tests {
         );
     }
 
+    fn push_signed_assistant_call(history: &mut Vec<Message>, call: &ToolCall) {
+        history.push(Message::Assistant {
+            id: None,
+            content: vec![
+                AssistantContent::Reasoning(rig::message::Reasoning::new_with_signature(
+                    "provider signed thinking",
+                    Some("sig-native".into()),
+                )),
+                AssistantContent::ToolCall(call.clone()),
+            ],
+        });
+    }
+
+    #[tokio::test]
+    async fn signed_reasoning_write_is_untouched_until_a_newer_assistant_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(crate::tools::write::WriteTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let content = long_write_content();
+        let args = serde_json::json!({ "path": "signed.rs", "content": content });
+        let call = tool_call("write", args.clone());
+        let mut history = Vec::new();
+        push_signed_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "write", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            write_call_args(&history)["content"],
+            serde_json::json!(content),
+            "signed latest assistant must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("signed.rs")).unwrap(),
+            content
+        );
+
+        history.push(Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::text("next turn")],
+        });
+        assert_eq!(
+            crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut history),
+            1
+        );
+        assert_eq!(
+            write_call_args(&history)["content"],
+            serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(
+                content.len()
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn captured_tool_result_persists_only_the_post_safety_body() {
         let tmp = tempfile::tempdir().unwrap();

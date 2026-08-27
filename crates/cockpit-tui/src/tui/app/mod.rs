@@ -55,6 +55,8 @@ mod skills_pane_actions;
 pub(super) mod slash;
 mod startup_layout;
 mod sticky_header;
+#[cfg(test)]
+mod sticky_header_tests;
 mod subagent_view;
 mod terminal_controls;
 mod terminal_display;

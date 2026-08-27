@@ -7894,6 +7894,9 @@ mod render_history_spacing_tests {
 
         app.use_emojis = !app.use_emojis;
         assert_eq!(render_calls_after(&mut app, 81, 8), 1);
+
+        app.sticky_user_message = !app.sticky_user_message;
+        assert_eq!(render_calls_after(&mut app, 81, 8), 1);
         assert_eq!(render_calls_after(&mut app, 81, 8), 0);
     }
 

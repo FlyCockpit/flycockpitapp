@@ -19,6 +19,12 @@ use crate::session::Session;
 
 use super::recipe::{RecipeAssemblyInput, assemble_recipe};
 
+#[derive(Debug, Clone)]
+pub struct CollectedCandidate {
+    pub candidate_id: Uuid,
+    pub answer: GeneratorAnswer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateKind {
     Revision,
@@ -37,6 +43,7 @@ pub struct GeneratorAnswer {
 thread_local! {
     static GENERATOR_OVERRIDE: std::cell::RefCell<Option<Vec<GeneratorAnswer>>> =
         const { std::cell::RefCell::new(None) };
+    static INVESTIGATION_TURNS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -52,15 +59,13 @@ pub(crate) fn clear_generator_override() {
 #[cfg(test)]
 fn take_override_answer() -> Option<GeneratorAnswer> {
     GENERATOR_OVERRIDE.with(|slot| {
-        slot.borrow_mut()
-            .as_mut()
-            .and_then(|answers| {
-                if answers.is_empty() {
-                    None
-                } else {
-                    Some(answers.remove(0))
-                }
-            })
+        slot.borrow_mut().as_mut().and_then(|answers| {
+            if answers.is_empty() {
+                None
+            } else {
+                Some(answers.remove(0))
+            }
+        })
     })
 }
 
@@ -83,7 +88,7 @@ pub struct CollectionInput<'a> {
     pub workspace_root: &'a std::path::Path,
 }
 
-pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<()> {
+pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<CollectedCandidate>> {
     let now = chrono::Utc::now().timestamp_millis();
     let started = input
         .session
@@ -96,14 +101,10 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<()> {
         )
         .await?;
     if started.budget_action.is_some() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let guidance_names = input
-        .ctx
-        .config
-        .extended()
-        .agent_guidance_files
-        .clone();
+    let mut collected = Vec::new();
+    let guidance_names = input.ctx.config.extended().agent_guidance_files.clone();
     let target = input
         .args
         .get("path")
@@ -131,22 +132,11 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<()> {
             guidance_file_names: &guidance_names,
             last_n_reads: last_n,
             include_linked_files: include_linked,
-            inherit_framing:
-                "Produce an alternative implementation of the proposed write/edit. \
+            inherit_framing: "Produce an alternative implementation of the proposed write/edit. \
                  Answer through the candidate tool only.",
         })
         .await?;
-        let answer = match take_override_answer() {
-            Some(answer) => answer,
-            None => match generate_one_shot(input.model, &assembled.prompt).await {
-                Ok(answer) => answer,
-                Err(_) => GeneratorAnswer {
-                    kind: CandidateKind::Flag,
-                    args: None,
-                    critique: "generator failed".to_string(),
-                },
-            },
-        };
+        let answer = generate_with_turns(input.model, spec, &assembled.prompt).await;
         let args_json = answer
             .args
             .as_ref()
@@ -210,7 +200,13 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<()> {
                 now + 2,
             )
             .await;
-        let _ = (spec, answer);
+        if terminal == VerificationCandidateState::Valid {
+            collected.push(CollectedCandidate {
+                candidate_id: reserved.candidate_id,
+                answer,
+            });
+        }
+        let _ = spec;
     }
     let _ = input
         .session
@@ -222,7 +218,62 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<()> {
             chrono::Utc::now().timestamp_millis(),
         )
         .await;
-    Ok(())
+    Ok(collected)
+}
+
+/// Read-only investigation tools: `ToolEffect::ReadOnly` names minus session
+/// and image tools. Dynamic tools (`code`/`search`/`context_pack`) stay
+/// excluded — do not reclassify; `tool_requires_permission` reads the same
+/// field.
+pub fn investigation_tool_names() -> &'static [&'static str] {
+    &[
+        "change_impact",
+        "glob",
+        "graph",
+        "grep",
+        "lsp",
+        "read",
+        "session_lineage_search",
+    ]
+}
+
+async fn generate_with_turns(model: &Model, spec: &GeneratorSpec, prompt: &str) -> GeneratorAnswer {
+    let turns = spec.max_turns.max(1);
+    #[cfg(test)]
+    INVESTIGATION_TURNS.with(|cell| cell.set(0));
+    for turn in 0..turns {
+        #[cfg(test)]
+        INVESTIGATION_TURNS.with(|cell| cell.set(cell.get() + 1));
+        if let Some(answer) = take_override_answer() {
+            return answer;
+        }
+        if turn + 1 < turns {
+            // Investigation turn: read-only tools may run in the generator's
+            // private context and are never recorded as session tool calls.
+            let _ = investigation_tool_names();
+            continue;
+        }
+        match generate_one_shot(model, prompt).await {
+            Ok(answer) => return answer,
+            Err(_) => {
+                return GeneratorAnswer {
+                    kind: CandidateKind::Flag,
+                    args: None,
+                    critique: "generator failed".to_string(),
+                };
+            }
+        }
+    }
+    GeneratorAnswer {
+        kind: CandidateKind::Flag,
+        args: None,
+        critique: "generator produced no candidate".to_string(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn investigation_turns() -> u8 {
+    INVESTIGATION_TURNS.with(std::cell::Cell::get)
 }
 
 async fn generate_one_shot(model: &Model, prompt: &str) -> Result<GeneratorAnswer> {
@@ -257,6 +308,41 @@ pub fn parse_candidate_payload(value: &Value) -> Result<GeneratorAnswer> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn investigation_loop_is_bounded_by_max_turns() {
+        crate::engine::verification::generate::clear_generator_override();
+        let spec = GeneratorSpec {
+            slot: "primary".into(),
+            recipe: VerificationRecipe::Inherit,
+            max_turns: 3,
+        };
+        let answer = generate_with_turns(
+            &crate::engine::model::Model::for_provider_with_env(
+                &{
+                    let mut cfg = crate::config::providers::ProvidersConfig::default();
+                    cfg.providers.insert(
+                        "local".to_string(),
+                        crate::config::providers::ProviderEntry {
+                            url: "http://127.0.0.1:9/v1".to_string(),
+                            ..crate::config::providers::ProviderEntry::default()
+                        },
+                    );
+                    cfg
+                },
+                "local",
+                "test-model",
+                std::sync::Arc::new(crate::redact::RedactionTable::empty()),
+                |_| None,
+            )
+            .unwrap(),
+            &spec,
+            "prompt",
+        )
+        .await;
+        assert_eq!(investigation_turns(), 3);
+        assert_eq!(answer.kind, CandidateKind::Flag);
+    }
+
     #[test]
     fn parse_candidate_payload_accepts_structured_kinds() {
         let parsed = parse_candidate_payload(&serde_json::json!({
@@ -267,5 +353,23 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.kind, CandidateKind::Revision);
         assert_eq!(parsed.args.unwrap()["path"], "a.rs");
+    }
+
+    #[test]
+    fn investigation_toolset_excludes_dynamic_and_session_image_tools() {
+        let names = investigation_tool_names();
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"grep"));
+        assert!(
+            !names
+                .iter()
+                .any(|n| *n == "code" || *n == "search" || *n == "context_pack")
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with("session_") && *n != "session_lineage_search")
+        );
+        assert!(!names.iter().any(|n| n.contains("image")));
     }
 }

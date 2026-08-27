@@ -30,10 +30,12 @@ use crate::engine::model::Model;
 use crate::engine::tool::ToolCtx;
 use crate::session::Session;
 
+use super::adjudicate::{AdjudicatorDecision, adjudicate, apply_mode, selected_revision};
 use super::budget::budget_to_ledger;
 use super::classify_tool;
 use super::estimate::{CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set};
 use super::generate::{CollectionInput, collect_candidates};
+use super::recipe::{proposed_diff, select_guidance_for_target};
 
 /// Outcome of the verification intercept.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,10 +47,7 @@ pub(crate) enum VerificationOutcome {
     /// original call unchanged.
     DispatchOriginal { operation_id: Uuid },
     /// Gate mode blocked the call. Do not execute.
-    Block {
-        message: String,
-        operation_id: Uuid,
-    },
+    Block { message: String, operation_id: Uuid },
     /// Revise mode: dispatch substituted args.
     Revise {
         args: Value,
@@ -159,9 +158,7 @@ async fn shadow_record(
         max_collection_millis: requested.max_collection_millis,
     });
     let estimate = match pre.to_verification_estimate() {
-        VerificationEstimate::UnknownPrice
-            if requested.max_estimated_cost_microusd == u64::MAX =>
-        {
+        VerificationEstimate::UnknownPrice if requested.max_estimated_cost_microusd == u64::MAX => {
             VerificationEstimate::Known(crate::agents::VerificationBudget {
                 max_candidates: pre.candidates,
                 max_total_tokens: pre.tokens,
@@ -234,8 +231,9 @@ async fn shadow_record(
             now,
         )
         .await?;
+    let mut collected = Vec::new();
     if recorded_action.is_none() && !generators.is_empty() {
-        let _ = collect_candidates(CollectionInput {
+        collected = collect_candidates(CollectionInput {
             session: input.session,
             agent: input.agent,
             model: input.model,
@@ -248,7 +246,82 @@ async fn shadow_record(
             expected_revision: created.revision,
             workspace_root: input.ctx.cwd.as_path(),
         })
-        .await;
+        .await
+        .unwrap_or_default();
+    }
+    if recorded_action.is_none() {
+        let names = input.ctx.config.extended().agent_guidance_files.clone();
+        let target = input
+            .args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(std::path::PathBuf::from);
+        let instructions = select_guidance_for_target(
+            input.session,
+            input.ctx.cwd.as_path(),
+            input.ctx.cwd.as_path(),
+            target.as_deref(),
+            &names,
+        )
+        .await
+        .map(|(_, body)| body)
+        .unwrap_or_default();
+        let verdict = adjudicate(
+            input.model,
+            input.args,
+            &collected,
+            &instructions,
+            rule.resolved_on_adjudication_failure(),
+        )
+        .await
+        .unwrap_or(super::adjudicate::AdjudicatorVerdict {
+            decision: match rule.resolved_on_adjudication_failure() {
+                crate::agents::OnAdjudicationFailure::Refuse => AdjudicatorDecision::Block,
+                crate::agents::OnAdjudicationFailure::DispatchOriginal => {
+                    AdjudicatorDecision::Approve
+                }
+            },
+            selected: None,
+            feedback: "adjudicator failed".into(),
+        });
+        let verdict = apply_mode(verdict, rule.resolved_mode(), &collected);
+        match (rule.resolved_mode(), verdict.decision) {
+            (_, AdjudicatorDecision::Approve) => {}
+            (crate::agents::VerificationMode::Gate, AdjudicatorDecision::Block) => {
+                let feedback = if verdict.feedback.is_empty() {
+                    "verification rejected this change".to_string()
+                } else {
+                    verdict.feedback
+                };
+                return Ok(VerificationOutcome::Block {
+                    message: format!(
+                        "verification blocked this edit: {feedback}; revise and re-emit"
+                    ),
+                    operation_id: created.operation_id,
+                });
+            }
+            (crate::agents::VerificationMode::Revise, AdjudicatorDecision::Select)
+            | (crate::agents::VerificationMode::Revise, AdjudicatorDecision::Block) => {
+                if let Some(answer) = selected_revision(&verdict, &collected)
+                    && let Some(applied) = answer.args.clone()
+                {
+                    let original_diff =
+                        proposed_diff(input.resolved_name, input.args, input.ctx.cwd.as_path());
+                    let applied_diff =
+                        proposed_diff(input.resolved_name, &applied, input.ctx.cwd.as_path());
+                    let disclosure = format!(
+                        "[cockpit] verification revised this change before applying:\n{}",
+                        crate::engine::guidance_diff::unified_diff(&original_diff, &applied_diff)
+                    );
+                    return Ok(VerificationOutcome::Revise {
+                        args: applied,
+                        disclosure,
+                        operation_id: created.operation_id,
+                    });
+                }
+            }
+            _ => {}
+        }
     }
     Ok(VerificationOutcome::DispatchOriginal {
         operation_id: created.operation_id,
@@ -265,9 +338,7 @@ mod tests {
     };
     use crate::db::agent_tree_decisions::NewAgentInstance;
     use crate::db::tool_calls::Recovery;
-    use crate::db::verification_ledger::{
-        VerificationBudgetAction, VerificationEstimateState,
-    };
+    use crate::db::verification_ledger::{VerificationBudgetAction, VerificationEstimateState};
     use crate::engine::agent::tool_dispatch::{DispatchEnv, execute_ordinary_call};
     use crate::engine::agent::{Agent, TurnEvent};
     use crate::engine::message::{Message, ToolCall};
@@ -482,7 +553,12 @@ mod tests {
         (session, created.agent_instance_id)
     }
 
-    fn tool_ctx(session: Arc<Session>, root: &std::path::Path, tx: &mpsc::Sender<TurnEvent>, agent_instance_id: Uuid) -> ToolCtx {
+    fn tool_ctx(
+        session: Arc<Session>,
+        root: &std::path::Path,
+        tx: &mpsc::Sender<TurnEvent>,
+        agent_instance_id: Uuid,
+    ) -> ToolCtx {
         ToolCtx {
             agent_id: "Build".to_string(),
             agent_instance_id: Some(agent_instance_id),
@@ -521,7 +597,11 @@ mod tests {
     async fn dispatch_named(
         name: &str,
         grant: Option<EffectiveVnextGrant>,
-    ) -> (bool, String, Vec<crate::db::verification_ledger::VerificationOperationRow>) {
+    ) -> (
+        bool,
+        String,
+        Vec<crate::db::verification_ledger::VerificationOperationRow>,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let called = Arc::new(AtomicBool::new(false));
         let tools = ToolBox::new().with(Arc::new(NamedFixtureTool {
@@ -589,7 +669,10 @@ mod tests {
             dispatch_named("read", Some(verify_grant(VerificationAction::Verify))).await;
         assert!(called);
         assert_eq!(wire, "applied");
-        assert!(rows.is_empty(), "unclassified tools must not write ledger rows");
+        assert!(
+            rows.is_empty(),
+            "unclassified tools must not write ledger rows"
+        );
     }
 
     #[tokio::test]
@@ -701,5 +784,50 @@ mod tests {
             crate::db::verification_ledger::VerificationCandidateState::Valid
         );
     }
-}
 
+    fn verify_grant_inheriting_cost() -> EffectiveVnextGrant {
+        let definition = VnextAgentDef {
+            schema_version: crate::agents::SCHEMA_VERSION,
+            agent_id: "authored/reviewer".to_string(),
+            execution_kind: ExecutionKind::Coding,
+            model_slots: BTreeMap::from([("primary".to_string(), slot())]),
+            delegation: crate::agents::DelegationPolicy::default(),
+            questions: None,
+            verification: Some(VerificationPolicy {
+                rules: vec![VerificationRule {
+                    selector: VerificationSelector {
+                        all_of: vec![SelectorPredicate::ToolClass {
+                            tool_class: ToolClass::ArtifactWrite,
+                        }],
+                        any_of: vec![],
+                    },
+                    action: VerificationAction::Verify,
+                    adjudicator_slot: Some("primary".into()),
+                    on_budget_exceeded: Some(OnBudgetExceeded::DispatchOriginal),
+                    ..Default::default()
+                }],
+            }),
+        };
+        definition.resolve_grant(&host()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gate_block_does_not_execute_and_returns_structured_refusal() {
+        crate::engine::verification::adjudicate::set_adjudicator_override(
+            crate::engine::verification::adjudicate::AdjudicatorVerdict {
+                decision: crate::engine::verification::adjudicate::AdjudicatorDecision::Block,
+                selected: None,
+                feedback: "style mismatch".into(),
+            },
+        );
+        let (called, wire, rows) =
+            dispatch_named("edit", Some(verify_grant_inheriting_cost())).await;
+        crate::engine::verification::adjudicate::clear_adjudicator_override();
+        assert!(!called, "blocked verification must not execute the tool");
+        assert!(
+            wire.contains("verification blocked this edit: style mismatch"),
+            "{wire}"
+        );
+        assert_eq!(rows.len(), 1);
+    }
+}

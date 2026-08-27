@@ -695,6 +695,7 @@ async fn execute_ordinary_call_unscoped(
     // rejections, and placeholder blocks are NOT executions and fire no post
     // hook. Only the `dispatch_one_timed` path is a real execution.
     let mut tool_was_dispatched = false;
+    let mut verification_disclosure: Option<String> = None;
     let (result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
         // The model reads back a deterministic diagnostic; the native computer
@@ -841,7 +842,7 @@ async fn execute_ordinary_call_unscoped(
         // Frame inputs are already pinned above. Stage 1 is shadow-mode: a
         // matching verify rule records a dispatch_original ledger row and the
         // original call still executes.
-        let _verification = crate::engine::verification::intercept_ordinary_call(
+        let verification = crate::engine::verification::intercept_ordinary_call(
             crate::engine::verification::InterceptInput {
                 session: env.session,
                 agent: env.agent,
@@ -854,21 +855,49 @@ async fn execute_ordinary_call_unscoped(
             },
         )
         .await;
-        // A real tool execution is about to occur: the pre-hook gate allowed
-        // it and `dispatch_one_timed` will run. Post hooks fire only after a
-        // real execution (success or failure).
-        tool_was_dispatched = true;
-        crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-            dispatch_one_timed(
-                env.active_tools,
-                resolved_name,
-                args.clone(),
-                env.ctx,
-                Some(&tc.id),
-            )
-            .await
-        })
-        .await
+        match verification {
+            crate::engine::verification::VerificationOutcome::Block { message, .. } => {
+                (Err(invalid_input(message)), 0)
+            }
+            crate::engine::verification::VerificationOutcome::Revise {
+                args: revised_args,
+                disclosure,
+                ..
+            } => {
+                super::rewrite_assistant_tool_call(history, tc.id.as_str(), &revised_args);
+                args = revised_args;
+                tool_was_dispatched = true;
+                let dispatched =
+                    crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                        dispatch_one_timed(
+                            env.active_tools,
+                            resolved_name,
+                            args.clone(),
+                            env.ctx,
+                            Some(&tc.id),
+                        )
+                        .await
+                    })
+                    .await;
+                verification_disclosure = Some(disclosure);
+                dispatched
+            }
+            crate::engine::verification::VerificationOutcome::Skip
+            | crate::engine::verification::VerificationOutcome::DispatchOriginal { .. } => {
+                tool_was_dispatched = true;
+                crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                    dispatch_one_timed(
+                        env.active_tools,
+                        resolved_name,
+                        args.clone(),
+                        env.ctx,
+                        Some(&tc.id),
+                    )
+                    .await
+                })
+                .await
+            }
+        }
     } else {
         let msg = repair_outcome
             .error
@@ -1110,6 +1139,12 @@ async fn execute_ordinary_call_unscoped(
     // Keep tool output raw in history and the local audit row. Egress
     // redaction happens at model dispatch and at the client boundary.
     let mut output_str = raw_output;
+    if let Some(disclosure) = &verification_disclosure {
+        if !output_str.ends_with('\n') {
+            output_str.push('\n');
+        }
+        output_str.push_str(disclosure);
+    }
     let output_before_recheck = output_str.clone();
 
     // Result injection re-check (implementation note):

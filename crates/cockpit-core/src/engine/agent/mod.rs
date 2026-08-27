@@ -1675,7 +1675,11 @@ fn history_rewrite_args<'a>(
 /// assistant turn in place. If that turn carries a signed thinking
 /// block, mutating any sibling block risks a "latest assistant message
 /// cannot be modified" 400. See `implementation notes` §10b.
-fn rewrite_assistant_tool_call(history: &mut [Message], call_id: &str, canonical_args: &Value) {
+pub(crate) fn rewrite_assistant_tool_call(
+    history: &mut [Message],
+    call_id: &str,
+    canonical_args: &Value,
+) {
     use rig::message::AssistantContent;
     for msg in history.iter_mut().rev() {
         if let Message::Assistant { content, .. } = msg {

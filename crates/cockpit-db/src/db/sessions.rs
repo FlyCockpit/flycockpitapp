@@ -1834,6 +1834,27 @@ impl Db {
             .await
     }
 
+    /// Latest non-ephemeral root session's `active_agent` for a project.
+    /// Used to derive "last used agent in this workspace" with no extra schema.
+    pub async fn last_used_root_agent_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<String>> {
+        let project_id = project_id.to_string();
+        self.read(move |conn| Self::last_used_root_agent_for_project_conn(conn, &project_id))
+            .await
+    }
+
+    pub(crate) fn last_used_root_agent_for_project_conn(
+        conn: &Connection,
+        project_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(Self::list_root_sessions_conn(conn, project_id, 1)?
+            .into_iter()
+            .next()
+            .map(|row| row.active_agent))
+    }
+
     pub(crate) fn list_root_sessions_conn(
         conn: &Connection,
         project_id: &str,
@@ -4427,6 +4448,40 @@ mod tests {
         let roots = db.list_root_sessions("p", 100).await.unwrap();
         assert_eq!(roots.len(), 2);
         assert!(roots.iter().all(|r| r.parent_session_id.is_none()));
+    }
+
+    #[tokio::test]
+    async fn last_used_root_agent_latest_non_ephemeral_wins() {
+        let db = Db::open_in_memory().unwrap();
+        let older = db.create_session("p", "/x", "Plan").await.unwrap();
+        let newer = db.create_session("p", "/x", "Build").await.unwrap();
+        let _other = db.create_session("q", "/y", "Careful").await.unwrap();
+        let _fork = db.create_fork(newer.session_id, None).await.unwrap();
+        let _side = db
+            .create_ephemeral_fork(newer.session_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.last_used_root_agent_for_project("p").await.unwrap(),
+            Some("Build".to_string()),
+            "later root session wins"
+        );
+        db.touch_session(older.session_id).await.unwrap();
+        assert_eq!(
+            db.last_used_root_agent_for_project("p").await.unwrap(),
+            Some("Plan".to_string()),
+            "touching an older root makes it last-used"
+        );
+        assert_eq!(
+            db.last_used_root_agent_for_project("q").await.unwrap(),
+            Some("Careful".to_string())
+        );
+        assert_eq!(
+            db.last_used_root_agent_for_project("missing")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

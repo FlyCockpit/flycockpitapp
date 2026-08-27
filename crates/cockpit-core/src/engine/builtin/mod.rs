@@ -2463,6 +2463,12 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         if def.vnext.is_some() && matches!(name.as_str(), "spawn" | "schedule" | "task") {
             continue;
         }
+        // This tool is materialized only by `with_read_image_tools`, which
+        // seals it to the direct-native registry and applies availability.
+        // The generic path also registers tools with MCP/Monty.
+        if name == "read_image" {
+            continue;
+        }
         tb = match effective_tool_tier(def, name, is_assistant) {
             crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
             crate::agents::ToolTier::Discoverable => {

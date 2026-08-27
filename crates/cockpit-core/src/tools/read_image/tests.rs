@@ -846,28 +846,42 @@ impl AttachmentResolver for TestAttachmentResolver {
         &self,
         _session_id: &str,
         attachment_id: &[u8; 16],
+        max_bytes: usize,
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
-        Ok(self.attachments.get(attachment_id).cloned())
+        Ok(self
+            .attachments
+            .get(attachment_id)
+            .filter(|attachment| attachment.content.len() <= max_bytes)
+            .cloned())
     }
 }
 
 struct TestLocalPathPolicy;
 
 impl LocalPathPolicy for TestLocalPathPolicy {
-    fn authorize(
+    fn admit(
         &self,
         _session_id: &str,
         path: &str,
-    ) -> Result<(std::path::PathBuf, HandleEvidence), AdmissionDenial> {
+        max_bytes: usize,
+    ) -> Result<crate::tool_media_authority::session_authority::AdmittedLocalHandle, AdmissionDenial>
+    {
         if path.contains("denied") {
             return Err(AdmissionDenial::LocalPathDenied);
         }
-        Ok((
-            std::path::PathBuf::from(path),
-            HandleEvidence {
-                metadata_fingerprint: [0xAA; 32],
-            },
-        ))
+        let content = std::fs::read(path).map_err(|e| AdmissionDenial::Internal(e.to_string()))?;
+        if content.len() > max_bytes {
+            return Err(AdmissionDenial::Internal("input too large".into()));
+        }
+        Ok(
+            crate::tool_media_authority::session_authority::AdmittedLocalHandle::from_held_bytes(
+                std::path::PathBuf::from(path),
+                HandleEvidence {
+                    metadata_fingerprint: [0xAA; 32],
+                },
+                content,
+            ),
+        )
     }
 }
 
@@ -880,9 +894,13 @@ impl RetainedHttpsPolicy for TestHttpsPolicy {
         &self,
         _session_id: &str,
         url: &str,
+        max_bytes: usize,
     ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
         if url.contains("denied") {
             return Err(AdmissionDenial::HttpsDenied);
+        }
+        if self.content.len() > max_bytes {
+            return Err(AdmissionDenial::Internal("input too large".into()));
         }
         Ok(AdmittedRetainedSource {
             canonical_url: url.to_string(),
@@ -923,6 +941,7 @@ fn test_authority_with_attachment(
             attachment_version: 1,
             checksum: [0x55; 32],
             kind: 1,
+            content: bytes.clone(),
         },
     );
     let auth = SessionMediaAuthority::new(
@@ -933,7 +952,6 @@ fn test_authority_with_attachment(
             content: bytes.clone(),
         }),
     );
-    auth.insert_attachment_bytes(attachment_id, bytes);
     auth
 }
 
@@ -1229,6 +1247,14 @@ fn read_image_toolsource_cleanup_race() {
     assert!(result.unwrap_err().to_string().contains("cancelled"));
     let race = cleanup_thread.join().unwrap();
     assert_eq!(race, CleanupRace::WaitedForLease);
+    assert_eq!(
+        auth_for_cleanup
+            .activity()
+            .source_releases
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "ToolSource must release exactly once on cancellation"
+    );
     assert_eq!(
         auth_for_cleanup
             .activity()

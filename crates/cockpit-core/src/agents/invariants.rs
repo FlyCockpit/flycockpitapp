@@ -165,6 +165,11 @@ pub fn validate_grant(
         if !known.contains(&tool.as_str()) {
             bail!("delegation to `{target_name}` granted unknown tool `{tool}`");
         }
+        if tool == "read_image" {
+            bail!(
+                "delegation to `{target_name}` may not be granted direct-native-only tool `read_image`"
+            );
+        }
         // Delegation tools are never grantable: handing a child the power to
         // spawn further work would break leaf-termination — the child is a
         // leaf and must report one result up. (`spawn` is the documented

@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -23,6 +23,7 @@ use super::revalidator::RevalidatedSubject;
 
 /// Image media kind (FCM2 wire code).
 const IMAGE_KIND: u8 = 1;
+const READ_IMAGE_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
 /// An admitted local-path handle — authority-owned, no-follow, with evidence.
 ///
@@ -32,15 +33,26 @@ const IMAGE_KIND: u8 = 1;
 pub struct AdmittedLocalHandle {
     /// The canonical absolute path that was authorized.
     canonical_path: PathBuf,
-    /// The already-opened no-follow source. Consumers read this descriptor and
-    /// never reopen `canonical_path`.
-    held_file: Arc<std::fs::File>,
     /// Opaque evidence that the handle was held by the authority at admission
     /// time (e.g. inode/device metadata). Never exposed to the model.
     evidence: HandleEvidence,
+    /// Bytes read through the policy's held, no-follow handle. Keeping them on
+    /// the admitted object prevents consumers from reopening the path spelling.
+    content: Vec<u8>,
 }
 
 impl AdmittedLocalHandle {
+    pub(crate) fn from_held_bytes(
+        canonical_path: PathBuf,
+        evidence: HandleEvidence,
+        content: Vec<u8>,
+    ) -> Self {
+        Self {
+            canonical_path,
+            evidence,
+            content,
+        }
+    }
     /// The canonical path — available to the authority's internal consumer
     /// only, never to the model.
     pub(crate) fn canonical_path(&self) -> &PathBuf {
@@ -52,8 +64,8 @@ impl AdmittedLocalHandle {
         &self.evidence
     }
 
-    pub(crate) fn held_file(&self) -> &std::fs::File {
-        &self.held_file
+    pub(crate) fn content(&self) -> &[u8] {
+        &self.content
     }
 }
 
@@ -95,6 +107,10 @@ pub struct AdmittedAttachment {
     pub(crate) attachment_version: u64,
     pub(crate) checksum: [u8; 32],
     pub(crate) kind: u8,
+    /// Bytes resolved through the durable attachment provider while admission
+    /// is authorized. Consumers receive this held evidence and never perform a
+    /// second lookup by attachment id.
+    pub(crate) content: Vec<u8>,
 }
 
 impl AdmittedAttachment {
@@ -109,6 +125,10 @@ impl AdmittedAttachment {
     }
     pub fn kind(&self) -> u8 {
         self.kind
+    }
+
+    pub(crate) fn content(&self) -> &[u8] {
+        &self.content
     }
 }
 
@@ -172,6 +192,7 @@ struct ToolSourceShared {
     model_leases: AtomicU64,
     preview_leases: AtomicU64,
     released_notify: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
+    activity: Arc<AuthorityActivity>,
 }
 
 impl std::fmt::Debug for ToolSource {
@@ -184,7 +205,11 @@ impl std::fmt::Debug for ToolSource {
 }
 
 impl ToolSource {
-    fn new(bytes: Vec<u8>, identity: ImmutableAttachmentIdentity) -> Self {
+    fn new(
+        bytes: Vec<u8>,
+        identity: ImmutableAttachmentIdentity,
+        activity: Arc<AuthorityActivity>,
+    ) -> Self {
         Self {
             shared: Arc::new(ToolSourceShared {
                 bytes,
@@ -194,6 +219,7 @@ impl ToolSource {
                 model_leases: AtomicU64::new(0),
                 preview_leases: AtomicU64::new(0),
                 released_notify: Mutex::new(Vec::new()),
+                activity,
             }),
             released: false,
         }
@@ -220,6 +246,10 @@ impl ToolSource {
         }
         self.released = true;
         self.shared.release_count.fetch_add(1, Ordering::SeqCst);
+        self.shared
+            .activity
+            .source_releases
+            .fetch_add(1, Ordering::SeqCst);
         self.shared.held.store(false, Ordering::SeqCst);
         let waiters = std::mem::take(&mut *self.shared.released_notify.lock().unwrap());
         for tx in waiters {
@@ -243,13 +273,13 @@ impl ToolSource {
         self.shared.preview_leases.load(Ordering::SeqCst)
     }
 
-    fn wait_until_released(&self) {
-        if !self.shared.held.load(Ordering::SeqCst) {
+    fn wait_shared_until_released(shared: &Arc<ToolSourceShared>) {
+        if !shared.held.load(Ordering::SeqCst) {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        self.shared.released_notify.lock().unwrap().push(tx);
-        if !self.shared.held.load(Ordering::SeqCst) {
+        shared.released_notify.lock().unwrap().push(tx);
+        if !shared.held.load(Ordering::SeqCst) {
             return;
         }
         let _ = rx.recv();
@@ -273,6 +303,18 @@ pub struct DerivativeReservation {
     pub id: Uuid,
     completed: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    registry: Arc<Mutex<ImageRegistry>>,
+}
+
+impl Drop for DerivativeReservation {
+    fn drop(&mut self) {
+        if self.completed.load(Ordering::SeqCst) || self.cancelled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut registry = self.registry.lock().unwrap();
+        registry.bytes.remove(self.id.as_bytes());
+        registry.identities.remove(self.id.as_bytes());
+    }
 }
 
 impl DerivativeReservation {
@@ -302,7 +344,7 @@ pub struct AuthorityActivity {
 struct ImageRegistry {
     bytes: HashMap<[u8; 16], Vec<u8>>,
     identities: HashMap<[u8; 16], ImmutableAttachmentIdentity>,
-    live_leases: HashMap<[u8; 16], Arc<ToolSourceShared>>,
+    live_leases: HashMap<[u8; 16], Vec<Weak<ToolSourceShared>>>,
     cleanup_requested: HashMap<[u8; 16], Arc<AtomicBool>>,
 }
 
@@ -317,18 +359,21 @@ pub trait AttachmentResolver: Send + Sync {
         &self,
         session_id: &str,
         attachment_id: &[u8; 16],
+        max_bytes: usize,
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial>;
 }
 
 /// The local-path admission policy trait.
 pub trait LocalPathPolicy: Send + Sync {
-    /// Canonicalize and authorize a local path.
-    /// Returns the canonical path and handle evidence on success.
-    fn authorize(
+    /// Canonicalize, authorize, and read a local path through one held,
+    /// no-follow handle. Implementations must enforce `max_bytes` while
+    /// reading, before allocating unbounded content.
+    fn admit(
         &self,
         session_id: &str,
         path: &str,
-    ) -> Result<(PathBuf, Arc<std::fs::File>, HandleEvidence), AdmissionDenial>;
+        max_bytes: usize,
+    ) -> Result<AdmittedLocalHandle, AdmissionDenial>;
 }
 
 /// Reopens and live-revalidates the persisted sealed binding. This is invoked
@@ -340,8 +385,12 @@ pub(crate) trait SubjectLiveness: Send + Sync {
 /// The retained-HTTPS admission policy trait.
 pub trait RetainedHttpsPolicy: Send + Sync {
     /// Fetch and retain an HTTPS source.
-    fn admit(&self, session_id: &str, url: &str)
-    -> Result<AdmittedRetainedSource, AdmissionDenial>;
+    fn admit(
+        &self,
+        session_id: &str,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<AdmittedRetainedSource, AdmissionDenial>;
 }
 
 /// `SessionMediaAuthority` — the private direct-native media authority.
@@ -354,7 +403,7 @@ pub struct SessionMediaAuthority {
     attachment_resolver: Arc<dyn AttachmentResolver>,
     local_path_policy: Arc<dyn LocalPathPolicy>,
     retained_https_policy: Arc<dyn RetainedHttpsPolicy>,
-    registry: Mutex<ImageRegistry>,
+    registry: Arc<Mutex<ImageRegistry>>,
     activity: Arc<AuthorityActivity>,
 }
 
@@ -380,12 +429,12 @@ impl SessionMediaAuthority {
             attachment_resolver,
             local_path_policy,
             retained_https_policy,
-            registry: Mutex::new(ImageRegistry {
+            registry: Arc::new(Mutex::new(ImageRegistry {
                 bytes: HashMap::new(),
                 identities: HashMap::new(),
                 live_leases: HashMap::new(),
                 cleanup_requested: HashMap::new(),
-            }),
+            })),
             activity: Arc::new(AuthorityActivity::default()),
         }
     }
@@ -422,10 +471,11 @@ impl SessionMediaAuthority {
         }
         self.revalidate_subject(session_id)?;
 
-        match self
-            .attachment_resolver
-            .resolve(session_id, attachment_id)?
-        {
+        match self.attachment_resolver.resolve(
+            session_id,
+            attachment_id,
+            READ_IMAGE_MAX_INPUT_BYTES,
+        )? {
             Some(att) => Ok(att),
             None => Err(AdmissionDenial::AttachmentNotFound),
         }
@@ -447,13 +497,8 @@ impl SessionMediaAuthority {
         }
         self.revalidate_subject(session_id)?;
 
-        let (canonical_path, held_file, evidence) =
-            self.local_path_policy.authorize(session_id, path)?;
-        Ok(AdmittedLocalHandle {
-            canonical_path,
-            held_file,
-            evidence,
-        })
+        self.local_path_policy
+            .admit(session_id, path, READ_IMAGE_MAX_INPUT_BYTES)
     }
 
     /// Admit a retained-HTTPS source.
@@ -471,26 +516,29 @@ impl SessionMediaAuthority {
         }
         self.revalidate_subject(session_id)?;
 
-        self.retained_https_policy.admit(session_id, url)
+        self.retained_https_policy
+            .admit(session_id, url, READ_IMAGE_MAX_INPUT_BYTES)
     }
     pub fn activity(&self) -> Arc<AuthorityActivity> {
         Arc::clone(&self.activity)
     }
 
     pub fn live_lease_ids(&self) -> Vec<Uuid> {
-        self.registry
-            .lock()
-            .unwrap()
+        let mut registry = self.registry.lock().unwrap();
+        registry.live_leases.retain(|_, leases| {
+            leases.retain(|lease| {
+                lease
+                    .upgrade()
+                    .is_some_and(|shared| shared.held.load(Ordering::SeqCst))
+            });
+            !leases.is_empty()
+        });
+        registry
             .live_leases
             .keys()
             .copied()
             .map(Uuid::from_bytes)
             .collect()
-    }
-
-    /// Seed attachment bytes for tests (and in-memory path/URL registration).
-    pub fn insert_attachment_bytes(&self, id: [u8; 16], bytes: Vec<u8>) {
-        self.registry.lock().unwrap().bytes.insert(id, bytes);
     }
 
     /// Admit a read-image source. The only source admission the consumer may use.
@@ -527,23 +575,23 @@ impl SessionMediaAuthority {
         attachment_id: Uuid,
     ) -> Result<AdmittedReadImage, AdmissionDenial> {
         let id_bytes = *attachment_id.as_bytes();
-        if self.cleanup_wins_before_decode(&id_bytes) {
-            return Err(AdmissionDenial::AttachmentNotFound);
-        }
         let att = self.resolve_attachment(session_hex, &id_bytes)?;
-        if att.kind != IMAGE_KIND {
+        if att.attachment_id != id_bytes || att.kind != IMAGE_KIND {
             return Err(AdmissionDenial::AttachmentNotFound);
         }
-        let bytes = self
-            .lookup_bytes(&id_bytes)
-            .ok_or(AdmissionDenial::AttachmentNotFound)?;
+        if att.content().len() > READ_IMAGE_MAX_INPUT_BYTES {
+            return Err(AdmissionDenial::Internal(
+                "input image exceeds 67108864 bytes".to_string(),
+            ));
+        }
+        let bytes = att.content().to_vec();
         let identity = ImmutableAttachmentIdentity {
             attachment_id,
             attachment_version: att.attachment_version,
             checksum: att.checksum,
             kind: att.kind,
         };
-        Ok(self.hold_source(identity, bytes))
+        self.hold_attachment_source(identity, bytes)
     }
 
     fn admit_path_as_image(
@@ -552,8 +600,12 @@ impl SessionMediaAuthority {
         path: &str,
     ) -> Result<AdmittedReadImage, AdmissionDenial> {
         let handle = self.admit_local_path(session_hex, path)?;
-        let bytes = std::fs::read(handle.canonical_path())
-            .map_err(|e| AdmissionDenial::Internal(e.to_string()))?;
+        if handle.content().len() > READ_IMAGE_MAX_INPUT_BYTES {
+            return Err(AdmissionDenial::Internal(
+                "input image exceeds 67108864 bytes".to_string(),
+            ));
+        }
+        let bytes = handle.content().to_vec();
         Ok(self.register_bytes(bytes))
     }
 
@@ -563,6 +615,11 @@ impl SessionMediaAuthority {
         url: &str,
     ) -> Result<AdmittedReadImage, AdmissionDenial> {
         let source = self.admit_retained_https(session_hex, url)?;
+        if source.content().len() > READ_IMAGE_MAX_INPUT_BYTES {
+            return Err(AdmissionDenial::Internal(
+                "input image exceeds 67108864 bytes".to_string(),
+            ));
+        }
         Ok(self.register_bytes(source.content().to_vec()))
     }
 
@@ -577,20 +634,7 @@ impl SessionMediaAuthority {
             checksum,
             kind: IMAGE_KIND,
         };
-        {
-            let mut registry = self.registry.lock().unwrap();
-            registry
-                .bytes
-                .insert(*attachment_id.as_bytes(), bytes.clone());
-            registry
-                .identities
-                .insert(*attachment_id.as_bytes(), identity.clone());
-        }
         self.hold_source(identity, bytes)
-    }
-
-    fn lookup_bytes(&self, id: &[u8; 16]) -> Option<Vec<u8>> {
-        self.registry.lock().unwrap().bytes.get(id).cloned()
     }
 
     fn hold_source(
@@ -598,24 +642,43 @@ impl SessionMediaAuthority {
         identity: ImmutableAttachmentIdentity,
         bytes: Vec<u8>,
     ) -> AdmittedReadImage {
-        let source = ToolSource::new(bytes, identity.clone());
-        self.registry.lock().unwrap().live_leases.insert(
-            *identity.attachment_id.as_bytes(),
-            Arc::clone(&source.shared),
-        );
+        let source = ToolSource::new(bytes, identity.clone(), Arc::clone(&self.activity));
+        self.registry
+            .lock()
+            .unwrap()
+            .live_leases
+            .entry(*identity.attachment_id.as_bytes())
+            .or_default()
+            .push(Arc::downgrade(&source.shared));
         AdmittedReadImage {
             identity,
             tool_source: source,
         }
     }
 
-    fn cleanup_wins_before_decode(&self, id: &[u8; 16]) -> bool {
-        self.registry
-            .lock()
-            .unwrap()
+    fn hold_attachment_source(
+        &self,
+        identity: ImmutableAttachmentIdentity,
+        bytes: Vec<u8>,
+    ) -> Result<AdmittedReadImage, AdmissionDenial> {
+        let source = ToolSource::new(bytes, identity.clone(), Arc::clone(&self.activity));
+        let mut registry = self.registry.lock().unwrap();
+        if registry
             .cleanup_requested
-            .get(id)
+            .get(identity.attachment_id.as_bytes())
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        {
+            return Err(AdmissionDenial::AttachmentNotFound);
+        }
+        registry
+            .live_leases
+            .entry(*identity.attachment_id.as_bytes())
+            .or_default()
+            .push(Arc::downgrade(&source.shared));
+        Ok(AdmittedReadImage {
+            identity,
+            tool_source: source,
+        })
     }
 
     /// Reserve a derivative of `source`. Denials before this have zero write.
@@ -632,6 +695,7 @@ impl SessionMediaAuthority {
             id: Uuid::now_v7(),
             completed: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            registry: Arc::clone(&self.registry),
         })
     }
 
@@ -639,13 +703,14 @@ impl SessionMediaAuthority {
     pub fn register_read_image_derivative(
         &self,
         reservation: DerivativeReservation,
+        cancel: &tokio_util::sync::CancellationToken,
         bytes: &[u8],
         _mime: &str,
         _width: u32,
         _height: u32,
         checksum_hex: &str,
     ) -> Result<ImmutableAttachmentIdentity, AdmissionDenial> {
-        if reservation.is_cancelled() {
+        if reservation.is_cancelled() || cancel.is_cancelled() {
             return Err(AdmissionDenial::Internal(
                 "derivative reservation cancelled".to_string(),
             ));
@@ -675,6 +740,11 @@ impl SessionMediaAuthority {
                 .identities
                 .insert(*attachment_id.as_bytes(), identity.clone());
         }
+        if cancel.is_cancelled() {
+            return Err(AdmissionDenial::Internal(
+                "derivative registration cancelled".to_string(),
+            ));
+        }
         reservation.complete();
         Ok(identity)
     }
@@ -695,34 +765,41 @@ impl SessionMediaAuthority {
     /// Cleanup racing source processing: wait on a held lease, or win before decode.
     pub fn request_source_cleanup(&self, attachment_id: Uuid) -> CleanupRace {
         let id = *attachment_id.as_bytes();
-        let (lease, already_held) = {
+        let (leases, already_held) = {
             let mut registry = self.registry.lock().unwrap();
             let flag = registry
                 .cleanup_requested
                 .entry(id)
                 .or_insert_with(|| Arc::new(AtomicBool::new(false)))
                 .clone();
-            let lease = registry.live_leases.get(&id).cloned();
-            if lease.is_none() {
-                flag.store(true, Ordering::SeqCst);
-            }
-            (lease, flag)
+            // Close admission before snapshotting leases. No later caller can
+            // slip a new ToolSource into the set while cleanup waits.
+            flag.store(true, Ordering::SeqCst);
+            let leases: Vec<_> = registry
+                .live_leases
+                .get_mut(&id)
+                .map(|entries| {
+                    entries.retain(|entry| entry.strong_count() > 0);
+                    entries.iter().filter_map(Weak::upgrade).collect()
+                })
+                .unwrap_or_default();
+            (leases, flag)
         };
-        match lease {
-            Some(shared) if shared.held.load(Ordering::SeqCst) => {
-                let proxy = ToolSource {
-                    shared,
-                    released: false,
-                };
-                proxy.wait_until_released();
-                std::mem::forget(proxy);
-                already_held.store(true, Ordering::SeqCst);
-                CleanupRace::WaitedForLease
+        if leases
+            .iter()
+            .any(|shared| shared.held.load(Ordering::SeqCst))
+        {
+            for shared in leases {
+                if !shared.held.load(Ordering::SeqCst) {
+                    continue;
+                }
+                ToolSource::wait_shared_until_released(&shared);
             }
-            _ => {
-                already_held.store(true, Ordering::SeqCst);
-                CleanupRace::WonBeforeDecode
-            }
+            already_held.store(true, Ordering::SeqCst);
+            CleanupRace::WaitedForLease
+        } else {
+            already_held.store(true, Ordering::SeqCst);
+            CleanupRace::WonBeforeDecode
         }
     }
 }
@@ -760,28 +837,38 @@ mod tests {
             &self,
             _session_id: &str,
             attachment_id: &[u8; 16],
+            max_bytes: usize,
         ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
-            Ok(self.attachments.get(attachment_id).cloned())
+            Ok(self
+                .attachments
+                .get(attachment_id)
+                .filter(|attachment| attachment.content.len() <= max_bytes)
+                .cloned())
         }
     }
 
     struct FakeLocalPathPolicy;
 
     impl LocalPathPolicy for FakeLocalPathPolicy {
-        fn authorize(
+        fn admit(
             &self,
             _session_id: &str,
             path: &str,
-        ) -> Result<(PathBuf, Arc<std::fs::File>, HandleEvidence), AdmissionDenial> {
+            max_bytes: usize,
+        ) -> Result<AdmittedLocalHandle, AdmissionDenial> {
             if path.contains("denied") {
                 return Err(AdmissionDenial::LocalPathDenied);
             }
-            Ok((
+            let content = std::fs::read(path).unwrap_or_default();
+            if content.len() > max_bytes {
+                return Err(AdmissionDenial::Internal("input too large".into()));
+            }
+            Ok(AdmittedLocalHandle::from_held_bytes(
                 PathBuf::from(path),
-                Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap()),
                 HandleEvidence {
                     metadata_fingerprint: [0xAA; 32],
                 },
+                content,
             ))
         }
     }
@@ -801,13 +888,18 @@ mod tests {
             &self,
             _session_id: &str,
             url: &str,
+            max_bytes: usize,
         ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
             if url.contains("denied") {
                 return Err(AdmissionDenial::HttpsDenied);
             }
+            let content = b"fake-content".to_vec();
+            if content.len() > max_bytes {
+                return Err(AdmissionDenial::Internal("input too large".into()));
+            }
             Ok(AdmittedRetainedSource {
                 canonical_url: url.to_string(),
-                content: b"fake-content".to_vec(),
+                content,
                 content_type: "image/png".to_string(),
             })
         }
@@ -837,6 +929,7 @@ mod tests {
                 attachment_version: 1,
                 checksum: [0x55; 32],
                 kind: 2,
+                content: Vec::new(),
             },
         );
         SessionMediaAuthority::new(

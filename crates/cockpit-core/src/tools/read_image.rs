@@ -121,7 +121,7 @@ impl OutputFormat {
 /// Integer pixel region `{x, y, width, height}` in original-orientation-
 /// normalized coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Region {
     pub x: u32,
     pub y: u32,
@@ -272,6 +272,13 @@ fn parse_source(value: &Value) -> Result<ReadImageSource> {
             invalid_input("`attachment_id` must be a canonical lowercase RFC-4122 UUID")
         })?;
         if uuid.to_string() != s {
+            return Err(invalid_input(
+                "`attachment_id` must be a canonical lowercase RFC-4122 UUID",
+            ));
+        }
+        if !(1..=8).contains(&uuid.get_version_num())
+            || uuid.get_variant() != uuid::Variant::RFC4122
+        {
             return Err(invalid_input(
                 "`attachment_id` must be a canonical lowercase RFC-4122 UUID",
             ));
@@ -571,6 +578,7 @@ impl Tool for ReadImageTool {
                                 "attachment_id": {
                                     "type": "string",
                                     "format": "uuid",
+                                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                                     "description": "Canonical lowercase RFC-4122 UUID of a session image attachment"
                                 }
                             },
@@ -595,6 +603,7 @@ impl Tool for ReadImageTool {
                                 "url": {
                                     "type": "string",
                                     "minLength": 1,
+                                    "pattern": "^https://",
                                     "description": "Retained HTTPS URL of the image"
                                 }
                             },
@@ -642,7 +651,7 @@ impl Tool for ReadImageTool {
                     "description": "Output format (default auto = lossless PNG)"
                 }
             },
-            "required": ["source"],
+            "required": ["source", "region", "max_width", "max_height", "format"],
             "additionalProperties": false,
             "description": "Read one image with optional crop and downscale; returns a typed media reference"
         })
@@ -665,13 +674,17 @@ impl Tool for ReadImageTool {
             .admit_read_image_source(authority.subject(), parsed.source)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let source_bytes = match admitted.tool_source.bytes() {
-            Ok(bytes) => bytes.to_vec(),
-            Err(e) => {
-                admitted.tool_source.release();
-                return Err(anyhow::anyhow!("{e}"));
-            }
-        };
+        let source_bytes = admitted
+            .tool_source
+            .bytes()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        if source_bytes.len() > MAX_INPUT_BYTES {
+            admitted.tool_source.release();
+            return Err(invalid_input(format!(
+                "input image exceeds {MAX_INPUT_BYTES} bytes (decompression bomb guard)"
+            )));
+        }
 
         if let Err(e) = media_image::preflight_exif_orientation(&source_bytes) {
             admitted.tool_source.release();
@@ -695,7 +708,7 @@ impl Tool for ReadImageTool {
         }
 
         let transformed = match transform_bytes(
-            &source_bytes,
+            source_bytes,
             parsed.region,
             parsed.max_width,
             parsed.max_height,
@@ -709,8 +722,15 @@ impl Tool for ReadImageTool {
             }
         };
 
+        if ctx.cancel.is_cancelled() {
+            authority.cancel_derivative(&reservation);
+            admitted.tool_source.release();
+            bail!("cancelled");
+        }
+
         let derivative = match authority.register_read_image_derivative(
             reservation,
+            &ctx.cancel,
             &transformed.bytes,
             transformed.mime_type,
             transformed.output_width,
@@ -719,6 +739,8 @@ impl Tool for ReadImageTool {
         ) {
             Ok(identity) => identity,
             Err(e) => {
+                // Registration owns the reservation on success. On failure
+                // its Drop guard cancels and removes any partial derivative.
                 admitted.tool_source.release();
                 return Err(anyhow::anyhow!("{e}"));
             }

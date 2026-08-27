@@ -235,12 +235,73 @@ pub fn scale_png_nearest(png: &[u8], width: u32, height: u32) -> Result<Vec<u8>>
 
 /// True when `input` is a multi-frame GIF (additional frames will be ignored).
 pub fn is_animated_gif(input: &[u8]) -> bool {
-    if let Ok(decoder) = image::codecs::gif::GifDecoder::new(Cursor::new(input)) {
-        let frames = decoder.into_frames();
-        let count = frames.collect_frames().map(|f| f.len()).unwrap_or(0);
-        return count > 1;
+    let Some(header) = input.get(..13) else {
+        return false;
+    };
+    if &header[..6] != b"GIF87a" && &header[..6] != b"GIF89a" {
+        return false;
+    }
+    let packed = header[10];
+    let global_table = if packed & 0x80 != 0 {
+        3usize << (usize::from(packed & 0x07) + 1)
+    } else {
+        0
+    };
+    let mut offset = 13usize.saturating_add(global_table);
+    let mut images = 0u8;
+    while let Some(&kind) = input.get(offset) {
+        offset += 1;
+        match kind {
+            0x2c => {
+                images = images.saturating_add(1);
+                if images > 1 {
+                    return true;
+                }
+                let Some(descriptor) = input.get(offset..offset.saturating_add(9)) else {
+                    return false;
+                };
+                offset += 9;
+                if descriptor[8] & 0x80 != 0 {
+                    offset =
+                        offset.saturating_add(3usize << (usize::from(descriptor[8] & 0x07) + 1));
+                }
+                // LZW minimum code size, followed by data sub-blocks.
+                offset = offset.saturating_add(1);
+                if !skip_gif_sub_blocks(input, &mut offset) {
+                    return false;
+                }
+            }
+            0x21 => {
+                // Extension label followed by data sub-blocks.
+                offset = offset.saturating_add(1);
+                if !skip_gif_sub_blocks(input, &mut offset) {
+                    return false;
+                }
+            }
+            0x3b => return false,
+            _ => return false,
+        }
     }
     false
+}
+
+fn skip_gif_sub_blocks(input: &[u8], offset: &mut usize) -> bool {
+    loop {
+        let Some(&length) = input.get(*offset) else {
+            return false;
+        };
+        *offset += 1;
+        if length == 0 {
+            return true;
+        }
+        let Some(next) = offset.checked_add(usize::from(length)) else {
+            return false;
+        };
+        if next > input.len() {
+            return false;
+        }
+        *offset = next;
+    }
 }
 
 fn check_output(bytes: Vec<u8>, profile: &ImageProfile) -> Result<Vec<u8>> {

@@ -1207,19 +1207,6 @@ fn render_sidecar_page(
     );
 }
 
-fn accept_or_back(action: &SettingsPointerAction, accepted: bool) -> Nav {
-    if accepted {
-        return Nav::Stay;
-    }
-    if matches!(
-        action,
-        SettingsPointerAction::Sidecar(SidecarAction::Cancel)
-    ) {
-        return Nav::Back;
-    }
-    Nav::Stay
-}
-
 impl SidecarPage {
     fn max_cursor(&self) -> usize {
         self.rendered_rows().len().saturating_sub(1)

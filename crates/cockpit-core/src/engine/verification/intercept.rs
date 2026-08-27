@@ -21,14 +21,18 @@ use crate::agents::{
     EffectiveVnextGrant, ToolClass, VerificationAction, VerificationDispatch, VerificationEstimate,
     VerificationSessionReduction, VerificationSubject,
 };
+use crate::db::stats::PriceTable;
 use crate::db::verification_ledger::{
     NewVerificationOperation, VerificationBudgetAction, VerificationDigest,
 };
 use crate::engine::agent::Agent;
+use crate::engine::model::Model;
 use crate::engine::tool::ToolCtx;
 use crate::session::Session;
 
+use super::budget::budget_to_ledger;
 use super::classify_tool;
+use super::estimate::{CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set};
 
 /// Outcome of the verification intercept. Stage 1 only produces [`Self::Skip`]
 /// and [`Self::DispatchOriginal`]; later stages add block/revise.
@@ -45,6 +49,7 @@ pub(crate) enum VerificationOutcome {
 pub(crate) struct InterceptInput<'a> {
     pub session: &'a Session,
     pub agent: &'a Agent,
+    pub model: &'a Model,
     pub ctx: &'a ToolCtx,
     pub resolved_name: &'a str,
     pub args: &'a Value,
@@ -88,21 +93,6 @@ async fn shadow_record(
         tool_id: input.resolved_name,
         namespace: "host",
     };
-    // No estimator yet: every verify resolution hits the Unknown* arm.
-    // Shadow mode defaults `onBudgetExceeded` to dispatch_original so the
-    // dispatch path stays byte-identical to baseline.
-    let dispatch = grant.resolve_verification(
-        &subject,
-        VerificationSessionReduction::Inherit,
-        None,
-        VerificationEstimate::UnknownTokens,
-    )?;
-    match dispatch {
-        VerificationDispatch::Off => return Ok(VerificationOutcome::Skip),
-        VerificationDispatch::Refuse
-        | VerificationDispatch::DispatchOriginal
-        | VerificationDispatch::Verify { .. } => {}
-    }
     let Some(rule) = grant
         .verification
         .as_ref()
@@ -113,20 +103,49 @@ async fn shadow_record(
     if rule.action == VerificationAction::Off {
         return Ok(VerificationOutcome::Skip);
     }
-    // No estimator yet: Unknown* always exceeds. Shadow mode records
-    // dispatch_original and still executes the original (behavior delta: none),
-    // even if the authored rule would refuse an unknown estimate.
-    let recorded_action = VerificationBudgetAction::DispatchOriginal;
+    let requested = rule.requested_budget(grant.host_policy.verification_ceiling)?;
+    let assembled = serde_json::to_string(&serde_json::json!({
+        "tool": input.resolved_name,
+        "args": input.args,
+    }))?;
+    let prices = PriceTable::load_default();
+    let price = prices.get(input.model.model_id_ref());
+    let pre = estimate_candidate_set(CandidateSetEstimateInput {
+        assembled_texts: &[assembled.clone()],
+        encoding: encoding_for_model_id(input.model.model_id_ref()),
+        input_price_per_mtok: price.map(|p| p.input_per_mtok),
+        output_price_per_mtok: price.map(|p| p.output_per_mtok),
+        max_candidates: requested.max_candidates,
+        max_collection_millis: requested.max_collection_millis,
+    });
+    let estimate = pre.to_verification_estimate();
+    let estimate_known = matches!(estimate, VerificationEstimate::Known(_));
+    let dispatch = grant.resolve_verification(
+        &subject,
+        VerificationSessionReduction::Inherit,
+        None,
+        estimate,
+    )?;
+    match dispatch {
+        VerificationDispatch::Off => return Ok(VerificationOutcome::Skip),
+        VerificationDispatch::Refuse
+        | VerificationDispatch::DispatchOriginal
+        | VerificationDispatch::Verify { .. } => {}
+    }
+    // No generators yet: never refuse the original (behavior delta: none).
+    // Record the pre-candidate action when the estimate exceeded, otherwise
+    // persist an available estimate and still dispatch the original.
+    let recorded_action = match dispatch {
+        VerificationDispatch::Verify { .. } => None,
+        VerificationDispatch::Refuse | VerificationDispatch::DispatchOriginal => {
+            Some(VerificationBudgetAction::DispatchOriginal)
+        }
+        VerificationDispatch::Off => return Ok(VerificationOutcome::Skip),
+    };
 
     let now = chrono::Utc::now().timestamp_millis();
-    let requested = rule.requested_budget(grant.host_policy.verification_ceiling)?;
-    let original_digest = VerificationDigest::of(
-        serde_json::to_vec(&serde_json::json!({
-            "tool": input.resolved_name,
-            "args": input.args,
-        }))?
-        .as_slice(),
-    );
+    let ledger = budget_to_ledger(requested);
+    let original_digest = VerificationDigest::of(assembled.as_bytes());
     let pretool_digest = VerificationDigest::of(
         format!(
             "shadow-pretool:{}:{}",
@@ -141,21 +160,18 @@ async fn shadow_record(
             NewVerificationOperation {
                 session_id: input.session.id,
                 agent_instance_id,
-                requested_candidate_count: i64::from(requested.max_candidates),
+                requested_candidate_count: ledger.candidate_count,
                 effective_candidate_count: 0,
-                total_token_ceiling: u64_to_ledger_i64(requested.max_total_tokens),
-                estimated_cost_ceiling_microunits: u64_to_ledger_i64(
-                    requested.max_estimated_cost_microusd,
-                ),
-                collection_deadline_unix_ms: now.saturating_add(u64_to_ledger_i64(
-                    requested.max_collection_millis,
-                )),
-                collection_duration_ms: u64_to_ledger_i64(requested.max_collection_millis),
+                total_token_ceiling: ledger.total_token_ceiling,
+                estimated_cost_ceiling_microunits: ledger.estimated_cost_ceiling_microunits,
+                collection_deadline_unix_ms: now.saturating_add(ledger.collection_duration_ms),
+                collection_duration_ms: ledger.collection_duration_ms,
                 conservative_token_reservation: 0,
                 conservative_cost_reservation_microunits: 0,
                 original_operation_digest: original_digest,
                 pretool_context_capability_digest: pretool_digest,
-                estimate_unavailable_action: Some(recorded_action),
+                estimate_unavailable_action: recorded_action,
+                estimate_known,
             },
             now,
         )
@@ -163,10 +179,6 @@ async fn shadow_record(
     Ok(VerificationOutcome::DispatchOriginal {
         operation_id: created.operation_id,
     })
-}
-
-fn u64_to_ledger_i64(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

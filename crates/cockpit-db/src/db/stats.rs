@@ -303,6 +303,11 @@ impl PriceTable {
         }
     }
 
+    /// Look up a model's catalog price, if present.
+    pub fn get(&self, model: &str) -> Option<&ModelPrice> {
+        self.by_model.get(model)
+    }
+
     /// Compute dollar cost for a token mix, or `None` when the model has
     /// no price row. Cached-read and cache-creation input tokens are billed
     /// at their own rates; the remaining `input_tokens` are billed at the

@@ -340,14 +340,14 @@ impl VerificationBudget {
         }
     }
 
-    fn contains(self, request: Self) -> bool {
+    pub fn contains(self, request: Self) -> bool {
         request.max_candidates <= self.max_candidates
             && request.max_total_tokens <= self.max_total_tokens
             && request.max_estimated_cost_microusd <= self.max_estimated_cost_microusd
             && request.max_collection_millis <= self.max_collection_millis
     }
 
-    fn reduce(self, session: Self) -> Result<Self> {
+    pub fn reduce(self, session: Self) -> Result<Self> {
         if !self.contains(session) {
             bail!(
                 "session verification budget may only reduce the resolved host/definition budget"

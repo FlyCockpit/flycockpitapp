@@ -513,6 +513,9 @@ pub struct NewVerificationOperation {
     /// `None` is a normal estimable request; `Some` makes the pre-candidate
     /// branch explicit and therefore impossible to silently fall back later.
     pub estimate_unavailable_action: Option<VerificationBudgetAction>,
+    /// When true, persist `estimate_state='available'` even if a pre-candidate
+    /// budget action is set (a known estimate exceeded its ceiling).
+    pub estimate_known: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -789,16 +792,19 @@ impl Db {
         let operation_id = Uuid::new_v4();
         self.transaction(move |conn| {
             ensure_agent_in_session(conn, input.session_id, input.agent_instance_id)?;
-            let (state, estimate_state, budget_action) = match input.estimate_unavailable_action {
-                None => (VerificationOperationState::Created, "available", None),
+            let estimate_state = if input.estimate_known {
+                "available"
+            } else {
+                "estimate_unavailable"
+            };
+            let (state, budget_action) = match input.estimate_unavailable_action {
+                None => (VerificationOperationState::Created, None),
                 Some(VerificationBudgetAction::Refuse) => (
                     VerificationOperationState::SkippedBudgetRefused,
-                    "estimate_unavailable",
                     Some(VerificationBudgetAction::Refuse),
                 ),
                 Some(VerificationBudgetAction::DispatchOriginal) => (
                     VerificationOperationState::Created,
-                    "estimate_unavailable",
                     Some(VerificationBudgetAction::DispatchOriginal),
                 ),
             };
@@ -2858,6 +2864,7 @@ mod tests {
             original_operation_digest: digest("original"),
             pretool_context_capability_digest: digest("pretool-context-anchor"),
             estimate_unavailable_action: None,
+            estimate_known: true,
         }
     }
 
@@ -3423,6 +3430,7 @@ mod tests {
         let (session_id, agent_id) = owner(&db, "budget").await;
         let mut refuse = operation(session_id, agent_id);
         refuse.effective_candidate_count = 0;
+        refuse.estimate_known = false;
         refuse.estimate_unavailable_action = Some(VerificationBudgetAction::Refuse);
         let refused = db.create_verification_operation(refuse, 3).await.unwrap();
         assert_eq!(
@@ -3431,6 +3439,7 @@ mod tests {
         );
         let mut original = operation(session_id, agent_id);
         original.effective_candidate_count = 0;
+        original.estimate_known = false;
         original.estimate_unavailable_action = Some(VerificationBudgetAction::DispatchOriginal);
         let created = db.create_verification_operation(original, 4).await.unwrap();
         let dispatching = db
@@ -3803,6 +3812,7 @@ mod tests {
             }),
             ("unknown-estimate-has-effective-candidates", {
                 let mut input = operation(session_id, agent_id);
+                input.estimate_known = false;
                 input.estimate_unavailable_action = Some(VerificationBudgetAction::Refuse);
                 input
             }),
@@ -3843,6 +3853,7 @@ mod tests {
         ] {
             let mut unknown = operation(session_id, agent_id);
             unknown.effective_candidate_count = 0;
+            unknown.estimate_known = false;
             unknown.estimate_unavailable_action = Some(action);
             let created = db.create_verification_operation(unknown, 5).await.unwrap();
             assert_eq!(created.state, expected_state);
@@ -3989,6 +4000,7 @@ mod tests {
 
         let mut original = operation(session_id, agent_id);
         original.effective_candidate_count = 0;
+        original.estimate_known = false;
         original.estimate_unavailable_action = Some(VerificationBudgetAction::DispatchOriginal);
         let original = db
             .create_verification_operation(original, 90)
@@ -4718,6 +4730,7 @@ mod tests {
         let (session_id, agent_id) = owner(&db, "original-recovery").await;
         let mut original = operation(session_id, agent_id);
         original.effective_candidate_count = 0;
+        original.estimate_known = false;
         original.estimate_unavailable_action = Some(VerificationBudgetAction::DispatchOriginal);
         let created = db.create_verification_operation(original, 3).await.unwrap();
         let dispatching = db
@@ -4803,6 +4816,7 @@ mod tests {
         ] {
             let mut original = operation(session_id, agent_id);
             original.effective_candidate_count = 0;
+            original.estimate_known = false;
             original.estimate_unavailable_action = Some(VerificationBudgetAction::DispatchOriginal);
             let created = db
                 .create_verification_operation(original, now)

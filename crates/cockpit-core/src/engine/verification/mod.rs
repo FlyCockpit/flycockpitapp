@@ -8,7 +8,9 @@
 //! unclassified and cannot match a verification rule. A future change should
 //! make `ToolClass` a declared field on standard tool definitions.
 
+pub(crate) mod budget;
 pub(crate) mod classify;
+pub(crate) mod estimate;
 pub(crate) mod intercept;
 
 pub(crate) use classify::classify_tool;

@@ -843,6 +843,7 @@ async fn execute_ordinary_call_unscoped(
             crate::engine::verification::InterceptInput {
                 session: env.session,
                 agent: env.agent,
+                model: env.model,
                 ctx: env.ctx,
                 resolved_name,
                 args: &args,

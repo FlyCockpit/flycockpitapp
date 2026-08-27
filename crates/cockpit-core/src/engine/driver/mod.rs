@@ -5237,9 +5237,9 @@ impl Driver {
                         )
                         .await
                         {
-                            Err(error) => Err(format!(
-                                "warm parent history projection failed: {error:#}"
-                            )),
+                            Err(error) => {
+                                Err(format!("warm parent history projection failed: {error:#}"))
+                            }
                             Ok(_) => model
                                 .text_completion_with_live_context(
                                     crate::engine::model::UtilityCallSite::AgentTreeDecision,
@@ -5251,9 +5251,7 @@ impl Driver {
                                     &cancel,
                                 )
                                 .await
-                                .map_err(|error| {
-                                    format!("warm parent resolver failed: {error:#}")
-                                }),
+                                .map_err(|error| format!("warm parent resolver failed: {error:#}")),
                         }
                     }
                     None => {

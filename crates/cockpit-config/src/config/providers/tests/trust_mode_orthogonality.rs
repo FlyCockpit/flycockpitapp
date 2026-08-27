@@ -1,17 +1,16 @@
-//! Trust and mode are orthogonal policy dimensions.
+//! Trust and agent-definition posture are orthogonal policy dimensions.
 //!
-//! `ModelTrust` is a provider/model data-custody filter; `LlmMode` is an
-//! independent harness-steering posture. Neither may be inferred from the
-//! other, and custody may never act as a ranking signal.
+//! `ModelTrust` is a provider/model data-custody filter; agent-definition
+//! posture is an independent harness-steering concern. Neither may be inferred
+//! from the other, and custody may never act as a ranking signal.
 
 use super::*;
 
-/// Provider entry with an explicit trust/mode pair and one ranked model.
-fn combo_provider(trust: ModelTrust, mode: LlmMode, quality: i64, cost: i64) -> ProviderEntry {
+/// Provider entry with an explicit trust class and one ranked model.
+fn combo_provider(trust: ModelTrust, quality: i64, cost: i64) -> ProviderEntry {
     let mut entry = ProviderEntry {
         url: "https://example.invalid/v1".into(),
         trust: Some(trust),
-        mode: Some(mode),
         ..ProviderEntry::default()
     };
     let mut m = model("m", false);
@@ -38,11 +37,11 @@ fn model_policy_default_ranking_is_trust_neutral() {
         let mut cfg = ProvidersConfig::default();
         cfg.providers.insert(
             trusted_provider.to_string(),
-            combo_provider(ModelTrust::Trusted, LlmMode::Defensive, 7, 3),
+            combo_provider(ModelTrust::Trusted, 7, 3),
         );
         cfg.providers.insert(
             untrusted_provider.to_string(),
-            combo_provider(ModelTrust::Untrusted, LlmMode::Frontier, 7, 3),
+            combo_provider(ModelTrust::Untrusted, 7, 3),
         );
 
         for optimize in [
@@ -234,31 +233,28 @@ fn model_policy_explicit_trust_filter_is_preserved() {
     ));
 }
 
-/// AC3. Every trust/mode combination is a valid configuration and neither
-/// dimension rewrites or rejects the other.
+/// AC3. Every trust class is a valid configuration and harness-steering
+/// posture never rewrites or rejects it.
 #[test]
 fn trust_mode_cartesian_configuration() {
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
     std::fs::write(&config_path, "{}").unwrap();
 
-    let combos = [
-        (ModelTrust::Trusted, LlmMode::Defensive),
-        (ModelTrust::Trusted, LlmMode::Normal),
-        (ModelTrust::Trusted, LlmMode::Frontier),
-        (ModelTrust::Untrusted, LlmMode::Defensive),
-        (ModelTrust::Untrusted, LlmMode::Normal),
-        (ModelTrust::Untrusted, LlmMode::Frontier),
-    ];
-    assert_eq!(combos.len(), 6, "the product must stay complete");
+    let trusts = [ModelTrust::Trusted, ModelTrust::Untrusted];
+    assert_eq!(
+        trusts.len(),
+        2,
+        "both custody classes must stay representable"
+    );
 
-    for (index, (trust, mode)) in combos.iter().enumerate() {
+    for (index, trust) in trusts.iter().enumerate() {
         let provider_id = format!("p{index}");
         let trust_id = match trust {
             ModelTrust::Trusted => "trusted",
             ModelTrust::Untrusted => "untrusted",
         };
-        // 1. Parsing: both dimensions round-trip from disk independently.
+        // 1. Parsing: trust round-trips from disk independently of posture.
         write_provider_file(
             &config_path,
             &provider_id,
@@ -266,36 +262,26 @@ fn trust_mode_cartesian_configuration() {
                 r#"{{
                     "url": "https://{provider_id}.invalid/v1",
                     "trust": "{trust_id}",
-                    "mode": "{}",
                     "models": [{{ "id": "m", "subagent_invokable": true }}]
-                }}"#,
-                mode.as_str()
+                }}"#
             ),
         );
     }
 
     let cfg = ConfigDoc::providers_from_paths(std::slice::from_ref(&config_path));
 
-    for (index, (trust, mode)) in combos.iter().enumerate() {
+    for (index, trust) in trusts.iter().enumerate() {
         let provider_id = format!("p{index}");
 
-        // 2. Resolution: each dimension resolves to exactly what was written,
-        //    whatever the other dimension is.
+        // 2. Resolution: trust resolves to exactly what was written.
         assert_eq!(
             cfg.resolve_trust(&provider_id, "m"),
             *trust,
-            "{provider_id}: mode {mode:?} must not change trust"
+            "{provider_id}: steering posture must not change trust"
         );
-        for global in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            assert_eq!(
-                cfg.resolve_mode(&provider_id, "m", global),
-                *mode,
-                "{provider_id}: trust {trust:?} must not change mode"
-            );
-        }
 
-        // 3. Persistence / config display: the on-disk document keeps both
-        //    values verbatim; neither is normalized away by the other.
+        // 3. Persistence / config display: the on-disk document keeps trust
+        //    verbatim; it is not normalized away by posture.
         let persisted = read_provider_file(&config_path, &provider_id);
         assert_eq!(
             persisted.get("trust").and_then(Value::as_str),
@@ -304,28 +290,17 @@ fn trust_mode_cartesian_configuration() {
                 ModelTrust::Untrusted => "untrusted",
             })
         );
-        assert_eq!(
-            persisted.get("mode").and_then(Value::as_str),
-            Some(mode.as_str())
-        );
         let entry = &cfg.providers[&provider_id];
         assert_eq!(entry.trust, Some(*trust));
-        assert_eq!(entry.mode, Some(*mode));
         let reserialized = serde_json::to_value(entry).unwrap();
         assert_eq!(
             reserialized.get("trust").and_then(Value::as_str),
             Some(trust_id_of(*trust)),
             "config display must keep trust"
         );
-        assert_eq!(
-            reserialized.get("mode").and_then(Value::as_str),
-            Some(mode.as_str()),
-            "config display must keep mode"
-        );
 
-        // 4. Routing diagnostics: trust and mode are separate fields, and a
-        //    custody filter matching this entry's class selects it under every
-        //    mode.
+        // 4. Routing diagnostics: a custody filter matching this entry's class
+        //    selects it, independent of harness-steering posture.
         let custody = match trust {
             ModelTrust::Trusted => ModelCustody::Trusted,
             ModelTrust::Untrusted => ModelCustody::Untrusted,
@@ -341,7 +316,6 @@ fn trust_mode_cartesian_configuration() {
                     ModelPolicyCriteria {
                         require_subagent_invokable: true,
                         availability: AvailabilityScope::Discovery,
-                        global_mode: LlmMode::Defensive,
                         ..policy_criteria(ModelPolicySelector::Exact(&selector))
                     },
                     custody,
@@ -352,7 +326,6 @@ fn trust_mode_cartesian_configuration() {
             .unwrap();
         let diagnostics = resolved.policy.routing_diagnostics();
         assert_eq!(diagnostics.trust, trust_id_of(*trust));
-        assert_eq!(diagnostics.mode, mode.as_str());
         assert_eq!(diagnostics.custody_filter, Some(custody.as_str()));
         assert!(
             !diagnostics.custody_filter_reason.is_empty(),
@@ -360,31 +333,43 @@ fn trust_mode_cartesian_configuration() {
         );
     }
 
-    // 5. Picker/setup defaults may classify vendor models by mode, but never
-    //    silently change their trust: trust stays conservatively unset, which
-    //    resolves to `untrusted` unless the user configures otherwise.
+    // 5. Picker/setup defaults may apply frontier riders, but never silently
+    //    change trust: trust stays conservatively unset, which resolves to
+    //    `untrusted` unless the user configures otherwise.
     let mut vendor = model("claude-fable-5", false);
-    vendor.mode = None;
     vendor.trust = None;
     apply_known_frontier_model_defaults(Some("anthropic"), &mut vendor);
-    assert_eq!(vendor.mode, Some(LlmMode::Frontier));
-    assert_eq!(vendor.trust, None, "a mode default must never assert trust");
+    assert_eq!(vendor.auto_prune, Some(false));
+    assert_eq!(
+        vendor.cache.as_ref().map(|c| c.mode),
+        Some(CacheMode::Ephemeral)
+    );
+    assert_eq!(
+        vendor.trust, None,
+        "a frontier default must never assert trust"
+    );
 
-    let mut copilot = model("gpt-4o", false);
-    copilot.mode = None;
+    let mut copilot = model("gpt-5.5", false);
     copilot.trust = None;
-    apply_copilot_model_mode_defaults(Some("copilot"), &mut copilot);
-    assert_eq!(copilot.mode, Some(LlmMode::Defensive));
+    crate::config::model_defaults::apply_copilot_model_defaults(Some("copilot"), &mut copilot);
+    assert_eq!(copilot.auto_prune, Some(false));
+    assert_eq!(
+        copilot.cache.as_ref().map(|c| c.mode),
+        Some(CacheMode::Ephemeral)
+    );
     assert_eq!(
         copilot.trust, None,
-        "a mode default must never assert trust"
+        "a frontier default must never assert trust"
     );
 
     let mut templated = model("claude-fable-5", false);
-    templated.mode = None;
     templated.trust = None;
     apply_template_model_defaults(Some("anthropic"), &mut templated);
-    assert_eq!(templated.mode, Some(LlmMode::Frontier));
+    assert_eq!(templated.auto_prune, Some(false));
+    assert_eq!(
+        templated.cache.as_ref().map(|c| c.mode),
+        Some(CacheMode::Ephemeral)
+    );
     assert_eq!(templated.trust, None);
     let mut entry = ProviderEntry {
         url: "https://vendor.invalid/v1".into(),
@@ -397,7 +382,7 @@ fn trust_mode_cartesian_configuration() {
     assert_eq!(
         cfg_defaults.resolve_trust("vendor", "claude-fable-5"),
         ModelTrust::Untrusted,
-        "a frontier mode default must not imply trust"
+        "a frontier default must not imply trust"
     );
 }
 
@@ -427,14 +412,10 @@ fn trust_id_of(trust: ModelTrust) -> &'static str {
 #[test]
 fn model_policy_custody_requirements_are_type_enforced() {
     let mut cfg = ProvidersConfig::default();
-    cfg.providers.insert(
-        "t".into(),
-        combo_provider(ModelTrust::Trusted, LlmMode::Normal, 5, 5),
-    );
-    cfg.providers.insert(
-        "u".into(),
-        combo_provider(ModelTrust::Untrusted, LlmMode::Normal, 5, 5),
-    );
+    cfg.providers
+        .insert("t".into(), combo_provider(ModelTrust::Trusted, 5, 5));
+    cfg.providers
+        .insert("u".into(), combo_provider(ModelTrust::Untrusted, 5, 5));
 
     // A payload built for one class can never be routed under the other.
     let mismatch = SensitiveModelPolicyRequest::new(
@@ -459,121 +440,114 @@ fn model_policy_custody_requirements_are_type_enforced() {
         .unwrap();
     assert_eq!(non_sensitive.custody_filter, None);
 
-    for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        // A trusted selection mints the grant that unlocks raw provider bytes.
-        let trusted = cfg
+    // A trusted selection mints the grant that unlocks raw provider bytes.
+    let trusted = cfg
+        .resolve_sensitive_model_policy(
+            &SensitiveModelPolicyRequest::new(
+                ModelPolicyCriteria {
+                    availability: AvailabilityScope::Discovery,
+                    ..policy_criteria(ModelPolicySelector::Exact("t:m"))
+                },
+                ModelCustody::Trusted,
+                SensitivePayload::raw_for_trusted_custody(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let grant = trusted
+        .trusted_custody_grant()
+        .expect("a trusted selection mints a grant");
+    assert_eq!(grant.provider(), "t");
+    assert_eq!(grant.model(), "m");
+    assert_eq!(
+        SensitivePayload::raw_for_trusted_custody().raw_provider_bytes(
+            grant,
+            &trusted.policy,
+            CUSTODY_TEST_SECRET
+        ),
+        Some(CUSTODY_TEST_SECRET),
+        "raw bytes are reachable only after a trusted selection"
+    );
+    assert_eq!(
+        SensitivePayload::raw_for_trusted_custody()
+            .render_for_untrusted(&trusted.policy, CUSTODY_TEST_SECRET),
+        None,
+        "a raw payload has no untrusted rendering"
+    );
+
+    // An untrusted payload has no raw-byte conversion, even holding a grant.
+    assert_eq!(
+        untrusted_payload().raw_provider_bytes(grant, &trusted.policy, CUSTODY_TEST_SECRET),
+        None,
+        "a redacted rendering has no raw-byte conversion"
+    );
+    let untrusted = cfg
+        .resolve_sensitive_model_policy(
+            &SensitiveModelPolicyRequest::new(
+                ModelPolicyCriteria {
+                    availability: AvailabilityScope::Discovery,
+                    ..policy_criteria(ModelPolicySelector::Exact("u:m"))
+                },
+                ModelCustody::Untrusted,
+                untrusted_payload(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(untrusted.trusted_custody_grant().is_none());
+    let rendered = untrusted_payload()
+        .render_for_untrusted(&untrusted.policy, CUSTODY_TEST_SECRET)
+        .expect("untrusted construction requires a target-specific rendering");
+    assert!(rendered.contains("u:m"), "{rendered}");
+    assert!(!rendered.contains(CUSTODY_TEST_SECRET));
+
+    // Exact selection: a custody mismatch rejects before dispatch and never
+    // falls back to the other, otherwise-eligible model.
+    for (selector, custody, actual) in [
+        ("t:m", ModelCustody::Untrusted, ModelTrust::Trusted),
+        ("u:m", ModelCustody::Trusted, ModelTrust::Untrusted),
+    ] {
+        let payload = match custody {
+            ModelCustody::Trusted => SensitivePayload::raw_for_trusted_custody(),
+            ModelCustody::Untrusted => untrusted_payload(),
+        };
+        let err = cfg
             .resolve_sensitive_model_policy(
                 &SensitiveModelPolicyRequest::new(
                     ModelPolicyCriteria {
                         availability: AvailabilityScope::Discovery,
-                        global_mode: mode,
-                        ..policy_criteria(ModelPolicySelector::Exact("t:m"))
+                        ..policy_criteria(ModelPolicySelector::Exact(selector))
                     },
-                    ModelCustody::Trusted,
-                    SensitivePayload::raw_for_trusted_custody(),
+                    custody,
+                    payload,
                 )
                 .unwrap(),
             )
-            .unwrap();
-        let grant = trusted
-            .trusted_custody_grant()
-            .expect("a trusted selection mints a grant");
-        assert_eq!(grant.provider(), "t");
-        assert_eq!(grant.model(), "m");
-        assert_eq!(
-            SensitivePayload::raw_for_trusted_custody().raw_provider_bytes(
-                grant,
-                &trusted.policy,
-                CUSTODY_TEST_SECRET
-            ),
-            Some(CUSTODY_TEST_SECRET),
-            "{mode:?}: raw bytes are reachable only after a trusted selection"
-        );
-        assert_eq!(
-            SensitivePayload::raw_for_trusted_custody()
-                .render_for_untrusted(&trusted.policy, CUSTODY_TEST_SECRET),
-            None,
-            "{mode:?}: a raw payload has no untrusted rendering"
-        );
-
-        // An untrusted payload has no raw-byte conversion, even holding a grant.
-        assert_eq!(
-            untrusted_payload().raw_provider_bytes(grant, &trusted.policy, CUSTODY_TEST_SECRET),
-            None,
-            "{mode:?}: a redacted rendering has no raw-byte conversion"
-        );
-        let untrusted = cfg
-            .resolve_sensitive_model_policy(
-                &SensitiveModelPolicyRequest::new(
-                    ModelPolicyCriteria {
-                        availability: AvailabilityScope::Discovery,
-                        global_mode: mode,
-                        ..policy_criteria(ModelPolicySelector::Exact("u:m"))
-                    },
-                    ModelCustody::Untrusted,
-                    untrusted_payload(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        assert!(untrusted.trusted_custody_grant().is_none());
-        let rendered = untrusted_payload()
-            .render_for_untrusted(&untrusted.policy, CUSTODY_TEST_SECRET)
-            .expect("untrusted construction requires a target-specific rendering");
-        assert!(rendered.contains("u:m"), "{mode:?}: {rendered}");
-        assert!(!rendered.contains(CUSTODY_TEST_SECRET), "{mode:?}");
-
-        // Exact selection: a custody mismatch rejects before dispatch and never
-        // falls back to the other, otherwise-eligible model.
-        for (selector, custody, actual) in [
-            ("t:m", ModelCustody::Untrusted, ModelTrust::Trusted),
-            ("u:m", ModelCustody::Trusted, ModelTrust::Untrusted),
-        ] {
-            let payload = match custody {
-                ModelCustody::Trusted => SensitivePayload::raw_for_trusted_custody(),
-                ModelCustody::Untrusted => untrusted_payload(),
-            };
-            let err = cfg
-                .resolve_sensitive_model_policy(
-                    &SensitiveModelPolicyRequest::new(
-                        ModelPolicyCriteria {
-                            availability: AvailabilityScope::Discovery,
-                            global_mode: mode,
-                            ..policy_criteria(ModelPolicySelector::Exact(selector))
-                        },
-                        custody,
-                        payload,
-                    )
-                    .unwrap(),
-                )
-                .unwrap_err();
-            let ModelPolicyError::CustodyMismatch {
-                provider,
-                model,
-                required,
-                actual: reported,
-            } = err
-            else {
-                panic!("{mode:?}: expected a custody mismatch for {selector}, got {err:?}");
-            };
-            assert_eq!(format!("{provider}:{model}"), selector);
-            assert_eq!(required, custody);
-            assert_eq!(reported, actual);
-        }
+            .unwrap_err();
+        let ModelPolicyError::CustodyMismatch {
+            provider,
+            model,
+            required,
+            actual: reported,
+        } = err
+        else {
+            panic!("expected a custody mismatch for {selector}, got {err:?}");
+        };
+        assert_eq!(format!("{provider}:{model}"), selector);
+        assert_eq!(required, custody);
+        assert_eq!(reported, actual);
     }
 
     // The grant is bound to the destination it was minted for. A grant for one
     // trusted route cannot be replayed to release raw bytes toward a different
     // route, so a mismatched destination yields no raw bytes.
     let mut two_trusted = ProvidersConfig::default();
-    two_trusted.providers.insert(
-        "t".into(),
-        combo_provider(ModelTrust::Trusted, LlmMode::Normal, 5, 5),
-    );
-    two_trusted.providers.insert(
-        "t2".into(),
-        combo_provider(ModelTrust::Trusted, LlmMode::Normal, 5, 5),
-    );
+    two_trusted
+        .providers
+        .insert("t".into(), combo_provider(ModelTrust::Trusted, 5, 5));
+    two_trusted
+        .providers
+        .insert("t2".into(), combo_provider(ModelTrust::Trusted, 5, 5));
     let first = resolve_sensitive(
         &two_trusted,
         ModelCustody::Trusted,
@@ -736,10 +710,8 @@ fn availability_allowlists_scope_discovery_not_host_named_targets() {
 #[test]
 fn eligibility_api_takes_no_payload_and_mints_no_grant() {
     let mut cfg = ProvidersConfig::default();
-    cfg.providers.insert(
-        "t".into(),
-        combo_provider(ModelTrust::Trusted, LlmMode::Normal, 5, 5),
-    );
+    cfg.providers
+        .insert("t".into(), combo_provider(ModelTrust::Trusted, 5, 5));
 
     let eligible = cfg
         .resolve_sensitive_model_policy_eligibility(

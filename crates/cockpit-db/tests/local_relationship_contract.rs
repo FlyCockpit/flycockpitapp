@@ -1094,7 +1094,6 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
             "recovery_kind",
             "recovery_stage",
             "hard_fail",
-            "llm_mode",
             "shape_fingerprint",
             "recoverable",
             "severity",

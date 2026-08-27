@@ -1389,13 +1389,13 @@ fn resolve_auto_prune_prefers_model_then_provider_then_on() {
 }
 
 #[test]
-fn fetched_known_frontier_model_gets_model_mode_even_with_provider_mode() {
+fn fetched_known_frontier_model_gets_riders_even_with_provider_auto_prune() {
     let mut cfg = ProvidersConfig::default();
     cfg.providers.insert(
         "codex-oauth".into(),
         ProviderEntry {
             url: "https://x".into(),
-            mode: Some(LlmMode::Defensive),
+            auto_prune: Some(true),
             models: merge_fetched_models_with_policy(
                 Some("codex-oauth"),
                 &[],
@@ -1407,11 +1407,12 @@ fn fetched_known_frontier_model_gets_model_mode_even_with_provider_mode() {
     );
 
     let row = &cfg.providers["codex-oauth"].models[0];
-    assert_eq!(row.mode, Some(LlmMode::Frontier));
+    assert_eq!(row.auto_prune, Some(false));
     assert_eq!(
-        cfg.resolve_mode("codex-oauth", "gpt-5.5", LlmMode::Normal),
-        LlmMode::Frontier
+        row.cache.as_ref().map(|c| c.mode),
+        Some(CacheMode::Ephemeral)
     );
+    assert!(!cfg.resolve_auto_prune("codex-oauth", "gpt-5.5"));
 }
 
 #[test]

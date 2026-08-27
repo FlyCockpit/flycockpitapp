@@ -2317,6 +2317,8 @@ pub fn spawn(
     terminal_closing: Arc<std::sync::atomic::AtomicBool>,
     terminal_cleanup_complete: Arc<std::sync::atomic::AtomicBool>,
     env_snapshot: EnvSnapshot,
+    image_generation_boot_id: Uuid,
+    image_generation_started_at: std::time::Instant,
     config_snapshot: SessionConfigSnapshot,
 ) -> (
     SessionWorkerHandle,
@@ -2512,6 +2514,8 @@ pub fn spawn(
             terminal_lock_cleanup_gate,
             terminal_closing,
             terminal_cleanup_complete,
+            image_generation_boot_id,
+            image_generation_started_at,
         ));
         crate::config::trust::scope_shared_workspace_trust_policy(trust_policy, worker).await;
     });

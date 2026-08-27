@@ -250,6 +250,9 @@ pub enum DecisionSource {
     HeadlessAutoReject,
     // Allowed by the session's unattended approval mode without a prompt.
     ModeAutoAllow,
+    /// Yolo allowed a hard-gate-safe action without a human prompt or standing
+    /// grant. Kept distinct from generic unattended allowance for audit.
+    AgentDiscretion,
     /// A standing loop-guard always-accept/always-reject rule decided it
     /// without prompting.
     LoopGuardRule,
@@ -267,6 +270,7 @@ impl DecisionSource {
             DecisionSource::UserPrompt => "user_prompt",
             DecisionSource::HeadlessAutoReject => "headless_auto_reject",
             DecisionSource::ModeAutoAllow => "mode_auto_allow",
+            DecisionSource::AgentDiscretion => "agent_discretion",
             DecisionSource::LoopGuardRule => "loop_guard_rule",
             DecisionSource::StandingReject => "standing_reject",
         }

@@ -983,6 +983,7 @@ struct CurrentTargetIdentity {
     immutable: String,
     model_or_workflow_digest: String,
     enabled: bool,
+    is_default: bool,
 }
 struct Flight {
     notify: Notify,
@@ -1074,14 +1075,20 @@ impl ImageRuntimeRegistry {
             if !target.enabled || !endpoint.enabled {
                 continue;
             }
-            let credential_material = endpoint
-                .credential_ref
-                .as_deref()
-                .and_then(|name| self.secret_lookup(name))
-                .unwrap_or_default();
-            let credential_identity_digest = CredentialIdentityDigest::from_sha256(
-                Sha256::digest(credential_material.as_bytes()).into(),
-            );
+            // The dispatch credential binding is the *effective* auth/header
+            // material, not merely the credential_ref label. A credential can
+            // be supplied by a configured secret header (and an Authorization
+            // header can override credential_ref), so hashing only the ref
+            // would let a rotated effective header reuse a health/approval
+            // binding. This helper hashes canonical header names and bytes
+            // without storing or exposing any raw value.
+            let credential_identity_digest = match self.effective_credential_identity(endpoint) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    tracing::warn!(target_id = %target.id, %error, "image generation target credential resolution failed");
+                    continue;
+                }
+            };
             let request_id = u64::try_from(index + 1).unwrap_or(u64::MAX);
             if let Err(error) = self
                 .refresh(
@@ -1156,6 +1163,37 @@ impl ImageRuntimeRegistry {
         }
         Ok(resolved)
     }
+
+    /// Secret-free identity of the exact credential-bearing request headers.
+    /// Header bytes are used only as input to this one-way digest and are never
+    /// copied into a health snapshot, plan, grant, or log.
+    pub(crate) fn effective_credential_identity(
+        &self,
+        endpoint: &ImageEndpoint,
+    ) -> Result<CredentialIdentityDigest, RuntimeError> {
+        let headers = self.resolve_ephemeral_headers(endpoint)?;
+        let mut entries = headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    value.as_bytes().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let mut digest = Sha256::new();
+        digest.update(b"flycockpit:image-generation-effective-credential:v1\0");
+        for (name, value) in entries {
+            digest.update((name.len() as u64).to_be_bytes());
+            digest.update(name.as_bytes());
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+        Ok(CredentialIdentityDigest::from_sha256(
+            digest.finalize().into(),
+        ))
+    }
     fn invalidate_target_cache(&self, endpoint_id: &str, target_id: &str) {
         self.inner.cache.lock().unwrap().remove(&CacheKey {
             endpoint: endpoint_id.to_owned(),
@@ -1199,14 +1237,19 @@ impl ImageRuntimeRegistry {
         self
     }
     pub fn standard(adapters: StandardImageRuntimeAdapters) -> Result<Self, RuntimeError> {
+        Self::standard_with_clock(Arc::new(SystemRuntimeClock::default()), adapters)
+    }
+
+    /// Construct the standard registry against a caller-owned monotonic clock.
+    /// The daemon passes its image-generation clock here so health TTLs and
+    /// sealed job deadlines share one origin across every session and worker.
+    pub fn standard_with_clock(
+        clock: Arc<dyn RuntimeClock>,
+        adapters: StandardImageRuntimeAdapters,
+    ) -> Result<Self, RuntimeError> {
         let dns: Arc<dyn DnsResolver> = Arc::new(TokioDnsResolver);
         let connector: Arc<dyn BoundConnector> = Arc::new(ReqwestPinnedConnector::new(dns.clone()));
-        Self::new(
-            Arc::new(SystemRuntimeClock::default()),
-            dns,
-            connector,
-            adapters.into_checked()?,
-        )
+        Self::new(clock, dns, connector, adapters.into_checked()?)
     }
     /// Construct the production registry with the four standard health /
     /// capability probe adapters (OpenAI Images, OpenRouter Images, Gemini
@@ -1217,6 +1260,14 @@ impl ImageRuntimeRegistry {
     /// [`Self::apply_config`] before dispatch.
     pub fn production_standard() -> Result<Self, RuntimeError> {
         Self::standard(production_standard_image_runtime_adapters())
+    }
+
+    /// Production factory variant for the daemon's shared image-generation
+    /// timeline. See [`Self::standard_with_clock`].
+    pub fn production_standard_with_clock(
+        clock: Arc<dyn RuntimeClock>,
+    ) -> Result<Self, RuntimeError> {
+        Self::standard_with_clock(clock, production_standard_image_runtime_adapters())
     }
     pub fn adapter(
         &self,
@@ -1341,6 +1392,7 @@ impl ImageRuntimeRegistry {
                     immutable,
                     model_or_workflow_digest,
                     enabled: target.enabled,
+                    is_default: target.is_default,
                 },
             );
         }
@@ -1379,6 +1431,7 @@ impl ImageRuntimeRegistry {
                 immutable: "test-target-identity".into(),
                 model_or_workflow_digest: model_or_workflow_digest.into(),
                 enabled: true,
+                is_default: false,
             },
         );
     }
@@ -1650,6 +1703,47 @@ impl ImageRuntimeRegistry {
             capability_fresh,
             secure_transport || endpoint.allow_insecure_transport,
         ))
+    }
+
+    /// Return the current sealed health snapshot for a configured target. The
+    /// endpoint association and config/refresh generation are checked under
+    /// the registry's live maps so callers cannot turn an old cache entry into
+    /// a preflight authority after a config replacement.
+    pub fn current_target_snapshot(&self, target_id: &str) -> Option<ImageHealthSnapshot> {
+        let target = self
+            .inner
+            .current_targets
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .cloned()?;
+        let snapshot = self.snapshot(&target.endpoint, target_id)?;
+        (snapshot.target_immutable_identity == target.immutable
+            && snapshot.config_generation == target.generation
+            && snapshot.refresh_epoch == target.epoch
+            && target.enabled)
+            .then_some(snapshot)
+    }
+
+    /// Resolve the sole enabled configured default target. Configuration
+    /// validation guarantees there is exactly one whenever an enabled target
+    /// exists; retaining the check here makes an in-memory partial refresh fail
+    /// closed rather than selecting an arbitrary target.
+    pub fn configured_default_target_id(&self) -> Option<String> {
+        let targets = self.inner.current_targets.lock().unwrap();
+        let endpoints = self.inner.current.lock().unwrap();
+        let mut defaults = targets
+            .iter()
+            .filter(|(_, target)| {
+                target.is_default
+                    && target.enabled
+                    && endpoints
+                        .get(&target.endpoint)
+                        .is_some_and(|endpoint| endpoint.enabled)
+            })
+            .map(|(target_id, _)| target_id.clone());
+        let target_id = defaults.next()?;
+        defaults.next().is_none().then_some(target_id)
     }
     pub async fn refresh(
         &self,
@@ -2313,11 +2407,10 @@ impl ImageRuntimeRegistry {
     ///
     /// `config_generation` is the snapshot's generation. Revalidation rejects a
     /// substantive endpoint/target/credential change (immutable-identity, location,
-    /// origin, or credential mismatch), but it does NOT compare the snapshot's
-    /// generation against the registry's live current generation: a pure generation
-    /// bump that leaves the cached snapshot's identity unchanged and within TTL is
-    /// not caught here. The caller binds this generation to the sealed plan's
-    /// generation, which is the obsolescence gate against a re-planned destination.
+    /// origin, or credential mismatch); config reconciliation also evicts cache
+    /// entries whose generation no longer matches the live target, so a pure
+    /// generation bump cannot reuse an old health proof. The caller additionally
+    /// binds this generation to the sealed plan's generation.
     pub async fn revalidate_dispatch_binding(
         &self,
         endpoint: &ImageEndpoint,

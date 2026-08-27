@@ -14,10 +14,31 @@
 //! [`ImageRuntimeRegistry::standard`]/[`ImageRuntimeRegistry::production_standard`]
 //! a real production factory and not dead code.
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use cockpit_config::config::image_generation::ImageGenerationConfig;
 
 use crate::credentials::CredentialStore;
-use crate::image_generation_runtime::{ImageRuntimeRegistry, RuntimeError};
+use crate::image_generation_runtime::{ImageRuntimeRegistry, RuntimeClock, RuntimeError};
+
+/// Daemon-wide monotonic origin used for both image runtime health TTLs and
+/// image-job deadlines. It carries no wall-clock data and cannot move backward.
+pub struct DaemonImageRuntimeClock {
+    started_at: Instant,
+}
+
+impl DaemonImageRuntimeClock {
+    pub const fn new(started_at: Instant) -> Self {
+        Self { started_at }
+    }
+}
+
+impl RuntimeClock for DaemonImageRuntimeClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
 
 /// Build the production image runtime registry with the four standard adapters,
 /// attach the credential store used to resolve endpoint credentials, and apply
@@ -33,8 +54,9 @@ pub fn install_standard_image_runtime_registry(
     generation: u64,
     epoch: u64,
     store: Option<CredentialStore>,
+    clock: Arc<dyn RuntimeClock>,
 ) -> Result<ImageRuntimeRegistry, RuntimeError> {
-    let mut registry = ImageRuntimeRegistry::production_standard()?;
+    let mut registry = ImageRuntimeRegistry::production_standard_with_clock(clock)?;
     if let Some(store) = store {
         registry = registry.with_store(store);
     }
@@ -54,8 +76,14 @@ mod tests {
         // adapter kinds must resolve — proving the standard factory is a real,
         // non-test production path.
         let config = ImageGenerationConfig::default();
-        let registry = install_standard_image_runtime_registry(&config, 1, 1, None)
-            .expect("production install seam must build the standard registry");
+        let registry = install_standard_image_runtime_registry(
+            &config,
+            1,
+            1,
+            None,
+            Arc::new(DaemonImageRuntimeClock::new(Instant::now())),
+        )
+        .expect("production install seam must build the standard registry");
         for kind in [
             ImageAdapterKind::OpenaiImages,
             ImageAdapterKind::OpenrouterImages,

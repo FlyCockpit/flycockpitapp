@@ -1150,8 +1150,15 @@ impl Approver {
             crate::config::extended::ApprovalMode::Yolo => {
                 // Yolo opens no human prompt and records agent discretion after
                 // every hard gate passed; it requires no grant and persists
-                // none. (A later increment records the `agent_discretion`
-                // disposition audit alongside grant persistence.)
+                // none.
+                self.record_permission_decision(
+                    "generate_image",
+                    facts.plan_digest.as_str(),
+                    &[Scope::Once],
+                    Decision::Allow { scope: Scope::Once },
+                    crate::approval::DecisionSource::AgentDiscretion,
+                )
+                .await;
                 Ok(Decision::Allow { scope: Scope::Once })
             }
             crate::config::extended::ApprovalMode::Manual => {
@@ -1207,9 +1214,9 @@ impl Approver {
     /// matching grant). Carries only the secret-free destination count, plan
     /// digest prefix, and redacted output write-authority identity. The human
     /// may approve once, for this session, or for this project; deny; or
-    /// dismiss (deny). A session/project allow is persisted as a standing
-    /// grant before the decision returns so a future matching request
-    /// short-circuits the prompt.
+    /// dismiss (deny). A session/project decision is persisted as a standing
+    /// grant only after the dispatch service has durably queued the exact job,
+    /// so a failed commit never leaves authorization behind.
     async fn raise_image_generation_prompt(
         &self,
         facts: &ImageGenerationAuthzFacts<'_>,
@@ -1249,8 +1256,6 @@ impl Approver {
                 ApprovalOptionId::Reject,
             ],
         );
-        let plan_digest = facts.plan_digest.as_str().to_owned();
-        let output_path_authority = facts.output_path_authority.as_str().to_owned();
         let decision = self
             .raise_and_decode(
                 &description,
@@ -1275,8 +1280,8 @@ impl Approver {
                     "output_path_authority": facts.output_path_authority.as_str(),
                     "candidate_effects": [
                         {"selection": "approve_once", "execute": {"plan_digest": facts.plan_digest.as_str(), "destinations": facts.destinations, "fanout": facts.fanout, "total_outputs": facts.total_outputs, "cost_maximum": facts.cost_maximum, "output_path_authority": facts.output_path_authority.as_str()}},
-                        {"selection": "approve_session", "persist_grant": {"scope": "session", "plan_digest": facts.plan_digest.as_str(), "output_path_authority": facts.output_path_authority.as_str()}},
-                        {"selection": "approve_project", "persist_grant": {"scope": "project", "plan_digest": facts.plan_digest.as_str(), "output_path_authority": facts.output_path_authority.as_str()}},
+                        {"selection": "approve_session", "persist_after_queued_job": {"scope": "session", "plan_digest": facts.plan_digest.as_str(), "output_path_authority": facts.output_path_authority.as_str()}},
+                        {"selection": "approve_project", "persist_after_queued_job": {"scope": "project", "plan_digest": facts.plan_digest.as_str(), "output_path_authority": facts.output_path_authority.as_str()}},
                         {"selection": "reject", "effect": "deny"}
                     ],
                 }),
@@ -1299,27 +1304,9 @@ impl Approver {
                 },
             )
             .await?;
-        // Persist a standing grant for a non-Once allow before returning the
-        // decision. A persistence failure must not silently turn the user's
-        // session/project choice into a one-time allow.
-        if let Decision::Allow {
-            scope: scope @ (Scope::Session | Scope::Project),
-        } = decision
-        {
-            if let Some(session) = self.session.as_deref() {
-                self.store
-                    .record_image_generation_grant(
-                        scope,
-                        &session.project_id,
-                        &plan_digest,
-                        facts.destination_grant_binding_digest,
-                        &output_path_authority,
-                    )
-                    .await?;
-            } else {
-                anyhow::bail!("image generation standing grant requires an attached session");
-            }
-        }
+        // Standing grants are persisted only by the dispatch service after it
+        // has durably committed the exact queued job. Recording one here would
+        // leave an authorization for an operation that failed before commit.
         Ok(decision)
     }
 }

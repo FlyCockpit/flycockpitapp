@@ -245,6 +245,16 @@ struct Inner {
     /// configuration: a recovered refresh operation must use the same
     /// composition-owned runtime that the original attached request used.
     host_capability_probes: Mutex<Option<crate::host_capabilities::HostCapabilityProbeInputs>>,
+    /// Daemon-owned image-generation deadline timeline. Installed once after
+    /// daemon boot and copied into every session dispatch service; sessions
+    /// must never mint their own boot id or monotonic origin.
+    image_generation_clock: Mutex<Option<ImageGenerationClockContext>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ImageGenerationClockContext {
+    pub boot_id: Uuid,
+    pub started_at: std::time::Instant,
 }
 
 struct WorkerState {
@@ -642,8 +652,20 @@ impl SessionRegistry {
                 pre_start_worker_hook: Mutex::new(None),
                 host_capabilities: Mutex::new(None),
                 host_capability_probes: Mutex::new(None),
+                // Production replaces this bootstrap value with the daemon's
+                // real shared worker timeline before accepting clients. Keeping
+                // a complete in-process fallback makes isolated registry tests
+                // exercise the same no-per-session-minting path.
+                image_generation_clock: Mutex::new(Some(ImageGenerationClockContext {
+                    boot_id: Uuid::now_v7(),
+                    started_at: std::time::Instant::now(),
+                })),
             }),
         }
+    }
+
+    pub fn set_image_generation_clock(&self, context: ImageGenerationClockContext) {
+        *crate::sync::lock_or_recover(&self.inner.image_generation_clock) = Some(context);
     }
 
     pub fn set_host_capabilities(
@@ -1829,6 +1851,11 @@ impl SessionRegistry {
         let terminal_lock_cleanup_gate = Arc::new(AsyncMutex::new(()));
         let terminal_closing = Arc::new(AtomicBool::new(false));
         let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));
+        let image_generation_clock =
+            crate::sync::lock_or_recover(&self.inner.image_generation_clock)
+                .as_ref()
+                .copied()
+                .context("image generation daemon clock is unavailable")?;
         let (handle, join, start_permit) = session_worker::spawn(
             session,
             self.inner.locks.clone(),
@@ -1854,6 +1881,8 @@ impl SessionRegistry {
             terminal_closing.clone(),
             terminal_cleanup_complete.clone(),
             env_snapshot,
+            image_generation_clock.boot_id,
+            image_generation_clock.started_at,
             {
                 let snapshot = session_worker::SessionConfigSnapshot::with_hooks(
                     0,

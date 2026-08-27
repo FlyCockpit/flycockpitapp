@@ -193,6 +193,7 @@ impl ImageGenerationPlanV1 {
             for reference in &target.reference_artifacts {
                 ensure!(
                     references.insert((
+                        target.target_id.clone(),
                         reference.attachment_id,
                         reference.attachment_version,
                         reference.component_id,

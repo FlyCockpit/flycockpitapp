@@ -2612,6 +2612,10 @@ impl DaemonContext {
         // uses it as `worker_boot_id`; a job-creation caller uses it as the
         // plan's `deadline_boot_id`.
         let image_generation_boot_id = Uuid::now_v7();
+        registry.set_image_generation_clock(crate::daemon::registry::ImageGenerationClockContext {
+            boot_id: image_generation_boot_id,
+            started_at,
+        });
         // Spawn the daemon-lifecycle image-generation worker on NON-ephemeral
         // start only (same gating as the scheduler / media-ledger install). It
         // shares `started_at` so its monotonic clock matches the media ledger and
@@ -2627,6 +2631,9 @@ impl DaemonContext {
                     1,
                     1,
                     None,
+                    Arc::new(crate::daemon::image_runtime::DaemonImageRuntimeClock::new(
+                        started_at,
+                    )),
                 ) {
                     Ok(registry) => {
                         let proof_source = Arc::new(

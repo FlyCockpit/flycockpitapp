@@ -241,8 +241,14 @@ pub struct ImageGenerationTargetProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectionReference {
-    pub name: String,
+    /// Secret-free stable identity binding. It is derived from the attachment
+    /// identity/checksum by the dispatch service and is never a local path,
+    /// URL, or provider payload.
+    pub identity_digest: String,
     pub thumbnail: bool,
+    /// The exact target this reference may egress to. This association is part
+    /// of the immutable approval digest; moving a reference to another target
+    /// cannot reuse an approval grant.
     pub destination_target_id: String,
 }
 
@@ -1008,9 +1014,9 @@ impl Tool for GenerateImageTool {
 /// dispatch DTO. Shared top-level `width`/`height`/`format` are the default for
 /// every target; a per-target value overrides when present. `samples` defaults
 /// to 1. When `targets` is omitted the schema means "the configured default
-/// target with one sample": a single placeholder target with an empty
-/// `target_id` is emitted, which the daemon reconciliation resolves to the
-/// configured default when the adapter map lands. References are a flat list;
+/// target with one sample". The dispatch service resolves that explicit
+/// default-target marker against its live registry before projecting,
+/// authorizing, or committing the request. References are a flat list;
 /// each target is bound to every reference by index.
 fn parse_generate_image_dispatch_args(
     args: &Value,
@@ -1069,7 +1075,11 @@ fn parse_generate_image_dispatch_args(
             })
             .collect::<Result<Vec<_>>>()?,
         _ => vec![crate::image_generation_job::GenerateImageDispatchTarget {
-            target_id: String::new(),
+            // This marker is intentionally not an empty target id: an empty id
+            // can accidentally be persisted or hashed as an authority fact.
+            // It is private to the tool/service DTO boundary and must be
+            // resolved to the one configured default before any projection.
+            target_id: crate::image_generation_job::DEFAULT_IMAGE_TARGET_MARKER.to_string(),
             samples: 1,
             width: shared_width.unwrap_or(0),
             height: shared_height.unwrap_or(0),
@@ -1385,6 +1395,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn changed_reference_cannot_reuse_approval_digest() {
+        let mut first = base_projection();
+        first.references = vec![ProjectionReference {
+            identity_digest: "a".repeat(64),
+            thumbnail: false,
+            destination_target_id: "t1".to_string(),
+        }];
+        let mut changed_reference = first.clone();
+        changed_reference.references[0].identity_digest = "b".repeat(64);
+        let mut changed_destination = first.clone();
+        changed_destination.references[0].destination_target_id = "t2".to_string();
+        assert_ne!(
+            plan_projection_digest(&first).unwrap(),
+            plan_projection_digest(&changed_reference).unwrap()
+        );
+        assert_ne!(
+            plan_projection_digest(&first).unwrap(),
+            plan_projection_digest(&changed_destination).unwrap()
+        );
+    }
+
     // The composite-decision tests that used to live here (hard gates,
     // ApprovalMode dispositions, unknown-cost dispatch) were REWRITTEN against
     // the real chokepoint `Approver::authorize(AuthorizationRequest::
@@ -1415,6 +1447,22 @@ mod tests {
         assert!(required_names.contains(&"prompt"));
         assert!(required_names.contains(&"directory"));
         assert!(required_names.contains(&"base_stem"));
+    }
+
+    #[test]
+    fn omitted_targets_use_the_explicit_default_target_marker() {
+        let args = serde_json::json!({
+            "prompt": "a small test image",
+            "directory": "/safe/output",
+            "base_stem": "image"
+        });
+        validate_generate_image_args(&args).unwrap();
+        let parsed = parse_generate_image_dispatch_args(&args).unwrap();
+        assert_eq!(parsed.targets.len(), 1);
+        assert_eq!(
+            parsed.targets[0].target_id,
+            crate::image_generation_job::DEFAULT_IMAGE_TARGET_MARKER
+        );
     }
 
     #[test]

@@ -4661,6 +4661,8 @@ pub(super) async fn run_worker(
     terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     terminal_closing: Arc<AtomicBool>,
     terminal_cleanup_complete: Arc<AtomicBool>,
+    image_generation_boot_id: uuid::Uuid,
+    image_generation_started_at: std::time::Instant,
 ) {
     let session_id = session.id;
     let mut startup_inbox = StartupWorkInbox::default();
@@ -5299,6 +5301,9 @@ pub(super) async fn run_worker(
             start_config.generation,
             1,
             credential_store,
+            Arc::new(crate::daemon::image_runtime::DaemonImageRuntimeClock::new(
+                image_generation_started_at,
+            )),
         ) {
             Ok(registry) => {
                 registry
@@ -5311,13 +5316,14 @@ pub(super) async fn run_worker(
                 let service = crate::image_generation_job::ImageGenerationDispatchService::new(
                     session.db.clone(),
                     Arc::new(registry),
-                    uuid::Uuid::now_v7(),
+                    image_generation_boot_id,
                     crate::daemon::principal::ClientPrincipal::owner(),
                     start_config.generation,
                     extended_cfg
                         .image_generation
                         .base_tier_known_cost_threshold_usd_micros(),
-                    Arc::new(SessionImageClock(std::time::Instant::now())),
+                    (*extended_cfg.media_resources).clone(),
+                    Arc::new(SessionImageClock(image_generation_started_at)),
                 );
                 session.set_image_generation_dispatch(Arc::new(service));
             }
@@ -10333,6 +10339,28 @@ pub(super) async fn run_worker(
                         expected_trust_revision,
                     );
                     let changed = result.changed;
+                    if changed {
+                        let refreshed = config_snapshot
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        if let Some(service) = session.image_generation_dispatch()
+                            && let Err(error) = service
+                                .reconcile_config(
+                                    &refreshed.extended.image_generation,
+                                    (*refreshed.extended.media_resources).clone(),
+                                    result.generation,
+                                    result.generation,
+                                )
+                                .await
+                        {
+                            // A half-reconciled runtime is never safe to keep:
+                            // remove dispatch authority rather than retaining
+                            // targets/credentials from the prior snapshot.
+                            tracing::error!(%error, "image generation config reconciliation failed; dispatch disabled");
+                            session.clear_image_generation_dispatch();
+                        }
+                    }
                     send_config_snapshot_event_if_changed(
                         &event_tx,
                         &redaction,

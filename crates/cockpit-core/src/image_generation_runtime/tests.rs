@@ -1246,6 +1246,26 @@ fn resolve_ephemeral_headers_uses_vault_credential_ref() {
 }
 
 #[test]
+fn effective_credential_identity_binds_resolved_header_secret_material() {
+    let mut endpoint = endpoint();
+    endpoint.headers = vec![cockpit_config::config::providers::HeaderSpec {
+        name: "X-Image-Token".into(),
+        value: "$secret:img-token".into(),
+    }];
+
+    let first = header_test_registry()
+        .with_store(vault_store_with_named_secret("img-token", "first-secret"))
+        .effective_credential_identity(&endpoint)
+        .expect("first resolved header identity");
+    let rotated = header_test_registry()
+        .with_store(vault_store_with_named_secret("img-token", "rotated-secret"))
+        .effective_credential_identity(&endpoint)
+        .expect("rotated resolved header identity");
+
+    assert_ne!(first, rotated);
+}
+
+#[test]
 fn resolve_ephemeral_headers_fail_closed_without_store() {
     let registry = header_test_registry();
     let mut endpoint = endpoint();

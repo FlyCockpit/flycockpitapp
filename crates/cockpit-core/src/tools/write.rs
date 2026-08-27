@@ -364,10 +364,7 @@ async fn create_new_and_release(
     guard: crate::locks::WriteGuard<'_>,
     create_file: impl FnOnce(&std::path::Path, &[u8]) -> std::io::Result<()>,
     contain_under: &std::path::Path,
-) -> Result<(
-    crate::tools::common::WriteReleaseOutcome,
-    Option<String>,
-)> {
+) -> Result<(crate::tools::common::WriteReleaseOutcome, Option<String>)> {
     let prep = ensure_parent_dirs(path, contain_under)?;
     let created = create_file(path, bytes);
     if created.is_err() {
@@ -492,15 +489,14 @@ fn create_missing_parent_chain(
     parent: &std::path::Path,
     created_paths: &mut Vec<std::path::PathBuf>,
 ) -> Result<Option<String>> {
-    let ancestor = cockpit_host::path_containment::nearest_existing_prefix(parent).with_context(
-        || {
+    let ancestor =
+        cockpit_host::path_containment::nearest_existing_prefix(parent).with_context(|| {
             format!(
                 "locate existing ancestor of parent `{}` for `{}`",
                 parent.display(),
                 path.display()
             )
-        },
-    )?;
+        })?;
     let ancestor_meta = std::fs::symlink_metadata(&ancestor).with_context(|| {
         format!(
             "stat existing ancestor `{}` for `{}`",
@@ -534,7 +530,13 @@ fn create_missing_parent_chain(
     } else {
         Some(format_created_directories_line(created_relative))
     };
-    create_parent_components(path, parent, &ancestor_canon, created_relative, created_paths)?;
+    create_parent_components(
+        path,
+        parent,
+        &ancestor_canon,
+        created_relative,
+        created_paths,
+    )?;
     Ok(disclosure)
 }
 
@@ -1495,11 +1497,7 @@ mod tests {
             "{}",
             out.content
         );
-        assert!(
-            !out.content.contains("/…/"),
-            "{}",
-            out.content
-        );
+        assert!(!out.content.contains("/…/"), "{}", out.content);
     }
 
     #[test]
@@ -1554,7 +1552,11 @@ mod tests {
         assert!(!outside.join("deep").exists());
         assert!(!outside.join("deep/file.txt").exists());
         assert!(!scope.join("nested/deep/file.txt").exists());
-        assert!(ctx.locks.holder(&scope.join("nested/deep/file.txt")).is_none());
+        assert!(
+            ctx.locks
+                .holder(&scope.join("nested/deep/file.txt"))
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1589,10 +1591,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(
-            err.contains("canonicalizes outside write scope"),
-            "{err}"
-        );
+        assert!(err.contains("canonicalizes outside write scope"), "{err}");
         assert!(!outside.join("deep/file.txt").exists());
         assert!(!scope.join("nested/deep/file.txt").is_file());
     }
@@ -1704,12 +1703,114 @@ mod tests {
             .await
             .unwrap();
 
-        let nested_mode =
-            std::fs::metadata(tmp.path().join("nested")).unwrap().permissions().mode() & 0o777;
-        let deep_mode =
-            std::fs::metadata(tmp.path().join("nested/deep")).unwrap().permissions().mode() & 0o777;
+        let nested_mode = std::fs::metadata(tmp.path().join("nested"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let deep_mode = std::fs::metadata(tmp.path().join("nested/deep"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(nested_mode, 0o755);
         assert_eq!(deep_mode, 0o755);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revised_write_into_new_directory_discloses_and_hardens() {
+        // Issue #76 revise mode redispatches through the same WriteTool, so
+        // parent-dir disclosure and containment hardening apply by construction.
+        // `x-cockpit-may-create` remains a repair-only annotation and is not
+        // consulted here.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let scope = tmp.path().join("scope");
+        std::fs::create_dir_all(&scope).unwrap();
+        ctx.write_scope = Some(scope.clone());
+
+        let original = WriteTool
+            .call(
+                serde_json::json!({"path": "scope/original.txt", "content": "v1"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !original.content.contains("created directories:"),
+            "{}",
+            original.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(scope.join("original.txt")).unwrap(),
+            "v1"
+        );
+
+        let revised = WriteTool
+            .call(
+                serde_json::json!({
+                    "path": "scope/revised/deep/file.txt",
+                    "content": "v2"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            revised
+                .content
+                .contains("created directories: revised/…/deep"),
+            "{}",
+            revised.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(scope.join("revised/deep/file.txt")).unwrap(),
+            "v2"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let revised_mode = std::fs::metadata(scope.join("revised"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            let deep_mode = std::fs::metadata(scope.join("revised/deep"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(revised_mode, 0o755);
+            assert_eq!(deep_mode, 0o755);
+        }
+
+        #[cfg(unix)]
+        {
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let nested = scope.join("trap");
+            let outside_for_hook = outside.clone();
+            set_before_parent_create_hook(move || {
+                std::os::unix::fs::symlink(&outside_for_hook, &nested).unwrap();
+            });
+            let err = WriteTool
+                .call(
+                    serde_json::json!({
+                        "path": "scope/trap/deep/file.txt",
+                        "content": "escaped"
+                    }),
+                    &ctx,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("symlink") || err.contains("not a directory"),
+                "{err}"
+            );
+            assert!(!outside.join("deep/file.txt").exists());
+        }
     }
 
     #[tokio::test]

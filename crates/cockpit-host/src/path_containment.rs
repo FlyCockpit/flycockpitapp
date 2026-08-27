@@ -124,7 +124,10 @@ mod tests {
         let missing = root.join("scope/nested/deep/file.txt");
         let (prefix, canonical) = nearest_existing_ancestor(&missing).unwrap();
         assert_eq!(prefix, root.join("scope"));
-        assert_eq!(canonical, std::fs::canonicalize(root.join("scope")).unwrap());
+        assert_eq!(
+            canonical,
+            std::fs::canonicalize(root.join("scope")).unwrap()
+        );
         assert_eq!(
             nearest_existing_prefix(&missing).unwrap(),
             root.join("scope")

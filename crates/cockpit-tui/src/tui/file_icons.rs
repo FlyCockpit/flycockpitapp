@@ -139,6 +139,7 @@ fn glyph_for_extension(ext: &str) -> Option<&'static str> {
 
 /// Every unique glyph in the table. Tests assert each is a single cell
 /// (unicode width 1); a width-2 pick would shift the tool glyph column.
+#[cfg(test)]
 const ALL_GLYPHS: &[&str] = &[
     GENERIC_FILE_GLYPH,
     ICON_RUST,

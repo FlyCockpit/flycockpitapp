@@ -2204,6 +2204,136 @@ async fn toolbox_honors_emoji_setting() {
     );
 }
 
+#[test]
+fn write_edit_lines_show_file_type_icon_from_summary_path() {
+    let rust_icon = crate::tui::file_icons::glyph_for_path("src/lib.rs");
+    let generic = crate::tui::file_icons::GENERIC_FILE_GLYPH;
+    let write = mk_call("write", "src/lib.rs", ToolCallState::Success);
+
+    let on = line_text(
+        &render_toolbox(&[write.clone()], 0, true, 80, false, true, &no_elided()).lines[0],
+    );
+    let off = line_text(
+        &render_toolbox(&[write.clone()], 0, true, 80, false, false, &no_elided()).lines[0],
+    );
+    assert!(on.contains(rust_icon), "icons on: {on}");
+    assert!(on.contains("write: src/lib.rs"), "{on}");
+    assert!(!off.contains(rust_icon), "icons off: {off}");
+    assert!(off.contains("write: src/lib.rs"), "{off}");
+
+    let (icon_glyph, label) = tool_call_glyph_label(&write, false, true);
+    assert_eq!(label, "write");
+    assert_eq!(
+        icon_glyph.width(),
+        TOOL_GLYPH_COLUMN,
+        "file-icon column stays {TOOL_GLYPH_COLUMN} cells, got {icon_glyph:?}"
+    );
+    assert!(icon_glyph.starts_with(rust_icon), "{icon_glyph:?}");
+
+    let (emoji_glyph, _) = tool_call_glyph_label(&write, true, false);
+    assert_eq!(
+        emoji_glyph.width(),
+        TOOL_GLYPH_COLUMN,
+        "emoji column stays {TOOL_GLYPH_COLUMN} cells"
+    );
+    let (both, _) = tool_call_glyph_label(&write, true, true);
+    assert!(
+        both.starts_with(rust_icon),
+        "file icon replaces the generic write glyph when both settings are on: {both:?}"
+    );
+    assert!(!both.contains('\u{1f513}'), "{both:?}");
+
+    let unknown = mk_call("write", "notes.xyz", ToolCallState::Success);
+    let (unknown_glyph, _) = tool_call_glyph_label(&unknown, false, true);
+    assert!(
+        unknown_glyph.starts_with(generic),
+        "unknown extension falls back to generic file glyph, got {unknown_glyph:?}"
+    );
+
+    let bash = mk_call("bash", "src/lib.rs", ToolCallState::Success);
+    let (bash_off, _) = tool_call_glyph_label(&bash, false, true);
+    assert!(
+        bash_off.is_empty(),
+        "non-file tools stay glyph-less when emojis are off: {bash_off:?}"
+    );
+    let (bash_emoji, bash_label) = tool_call_glyph_label(&bash, true, true);
+    assert_eq!(bash_label, "bash");
+    assert!(!bash_emoji.contains(rust_icon), "{bash_emoji:?}");
+    assert!(!bash_emoji.is_empty(), "bash still shows its emoji glyph");
+
+    for tool in ["edit", "writeunlock", "editunlock", "plan_write", "plan_edit"] {
+        let call = mk_call(tool, "src/main.rs", ToolCallState::Success);
+        let (glyph, _) = tool_call_glyph_label(&call, false, true);
+        assert!(
+            glyph.starts_with(rust_icon),
+            "{tool} should use the rust file icon, got {glyph:?}"
+        );
+    }
+}
+
+#[test]
+fn tool_line_and_diff_honor_file_icons() {
+    let rust_icon = crate::tui::file_icons::glyph_for_path("src/lib.rs");
+    let line = HistoryEntry::ToolLine {
+        call_id: "w".to_string(),
+        tool: "write".to_string(),
+        summary: "src/lib.rs".to_string(),
+        state: ToolCallState::Success,
+    };
+    let on = render_entry(
+        &line,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        true,
+        &no_elided(),
+        0,
+        None,
+    );
+    let on_text = line_text(&on.lines[0]);
+    assert!(on_text.contains(rust_icon), "{on_text}");
+    assert!(on_text.contains("write: src/lib.rs"), "{on_text}");
+
+    let off = render_entry(
+        &line,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        false,
+        &no_elided(),
+        0,
+        None,
+    );
+    let off_text = line_text(&off.lines[0]);
+    assert!(!off_text.contains(rust_icon), "{off_text}");
+
+    let diff = HistoryEntry::Diff {
+        tool: "edit".to_string(),
+        path: "src/lib.rs".to_string(),
+        old: "old\n".to_string(),
+        new: "new\n".to_string(),
+    };
+    let diff_on = render_entry(
+        &diff,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::Hidden,
+        false,
+        true,
+        &no_elided(),
+        0,
+        None,
+    );
+    let diff_text = rendered_text(&diff_on).join("\n");
+    assert!(diff_text.contains(rust_icon), "{diff_text}");
+    assert!(diff_text.contains("src/lib.rs"), "{diff_text}");
+}
+
 // ── prune dimming ──────────────────────────────────────────────────
 
 const MUTED: Color = Color::Indexed(MUTED_COLOR_INDEX);

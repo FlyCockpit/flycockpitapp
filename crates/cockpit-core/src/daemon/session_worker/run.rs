@@ -4803,6 +4803,7 @@ pub(super) async fn run_worker(
             &pinned.providers,
             pinned.guidance_global_layer,
             pinned.guidance_project_layer,
+            pinned.generation,
             guidance_model.provider_id(),
             guidance_model.model_id_ref(),
             project_root.as_os_str().as_encoded_bytes(),
@@ -4817,10 +4818,12 @@ pub(super) async fn run_worker(
             &guidance_snapshot.provider_digest,
             &guidance_snapshot.model_digest,
         );
-    let guidance_compiler = guidance_proposals
-        .lock()
-        .await
-        .compiler(*session_id.as_bytes());
+    let guidance_compiler = guidance_proposals.lock().await.compiler(
+        *session_id.as_bytes(),
+        crate::computer::guidance::service::canonical_project_digest(
+            project_root.as_os_str().as_encoded_bytes(),
+        ),
+    );
     let spawn_args = SpawnArgs {
         compiled_guidance,
         guidance_compiler: Some(guidance_compiler.clone()),

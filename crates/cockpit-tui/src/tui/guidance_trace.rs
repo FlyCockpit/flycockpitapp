@@ -7,12 +7,10 @@
 //! disable veto is present, and the config generation the resolution was
 //! stamped under.
 //!
-//! This module is pure presentation logic: it formats
-//! [`EnablementResolution`] + a config generation into display lines the TUI
-//! settings pane renders. The resolution itself is computed in-process via
-//! [`cockpit_core::computer::guidance::enablement::resolve_guidance_enablement`]
-//! (the TUI already holds the layered config + providers), so no new daemon
-//! RPC is required for the trace.
+//! This module is pure presentation logic: it formats the authoritative
+//! daemon-provided [`EnablementResolution`] projection plus its generation
+//! into settings display lines. It intentionally does not re-resolve local
+//! config, which could race the attached daemon snapshot.
 
 use cockpit_core::computer::guidance::{EnablementLayers, EnablementResolution, EnablementValue};
 

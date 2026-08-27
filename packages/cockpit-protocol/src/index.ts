@@ -597,6 +597,35 @@ export const agentDecisionAnswerSchema = z.discriminatedUnion("kind", [
 ]);
 export type AgentDecisionAnswer = z.infer<typeof agentDecisionAnswerSchema>;
 
+/** Daemon-owned typed computer-use guidance rule encoding. */
+export const computerGuidanceRuleV1Schema = z
+  .tuple([
+    z.number().int().min(0).max(255),
+    z.number().int().min(0).max(255),
+    z.number().int().min(0).max(255),
+  ])
+  .readonly();
+export type ComputerGuidanceRuleV1 = z.infer<typeof computerGuidanceRuleV1Schema>;
+
+export const guidanceProposalDecisionSchema = z.enum([
+  "reject",
+  "accept_session",
+  "accept_persistent",
+]);
+export type GuidanceProposalDecision = z.infer<typeof guidanceProposalDecisionSchema>;
+
+/** Pending proposal contents are scoped by the attached daemon session. */
+export const pendingGuidanceProposalSchema = z
+  .object({
+    proposalId: uuidSchema,
+    rules: z.array(computerGuidanceRuleV1Schema),
+    rationale: z.string().nullable(),
+    expiresAtUnixMs: safeI64NumberSchema,
+    persistentAcceptanceAllowed: z.boolean(),
+  })
+  .strict();
+export type PendingGuidanceProposal = z.infer<typeof pendingGuidanceProposalSchema>;
+
 const requestParamSchemas = {
   get_app_flag: z.object({ key: z.literal("daemon_autostart_notice") }).strict(),
   get_startup_disclosures: z.object({ project_root: projectRootSchema }).strict(),
@@ -700,6 +729,11 @@ const requestParamSchemas = {
     })
     .strict(),
   get_session_setup_snapshot: z.object({ session_id: uuidSchema }).strict(),
+  list_guidance_proposals: z.undefined(),
+  get_guidance_enablement_trace: z.undefined(),
+  review_guidance_proposal: z
+    .object({ proposal_id: uuidSchema, decision: guidanceProposalDecisionSchema })
+    .strict(),
   list_sessions: z
     .object({
       project_id: z.string().nullable().optional(),
@@ -1003,6 +1037,9 @@ const clientRequestVariants = [
   requestVariant("git_status", requestParamSchemas.git_status),
   requestVariant("get_inventory_bundle", requestParamSchemas.get_inventory_bundle),
   requestVariant("get_session_setup_snapshot", requestParamSchemas.get_session_setup_snapshot),
+  requestVariantNoParams("list_guidance_proposals"),
+  requestVariantNoParams("get_guidance_enablement_trace"),
+  requestVariant("review_guidance_proposal", requestParamSchemas.review_guidance_proposal),
   requestVariant("list_sessions", requestParamSchemas.list_sessions),
   requestVariant("read_history_page", requestParamSchemas.read_history_page),
   requestVariant("read_agent_tree", requestParamSchemas.read_agent_tree),
@@ -1139,6 +1176,9 @@ export const responseNameSchema = z.enum([
   "fs_write",
   "git_diff_file",
   "git_status",
+  "guidance_proposals",
+  "guidance_enablement_trace",
+  "guidance_proposal_reviewed",
   "agent_tree_page",
   "agent_attention_page",
   "agent_decision_steered",
@@ -1532,6 +1572,28 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     z.object({ applied_generation: safeU64NumberSchema, changed: z.boolean() }).strict(),
   ),
   responseVariant("attached", attachedDataSchema),
+  responseVariant(
+    "guidance_proposals",
+    z.object({ proposals: z.array(pendingGuidanceProposalSchema) }).strict(),
+  ),
+  responseVariant(
+    "guidance_enablement_trace",
+    z
+      .object({
+        global: z.boolean().nullable(),
+        project: z.boolean().nullable(),
+        provider: z.boolean().nullable(),
+        model: z.boolean().nullable(),
+        enabled: z.boolean(),
+        has_disable_veto: z.boolean(),
+        config_generation: safeU64NumberSchema,
+      })
+      .strict(),
+  ),
+  responseVariant(
+    "guidance_proposal_reviewed",
+    z.object({ installed_rules: z.array(computerGuidanceRuleV1Schema) }).strict(),
+  ),
   responseVariant("export_session_data", z.object({ data: exportSessionDataSchema }).passthrough()),
   responseVariant(
     "bulk_transfer_chunk_accepted",

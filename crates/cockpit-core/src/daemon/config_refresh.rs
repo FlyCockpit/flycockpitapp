@@ -296,13 +296,21 @@ async fn refresh_session_config_explicit_once_with_publication(
     if latest_trust != resolved_trust || !handle.trust_transition_matches(&resolved_trust) {
         return Err(ExplicitConfigRefreshError::Stale);
     }
+    let guidance_layers = crate::config::extended::guidance_proposal_doc_layers_from_snapshot_chain(
+        &workspace_layer,
+    )
+    .map_err(|error| {
+        tracing::warn!(%error, "explicit config refresh guidance layer reconstruction rejected");
+        ExplicitConfigRefreshError::Internal
+    })?;
     let snapshot = SessionConfigSnapshot::with_hooks(0, providers, extended, hooks)
         .with_trust_revision(trust_revision)
         .with_retained_provider_model_sources(&workspace_layer)
         .map_err(|error| {
             tracing::warn!(%error, "explicit config refresh provider provenance rejected");
             ExplicitConfigRefreshError::Internal
-        })?;
+        })?
+        .with_guidance_doc_layers(guidance_layers);
     let (respond_to, response_rx) = oneshot::channel();
     let deadline = tokio::time::Instant::now() + CONFIG_REPLACEMENT_DEADLINE;
     let delivered = tokio::time::timeout_at(
@@ -521,11 +529,31 @@ async fn refresh_session_config_once(
         }));
     }
 
+    let guidance_layers =
+        match crate::config::extended::guidance_proposal_doc_layers_from_snapshot_chain(
+            &workspace_layer,
+        ) {
+            Ok(layers) => layers,
+            Err(error) => {
+                let notice = format!(
+                    "{CONFIG_REFRESH_FAILURE_PREFIX}: guidance layer reconstruction is invalid"
+                );
+                tracing::warn!(%error, "background config refresh guidance layer reconstruction rejected");
+                if failure_deduper
+                    .as_deref_mut()
+                    .map(|deduper| deduper.should_emit(&notice))
+                    .unwrap_or(true)
+                {
+                    handle.broadcast_notice(notice);
+                }
+                return Ok(None);
+            }
+        };
     let snapshot = match SessionConfigSnapshot::with_hooks(0, providers, extended, hooks)
         .with_trust_revision(trust_revision)
         .with_retained_provider_model_sources(&workspace_layer)
     {
-        Ok(snapshot) => snapshot,
+        Ok(snapshot) => snapshot.with_guidance_doc_layers(guidance_layers),
         Err(error) => {
             let notice =
                 format!("{CONFIG_REFRESH_FAILURE_PREFIX}: provider source provenance is invalid");

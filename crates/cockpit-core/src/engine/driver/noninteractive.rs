@@ -2571,6 +2571,7 @@ impl Driver {
                 self.redact.clone(),
                 child_cwd.resolved,
                 self.config.clone(),
+                self.guidance_compiler.clone(),
                 self.interrupts.clone(),
                 cancel,
                 self.approver.clone(),
@@ -3155,6 +3156,7 @@ impl Driver {
                         self.redact.clone(),
                         child_cwd.resolved.clone(),
                         self.config.clone(),
+                        self.guidance_compiler.clone(),
                         self.interrupts.clone(),
                         cancel,
                         self.approver.clone(),
@@ -5653,6 +5655,7 @@ impl Driver {
                         driver.redact.clone(),
                         child_cwd.resolved.clone(),
                         pinned.clone(),
+                        driver.guidance_compiler.clone(),
                         driver.interrupts.clone(),
                         child_cancel.clone(),
                         driver.approver.clone(),
@@ -6391,6 +6394,7 @@ pub(crate) async fn run_noninteractive(
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -6415,6 +6419,7 @@ pub(crate) async fn run_noninteractive(
         redact,
         cwd,
         config,
+        guidance_compiler,
         interrupts,
         cancel,
         approver,
@@ -7325,6 +7330,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
     parent_cwd: &std::path::Path,
     session: &Session,
     config: &crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<&crate::computer::guidance::service::GuidanceCompiler>,
     local_installations: &crate::agents::LocalInstallationResolver,
 ) -> Result<PreparedRecoveredRecursiveExecutor> {
     let launch: serde_json::Value = serde_json::from_str(descriptor.launch.as_json())
@@ -7403,7 +7409,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
         &child_agent,
         &crate::engine::builtin::SpawnArgs {
             compiled_guidance: vec![],
-            guidance_compiler: None,
+            guidance_compiler: guidance_compiler.cloned(),
             model: parent_agent.model.clone(),
             params: crate::engine::model::ModelParams {
                 prompt_cache_key: None,
@@ -7457,6 +7463,7 @@ async fn preflight_pending_recursive_recovery(
     pending: &PendingRecursiveContinuation,
     session: &Session,
     config: &crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<&crate::computer::guidance::service::GuidanceCompiler>,
     local_installations: &crate::agents::LocalInstallationResolver,
 ) -> Result<()> {
     for child_agent_instance_id in recursive_recovery_execution_order(pending)? {
@@ -7490,6 +7497,7 @@ async fn preflight_pending_recursive_recovery(
             parent_cwd,
             session,
             config,
+            guidance_compiler,
             local_installations,
         )
         .await?;
@@ -7501,6 +7509,7 @@ async fn preflight_pending_recursive_recovery(
                 nested,
                 session,
                 config,
+                guidance_compiler,
                 local_installations,
             ))
             .await?;
@@ -7521,6 +7530,7 @@ async fn run_recovered_recursive_noninteractive_executor(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -7547,6 +7557,7 @@ async fn run_recovered_recursive_noninteractive_executor(
         parent_cwd,
         &session,
         &config,
+        guidance_compiler.as_ref(),
         &local_installations,
     )
     .await?;
@@ -7562,6 +7573,7 @@ async fn run_recovered_recursive_noninteractive_executor(
         redact,
         child_cwd,
         config,
+        guidance_compiler,
         interrupts,
         cancel,
         approver,
@@ -7613,6 +7625,7 @@ async fn recover_pending_recursive_continuation(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -7751,6 +7764,7 @@ async fn recover_pending_recursive_continuation(
         let local_installations = local_installations.clone();
         let tandem = tandem.clone();
         let event_tx = event_tx.clone();
+        let guidance_compiler = guidance_compiler.clone();
         let endpoint_collector = endpoint_collector.clone();
         let activation_gate = activation_gate.clone();
         let start_gate = NoninteractiveStartGate {
@@ -7767,6 +7781,7 @@ async fn recover_pending_recursive_continuation(
                 locks,
                 redact,
                 config,
+                guidance_compiler,
                 interrupts,
                 cancel,
                 approver,
@@ -8103,6 +8118,7 @@ pub(crate) async fn run_noninteractive_resumable(
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -8210,6 +8226,7 @@ pub(crate) async fn run_noninteractive_resumable(
             pending,
             &session,
             &config,
+            guidance_compiler.as_ref(),
             &local_installations,
         ))
         .await
@@ -8387,6 +8404,7 @@ pub(crate) async fn run_noninteractive_resumable(
             locks.clone(),
             redact.clone(),
             config.clone(),
+            guidance_compiler.clone(),
             interrupts.clone(),
             cancel.clone(),
             approver.clone(),
@@ -9484,7 +9502,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 let recovery_granted_tools = granted_tools.clone();
                 let child_args = crate::engine::builtin::SpawnArgs {
                     compiled_guidance: vec![],
-                    guidance_compiler: None,
+                    guidance_compiler: guidance_compiler.clone(),
                     model: agent.model.clone(),
                     params: crate::engine::model::ModelParams {
                         prompt_cache_key: None,
@@ -9679,6 +9697,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         redact.clone(),
                         child_cwd,
                         config.clone(),
+                        guidance_compiler.clone(),
                         interrupts.clone(),
                         cancel.clone(),
                         approver.clone(),
@@ -9841,7 +9860,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     };
                     let child_args = crate::engine::builtin::SpawnArgs {
                         compiled_guidance: vec![],
-                        guidance_compiler: None,
+                        guidance_compiler: guidance_compiler.clone(),
                         model: agent.model.clone(),
                         params: crate::engine::model::ModelParams {
                             prompt_cache_key: None,
@@ -10232,6 +10251,7 @@ pub(crate) async fn run_noninteractive_resumable(
                             redact,
                             child_cwd,
                             config,
+                            guidance_compiler,
                             interrupts,
                             cancel,
                             approver,

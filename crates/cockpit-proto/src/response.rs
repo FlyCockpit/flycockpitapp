@@ -978,6 +978,7 @@ pub enum Response {
         provider: Option<bool>,
         model: Option<bool>,
         enabled: bool,
+        has_disable_veto: bool,
         config_generation: u64,
     },
     GuidanceProposalReviewed {

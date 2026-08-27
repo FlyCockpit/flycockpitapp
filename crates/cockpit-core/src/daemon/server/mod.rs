@@ -4351,7 +4351,7 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
                 if let Err(error) = service.flush_audit_outbox(now_ms).await {
                     tracing::warn!(%error, "guidance proposal audit outbox delivery deferred");
                 }
-                let candidates = service.expired_candidates(now_ms / 1000);
+                let candidates = service.expired_candidates(now_ms);
                 for candidate in candidates {
                     if let Err(error) = service.expire_candidate(&candidate, now_ms).await {
                         tracing::warn!(%error, "guidance proposal expiry delivery deferred");

@@ -763,9 +763,6 @@ mod tests {
     fn hex16(n: u8) -> String {
         format!("{n:016x}{n:016x}")
     }
-    fn hex32(n: u8) -> String {
-        format!("{n:032x}{n:032x}")
-    }
 
     fn insert<'a>(
         proposal: &'a str,
@@ -776,9 +773,9 @@ mod tests {
             proposal_id: proposal,
             session_id: session,
             delegation_id: delegation,
-            canonical_project_digest: &hex32(1),
-            provider_digest: &hex32(2),
-            model_digest: &hex32(3),
+            canonical_project_digest: "0000000000000000000000000000000000000000000000000000000000000001",
+            provider_digest: "0000000000000000000000000000000000000000000000000000000000000002",
+            model_digest: "0000000000000000000000000000000000000000000000000000000000000003",
             config_generation: 7,
             rule_kind_bits: 0b000001,
             created_at_unix_ms: 1000,

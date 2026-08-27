@@ -1953,7 +1953,11 @@ pub struct PendingGuidanceProposal {
     pub proposal_id: Uuid,
     pub rules: Vec<[u8; 3]>,
     pub rationale: Option<String>,
-    pub expires_at_unix_secs: i64,
+    pub expires_at_unix_ms: i64,
+    /// The daemon has confirmed that the proposal's current scope still
+    /// permits machine-local persistent acceptance. The server remains the
+    /// authority at review time; clients use this only to hide the action.
+    pub persistent_acceptance_allowed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

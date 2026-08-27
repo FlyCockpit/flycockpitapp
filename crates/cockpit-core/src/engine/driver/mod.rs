@@ -1752,6 +1752,7 @@ impl Driver {
         &mut self,
         compiler: crate::computer::guidance::service::GuidanceCompiler,
     ) {
+        self.schedule.set_guidance_compiler(compiler.clone());
         self.guidance_compiler = Some(compiler);
     }
 
@@ -1800,6 +1801,7 @@ impl Driver {
                         &pinned.providers,
                         pinned.guidance_global_layer,
                         pinned.guidance_project_layer,
+                        pinned.generation,
                         &coordinator.provider_id().0,
                         &coordinator.model_id().0,
                         self.cwd.as_os_str().as_encoded_bytes(),
@@ -1979,8 +1981,7 @@ impl Driver {
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
-            guidance_proposals: None,
-            guidance_compiler: None,
+            guidance_compiler: self.guidance_compiler.clone(),
             agent: self.stack[0].agent.clone(),
             write_scope: self.write_scope.clone(),
         };
@@ -2318,7 +2319,6 @@ impl Driver {
             redact: redact.clone(),
             cwd: cwd.clone(),
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
-            guidance_proposals: None,
             guidance_compiler: None,
             agent: root.clone(),
             // Installed later by `set_write_scope_source`; the authority's copy

@@ -107,6 +107,68 @@ const WORKSPACE_TRUST_STOP_ATTEMPTS: usize = WORKSPACE_TRUST_STOP_BACKOFF.len() 
 pub(crate) static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// Persistent guidance acceptance is valid only for the attached session's
+/// current project/provider/model scope and exact config generation. The TUI
+/// receives this as a display capability, but review rechecks it immediately
+/// before the durable transition so a stale client cannot widen authority.
+fn guidance_scope_currently_enabled(
+    snapshot: &crate::daemon::session_worker::SessionConfigSnapshot,
+    session_id: uuid::Uuid,
+    project_root: &std::path::Path,
+    scope: &crate::computer::guidance::lifecycle::ProposalScopeKey,
+) -> bool {
+    if !guidance_scope_matches_attached_session(session_id, project_root, scope) {
+        return false;
+    }
+
+    snapshot
+        .providers
+        .providers
+        .iter()
+        .any(|(provider_id, provider)| {
+            crate::computer::guidance::service::provider_digest(provider_id)
+                == scope.provider_digest
+                && provider.models.iter().any(|(model_id, _)| {
+                    crate::computer::guidance::service::model_digest(provider_id, model_id)
+                    == scope.model_digest
+                    && crate::computer::guidance::enablement::resolve_guidance_enablement_pinned(
+                        &snapshot.providers,
+                        snapshot.guidance_global_layer,
+                        snapshot.guidance_project_layer,
+                        provider_id,
+                        model_id,
+                    )
+                    .enabled
+                })
+        })
+}
+
+/// A client may see or review only proposals for its attached session and
+/// canonical project. Acceptance adds a current enablement/generation check,
+/// but a stale proposal remains rejectable by its owning session.
+fn guidance_scope_matches_attached_session(
+    session_id: uuid::Uuid,
+    project_root: &std::path::Path,
+    scope: &crate::computer::guidance::lifecycle::ProposalScopeKey,
+) -> bool {
+    scope.session_id == *session_id.as_bytes()
+        && scope.project_digest
+            == crate::computer::guidance::service::canonical_project_digest(
+                project_root.as_os_str().as_encoded_bytes(),
+            )
+}
+
+fn guidance_scope_current_and_persistable(
+    snapshot: &crate::daemon::session_worker::SessionConfigSnapshot,
+    session_id: uuid::Uuid,
+    project_root: &std::path::Path,
+    scope: &crate::computer::guidance::lifecycle::ProposalScopeKey,
+    proposal_config_generation: u64,
+) -> bool {
+    snapshot.generation == proposal_config_generation
+        && guidance_scope_currently_enabled(snapshot, session_id, project_root, scope)
+}
+
 #[derive(Clone)]
 struct ProviderEditCapability {
     owner: String,
@@ -14338,10 +14400,43 @@ async fn handle_serialized_request_impl(
         }
 
         Request::ListGuidanceProposals => {
+            let attached = state
+                .attached
+                .as_ref()
+                .ok_or_else(|| invalid("session attachment required"))?;
+            let snapshot = attached.handle.config_snapshot();
             let service = ctx.guidance_proposals.lock().await;
-            Ok(Response::GuidanceProposals {
-                proposals: service.pending_proposals(),
-            })
+            let mut proposals = service.pending_proposals(
+                |scope| {
+                    guidance_scope_matches_attached_session(
+                        attached.handle.session_id,
+                        &attached.handle.project_root,
+                        scope,
+                    )
+                },
+                |_| false,
+            );
+            for proposal in &mut proposals {
+                let Some(scope) = service.proposal_scope_by_id(*proposal.proposal_id.as_bytes())
+                else {
+                    continue;
+                };
+                let Some(config_generation) = service
+                    .proposal_config_generation(*proposal.proposal_id.as_bytes())
+                    .await
+                    .map_err(internal)?
+                else {
+                    continue;
+                };
+                proposal.persistent_acceptance_allowed = guidance_scope_current_and_persistable(
+                    &snapshot,
+                    attached.handle.session_id,
+                    &attached.handle.project_root,
+                    &scope,
+                    config_generation,
+                );
+            }
+            Ok(Response::GuidanceProposals { proposals })
         }
         Request::GetGuidanceEnablementTrace => {
             let attached = state
@@ -14375,6 +14470,7 @@ async fn handle_serialized_request_impl(
                     .and_then(|value| value.models.get(model_id))
                     .and_then(|value| value.allow_computer_guidance_proposals),
                 enabled: resolution.enabled,
+                has_disable_veto: resolution.has_disable_veto,
                 config_generation: snapshot.generation,
             })
         }
@@ -14383,6 +14479,59 @@ async fn handle_serialized_request_impl(
             decision,
         } => {
             let mut service = ctx.guidance_proposals.lock().await;
+            let attached = state
+                .attached
+                .as_ref()
+                .ok_or_else(|| invalid("session attachment required"))?;
+            let scope = service
+                .proposal_scope_by_id(*proposal_id.as_bytes())
+                .ok_or_else(|| invalid("guidance proposal is no longer pending"))?;
+            if !guidance_scope_matches_attached_session(
+                attached.handle.session_id,
+                &attached.handle.project_root,
+                &scope,
+            ) {
+                return Err(invalid(
+                    "guidance proposal is outside the attached session/project scope",
+                ));
+            }
+            if matches!(
+                decision,
+                cockpit_proto::GuidanceProposalDecision::AcceptSession
+                    | cockpit_proto::GuidanceProposalDecision::AcceptPersistent
+            ) {
+                let snapshot = attached.handle.config_snapshot();
+                let config_generation = service
+                    .proposal_config_generation(*proposal_id.as_bytes())
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| invalid("guidance proposal receipt is missing"))?;
+                if !guidance_scope_current_and_persistable(
+                    &snapshot,
+                    attached.handle.session_id,
+                    &attached.handle.project_root,
+                    &scope,
+                    config_generation,
+                ) {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    service
+                        .invalidate(
+                            |candidate| {
+                                candidate.session_id == scope.session_id
+                                    && candidate.delegation_id == scope.delegation_id
+                                    && candidate.project_digest == scope.project_digest
+                                    && candidate.provider_digest == scope.provider_digest
+                                    && candidate.model_digest == scope.model_digest
+                            },
+                            now,
+                        )
+                        .await
+                        .map_err(internal)?;
+                    return Err(invalid(
+                        "guidance proposal expired because its config scope changed or was disabled",
+                    ));
+                }
+            }
             let installed = service
                 .review_by_id(
                     *proposal_id.as_bytes(),
@@ -16077,7 +16226,7 @@ async fn handle_concurrent_request_impl(
         Request::ListGuidanceProposals => {
             let service = ctx.guidance_proposals.lock().await;
             Ok(Response::GuidanceProposals {
-                proposals: service.pending_proposals(),
+                proposals: service.pending_proposals(|_| false, |_| false),
             })
         }
         Request::GetGuidanceEnablementTrace => Err(invalid(
@@ -24926,6 +25075,7 @@ async fn docs_ask_response(
     let resolver = ctx.redaction_key_resolver().map_err(internal)?;
     let vault = ctx.secret_vault.clone();
     let db = ctx.db.clone();
+    let guidance_proposals = ctx.guidance_proposals.clone();
 
     // Async, owner-scoped pre-resolution BEFORE spawn_blocking: command
     // resolution is async subprocess work and cannot run on the sync docs build
@@ -24951,6 +25101,7 @@ async fn docs_ask_response(
             env_snapshot,
             resolver,
             vault,
+            guidance_proposals,
             command_secret_cache,
             package,
             question,
@@ -24975,6 +25126,9 @@ async fn run_docs_ask_pipeline(
     env_snapshot: EnvSnapshot,
     resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     vault: Arc<crate::secure_key::SecretVault>,
+    guidance_proposals: Arc<
+        tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+    >,
     command_secret_cache: Arc<crate::secret_command::CommandSecretCache>,
     package: Option<String>,
     question: String,
@@ -25030,9 +25184,20 @@ async fn run_docs_ask_pipeline(
         ),
     );
     let session = Arc::new(session);
+    // DocsAsk owns a fresh daemon session rather than an attached worker, but
+    // accepted persistent guidance is still scoped to this canonical project
+    // and the model selected below. The compiler also permits future
+    // session-scoped guidance for this exact throwaway session without ever
+    // borrowing a different project's accepted rules.
+    let guidance_compiler = guidance_proposals.lock().await.compiler(
+        *session.id.as_bytes(),
+        crate::computer::guidance::service::canonical_project_digest(
+            cwd.as_os_str().as_encoded_bytes(),
+        ),
+    );
     let spawn_args = crate::engine::builtin::SpawnArgs {
         compiled_guidance: vec![],
-        guidance_compiler: None,
+        guidance_compiler: Some(guidance_compiler),
         model,
         params: crate::engine::model::ModelParams {
             additional_params: reasoning_params,

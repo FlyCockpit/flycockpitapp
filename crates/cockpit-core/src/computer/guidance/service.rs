@@ -373,17 +373,22 @@ pub struct GuidanceProposalService {
 pub struct GuidanceCompiler {
     accepted: Arc<AcceptedRulesStore>,
     session_id: [u8; 16],
+    canonical_project_digest: [u8; 32],
 }
 
 impl GuidanceCompiler {
-    pub fn compile(&self, cwd: &std::path::Path, provider_id: &str, model_id: &str) -> Vec<u8> {
-        let project = canonical_project_digest(cwd.as_os_str().as_encoded_bytes());
+    pub fn compile(&self, _cwd: &std::path::Path, provider_id: &str, model_id: &str) -> Vec<u8> {
         let provider = provider_digest(provider_id);
         let model = model_digest(provider_id, model_id);
-        let session = self
-            .accepted
-            .session_rules(&self.session_id, &project, &provider, &model);
-        let persistent = self.accepted.persistent_rules(&project, &provider, &model);
+        let session = self.accepted.session_rules(
+            &self.session_id,
+            &self.canonical_project_digest,
+            &provider,
+            &model,
+        );
+        let persistent =
+            self.accepted
+                .persistent_rules(&self.canonical_project_digest, &provider, &model);
         super::compose_and_compile(&session, &persistent)
     }
 }
@@ -408,10 +413,15 @@ pub struct GuidanceCreateSnapshot {
 }
 
 impl GuidanceProposalService {
-    pub fn pending_proposals(&self) -> Vec<cockpit_proto::PendingGuidanceProposal> {
+    pub fn pending_proposals(
+        &self,
+        include_scope: impl Fn(&ProposalScopeKey) -> bool,
+        persistent_acceptance_allowed: impl Fn(&ProposalScopeKey) -> bool,
+    ) -> Vec<cockpit_proto::PendingGuidanceProposal> {
         self.pending
             .proposals()
-            .map(|(_, proposal)| cockpit_proto::PendingGuidanceProposal {
+            .filter(|(scope, _)| include_scope(scope))
+            .map(|(scope, proposal)| cockpit_proto::PendingGuidanceProposal {
                 proposal_id: uuid::Uuid::from_bytes(proposal.proposal_id.0),
                 rules: proposal
                     .rules
@@ -419,9 +429,34 @@ impl GuidanceProposalService {
                     .map(ComputerGuidanceRuleV1::encode)
                     .collect(),
                 rationale: proposal.rationale.clone(),
-                expires_at_unix_secs: proposal.expires_at,
+                expires_at_unix_ms: proposal.expires_at,
+                persistent_acceptance_allowed: persistent_acceptance_allowed(scope),
             })
             .collect()
+    }
+
+    pub fn proposal_scope_by_id(&self, proposal_id: [u8; 16]) -> Option<ProposalScopeKey> {
+        self.pending
+            .proposals()
+            .find(|(_, proposal)| proposal.proposal_id.0 == proposal_id)
+            .map(|(scope, _)| scope.clone())
+    }
+
+    pub async fn proposal_config_generation(
+        &self,
+        proposal_id: [u8; 16],
+    ) -> Result<Option<u64>, TransitionProposalError> {
+        let receipt = self
+            .db
+            .guidance_proposal_receipt(&hex16(&proposal_id))
+            .await
+            .map_err(|error| TransitionProposalError::Storage(error.to_string()))?;
+        receipt
+            .map(|receipt| {
+                u64::try_from(receipt.config_generation)
+                    .map_err(|error| TransitionProposalError::Storage(error.to_string()))
+            })
+            .transpose()
     }
 
     pub async fn review_by_id(
@@ -471,10 +506,15 @@ impl GuidanceProposalService {
         }
     }
 
-    pub fn compiler(&self, session_id: [u8; 16]) -> GuidanceCompiler {
+    pub fn compiler(
+        &self,
+        session_id: [u8; 16],
+        canonical_project_digest: [u8; 32],
+    ) -> GuidanceCompiler {
         GuidanceCompiler {
             accepted: self.accepted.clone(),
             session_id,
+            canonical_project_digest,
         }
     }
 
@@ -588,6 +628,7 @@ impl GuidanceProposalService {
         providers: &crate::config::providers::ProvidersConfig,
         global: Option<bool>,
         project: Option<bool>,
+        config_generation: u64,
         provider_id: &str,
         model_id: &str,
         project_identity: &[u8],
@@ -601,7 +642,7 @@ impl GuidanceProposalService {
                     provider_id,
                     model_id,
                 ),
-                config_generation: providers.resolution_generation.max(1),
+                config_generation,
             },
             project_digest: canonical_project_digest(project_identity),
             provider_digest: provider_digest(provider_id),
@@ -622,8 +663,8 @@ impl GuidanceProposalService {
     /// 4. Insert the content-free receipt + increment counters (transactional,
     ///    cap-enforced). On any failure release the reservation and return.
     /// 5. Append `guidance_proposal_created` via the audit writer (fail-closed
-    ///    on unavailable writer: the receipt is CASed to `expired` and the
-    ///    reservation/memory released — no silent undurable proposal).
+    ///    on append failure: atomically delete the new receipt, its outbox row,
+    ///    and both counter increments; then release the memory reservation).
     /// 6. Install typed values + rationale into memory.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_proposal(
@@ -719,7 +760,26 @@ impl GuidanceProposalService {
             disposition: None,
             scope: None,
         };
-        if self.audit.delivers_immediately() && self.audit.append(&audit_event).is_ok() {
+        if self.audit.delivers_immediately() {
+            if let Err(audit_error) = self.audit.append(&audit_event) {
+                let proposal_id = hex16(&proposal_id);
+                let rollback = self
+                    .db
+                    .rollback_created_guidance_proposal_receipt(&proposal_id)
+                    .await;
+                self.pending.release(&key, pid);
+                return match rollback {
+                    Ok(true) => Err(CreateProposalError::AuditUnavailable(
+                        audit_error.to_string(),
+                    )),
+                    Ok(false) => Err(CreateProposalError::Storage(format!(
+                        "guidance audit append failed and created receipt could not be rolled back: {audit_error}"
+                    ))),
+                    Err(rollback_error) => Err(CreateProposalError::Storage(format!(
+                        "guidance audit append failed and rollback failed: {audit_error}; {rollback_error}"
+                    ))),
+                };
+            }
             if let Err(error) = self
                 .db
                 .mark_guidance_proposal_audit_delivered(
@@ -1045,11 +1105,8 @@ impl GuidanceProposalService {
     /// Enumerate expired pending proposals (injected clock) without mutating.
     /// The caller (coordinator tick) commits each durable expiry CAS + audit,
     /// then [`Self::remove_expired`] drops memory (AC5).
-    pub fn expired_candidates(
-        &self,
-        now_unix_secs: i64,
-    ) -> Vec<super::lifecycle::ProposalCandidate> {
-        self.pending.expired_candidates(now_unix_secs)
+    pub fn expired_candidates(&self, now_unix_ms: i64) -> Vec<super::lifecycle::ProposalCandidate> {
+        self.pending.expired_candidates(now_unix_ms)
     }
 
     /// Commit the durable expiry CAS + audit for one candidate, then drop memory.
@@ -1303,6 +1360,14 @@ mod tests {
         }
     }
 
+    struct FailingAuditWriter;
+
+    impl GuidanceAuditWriter for FailingAuditWriter {
+        fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+            anyhow::bail!("audit transport failed")
+        }
+    }
+
     fn fresh_service() -> GuidanceProposalService {
         GuidanceProposalService::with_audit_writer(
             Arc::new(Db::open_in_memory().unwrap()),
@@ -1339,7 +1404,7 @@ mod tests {
         model: &str,
         project: &[u8],
     ) -> GuidanceCreateSnapshot {
-        svc.resolve_create_snapshot(providers, None, None, "p", model, project)
+        svc.resolve_create_snapshot(providers, None, None, 1, "p", model, project)
     }
 
     #[tokio::test]
@@ -1374,6 +1439,41 @@ mod tests {
         assert_eq!(svc.pending_store().len(), 1);
         assert_eq!(svc.session_counter(&id16(1)).await.unwrap(), 1);
         assert_eq!(svc.delegation_counter(&id16(2)).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_rolls_back_receipt_counters_outbox_and_reservation_when_audit_append_fails() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let mut svc =
+            GuidanceProposalService::with_audit_writer(db.clone(), Arc::new(FailingAuditWriter));
+        let err = svc
+            .create_proposal(
+                snapshot(&svc, &providers_enabled(), "m", b"project"),
+                id16(1),
+                id16(2),
+                id16(9),
+                vec![rule()],
+                None,
+                1000,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CreateProposalError::AuditUnavailable(_)));
+        assert!(svc.pending_store().is_empty());
+        assert_eq!(svc.session_counter(&id16(1)).await.unwrap(), 0);
+        assert_eq!(svc.delegation_counter(&id16(2)).await.unwrap(), 0);
+        assert!(
+            db.guidance_proposal_receipt(&hex16(&id16(9)))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.pending_guidance_proposal_audits()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1420,8 +1520,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // created_at_secs = 0; expiry at 600s.
-        let due = svc.expired_candidates(600);
+        // Creation and deadline are both Unix milliseconds.
+        let due = svc.expired_candidates(600_000);
         assert_eq!(due.len(), 1);
         svc.expire_candidate(&due[0], 600_000).await.unwrap();
         assert!(svc.pending_store().is_empty());
@@ -1499,6 +1599,31 @@ mod tests {
         let compiled_str = std::str::from_utf8(&compiled).unwrap();
         assert!(compiled_str.contains("two"));
         assert!(!compiled_str.contains("five"));
+    }
+
+    #[test]
+    fn compiler_keeps_the_session_project_scope_when_child_cwd_changes() {
+        let svc = fresh_service();
+        let session_id = id16(1);
+        let project = canonical_project_digest(b"session-project");
+        let provider = provider_digest("p");
+        let model = model_digest("p", "m");
+        svc.accepted.install_session(
+            SessionRuleKey {
+                session_id,
+                project_digest: project,
+                provider_digest: provider,
+                model_digest: model,
+            },
+            vec![rule()],
+        );
+
+        let compiled = svc.compiler(session_id, project).compile(
+            std::path::Path::new("session-project/child"),
+            "p",
+            "m",
+        );
+        assert!(!compiled.is_empty());
     }
 
     #[tokio::test]

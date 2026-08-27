@@ -780,5 +780,44 @@
     "kind": "res",
     "response": "session_setup_snapshot",
     "v": 20
+  },
+  "guidance_proposals": {
+    "data": {
+      "proposals": [
+        {
+          "proposalId": "22222222-2222-4222-8222-222222222222",
+          "rules": [[1, 1, 1]],
+          "rationale": "fixture rationale",
+          "expiresAtUnixMs": 1700000600123,
+          "persistentAcceptanceAllowed": true
+        }
+      ]
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "guidance_proposals",
+    "v": 20
+  },
+  "guidance_enablement_trace": {
+    "data": {
+      "global": false,
+      "project": true,
+      "provider": null,
+      "model": null,
+      "enabled": false,
+      "has_disable_veto": true,
+      "config_generation": 7
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "guidance_enablement_trace",
+    "v": 20
+  },
+  "guidance_proposal_reviewed": {
+    "data": { "installed_rules": [[1, 1, 1]] },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "guidance_proposal_reviewed",
+    "v": 20
   }
 }

@@ -210,6 +210,9 @@ pub struct ScheduleContext {
     /// driver so loop/swarm iterations read the same snapshot as the
     /// foreground turn (`engine-config-snapshot-adoption`).
     pub config: crate::daemon::session_worker::SessionConfigHandle,
+    /// The session-bound compiler must travel with every fresh scheduled
+    /// context so child cwd changes cannot select a different project scope.
+    pub guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     /// The main agent — ephemeral-fork loop iterations run on the same
     /// agent/model/provider config (GOALS §22).
     pub agent: Arc<Agent>,
@@ -370,6 +373,15 @@ pub struct ScheduleAuthority {
 }
 
 impl ScheduleAuthority {
+    /// Install the session-bound compiler into the context handed to every
+    /// newly spawned scheduled child.
+    pub fn set_guidance_compiler(
+        &mut self,
+        compiler: crate::computer::guidance::service::GuidanceCompiler,
+    ) {
+        self.ctx.guidance_compiler = Some(compiler);
+    }
+
     /// Install the durable write-scope cell into the context this authority
     /// hands to every spawned job.
     pub fn set_write_scope_source(&mut self, write_scope: crate::write_scope::WriteScopeSource) {
@@ -1082,6 +1094,7 @@ mod tests {
             cwd: root,
             write_scope: None,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            guidance_compiler: None,
             agent,
         };
         let authority = ScheduleAuthority::new(event_tx, cmd_tx, turn_tx, ctx, max);

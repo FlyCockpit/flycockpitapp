@@ -147,6 +147,7 @@ pub async fn run(
         redact.clone(),
         spawn_args.cwd.clone(),
         config.clone(),
+        spawn_args.guidance_compiler.clone(),
         interrupts.clone(),
         cancel.clone(),
         // The docs pipeline has no human on the other end (detached hub)
@@ -204,6 +205,7 @@ pub async fn run(
         redact,
         resolved.path,
         config,
+        answerer_args.guidance_compiler.clone(),
         interrupts,
         cancel,
         // Docs answerer: hard-deny `confine()` path, no human — no

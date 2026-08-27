@@ -3552,17 +3552,35 @@ impl SettingsCx {
                         provider,
                         model,
                         enabled,
+                        has_disable_veto,
                         config_generation,
-                    }) => vec![
-                        format!(
-                            "Computer guidance proposals: {} (generation {config_generation})",
-                            if enabled { "enabled" } else { "disabled" }
+                    }) => crate::tui::guidance_trace::render_trace_lines(
+                        &crate::tui::guidance_trace::format_enablement_trace(
+                            &cockpit_core::computer::guidance::EnablementResolution {
+                                enabled,
+                                layers: cockpit_core::computer::guidance::EnablementLayers {
+                                    global:
+                                        cockpit_core::computer::guidance::EnablementValue::from_bool(
+                                            global,
+                                        ),
+                                    project:
+                                        cockpit_core::computer::guidance::EnablementValue::from_bool(
+                                            project,
+                                        ),
+                                    provider:
+                                        cockpit_core::computer::guidance::EnablementValue::from_bool(
+                                            provider,
+                                        ),
+                                    model:
+                                        cockpit_core::computer::guidance::EnablementValue::from_bool(
+                                            model,
+                                        ),
+                                },
+                                has_disable_veto,
+                            },
+                            config_generation,
                         ),
-                        format!("global: {global:?}"),
-                        format!("project: {project:?}"),
-                        format!("provider: {provider:?}"),
-                        format!("model: {model:?}"),
-                    ],
+                    ),
                     Ok(other) => vec![format!("Guidance trace unavailable: {other:?}")],
                     Err(error) => vec![format!("Guidance trace unavailable: {error}")],
                 };
@@ -6548,7 +6566,6 @@ impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
         let mut settings = Self::open_with_config(config_path, ProvidersConfig::default());
         settings.cx.queue_provider_catalog(None);
-        settings.cx.queue_guidance_trace();
         settings.cx.queue_extended_load();
         settings.cx.queue_guidance_trace();
         settings

@@ -348,6 +348,7 @@ struct WorkspaceConfigLayerAuthority {
     config_leaf: OsString,
     effective_default_journal_leaf: OsString,
     effective_default_backup_leaf: OsString,
+    config_dir_kind: Option<crate::config::dirs::ConfigDirKind>,
 }
 
 /// Non-serializable authority for one captured project/explicit hook source.
@@ -1030,6 +1031,7 @@ struct RetainedDefaultWriteTargetAuthority {
     effective_default_backup_leaf: OsString,
     canonical_config_path: PathBuf,
     scope: cockpit_config::config::effective_default::EffectiveDefaultScope,
+    config_dir_kind: Option<crate::config::dirs::ConfigDirKind>,
 }
 
 fn capture_retained_default_layer(
@@ -1059,15 +1061,22 @@ fn capture_retained_default_layer(
             .file_name()
             .context("effective-default backup has no file name")?
             .to_os_string();
-    let scope = if exclusive_config_override {
-        cockpit_config::config::effective_default::EffectiveDefaultScope::ExplicitOverride
+    let config_dir_kind = if exclusive_config_override {
+        None
     } else {
         crate::config::dirs::discover_config_dirs(project_root)
             .into_iter()
             .find(|directory| directory.path.join(crate::config::dirs::CONFIG_FILE) == config_path)
-            .map(|directory| {
+            .map(|directory| directory.kind)
+    };
+    let scope = if exclusive_config_override {
+        cockpit_config::config::effective_default::EffectiveDefaultScope::ExplicitOverride
+    } else {
+        config_dir_kind
+            .as_ref()
+            .map(|kind| {
                 cockpit_config::config::effective_default::EffectiveDefaultScope::from_dir_kind(
-                    &directory.kind,
+                    kind,
                 )
             })
             // A custom nonexclusive source can only arise from a test/config
@@ -1081,6 +1090,7 @@ fn capture_retained_default_layer(
         effective_default_backup_leaf,
         canonical_config_path,
         scope,
+        config_dir_kind,
     })
 }
 
@@ -1173,6 +1183,11 @@ impl WorkerWorkspaceConfigAuthority {
                 config_leaf,
                 effective_default_journal_leaf,
                 effective_default_backup_leaf,
+                config_dir_kind: if exclusive_config_override {
+                    None
+                } else {
+                    Some(crate::config::dirs::ConfigDirKind::Project)
+                },
             });
         }
         let default_effective_layers = effective_paths
@@ -1218,7 +1233,8 @@ impl WorkerWorkspaceConfigAuthority {
                     &canonical_config_path,
                     Some(&layer.effective_default_journal_leaf),
                     Some(&layer.effective_default_backup_leaf),
-                )?,
+                )?
+                .with_origin(layer.config_dir_kind.clone()),
             );
         }
         Ok(
@@ -1787,10 +1803,14 @@ impl WorkerWorkspaceConfigAuthority {
                         &layer.canonical_config_path,
                         Some(&layer.effective_default_journal_leaf),
                         Some(&layer.effective_default_backup_leaf),
-                    )?,
+                    )?
+                    .with_origin(layer.config_dir_kind.clone()),
                 );
             } else {
-                snapshots.push(cockpit_config::config::empty_workspace_config_layer_snapshot());
+                snapshots.push(
+                    cockpit_config::config::empty_workspace_config_layer_snapshot()
+                        .with_origin(layer.config_dir_kind.clone()),
+                );
             }
         }
         self.verify_retained_config_source_chain_for_policy(policy)?;
@@ -1828,7 +1848,8 @@ impl WorkerWorkspaceConfigAuthority {
                 &layer.canonical_config_path,
                 Some(&layer.effective_default_journal_leaf),
                 Some(&layer.effective_default_backup_leaf),
-            )?;
+            )?
+            .with_origin(layer.config_dir_kind.clone());
             snapshots.push(snapshot);
         }
         self.verify_default_effective_layers()?;

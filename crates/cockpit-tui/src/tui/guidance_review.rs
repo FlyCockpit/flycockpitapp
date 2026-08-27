@@ -29,6 +29,7 @@ pub struct GuidanceReviewProposal {
     pub proposal_id: [u8; 16],
     pub rules: Vec<ComputerGuidanceRuleV1>,
     pub rationale: Option<String>,
+    pub persistent_acceptance_allowed: bool,
 }
 
 /// The three review actions (AC8). `AcceptPersistent` is offered only when
@@ -114,7 +115,14 @@ pub fn render_review_lines(proposal: &GuidanceReviewProposal) -> Vec<String> {
         None => out.push("Rationale: (none)".to_string()),
     }
     out.push(String::new());
-    out.push("Actions: [r] reject  [s] accept session  [p] accept persistent".to_string());
+    out.push(
+        if proposal.persistent_acceptance_allowed {
+            "Actions: [r] reject  [s] accept session  [p] accept persistent"
+        } else {
+            "Actions: [r] reject  [s] accept session"
+        }
+        .to_string(),
+    );
     out
 }
 
@@ -285,7 +293,13 @@ impl GuidanceReviewPane {
                 false
             }
             KeyCode::Char('p') => {
-                self.review(cockpit_proto::GuidanceProposalDecision::AcceptPersistent);
+                if self
+                    .proposals
+                    .get(self.selected)
+                    .is_some_and(|proposal| proposal.persistent_acceptance_allowed)
+                {
+                    self.review(cockpit_proto::GuidanceProposalDecision::AcceptPersistent);
+                }
                 false
             }
             _ => false,
@@ -344,6 +358,7 @@ impl DaemonGuidanceReviewDispatcher {
                         .map(|rule| ComputerGuidanceRuleV1::decode(rule))
                         .collect::<Result<Vec<_>, _>>()?,
                     rationale: proposal.rationale,
+                    persistent_acceptance_allowed: proposal.persistent_acceptance_allowed,
                 })
             })
             .collect()
@@ -385,6 +400,7 @@ mod tests {
                 ComputerGuidanceRuleV1::MaxReversibleBatch { max_actions: 2 },
             ],
             rationale: rationale.map(|s| s.to_string()),
+            persistent_acceptance_allowed: true,
         }
     }
 
@@ -403,6 +419,14 @@ mod tests {
         assert!(rendered.contains("https://y"));
         // No markdown rendering artifacts (e.g. rendered link text only).
         assert!(!rendered.contains("alert(1)\u{200b}"));
+    }
+
+    #[test]
+    fn persistent_acceptance_is_not_rendered_when_the_daemon_disallows_it() {
+        let mut pending = proposal(None);
+        pending.persistent_acceptance_allowed = false;
+        let lines = render_review_lines(&pending);
+        assert!(!lines.iter().any(|line| line.contains("accept persistent")));
     }
 
     #[test]

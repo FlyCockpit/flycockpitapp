@@ -1125,6 +1125,22 @@ pub enum DaemonCommand {
         #[arg(long)]
         no_sandbox: bool,
     },
+    /// Internal one-shot failed-call reader. Does not boot the daemon server.
+    #[command(hide = true)]
+    DiagnosticFailedCalls {
+        #[arg(long)]
+        since_epoch: i64,
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        include_recovered: bool,
+        #[arg(long)]
+        limit: u32,
+    },
 }
 
 #[derive(Debug, clap::Args)]

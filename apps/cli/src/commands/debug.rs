@@ -1,12 +1,21 @@
+use std::process::Stdio;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use tokio::io::AsyncReadExt as _;
+use tokio::process::{ChildStdout, Command};
 
 use crate::cli::{DebugCommand, FailedCallsArgs};
-use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{Request, Response};
+use crate::daemon::{DaemonStatus, discover};
 use crate::db::Db;
 use crate::session::project_id_for;
+use cockpit_client::DaemonClient;
+
+const DIAGNOSTIC_FAILED_CALLS_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_DIAGNOSTIC_FAILED_CALLS_BYTES: usize = 1024 * 1024;
 
 pub async fn run(cmd: DebugCommand) -> Result<()> {
     match cmd {
@@ -201,25 +210,54 @@ async fn failed_calls(args: FailedCallsArgs) -> Result<()> {
         .as_ref()
         .map(|project| project_id_for(project.as_path()));
     let since_epoch = Utc::now().timestamp() - (args.days as i64) * 86_400;
-
-    let daemon = ensure_persistent_daemon()
-        .await
-        .context("starting persistent daemon for failed tool calls")?;
-    let Response::FailedToolCalls { calls_json } = daemon
-        .client
-        .request(Request::ListFailedToolCalls {
+    let probe = discover().await;
+    let calls_json = match probe.status {
+        DaemonStatus::Running => {
+            match list_failed_calls_from_running_daemon(
+                &probe.paths.socket,
+                since_epoch,
+                args.tool.clone(),
+                args.model.clone(),
+                project_id.clone(),
+                args.include_recovered,
+                args.limit,
+            )
+            .await
+            {
+                Ok(calls_json) => calls_json,
+                Err(error) => diagnostic_failed_calls_worker(
+                    since_epoch,
+                    args.tool.as_deref(),
+                    args.model.as_deref(),
+                    project_id.as_deref(),
+                    args.include_recovered,
+                    args.limit,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "live daemon became unreachable ({error:#}); diagnostic worker also failed"
+                    )
+                })?,
+            }
+        }
+        DaemonStatus::NotRunning | DaemonStatus::Stale => diagnostic_failed_calls_worker(
             since_epoch,
-            tool: args.tool.clone(),
-            model: args.model.clone(),
-            project_id,
-            include_recovered: args.include_recovered,
-            limit: args.limit,
-        })
+            args.tool.as_deref(),
+            args.model.as_deref(),
+            project_id.as_deref(),
+            args.include_recovered,
+            args.limit,
+        )
         .await
-        .context("requesting failed tool calls from daemon")?
-        .map_err(|error| anyhow::anyhow!("daemon rejected failed tool call query: {error}"))?
-    else {
-        bail!("daemon returned unexpected response to failed tool call query");
+        .context("reading failed tool calls via diagnostic worker")?,
+        DaemonStatus::IncompatibleProtocol
+        | DaemonStatus::LivePidSocketUnreachable
+        | DaemonStatus::UnverifiedPid => {
+            bail!(
+                "cannot inspect failed calls while a shared daemon is live but unreachable; run `cockpit daemon status`"
+            )
+        }
     };
 
     if args.json {
@@ -237,6 +275,115 @@ async fn failed_calls(args: FailedCallsArgs) -> Result<()> {
         serde_json::from_str(&calls_json).context("parsing failed tool calls")?;
     print!("{}", format_failed_calls(&rows, args.days));
     Ok(())
+}
+
+async fn list_failed_calls_from_running_daemon(
+    socket: &std::path::Path,
+    since_epoch: i64,
+    tool: Option<String>,
+    model: Option<String>,
+    project_id: Option<String>,
+    include_recovered: bool,
+    limit: u32,
+) -> Result<String> {
+    let client = DaemonClient::connect(socket)
+        .await
+        .context("connecting to the running daemon")?;
+    let Response::FailedToolCalls { calls_json } = client
+        .request(Request::ListFailedToolCalls {
+            since_epoch,
+            tool,
+            model,
+            project_id,
+            include_recovered,
+            limit,
+        })
+        .await
+        .context("requesting failed tool calls from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected failed tool call query: {error}"))?
+    else {
+        bail!("daemon returned unexpected response to failed tool call query");
+    };
+    Ok(calls_json)
+}
+
+async fn diagnostic_failed_calls_worker(
+    since_epoch: i64,
+    tool: Option<&str>,
+    model: Option<&str>,
+    project_id: Option<&str>,
+    include_recovered: bool,
+    limit: u32,
+) -> Result<String> {
+    let executable = std::env::current_exe().context("locating cockpit executable")?;
+    let mut command = Command::new(executable);
+    command
+        .arg("daemon")
+        .arg("diagnostic-failed-calls")
+        .arg("--since-epoch")
+        .arg(since_epoch.to_string())
+        .arg("--limit")
+        .arg(limit.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if let Some(tool) = tool {
+        command.arg("--tool").arg(tool);
+    }
+    if let Some(model) = model {
+        command.arg("--model").arg(model);
+    }
+    if let Some(project_id) = project_id {
+        command.arg("--project-id").arg(project_id);
+    }
+    if include_recovered {
+        command.arg("--include-recovered");
+    }
+
+    let mut child = command
+        .spawn()
+        .context("starting diagnostic failed-calls worker")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("diagnostic failed-calls worker stdout was not captured")?;
+    let completed = tokio::time::timeout(DIAGNOSTIC_FAILED_CALLS_TIMEOUT, async {
+        tokio::try_join!(read_bounded_stdout(stdout), async {
+            Ok::<_, anyhow::Error>(child.wait().await?)
+        },)
+    })
+    .await;
+    let (stdout, status) = match completed {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!("diagnostic failed-calls worker timed out")
+        }
+    };
+    if !status.success() {
+        anyhow::bail!("diagnostic failed-calls worker exited unsuccessfully")
+    }
+    String::from_utf8(stdout).context("parsing diagnostic failed-calls worker output")
+}
+
+async fn read_bounded_stdout(mut stdout: ChildStdout) -> anyhow::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = stdout.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        let new_len = output
+            .len()
+            .checked_add(read)
+            .context("diagnostic failed-calls worker output length overflow")?;
+        if new_len > MAX_DIAGNOSTIC_FAILED_CALLS_BYTES {
+            anyhow::bail!("diagnostic failed-calls worker output exceeded its size limit")
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
 }
 
 fn format_failed_calls(rows: &[FailedCallView], days: u32) -> String {

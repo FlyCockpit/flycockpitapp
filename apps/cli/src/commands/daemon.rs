@@ -262,6 +262,26 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             );
             Ok(())
         }
+        DaemonCommand::DiagnosticFailedCalls {
+            since_epoch,
+            tool,
+            model,
+            project_id,
+            include_recovered,
+            limit,
+        } => {
+            let calls_json = crate::diagnostics::failed_tool_calls_json(
+                since_epoch,
+                tool,
+                model,
+                project_id,
+                include_recovered,
+                limit as usize,
+            )
+            .await?;
+            println!("{calls_json}");
+            Ok(())
+        }
     }
 }
 

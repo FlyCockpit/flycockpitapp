@@ -3665,7 +3665,8 @@ impl Driver {
                 .await
             {
                 Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_))
-                | Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_)) => {
+                | Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_)) =>
+                {
                     return;
                 }
                 Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict) => {

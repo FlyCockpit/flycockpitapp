@@ -85,6 +85,29 @@ impl<'a> DiagnosticDb<'a> {
 /// pass `None`.
 pub type SecretLookup<'a> = Option<&'a dyn Fn(&str) -> Option<String>>;
 
+/// Hidden `daemon diagnostic-failed-calls` worker. Opens the ledger through
+/// the single diagnostic probe; never starts or promotes a daemon.
+pub async fn failed_tool_calls_json(
+    since_epoch: i64,
+    tool: Option<String>,
+    model: Option<String>,
+    project_id: Option<String>,
+    include_recovered: bool,
+    limit: usize,
+) -> Result<String> {
+    crate::daemon::diagnostics_probe::failed_tool_calls_json(
+        crate::db::tool_calls::FailedCallsFilter {
+            since_epoch,
+            tool,
+            model,
+            project_id,
+            include_recovered,
+            limit,
+        },
+    )
+    .await
+}
+
 pub async fn cli_snapshot(
     path: Option<&Path>,
     no_sandbox: bool,

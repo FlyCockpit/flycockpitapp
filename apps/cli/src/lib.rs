@@ -726,7 +726,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
     }
     !matches!(
         command,
-        Some(Command::Debug(crate::cli::DebugCommand::Paths))
+        Some(Command::Debug(_))
             | Some(Command::Doctor(_))
             | Some(Command::Invocation(_))
             | Some(Command::Daemon(
@@ -735,6 +735,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
                     | crate::cli::DaemonCommand::Stop { .. }
                     | crate::cli::DaemonCommand::Restart { .. }
                     | crate::cli::DaemonCommand::DiagnosticSnapshot { .. }
+                    | crate::cli::DaemonCommand::DiagnosticFailedCalls { .. }
             ))
             | Some(Command::Trust(_))
             | Some(Command::Jq(_))
@@ -1178,14 +1179,28 @@ mod tests {
     }
 
     #[test]
-    fn debug_paths_is_diagnostic_and_does_not_initialize_trust_storage() {
+    fn debug_commands_are_diagnostic_and_do_not_initialize_trust_storage() {
         assert!(!command_requires_workspace_trust(Some(&Command::Debug(
             crate::cli::DebugCommand::Paths,
         ))));
-        assert!(command_requires_workspace_trust(None));
-        assert!(command_requires_workspace_trust(Some(&Command::Debug(
+        assert!(!command_requires_workspace_trust(Some(&Command::Debug(
             crate::cli::DebugCommand::Config,
         ))));
+        assert!(!command_requires_workspace_trust(Some(&Command::Debug(
+            crate::cli::DebugCommand::Context,
+        ))));
+        assert!(!command_requires_workspace_trust(Some(&Command::Debug(
+            crate::cli::DebugCommand::FailedCalls(crate::cli::FailedCallsArgs {
+                days: 7,
+                tool: None,
+                model: None,
+                project: None,
+                limit: 50,
+                include_recovered: false,
+                json: false,
+            }),
+        ))));
+        assert!(command_requires_workspace_trust(None));
     }
 
     #[test]

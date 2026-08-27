@@ -1281,6 +1281,33 @@ CREATE TABLE root_agent_continuations (
 CREATE INDEX idx_root_agent_continuations_recovery
     ON root_agent_continuations(session_id, agent_instance_id, continuation_id);
 
+-- Private replay authority for every source call claimed by the turn
+-- scheduler. Canonical wire input deliberately lives here instead of the
+-- exportable tool_call_scheduling event. A worker crash can therefore settle
+-- calls that never reached a tool_call/subagent row without exposing arguments
+-- on the public timeline.
+CREATE TABLE turn_scheduler_continuations (
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    source_index INTEGER NOT NULL CHECK (source_index >= 0),
+    call_id TEXT NOT NULL,
+    provider_item_id TEXT,
+    provider_call_id TEXT,
+    resolved_tool TEXT NOT NULL,
+    wire_input_json TEXT NOT NULL CHECK (json_valid(wire_input_json)),
+    classification TEXT NOT NULL CHECK (classification IN ('parallel_lane', 'deferred_delegate', 'serial_barrier')),
+    terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'refused', 'transitioned', 'cancelled')),
+    created_at_unix_ms INTEGER NOT NULL,
+    settled_at_unix_ms INTEGER,
+    PRIMARY KEY (session_id, turn_id, source_index),
+    UNIQUE (session_id, call_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    CHECK ((terminal_outcome IS NULL) = (settled_at_unix_ms IS NULL))
+);
+CREATE INDEX idx_turn_scheduler_continuations_recovery
+    ON turn_scheduler_continuations(session_id, terminal_outcome, turn_id, source_index);
+
 -- Recursive noninteractive children are not compatibility `task` rows. Their
 -- immutable launch descriptor and newest exact continuation therefore have a
 -- dedicated one-to-one durable record rather than borrowing (and overwriting)

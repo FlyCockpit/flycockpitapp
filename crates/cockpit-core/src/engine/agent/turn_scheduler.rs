@@ -26,8 +26,8 @@
 //! settles, the next queued eligible member starts. The lane drains before
 //! the next serial barrier.
 
+use serde::Serialize;
 use serde_json::Value;
-use std::sync::Arc;
 
 use crate::engine::tool::{ToolBox, ToolEffect};
 
@@ -38,6 +38,10 @@ pub(crate) enum CallClassification {
     /// a noninteractive delegate whose `ResolvedChildExecutionSurface` proves
     /// `parallel_read_only_eligible`.
     ParallelLane { reason: ParallelLaneReason },
+    /// A syntactically noninteractive delegate.  Its real child surface is
+    /// deliberately unresolved here: the Driver resolves and pins it only
+    /// when this source position is ready to start.
+    DelegateCandidate,
     /// Must run serially, draining any in-flight lane first.
     SerialBarrier { reason: SerialBarrierReason },
 }
@@ -54,6 +58,7 @@ impl CallClassification {
     pub fn reason_str(&self) -> &'static str {
         match self {
             Self::ParallelLane { reason } => reason.as_str(),
+            Self::DelegateCandidate => "delegate_attempt_resolution",
             Self::SerialBarrier { reason } => reason.as_str(),
         }
     }
@@ -64,16 +69,12 @@ impl CallClassification {
 pub(crate) enum ParallelLaneReason {
     /// A registered ordinary tool with `ToolEffect::ReadOnly`.
     ReadOnlyOrdinary,
-    /// A noninteractive delegate whose execution surface proves
-    /// `parallel_read_only_eligible`.
-    ReadOnlyDelegate,
 }
 
 impl ParallelLaneReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnlyOrdinary => "read_only_ordinary",
-            Self::ReadOnlyDelegate => "read_only_delegate",
         }
     }
 }
@@ -86,11 +87,10 @@ pub(crate) enum SerialBarrierReason {
     UnknownTool,
     ApprovalGated,
     InteractiveDelegate,
+    DelegateNotEligible,
     WriteCapableTask,
     TaskControl,
     TaskBatch,
-    DelegateNotEligible,
-    DelegateResolutionFailed,
     Schedule,
     Spawn,
     Return,
@@ -106,11 +106,10 @@ impl SerialBarrierReason {
             Self::UnknownTool => "unknown_tool",
             Self::ApprovalGated => "approval_gated",
             Self::InteractiveDelegate => "interactive_delegate",
+            Self::DelegateNotEligible => "delegate_not_eligible",
             Self::WriteCapableTask => "write_capable_task",
             Self::TaskControl => "task_control",
             Self::TaskBatch => "task_batch",
-            Self::DelegateNotEligible => "delegate_not_eligible",
-            Self::DelegateResolutionFailed => "delegate_resolution_failed",
             Self::Schedule => "schedule",
             Self::Spawn => "spawn",
             Self::Return => "return",
@@ -141,6 +140,20 @@ impl ScheduledCall {
     pub fn is_serial_barrier(&self) -> bool {
         self.classification.is_serial_barrier()
     }
+
+    pub fn is_delegate_candidate(&self) -> bool {
+        matches!(self.classification, CallClassification::DelegateCandidate)
+    }
+
+    pub fn classification_str(&self) -> &'static str {
+        if self.is_parallel_lane() {
+            "parallel_lane"
+        } else if self.is_delegate_candidate() {
+            "deferred_delegate"
+        } else {
+            "serial_barrier"
+        }
+    }
 }
 
 /// The complete turn scheduler plan.
@@ -162,8 +175,9 @@ impl TurnSchedulerPlan {
     /// classification, and the max_parallel bound — never tool arguments,
     /// title candidates, or provider bodies.
     pub fn to_event_payload(&self) -> Value {
-        Value::Array(
-            self.calls
+        serde_json::json!({
+            "max_parallel": self.max_parallel,
+            "calls": self.calls
                 .iter()
                 .map(|call| {
                     Value::Object({
@@ -177,6 +191,9 @@ impl TurnSchedulerPlan {
                             CallClassification::ParallelLane { reason } => {
                                 ("parallel_lane", reason.as_str())
                             }
+                            CallClassification::DelegateCandidate => {
+                                ("deferred_delegate", "delegate_attempt_resolution")
+                            }
                             CallClassification::SerialBarrier { reason } => {
                                 ("serial_barrier", reason.as_str())
                             }
@@ -186,9 +203,50 @@ impl TurnSchedulerPlan {
                         map
                     })
                 })
-                .collect(),
-        )
+                .collect::<Vec<_>>(),
+        })
     }
+}
+
+pub(crate) const SCHEDULER_INTERRUPTED_BODY: &str =
+    "Tool call interrupted before the turn scheduler could durably settle it.";
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum SchedulerTerminalOutcome {
+    Completed,
+    Refused,
+    Transitioned,
+    Cancelled,
+}
+
+impl SchedulerTerminalOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Refused => "refused",
+            Self::Transitioned => "transitioned",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+pub(crate) fn terminal_event_payload(
+    call: &ScheduledCall,
+    outcome: SchedulerTerminalOutcome,
+) -> Value {
+    serde_json::json!({
+        "call_id": call.call_id,
+        "lane": if call.is_parallel_lane() {
+            "parallel_lane"
+        } else if call.is_delegate_candidate() {
+            "deferred_delegate"
+        } else {
+            "serial_barrier"
+        },
+        "reason": call.classification.reason_str(),
+        "terminal_outcome": outcome,
+    })
 }
 
 /// Build the scheduler plan from a list of resolved tool calls.
@@ -197,18 +255,23 @@ impl TurnSchedulerPlan {
 /// tool name for the corresponding call. `active_tools` is the turn's toolbox.
 /// `max_parallel` is `delegation.max_parallel.max(1)`.
 ///
-/// For `task` delegate calls, this attempts a side-effect-free
-/// `resolve_child_execution_surface` to check
-/// `parallel_read_only_eligible`. If resolution fails, the call is classified
-/// as a serial barrier (fail-closed). The resolution creates no child/task
-/// record, spawns no child, pregrants no write scope, requests no approval,
-/// and mutates no task lifecycle — it is purely a read-only classification
-/// probe.
+/// Delegate calls are only syntax-classified here.  Real child resolution and
+/// admission belong to the Driver at the attempt boundary.
 pub(crate) fn build_plan(
     calls: &[crate::engine::message::ToolCall],
     resolved_names: &[String],
     active_tools: &ToolBox,
     max_parallel: usize,
+) -> TurnSchedulerPlan {
+    build_plan_with_delegate_context(calls, resolved_names, active_tools, max_parallel, false)
+}
+
+pub(crate) fn build_plan_with_delegate_context(
+    calls: &[crate::engine::message::ToolCall],
+    resolved_names: &[String],
+    active_tools: &ToolBox,
+    max_parallel: usize,
+    force_noninteractive_delegates: bool,
 ) -> TurnSchedulerPlan {
     let scheduled = calls
         .iter()
@@ -218,7 +281,12 @@ pub(crate) fn build_plan(
                 .get(idx)
                 .map(String::as_str)
                 .unwrap_or(&tc.function.name);
-            let classification = classify_call(tc, resolved_name, active_tools);
+            let classification = classify_call(
+                tc,
+                resolved_name,
+                active_tools,
+                force_noninteractive_delegates,
+            );
             ScheduledCall {
                 source_index: idx,
                 call_id: tc.id.to_string(),
@@ -238,11 +306,12 @@ fn classify_call(
     tc: &crate::engine::message::ToolCall,
     resolved_name: &str,
     active_tools: &ToolBox,
+    force_noninteractive_delegates: bool,
 ) -> CallClassification {
     // Structural tools are always serial barriers unless they are a
     // noninteractive delegate that proves parallel_read_only_eligible.
     match resolved_name {
-        "task" => classify_task_call(tc, active_tools),
+        "task" => classify_task_call(tc, active_tools, force_noninteractive_delegates),
         "schedule" => {
             return CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::Schedule,
@@ -306,6 +375,7 @@ fn classify_call(
 fn classify_task_call(
     tc: &crate::engine::message::ToolCall,
     _active_tools: &ToolBox,
+    force_noninteractive_delegates: bool,
 ) -> CallClassification {
     let known_task_call_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let parsed = match crate::tools::task_repair::parse_task_args(
@@ -334,17 +404,14 @@ fn classify_task_call(
             }
         }
         crate::tools::task_repair::ParsedTaskArgs::Delegate { args, .. } => {
-            classify_delegate_call(&args)
+            classify_delegate_call(&args, force_noninteractive_delegates)
         }
     }
 }
 
-/// Classify a `task(intent=delegate)` call by probing the child execution
-/// surface. Side-effect-free: builds the child agent (a pure construction)
-/// and derives the surface, but creates no task record, spawns no child,
-/// pregrants no write scope, requests no approval, or mutates no task
-/// lifecycle.
-fn classify_delegate_call(delegate_args: &Value) -> CallClassification {
+/// Classify only the syntax-owned delegate barriers.  A remaining candidate
+/// is resolved by the Driver from its live cwd/config/grants at attempt start.
+fn classify_delegate_call(delegate_args: &Value, force_noninteractive: bool) -> CallClassification {
     let child_agent = delegate_args
         .get("agent")
         .and_then(Value::as_str)
@@ -387,7 +454,7 @@ fn classify_delegate_call(delegate_args: &Value) -> CallClassification {
         .filter(|s| !s.is_empty())
         .is_some();
 
-    let interactive = if has_resume_handle {
+    let interactive = if force_noninteractive || has_resume_handle {
         false // follow-up is always noninteractive
     } else {
         match mode {
@@ -403,77 +470,7 @@ fn classify_delegate_call(delegate_args: &Value) -> CallClassification {
         };
     }
 
-    // Attempt a side-effect-free child surface resolution. If it succeeds and
-    // the surface proves parallel_read_only_eligible, the delegate is admitted
-    // to a parallel lane. Otherwise it is a serial barrier (fail-closed).
-    //
-    // The resolution builds SpawnArgs from the delegate args. This creates no
-    // child/task record, spawns no child, pregrants no write scope, requests no
-    // approval, and mutates no task lifecycle — `resolve_child_execution_surface`
-    // is a pure construction + derivation.
-    match try_resolve_delegate_surface(child_agent, delegate_args) {
-        Ok(surface) => {
-            if surface.parallel_read_only_eligible {
-                CallClassification::ParallelLane {
-                    reason: ParallelLaneReason::ReadOnlyDelegate,
-                }
-            } else {
-                CallClassification::SerialBarrier {
-                    reason: SerialBarrierReason::DelegateNotEligible,
-                }
-            }
-        }
-        Err(_) => CallClassification::SerialBarrier {
-            reason: SerialBarrierReason::DelegateResolutionFailed,
-        },
-    }
-}
-
-/// Build a minimal `SpawnArgs` for a plan-time delegate surface probe and
-/// resolve the child execution surface. This is side-effect-free.
-///
-/// The SpawnArgs is constructed from the delegate's parsed args with defaults
-/// for Driver-specific fields. The key fields that affect
-/// `parallel_read_only_eligible` (interactive, write_scope, config, cwd, model)
-/// are set correctly from the delegate args and the turn context. Fields that
-/// the driver owns (assistant_identity_prefix, model_override,
-/// vnext_local_installation_resolver, etc.) are defaulted — they do not affect
-/// the read-only eligibility derivation for standard built-in agents.
-fn try_resolve_delegate_surface(
-    child_agent: &str,
-    delegate_args: &Value,
-) -> anyhow::Result<crate::engine::builtin::ResolvedChildExecutionSurface> {
-    // Build a minimal SpawnArgs for the probe. We use no_installations() for
-    // the vnext resolver — standard built-in agents (explore, etc.) don't need
-    // vnext bindings.
-    let args = build_probe_spawn_args(child_agent, delegate_args)?;
-    crate::engine::builtin::resolve_child_execution_surface(child_agent, &args)
-}
-
-/// Build a minimal `SpawnArgs` for a plan-time surface probe.
-///
-/// This is intentionally minimal: it provides the fields that
-/// `derive_parallel_read_only_eligible` and `load()` need to build the child
-/// and derive its surface, without requiring the full Driver context. Fields
-/// that the Driver owns and that don't affect read-only eligibility are
-/// defaulted.
-fn build_probe_spawn_args(
-    _child_agent: &str,
-    _delegate_args: &Value,
-) -> anyhow::Result<crate::engine::builtin::SpawnArgs> {
-    // This function requires a config handle and model to build SpawnArgs.
-    // In the current architecture, the turn context provides these, but they
-    // are not available in this free function. The scheduler's `build_plan`
-    // is called from `run_turn` which has the full TurnCtx.
-    //
-    // For now, we return an error to indicate that probe resolution is not
-    // available without the full turn context. This makes all delegates
-    // serial barriers (fail-closed), which is safe but conservative.
-    //
-    // TODO: Thread the TurnCtx into the scheduler so delegate surface probes
-    // can resolve at plan time. The issue's AC1 requires this for full
-    // parallel-lane admission of eligible delegates.
-    anyhow::bail!("delegate surface probe requires turn context (not yet threaded)")
+    CallClassification::DelegateCandidate
 }
 
 /// A lane admission state tracking FIFO bounding by `max_parallel`.
@@ -625,7 +622,7 @@ mod tests {
 
         // Event payload contains only call IDs, lane, and reason — no args.
         let payload = plan.to_event_payload();
-        let arr = payload.as_array().expect("payload is an array");
+        let arr = payload["calls"].as_array().expect("calls is an array");
         assert_eq!(arr.len(), 4);
         assert_eq!(arr[0]["call_id"], "read");
         assert_eq!(arr[0]["lane"], "parallel_lane");
@@ -824,17 +821,41 @@ mod tests {
         assert!(lane.is_drained());
     }
 
-    /// AC3: `scheduler_defers_delegate_admission_until_serial_barrier` — a
-    /// delegate call is classified as a serial barrier when surface resolution
-    /// is unavailable (fail-closed), proving no child selection/build/record/
-    /// spawn happens at plan time.
+    /// A completion race changes which in-flight member frees capacity, never
+    /// which queued source position starts next. Here source 1 is the fast
+    /// finisher while source 0 remains active; source 2 must still be the sole
+    /// next admission and the bound must remain saturated, not exceeded.
+    #[test]
+    fn completion_race_still_admits_the_next_source_fifo_under_the_bound() {
+        let mut lane = LaneAdmission::new(2);
+        for source_index in 0..4 {
+            lane.enqueue(source_index);
+        }
+        assert_eq!(lane.admit_available(), vec![0, 1]);
+
+        // `settle_one` is identity-agnostic by design: model this as source 1
+        // completing ahead of source 0. Capacity, not completion order, drives
+        // admission of the FIFO queue head.
+        lane.settle_one();
+        assert_eq!(lane.admit_available(), vec![2]);
+        assert_eq!(lane.in_flight_count(), 2);
+        assert_eq!(lane.queued_count(), 1);
+
+        // Source 2 may now beat source 0 as well; source 3 is still next.
+        lane.settle_one();
+        assert_eq!(lane.admit_available(), vec![3]);
+        assert_eq!(lane.in_flight_count(), 2);
+        assert_eq!(lane.queued_count(), 0);
+    }
+
+    /// AC3: delegate admission is deferred to the Driver attempt boundary,
+    /// proving no child selection/build/record/spawn happens at plan time.
     #[test]
     fn scheduler_defers_delegate_admission_until_serial_barrier() {
         let toolbox = ToolBox::new();
 
-        // A noninteractive delegate (explore) without write_scope. Without
-        // turn context for surface resolution, this is fail-closed to a
-        // serial barrier.
+        // A noninteractive delegate (explore) without write_scope remains an
+        // opaque attempt candidate until the Driver has drained prior barriers.
         let calls = vec![tool_call(
             "task",
             serde_json::json!({ "intent": "delegate", "payload": { "agent": "explore", "prompt": "look around" } }),
@@ -842,18 +863,10 @@ mod tests {
         let names = resolved_names(&calls);
         let plan = build_plan(&calls, &names, &toolbox, 4);
 
-        // Fail-closed: delegate is a serial barrier when surface probe is
-        // unavailable. No child record/spawn/scope happens at plan time.
-        assert!(plan.calls[0].is_serial_barrier());
-        // The reason is either DelegateResolutionFailed or DelegateNotEligible.
-        let reason = match &plan.calls[0].classification {
-            CallClassification::SerialBarrier { reason } => *reason,
-            _ => unreachable!(),
-        };
-        assert!(
-            reason == SerialBarrierReason::DelegateResolutionFailed
-                || reason == SerialBarrierReason::DelegateNotEligible,
-            "expected delegate resolution failure or not-eligible, got {reason:?}"
+        assert!(plan.calls[0].is_delegate_candidate());
+        assert_eq!(
+            plan.calls[0].classification,
+            CallClassification::DelegateCandidate
         );
     }
 
@@ -904,10 +917,72 @@ mod tests {
         // They are separate entries in the plan — not coalesced.
         assert_ne!(plan.calls[1].source_index, plan.calls[2].source_index);
 
-        // Each delegate is its own serial barrier (fail-closed without turn
-        // context for surface resolution).
-        assert!(plan.calls[1].is_serial_barrier());
-        assert!(plan.calls[2].is_serial_barrier());
+        // Each delegate remains its own attempt-resolved lifecycle.
+        assert!(plan.calls[1].is_delegate_candidate());
+        assert!(plan.calls[2].is_delegate_candidate());
+    }
+
+    /// Regression for the production mixed-lane shape: an ordinary read and
+    /// two separately authored noninteractive delegates stay three distinct,
+    /// FIFO scheduler identities under one bound.  In particular, the two task
+    /// calls are not rewritten into the explicit-batch lifecycle.
+    #[test]
+    fn ordinary_plus_two_distinct_delegates_form_one_bounded_candidate_run() {
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::read::ReadTool));
+        let calls = vec![
+            tool_call("read", serde_json::json!({ "path": "Cargo.toml" })),
+            tool_call(
+                "task",
+                serde_json::json!({
+                    "intent": "delegate",
+                    "payload": { "agent": "probe-a", "prompt": "first" }
+                }),
+            ),
+            tool_call(
+                "task",
+                serde_json::json!({
+                    "intent": "delegate",
+                    "payload": { "agent": "probe-b", "prompt": "second" }
+                }),
+            ),
+        ];
+        let plan =
+            build_plan_with_delegate_context(&calls, &resolved_names(&calls), &toolbox, 2, true);
+
+        assert_eq!(plan.max_parallel, 2);
+        assert_eq!(
+            plan.calls
+                .iter()
+                .map(|call| call.source_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(plan.calls[0].is_parallel_lane());
+        assert!(plan.calls[1].is_delegate_candidate());
+        assert!(plan.calls[2].is_delegate_candidate());
+        assert_ne!(plan.calls[1].source_index, plan.calls[2].source_index);
+    }
+
+    /// Architecture acceptance: every resumable nested turn loop must enter
+    /// the same Driver-owned mixed-lane funnel.  This ratchet prevents a future
+    /// call site from restoring the former ordinary-only `plan.advance` path,
+    /// which silently serialized distinct eligible delegates.
+    #[test]
+    fn nested_resumable_runners_are_wired_to_driver_mixed_lane_authority() {
+        for source in [
+            include_str!("../driver/noninteractive.rs"),
+            include_str!("../schedule/loop_runner.rs"),
+            include_str!("../schedule/swarm.rs"),
+        ] {
+            assert!(
+                source.contains("advance_driver_owned_turn_plan_in_history"),
+                "nested runner must use the Driver mixed-lane authority"
+            );
+            assert!(
+                !source.contains("plan.advance("),
+                "nested runner must not bypass delegate lane admission"
+            );
+        }
     }
 
     /// The event payload never contains tool arguments or provider bodies.

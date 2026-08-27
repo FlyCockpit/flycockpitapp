@@ -221,6 +221,495 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) display_slot: Option<crate::engine::model::DisplayAttemptSlot>,
 }
 
+/// Opaque, source-ordered remainder of one provider-emitted tool-call turn.
+///
+/// It is owned by the Driver between structural transitions.  In particular,
+/// the Driver can park it while an interactive child runs and resume it only
+/// after that exact task call has produced its paired result.  No provider
+/// inference is allowed while this plan still has calls.
+pub struct DeferredTurnPlan {
+    continuation_turn_id: uuid::Uuid,
+    scheduler: turn_scheduler::TurnSchedulerPlan,
+    calls: Vec<ToolCall>,
+    name_recoveries: Vec<Recovery>,
+    recovered_markers: std::collections::HashMap<String, Recovery>,
+    cursor: usize,
+    active_tools: ToolBox,
+    tool_ctx: ToolCtx,
+    session: Arc<Session>,
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    tx: mpsc::Sender<TurnEvent>,
+    hint_corrections: bool,
+    loop_guard_threshold: u32,
+    cwd: std::path::PathBuf,
+}
+
+/// One Driver-owned FIFO lane. Ordinary calls carry fully owned dispatch
+/// recipes; delegates carry their distinct structural outcome and original
+/// scheduler identity. The payload never merges delegate lifecycles.
+pub struct DeferredParallelLane {
+    pub(crate) max_parallel: usize,
+    pub(crate) calls: Vec<DeferredParallelCall>,
+}
+
+impl std::fmt::Debug for DeferredParallelLane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredParallelLane")
+            .field("max_parallel", &self.max_parallel)
+            .field("calls", &self.calls.len())
+            .finish()
+    }
+}
+
+pub(crate) enum DeferredParallelCall {
+    Ordinary(DeferredOrdinaryCall),
+    Delegate(DeferredDelegateCall),
+}
+
+pub(crate) struct DeferredOrdinaryCall {
+    continuation_turn_id: uuid::Uuid,
+    durable_permit: super::tool_dispatch::SchedulerDurablePermit,
+    scheduled: turn_scheduler::ScheduledCall,
+    call: ToolCall,
+    name_recovery: Recovery,
+    text_recovery_marker: Option<Recovery>,
+    agent: Agent,
+    active_tools: ToolBox,
+    tool_ctx: ToolCtx,
+    session: Arc<Session>,
+    tx: mpsc::Sender<TurnEvent>,
+    hint_corrections: bool,
+    loop_guard_threshold: u32,
+    cwd: std::path::PathBuf,
+}
+
+impl DeferredOrdinaryCall {
+    pub(crate) fn source_index(&self) -> usize {
+        self.scheduled.source_index
+    }
+
+    pub(crate) async fn execute(
+        self,
+    ) -> (
+        Vec<Message>,
+        Option<anyhow::Error>,
+        DeferredSchedulerTerminalRecord,
+        turn_scheduler::SchedulerTerminalOutcome,
+    ) {
+        let terminal_record = DeferredSchedulerTerminalRecord {
+            scheduled: self.scheduled.clone(),
+            continuation_turn_id: self.continuation_turn_id,
+            session: self.session.clone(),
+            agent_id: self.tool_ctx.agent_id.clone(),
+        };
+        let config_snapshot = self.tool_ctx.config.snapshot();
+        let env = super::tool_dispatch::DispatchEnv {
+            agent: &self.agent,
+            session: &self.session,
+            model: &self.agent.model,
+            active_tools: &self.active_tools,
+            ctx: &self.tool_ctx,
+            tx: &self.tx,
+            hint_corrections: self.hint_corrections,
+            loop_guard_threshold: self.loop_guard_threshold,
+            cwd: &self.cwd,
+            hooks: config_snapshot.hooks(),
+        };
+        let mut history = Vec::new();
+        let result = super::tool_dispatch::with_scheduler_durable_order(
+            self.durable_permit,
+            super::tool_dispatch::execute_ordinary_call(
+                &env,
+                &mut history,
+                &self.call,
+                &self.scheduled.resolved_name,
+                self.name_recovery,
+                self.text_recovery_marker,
+            ),
+        )
+        .await;
+        let terminal = match result {
+            Ok(()) => turn_scheduler::SchedulerTerminalOutcome::Completed,
+            Err(error) => {
+                history.push(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        self.scheduled.call_id.clone(),
+                        self.call
+                            .provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        self.call
+                            .provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        &self.scheduled.resolved_name,
+                        turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                    ),
+                );
+                return (
+                    history,
+                    Some(error),
+                    terminal_record,
+                    turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                );
+            }
+        };
+        (history, None, terminal_record, terminal)
+    }
+}
+
+pub(crate) struct DeferredSchedulerTerminalRecord {
+    scheduled: turn_scheduler::ScheduledCall,
+    continuation_turn_id: uuid::Uuid,
+    session: Arc<Session>,
+    agent_id: String,
+}
+
+impl DeferredSchedulerTerminalRecord {
+    pub(crate) async fn record(self, outcome: turn_scheduler::SchedulerTerminalOutcome) {
+        if let Err(error) = self
+            .session
+            .db
+            .settle_turn_scheduler_call(
+                self.session.id,
+                self.continuation_turn_id,
+                self.scheduled.call_id.clone(),
+                outcome.as_str().to_string(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+        {
+            tracing::warn!(%error, call_id = %self.scheduled.call_id, "settle scheduler continuation failed");
+        }
+        if let Err(error) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCallScheduling,
+                Some(&self.agent_id),
+                Some(&self.scheduled.call_id),
+                &turn_scheduler::terminal_event_payload(&self.scheduled, outcome),
+            )
+            .await
+        {
+            tracing::warn!(%error, call_id = %self.scheduled.call_id, "record scheduler terminal outcome failed");
+        }
+    }
+}
+
+pub(crate) struct DeferredDelegateCall {
+    pub(crate) source_index: usize,
+    pub(crate) call_id: String,
+    call: ToolCall,
+    resolved_name: String,
+    agent: Agent,
+    provider_item_id: Option<String>,
+    function_call_id: Option<String>,
+    scheduled: turn_scheduler::ScheduledCall,
+    continuation_turn_id: uuid::Uuid,
+    session: Arc<Session>,
+    tx: mpsc::Sender<TurnEvent>,
+    agent_id: String,
+}
+
+impl DeferredDelegateCall {
+    pub(crate) fn terminal_record(&self) -> DeferredSchedulerTerminalRecord {
+        DeferredSchedulerTerminalRecord {
+            scheduled: self.scheduled.clone(),
+            continuation_turn_id: self.continuation_turn_id,
+            session: self.session.clone(),
+            agent_id: self.agent_id.clone(),
+        }
+    }
+    pub(crate) async fn resolve_outcome(
+        &self,
+        config: &crate::daemon::session_worker::SessionConfigHandle,
+    ) -> Result<TurnOutcome> {
+        match phase_10_dispatch_one_call(
+            &self.agent,
+            &self.session,
+            config,
+            &self.tx,
+            &self.call,
+            &self.resolved_name,
+        )
+        .await?
+        {
+            ControlFlow::Break(outcome) => Ok(outcome),
+            ControlFlow::Continue(()) => {
+                anyhow::bail!("delegate scheduler candidate resolved as an ordinary tool")
+            }
+        }
+    }
+
+    pub(crate) fn interrupted_message(&self) -> Message {
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            self.call_id.clone(),
+            self.provider_item_id.clone(),
+            self.function_call_id.clone(),
+            "task",
+            turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+        )
+    }
+}
+
+impl std::fmt::Debug for DeferredTurnPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredTurnPlan")
+            .field("cursor", &self.cursor)
+            .field("calls", &self.scheduler.calls.len())
+            .field("max_parallel", &self.scheduler.max_parallel)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeferredTurnPlan {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.cursor >= self.scheduler.calls.len()
+    }
+
+    async fn record_terminal(
+        &self,
+        scheduled: &turn_scheduler::ScheduledCall,
+        outcome: turn_scheduler::SchedulerTerminalOutcome,
+    ) {
+        if let Err(error) = self
+            .session
+            .db
+            .settle_turn_scheduler_call(
+                self.session.id,
+                self.continuation_turn_id,
+                scheduled.call_id.clone(),
+                outcome.as_str().to_string(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+        {
+            tracing::warn!(%error, call_id = %scheduled.call_id, "settle scheduler continuation failed");
+        }
+        if let Err(error) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCallScheduling,
+                Some(&self.tool_ctx.agent_id),
+                Some(&scheduled.call_id),
+                &turn_scheduler::terminal_event_payload(scheduled, outcome),
+            )
+            .await
+        {
+            tracing::warn!(%error, call_id = %scheduled.call_id, "record scheduler terminal outcome failed");
+        }
+    }
+
+    pub(crate) async fn settle_unreachable_remainder(&mut self, history: &mut Vec<Message>) {
+        while self.cursor < self.scheduler.calls.len() {
+            let scheduled = self.scheduler.calls[self.cursor].clone();
+            self.cursor += 1;
+            let call = &self.calls[scheduled.source_index];
+            history.push(
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    scheduled.call_id.clone(),
+                    call.provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    call.provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
+                    &scheduled.resolved_name,
+                    turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                ),
+            );
+            self.record_terminal(
+                &scheduled,
+                turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+            )
+            .await;
+        }
+    }
+
+    async fn execute_ordinary(
+        &mut self,
+        agent: &Agent,
+        scheduled: &turn_scheduler::ScheduledCall,
+    ) -> Result<Vec<Message>> {
+        let text_recovery_marker = self.recovered_markers.remove(&scheduled.call_id);
+        let tc = &self.calls[scheduled.source_index];
+        let config_snapshot = self.tool_ctx.config.snapshot();
+        let env = super::tool_dispatch::DispatchEnv {
+            agent,
+            session: &self.session,
+            model: &agent.model,
+            active_tools: &self.active_tools,
+            ctx: &self.tool_ctx,
+            tx: &self.tx,
+            hint_corrections: self.hint_corrections,
+            loop_guard_threshold: self.loop_guard_threshold,
+            cwd: &self.cwd,
+            hooks: config_snapshot.hooks(),
+        };
+        let mut call_history = Vec::new();
+        super::tool_dispatch::execute_ordinary_call(
+            &env,
+            &mut call_history,
+            tc,
+            &scheduled.resolved_name,
+            self.name_recoveries[scheduled.source_index].clone(),
+            text_recovery_marker,
+        )
+        .await?;
+        Ok(call_history)
+    }
+
+    /// Advance through a mixed ordinary/delegate lane and at most one static
+    /// serial transition. The lane itself is returned to the Driver so it can
+    /// resolve delegate surfaces at the exact attempt boundary.
+    pub(crate) async fn advance_for_driver(
+        &mut self,
+        agent: &Agent,
+        history: &mut Vec<Message>,
+    ) -> Result<TurnOutcome> {
+        loop {
+            if self.is_finished() {
+                return Ok(TurnOutcome::Continue);
+            }
+
+            if self.scheduler.calls[self.cursor].is_parallel_lane()
+                || self.scheduler.calls[self.cursor].is_delegate_candidate()
+            {
+                let mut calls = Vec::new();
+                let durable_order = super::tool_dispatch::SchedulerDurableOrder::new();
+                let mut durable_ordinal = 0usize;
+                while self.cursor < self.scheduler.calls.len()
+                    && (self.scheduler.calls[self.cursor].is_parallel_lane()
+                        || self.scheduler.calls[self.cursor].is_delegate_candidate())
+                {
+                    let scheduled = self.scheduler.calls[self.cursor].clone();
+                    self.cursor += 1;
+                    if scheduled.is_parallel_lane() {
+                        calls.push(DeferredParallelCall::Ordinary(DeferredOrdinaryCall {
+                            continuation_turn_id: self.continuation_turn_id,
+                            durable_permit: super::tool_dispatch::SchedulerDurablePermit::new(
+                                durable_order.clone(),
+                                durable_ordinal,
+                            ),
+                            call: self.calls[scheduled.source_index].clone(),
+                            name_recovery: self.name_recoveries[scheduled.source_index].clone(),
+                            text_recovery_marker: self.recovered_markers.remove(&scheduled.call_id),
+                            scheduled,
+                            agent: agent.clone(),
+                            active_tools: self.active_tools.clone(),
+                            tool_ctx: self.tool_ctx.clone(),
+                            session: self.session.clone(),
+                            tx: self.tx.clone(),
+                            hint_corrections: self.hint_corrections,
+                            loop_guard_threshold: self.loop_guard_threshold,
+                            cwd: self.cwd.clone(),
+                        }));
+                        durable_ordinal += 1;
+                        continue;
+                    }
+
+                    let tc = &self.calls[scheduled.source_index];
+                    rewrite_structural_call_name_if_repaired(
+                        history,
+                        tc,
+                        &scheduled.resolved_name,
+                        &self.name_recoveries[scheduled.source_index],
+                    );
+                    calls.push(DeferredParallelCall::Delegate(DeferredDelegateCall {
+                        source_index: scheduled.source_index,
+                        call_id: scheduled.call_id.clone(),
+                        call: tc.clone(),
+                        resolved_name: scheduled.resolved_name.clone(),
+                        agent: agent.clone(),
+                        provider_item_id: tc
+                            .provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        function_call_id: tc
+                            .provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        scheduled,
+                        continuation_turn_id: self.continuation_turn_id,
+                        session: self.session.clone(),
+                        tx: self.tx.clone(),
+                        agent_id: self.tool_ctx.agent_id.clone(),
+                    }));
+                }
+                return Ok(TurnOutcome::ScheduledParallelLane {
+                    lane: Box::new(DeferredParallelLane {
+                        max_parallel: self.scheduler.max_parallel,
+                        calls,
+                    }),
+                });
+            }
+
+            let scheduled = self.scheduler.calls[self.cursor].clone();
+            self.cursor += 1;
+            let tc = &self.calls[scheduled.source_index];
+            match phase_10_dispatch_one_call(
+                agent,
+                &self.session,
+                &self.config,
+                &self.tx,
+                tc,
+                &scheduled.resolved_name,
+            )
+            .await?
+            {
+                ControlFlow::Break(outcome) => {
+                    rewrite_structural_call_name_if_repaired(
+                        history,
+                        tc,
+                        &scheduled.resolved_name,
+                        &self.name_recoveries[scheduled.source_index],
+                    );
+                    let terminal = match &outcome {
+                        TurnOutcome::ToolResult { body, .. }
+                            if body.trim_start().starts_with("Error:") =>
+                        {
+                            turn_scheduler::SchedulerTerminalOutcome::Refused
+                        }
+                        _ => turn_scheduler::SchedulerTerminalOutcome::Transitioned,
+                    };
+                    self.record_terminal(&scheduled, terminal).await;
+                    if matches!(&outcome, TurnOutcome::Return { .. } | TurnOutcome::Done) {
+                        self.settle_unreachable_remainder(history).await;
+                    }
+                    return Ok(outcome);
+                }
+                ControlFlow::Continue(()) => match self.execute_ordinary(agent, &scheduled).await {
+                    Ok(call_history) => {
+                        history.extend(call_history);
+                        self.record_terminal(
+                            &scheduled,
+                            turn_scheduler::SchedulerTerminalOutcome::Completed,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let tc = &self.calls[scheduled.source_index];
+                        history.push(crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                scheduled.call_id.clone(),
+                                tc.provider.as_ref().and_then(|provider| provider.item_id.clone()),
+                                tc.provider.as_ref().map(|provider| provider.call_id.clone()),
+                                &scheduled.resolved_name,
+                                turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                            ));
+                        self.record_terminal(
+                            &scheduled,
+                            turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                        )
+                        .await;
+                        self.settle_unreachable_remainder(history).await;
+                        return Err(error);
+                    }
+                },
+            }
+        }
+    }
+}
+
 pub(crate) fn phase_01_pre_send_history_mutation() {}
 pub(crate) fn phase_02_dispatch_time_record() {}
 pub(crate) fn phase_03_tandem_shadow_dispatch() {}
@@ -2331,111 +2820,91 @@ pub(crate) async fn run_turn(
 
     // Phase 2: Build the scheduler plan.
     let max_parallel = config.extended().delegation.max_parallel.max(1);
-    let plan = turn_scheduler::build_plan(&calls, &resolved_names, &active_tools, max_parallel);
+    let plan = turn_scheduler::build_plan_with_delegate_context(
+        &calls,
+        &resolved_names,
+        &active_tools,
+        max_parallel,
+        agent.vnext_grant.is_some(),
+    );
+
+    // The exportable scheduling event intentionally omits arguments. Persist a
+    // private canonical replay row for every claimed source id first, so a
+    // crash at any later instruction can deterministically pair the whole turn.
+    let continuation_turn_id = uuid::Uuid::new_v4();
+    let continuation_calls = plan
+        .iter()
+        .map(|scheduled| {
+            let call = &calls[scheduled.source_index];
+            crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                source_index: scheduled.source_index,
+                call_id: scheduled.call_id.clone(),
+                provider_item_id: call
+                    .provider
+                    .as_ref()
+                    .and_then(|provider| provider.item_id.clone()),
+                provider_call_id: call
+                    .provider
+                    .as_ref()
+                    .map(|provider| provider.call_id.clone()),
+                resolved_tool: scheduled.resolved_name.clone(),
+                wire_input: call.function.arguments.clone(),
+                classification: scheduled.classification_str().to_string(),
+            }
+        })
+        .collect();
+    session
+        .db
+        .persist_turn_scheduler_plan(
+            session.id,
+            continuation_turn_id,
+            agent.name.clone(),
+            continuation_calls,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .context("persisting private turn scheduler continuation")?;
 
     // Phase 3: Emit the `tool_call_scheduling` session event carrying original
     // call IDs, lane/barrier classification, and the max_parallel bound. The
     // payload never contains tool arguments, title candidates, or provider
     // bodies (fail-closed safe metadata only).
+    let mut scheduling_payload = plan.to_event_payload();
+    scheduling_payload["continuation_turn_id"] =
+        serde_json::Value::String(continuation_turn_id.to_string());
     if let Err(e) = session
         .record_event(
             crate::db::session_log::SessionEventKind::ToolCallScheduling,
             Some(&agent.name),
             None,
-            &plan.to_event_payload(),
+            &scheduling_payload,
         )
         .await
     {
         tracing::warn!(error = %e, "record tool_call_scheduling event failed");
     }
 
-    // Phase 4: Walk the plan in source order, dispatching calls. Parallel-
-    // eligible ordinary tools are dispatched before the next serial barrier.
-    // The first structural outcome (Break) is returned only after the lane
-    // drains — guaranteeing no sibling call is dropped.
-    //
-    // (A future implementation will dispatch parallel-eligible ordinary tools
-    // concurrently via tokio, bounded by `max_parallel` FIFO. The current
-    // sequential dispatch preserves the no-drop guarantee and source-order
-    // result insertion; the plan and event emission already track the full
-    // lane/barrier classification.)
-    for scheduled in plan.iter() {
-        let tc = &calls[scheduled.source_index];
-        let resolved_name = scheduled.resolved_name.as_str();
-        let name_recovery = name_recoveries[scheduled.source_index].clone();
-
-        if scheduled.is_parallel_lane() {
-            // Parallel-lane-eligible ordinary read-only tool: dispatch directly
-            // via execute_ordinary_call. No structural outcome possible.
-            let text_recovery_marker = recovered_markers.remove(tc.id.as_str());
-            let config_snapshot = ctx.config.snapshot();
-            let env = super::tool_dispatch::DispatchEnv {
-                agent,
-                session: &session,
-                model,
-                active_tools: &active_tools,
-                ctx: &ctx,
-                tx,
-                hint_corrections,
-                loop_guard_threshold,
-                cwd: &cwd,
-                hooks: config_snapshot.hooks(),
-            };
-            super::tool_dispatch::execute_ordinary_call(
-                &env,
-                history,
-                tc,
-                resolved_name,
-                name_recovery,
-                text_recovery_marker,
-            )
-            .await?;
-            continue;
-        }
-
-        // Serial barrier: route through phase_10_dispatch_one_call which
-        // handles structural tools (task, schedule, spawn, return).
-        match phase_10_dispatch_one_call(agent, &session, &config, tx, tc, resolved_name).await? {
-            ControlFlow::Break(outcome) => {
-                rewrite_structural_call_name_if_repaired(
-                    history,
-                    tc,
-                    resolved_name,
-                    &name_recovery,
-                );
-                return Ok(outcome);
-            }
-            ControlFlow::Continue(()) => {}
-        }
-
-        // The serial barrier continued (not structural): execute as an
-        // ordinary call (e.g. a mutating/dynamic/unknown tool).
-        let text_recovery_marker = recovered_markers.remove(tc.id.as_str());
-        let config_snapshot = ctx.config.snapshot();
-        let env = super::tool_dispatch::DispatchEnv {
-            agent,
-            session: &session,
-            model,
-            active_tools: &active_tools,
-            ctx: &ctx,
-            tx,
+    // Phase 4 is Driver-owned. Carry the exact calls and their pinned ordinary
+    // dispatch context across structural transitions. The Driver resumes this
+    // plan before allowing another inference on its owning frame.
+    Ok(TurnOutcome::ScheduledCalls {
+        plan: Box::new(DeferredTurnPlan {
+            continuation_turn_id,
+            scheduler: plan,
+            calls,
+            name_recoveries,
+            recovered_markers,
+            cursor: 0,
+            active_tools,
+            tool_ctx: ctx,
+            session,
+            config,
+            tx: tx.clone(),
             hint_corrections,
             loop_guard_threshold,
-            cwd: &cwd,
-            hooks: config_snapshot.hooks(),
-        };
-        super::tool_dispatch::execute_ordinary_call(
-            &env,
-            history,
-            tc,
-            resolved_name,
-            name_recovery,
-            text_recovery_marker,
-        )
-        .await?;
-    }
-
-    Ok(TurnOutcome::Continue)
+            cwd,
+        }),
+    })
 }
 
 #[cfg(test)]

@@ -1185,6 +1185,44 @@ fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
             .map(|message| message["tool_call_id"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(result_ids, vec!["read-alpha", "read-beta"]);
+
+        // Production Driver durability follows source order too, even if the
+        // read futures complete in the opposite order. Check each durable
+        // lifecycle phase independently; message folding alone would not catch
+        // completion-ordered audit commits.
+        let durable = session_events(&driver).await;
+        for kind in ["tool_call_started", "tool_call", "tool_call_completed"] {
+            assert_eq!(
+                durable
+                    .iter()
+                    .filter(|event| event.kind == kind)
+                    .filter_map(|event| event.call_id.as_deref())
+                    .collect::<Vec<_>>(),
+                vec!["read-alpha", "read-beta"],
+                "{kind} durability must remain in provider source order"
+            );
+        }
+        let continuations = driver
+            .session
+            .db
+            .read({
+                let session_id = driver.session.id;
+                move |conn| crate::db::Db::list_turn_scheduler_continuations_conn(conn, session_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            continuations
+                .iter()
+                .map(|row| row.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read-alpha", "read-beta"]
+        );
+        assert!(
+            continuations
+                .iter()
+                .all(|row| row.terminal_outcome.as_deref() == Some("completed"))
+        );
     });
 }
 

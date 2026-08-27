@@ -9,6 +9,139 @@
 use std::sync::Arc;
 
 use super::*;
+
+#[derive(Debug)]
+pub(crate) struct SchedulerDurableOrder {
+    next_started: std::sync::atomic::AtomicUsize,
+    next_commit: std::sync::atomic::AtomicUsize,
+    released_starts: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    released_commits: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    notify: tokio::sync::Notify,
+}
+
+impl SchedulerDurableOrder {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            next_started: std::sync::atomic::AtomicUsize::new(0),
+            next_commit: std::sync::atomic::AtomicUsize::new(0),
+            released_starts: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            released_commits: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn release(
+        &self,
+        ordinal: usize,
+        counter: &std::sync::atomic::AtomicUsize,
+        released: &std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    ) {
+        let mut released = released.lock().unwrap();
+        released.insert(ordinal);
+        let mut next = counter.load(std::sync::atomic::Ordering::Acquire);
+        while released.remove(&next) {
+            next += 1;
+        }
+        counter.store(next, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_for(
+        counter: &std::sync::atomic::AtomicUsize,
+        ordinal: usize,
+        notify: &tokio::sync::Notify,
+    ) {
+        loop {
+            let notified = notify.notified();
+            if counter.load(std::sync::atomic::Ordering::Acquire) == ordinal {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+pub(crate) struct SchedulerDurablePermit {
+    order: Arc<SchedulerDurableOrder>,
+    ordinal: usize,
+    started_released: bool,
+}
+
+impl SchedulerDurablePermit {
+    pub(crate) fn new(order: Arc<SchedulerDurableOrder>, ordinal: usize) -> Self {
+        Self {
+            order,
+            ordinal,
+            started_released: false,
+        }
+    }
+
+    async fn await_started(&self) {
+        SchedulerDurableOrder::wait_for(&self.order.next_started, self.ordinal, &self.order.notify)
+            .await;
+    }
+
+    fn release_started(&mut self) {
+        if !self.started_released {
+            self.started_released = true;
+            self.order.release(
+                self.ordinal,
+                &self.order.next_started,
+                &self.order.released_starts,
+            );
+        }
+    }
+
+    async fn await_commit(&mut self) {
+        SchedulerDurableOrder::wait_for(&self.order.next_commit, self.ordinal, &self.order.notify)
+            .await;
+    }
+}
+
+impl Drop for SchedulerDurablePermit {
+    fn drop(&mut self) {
+        self.release_started();
+        // An error can leave before the common durable-commit boundary. Mark
+        // that ordinal released as well so later completed calls never deadlock
+        // behind a cancelled predecessor.
+        self.order.release(
+            self.ordinal,
+            &self.order.next_commit,
+            &self.order.released_commits,
+        );
+    }
+}
+
+tokio::task_local! {
+    static SCHEDULER_DURABLE_PERMIT: Arc<tokio::sync::Mutex<SchedulerDurablePermit>>;
+}
+
+pub(crate) async fn with_scheduler_durable_order<F: std::future::Future>(
+    permit: SchedulerDurablePermit,
+    future: F,
+) -> F::Output {
+    SCHEDULER_DURABLE_PERMIT
+        .scope(Arc::new(tokio::sync::Mutex::new(permit)), future)
+        .await
+}
+
+async fn scheduler_await_started() {
+    if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
+        permit.lock().await.await_started().await;
+    }
+}
+
+async fn scheduler_release_started() {
+    if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
+        permit.lock().await.release_started();
+    }
+}
+
+async fn scheduler_await_commit() {
+    if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
+        permit.lock().await.await_commit().await;
+    }
+}
 use crate::db::needs_attention::{InterruptParkPayload, InterruptResumeAnchor};
 
 pub(crate) struct DispatchEnv<'a> {
@@ -890,6 +1023,11 @@ async fn execute_ordinary_call_unscoped(
         config: &env.ctx.config,
         session_table: tool_session_table.as_ref(),
     };
+    // Parallel calls may finish in any order, but their durable lifecycle
+    // starts and completed audit/event bundles are committed in original
+    // source order. Actual read-only tool execution remains concurrent between
+    // these two short ordering gates.
+    scheduler_await_started().await;
     let mut assistant_seq = None;
     if lifecycle_started {
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
@@ -919,6 +1057,7 @@ async fn execute_ordinary_call_unscoped(
             }
         }
     }
+    scheduler_release_started().await;
     let gate_blocked = gate_block.is_some();
     let repeated_recoverable_tool_call_reject = repeated_recoverable_tool_call.is_some();
     // `permissionDenied` observe-hook classification (Decision 3): a real
@@ -1719,6 +1858,7 @@ async fn execute_ordinary_call_unscoped(
     // trust + table and can never disagree across the intervening awaits (finding
     // 7 TOCTOU / finding r11-3 / decision 12).
     let audit_target_trusted = tool_frame().resolved_trusted();
+    scheduler_await_commit().await;
     if let Err(e) = env
         .session
         .record_tool_call_journaled(

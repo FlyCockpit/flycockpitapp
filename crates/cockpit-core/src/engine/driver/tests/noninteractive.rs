@@ -222,6 +222,55 @@ async fn delegation_retry_budget_bounds_a_spinning_parent() {
     assert!(refusal.contains("task"), "{refusal}");
 }
 
+#[tokio::test]
+async fn scheduler_delegate_probe_is_side_effect_free_until_attempt_admission() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver.reset_delegation_retry_budget();
+    let outcome = crate::engine::agent::TurnOutcome::SpawnNoninteractive {
+        child_agent: "explore".to_string(),
+        prompt: "inspect".to_string(),
+        model: None,
+        remaining_depth: Some(0),
+        why: "scheduler test".to_string(),
+        resume_handle: None,
+        cwd: None,
+        write_scope: None,
+        context: crate::engine::agent::TaskContext::Fresh,
+        granted_tools: Vec::new(),
+        todo_ids: Vec::new(),
+        repair_notes: Vec::new(),
+        task_call_id: "probe-no-consume".to_string(),
+        task_provider_item_id: Some("fc-probe".to_string()),
+        task_function_call_id: Some("fn-probe".to_string()),
+    };
+
+    let mut task = driver
+        .scheduler_probe_task_from_outcome(outcome)
+        .expect("syntax/cwd/recursion probe");
+    let pinned_generation = driver.config.generation();
+    let _ = driver
+        .pin_single_noninteractive_admission(&mut task)
+        .expect("surface probe");
+    assert_eq!(
+        task.execution_surface
+            .as_ref()
+            .expect("ordinary child surface")
+            .config_generation,
+        pinned_generation,
+        "the immutable surface is bound to the generation used by this attempt"
+    );
+
+    // Neither recipe construction nor surface probing consumes the mutable
+    // per-turn retry budget. A dynamic barrier can therefore drain preceding
+    // work before the real admission mutates any delegation authority.
+    for _ in 0..DELEGATION_RETRY_BUDGET_PER_TURN {
+        driver
+            .consume_delegation_retry_budget()
+            .expect("probe left the entire retry budget untouched");
+    }
+    assert!(driver.consume_delegation_retry_budget().is_err());
+}
+
 fn exact_model_selector(model: &str) -> crate::engine::model_roles::DelegationModelSelector {
     crate::engine::model_roles::DelegationModelSelector::Exact {
         selector: format!("lmstudio:{model}"),
@@ -373,6 +422,7 @@ fn single_task(
         task_call_id: task_call_id.to_string(),
         task_provider_item_id: None,
         task_function_call_id: Some(format!("fn-{task_call_id}")),
+        execution_surface: None,
         recovery: None,
     }
 }

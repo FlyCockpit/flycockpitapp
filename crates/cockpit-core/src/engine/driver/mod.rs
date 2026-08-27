@@ -761,6 +761,12 @@ struct ConsumedNodeOverride {
     model: Option<(String, String)>,
 }
 
+struct PendingScheduledTurn {
+    owner_agent_instance_id: Option<uuid::Uuid>,
+    owner_stack_depth: usize,
+    plan: Box<crate::engine::agent::DeferredTurnPlan>,
+}
+
 /// One agent's slice of state on the driver stack.
 pub struct AgentSession {
     pub agent: Arc<Agent>,
@@ -999,6 +1005,11 @@ pub struct Driver {
     /// worker via [`Self::set_config_handle`] before the loop starts.
     config: crate::daemon::session_worker::SessionConfigHandle,
     pub stack: Vec<AgentSession>,
+    /// Source-order tool-call plans waiting behind Driver structural
+    /// transitions. The owner identity prevents an interactive child from
+    /// consuming its parent's continuation; nested parent/child plans coexist
+    /// and each resumes only when its exact frame is active again.
+    pending_scheduled_turn: Vec<PendingScheduledTurn>,
     /// Completion acknowledgements for durable late steers queued for an exact
     /// interactive target. Keyed by the queue item's UUID, so a reused display
     /// name or queue target can never settle the wrong agent-instance claim.
@@ -1736,6 +1747,49 @@ fn subagent_routing_event_data(
 const JOB_CHANNEL_CAPACITY: usize = 256;
 
 impl Driver {
+    /// Build the Driver authority used by a detached/nested turn loop to drain
+    /// one provider-emitted scheduler plan.  This is deliberately a real
+    /// Driver rather than an ordinary-tool shortcut: delegate admission, durable
+    /// lifecycle publication, completion routing, and source-order settlement
+    /// all remain owned by the same production funnels as the foreground loop.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_nested_turn_plans(
+        session: Arc<Session>,
+        locks: Arc<crate::locks::LockManager>,
+        redact: Arc<RedactionTable>,
+        cwd: std::path::PathBuf,
+        agent: Arc<Agent>,
+        config: crate::daemon::session_worker::SessionConfigHandle,
+        agent_instance_id: Option<uuid::Uuid>,
+        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+        approver: Option<Arc<crate::approval::Approver>>,
+        resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+        local_installations: crate::agents::LocalInstallationResolver,
+        tandem: Option<crate::engine::schedule::TandemSet>,
+    ) -> Self {
+        let mut driver = Self::with_max_schedules_inner(
+            session,
+            locks,
+            redact,
+            cwd,
+            agent,
+            crate::engine::schedule::DEFAULT_MAX_CONCURRENT_SCHEDULES,
+            false,
+        );
+        driver.set_config_handle(config);
+        if let Some(agent_instance_id) = agent_instance_id {
+            driver.set_root_agent_instance_id(agent_instance_id);
+        }
+        driver.interrupts = interrupts;
+        driver.approver = approver;
+        driver.resource_scheduler = resource_scheduler;
+        driver.set_vnext_local_installation_resolver(local_installations);
+        if let Some(tandem) = tandem {
+            driver.tandem_set = tandem;
+        }
+        driver
+    }
+
     async fn emit_subagent_routing_amend(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
@@ -1827,6 +1881,7 @@ impl Driver {
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
+            local_installations: self.vnext_local_installation_resolver.clone(),
             agent: self.stack[0].agent.clone(),
             write_scope: self.write_scope.clone(),
         };
@@ -1869,6 +1924,7 @@ impl Driver {
             // The foreground driver owns the durable steer claims.  A
             // background clone must not inherit, acknowledge, or reroute them.
             pending_late_user_steer_acks: std::collections::HashMap::new(),
+            pending_scheduled_turn: Vec::new(),
             late_steer_continuation_outcome: None,
             recovered_interactive_continuations: std::collections::HashMap::new(),
             recovered_interactive_late_steer_continuations: std::collections::HashMap::new(),
@@ -2151,6 +2207,26 @@ impl Driver {
         root: Arc<Agent>,
         max_concurrent_schedules: usize,
     ) -> Self {
+        Self::with_max_schedules_inner(
+            session,
+            locks,
+            redact,
+            cwd,
+            root,
+            max_concurrent_schedules,
+            true,
+        )
+    }
+
+    fn with_max_schedules_inner(
+        session: Arc<Session>,
+        locks: Arc<crate::locks::LockManager>,
+        redact: Arc<RedactionTable>,
+        cwd: std::path::PathBuf,
+        root: Arc<Agent>,
+        max_concurrent_schedules: usize,
+        publish_active_tools: bool,
+    ) -> Self {
         let (job_event_tx, job_event_rx) = mpsc::channel::<ScheduleEvent>(JOB_CHANNEL_CAPACITY);
         let (job_cmd_tx, job_cmd_rx) = mpsc::channel::<ScheduleCommand>(JOB_CHANNEL_CAPACITY);
         let (noninteractive_complete_tx, noninteractive_complete_rx) =
@@ -2161,6 +2237,7 @@ impl Driver {
             redact: redact.clone(),
             cwd: cwd.clone(),
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: root.clone(),
             // Installed later by `set_write_scope_source`; the authority's copy
             // is updated through the same setter.
@@ -2180,10 +2257,12 @@ impl Driver {
             max_concurrent_schedules,
         );
         let initial_tools = root.tools.clone();
-        session.set_active_tool_names(
-            initial_tools.names(),
-            crate::engine::tool::Capability::SandboxEscalate.enabled(&root.posture),
-        );
+        if publish_active_tools {
+            session.set_active_tool_names(
+                initial_tools.names(),
+                crate::engine::tool::Capability::SandboxEscalate.enabled(&root.posture),
+            );
+        }
         Self {
             session,
             locks,
@@ -2205,6 +2284,7 @@ impl Driver {
                 stop_gate: crate::engine::agent::hooks::StopGateState::default(),
             }],
             pending_late_user_steer_acks: std::collections::HashMap::new(),
+            pending_scheduled_turn: Vec::new(),
             late_steer_continuation_outcome: None,
             recovered_interactive_continuations: std::collections::HashMap::new(),
             recovered_interactive_late_steer_continuations: std::collections::HashMap::new(),
@@ -2720,6 +2800,7 @@ impl Driver {
         &mut self,
         resolver: crate::agents::LocalInstallationResolver,
     ) {
+        self.schedule.set_local_installations(resolver.clone());
         self.vnext_local_installation_resolver = resolver;
     }
 
@@ -9075,6 +9156,10 @@ impl Driver {
         reason: StackUnwindReason,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
+        // The in-memory plan belongs to the cancelled/failed working span.
+        // Durable scheduler ownership remains in the session log so live/resume
+        // pairing can settle every unexecuted source id exactly once.
+        self.pending_scheduled_turn.clear();
         while self.stack.len() > 1 {
             let popped_depth = self.stack.len();
             let child = self
@@ -9408,6 +9493,56 @@ impl Driver {
         if result.is_ok() {
             self.acknowledge_interrupted_turns_after_progress().await;
         }
+        result
+    }
+
+    fn active_pending_scheduled_turn_index(&self) -> Option<usize> {
+        let stack_depth = self.stack.len();
+        let agent_instance_id = self.stack.last().and_then(|frame| frame.agent_instance_id);
+        self.pending_scheduled_turn.iter().rposition(|pending| {
+            pending.owner_stack_depth == stack_depth
+                && pending.owner_agent_instance_id == agent_instance_id
+        })
+    }
+
+    pub(crate) async fn advance_driver_owned_turn_plan_in_history(
+        &mut self,
+        plan: &mut crate::engine::agent::DeferredTurnPlan,
+        agent: &Agent,
+        history: &mut Vec<Message>,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<TurnOutcome> {
+        loop {
+            let outcome = plan.advance_for_driver(agent, history).await?;
+            match outcome {
+                TurnOutcome::ScheduledParallelLane { lane } => {
+                    if let Err(error) = self
+                        .run_deferred_parallel_lane(*lane, history, tx, cancel.clone())
+                        .await
+                    {
+                        plan.settle_unreachable_remainder(history).await;
+                        return Err(error);
+                    }
+                }
+                outcome => return Ok(outcome),
+            }
+        }
+    }
+
+    async fn advance_driver_owned_turn_plan(
+        &mut self,
+        plan: &mut crate::engine::agent::DeferredTurnPlan,
+        agent: &Agent,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<TurnOutcome> {
+        let mut history =
+            std::mem::take(&mut self.stack.last_mut().expect("stack never empty").history);
+        let result = self
+            .advance_driver_owned_turn_plan_in_history(plan, agent, &mut history, tx, cancel)
+            .await;
+        self.stack.last_mut().expect("stack never empty").history = history;
         result
     }
 
@@ -10333,7 +10468,11 @@ impl Driver {
             // Cache-aware auto-prune (GOALS §10): before talking to the
             // model, if the cache is cold and the foreground history has
             // grown something prunable, collapse it for free.
-            self.maybe_auto_prune(tx).await;
+            let active_frame_has_scheduled_turn =
+                self.active_pending_scheduled_turn_index().is_some();
+            if !active_frame_has_scheduled_turn {
+                self.maybe_auto_prune(tx).await;
+            }
 
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
@@ -10346,6 +10485,38 @@ impl Driver {
             // injects. Subagents (stack depth > 1) recompose a fresh system
             // prompt on spawn, so they skip it.
             let is_root = self.stack.len() == 1;
+            let scheduled_turn_result = if let Some(pending_index) =
+                self.active_pending_scheduled_turn_index()
+            {
+                let mut pending = self.pending_scheduled_turn.remove(pending_index);
+                // The preceding Driver transition produced this paired result.
+                // Fold it before advancing the next source position; never send
+                // it to a provider while the scheduler still owns calls.
+                self.stack
+                    .last_mut()
+                    .expect("stack never empty")
+                    .history
+                    .push(next_prompt.clone());
+                let result = self
+                    .advance_driver_owned_turn_plan(&mut pending.plan, &agent, tx, cancel.clone())
+                    .await;
+                let waits_for_driver_result = matches!(
+                    &result,
+                    Ok(outcome)
+                        if !matches!(
+                            outcome,
+                            TurnOutcome::Continue
+                                | TurnOutcome::Done
+                                | TurnOutcome::Return { .. }
+                        )
+                );
+                if !pending.plan.is_finished() || waits_for_driver_result {
+                    self.pending_scheduled_turn.push(pending);
+                }
+                Some(result)
+            } else {
+                None
+            };
             // Per-turn backup-model fallback (`per-model-backup-
             // fallback.md`): resolved fresh every turn, primary-first. Keyed by
             // the running agent's exact `(provider, model)` so the same
@@ -10359,7 +10530,11 @@ impl Driver {
             // before. This is the bridge from the steer checkpoint to the
             // external-journal before-handoff fence: a crash/recovery cannot
             // dispatch its provider turn a second time under a new UUID.
-            let late_user_steer_continuation_id = late_user_steer_first_call_id.take();
+            let late_user_steer_continuation_id = if scheduled_turn_result.is_none() {
+                late_user_steer_first_call_id.take()
+            } else {
+                None
+            };
             let call_id = late_user_steer_continuation_id.unwrap_or_else(uuid::Uuid::new_v4);
             let context_usage = self.context_usage_snapshot();
 
@@ -10383,13 +10558,17 @@ impl Driver {
             // provider handoff.  A later QuestionTool park must recover the
             // same no-redelivery checkpoint instead of falling back to a
             // fresh user-body injection after restart.
-            self.persist_active_interactive_task_snapshot(
-                &next_prompt,
-                late_user_steer_permit.map(|permit| permit.continuation_id),
-            )
-            .await?;
+            if scheduled_turn_result.is_none() {
+                self.persist_active_interactive_task_snapshot(
+                    &next_prompt,
+                    late_user_steer_permit.map(|permit| permit.continuation_id),
+                )
+                .await?;
+            }
             // Run-invocation turn reservation: exact N max, terminal before N+1.
-            if let Some(run_id) = run_invocation_id {
+            if scheduled_turn_result.is_none()
+                && let Some(run_id) = run_invocation_id
+            {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
@@ -10470,7 +10649,9 @@ impl Driver {
                     }
                 }
             }
-            let turn_result = {
+            let turn_result = if let Some(result) = scheduled_turn_result {
+                result
+            } else {
                 let top = self.stack.last_mut().expect("stack never empty");
                 // The foreground frame's deferred-log buffer (`plan.md §3d`):
                 // a subagent's `defer_to_orchestrator` calls land here, and
@@ -10548,7 +10729,7 @@ impl Driver {
             // the primary running. Draining here makes ctrl+c a reliable return
             // to idle for the queued-but-not-yet-dispatched state too. The TUI
             // clears its mirror of the queue on the same ctrl+c.
-            let outcome = match turn_result {
+            let mut outcome = match turn_result {
                 Ok(outcome) => outcome,
                 Err(e) if crate::engine::interrupt::is_parked(&e) => {
                     tracing::info!(agent = %agent.name, "turn paused on parked interrupt");
@@ -10700,6 +10881,32 @@ impl Driver {
                     return Err(e);
                 }
             };
+
+            // The inference result carries an opaque plan rather than
+            // dispatching tools inside the agent layer. Advance it immediately
+            // until it reaches a Driver structural transition or exhausts all
+            // calls. A remainder is bound to this exact frame and survives an
+            // interactive child push/pop.
+            while let TurnOutcome::ScheduledCalls { plan } = outcome {
+                let owner_agent_instance_id =
+                    self.stack.last().and_then(|frame| frame.agent_instance_id);
+                let owner_stack_depth = self.stack.len();
+                let mut plan = plan;
+                outcome = self
+                    .advance_driver_owned_turn_plan(&mut plan, &agent, tx, cancel.clone())
+                    .await?;
+                let waits_for_driver_result = !matches!(
+                    &outcome,
+                    TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
+                );
+                if !plan.is_finished() || waits_for_driver_result {
+                    self.pending_scheduled_turn.push(PendingScheduledTurn {
+                        owner_agent_instance_id,
+                        owner_stack_depth,
+                        plan,
+                    });
+                }
+            }
 
             // Inference boundary (implementation note):
             // a turn just completed. Persist the root frame's prune ledger
@@ -11524,32 +11731,38 @@ impl Driver {
                         );
                         continue;
                     }
-                    next_prompt = self
-                        .run_single_noninteractive_task_backgroundable(
-                            SingleNoninteractiveTask {
-                                child_agent,
-                                brief,
-                                model,
-                                remaining_depth,
-                                why,
-                                resume_handle,
-                                child_cwd,
-                                context,
-                                write_scope,
-                                granted_tools,
-                                todo_ids,
-                                child_recursion,
-                                repair_notes,
-                                task_call_id,
-                                task_provider_item_id,
-                                task_function_call_id,
-                                recovery: None,
-                            },
+                    let task = SingleNoninteractiveTask {
+                        child_agent,
+                        brief,
+                        model,
+                        remaining_depth,
+                        why,
+                        resume_handle,
+                        child_cwd,
+                        context,
+                        write_scope,
+                        granted_tools,
+                        todo_ids,
+                        child_recursion,
+                        repair_notes,
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        execution_surface: None,
+                        recovery: None,
+                    };
+                    next_prompt = if self.active_pending_scheduled_turn_index().is_some() {
+                        self.run_single_noninteractive_task_scheduled(task, tx, cancel.clone())
+                            .await?
+                    } else {
+                        self.run_single_noninteractive_task_backgroundable(
+                            task,
                             input_rx,
                             tx,
                             cancel.clone(),
                         )
-                        .await?;
+                        .await?
+                    };
                     continue;
                 }
                 TurnOutcome::SpawnNoninteractiveBatch {
@@ -11909,6 +12122,9 @@ impl Driver {
                         output,
                     );
                     continue;
+                }
+                TurnOutcome::ScheduledCalls { .. } | TurnOutcome::ScheduledParallelLane { .. } => {
+                    unreachable!("scheduled calls are normalized before Driver dispatch")
                 }
             }
         }

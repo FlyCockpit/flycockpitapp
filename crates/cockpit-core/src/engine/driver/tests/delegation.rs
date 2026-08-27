@@ -651,6 +651,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         task_call_id: "task-resolved-cwd".to_string(),
         task_provider_item_id: None,
         task_function_call_id: Some("fn-task-resolved-cwd".to_string()),
+        execution_surface: None,
         recovery: None,
     };
 

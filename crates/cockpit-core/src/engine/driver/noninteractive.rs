@@ -634,10 +634,20 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) task_call_id: String,
     pub(in crate::engine::driver) task_provider_item_id: Option<String>,
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
+    /// The immutable child surface resolved from the exact config generation
+    /// pinned at this attempt's start. `None` is reserved for docs (whose
+    /// embedded resolver model is preflighted separately) and crash recovery.
+    pub(in crate::engine::driver) execution_surface:
+        Option<crate::engine::builtin::ResolvedChildExecutionSurface>,
     /// Present only when this exact durable executor is reconstructed after a
     /// worker crash.  The snapshot owns the real next `Message`; no recovery
     /// path projects it through text or replays the original task payload.
     pub(in crate::engine::driver) recovery: Option<RecoveredNoninteractiveTaskState>,
+}
+
+struct SingleDelegationAdmission {
+    surface: Option<crate::engine::builtin::ResolvedChildExecutionSurface>,
+    concurrently_admissible: bool,
 }
 
 pub(in crate::engine::driver) struct RecoveredNoninteractiveTaskState {
@@ -848,6 +858,12 @@ pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
     pub(in crate::engine::driver) shrink: Option<PendingDelegationShrink>,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
     pub(in crate::engine::driver) child_routing: Option<ChildRoutingMetadata>,
+}
+
+struct SchedulerLaneSettled {
+    messages: Vec<Message>,
+    terminal_record: crate::engine::agent::DeferredSchedulerTerminalRecord,
+    terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome,
 }
 
 pub(in crate::engine::driver) struct BatchNoninteractiveTask {
@@ -1278,7 +1294,7 @@ impl Driver {
     fn preflight_single_delegation(
         &self,
         task: &SingleNoninteractiveTask,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<SingleDelegationAdmission, String> {
         let scope = resolve_write_scope(
             task.write_scope.as_deref(),
             &task.child_cwd.resolved,
@@ -1295,6 +1311,10 @@ impl Driver {
             );
             crate::engine::builtin::resolve_child_model("docs-resolver", &docs_args)
                 .map_err(|e| format!("Error: {e:#}"))?;
+            Ok(SingleDelegationAdmission {
+                surface: None,
+                concurrently_admissible: false,
+            })
         } else {
             let args = self.spawn_args_delegated_in_cwd_scoped(
                 &task.child_cwd.resolved,
@@ -1307,10 +1327,16 @@ impl Driver {
                     write_scope: scope,
                 },
             );
-            crate::engine::builtin::resolve_child_execution_surface(&task.child_agent, &args)
-                .map_err(|e| format!("Error: {e:#}"))?;
+            let surface =
+                crate::engine::builtin::resolve_child_execution_surface(&task.child_agent, &args)
+                    .map_err(|e| format!("Error: {e:#}"))?;
+            let concurrently_admissible =
+                crate::engine::builtin::batch_child_concurrently_admissible(&surface, false);
+            Ok(SingleDelegationAdmission {
+                surface: Some(surface),
+                concurrently_admissible,
+            })
         }
-        Ok(())
     }
 
     /// Validate ONE batch entry's child (or docs-stage) model, side-effect-free —
@@ -1556,6 +1582,7 @@ impl Driver {
                 .get("function_call_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            execution_surface: None,
             recovery: Some(RecoveredNoninteractiveTaskState {
                 agent_instance_id: recovery.agent_instance_id,
                 label: recovery.label,
@@ -1696,6 +1723,7 @@ impl Driver {
                 .get("function_call_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            execution_surface: None,
             recovery: Some(RecoveredNoninteractiveTaskState {
                 agent_instance_id: recovery.agent_instance_id,
                 label: recovery.label,
@@ -2150,33 +2178,67 @@ impl Driver {
         Ok(())
     }
 
-    pub(in crate::engine::driver) async fn run_single_noninteractive_task_backgroundable(
+    /// Pin the current generation and resolve the exact immutable execution
+    /// surface without publishing any lifecycle state. A mixed scheduler lane
+    /// uses the returned closed admission bit to decide whether earlier work
+    /// must drain before this call starts.
+    pub(in crate::engine::driver) fn pin_single_noninteractive_admission(
         &mut self,
-        mut task: SingleNoninteractiveTask,
-        input_rx: &crate::engine::message::UserSubmissionQueue,
+        task: &mut SingleNoninteractiveTask,
+    ) -> std::result::Result<bool, String> {
+        self.config = self.config.repin();
+        let admission = self.preflight_single_delegation(task)?;
+        let concurrently_admissible = admission.concurrently_admissible;
+        task.execution_surface = admission.surface;
+        Ok(concurrently_admissible)
+    }
+
+    pub(in crate::engine::driver) async fn start_prepared_single_noninteractive_task(
+        &mut self,
+        task: SingleNoninteractiveTask,
+        concurrently_admissible: bool,
         tx: &mpsc::Sender<TurnEvent>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Message> {
+    ) -> Result<Option<Message>> {
         // FAIL CLOSED before ANY task persist / registration / lifecycle mutation:
         // validate the child's execution surface from its OWN selected model. An
         // unresolvable child model (or docs-stage model) returns the content-safe
         // routing error having persisted no task delegation, registered no running
         // child, spawned nothing, and dispatched no inference.
-        if let Err(err) = self.preflight_single_delegation(&task) {
-            return Ok(
-                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                    task.task_call_id.clone(),
-                    task.task_provider_item_id.clone(),
-                    task.task_function_call_id.clone(),
-                    "task",
-                    prepend_task_repair_notes(err, &task.repair_notes),
-                ),
-            );
+        // Pin from the current shared generation at the actual attempt start.
+        // The same pinned handle is cloned into the runner below. A refresh
+        // that landed while this call waited behind a barrier is therefore
+        // reflected before admission/lifecycle mutation.
+        debug_assert!(
+            task.execution_surface.is_some()
+                || task.child_agent == "docs"
+                || task.recovery.is_some(),
+            "fresh delegated attempt must carry its pinned execution surface"
+        );
+        if let Err(error) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCallScheduling,
+                self.stack.last().map(|frame| frame.agent.name.as_str()),
+                Some(&task.task_call_id),
+                &serde_json::json!({
+                    "call_id": task.task_call_id,
+                    "lane": if concurrently_admissible { "parallel_lane" } else { "serial_barrier" },
+                    "reason": if concurrently_admissible { "read_only_delegate" } else { "delegate_not_concurrently_admissible" },
+                    "admission": {
+                        "kind": "resolved_child_execution_surface",
+                        "config_generation": self.config.generation(),
+                    },
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%error, call_id = %task.task_call_id, "record delegate scheduler admission failed");
         }
         let vnext_admissions = match self.admit_current_vnext_children(1) {
             Ok(permits) => permits,
             Err(err) => {
-                return Ok(
+                return Ok(Some(
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task.task_call_id.clone(),
                         task.task_provider_item_id.clone(),
@@ -2184,7 +2246,7 @@ impl Driver {
                         "task",
                         prepend_task_repair_notes(err, &task.repair_notes),
                     ),
-                );
+                ));
             }
         };
         let task_call_id = task.task_call_id.clone();
@@ -2251,7 +2313,7 @@ impl Driver {
             }
             Err(e) => {
                 tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
-                return Ok(
+                return Ok(Some(
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
                         task_provider_item_id,
@@ -2262,7 +2324,7 @@ impl Driver {
                             &task.repair_notes,
                         ),
                     ),
-                );
+                ));
             }
         }
         // Publishing a task child is a two-phase durability boundary: create
@@ -2287,7 +2349,7 @@ impl Driver {
                 Ok(delivery) => delivery,
                 Err(error) => {
                     tracing::warn!(%error, %task_call_id, "preparing initial task continuation failed");
-                    return Ok(
+                    return Ok(Some(
                         crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id,
@@ -2298,7 +2360,7 @@ impl Driver {
                                 &task.repair_notes,
                             ),
                         ),
-                    );
+                    ));
                 }
             }
         };
@@ -2309,7 +2371,7 @@ impl Driver {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(%error, %task_call_id, "serializing initial task continuation failed");
-                return Ok(
+                return Ok(Some(
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
                         task_provider_item_id,
@@ -2320,14 +2382,14 @@ impl Driver {
                             &task.repair_notes,
                         ),
                     ),
-                );
+                ));
             }
         };
         let Some(parent_agent_instance_id) =
             self.stack.last().and_then(|frame| frame.agent_instance_id)
         else {
             tracing::warn!(%task_call_id, "single task has no durable parent agent");
-            return Ok(
+            return Ok(Some(
                 crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                     task_call_id,
                     task_provider_item_id,
@@ -2338,7 +2400,7 @@ impl Driver {
                         &task.repair_notes,
                     ),
                 ),
-            );
+            ));
         };
         if let Err(error) = self
             .session
@@ -2356,7 +2418,7 @@ impl Driver {
             .await
         {
             tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
-            return Ok(
+            return Ok(Some(
                 crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                     task_call_id,
                     task_provider_item_id,
@@ -2367,7 +2429,7 @@ impl Driver {
                         &task.repair_notes,
                     ),
                 ),
-            );
+            ));
         }
         self.noninteractive_delegations.register_running(
             &task_call_id,
@@ -2419,6 +2481,544 @@ impl Driver {
                 handle,
             },
         );
+        Ok(None)
+    }
+
+    async fn prepare_and_start_single_noninteractive_task(
+        &mut self,
+        mut task: SingleNoninteractiveTask,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<Message>> {
+        let concurrently_admissible = match self.pin_single_noninteractive_admission(&mut task) {
+            Ok(admissible) => admissible,
+            Err(error) => {
+                return Ok(Some(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task.task_call_id.clone(),
+                        task.task_provider_item_id.clone(),
+                        task.task_function_call_id.clone(),
+                        "task",
+                        prepend_task_repair_notes(error, &task.repair_notes),
+                    ),
+                ));
+            }
+        };
+        self.start_prepared_single_noninteractive_task(task, concurrently_admissible, tx, cancel)
+            .await
+    }
+
+    /// Scheduler-owned delegates may not consume or background a queued user
+    /// submission between sibling calls from the same provider turn. Start the
+    /// durable child, then await/finalize its exact completion while the source
+    /// order barrier remains closed.
+    pub(in crate::engine::driver) async fn run_single_noninteractive_task_scheduled(
+        &mut self,
+        task: SingleNoninteractiveTask,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message> {
+        let task_call_id = task.task_call_id.clone();
+        if let Some(settled) = self
+            .prepare_and_start_single_noninteractive_task(task, tx, cancel)
+            .await?
+        {
+            return Ok(settled);
+        }
+        let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
+        let delivery = self
+            .finalize_background_noninteractive_completion(completion, tx)
+            .await?;
+        self.reap_finished_noninteractive_jobs();
+        Ok(delivery.into_inline_message())
+    }
+
+    /// Convert syntax-owned structural data into a side-effect-free admission
+    /// probe. Retry budget consumption and grant resolution are deliberately
+    /// deferred until the lane has decided whether this source position is a
+    /// barrier and, when it is, all earlier work has drained.
+    pub(in crate::engine::driver) fn scheduler_probe_task_from_outcome(
+        &mut self,
+        outcome: crate::engine::agent::TurnOutcome,
+    ) -> std::result::Result<SingleNoninteractiveTask, Message> {
+        let crate::engine::agent::TurnOutcome::SpawnNoninteractive {
+            child_agent,
+            prompt: brief,
+            model,
+            remaining_depth,
+            why,
+            resume_handle,
+            cwd,
+            write_scope,
+            context,
+            granted_tools,
+            todo_ids,
+            repair_notes,
+            task_call_id,
+            task_provider_item_id,
+            task_function_call_id,
+        } = outcome
+        else {
+            return Err(Message::user(
+                "Error: scheduler delegate candidate did not resolve to a noninteractive task",
+            ));
+        };
+        let refusal = |body: String| {
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                task_call_id.clone(),
+                task_provider_item_id.clone(),
+                task_function_call_id.clone(),
+                "task",
+                prepend_task_repair_notes(body, &repair_notes),
+            )
+        };
+        let child_recursion =
+            match self.resolve_task_recursion(&child_agent, remaining_depth, &model) {
+                Ok(context) => context,
+                Err(error) => return Err(refusal(error)),
+            };
+        let child_cwd = match self.resolve_child_cwd(cwd.as_deref()) {
+            Ok(child_cwd) => child_cwd,
+            Err(error) => return Err(refusal(error)),
+        };
+        Ok(SingleNoninteractiveTask {
+            child_agent,
+            brief,
+            model,
+            remaining_depth,
+            why,
+            resume_handle,
+            child_cwd,
+            context,
+            write_scope,
+            granted_tools,
+            todo_ids,
+            child_recursion,
+            repair_notes,
+            task_call_id,
+            task_provider_item_id,
+            task_function_call_id,
+            execution_surface: None,
+            recovery: None,
+        })
+    }
+
+    async fn admit_scheduler_probe_task(
+        &mut self,
+        task: &SingleNoninteractiveTask,
+    ) -> std::result::Result<(), Message> {
+        let refusal = |body: String| {
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                task.task_call_id.clone(),
+                task.task_provider_item_id.clone(),
+                task.task_function_call_id.clone(),
+                "task",
+                prepend_task_repair_notes(body, &task.repair_notes),
+            )
+        };
+        if let Err(error) = self.consume_delegation_retry_budget() {
+            return Err(refusal(error));
+        }
+        let parent_agent = self.stack.last().unwrap().agent.name.clone();
+        let parent_vnext_grant = self
+            .stack
+            .last()
+            .and_then(|frame| frame.agent.vnext_grant.clone());
+        if let Some(error) = grant_rejection(GrantRejectionInput {
+            parent_cwd: &self.cwd,
+            cwd: &task.child_cwd.resolved,
+            config: &self.config,
+            parent_agent: &parent_agent,
+            parent_vnext_grant: parent_vnext_grant.as_ref(),
+            child_agent: &task.child_agent,
+            grant: &task.granted_tools,
+            assistant_db: &self.session.db,
+            local_installations: &self.vnext_local_installation_resolver,
+        })
+        .await
+        {
+            return Err(refusal(error));
+        }
+        Ok(())
+    }
+
+    async fn await_one_scheduler_lane_completion(
+        &mut self,
+        ordinary_rx: &mut mpsc::Receiver<(usize, SchedulerLaneSettled, Option<anyhow::Error>)>,
+        ordinary_active: &mut usize,
+        delegates: &mut std::collections::HashMap<
+            String,
+            (usize, crate::engine::agent::DeferredDelegateCall),
+        >,
+        results: &mut std::collections::BTreeMap<usize, SchedulerLaneSettled>,
+        errors: &mut std::collections::BTreeMap<usize, anyhow::Error>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let pending_delegate_id = delegates
+            .keys()
+            .find(|call_id| {
+                self.pending_noninteractive_completions
+                    .iter()
+                    .any(|completion| completion.task_call_id() == call_id.as_str())
+            })
+            .cloned();
+        let completion = pending_delegate_id
+            .as_deref()
+            .and_then(|call_id| self.take_pending_noninteractive_completion(call_id));
+
+        enum Ready {
+            Ordinary((usize, SchedulerLaneSettled, Option<anyhow::Error>)),
+            Delegate(Option<BackgroundNoninteractiveCompletion>),
+        }
+        let ready = if let Some(completion) = completion {
+            Ready::Delegate(Some(completion))
+        } else {
+            tokio::select! {
+                ordinary = ordinary_rx.recv(), if *ordinary_active > 0 => {
+                    match ordinary {
+                        Some(completion) => Ready::Ordinary(completion),
+                        None => Ready::Delegate(None),
+                    }
+                }
+                delegate = self.noninteractive_complete_rx.recv(), if !delegates.is_empty() => {
+                    Ready::Delegate(delegate)
+                }
+            }
+        };
+        match ready {
+            Ready::Ordinary((source_index, settled, error)) => {
+                *ordinary_active = ordinary_active.saturating_sub(1);
+                results.insert(source_index, settled);
+                if let Some(error) = error {
+                    errors.insert(source_index, error);
+                }
+            }
+            Ready::Delegate(Some(completion)) => {
+                let task_call_id = completion.task_call_id().to_string();
+                let Some((source_index, delegate)) = delegates.remove(&task_call_id) else {
+                    self.pending_noninteractive_completions
+                        .push_back(completion);
+                    return;
+                };
+                match self
+                    .finalize_background_noninteractive_completion(Some(completion), tx)
+                    .await
+                {
+                    Ok(delivery) => {
+                        results.insert(source_index, SchedulerLaneSettled {
+                            messages: vec![delivery.into_inline_message()],
+                            terminal_record: delegate.terminal_record(),
+                            terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Completed,
+                        });
+                    }
+                    Err(error) => {
+                        results.insert(source_index, SchedulerLaneSettled {
+                            messages: vec![delegate.interrupted_message()],
+                            terminal_record: delegate.terminal_record(),
+                            terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                        });
+                        errors.insert(source_index, error);
+                    }
+                }
+                self.reap_finished_noninteractive_jobs();
+            }
+            Ready::Delegate(None) => {
+                *ordinary_active = 0;
+                let first_source_index = delegates
+                    .values()
+                    .map(|(source_index, _)| *source_index)
+                    .min()
+                    .unwrap_or(usize::MAX);
+                for (_, (source_index, delegate)) in delegates.drain() {
+                    results.insert(source_index, SchedulerLaneSettled {
+                        messages: vec![delegate.interrupted_message()],
+                        terminal_record: delegate.terminal_record(),
+                        terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                    });
+                }
+                errors.insert(
+                    first_source_index,
+                    anyhow::anyhow!("scheduler delegate completion channel closed"),
+                );
+            }
+        }
+    }
+
+    /// Execute one mixed source-order lane. Ordinary calls and delegates share
+    /// the same FIFO `max_parallel` bound. Delegate admission is resolved only
+    /// when its source position reaches the start boundary; a non-admissible
+    /// surface drains all earlier work and runs exclusively as a barrier.
+    pub(in crate::engine::driver) async fn run_deferred_parallel_lane(
+        &mut self,
+        lane: crate::engine::agent::DeferredParallelLane,
+        history: &mut Vec<Message>,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let max_parallel = lane.max_parallel.max(1);
+        let (ordinary_tx, mut ordinary_rx) = mpsc::channel(max_parallel);
+        let mut ordinary_active = 0usize;
+        let mut delegates = std::collections::HashMap::<
+            String,
+            (usize, crate::engine::agent::DeferredDelegateCall),
+        >::new();
+        let mut results = std::collections::BTreeMap::<usize, SchedulerLaneSettled>::new();
+        let mut errors = std::collections::BTreeMap::<usize, anyhow::Error>::new();
+
+        for call in lane.calls {
+            while ordinary_active + delegates.len() >= max_parallel {
+                self.await_one_scheduler_lane_completion(
+                    &mut ordinary_rx,
+                    &mut ordinary_active,
+                    &mut delegates,
+                    &mut results,
+                    &mut errors,
+                    tx,
+                )
+                .await;
+            }
+
+            match call {
+                crate::engine::agent::DeferredParallelCall::Ordinary(call) => {
+                    let source_index = call.source_index();
+                    let completion_tx = ordinary_tx.clone();
+                    ordinary_active += 1;
+                    tokio::spawn(async move {
+                        let (messages, error, terminal_record, terminal) = call.execute().await;
+                        let _ = completion_tx
+                            .send((
+                                source_index,
+                                SchedulerLaneSettled {
+                                    messages,
+                                    terminal_record,
+                                    terminal,
+                                },
+                                error,
+                            ))
+                            .await;
+                    });
+                }
+                crate::engine::agent::DeferredParallelCall::Delegate(delegate) => {
+                    let source_index = delegate.source_index;
+                    let call_id = delegate.call_id.clone();
+                    // This exact FIFO source position is now ready. Repin before
+                    // even resolving the structural delegate recipe; no later
+                    // candidate is selected/built ahead of a discovered barrier.
+                    self.config = self.config.repin();
+                    let resolved_outcome = match delegate.resolve_outcome(&self.config).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![delegate.interrupted_message()],
+                                terminal_record: delegate.terminal_record(),
+                                terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                            });
+                            errors.insert(source_index, error);
+                            continue;
+                        }
+                    };
+                    let outcome = match resolved_outcome {
+                        crate::engine::agent::TurnOutcome::ToolResult {
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            body,
+                        } => {
+                            let terminal = if body.trim_start().starts_with("Error:") {
+                                crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused
+                            } else {
+                                crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Completed
+                            };
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                    task_call_id,
+                                    task_provider_item_id,
+                                    task_function_call_id,
+                                    "task",
+                                    body,
+                                )],
+                                terminal_record: delegate.terminal_record(),
+                                terminal,
+                            });
+                            continue;
+                        }
+                        outcome => outcome,
+                    };
+                    if !matches!(
+                        &outcome,
+                        crate::engine::agent::TurnOutcome::SpawnNoninteractive { .. }
+                    ) {
+                        results.insert(source_index, SchedulerLaneSettled {
+                            messages: vec![delegate.interrupted_message()],
+                            terminal_record: delegate.terminal_record(),
+                            terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                        });
+                        errors.insert(
+                            source_index,
+                            anyhow::anyhow!(
+                                "scheduler delegate candidate changed structural mode before admission"
+                            ),
+                        );
+                        continue;
+                    }
+                    let mut task = match self.scheduler_probe_task_from_outcome(outcome) {
+                        Ok(task) => task,
+                        Err(message) => {
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![message],
+                                terminal_record: delegate.terminal_record(),
+                                terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                            });
+                            continue;
+                        }
+                    };
+                    let mut concurrently_admissible = match self
+                        .pin_single_noninteractive_admission(&mut task)
+                    {
+                        Ok(admissible) => admissible,
+                        Err(error) => {
+                            results.insert(source_index, SchedulerLaneSettled {
+                                    messages: vec![crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                        task.task_call_id.clone(),
+                                        task.task_provider_item_id.clone(),
+                                        task.task_function_call_id.clone(),
+                                        "task",
+                                        prepend_task_repair_notes(error, &task.repair_notes),
+                                    )],
+                                    terminal_record: delegate.terminal_record(),
+                                    terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                                });
+                            continue;
+                        }
+                    };
+                    if !concurrently_admissible {
+                        while ordinary_active > 0 || !delegates.is_empty() {
+                            self.await_one_scheduler_lane_completion(
+                                &mut ordinary_rx,
+                                &mut ordinary_active,
+                                &mut delegates,
+                                &mut results,
+                                &mut errors,
+                                tx,
+                            )
+                            .await;
+                        }
+                        // The barrier wait can cross a live config refresh. Pin
+                        // and resolve again immediately before this attempt.
+                        concurrently_admissible = match self
+                            .pin_single_noninteractive_admission(&mut task)
+                        {
+                            Ok(admissible) => admissible,
+                            Err(error) => {
+                                results.insert(source_index, SchedulerLaneSettled {
+                                        messages: vec![crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                            task.task_call_id.clone(),
+                                            task.task_provider_item_id.clone(),
+                                            task.task_function_call_id.clone(),
+                                            "task",
+                                            prepend_task_repair_notes(error, &task.repair_notes),
+                                        )],
+                                        terminal_record: delegate.terminal_record(),
+                                        terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                                    });
+                                continue;
+                            }
+                        };
+                    }
+                    // Only now is the exact attempt admitted. For a barrier,
+                    // every earlier member has drained; for an eligible child,
+                    // the immutable surface above is the generation bound to
+                    // this immediately-starting attempt.
+                    if let Err(message) = self.admit_scheduler_probe_task(&task).await {
+                        results.insert(source_index, SchedulerLaneSettled {
+                            messages: vec![message],
+                            terminal_record: delegate.terminal_record(),
+                            terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                        });
+                        continue;
+                    }
+                    match self
+                        .start_prepared_single_noninteractive_task(
+                            task,
+                            concurrently_admissible,
+                            tx,
+                            cancel.clone(),
+                        )
+                        .await
+                    {
+                        Ok(Some(message)) => {
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![message],
+                                terminal_record: delegate.terminal_record(),
+                                terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                            });
+                        }
+                        Ok(None) => {
+                            delegates.insert(call_id, (source_index, delegate));
+                        }
+                        Err(error) => {
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![delegate.interrupted_message()],
+                                terminal_record: delegate.terminal_record(),
+                                terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                            });
+                            errors.insert(source_index, error);
+                        }
+                    }
+                    if !concurrently_admissible {
+                        while ordinary_active > 0 || !delegates.is_empty() {
+                            self.await_one_scheduler_lane_completion(
+                                &mut ordinary_rx,
+                                &mut ordinary_active,
+                                &mut delegates,
+                                &mut results,
+                                &mut errors,
+                                tx,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+        drop(ordinary_tx);
+        while ordinary_active > 0 || !delegates.is_empty() {
+            self.await_one_scheduler_lane_completion(
+                &mut ordinary_rx,
+                &mut ordinary_active,
+                &mut delegates,
+                &mut results,
+                &mut errors,
+                tx,
+            )
+            .await;
+        }
+        for settled in results.into_values() {
+            history.extend(settled.messages);
+            settled.terminal_record.record(settled.terminal).await;
+        }
+        if let Some(error) = errors.into_values().next() {
+            return Err(error.context("scheduler lane contained one or more interrupted calls"));
+        }
+        Ok(())
+    }
+
+    pub(in crate::engine::driver) async fn run_single_noninteractive_task_backgroundable(
+        &mut self,
+        task: SingleNoninteractiveTask,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message> {
+        let task_call_id = task.task_call_id.clone();
+        let task_provider_item_id = task.task_provider_item_id.clone();
+        let task_function_call_id = task.task_function_call_id.clone();
+        if let Some(settled) = self
+            .prepare_and_start_single_noninteractive_task(task, tx, cancel)
+            .await?
+        {
+            return Ok(settled);
+        }
         tokio::select! {
             biased;
             user = input_rx.recv() => {
@@ -2493,6 +3093,7 @@ impl Driver {
             task_call_id,
             task_provider_item_id,
             task_function_call_id,
+            mut execution_surface,
             recovery,
         } = task;
 
@@ -2592,8 +3193,9 @@ impl Driver {
             };
         }
 
-        // Repin the config to a held snapshot for THIS delegation attempt. A
-        // pinned handle's reads return the fixed snapshot and do NOT observe later
+        // `prepare_and_start_single_noninteractive_task` pinned the config and
+        // resolved the immutable child surface immediately before publishing
+        // this attempt. A pinned handle does NOT observe later
         // live refreshes, so every read below — child model resolution, posture,
         // surface, handoff-tag expansion, `pregrant_write_scope`,
         // `builtin::load`/build, dispatch, and the docs pipeline's internal
@@ -2601,8 +3203,8 @@ impl Driver {
         // AND posture come from the pinned generation by construction (AC6), a
         // concurrent refresh affects only the NEXT delegation, and the
         // write-scope grant cannot be orphaned by a move because the config
-        // physically cannot move mid-attempt.
-        self.config = self.config.repin();
+        // physically cannot move mid-attempt. Recovery has
+        // its separate repin above because it bypasses ordinary preparation.
 
         // FAIL CLOSED before ANY child lifecycle / spawn side effect. Resolve the
         // write scope and the child's execution surface from its OWN selected
@@ -2713,40 +3315,65 @@ impl Driver {
                 }
             }
         } else {
-            let preflight_args = self.spawn_args_delegated_in_cwd_scoped(
-                &child_cwd.resolved,
-                false,
-                granted_tools.clone(),
-                model.clone(),
-                child_recursion.clone(),
-                DelegationConfinement {
-                    lock_identity: None,
-                    write_scope: resolved_write_scope.clone(),
-                },
-            );
-            match crate::engine::builtin::resolve_child_execution_surface(
-                &child_agent,
-                &preflight_args,
-            ) {
-                Ok(surface) => (surface.posture, surface.context_policy),
-                Err(e) => {
-                    return Ok(SingleNoninteractiveCompletion {
-                        child_agent,
-                        task_call_id,
-                        task_provider_item_id,
-                        task_function_call_id,
-                        report: format!("Error: {e:#}"),
-                        failed: true,
-                        failure: None,
-                        partial_progress: DelegationPartialProgress::default(),
-                        new_handle: None,
-                        snapshot: NoninteractiveDelegationSnapshot::empty(),
-                        shrink: None,
-                        repair_notes,
-                        child_routing: None,
-                    });
-                }
+            if execution_surface.is_none() {
+                let preflight_args = self.spawn_args_delegated_in_cwd_scoped(
+                    &child_cwd.resolved,
+                    false,
+                    granted_tools.clone(),
+                    model.clone(),
+                    child_recursion.clone(),
+                    DelegationConfinement {
+                        lock_identity: None,
+                        write_scope: resolved_write_scope.clone(),
+                    },
+                );
+                execution_surface = match crate::engine::builtin::resolve_child_execution_surface(
+                    &child_agent,
+                    &preflight_args,
+                ) {
+                    Ok(surface) => Some(surface),
+                    Err(error) => {
+                        return Ok(SingleNoninteractiveCompletion {
+                            child_agent,
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            report: format!("Error: {error:#}"),
+                            failed: true,
+                            failure: None,
+                            partial_progress: DelegationPartialProgress::default(),
+                            new_handle: None,
+                            snapshot: NoninteractiveDelegationSnapshot::empty(),
+                            shrink: None,
+                            repair_notes,
+                            child_routing: None,
+                        });
+                    }
+                };
             }
+            let surface = execution_surface
+                .as_ref()
+                .expect("fresh child surface resolved above");
+            if surface.config_generation != self.config.generation() {
+                return Ok(SingleNoninteractiveCompletion {
+                    child_agent,
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    report:
+                        "Error: delegated execution surface generation changed before attempt start"
+                            .to_string(),
+                    failed: true,
+                    failure: None,
+                    partial_progress: DelegationPartialProgress::default(),
+                    new_handle: None,
+                    snapshot: NoninteractiveDelegationSnapshot::empty(),
+                    shrink: None,
+                    repair_notes,
+                    child_routing: None,
+                });
+            }
+            (surface.posture.clone(), surface.context_policy.clone())
         };
         let followup_enabled =
             crate::engine::tool::Capability::FollowupSeed.enabled(&child_posture);
@@ -2999,20 +3626,18 @@ impl Driver {
             match rehydrated {
                 Err(msg) => DelegationChildOutcome::failed(msg),
                 Ok(prior_history) => {
-                    let child = match crate::engine::builtin::load(
-                        &child_agent,
-                        &self.spawn_args_delegated_in_cwd_scoped(
-                            &child_cwd.resolved,
-                            false,
-                            granted_tools.clone(),
-                            model.clone(),
-                            child_recursion.clone(),
-                            DelegationConfinement {
-                                lock_identity: None,
-                                write_scope: resolved_write_scope.clone(),
-                            },
-                        ),
-                    ) {
+                    let dispatch_args = self.spawn_args_delegated_in_cwd_scoped(
+                        &child_cwd.resolved,
+                        false,
+                        granted_tools.clone(),
+                        model.clone(),
+                        child_recursion.clone(),
+                        DelegationConfinement {
+                            lock_identity: None,
+                            write_scope: resolved_write_scope.clone(),
+                        },
+                    );
+                    let child = match crate::engine::builtin::load(&child_agent, &dispatch_args) {
                         Ok(child) => child,
                         Err(e) => {
                             return Ok(SingleNoninteractiveCompletion {
@@ -3035,6 +3660,32 @@ impl Driver {
                             });
                         }
                     };
+                    let actual_surface = crate::engine::builtin::surface_for_built_child(
+                        &child,
+                        &dispatch_args,
+                        self.config.generation(),
+                    );
+                    if execution_surface.as_ref() != Some(&actual_surface) {
+                        return Ok(SingleNoninteractiveCompletion {
+                            child_agent,
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            report: "Error: delegated execution surface changed before child start"
+                                .to_string(),
+                            failed: true,
+                            failure: None,
+                            partial_progress: DelegationPartialProgress::default(),
+                            new_handle: None,
+                            snapshot: NoninteractiveDelegationSnapshot::empty(),
+                            shrink: Some(PendingDelegationShrink {
+                                tracker,
+                                handle: shrink_handle,
+                            }),
+                            repair_notes,
+                            child_routing: None,
+                        });
+                    }
                     // The child was BUILT from the pinned attempt config, so its
                     // model + posture match the posture/handoff derived above by
                     // construction — no generation split is possible. Record the
@@ -4753,6 +5404,14 @@ impl Driver {
                 handle,
             },
         );
+        if self.active_pending_scheduled_turn_index().is_some() {
+            let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
+            let delivery = self
+                .finalize_background_noninteractive_completion(completion, tx)
+                .await?;
+            self.reap_finished_noninteractive_jobs();
+            return Ok(delivery.into_inline_message());
+        }
         tokio::select! {
             biased;
             user = input_rx.recv() => {
@@ -8135,6 +8794,25 @@ pub(crate) async fn run_noninteractive_resumable(
         },
         None => None,
     };
+    let mut scheduled_lane_driver = Driver::for_nested_turn_plans(
+        session.clone(),
+        locks.clone(),
+        redact.clone(),
+        cwd.clone(),
+        agent.clone(),
+        config.clone(),
+        agent_instance_id,
+        interrupts.clone(),
+        approver.clone(),
+        resource_scheduler.clone(),
+        local_installations.clone(),
+        tandem.clone(),
+    );
+    // The nested loop and its mixed-lane Driver must account against one
+    // parent-instance child limit.  A second registry here would let two
+    // delegate candidates from one provider turn each believe they owned the
+    // final slot.
+    scheduled_lane_driver.vnext_child_admissions = recursive_vnext_admissions.clone();
     let mut endpoint_ready = endpoint_ready;
     if let (Some(pending), Some(parent_agent_instance_id)) =
         (pending_recursive.as_ref(), agent_instance_id)
@@ -8403,6 +9081,7 @@ pub(crate) async fn run_noninteractive_resumable(
     let recovered_agent_tree_steer_continuation_id = steer_target
         .as_ref()
         .and_then(|target| target.late_user_steer_continuation_id);
+    let mut pending_scheduled_turn = None;
     'turns: for _ in 0..max_turns {
         if !parked_replay
             && active_agent_tree_steer_permit.is_none()
@@ -9072,151 +9751,210 @@ pub(crate) async fn run_noninteractive_resumable(
         // inference.md`). Passed into `turn`, which dispatches the shadows from
         // the exact post-redaction body; a pure DB-only observer that never
         // enters the child's history or affects its loop. `None`/empty = off.
-        let turn_future = crate::engine::agent::with_agent_instance_id(
-            agent_instance_id,
-            crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                agent_tree_steer_dispatch_permit,
-                turn_with_backup(
+        let mut outcome = if let Some(mut plan) = pending_scheduled_turn.take() {
+            history.push(next_prompt.clone());
+            let outcome = scheduled_lane_driver
+                .advance_driver_owned_turn_plan_in_history(
+                    &mut plan,
                     &agent,
-                    backup_model.as_ref(),
-                    &fallback_models,
                     &mut history,
-                    next_prompt.clone(),
-                    session.clone(),
-                    locks.clone(),
-                    redact.clone(),
-                    cwd.clone(),
-                    config.clone(),
-                    interrupts.clone(),
-                    cancel.clone(),
-                    approver.clone(),
-                    None,
-                    resource_scheduler.clone(),
-                    loop_guard_threshold,
-                    // A noninteractive child delegation recomposes its own fresh
-                    // system prompt on spawn, so it never needs the live
-                    // instructions-file diff injection.
-                    false,
-                    crate::skills::manage::SkillWriteOrigin::Foreground,
-                    None,
-                    crate::engine::tool::ContextUsageSnapshot::unavailable(),
-                    deferred_log.clone(),
-                    call_id,
-                    tandem.as_ref(),
-                    None,
-                    None,
                     &child_tx,
-                    Some(&mut turn_metadata),
-                ),
-            ),
-        );
-        let outcome_future = async {
-            if let Some(target) = &steer_target {
-                crate::session::with_session_event_lineage(Some(target.lineage()), turn_future)
-                    .await
-            } else {
-                turn_future.await
-            }
-        };
-        let outcome = match outcome_future.await {
-            Ok(outcome) => {
-                // The first provider handoff succeeded, so the saved prompt
-                // is now ordinary transcript history rather than a deferred
-                // substitution we could roll back.
-                active_agent_tree_steer_injected_prompt = false;
-                if !turn_metadata.fallback_tried.is_empty() {
-                    fallback_tried = turn_metadata.fallback_tried.clone();
-                }
-                if let Some(fallback) = turn_metadata.fallback_decision.take() {
-                    fallback_decision = Some(fallback);
-                }
-                outcome
-            }
-            Err(error) => {
-                if !turn_metadata.fallback_tried.is_empty() {
-                    fallback_tried = turn_metadata.fallback_tried.clone();
-                }
-                if let Some(fallback) = turn_metadata.fallback_decision.take() {
-                    fallback_decision = Some(fallback);
-                }
-                if crate::engine::model::is_late_user_steer_deferred(&error) {
-                    // No provider bytes were sent and the permit transaction
-                    // left a pending row unaccepted. Restore the pre-steer
-                    // prompt only for a new pending delivery, release that
-                    // claim, and remain attached to the exact executor while
-                    // the owner waits for its question/approval replay.
-                    if active_agent_tree_steer_injected_prompt {
-                        let Some(original_prompt) = history.pop() else {
-                            return Err(NoninteractiveRunError::new(
-                                anyhow::anyhow!(
-                                    "deferred noninteractive late steer lost its original continuation prompt"
-                                ),
-                                history,
-                                fallback_decision,
-                                fallback_tried,
-                            ));
-                        };
-                        next_prompt = original_prompt;
-                        active_agent_tree_steer_injected_prompt = false;
-                    }
-                    defer_noninteractive_late_steers_until_owner_is_runnable(
-                        &session,
-                        &active_claimed_agent_tree_steers,
-                        active_agent_tree_steer_epoch,
-                        std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                    cancel.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    NoninteractiveRunError::new(
+                        error,
+                        history.clone(),
+                        fallback_decision.clone(),
+                        fallback_tried.clone(),
                     )
-                    .await;
-                    active_claimed_agent_tree_steers.clear();
-                    active_agent_tree_steer_epoch = None;
-                    active_agent_tree_steer_permit = None;
-                    active_agent_tree_steer_continuation_id = None;
-                    // A nonterminal owner will eventually send this exact
-                    // executor a replay after its current decision resolves.
-                    // Terminal transitions reject pending rows atomically;
-                    // their cancellation path owns executor shutdown.
-                    parked_replay = true;
-                    continue 'turns;
-                }
-                // Any other outcome reached (or got past) the provider
-                // boundary. A later parked replay must not roll the original
-                // prompt back if its accepted permit is subsequently revoked.
-                active_agent_tree_steer_injected_prompt = false;
-                if crate::engine::interrupt::is_parked(&error) {
-                    // A parked QuestionTool is an intermediate continuation
-                    // checkpoint, not a terminal steer outcome. Keep the
-                    // accepted identity, provider permit, and worker receipt
-                    // alive while this exact executor waits for the replay
-                    // mailbox; the replay then feeds its tool result into the
-                    // next turn under the same permit.
-                    parked_replay = true;
-                    continue 'turns;
-                }
-                let continuation_outcome = if crate::engine::model::is_cancelled(&error) {
-                    crate::engine::driver::LateUserSteerContinuationOutcome::Cancelled
+                })?;
+            let waits_for_host_result = !matches!(
+                &outcome,
+                TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
+            );
+            if !plan.is_finished() || waits_for_host_result {
+                pending_scheduled_turn = Some(plan);
+            }
+            outcome
+        } else {
+            let turn_future = crate::engine::agent::with_agent_instance_id(
+                agent_instance_id,
+                crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                    agent_tree_steer_dispatch_permit,
+                    turn_with_backup(
+                        &agent,
+                        backup_model.as_ref(),
+                        &fallback_models,
+                        &mut history,
+                        next_prompt.clone(),
+                        session.clone(),
+                        locks.clone(),
+                        redact.clone(),
+                        cwd.clone(),
+                        config.clone(),
+                        interrupts.clone(),
+                        cancel.clone(),
+                        approver.clone(),
+                        None,
+                        resource_scheduler.clone(),
+                        loop_guard_threshold,
+                        // A noninteractive child delegation recomposes its own fresh
+                        // system prompt on spawn, so it never needs the live
+                        // instructions-file diff injection.
+                        false,
+                        crate::skills::manage::SkillWriteOrigin::Foreground,
+                        None,
+                        crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                        deferred_log.clone(),
+                        call_id,
+                        tandem.as_ref(),
+                        None,
+                        None,
+                        &child_tx,
+                        Some(&mut turn_metadata),
+                    ),
+                ),
+            );
+            let outcome_future = async {
+                if let Some(target) = &steer_target {
+                    crate::session::with_session_event_lineage(Some(target.lineage()), turn_future)
+                        .await
                 } else {
-                    crate::engine::driver::LateUserSteerContinuationOutcome::failed(format!(
-                        "noninteractive late steer continuation failed: {error:#}"
-                    ))
-                };
-                // Do not call `release_late_user_decision_steer_claim` here:
-                // these rows are already in the irreversible `accepted`
-                // state, and releasing is both ineffective and conceptually
-                // wrong. Their immutable checkpoint is the recovery unit.
-                retain_noninteractive_late_steer_checkpoint(
-                    &active_claimed_agent_tree_steers,
-                    std::mem::take(&mut active_externally_claimed_agent_tree_steers),
-                    continuation_outcome,
-                );
-                drop(child_tx);
-                let _ = forwarder.await;
-                return Err(NoninteractiveRunError::new(
-                    error,
-                    history,
-                    fallback_decision,
-                    fallback_tried,
-                ));
+                    turn_future.await
+                }
+            };
+            match outcome_future.await {
+                Ok(outcome) => {
+                    // The first provider handoff succeeded, so the saved prompt
+                    // is now ordinary transcript history rather than a deferred
+                    // substitution we could roll back.
+                    active_agent_tree_steer_injected_prompt = false;
+                    if !turn_metadata.fallback_tried.is_empty() {
+                        fallback_tried = turn_metadata.fallback_tried.clone();
+                    }
+                    if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                        fallback_decision = Some(fallback);
+                    }
+                    outcome
+                }
+                Err(error) => {
+                    if !turn_metadata.fallback_tried.is_empty() {
+                        fallback_tried = turn_metadata.fallback_tried.clone();
+                    }
+                    if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                        fallback_decision = Some(fallback);
+                    }
+                    if crate::engine::model::is_late_user_steer_deferred(&error) {
+                        // No provider bytes were sent and the permit transaction
+                        // left a pending row unaccepted. Restore the pre-steer
+                        // prompt only for a new pending delivery, release that
+                        // claim, and remain attached to the exact executor while
+                        // the owner waits for its question/approval replay.
+                        if active_agent_tree_steer_injected_prompt {
+                            let Some(original_prompt) = history.pop() else {
+                                return Err(NoninteractiveRunError::new(
+                                    anyhow::anyhow!(
+                                        "deferred noninteractive late steer lost its original continuation prompt"
+                                    ),
+                                    history,
+                                    fallback_decision,
+                                    fallback_tried,
+                                ));
+                            };
+                            next_prompt = original_prompt;
+                            active_agent_tree_steer_injected_prompt = false;
+                        }
+                        defer_noninteractive_late_steers_until_owner_is_runnable(
+                            &session,
+                            &active_claimed_agent_tree_steers,
+                            active_agent_tree_steer_epoch,
+                            std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                        )
+                        .await;
+                        active_claimed_agent_tree_steers.clear();
+                        active_agent_tree_steer_epoch = None;
+                        active_agent_tree_steer_permit = None;
+                        active_agent_tree_steer_continuation_id = None;
+                        // A nonterminal owner will eventually send this exact
+                        // executor a replay after its current decision resolves.
+                        // Terminal transitions reject pending rows atomically;
+                        // their cancellation path owns executor shutdown.
+                        parked_replay = true;
+                        continue 'turns;
+                    }
+                    // Any other outcome reached (or got past) the provider
+                    // boundary. A later parked replay must not roll the original
+                    // prompt back if its accepted permit is subsequently revoked.
+                    active_agent_tree_steer_injected_prompt = false;
+                    if crate::engine::interrupt::is_parked(&error) {
+                        // A parked QuestionTool is an intermediate continuation
+                        // checkpoint, not a terminal steer outcome. Keep the
+                        // accepted identity, provider permit, and worker receipt
+                        // alive while this exact executor waits for the replay
+                        // mailbox; the replay then feeds its tool result into the
+                        // next turn under the same permit.
+                        parked_replay = true;
+                        continue 'turns;
+                    }
+                    let continuation_outcome = if crate::engine::model::is_cancelled(&error) {
+                        crate::engine::driver::LateUserSteerContinuationOutcome::Cancelled
+                    } else {
+                        crate::engine::driver::LateUserSteerContinuationOutcome::failed(format!(
+                            "noninteractive late steer continuation failed: {error:#}"
+                        ))
+                    };
+                    // Do not call `release_late_user_decision_steer_claim` here:
+                    // these rows are already in the irreversible `accepted`
+                    // state, and releasing is both ineffective and conceptually
+                    // wrong. Their immutable checkpoint is the recovery unit.
+                    retain_noninteractive_late_steer_checkpoint(
+                        &active_claimed_agent_tree_steers,
+                        std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                        continuation_outcome,
+                    );
+                    drop(child_tx);
+                    let _ = forwarder.await;
+                    return Err(NoninteractiveRunError::new(
+                        error,
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                }
             }
         };
+        while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
+            outcome = scheduled_lane_driver
+                .advance_driver_owned_turn_plan_in_history(
+                    &mut plan,
+                    &agent,
+                    &mut history,
+                    &child_tx,
+                    cancel.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    NoninteractiveRunError::new(
+                        error,
+                        history.clone(),
+                        fallback_decision.clone(),
+                        fallback_tried.clone(),
+                    )
+                })?;
+            let waits_for_host_result = !matches!(
+                &outcome,
+                TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
+            );
+            if !plan.is_finished() || waits_for_host_result {
+                pending_scheduled_turn = Some(plan);
+            }
+            // Noninteractive children are leaves. A structural transition
+            // below either terminates them (`return`) or is rejected by the
+            // existing fail-closed arms; ordinary calls exhaust the plan in
+            // this loop without another provider turn.
+        }
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -10253,9 +10991,11 @@ pub(crate) async fn run_noninteractive_resumable(
             | TurnOutcome::SpawnNoninteractive { .. }
             | TurnOutcome::SpawnNoninteractiveBatch { .. }
             | TurnOutcome::TaskControl { .. }
-            | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Spawn { .. } => {
+                if let Some(mut plan) = pending_scheduled_turn.take() {
+                    plan.settle_unreachable_remainder(&mut history).await;
+                }
                 // explore is a leaf without `task`/`schedule`; this shouldn't
                 // happen, but if it does we bail rather than spin (the single
                 // async-job authority is the main driver, never a noninteractive
@@ -10279,7 +11019,28 @@ pub(crate) async fn run_noninteractive_resumable(
                     fallback_tried,
                 ));
             }
+            TurnOutcome::ToolResult {
+                task_call_id,
+                task_provider_item_id,
+                task_function_call_id,
+                body,
+            } => {
+                next_prompt =
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        body,
+                    );
+            }
+            TurnOutcome::ScheduledCalls { .. } | TurnOutcome::ScheduledParallelLane { .. } => {
+                unreachable!("scheduled calls are normalized before leaf dispatch")
+            }
         }
+    }
+    if let Some(mut plan) = pending_scheduled_turn {
+        plan.settle_unreachable_remainder(&mut history).await;
     }
     retain_noninteractive_late_steer_checkpoint(
         &active_claimed_agent_tree_steers,

@@ -3183,6 +3183,33 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
         matches!(decoded, DurableCompactionShadow::ReadyBrief(_)),
         "a partial shadow must be a ReadyBrief, not a PreparedCompaction handoff"
     );
+
+    // A restart must not turn the partial ready brief into a complete
+    // handoff. The foreground delta receives the current complete history,
+    // including the snapshot prefix omitted by the initial fitted shadow.
+    restored.stack[0].history = snapshot_history.clone();
+    install_test_providers(
+        &mut restored,
+        crate::config::providers::CacheMode::None,
+        crate::config::providers::ContextConfig::default(),
+        10_000,
+    );
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
+    restored.do_compact(&tx).await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    let calls = crate::sync::lock_or_recover(
+        restored
+            .test_compact_brief_calls
+            .as_ref()
+            .expect("fake compact seam"),
+    );
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].purpose, "compact_brief_delta");
+    assert_eq!(
+        calls[0].history, snapshot_history,
+        "a partial shadow delta must include every source exchange, not only the old tail"
+    );
 }
 
 /// Manual `/compact` bypasses the auto-compaction gate: even when the gate

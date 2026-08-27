@@ -606,6 +606,7 @@ pub(crate) async fn attach_send_pump(
                     expected_model_state_generation: None,
                     expected_model: None,
                     client_submission_id,
+                    origin: Default::default(),
                     transfer,
                     display_text: None,
                     display_transfer: None,
@@ -621,6 +622,7 @@ pub(crate) async fn attach_send_pump(
                     expected_model_state_generation: None,
                     expected_model: None,
                     client_submission_id,
+                    origin: Default::default(),
                     text: prompt,
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -2139,6 +2141,7 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: id,
+            origin: Default::default(),
             text: "go".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -2171,6 +2174,7 @@ mod tests {
         match send {
             Request::SendUserMessage {
                 client_submission_id,
+                origin: Default::default(),
                 run_invocation_options: Some(opts),
                 ..
             } => {

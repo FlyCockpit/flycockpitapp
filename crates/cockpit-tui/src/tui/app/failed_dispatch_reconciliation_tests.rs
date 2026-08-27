@@ -1944,6 +1944,11 @@ fn multireview_kickoff_success_warns_pushes_user_and_dispatches() {
     );
     let submission = input_rx.try_recv().expect("kickoff submitted");
     assert_eq!(submission.text, "kickoff");
+    assert_eq!(
+        submission.origin,
+        cockpit_client::submission::SubmissionOrigin::ExternalRoot,
+        "/multireview kickoff is authored by the user"
+    );
     assert!(
         app.history.iter().any(|entry| {
             matches!(

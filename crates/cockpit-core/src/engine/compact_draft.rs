@@ -255,24 +255,39 @@ pub(crate) fn fit_whole_exchange_suffix(
 /// Strictly reduce a provider-rejected request. This is used only after an
 /// actual context-overflow verdict; transient failures stay on the same input.
 pub(crate) fn next_smaller_fit(
-    history: &[Message],
+    source_history: &[Message],
+    current_history: &[Message],
     current_rung: CompactFitRung,
 ) -> Option<FittedCompactHistory> {
-    let ranges = super::compact::complete_exchange_ranges(history);
-    if ranges.len() > 1 {
-        let first = ranges[1].start;
-        let fitted = FittedCompactHistory {
-            history: history[first..].to_vec(),
-            rung: CompactFitRung::HistorySelected,
-            coverage: CompactInputCoverage::Partial,
-        };
-        super::rehydrate::validate_pairing(&fitted.history).ok()?;
-        return Some(fitted);
-    }
     if current_rung == CompactFitRung::Emergency {
         return None;
     }
-    emergency_history_to_fit(history, wire_token_total(history).saturating_sub(1))
+    let allowance = wire_token_total(current_history).saturating_sub(1);
+    // Every rung is derived from the immutable source history. In particular,
+    // Emergency must not truncate the omission marker emitted by the previous
+    // ToolResultTruncated attempt: that would report bytes omitted from a
+    // synthetic marker rather than from the original tool result.
+    if current_rung != CompactFitRung::ToolResultTruncated {
+        if let Some(selected) =
+            fit_whole_exchange_suffix(source_history, allowance).filter(|candidate| {
+                wire_token_total(&candidate.history) < wire_token_total(current_history)
+            })
+        {
+            return Some(selected);
+        }
+    }
+    if current_rung != CompactFitRung::ToolResultTruncated {
+        if let Some(truncated) =
+            truncate_newest_exchange_to_fit(source_history, allowance).filter(|candidate| {
+                wire_token_total(&candidate.history) < wire_token_total(current_history)
+            })
+        {
+            return Some(truncated);
+        }
+    }
+    emergency_history_to_fit(source_history, allowance).filter(|candidate| {
+        wire_token_total(&candidate.history) < wire_token_total(current_history)
+    })
 }
 
 fn utf8_prefix(text: &str, byte_cap: usize) -> &str {
@@ -748,6 +763,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_overflow_reaches_tool_result_truncation_before_emergency() {
+        let history = vec![
+            Message::user("inspect it"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-overflow-ladder"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "large.json"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                })],
+            },
+            Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-overflow-ladder"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text("x".repeat(4_000))],
+                })],
+            },
+            Message::assistant("done"),
+        ];
+
+        let smaller = next_smaller_fit(&history, &history, CompactFitRung::Verbatim)
+            .expect("overflowed single exchange with a tool result can be truncated");
+        assert_eq!(smaller.rung, CompactFitRung::ToolResultTruncated);
+        assert!(wire_token_total(&smaller.history) < wire_token_total(&history));
+        crate::engine::rehydrate::validate_pairing(&smaller.history).unwrap();
+    }
+
+    #[test]
     fn provider_overflow_advances_truncated_single_exchange_to_emergency() {
         let history = vec![
             Message::user("inspect it"),
@@ -779,10 +829,54 @@ mod tests {
             wire_token_total(&history).saturating_sub(100),
         )
         .expect("fixture must first reach ToolResultTruncated");
-        let emergency = next_smaller_fit(&truncated.history, truncated.rung)
+        let emergency = next_smaller_fit(&history, &truncated.history, truncated.rung)
             .expect("provider overflow must advance to Emergency");
         assert_eq!(emergency.rung, CompactFitRung::Emergency);
         assert!(wire_token_total(&emergency.history) < wire_token_total(&truncated.history));
+        crate::engine::rehydrate::validate_pairing(&emergency.history).unwrap();
+    }
+
+    #[test]
+    fn emergency_retruncation_uses_original_tool_result_without_nested_markers() {
+        let source = "x".repeat(4_000);
+        let history = vec![
+            Message::user("inspect it"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-original-source"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "large.json"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                })],
+            },
+            Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-original-source"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text(source.clone())],
+                })],
+            },
+        ];
+        let truncated = truncate_newest_exchange_to_fit(
+            &history,
+            wire_token_total(&history).saturating_sub(100),
+        )
+        .expect("first rung must truncate the tool result");
+        let emergency = next_smaller_fit(&history, &truncated.history, truncated.rung)
+            .expect("overflow must derive Emergency from original source");
+        let serialized = serde_json::to_string(&emergency.history).unwrap();
+        assert_eq!(serialized.matches("compaction omitted").count(), 1);
+        assert!(
+            !serialized.contains("compaction omitted 0 bytes from this tool result]\\n[compaction"),
+            "a fresh Emergency candidate must not shorten a prior omission marker"
+        );
+        assert!(serialized.contains(&source[..64]));
         crate::engine::rehydrate::validate_pairing(&emergency.history).unwrap();
     }
 

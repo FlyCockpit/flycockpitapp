@@ -9523,6 +9523,7 @@ impl Driver {
         // built. Non-vision callers already folded images into `text` and
         // pass none here (composer-paste-handling).
         let submission_kind = submission.kind;
+        let submission_origin = submission.origin;
         // Classify the root-turn origin for the `userPromptSubmit` hook: only a
         // genuine external user submission fires the event; goal / scheduled /
         // auto-continue / retry / tool-result / internal directives reach this
@@ -9843,7 +9844,8 @@ impl Driver {
                     // From this point the turn is durably accepted. No rejected
                     // source can advance activity/title/provider state.
                     if submission_kind == UserSubmissionKind::User
-                        && user_prompt_source.is_some()
+                        && submission_origin
+                            == crate::engine::message::SubmissionOrigin::ExternalRoot
                     {
                         // The FCM2 scheduler epoch is intentionally advanced
                         // only after phase two has atomically materialized the

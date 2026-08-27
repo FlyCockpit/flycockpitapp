@@ -1408,11 +1408,23 @@ impl Driver {
         let (brief, handoff, mut plan) = loop {
             let tail_message_seqs = self.compact_tail_message_seqs(keep).await;
             let (brief, authoring) = if let Some(ready) = shadow.as_ref() {
-                let revision_history = compact::shadow_revision_history(
-                    &ready.snapshot_history,
-                    &filtered_history,
-                    ready.snapshot_tail_turns,
-                );
+                // A fitted initial shadow has only partial source coverage.
+                // Its brief is useful context for a delta, but cannot stand in
+                // for the snapshot prefix that fitting omitted. Feed the
+                // delta the entire current source history in that case; a
+                // further fitted delta then falls back to full chunked
+                // synthesis below rather than promoting omitted history.
+                let revision_history = if ready.input_coverage
+                    == crate::engine::compact_draft::CompactInputCoverage::Partial
+                {
+                    filtered_history.clone()
+                } else {
+                    compact::shadow_revision_history(
+                        &ready.snapshot_history,
+                        &filtered_history,
+                        ready.snapshot_tail_turns,
+                    )
+                };
                 self.draft_brief_delta(
                     tx,
                     &tail_message_seqs,
@@ -1911,6 +1923,7 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
     if let Err(diagnostic) = crate::sync::lock_or_recover(&draft.quota).claim_node() {
         return O::ContextOverflow { diagnostic };
     }
+    let source_history = draft.history.clone();
     let fitted = match crate::engine::compact_draft::fit_compact_request(
         &draft.history,
         &draft.system,
@@ -2031,6 +2044,7 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                                 && attempt < MAX_WIRE_SAMPLES_PER_NODE
                                 && let Some(smaller) =
                                     crate::engine::compact_draft::next_smaller_fit(
+                                        &source_history,
                                         &draft.history,
                                         fit_rung,
                                     )
@@ -2217,6 +2231,7 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                         if draft.context_window.is_some()
                             && attempt < MAX_WIRE_SAMPLES_PER_NODE
                             && let Some(smaller) = crate::engine::compact_draft::next_smaller_fit(
+                                &source_history,
                                 &draft.history,
                                 fit_rung,
                             )

@@ -113,6 +113,7 @@ describe("RemoteSessionClient", () => {
         request: "send_user_message",
         params: {
           client_submission_id: "33333333-3333-4333-8333-333333333333",
+          origin: "external_root",
           text: "hello",
         },
       },
@@ -155,6 +156,7 @@ describe("RemoteSessionClient", () => {
     const { client, socket } = makeClient();
     const submission = {
       client_submission_id: "44444444-4444-4444-8444-444444444444",
+      origin: "external_root" as const,
       text: "@review inspect this",
       display_text: "inspect this",
       tag_expansions: [{ tag: "review", replacement: "review the patch" }],
@@ -218,6 +220,7 @@ describe("RemoteSessionClient", () => {
       request: "send_user_message_bulk",
       params: {
         client_submission_id: submission.client_submission_id,
+        origin: "external_root",
         transfer: chunk.payload.params.transfer,
       },
     });
@@ -353,6 +356,7 @@ describe("RemoteSessionClient", () => {
       request: "send_user_message_bulk",
       params: {
         client_submission_id: submission.client_submission_id,
+        origin: "external_root",
         transfer: sourceChunk.payload.params.transfer,
         display_transfer: displayChunk.payload.params.transfer,
       },
@@ -410,6 +414,7 @@ describe("RemoteSessionClient", () => {
       request: "send_user_message_bulk",
       params: {
         client_submission_id: submission.client_submission_id,
+        origin: "external_root",
         transfer: {
           mime_class: "opaque",
           total_length: String(8 * 1024 * 1024),

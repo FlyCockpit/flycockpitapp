@@ -151,6 +151,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
     for (const vector of [...fixture.vectors, ...fixture.compact_positive_vectors]) {
       const bytes = vector.fcm2_hex ? fromHex(vector.fcm2_hex) : compactBytes(vector);
       const decoded = decodeCanonicalSendUserMessageV2(bytes);
+      expect(decoded.request.origin, vector.name).toBe("external_root");
       expect(toHex(encodeCanonicalSendUserMessageV2(decoded)), vector.name).toBe(toHex(bytes));
       expect(toHex(await messageRequestDigest(decoded)), vector.name).toBe(
         vector.message_request_digest_hex,
@@ -159,6 +160,18 @@ describe("send_user_message_v2_canonical_vectors", () => {
         vector.attachment_set_digest_hex,
       );
     }
+  });
+
+  it("binds origin into the canonical replay identity", async () => {
+    const external = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[1].fcm2_hex));
+    const internal = structuredClone(external);
+    internal.request.origin = "auto_continue";
+    expect(toHex(encodeCanonicalSendUserMessageV2(internal))).not.toBe(
+      toHex(encodeCanonicalSendUserMessageV2(external)),
+    );
+    expect(toHex(await messageRequestDigest(internal))).not.toBe(
+      toHex(await messageRequestDigest(external)),
+    );
   });
 
   it("rejects shared semantic mutations with exact errors", () => {

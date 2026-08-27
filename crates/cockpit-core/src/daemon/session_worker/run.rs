@@ -3625,6 +3625,10 @@ fn validate_oversized_artifact_admission(
         "FCM2 submission identity does not match queue receipt"
     );
     anyhow::ensure!(
+        canonical.request.origin == submission.origin.into(),
+        "FCM2 origin does not match the submission"
+    );
+    anyhow::ensure!(
         canonical.request.text == submission.text,
         "FCM2 source text does not match the transport-normalized submission"
     );
@@ -3961,7 +3965,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 .map(|(generation, _)| *generation),
             expected_model: durable_model_fence.map(|(_, model)| model),
             kind: crate::engine::message::UserSubmissionKind::User,
-            origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+            origin: canonical.request.origin.into(),
             text: canonical.request.text,
             display_text: canonical.request.display_text,
             tag_expansions: canonical

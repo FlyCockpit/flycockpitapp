@@ -2468,6 +2468,7 @@ const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub session_id: Uuid,
     pub client_submission_id: Uuid,
+    pub origin: proto::UserMessageOrigin,
     pub expected_model_state_generation: Option<u64>,
     pub expected_model: Option<&'a cockpit_config::config::providers::ActiveModelRef>,
     pub text: &'a str,
@@ -2491,6 +2492,7 @@ pub(super) fn oversized_text_artifact_admission(
     let OversizedTextArtifactAdmissionRequest {
         session_id,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
@@ -2552,6 +2554,7 @@ pub(super) fn oversized_text_artifact_admission(
         canonical_model_digest,
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin,
             text: text.to_owned(),
             display_text: display_text.map(str::to_owned),
             tag_expansions: tag_expansions
@@ -2663,11 +2666,41 @@ pub(super) async fn handle_request(
     result
 }
 
+fn submission_origin_from_wire(
+    origin: proto::UserMessageOrigin,
+) -> crate::engine::message::SubmissionOrigin {
+    match origin {
+        proto::UserMessageOrigin::ExternalRoot => {
+            crate::engine::message::SubmissionOrigin::ExternalRoot
+        }
+        proto::UserMessageOrigin::GoalContinuation => {
+            crate::engine::message::SubmissionOrigin::GoalContinuation
+        }
+        proto::UserMessageOrigin::ScheduledJob => {
+            crate::engine::message::SubmissionOrigin::ScheduledJob
+        }
+        proto::UserMessageOrigin::AutoContinue => {
+            crate::engine::message::SubmissionOrigin::AutoContinue
+        }
+        proto::UserMessageOrigin::RetryRecovery => {
+            crate::engine::message::SubmissionOrigin::RetryRecovery
+        }
+        proto::UserMessageOrigin::ToolResult => {
+            crate::engine::message::SubmissionOrigin::ToolResult
+        }
+        proto::UserMessageOrigin::CompactNotice => {
+            crate::engine::message::SubmissionOrigin::CompactNotice
+        }
+        proto::UserMessageOrigin::Internal => crate::engine::message::SubmissionOrigin::Internal,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_send_user_message(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     text: String,
@@ -2731,6 +2764,7 @@ async fn handle_send_user_message(
             OversizedTextArtifactAdmissionRequest {
                 session_id,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model: expected_model.as_ref(),
                 text: &text,
@@ -2747,12 +2781,14 @@ async fn handle_send_user_message(
     // Legacy-sized/media messages retain their existing admission behavior.
     // Oversized FCM2 messages record activity only after the worker has
     // durably accepted both the receipt triple and source reservation.
-    if artifact_admission.is_none()
+    if origin == proto::UserMessageOrigin::ExternalRoot
+        && artifact_admission.is_none()
         && let Some(scheduler) = &ctx.scheduler
     {
         scheduler.record_user_activity().await;
     }
     let mut wire_fingerprint = user_message_wire_fingerprint(
+        origin,
         &text,
         display_text.as_deref(),
         &tag_expansions,
@@ -2902,7 +2938,7 @@ async fn handle_send_user_message(
     };
     let (respond_to, response_rx) = tokio::sync::oneshot::channel();
     let mut submission = crate::engine::message::UserSubmission {
-        origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+        origin: submission_origin_from_wire(origin),
         expected_model_state_generation,
         expected_model,
         kind: crate::engine::message::UserSubmissionKind::User,
@@ -3261,6 +3297,7 @@ async fn handle_send_user_message_bulk(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     transfer: cockpit_proto::bulk_transfer::BulkTransferRef,
@@ -3299,6 +3336,7 @@ async fn handle_send_user_message_bulk(
         state,
         ctx,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
@@ -4599,6 +4637,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SendUserMessage {
+            origin,
             expected_model_state_generation,
             expected_model,
             client_submission_id,
@@ -4613,6 +4652,7 @@ async fn handle_serialized_request_impl(
                 state,
                 ctx,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 text,
@@ -4628,6 +4668,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SendUserMessageBulk {
+            origin,
             expected_model_state_generation,
             expected_model,
             client_submission_id,
@@ -4642,6 +4683,7 @@ async fn handle_serialized_request_impl(
                 state,
                 ctx,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 transfer,

@@ -15,8 +15,16 @@ impl Driver {
         match event {
             ScheduleEvent::LoopIterationDue { job_id, prompt } => {
                 let framed = format!("[loop {job_id}] {prompt}");
-                self.run_user_input(UserSubmission::text(framed), input_rx, tx)
-                    .await?;
+                self.run_user_input(
+                    UserSubmission {
+                        origin: crate::engine::message::SubmissionOrigin::ScheduledJob,
+                        text: framed,
+                        ..Default::default()
+                    },
+                    input_rx,
+                    tx,
+                )
+                .await?;
                 // The iteration's turn finished — advance the schedule.
                 self.schedule.iteration_finished(&job_id);
             }

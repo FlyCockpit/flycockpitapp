@@ -599,6 +599,11 @@ fn init_and_learn_submissions_use_external_root_origin() {
         SubmissionOrigin::ExternalRoot,
         "/init must use ExternalRoot so it advances activity_epoch"
     );
+    assert!(init_submission.origin.advances_activity_epoch());
+    assert_eq!(
+        init_submission.origin.user_prompt_submit_source(),
+        Some("user")
+    );
 
     // ── /learn ─────────────────────────────────────────────────────────
     let tmp2 = tempfile::tempdir().unwrap();
@@ -621,5 +626,10 @@ fn init_and_learn_submissions_use_external_root_origin() {
         learn_submission.origin,
         SubmissionOrigin::ExternalRoot,
         "/learn must use ExternalRoot so it advances activity_epoch"
+    );
+    assert!(learn_submission.origin.advances_activity_epoch());
+    assert_eq!(
+        learn_submission.origin.user_prompt_submit_source(),
+        Some("user")
     );
 }

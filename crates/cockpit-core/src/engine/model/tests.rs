@@ -489,6 +489,123 @@ async fn compact_utility_dispatch_does_not_inner_retry_overload() {
     );
 }
 
+/// Like the idle case below, but no SSE event ever arrives: the public
+/// compact-utility wrapper must wire its terminal TTFT policy into the real
+/// request drain, without relying on a configured backup model.
+#[tokio::test(start_paused = true)]
+async fn compact_utility_wrapper_aborts_a_no_token_stall_without_fallback() {
+    let provider = provider_with_turns([
+        Turn::SseHeadersThenHang,
+        Turn::RawJson(chat_text_json("must not be requested")),
+    ])
+    .await;
+    let timeout = TimeoutConfig {
+        ttft_secs: 1,
+        idle_secs: 10,
+    };
+    let redact = TestArc::new(RedactionTable::empty());
+    let model = build_openai_model_from_resolved(
+        "p",
+        &resolved_local_request(provider.base_url()),
+        "m",
+        &timeout,
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Completions,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        redact.clone(),
+        redact,
+    )
+    .expect("test model must build");
+
+    let error = model
+        .complete_captured_compact_utility(
+            "system",
+            &[],
+            Message::user("summarize"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("compact utility TTFT timeout must be terminal without a fallback");
+    assert_eq!(
+        classify_inference_failure(&error),
+        InferenceErrorClass::TimeoutTtft
+    );
+    assert_eq!(
+        provider.captured().len(),
+        1,
+        "compact utility must not retry or swap endpoints after a terminal stall"
+    );
+}
+
+/// Exercise the public compact-utility wrapper against a real stalled SSE
+/// provider. This proves the wrapper, rather than only the `run_drain` helper,
+/// makes an idle deadline terminal and leaves retry ownership to compaction.
+#[tokio::test(start_paused = true)]
+async fn compact_utility_wrapper_aborts_a_stalled_provider_without_fallback() {
+    let provider = provider_with_turns([
+        Turn::RawSseThenHang(
+            "data: {\"id\":\"c\",\"model\":\"local\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}],\"usage\":null}\n\n"
+                .to_string(),
+        ),
+        Turn::RawJson(chat_text_json("must not be requested")),
+    ])
+    .await;
+    let timeout = TimeoutConfig {
+        ttft_secs: 10,
+        idle_secs: 1,
+    };
+    let redact = TestArc::new(RedactionTable::empty());
+    let model = build_openai_model_from_resolved(
+        "p",
+        &resolved_local_request(provider.base_url()),
+        "m",
+        &timeout,
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Completions,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        redact.clone(),
+        redact,
+    )
+    .expect("test model must build");
+
+    let error = model
+        .complete_captured_compact_utility(
+            "system",
+            &[],
+            Message::user("summarize"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("compact utility idle timeout must be terminal without a fallback");
+    assert_eq!(
+        classify_inference_failure(&error),
+        InferenceErrorClass::TimeoutIdle
+    );
+    assert_eq!(
+        provider.captured().len(),
+        1,
+        "compact utility must not retry or swap endpoints after a terminal stall"
+    );
+}
+
 #[test]
 fn compact_diagnostic_is_redacted_before_bounding() {
     let (_tmp, redact) = secret_table();

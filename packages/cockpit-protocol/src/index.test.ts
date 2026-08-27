@@ -97,6 +97,7 @@ describe("cockpit-proto daemon wire schemas", () => {
       request: "send_user_message_bulk",
       params: {
         client_submission_id: "22222222-2222-4222-8222-222222222222",
+        origin: "external_root",
         transfer: {
           transfer_id: "AQIDBAUGBwgJCgsMDQ4PEA",
           total_length,
@@ -473,6 +474,7 @@ describe("cockpit-proto daemon wire schemas", () => {
         request: "send_user_message",
         params: {
           client_submission_id: "00000000-0000-0000-0000-000000000000",
+          origin: "external_root",
           text: "hello",
         },
       }).success,

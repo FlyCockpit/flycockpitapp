@@ -330,6 +330,7 @@ async fn reserve_oversized_restart_fixture(
     seed: u8,
     fence: Option<(u64, cockpit_config::providers::ActiveModelRef)>,
     bind_run: bool,
+    origin: proto::UserMessageOrigin,
 ) -> ([u8; 16], Uuid) {
     let client_submission_id = Uuid::new_v4();
     let text = "restart-fence-source\n".repeat(4_000);
@@ -341,6 +342,7 @@ async fn reserve_oversized_restart_fixture(
         canonical_model_digest: [seed.wrapping_add(1); 32],
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin,
             text: text.clone(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -443,9 +445,15 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    let (stale_operation, stale_submission) =
-        reserve_oversized_restart_fixture(&db, &session, 71, Some((7, expected.clone())), true)
-            .await;
+    let (stale_operation, stale_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        71,
+        Some((7, expected.clone())),
+        true,
+        proto::UserMessageOrigin::ExternalRoot,
+    )
+    .await;
     let changed = proto::ActiveModelState {
         selection: cockpit_config::providers::ActiveModelRef {
             model: "model-b".to_owned(),
@@ -526,15 +534,38 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     assert!(db.list_session_events(session.id).await.unwrap().is_empty());
     assert!(db.list_text_artifacts(session.id).await.unwrap().is_empty());
 
-    let (matching_operation, matching_submission) =
-        reserve_oversized_restart_fixture(&db, &session, 72, Some((9, expected.clone())), false)
-            .await;
+    let (matching_operation, matching_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        72,
+        Some((9, expected.clone())),
+        false,
+        proto::UserMessageOrigin::AutoContinue,
+    )
+    .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
         selection: expected.clone(),
         default_selection: None,
         diverged: false,
         generation: 9,
     });
+    let persisted_matching = db
+        .accepted_message_queue(session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.client_submission_id == *matching_submission.as_bytes())
+        .expect("matching FCM2 admission must remain durable across restart");
+    assert_eq!(
+        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+            &persisted_matching.canonical_message,
+        )
+        .unwrap()
+        .request
+        .origin,
+        proto::UserMessageOrigin::AutoContinue,
+        "the persisted FCM2 form must retain the original origin"
+    );
     let (matching_updates, _matching_rx) = watch::channel(Vec::new());
     let matching_queue = crate::engine::message::UserSubmissionQueue::new(matching_updates);
     assert_eq!(
@@ -562,8 +593,15 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         crate::db::text_artifacts::TextArtifactReservationReplay::Live(_)
     ));
 
-    let (_implicit_operation, implicit_submission) =
-        reserve_oversized_restart_fixture(&db, &session, 73, None, false).await;
+    let (_implicit_operation, implicit_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        73,
+        None,
+        false,
+        proto::UserMessageOrigin::ExternalRoot,
+    )
+    .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
         selection: cockpit_config::providers::ActiveModelRef {
             model: "model-c".to_owned(),
@@ -1387,6 +1425,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             canonical_model_digest: [32; 32],
             request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
                 client_submission_id,
+                origin: proto::UserMessageOrigin::ExternalRoot,
                 text: oversized_source.clone(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -1595,6 +1634,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             canonical_model_digest: [2; 32],
             request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
                 client_submission_id,
+                origin: proto::UserMessageOrigin::ExternalRoot,
                 text: source.clone(),
                 display_text: None,
                 tag_expansions: Vec::new(),

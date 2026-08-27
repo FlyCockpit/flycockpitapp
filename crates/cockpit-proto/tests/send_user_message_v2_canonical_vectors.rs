@@ -208,6 +208,7 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
         canonical_model_digest: [2; 32],
         request: SendUserMessageV2 {
             client_submission_id: Uuid::from_u128(2),
+            origin: cockpit_proto::UserMessageOrigin::ExternalRoot,
             text: ascii_max.clone(),
             display_text: Some(ascii_max),
             tag_expansions: tags,
@@ -296,6 +297,10 @@ fn send_user_message_v2_shared_bytes_and_digests() {
     for vector in fixture["vectors"].as_array().unwrap() {
         let bytes = hex(vector["fcm2_hex"].as_str().unwrap());
         let decoded = CanonicalSendUserMessageV2::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.request.origin,
+            cockpit_proto::UserMessageOrigin::ExternalRoot
+        );
         assert_eq!(decoded.encode().unwrap(), bytes);
         assert_eq!(
             decoded.message_request_digest().unwrap().as_slice(),
@@ -309,6 +314,10 @@ fn send_user_message_v2_shared_bytes_and_digests() {
     for vector in fixture["compact_positive_vectors"].as_array().unwrap() {
         let bytes = compact_bytes(vector);
         let decoded = CanonicalSendUserMessageV2::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.request.origin,
+            cockpit_proto::UserMessageOrigin::ExternalRoot
+        );
         assert_eq!(decoded.encode().unwrap(), bytes);
         assert_eq!(
             decoded.message_request_digest().unwrap().as_slice(),
@@ -319,6 +328,26 @@ fn send_user_message_v2_shared_bytes_and_digests() {
             hex(vector["attachment_set_digest_hex"].as_str().unwrap())
         );
     }
+}
+
+#[test]
+fn send_user_message_v2_origin_is_bound_into_replay_identity() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+    ))
+    .unwrap();
+    let external = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][1]["fcm2_hex"]
+        .as_str()
+        .unwrap()))
+    .unwrap();
+    let mut internal = external.clone();
+    internal.request.origin = cockpit_proto::UserMessageOrigin::AutoContinue;
+    assert_ne!(external.encode().unwrap(), internal.encode().unwrap());
+    assert_ne!(
+        external.message_request_digest().unwrap(),
+        internal.message_request_digest().unwrap(),
+        "semantic replay must not reuse an identity with a changed origin"
+    );
 }
 
 #[test]

@@ -2516,6 +2516,24 @@ async fn try_spawn_inner(
                 let event_notify = event_notify.clone();
                 async move {
                     let client = current_client.read().await.clone();
+                    // `/compact` is a daemon operation, not an authored user
+                    // turn. Routing the compact notice through SendUserMessage
+                    // discarded its Compact/CompactNotice classification and
+                    // reconstructed it as an ExternalRoot user prompt. Use
+                    // the dedicated RPC so it cannot advance activity or be
+                    // sent to the model as ordinary text.
+                    if sub.kind == cockpit_client::submission::UserSubmissionKind::Compact {
+                        return match client.request(Request::Compact).await {
+                            Ok(Response::Ack) => Ok(()),
+                            Ok(response) => Err(UserSubmissionSendError::Ambiguous(format!(
+                                "daemon returned an unexpected response to compact: {response:?}"
+                            ))),
+                            Err(error) => {
+                                tracing::warn!(error = ?error, "compact transport failed");
+                                Err(UserSubmissionSendError::Ambiguous(error.to_string()))
+                            }
+                        };
+                    }
                     let use_bulk = user_message_needs_bulk(&sub.text, sub.display_text.as_deref());
                     // FCM2 source artifacts are intentionally text-only.  Do
                     // this guard before image upload so a rejected mixed
@@ -2552,6 +2570,7 @@ async fn try_spawn_inner(
                         };
                         client
                             .request(Request::SendUserMessageBulk {
+                                origin: sub.origin.into(),
                                 expected_model_state_generation: sub
                                     .expected_model_state_generation,
                                 expected_model: sub.expected_model,
@@ -2574,6 +2593,7 @@ async fn try_spawn_inner(
                             .map_err(classify_image_upload_error)?;
                         client
                             .request(Request::SendUserMessage {
+                                origin: sub.origin.into(),
                                 expected_model_state_generation: sub.expected_model_state_generation,
                                 expected_model: sub.expected_model,
                                 client_submission_id,

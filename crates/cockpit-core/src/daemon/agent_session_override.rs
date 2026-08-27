@@ -719,4 +719,162 @@ mod tests {
             Some(AgentControlLockedReasonV1::Terminal)
         );
     }
+
+    #[test]
+    fn modes_session_setup_sandbox_ordering_endpoints() {
+        // From the strictest posture nothing is loosenable: allowed is a
+        // singleton; from `off` every posture is allowed (off included).
+        let mut ctx = base_ctx();
+        ctx.session_sandbox_default = SandboxMode::ContainerReadonly;
+        assert_eq!(
+            build_effective_settings(&ctx).sandbox.allowed,
+            vec![SandboxMode::ContainerReadonly]
+        );
+        ctx.session_sandbox_default = SandboxMode::Off;
+        assert_eq!(
+            build_effective_settings(&ctx).sandbox.allowed,
+            vec![
+                SandboxMode::Off,
+                SandboxMode::Sandbox,
+                SandboxMode::Container,
+                SandboxMode::ContainerReadonly
+            ]
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_question_override_monotonic_every_transition() {
+        let mut ctx = base_ctx();
+        ctx.profile = Some(RedactedAgentProfileSnapshot {
+            agent_id: "a".to_string(),
+            execution_kind: AgentExecutionKind::Coding,
+            effective_delegation: None,
+            recommendations: Vec::new(),
+            question_policy: active_question(30_000, 60_000, false),
+            verification_regions: Vec::new(),
+            bindings: Vec::new(),
+        });
+        // Equal to the current required timeout is a no-op reduction (allowed).
+        assert!(authorize_question(
+            &AgentQuestionOverrideV1::Reduce {
+                required_decision_timeout_seconds: 30
+            },
+            &ctx
+        )
+        .is_ok());
+        // Effective rendering: auto-answer enabled, ceiling reflected, disable
+        // offerable while live.
+        let effective = build_effective_settings(&ctx).question.effective.unwrap();
+        assert!(effective.auto_answer_enabled);
+        assert_eq!(effective.required_decision_timeout_seconds, 30);
+        assert_eq!(effective.host_ceiling_seconds, 60);
+        assert_eq!(effective.max_required_decision_timeout_seconds, 60);
+        assert!(effective.can_disable_auto_answer);
+    }
+
+    #[test]
+    fn modes_session_setup_question_auto_answer_already_disabled_cannot_redisable() {
+        let mut ctx = base_ctx();
+        ctx.profile = Some(RedactedAgentProfileSnapshot {
+            agent_id: "a".to_string(),
+            execution_kind: AgentExecutionKind::Coding,
+            effective_delegation: None,
+            recommendations: Vec::new(),
+            // auto-answer already disabled.
+            question_policy: active_question(30_000, 60_000, true),
+            verification_regions: Vec::new(),
+            bindings: Vec::new(),
+        });
+        let effective = build_effective_settings(&ctx).question.effective.unwrap();
+        assert!(!effective.auto_answer_enabled);
+        // Disabling is not offered again once auto-answer is already off.
+        assert!(!effective.can_disable_auto_answer);
+    }
+
+    #[test]
+    fn modes_session_setup_question_terminal_node_is_read_only() {
+        let mut ctx = base_ctx();
+        ctx.state = AgentInstanceState::Completed;
+        ctx.profile = Some(RedactedAgentProfileSnapshot {
+            agent_id: "a".to_string(),
+            execution_kind: AgentExecutionKind::Coding,
+            effective_delegation: None,
+            recommendations: Vec::new(),
+            question_policy: active_question(30_000, 60_000, false),
+            verification_regions: Vec::new(),
+            bindings: Vec::new(),
+        });
+        let question = build_effective_settings(&ctx).question;
+        assert_eq!(
+            question.locked_reason,
+            Some(AgentControlLockedReasonV1::Terminal)
+        );
+        assert!(!question.effective.unwrap().can_disable_auto_answer);
+    }
+
+    #[test]
+    fn modes_session_setup_verification_restrict_requires_real_narrowing() {
+        let mut ctx = base_ctx();
+        ctx.profile = Some(RedactedAgentProfileSnapshot {
+            agent_id: "a".to_string(),
+            execution_kind: AgentExecutionKind::Coding,
+            effective_delegation: None,
+            recommendations: Vec::new(),
+            question_policy: RedactedQuestionPolicy::Off,
+            verification_regions: vec![verifying_region("rule-1", Some(1000))],
+            bindings: Vec::new(),
+        });
+        // A Restrict with neither a selector nor a lowered budget narrows
+        // nothing and is refused.
+        assert_eq!(
+            authorize_verification(
+                &AgentVerificationReductionV1::Restrict {
+                    region_id: "rule-1".to_string(),
+                    selector_intersection: Vec::new(),
+                    max_candidates: None,
+                    max_total_tokens: None,
+                    max_estimated_cost_microusd: None,
+                    max_collection_millis: None,
+                },
+                &ctx
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible)
+        );
+        // A selector intersection within the ceiling is a valid narrowing.
+        assert!(authorize_verification(
+            &AgentVerificationReductionV1::Restrict {
+                region_id: "rule-1".to_string(),
+                selector_intersection: vec!["tool_class:write".to_string()],
+                max_candidates: None,
+                max_total_tokens: Some(500),
+                max_estimated_cost_microusd: None,
+                max_collection_millis: None,
+            },
+            &ctx
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn modes_session_setup_verification_region_projected_with_flags() {
+        let mut ctx = base_ctx();
+        let mut off_region = verifying_region("rule-off", None);
+        off_region.whole_region_off = true;
+        ctx.profile = Some(RedactedAgentProfileSnapshot {
+            agent_id: "a".to_string(),
+            execution_kind: AgentExecutionKind::Coding,
+            effective_delegation: None,
+            recommendations: Vec::new(),
+            question_policy: RedactedQuestionPolicy::Off,
+            verification_regions: vec![verifying_region("rule-on", None), off_region],
+            bindings: Vec::new(),
+        });
+        let regions = build_effective_settings(&ctx).verification.regions;
+        assert_eq!(regions.len(), 2);
+        let on = regions.iter().find(|r| r.region_id == "rule-on").unwrap();
+        assert!(on.enabled && on.can_disable && on.can_restrict);
+        // A region already turned off is not enabled and offers no reduction.
+        let off = regions.iter().find(|r| r.region_id == "rule-off").unwrap();
+        assert!(!off.enabled && !off.can_disable && !off.can_restrict);
+    }
 }

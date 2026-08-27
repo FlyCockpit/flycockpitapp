@@ -10497,6 +10497,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn modes_session_setup_override_snapshot_reload_preserves_narrowed_region() {
+        // AC6: a disabled/narrowed earlier region survives consume + a fresh
+        // read (snapshot reload), and later axes are not revealed as a fallback.
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let root = db
+            .ensure_session_root_agent(session.session_id, None, host_workspace_ref(), 1)
+            .await
+            .unwrap();
+        db.apply_agent_session_override(
+            session.session_id,
+            root.agent_instance_id,
+            0,
+            StoredOverrideField::Verification(StoredVerificationReduction {
+                region_id: "rule-1".to_string(),
+                off: true,
+                selector_intersection: Vec::new(),
+                max_candidates: None,
+                max_total_tokens: None,
+                max_estimated_cost_microusd: None,
+                max_collection_millis: None,
+            }),
+            10,
+        )
+        .await
+        .unwrap();
+        db.apply_agent_session_override(
+            session.session_id,
+            root.agent_instance_id,
+            1,
+            StoredOverrideField::Question(StoredQuestionOverride::Disable),
+            11,
+        )
+        .await
+        .unwrap();
+        db.consume_pending_agent_override(session.session_id, root.agent_instance_id, 12)
+            .await
+            .unwrap();
+
+        // Fresh read simulates a reload: both reductions persist in effective.
+        let reloaded = db
+            .read_agent_override_state(session.session_id, root.agent_instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let effective = reloaded.effective.expect("effective preserved on reload");
+        let region = effective
+            .verification
+            .iter()
+            .find(|r| r.region_id == "rule-1")
+            .expect("narrowed region preserved");
+        assert!(region.off, "the off mask is preserved, not a later fallback");
+        assert_eq!(effective.question, Some(StoredQuestionOverride::Disable));
+        assert!(reloaded.pending.is_none(), "nothing left pending after consume");
+    }
+
+    #[tokio::test]
     async fn modes_session_setup_override_consume_moves_pending_into_effective() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/workspace", "root").await.unwrap();

@@ -1449,7 +1449,6 @@ mod capability_tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
             capabilities: Some(grants.clone()),
             tool_steering: None,
             context_policy: None,

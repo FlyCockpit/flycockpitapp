@@ -843,7 +843,6 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: cockpit_core::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
             capabilities: None,
             tool_steering: None,
             context_policy: None,

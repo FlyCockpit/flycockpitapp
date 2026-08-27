@@ -694,7 +694,6 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         scan_tool_results: None,
         goal_supervision: GoalSettingsOverride::default(),
         permission: None,
-        fork_eligible: false,
         capabilities: None,
         tool_steering: None,
         context_policy: None,
@@ -1803,6 +1802,15 @@ fn agent_def_capabilities_parse_and_validate() {
     let resolved = parsed.capabilities.expect("capabilities present");
     assert!(resolved.contains(&AgentCapability::FollowupSeed));
     assert!(resolved.contains(&AgentCapability::ScopedParallelWrite));
+}
+
+#[test]
+fn absent_capabilities_resolve_to_no_grants() {
+    let def = def_with_tools("standard", &["read"]);
+    let posture = PostureResolution::from_def(&def);
+
+    assert!(posture.grants().is_empty());
+    assert!(!posture.grants().contains(&AgentCapability::ForkContext));
 }
 
 #[test]

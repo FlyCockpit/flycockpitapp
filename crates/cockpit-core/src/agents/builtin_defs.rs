@@ -19,8 +19,9 @@
 use std::path::PathBuf;
 
 use super::{
-    AgentDef, AgentMode, AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind,
-    ModelCapability, ModelLocality, ModelSlot, ToolDescriptionSpec, ToolTier, VnextAgentDef,
+    AgentCapability, AgentDef, AgentMode, AllowedChild, DelegationPolicy, DelegationTarget,
+    ExecutionKind, ModelCapability, ModelLocality, ModelSlot, ToolDescriptionSpec, ToolTier,
+    VnextAgentDef,
 };
 
 /// Names of the built-in agents in scope for user editing, in canonical
@@ -179,7 +180,6 @@ fn def_with_normal(
         scan_tool_results: Some(super::default_scan_tool_results(name)),
         goal_supervision: super::GoalSettingsOverride::default(),
         permission: None,
-        fork_eligible: false,
         capabilities: None,
         tool_steering: None,
         context_policy: None,
@@ -681,6 +681,7 @@ fn docs_answerer_def() -> AgentDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::PostureResolution;
 
     fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
         if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {
@@ -729,10 +730,17 @@ mod tests {
     }
 
     #[test]
-    fn no_builtin_agent_is_fork_eligible_by_default() {
+    fn builtin_agents_grant_fork_context_only_where_intended() {
         for name in BUILTIN_AGENT_NAMES {
             let def = embedded_default(name).expect("builtin agent definition");
-            assert!(!def.fork_eligible, "{name} must opt out by default");
+            let grants_fork_context = PostureResolution::from_def(def)
+                .grants()
+                .contains(&AgentCapability::ForkContext);
+            assert_eq!(
+                grants_fork_context,
+                matches!(*name, "Build" | "builder"),
+                "unexpected forkContext grant for {name}"
+            );
         }
     }
 

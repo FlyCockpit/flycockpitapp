@@ -235,7 +235,6 @@ fn create_assistant_with_installation_id_sync(
         scan_tool_results: None,
         goal_supervision: crate::agents::GoalSettingsOverride::default(),
         permission: None,
-        fork_eligible: false,
         capabilities: None,
         tool_steering: None,
         context_policy: None,

@@ -491,7 +491,6 @@ mod grant_tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
             capabilities: None,
             tool_steering: None,
             context_policy: None,

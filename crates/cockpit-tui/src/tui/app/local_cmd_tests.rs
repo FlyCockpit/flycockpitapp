@@ -592,7 +592,7 @@ fn init_and_learn_submissions_use_external_root_origin() {
 
     let init_submission = match input_rx.try_recv() {
         Ok(crate::tui::agent_runner::RunnerInput::Submission(bound)) => bound.submission,
-        other => panic!("expected /init Submission, got {other:?}"),
+        _ => panic!("expected /init Submission"),
     };
     assert_eq!(
         init_submission.origin,
@@ -615,7 +615,7 @@ fn init_and_learn_submissions_use_external_root_origin() {
 
     let learn_submission = match input_rx2.try_recv() {
         Ok(crate::tui::agent_runner::RunnerInput::Submission(bound)) => bound.submission,
-        other => panic!("expected /learn Submission, got {other:?}"),
+        _ => panic!("expected /learn Submission"),
     };
     assert_eq!(
         learn_submission.origin,

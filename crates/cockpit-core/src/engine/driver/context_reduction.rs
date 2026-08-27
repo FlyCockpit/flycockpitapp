@@ -2030,8 +2030,9 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                             if draft.context_window.is_some()
                                 && attempt < MAX_WIRE_SAMPLES_PER_NODE
                                 && let Some(smaller) =
-                                    crate::engine::compact_draft::next_smaller_whole_exchange_fit(
+                                    crate::engine::compact_draft::next_smaller_fit(
                                         &draft.history,
+                                        fit_rung,
                                     )
                             {
                                 draft.history = smaller.history;
@@ -2215,10 +2216,10 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                         // suffix; never retry the known-overflowing input.
                         if draft.context_window.is_some()
                             && attempt < MAX_WIRE_SAMPLES_PER_NODE
-                            && let Some(smaller) =
-                                crate::engine::compact_draft::next_smaller_whole_exchange_fit(
-                                    &draft.history,
-                                )
+                            && let Some(smaller) = crate::engine::compact_draft::next_smaller_fit(
+                                &draft.history,
+                                fit_rung,
+                            )
                         {
                             draft.history = smaller.history;
                             fit_rung = smaller.rung;
@@ -2278,7 +2279,7 @@ async fn record_compact_sample_observation(
 }
 
 fn compact_diagnostic(draft: &CompactBriefDraft, text: &str) -> String {
-    crate::engine::compact_draft::bounded_diagnostic(&draft.model.scrub_diagnostic(text))
+    crate::engine::compact_draft::bounded_model_diagnostic(&draft.model, text)
 }
 
 /// Context-fill metrics for the auto-prune/auto-compact triggers

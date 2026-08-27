@@ -830,7 +830,9 @@ impl Model {
                             }
                         }
                     };
-                    let result = if single_handoff || compact_utility {
+                    let result = if compact_utility {
+                        attempt().await
+                    } else if single_handoff {
                         retry::with_retry_max(
                             agent_name,
                             &reconnect_target,
@@ -1023,7 +1025,9 @@ impl Model {
                     )
                     .await
                 };
-                if single_handoff || compact_utility {
+                if compact_utility {
+                    attempt().await
+                } else if single_handoff {
                     retry::with_retry_max(
                         agent_name,
                         &reconnect_target,
@@ -1086,7 +1090,9 @@ impl Model {
                     )
                     .await
                 };
-                if single_handoff || compact_utility {
+                if compact_utility {
+                    attempt().await
+                } else if single_handoff {
                     retry::with_retry_max(
                         agent_name,
                         &reconnect_target,

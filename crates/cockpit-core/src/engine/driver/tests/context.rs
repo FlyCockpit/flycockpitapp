@@ -622,7 +622,7 @@ async fn load_without_row_clears_memory_view() {
 
 #[tokio::test]
 async fn loaded_brief_generation_is_persisted_and_compared() {
-    let (driver, _tmp) = test_driver_without_network(8);
+    let (mut driver, _tmp) = test_driver_without_network(8);
     let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
         generation: 7,
         snapshot_history: vec![Message::user("snapshot"), Message::assistant("briefed")],
@@ -3111,22 +3111,42 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
         Message::user("second request"),
         Message::assistant("second response"),
     ];
-    let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
+    driver.shadow_brief_generation = 5;
+    driver.shadow_brief = Some(ShadowBriefState::InFlight(ShadowBriefInFlight {
         generation: 5,
         snapshot_history: snapshot_history.clone(),
         snapshot_turns: 2,
         snapshot_tail_turns: 1,
-        brief: "partial shadow brief derived from fitted history".to_string(),
-        fit_rung: CompactFitRung::HistorySelected,
-        input_coverage: CompactInputCoverage::Partial,
-    });
-    let payload_json = serde_json::to_string(&payload).unwrap();
-    driver
+        cancel: tokio_util::sync::CancellationToken::new(),
+        handle: tokio::spawn(async {
+            crate::engine::compact_draft::CompactDraftOutcome::Success(
+                crate::engine::compact_draft::CompactDraftSuccess {
+                    brief: "partial shadow brief derived from fitted history".to_string(),
+                    fit_rung: CompactFitRung::HistorySelected,
+                    input_coverage: CompactInputCoverage::Partial,
+                    attempts: 1,
+                },
+            )
+        }),
+    }));
+    tokio::task::yield_now().await;
+    driver.settle_shadow_brief().await;
+
+    let stored = driver
         .session
         .db
-        .upsert_compaction_shadow(driver.session.id, &payload_json)
+        .compaction_shadow(driver.session.id)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("settling a fitted shadow must persist it");
+    let payload_json = stored.payload_json;
+    let persisted: DurableCompactionShadow = serde_json::from_str(&payload_json).unwrap();
+    let DurableCompactionShadow::ReadyBrief(persisted) = persisted else {
+        panic!("settled shadow must persist a ready brief");
+    };
+    assert_eq!(persisted.fit_rung, CompactFitRung::HistorySelected);
+    assert_eq!(persisted.input_coverage, CompactInputCoverage::Partial);
+    assert_eq!(persisted.snapshot_history, snapshot_history);
 
     // Simulate a restart: create a fresh driver on the same session DB.
     let mut restored = Driver::new(
@@ -3141,7 +3161,7 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
     // The shadow is restored as Ready, not discarded.
     let ready = match &restored.shadow_brief {
         Some(ShadowBriefState::Ready(ready)) => ready,
-        other => panic!("expected Ready shadow after restart, got {other:?}"),
+        _ => panic!("expected Ready shadow after restart"),
     };
     assert_eq!(restored.shadow_brief_generation, 5);
     assert_eq!(
@@ -3237,13 +3257,17 @@ async fn manual_compact_bypasses_auto_compact_gate() {
 /// even if a prior run left the gate in a blocking state.
 #[tokio::test]
 async fn auto_compact_gate_restart_begins_eligible() {
-    let (driver, _tmp) = test_driver_without_network(8);
+    let (mut driver, _tmp) = test_driver_without_network(8);
     let coverage = prepared_compaction_coverage(&[Message::user("one")]);
 
-    // A fresh driver's gate is Eligible and does not suppress.
+    // Leave the prior in-memory driver in a blocking state.
+    driver.auto_compact_gate = AutoCompactGate::UntilActivity {
+        activity_epoch: 0,
+        reason: "deterministic failure".to_string(),
+    };
     assert!(
-        !driver.auto_compact_gate.suppresses(&coverage),
-        "a fresh driver must start Eligible"
+        driver.auto_compact_gate.suppresses(&coverage),
+        "precondition: the prior driver must be blocked"
     );
 
     // Simulate a restart by creating a new driver on the same session.

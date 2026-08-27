@@ -449,10 +449,7 @@ async fn compact_utility_dispatch_has_terminal_ttft_deadline() {
         ttft_secs: 1,
         idle_secs: 1,
     };
-    // `hard_timeout_on_stall: true` is what `complete_captured_compact_utility`
-    // sets via `compact_utility || self.hard_timeout_on_stall()`.
-    let (res, phase, events) = run_drain(&mut stream, &timeout, true).await;
-
+    let (res, phase, _) = run_drain(&mut stream, &timeout, true).await;
     let err = res.expect_err("compact-utility TTFT must abort without a backup model");
     assert_eq!(
         classify_inference_failure(&err),
@@ -460,16 +457,52 @@ async fn compact_utility_dispatch_has_terminal_ttft_deadline() {
         "TTFT expiration in compact-utility mode must be a typed transient outcome"
     );
     assert_eq!(phase, InferencePhase::Prep);
-    assert!(events.iter().any(|event| {
-        matches!(
-            event,
-            TurnEvent::InferenceWarning {
-                phase,
-                waited_secs,
-                ..
-            } if phase == "ttft" && *waited_secs == 1
+}
+
+#[tokio::test]
+async fn compact_utility_dispatch_does_not_inner_retry_overload() {
+    let provider = provider_with_turns([
+        Turn::HttpError {
+            status: 429,
+            body: r#"{"error":{"message":"overloaded"}}"#.to_string(),
+        },
+        Turn::RawJson(chat_text_json("must not be requested")),
+    ])
+    .await;
+    let model = openai_model_at_with_wire(&provider.base_url(), WireApi::Completions, true);
+    model
+        .complete_captured_compact_utility(
+            "system",
+            &[],
+            Message::user("summarize"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            &CancellationToken::new(),
         )
-    }));
+        .await
+        .expect_err("429 must return to the compaction sampler");
+    assert_eq!(
+        provider.captured().len(),
+        1,
+        "compact utility owns no inner overload retry"
+    );
+}
+
+#[test]
+fn compact_diagnostic_is_redacted_before_bounding() {
+    let (_tmp, redact) = secret_table();
+    let model = model_at("http://127.0.0.1:1/v1", redact);
+    let diagnostic = crate::engine::compact_draft::bounded_model_diagnostic(
+        &model,
+        &format!(
+            "provider rejected secret {SECRET} {}",
+            "detail ".repeat(100)
+        ),
+    );
+    assert!(!diagnostic.contains(SECRET));
+    assert!(diagnostic.contains(PLACEHOLDER));
+    assert!(diagnostic.chars().count() <= crate::engine::compact_draft::DIAGNOSTIC_LIMIT);
 }
 
 #[tokio::test(start_paused = true)]

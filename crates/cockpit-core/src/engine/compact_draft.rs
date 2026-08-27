@@ -21,7 +21,7 @@ pub(crate) const MAX_WIRE_SAMPLES_PER_NODE: u8 = 2;
 pub(crate) const MAX_DRAFT_NODES: usize = 64;
 pub(crate) const MAX_COMPACTION_WIRE_SAMPLES: usize =
     MAX_DRAFT_NODES * MAX_WIRE_SAMPLES_PER_NODE as usize;
-const DIAGNOSTIC_LIMIT: usize = 240;
+pub(crate) const DIAGNOSTIC_LIMIT: usize = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -114,6 +114,10 @@ pub(crate) fn classify_sample_error(
 pub(crate) fn bounded_diagnostic(text: &str) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     one_line.chars().take(DIAGNOSTIC_LIMIT).collect()
+}
+
+pub(crate) fn bounded_model_diagnostic(model: &crate::engine::model::Model, text: &str) -> String {
+    bounded_diagnostic(&model.scrub_diagnostic(text))
 }
 
 pub(crate) fn cleaned_brief_chars(text: &str) -> usize {
@@ -248,22 +252,27 @@ pub(crate) fn fit_whole_exchange_suffix(
     Some(fitted)
 }
 
-/// Strictly reduce a provider-rejected whole-exchange request. This is used
-/// only after an actual context-overflow verdict; transient failures stay on
-/// the same input. A single-exchange request has no pair-safe smaller rung.
-pub(crate) fn next_smaller_whole_exchange_fit(history: &[Message]) -> Option<FittedCompactHistory> {
+/// Strictly reduce a provider-rejected request. This is used only after an
+/// actual context-overflow verdict; transient failures stay on the same input.
+pub(crate) fn next_smaller_fit(
+    history: &[Message],
+    current_rung: CompactFitRung,
+) -> Option<FittedCompactHistory> {
     let ranges = super::compact::complete_exchange_ranges(history);
-    if ranges.len() <= 1 {
+    if ranges.len() > 1 {
+        let first = ranges[1].start;
+        let fitted = FittedCompactHistory {
+            history: history[first..].to_vec(),
+            rung: CompactFitRung::HistorySelected,
+            coverage: CompactInputCoverage::Partial,
+        };
+        super::rehydrate::validate_pairing(&fitted.history).ok()?;
+        return Some(fitted);
+    }
+    if current_rung == CompactFitRung::Emergency {
         return None;
     }
-    let first = ranges[1].start;
-    let fitted = FittedCompactHistory {
-        history: history[first..].to_vec(),
-        rung: CompactFitRung::HistorySelected,
-        coverage: CompactInputCoverage::Partial,
-    };
-    super::rehydrate::validate_pairing(&fitted.history).ok()?;
-    Some(fitted)
+    emergency_history_to_fit(history, wire_token_total(history).saturating_sub(1))
 }
 
 fn utf8_prefix(text: &str, byte_cap: usize) -> &str {
@@ -633,7 +642,7 @@ mod tests {
         let fitted = fit_whole_exchange_suffix(&history, newest_tokens).unwrap();
         assert_eq!(fitted.rung, CompactFitRung::HistorySelected);
         // The fitted suffix must pass provider-valid tool pairing.
-        super::rehydrate::validate_pairing(&fitted.history).unwrap();
+        crate::engine::rehydrate::validate_pairing(&fitted.history).unwrap();
         // The multi-call assistant turn and its multi-result run are intact.
         let serialized = serde_json::to_string(&fitted.history).unwrap();
         assert!(serialized.contains("call-a"));
@@ -683,7 +692,7 @@ mod tests {
         let last_exchange_tokens = wire_token_total(&history[4..]);
         let fitted = fit_whole_exchange_suffix(&history, last_exchange_tokens).unwrap();
         // The fitted suffix must pass pairing validation.
-        super::rehydrate::validate_pairing(&fitted.history).unwrap();
+        crate::engine::rehydrate::validate_pairing(&fitted.history).unwrap();
         // It must not begin at the orphaned tool result.
         assert!(
             !fitted
@@ -736,6 +745,45 @@ mod tests {
         assert!(serialized.contains("call-1"));
         assert!(serialized.contains("provider-call-1"));
         assert!(serialized.contains("large.json"));
+    }
+
+    #[test]
+    fn provider_overflow_advances_truncated_single_exchange_to_emergency() {
+        let history = vec![
+            Message::user("inspect it"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-overflow"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "large.json"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                })],
+            },
+            Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-overflow"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text("x".repeat(4_000))],
+                })],
+            },
+            Message::assistant("done"),
+        ];
+        let truncated = truncate_newest_exchange_to_fit(
+            &history,
+            wire_token_total(&history).saturating_sub(100),
+        )
+        .expect("fixture must first reach ToolResultTruncated");
+        let emergency = next_smaller_fit(&truncated.history, truncated.rung)
+            .expect("provider overflow must advance to Emergency");
+        assert_eq!(emergency.rung, CompactFitRung::Emergency);
+        assert!(wire_token_total(&emergency.history) < wire_token_total(&truncated.history));
+        crate::engine::rehydrate::validate_pairing(&emergency.history).unwrap();
     }
 
     #[test]
@@ -887,27 +935,36 @@ mod tests {
         assert_eq!(selected.rung, CompactFitRung::HistorySelected);
         assert!(wire_token_total(&selected.history) <= full);
         // Tool pairing must survive the selection.
-        super::rehydrate::validate_pairing(&selected.history).unwrap();
+        crate::engine::rehydrate::validate_pairing(&selected.history).unwrap();
 
         // ToolResultTruncated: a window that fits only with truncated payloads.
-        let truncated = truncate_newest_exchange_to_fit(&history, newest_exchange / 2);
-        if let Some(fitted) = truncated {
-            assert_eq!(fitted.rung, CompactFitRung::ToolResultTruncated);
-            assert!(wire_token_total(&fitted.history) <= newest_exchange);
-            super::rehydrate::validate_pairing(&fitted.history).unwrap();
-            let serialized = serde_json::to_string(&fitted.history).unwrap();
-            assert!(serialized.contains("compaction omitted"));
-            assert!(serialized.contains("call-ladder"));
-            assert!(serialized.contains("big.json"));
-        }
+        let truncated_allowance = newest_exchange / 2;
+        let fitted = truncate_newest_exchange_to_fit(&history, truncated_allowance)
+            .expect("the fixture must exercise ToolResultTruncated");
+        assert_eq!(fitted.rung, CompactFitRung::ToolResultTruncated);
+        let truncated_tokens = wire_token_total(&fitted.history);
+        assert!(truncated_tokens <= truncated_allowance);
+        crate::engine::rehydrate::validate_pairing(&fitted.history).unwrap();
+        let serialized = serde_json::to_string(&fitted.history).unwrap();
+        assert!(serialized.contains("compaction omitted"));
+        assert!(serialized.contains("call-ladder"));
+        assert!(serialized.contains("big.json"));
 
         // Emergency: an even smaller window.
-        let emergency = emergency_history_to_fit(&history, newest_exchange / 4);
-        if let Some(fitted) = emergency {
-            assert_eq!(fitted.rung, CompactFitRung::Emergency);
-            assert!(wire_token_total(&fitted.history) <= newest_exchange);
-            super::rehydrate::validate_pairing(&fitted.history).unwrap();
-        }
+        let newest_range = super::super::compact::complete_exchange_ranges(&history)
+            .into_iter()
+            .find(|range| range.contains(&2))
+            .unwrap();
+        let (minimal_emergency, changed) = truncate_tool_payloads(&history[newest_range], 0);
+        assert!(changed);
+        let emergency_allowance = wire_token_total(&minimal_emergency);
+        let fitted = emergency_history_to_fit(&history, emergency_allowance)
+            .expect("the fixture must exercise Emergency");
+        assert_eq!(fitted.rung, CompactFitRung::Emergency);
+        let emergency_tokens = wire_token_total(&fitted.history);
+        assert!(emergency_tokens <= emergency_allowance);
+        assert!(emergency_tokens <= truncated_tokens);
+        crate::engine::rehydrate::validate_pairing(&fitted.history).unwrap();
 
         // Impossibly small known window fails without mutation.
         assert!(

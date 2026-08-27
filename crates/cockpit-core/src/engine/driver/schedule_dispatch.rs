@@ -135,6 +135,7 @@ impl Driver {
                         display_text: None,
                         tag_expansions: Vec::new(),
                         images: Vec::new(),
+                        media: Vec::new(),
                         forced_skill: None,
                         origin_principal: None,
                         job_id: Some(job_id.clone()),

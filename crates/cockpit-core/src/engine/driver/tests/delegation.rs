@@ -820,6 +820,7 @@ async fn all_unwind_paths_drain_pending_input() {
                         display_text: None,
                         tag_expansions: Vec::new(),
                         images: vec![],
+                        media: vec![],
                         forced_skill: None,
                         origin_principal: None,
                         job_id: None,

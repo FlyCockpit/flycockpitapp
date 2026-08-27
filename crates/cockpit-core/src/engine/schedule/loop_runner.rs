@@ -74,6 +74,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     ) {
         Ok(s) => {
             s.set_external_journal(ctx.session.external_journal());
+            s.set_message_media_authority(ctx.session.message_media_authority());
             // Inherit the parent's command-secret cache so the scheduled loop
             // fork's store funnel injects resolved command outputs.
             s.set_command_secret_cache(ctx.session.command_secret_cache());

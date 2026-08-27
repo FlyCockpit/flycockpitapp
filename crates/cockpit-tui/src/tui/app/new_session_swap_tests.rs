@@ -214,6 +214,7 @@ fn complete_submission(index: usize) -> UserSubmission {
             3,
             4,
         ])],
+        media: Vec::new(),
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some(format!("job-{index}")),

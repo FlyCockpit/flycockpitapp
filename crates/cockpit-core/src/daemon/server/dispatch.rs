@@ -2725,16 +2725,37 @@ async fn handle_send_user_message_v2(
                     .into(),
         });
     }
-    if request
-        .attachments
-        .iter()
-        .any(|attachment| attachment.kind != cockpit_db::media_attachments::MediaKind::Image)
-    {
-        return Err(ErrorPayload {
-            code: ErrorCode::BadRequest,
-            message: "the local model path currently accepts image attachments only".into(),
-        });
-    }
+    let capability_snapshot = attached.handle.config_snapshot();
+    let attachment_capabilities = match authoritative_model.as_ref() {
+        Some(model) => {
+            let capabilities = capability_snapshot
+                .providers
+                .resolve_effective_model_capabilities(
+                    &model.selection.provider,
+                    &model.selection.model,
+                    capability_snapshot.providers.resolution_generation,
+                );
+            request
+                .attachments
+                .iter()
+                .map(|attachment| match attachment.kind {
+                    cockpit_db::media_attachments::MediaKind::Image => {
+                        capabilities.image_input.status
+                    }
+                    cockpit_db::media_attachments::MediaKind::Audio => {
+                        capabilities.audio_input.status
+                    }
+                    cockpit_db::media_attachments::MediaKind::Video => {
+                        capabilities.video_input.status
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+        None => vec![
+            cockpit_config::config::providers::CapabilityStatus::Unknown;
+            request.attachments.len()
+        ],
+    };
     let project_text = attached
         .handle
         .project_root
@@ -2792,6 +2813,29 @@ async fn handle_send_user_message_v2(
         code: ErrorCode::BadRequest,
         message: error.to_string(),
     })?;
+    let message_request_digest = canonical.message_request_digest().map_err(internal)?;
+    let run_invocation = validated
+        .run_invocation_options
+        .as_ref()
+        .map(|options| {
+            let options_digest = run_invocation::options_digest(options);
+            let canonical_fingerprint = format!(
+                "fcm2:{}|run:{options_digest}",
+                crate::intel::hex_lower(&message_request_digest)
+            );
+            Ok(LocalMessageRunInvocationAdmission {
+                origin_principal_digest: principal_digest(&state.principal),
+                options_json: run_invocation::options_json(options)?,
+                content_digest: run_invocation::content_digest(
+                    &canonical_fingerprint,
+                    &options_digest,
+                ),
+                options_digest,
+                max_turns: options.max_turns,
+                timeout_ms: options.timeout_ms,
+            })
+        })
+        .transpose()?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let attachments = request
         .attachments
@@ -2810,12 +2854,14 @@ async fn handle_send_user_message_v2(
         project_digest: project_digest.clone(),
         client_submission_id: request.client_submission_id,
         attachments: request.attachments.clone(),
+        attachment_capabilities,
         expected_model_state_generation: validated.expected_model_state_generation,
         expected_model: validated.expected_model.clone(),
         authoritative_model,
+        run_invocation,
         now_ms,
     };
-    match ctx
+    let acceptance = ctx
         .db
         .accept_message_with_attachments(
             crate::db::db::message_attachments::AcceptMessageInput {
@@ -2823,7 +2869,7 @@ async fn handle_send_user_message_v2(
                 operation_id: *validated.operation_id.as_bytes(),
                 actor: crate::db::db::message_attachments::MessageActor::LocalOwner,
                 request_hash,
-                message_request_digest: canonical.message_request_digest().map_err(internal)?,
+                message_request_digest,
                 attachment_set_digest: canonical.attachment_set_digest().map_err(internal)?,
                 client_submission_id: *request.client_submission_id.as_bytes(),
                 queue_item_id: *request.client_submission_id.as_bytes(),
@@ -2839,15 +2885,38 @@ async fn handle_send_user_message_v2(
             let text = error.to_string();
             if text.contains("media_attachment_unavailable") {
                 bad_request("media attachment unavailable")
+            } else if text.contains("media_attachment_capability_unsupported") {
+                bad_request("model does not support an attached media modality")
+            } else if text.contains("media_attachment_capability_requires_entitlement") {
+                bad_request("model requires an entitlement for an attached media modality")
+            } else if text.contains("media_attachment_capability_unknown") {
+                bad_request("model media capability is unknown")
             } else if text.contains("expected model state changed") {
                 ErrorPayload {
                     code: ErrorCode::Conflict,
                     message: "expected model state changed before message acceptance".into(),
                 }
+            } else if text.contains("run_invocation_idempotency_conflict") {
+                ErrorPayload {
+                    code: ErrorCode::IdempotencyConflict,
+                    message: "client_submission_id was already used with different run options"
+                        .into(),
+                }
+            } else if text.contains("run_invocation_client_submission_unavailable") {
+                ErrorPayload {
+                    code: ErrorCode::ClientSubmissionIdUnavailable,
+                    message: "client_submission_id is unavailable".into(),
+                }
+            } else if text.contains("run_invocation_capacity_exceeded") {
+                ErrorPayload {
+                    code: ErrorCode::InvocationCapacityExceeded,
+                    message: "run invocation capacity exceeded".into(),
+                }
             } else {
                 internal(error)
             }
-        })? {
+        })?;
+    match &acceptance {
         crate::db::db::message_attachments::AcceptMessageResult::Conflict => {
             return Err(ErrorPayload {
                 code: ErrorCode::Conflict,
@@ -2856,34 +2925,86 @@ async fn handle_send_user_message_v2(
                         .into(),
             });
         }
-        crate::db::db::message_attachments::AcceptMessageResult::Accepted
-        | crate::db::db::message_attachments::AcceptMessageResult::Replayed { .. } => {}
+        crate::db::db::message_attachments::AcceptMessageResult::Accepted => {}
+        crate::db::db::message_attachments::AcceptMessageResult::Replayed { safe_outcome } => {
+            use crate::db::db::message_attachments::MessageSafeOutcome;
+            match safe_outcome {
+                MessageSafeOutcome::Accepted { .. } => {}
+                MessageSafeOutcome::Materialized { .. } => return Ok(Response::Ack),
+                MessageSafeOutcome::TerminalRejected => {
+                    if let Err(error) = ctx
+                        .media_ledger
+                        .return_downstream_ownership(&request.client_submission_id.to_string())
+                        .await
+                    {
+                        tracing::warn!(%error, %session_id, "terminal V2 replay media ownership cleanup remains retryable");
+                    }
+                    return Err(ErrorPayload {
+                        code: ErrorCode::UserMessageNotAccepted,
+                        message: "message was durably rejected after acceptance".into(),
+                    });
+                }
+                MessageSafeOutcome::Removed => {
+                    if let Err(error) = ctx
+                        .media_ledger
+                        .return_downstream_ownership(&request.client_submission_id.to_string())
+                        .await
+                    {
+                        tracing::warn!(%error, %session_id, "removed V2 replay media ownership cleanup remains retryable");
+                    }
+                    return Err(ErrorPayload {
+                        code: ErrorCode::UserMessageNotAccepted,
+                        message: "message was durably removed after acceptance".into(),
+                    });
+                }
+            }
+        }
     }
-    let images = if request.attachments.is_empty() {
+    let media = if request.attachments.is_empty() {
         Vec::new()
     } else {
         let storage = ctx
             .media_storage_recovery
             .as_ref()
             .ok_or_else(|| internal("durable media storage unavailable"))?;
-        storage
-            .acquire_message_images_bound(crate::media_storage::AcquireMessageImagesInput {
-                attachment_ids: request
-                    .attachments
-                    .iter()
-                    .map(|attachment| attachment.attachment_id)
-                    .collect(),
+        match storage
+            .acquire_message_media_bound(crate::media_storage::AcquireMessageMediaInput {
+                attachments: request.attachments.clone(),
                 session_id,
                 project_digest,
                 consumer_id: request.client_submission_id.to_string(),
                 ledger: &ctx.media_ledger,
-                max_total_bytes: proto::MAX_TOTAL_IMAGE_BYTES as u64,
                 now_unix_ms: now_ms,
             })
             .await
-            .map_err(|_| bad_request("media attachment unavailable"))?
+        {
+            Ok(media) => media,
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "accepted V2 media acquisition failed");
+                ctx.db
+                    .terminate_accepted_message(
+                        session_id,
+                        *request.client_submission_id.as_bytes(),
+                        crate::db::db::message_attachments::TerminalMessageState::TerminalRejected,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .map_err(internal)?;
+                if let Err(cleanup_error) = ctx
+                    .media_ledger
+                    .return_downstream_ownership(&request.client_submission_id.to_string())
+                    .await
+                {
+                    tracing::warn!(%cleanup_error, %session_id, "rejected V2 media ownership cleanup remains retryable");
+                }
+                return Err(ErrorPayload {
+                    code: ErrorCode::UserMessageNotAccepted,
+                    message: "message was durably rejected after acceptance".into(),
+                });
+            }
+        }
     };
-    handle_send_user_message(
+    let result = handle_send_user_message(
         state,
         ctx,
         request.client_submission_id,
@@ -2904,13 +3025,42 @@ async fn handle_send_user_message_v2(
                 ok: tag.ok,
             })
             .collect(),
-        images,
+        Vec::new(),
+        media,
+        true,
+        true,
         request.forced_skill,
         validated.run_invocation_options,
         #[cfg(feature = "remote")]
         remote_operation,
     )
-    .await
+    .await;
+    match result {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            tracing::warn!(code = ?error.code, %session_id, "accepted V2 worker handoff failed");
+            ctx.db
+                .terminate_accepted_message(
+                    session_id,
+                    *request.client_submission_id.as_bytes(),
+                    crate::db::db::message_attachments::TerminalMessageState::TerminalRejected,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            if let Err(cleanup_error) = ctx
+                .media_ledger
+                .return_downstream_ownership(&request.client_submission_id.to_string())
+                .await
+            {
+                tracing::warn!(%cleanup_error, %session_id, "failed V2 handoff media ownership cleanup remains retryable");
+            }
+            Err(ErrorPayload {
+                code: ErrorCode::UserMessageNotAccepted,
+                message: "message was durably rejected after acceptance".into(),
+            })
+        }
+    }
 }
 
 struct LocalMessageAttachmentAcceptanceJoin {
@@ -2918,10 +3068,21 @@ struct LocalMessageAttachmentAcceptanceJoin {
     project_digest: String,
     client_submission_id: Uuid,
     attachments: Vec<crate::proto_crate::send_user_message_v2::MessageAttachmentIdentity>,
+    attachment_capabilities: Vec<cockpit_config::config::providers::CapabilityStatus>,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     authoritative_model: Option<proto::ActiveModelState>,
+    run_invocation: Option<LocalMessageRunInvocationAdmission>,
     now_ms: i64,
+}
+
+struct LocalMessageRunInvocationAdmission {
+    origin_principal_digest: String,
+    options_json: String,
+    options_digest: String,
+    content_digest: String,
+    max_turns: Option<u32>,
+    timeout_ms: Option<u64>,
 }
 
 impl crate::db::db::message_attachments::MessageAcceptanceJoin
@@ -2935,7 +3096,8 @@ impl crate::db::db::message_attachments::MessageAcceptanceJoin
         anyhow::ensure!(
             input.session_id == self.session_id
                 && input.client_submission_id == *self.client_submission_id.as_bytes()
-                && input.attachments.len() == self.attachments.len(),
+                && input.attachments.len() == self.attachments.len()
+                && self.attachment_capabilities.len() == self.attachments.len(),
             "media_attachment_unavailable"
         );
         match (
@@ -2948,7 +3110,19 @@ impl crate::db::db::message_attachments::MessageAcceptanceJoin
                 if generation == actual.generation && expected == &actual.selection => {}
             _ => anyhow::bail!("expected model state changed before message acceptance"),
         }
-        for attachment in &self.attachments {
+        for (attachment, capability) in self.attachments.iter().zip(&self.attachment_capabilities) {
+            match capability {
+                cockpit_config::config::providers::CapabilityStatus::Supported => {}
+                cockpit_config::config::providers::CapabilityStatus::Unsupported => {
+                    anyhow::bail!("media_attachment_capability_unsupported")
+                }
+                cockpit_config::config::providers::CapabilityStatus::RequiresEntitlement => {
+                    anyhow::bail!("media_attachment_capability_requires_entitlement")
+                }
+                cockpit_config::config::providers::CapabilityStatus::Unknown => {
+                    anyhow::bail!("media_attachment_capability_unknown")
+                }
+            }
             let record = cockpit_db::Db::media_attachment_for_owner_conn(
                 conn,
                 attachment.attachment_id,
@@ -2961,6 +3135,13 @@ impl crate::db::db::message_attachments::MessageAcceptanceJoin
                 cockpit_db::media_attachments::MediaKind::Audio => "audio_model",
                 cockpit_db::media_attachments::MediaKind::Video => "video_model",
             };
+            anyhow::ensure!(
+                crate::media_storage::provider_media_mime_supported(
+                    record.media_kind,
+                    &record.canonical_mime,
+                ),
+                "media_attachment_capability_unsupported"
+            );
             let component_checksum = conn
                 .query_row(
                     "SELECT sha256 FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind=?3 AND lifecycle_state='ready'",
@@ -2995,6 +3176,32 @@ impl crate::db::db::message_attachments::MessageAcceptanceJoin
                 },
             )?;
         }
+        if let Some(run) = &self.run_invocation {
+            match cockpit_db::run_invocations::accept_run_invocation_conn(
+                conn,
+                self.client_submission_id,
+                &run.origin_principal_digest,
+                self.session_id,
+                &run.options_json,
+                &run.options_digest,
+                &run.content_digest,
+                run.max_turns,
+                run.timeout_ms,
+                self.now_ms,
+            )? {
+                cockpit_db::run_invocations::AcceptRunInvocationOutcome::Created(_)
+                | cockpit_db::run_invocations::AcceptRunInvocationOutcome::ExactReplay(_) => {}
+                cockpit_db::run_invocations::AcceptRunInvocationOutcome::IdempotencyConflict => {
+                    anyhow::bail!("run_invocation_idempotency_conflict")
+                }
+                cockpit_db::run_invocations::AcceptRunInvocationOutcome::ClientSubmissionIdUnavailable => {
+                    anyhow::bail!("run_invocation_client_submission_unavailable")
+                }
+                cockpit_db::run_invocations::AcceptRunInvocationOutcome::CapacityExceeded => {
+                    anyhow::bail!("run_invocation_capacity_exceeded")
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -3004,6 +3211,7 @@ fn user_message_wire_fingerprint_bytes(
     display_text: Option<&str>,
     tag_expansions: &[proto::TagExpansionMeta],
     images: &[Vec<u8>],
+    media: &[crate::engine::message::SubmissionMedia],
     forced_skill: Option<&str>,
 ) -> String {
     fn part(hasher: &mut Sha256, bytes: &[u8]) {
@@ -3030,6 +3238,9 @@ fn user_message_wire_fingerprint_bytes(
     for image in images {
         part(&mut hasher, &Sha256::digest(image));
     }
+    for item in media {
+        part(&mut hasher, &serde_json::to_vec(item).unwrap_or_default());
+    }
     optional_part(&mut hasher, forced_skill);
     crate::intel::hex_lower(&hasher.finalize())
 }
@@ -3044,6 +3255,9 @@ async fn handle_send_user_message(
     display_text: Option<String>,
     tag_expansions: Vec<proto::TagExpansionMeta>,
     images: Vec<Vec<u8>>,
+    media: Vec<crate::engine::message::SubmissionMedia>,
+    durable_message_receipt: bool,
+    durable_run_invocation_bound: bool,
     forced_skill: Option<String>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
@@ -3080,7 +3294,7 @@ async fn handle_send_user_message(
     // receipt/run-invocation acceptance, scheduler activity, or any provider
     // handoff.  Media/file submissions at the inline boundary retain their
     // existing typed attachment route unchanged.
-    if !images.is_empty() && text.len() > INLINE_USER_TEXT_BYTES {
+    if (!images.is_empty() || !media.is_empty()) && text.len() > INLINE_USER_TEXT_BYTES {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
             message: "media/file submissions cannot carry text over the 64 KiB artifact threshold"
@@ -3093,7 +3307,7 @@ async fn handle_send_user_message(
     // A text-only oversized source switches to FCM2 before any receipt or
     // queue side effect. In particular the codec rejects 8MiB+1 before the
     // worker can create a receipt triple or reservation.
-    let mut artifact_admission = if images.is_empty() {
+    let mut artifact_admission = if images.is_empty() && media.is_empty() {
         oversized_text_artifact_admission(
             ctx,
             &handle,
@@ -3127,6 +3341,7 @@ async fn handle_send_user_message(
         display_text.as_deref(),
         &tag_expansions,
         &images,
+        &media,
         forced_skill.as_deref(),
     );
     if let (Some(generation), Some(model)) =
@@ -3136,13 +3351,16 @@ async fn handle_send_user_message(
         wire_fingerprint.push_str(&format!("|model:{generation}:{model_json}"));
     }
     // Include immutable run options in the fingerprint so option drift
-    // conflicts. Inline/media retains its historical barrier; oversized FCM2
-    // carries the immutable values to the worker, which creates it atomically
-    // with phase one and binds it to the exact source reservation.
+    // conflicts. V2 inline/media has already persisted the invocation in its
+    // one acceptance transaction; oversized FCM2 carries the immutable values
+    // to the worker, which creates it atomically with phase one.
     if let Some(options) = &run_invocation_options {
         let opts_digest = run_invocation::options_digest(options);
         wire_fingerprint = format!("{wire_fingerprint}|run:{opts_digest}");
-        if let Some(admission) = artifact_admission.as_mut() {
+        if durable_run_invocation_bound {
+            // V2 inline/media admission persisted this exact invocation in the
+            // same transaction as the message receipt and attachment refs.
+        } else if let Some(admission) = artifact_admission.as_mut() {
             admission.run_invocation = Some(
                 crate::daemon::session_worker::OversizedRunInvocationAdmission {
                     origin_principal_digest: principal_digest(&state.principal),
@@ -3211,6 +3429,7 @@ async fn handle_send_user_message(
             .into_iter()
             .map(crate::engine::message::SubmissionImage::png)
             .collect(),
+        media,
         forced_skill,
         origin_principal: origin_principal.clone(),
         job_id: None,
@@ -3218,7 +3437,9 @@ async fn handle_send_user_message(
         queue_item_ids: Vec::new(),
         client_submissions: Vec::new(),
         queue_target: None,
-        pending_terminal_disposition: None,
+        pending_terminal_disposition: durable_message_receipt.then_some(
+            crate::engine::message::PendingSubmissionTerminalDisposition::MessageAttachments,
+        ),
         run_invocation_id: run_invocation_options
             .as_ref()
             .map(|_| client_submission_id),
@@ -3588,6 +3809,9 @@ async fn handle_send_user_message_bulk(
         display_text,
         tag_expansions,
         Vec::new(),
+        Vec::new(),
+        false,
+        false,
         forced_skill,
         run_invocation_options,
         #[cfg(feature = "remote")]

@@ -188,6 +188,15 @@ pub struct Session {
     /// Daemon-owned external side-effect journal. Installed by the registry
     /// before the worker starts; absent in isolated unit sessions.
     external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
+    /// Daemon-owned durable media reader plus reservation ledger. Installed by
+    /// the registry before a worker starts so accepted V2 queue rows and typed
+    /// tool results can reacquire normalized bytes after restart.
+    message_media_authority: Mutex<
+        Option<(
+            Arc<crate::media_storage::MediaStorageRecovery>,
+            crate::media_reservation::MediaReservationLedger,
+        )>,
+    >,
     /// Daemon-process command-backed secret cache. Late-installed by the
     /// registry / daemon before the worker (or DocsAsk session) builds any
     /// store, so every `credential_store` / `provider_credential_store` this
@@ -467,6 +476,25 @@ impl Session {
 
     pub(crate) fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
         self.external_journal.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_message_media_authority(
+        &self,
+        authority: Option<(
+            Arc<crate::media_storage::MediaStorageRecovery>,
+            crate::media_reservation::MediaReservationLedger,
+        )>,
+    ) {
+        *self.message_media_authority.lock().unwrap() = authority;
+    }
+
+    pub(crate) fn message_media_authority(
+        &self,
+    ) -> Option<(
+        Arc<crate::media_storage::MediaStorageRecovery>,
+        crate::media_reservation::MediaReservationLedger,
+    )> {
+        self.message_media_authority.lock().unwrap().clone()
     }
 
     /// Install (or inherit) the daemon-process command-secret cache.

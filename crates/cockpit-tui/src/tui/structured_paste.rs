@@ -411,6 +411,7 @@ pub fn user_submission_wire_digest(
         display_text,
         tag_expansions,
         images,
+        media,
         forced_skill,
         ..
     } = submission;
@@ -432,6 +433,13 @@ pub fn user_submission_wire_digest(
     for image in images {
         let encoded = serde_json::to_vec(image)
             .expect("submission image contains only infallibly serializable fields");
+        digest.update((encoded.len() as u64).to_le_bytes());
+        digest.update(encoded);
+    }
+    digest.update((media.len() as u64).to_le_bytes());
+    for item in media {
+        let encoded = serde_json::to_vec(item)
+            .expect("submission media contains only infallibly serializable fields");
         digest.update((encoded.len() as u64).to_le_bytes());
         digest.update(encoded);
     }

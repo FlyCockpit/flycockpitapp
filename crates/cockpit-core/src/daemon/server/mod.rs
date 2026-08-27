@@ -2607,6 +2607,9 @@ impl DaemonContext {
                 crate::media_storage::MediaStorageRecovery::open_or_create(db.clone(), &root).ok()
             })
             .map(Arc::new);
+        if let Some(storage) = &media_storage_recovery {
+            registry.set_message_media_authority(storage.clone(), media_ledger.clone());
+        }
         // One stable, nonzero daemon boot UUID drives every image-generation
         // scheduler pass and deadline observation. The lifecycle worker below
         // uses it as `worker_boot_id`; a job-creation caller uses it as the

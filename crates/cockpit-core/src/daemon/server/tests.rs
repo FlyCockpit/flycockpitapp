@@ -7525,7 +7525,9 @@ fn stub_active_model_ref() -> crate::config::providers::ActiveModelRef {
 }
 
 fn stub_providers_config() -> crate::config::providers::ProvidersConfig {
-    use crate::config::providers::{ModelEntry, ProviderEntry};
+    use crate::config::providers::{
+        CapabilityStatus, ModelCapabilities, ModelEntry, ProviderEntry,
+    };
 
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
@@ -7534,6 +7536,10 @@ fn stub_providers_config() -> crate::config::providers::ProvidersConfig {
             url: "http://localhost:1/v1".to_string(),
             models: vec![ModelEntry {
                 id: "stub-model".to_string(),
+                capabilities: ModelCapabilities {
+                    image_input: CapabilityStatus::Supported,
+                    ..ModelCapabilities::default()
+                },
                 ..ModelEntry::default()
             }],
             ..ProviderEntry::default()
@@ -14778,9 +14784,16 @@ async fn attached_state_with_worker_receiver(
     );
     let locks = Arc::new(LockManager::in_memory(ctx.db.clone()));
     let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
-    // Production registry constructs the worker only after a positive durable
-    // trust revision is resolved. Bare test handles start at revision 0, which
-    // `SetDefaultModel` now refuses at its attach-time fence.
+    // Image-capable stub catalog first; the trust transition then tags this
+    // existing projection with the durable revision. Bare test handles start
+    // at revision 0, which `SetDefaultModel` now refuses at its attach-time fence.
+    handle.set_full_config_snapshot_for_tests(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(
+            0,
+            stub_providers_config(),
+            crate::config::extended::ExtendedConfig::default(),
+        ),
+    );
     let resolved_trust =
         crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
             &ctx.db,
@@ -26937,6 +26950,21 @@ fn assert_same_png_pixels(got: &crate::engine::message::SubmissionImage, want: &
     );
 }
 
+fn assert_same_durable_png_pixels(got: &crate::engine::message::SubmissionMedia, want: &[u8]) {
+    let crate::engine::message::SubmissionMedia::Image { bytes: got, .. } = got else {
+        panic!("dispatcher must resolve retained image media to normalized bytes");
+    };
+    let got = image::load_from_memory(got)
+        .expect("got png")
+        .to_rgba8()
+        .into_raw();
+    let want = image::load_from_memory(want)
+        .expect("want png")
+        .to_rgba8()
+        .into_raw();
+    assert_eq!(got, want, "durable normalized image pixels must match");
+}
+
 fn begin_upload_for(state: &mut MutableClientState, png: &[u8]) -> Uuid {
     match begin_attachment_upload(
         state,
@@ -27074,6 +27102,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         display_text: None,
         tag_expansions: Vec::new(),
         images: Vec::new(),
+        media: Vec::new(),
         forced_skill: None,
         origin_principal: origin_principal.clone(),
         job_id: None,
@@ -27179,6 +27208,238 @@ fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference()
         .build()
         .expect("production-equivalent image retry runtime");
     runtime.block_on(Box::pin(image_submission_exact_retry_case()));
+}
+
+#[test]
+fn message_attachment_history_receipts_fold_restart_terminal_and_release() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(crate::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
+        .enable_all()
+        .build()
+        .expect("production-equivalent attachment history runtime");
+    runtime.block_on(Box::pin(async {
+        let mut ctx = test_ctx();
+        let media_dir = tempfile::tempdir().unwrap();
+        let db = ctx.db.clone();
+        Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+            crate::media_storage::MediaStorageRecovery::open_or_create(
+                db,
+                &media_dir.path().join("media"),
+            )
+            .unwrap(),
+        ));
+        let project = tempfile::tempdir().unwrap();
+        let (mut state, session_id, mut work_rx) =
+            attached_state_with_worker_receiver(&ctx, project.path()).await;
+        let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
+        let identities = (0..3)
+            .map(|_| (Uuid::now_v7(), Uuid::now_v7()))
+            .collect::<Vec<_>>();
+
+        for (index, (operation_id, submission_id)) in identities.iter().copied().enumerate() {
+            let request = Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                    operation_id,
+                    session_id.to_string(),
+                    None,
+                    None,
+                    (index == 2).then_some(proto::RunInvocationOptions {
+                        max_turns: Some(3),
+                        timeout_ms: Some(60_000),
+                        approval_mode: None,
+                    }),
+                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                        client_submission_id: submission_id,
+                        text: format!("history message {index}"),
+                        display_text: None,
+                        tag_expansions: Vec::new(),
+                        forced_skill: None,
+                        attachments: vec![image_ref.clone()],
+                    },
+                ),
+            };
+            let request_ctx = ctx.clone();
+            let send = tokio::spawn(async move {
+                let result = handle_request(request, &mut state, &request_ctx).await;
+                (state, result)
+            });
+            let SessionWork::UserMessage {
+                submission,
+                respond_to,
+                ..
+            } = work_rx.recv().await.expect("accepted V2 work reaches worker")
+            else {
+                panic!("expected V2 UserMessage work");
+            };
+            assert_eq!(submission.client_submissions[0].id, submission_id);
+            assert_same_durable_png_pixels(&submission.media[0], &sample_png());
+            let item = proto::QueueItem {
+                id: submission_id,
+                status: proto::QueueItemStatus::Folding,
+                text: submission.text.clone(),
+                display_text: submission.display_text.clone(),
+                target: proto::QueueTarget::default(),
+            };
+            respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
+            let (returned_state, response) = send.await.unwrap();
+            state = returned_state;
+            assert!(matches!(
+                response.unwrap(),
+                Response::UserMessageQueued { .. }
+            ));
+        }
+
+        let restart_projection = ctx.db.accepted_message_queue(session_id).await.unwrap();
+        assert_eq!(restart_projection.len(), 3);
+        for row in &restart_projection {
+            let canonical =
+                crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                    &row.canonical_message,
+                )
+                .unwrap();
+            assert_eq!(canonical.session_id, session_id);
+            assert_eq!(canonical.request.attachments, vec![image_ref.clone()]);
+        }
+        let session = state.attached.as_ref().unwrap().handle.session();
+        session.set_message_media_authority(Some((
+            ctx.media_storage_recovery.as_ref().unwrap().clone(),
+            ctx.media_ledger.clone(),
+        )));
+        let (replay_updates, _) = tokio::sync::watch::channel(Vec::new());
+        let replay_queue = crate::engine::message::UserSubmissionQueue::new(replay_updates);
+        assert_eq!(
+            crate::daemon::session_worker::replay_accepted_message_attachment_queue(
+                &session,
+                &replay_queue,
+                proto::QueueTarget::root("Build"),
+            )
+            .await
+            .unwrap(),
+            3
+        );
+        for expected in &restart_projection {
+            let replayed = replay_queue.recv().await.expect("restart replay item");
+            assert_eq!(
+                replayed.client_submissions[0].id.as_bytes(),
+                &expected.client_submission_id
+            );
+            assert_same_durable_png_pixels(&replayed.media[0], &sample_png());
+            assert_eq!(
+                replayed.run_invocation_id,
+                (expected.client_submission_id == *identities[2].1.as_bytes())
+                    .then_some(identities[2].1)
+            );
+            assert!(matches!(
+                replayed.pending_terminal_disposition,
+                Some(
+                    crate::engine::message::PendingSubmissionTerminalDisposition::MessageAttachments
+                )
+            ));
+        }
+
+        let fold_order = vec![
+            *identities[1].1.as_bytes(),
+            *identities[0].1.as_bytes(),
+        ];
+        let event_data = serde_json::json!({
+            "text": "folded history",
+            "client_submission_ids": [identities[1].1, identities[0].1],
+        });
+        let transition_now = chrono::Utc::now().timestamp_millis();
+        let message_seq = ctx
+            .db
+            .materialize_message_submissions(
+                session_id,
+                fold_order,
+                Some("Build".to_string()),
+                Some("local_owner".to_string()),
+                serde_json::to_string(&event_data).unwrap(),
+                transition_now,
+            )
+            .await
+            .unwrap();
+        for (fold_ordinal, index) in [1usize, 0usize].into_iter().enumerate() {
+            let status = ctx
+                .db
+                .message_receipt_status(session_id, *identities[index].0.as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.state, "materialized");
+            assert_eq!(status.message_seq, Some(message_seq));
+            assert_eq!(status.fold_ordinal, Some(fold_ordinal as i64));
+            assert!(matches!(
+                status.safe_outcome,
+                crate::db::message_attachments::MessageSafeOutcome::Materialized {
+                    message_seq: seq
+                } if seq == message_seq as u64
+            ));
+        }
+
+        let terminal_submission = *identities[2].1.as_bytes();
+        assert!(
+            ctx.db
+                .terminate_accepted_message(
+                    session_id,
+                    terminal_submission,
+                    crate::db::message_attachments::TerminalMessageState::TerminalRejected,
+                    transition_now + 1,
+                )
+                .await
+                .unwrap()
+        );
+        let released_before_retry = ctx
+            .db
+            .read(move |conn| {
+                let message_released: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM message_attachment_references WHERE session_id=?1 AND released_at IS NOT NULL",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let media_released: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM media_attachment_references r JOIN media_attachments a ON a.attachment_id=r.attachment_id WHERE a.session_id=?1 AND r.consumer_kind='message' AND r.released_at_unix_ms IS NOT NULL",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                Ok((message_released, media_released))
+            })
+            .await
+            .unwrap();
+        assert_eq!(released_before_retry, (3, 3));
+        assert!(
+            !ctx.db
+                .terminate_accepted_message(
+                    session_id,
+                    terminal_submission,
+                    crate::db::message_attachments::TerminalMessageState::TerminalRejected,
+                    transition_now + 2,
+                )
+                .await
+                .unwrap(),
+            "terminal replay must not release either reference twice"
+        );
+        let terminal = ctx
+            .db
+            .message_receipt_status(session_id, *identities[2].0.as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.state, "terminal_rejected");
+        assert_eq!(
+            terminal.safe_outcome,
+            crate::db::message_attachments::MessageSafeOutcome::TerminalRejected
+        );
+        let terminal_run = ctx
+            .db
+            .get_run_invocation(identities[2].1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal_run.state, "failed");
+        assert_eq!(terminal_run.terminal_reason.as_deref(), Some("failed"));
+        assert!(ctx.db.accepted_message_queue(session_id).await.unwrap().is_empty());
+    }));
 }
 
 async fn image_submission_exact_retry_case() {
@@ -27376,10 +27637,7 @@ async fn image_submission_exact_retry_case() {
     )
     .await
     .expect("exact retry with a durable attachment is idempotently acknowledged");
-    let Response::UserMessageQueued { item: retry, .. } = retry else {
-        panic!("expected queued retry response");
-    };
-    assert_eq!(retry.id, client_submission_id);
+    assert_eq!(retry, Response::Ack);
 
     // A re-upload has a different durable attachment identity even when its
     // pixels match. Rebinding the accepted operation must conflict rather than
@@ -27513,15 +27771,20 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     };
     assert_eq!(submission.client_submissions[0].id, first_id);
 
-    // Dropping the worker response makes only this submission outcome
-    // ambiguous. It never grants exclusive ownership of immutable media.
+    // Dropping the worker response is a post-accept handoff failure. The V2
+    // receipt is terminalized before the caller receives its deterministic
+    // rejection; immutable media remains reusable by a different submission.
     drop(respond_to);
     let (mut state, result) = first.await.unwrap();
-    let error = result.expect_err("lost worker response is ambiguous");
-    assert_eq!(error.code, ErrorCode::Internal);
-    // Immutable durable media is never exclusively owned by an ambiguous
-    // submission, so the attachment persists and stays reusable — the
-    // The durable attachment remains available after an ambiguous outcome.
+    let error = result.expect_err("lost worker response is durably rejected");
+    assert_eq!(error.code, ErrorCode::UserMessageNotAccepted);
+    let terminal = ctx
+        .db
+        .message_receipt_status(session_id, *first_operation_id.as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.state, "terminal_rejected");
     assert_durable_attachment_persists(&ctx, image_ref.attachment_id).await;
 
     let competing_ctx = ctx.clone();
@@ -27541,7 +27804,7 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     else {
         panic!("expected competing UserMessage work");
     };
-    assert_same_png_pixels(&submission.images[0], &sample_png());
+    assert_same_durable_png_pixels(&submission.media[0], &sample_png());
     let competing_id = submission.client_submissions[0].id;
     let item = proto::QueueItem {
         id: competing_id,
@@ -27557,38 +27820,10 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
         Response::UserMessageQueued { .. }
     ));
 
-    let retry_ctx = ctx.clone();
-    let retry_request = request(first_operation_id, first_id);
-    let retry = tokio::spawn(async move {
-        let result = handle_request(retry_request, &mut state, &retry_ctx).await;
-        (state, result)
-    });
-    let SessionWork::UserMessage {
-        submission,
-        respond_to,
-        ..
-    } = work_rx
-        .recv()
+    let retry_result = handle_request(request(first_operation_id, first_id), &mut state, &ctx)
         .await
-        .expect("same-UUID retry reaches worker")
-    else {
-        panic!("expected retry UserMessage work");
-    };
-    assert_eq!(submission.client_submissions[0].id, first_id);
-    assert_same_png_pixels(&submission.images[0], &sample_png());
-    let item = proto::QueueItem {
-        id: first_id,
-        status: proto::QueueItemStatus::Folding,
-        text: submission.text.clone(),
-        display_text: submission.display_text.clone(),
-        target: proto::QueueTarget::default(),
-    };
-    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
-    let (_, retry_result) = retry.await.unwrap();
-    assert!(matches!(
-        retry_result.unwrap(),
-        Response::UserMessageQueued { .. }
-    ));
+        .expect_err("same-UUID retry replays the durable terminal rejection");
+    assert_eq!(retry_result.code, ErrorCode::UserMessageNotAccepted);
 }
 
 #[tokio::test]

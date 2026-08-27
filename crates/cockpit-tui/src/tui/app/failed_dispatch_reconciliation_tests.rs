@@ -1145,6 +1145,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
         images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
             1, 2, 3, 4,
         ])],
+        media: Vec::new(),
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some("side-job".to_string()),
@@ -1255,6 +1256,7 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
             cockpit_client::image_upload::SubmissionImage::png(marker.as_bytes().to_vec()),
             cockpit_client::image_upload::SubmissionImage::png(vec![0x89, b'P', b'N', b'G']),
         ],
+        media: Vec::new(),
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some(format!("job-{marker}")),
@@ -2060,6 +2062,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
         images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
             0x89, b'P', b'N', b'G',
         ])],
+        media: Vec::new(),
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some("job-before-switch".to_string()),

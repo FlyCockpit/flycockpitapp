@@ -916,6 +916,7 @@ impl App {
             display_text: None,
             tag_expansions: Vec::new(),
             images: Vec::new(),
+            media: Vec::new(),
             forced_skill: Some(name.to_string()),
             ..Default::default()
         };

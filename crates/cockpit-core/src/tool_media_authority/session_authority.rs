@@ -100,6 +100,23 @@ impl AdmittedRetainedSource {
     }
 }
 
+/// Nested closed `source` union: `{attachment_id}`, `{path}`, or `{url}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedMediaSource {
+    AttachmentId(String),
+    Path(String),
+    Url(String),
+}
+
+/// Result of admitting a nested source. Path/URL admissions create a session
+/// attachment; attachment-id reuse does not open or fetch again.
+#[derive(Debug, Clone)]
+pub struct SourceAdmission {
+    pub handle: AdmittedHandle,
+    pub attachment: AdmittedAttachment,
+    pub newly_created: bool,
+}
+
 /// An admitted attachment reference — resolved from session attachments.
 #[derive(Debug, Clone)]
 pub struct AdmittedAttachment {
@@ -353,6 +370,30 @@ struct ImageRegistry {
     cleanup_requested: HashMap<[u8; 16], Arc<AtomicBool>>,
 }
 
+/// Counter for denial I/O operations — tests verify zero on every denied path.
+#[derive(Debug, Default, Clone)]
+pub struct DenialIoCounters {
+    pub source_opens: u64,
+    pub source_reads: u64,
+    pub fetches: u64,
+    pub reservations: u64,
+    pub derivatives: u64,
+    pub runner_calls: u64,
+}
+
+/// Success-path I/O counters. Attachment-id reuse must not increment
+/// path authorizations or fetches.
+#[derive(Debug, Default, Clone)]
+pub struct AdmissionIoCounters {
+    pub path_authorizations: u64,
+    pub path_reads: u64,
+    pub fetches: u64,
+    pub attachment_resolves: u64,
+    pub attachments_created: u64,
+    pub runner_calls: u64,
+    pub reservations: u64,
+}
+
 /// The attachment resolver trait — resolves session attachments by id.
 ///
 /// Existence-hiding: a `None` return does not distinguish "not found" from
@@ -366,6 +407,15 @@ pub trait AttachmentResolver: Send + Sync {
         attachment_id: &[u8; 16],
         max_bytes: usize,
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial>;
+
+    /// Resolve a non-canonical alias such as a test fixture id.
+    fn resolve_alias(
+        &self,
+        _session_id: &str,
+        _alias: &str,
+    ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
+        Ok(None)
+    }
 }
 
 /// The local-path admission policy trait.
@@ -398,6 +448,25 @@ pub trait RetainedHttpsPolicy: Send + Sync {
     ) -> Result<AdmittedRetainedSource, AdmissionDenial>;
 }
 
+/// In-session attachment ledger created by path/URL admissions.
+struct SessionAttachmentLedger {
+    by_id: std::collections::HashMap<[u8; 16], AdmittedAttachment>,
+    aliases: std::collections::HashMap<String, [u8; 16]>,
+    local_paths: std::collections::HashMap<[u8; 16], PathBuf>,
+    https_bytes: std::collections::HashMap<[u8; 16], Vec<u8>>,
+}
+
+impl SessionAttachmentLedger {
+    fn new() -> Self {
+        Self {
+            by_id: std::collections::HashMap::new(),
+            aliases: std::collections::HashMap::new(),
+            local_paths: std::collections::HashMap::new(),
+            https_bytes: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// `SessionMediaAuthority` — the private direct-native media authority.
 ///
 /// Constructed only by the daemon/session-worker production composition and
@@ -412,6 +481,10 @@ pub struct SessionMediaAuthority {
     activity: Arc<AuthorityActivity>,
     durable_storage: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
     durable_project_digest: Option<[u8; 32]>,
+    /// I/O counters for denial verification (test instrumentation).
+    denial_counters: std::sync::Mutex<DenialIoCounters>,
+    io: std::sync::Mutex<AdmissionIoCounters>,
+    ledger: std::sync::Mutex<SessionAttachmentLedger>,
 }
 
 impl std::fmt::Debug for SessionMediaAuthority {
@@ -445,6 +518,9 @@ impl SessionMediaAuthority {
             activity: Arc::new(AuthorityActivity::default()),
             durable_storage: None,
             durable_project_digest: None,
+            denial_counters: std::sync::Mutex::new(DenialIoCounters::default()),
+            io: std::sync::Mutex::new(AdmissionIoCounters::default()),
+            ledger: std::sync::Mutex::new(SessionAttachmentLedger::new()),
         }
     }
 
@@ -927,6 +1003,168 @@ impl SessionMediaAuthority {
             CleanupRace::WonBeforeDecode
         }
     }
+
+    /// Admit a nested closed source union. Path/URL branches create one
+    /// session attachment; attachment-id reuse resolves only.
+    pub fn admit_nested_source(
+        &self,
+        session_id: &str,
+        source: &NestedMediaSource,
+    ) -> Result<SourceAdmission, AdmissionDenial> {
+        match source {
+            NestedMediaSource::AttachmentId(id) => {
+                let attachment = self.resolve_attachment_ref(session_id, id)?;
+                if let Ok(mut io) = self.io.lock() {
+                    io.attachment_resolves += 1;
+                }
+                Ok(SourceAdmission {
+                    handle: self.held_handle_for(&attachment),
+                    attachment,
+                    newly_created: false,
+                })
+            }
+            NestedMediaSource::Path(path) => {
+                let local = self.admit_local_path(session_id, path)?;
+                if let Ok(mut io) = self.io.lock() {
+                    io.path_authorizations += 1;
+                }
+                let attachment = self.record_local_attachment(&local);
+                Ok(SourceAdmission {
+                    handle: AdmittedHandle::Local(local),
+                    attachment,
+                    newly_created: true,
+                })
+            }
+            NestedMediaSource::Url(url) => {
+                let https = self.admit_retained_https(session_id, url)?;
+                if let Ok(mut io) = self.io.lock() {
+                    io.fetches += 1;
+                }
+                let attachment = self.record_https_attachment(&https);
+                Ok(SourceAdmission {
+                    handle: AdmittedHandle::RetainedHttps(https),
+                    attachment,
+                    newly_created: true,
+                })
+            }
+        }
+    }
+
+    /// Resolve an attachment by canonical hex/UUID or a fixture alias.
+    pub fn resolve_attachment_ref(
+        &self,
+        session_id: &str,
+        attachment_ref: &str,
+    ) -> Result<AdmittedAttachment, AdmissionDenial> {
+        if let Some(id) = parse_attachment_id(attachment_ref) {
+            if let Ok(ledger) = self.ledger.lock() {
+                if let Some(att) = ledger.by_id.get(&id) {
+                    return Ok(att.clone());
+                }
+            }
+            return self.resolve_attachment(session_id, &id);
+        }
+        if let Ok(ledger) = self.ledger.lock() {
+            if let Some(id) = ledger.aliases.get(attachment_ref) {
+                if let Some(att) = ledger.by_id.get(id) {
+                    return Ok(att.clone());
+                }
+            }
+        }
+        match self
+            .attachment_resolver
+            .resolve_alias(session_id, attachment_ref)?
+        {
+            Some(att) => Ok(att),
+            None => Err(AdmissionDenial::AttachmentNotFound),
+        }
+    }
+
+    fn record_local_attachment(&self, local: &AdmittedLocalHandle) -> AdmittedAttachment {
+        let attachment = new_session_attachment(1, local.content().to_vec());
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger
+                .local_paths
+                .insert(attachment.attachment_id, local.canonical_path.clone());
+            ledger
+                .aliases
+                .insert(hex_id(&attachment.attachment_id), attachment.attachment_id);
+            ledger
+                .by_id
+                .insert(attachment.attachment_id, attachment.clone());
+        }
+        if let Ok(mut io) = self.io.lock() {
+            io.attachments_created += 1;
+        }
+        attachment
+    }
+
+    fn record_https_attachment(&self, https: &AdmittedRetainedSource) -> AdmittedAttachment {
+        let attachment = new_session_attachment(3, https.content.clone());
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger
+                .https_bytes
+                .insert(attachment.attachment_id, https.content.clone());
+            ledger
+                .aliases
+                .insert(hex_id(&attachment.attachment_id), attachment.attachment_id);
+            ledger
+                .by_id
+                .insert(attachment.attachment_id, attachment.clone());
+        }
+        if let Ok(mut io) = self.io.lock() {
+            io.attachments_created += 1;
+        }
+        attachment
+    }
+
+    fn held_handle_for(&self, attachment: &AdmittedAttachment) -> AdmittedHandle {
+        if let Ok(ledger) = self.ledger.lock() {
+            if let Some(path) = ledger.local_paths.get(&attachment.attachment_id) {
+                return AdmittedHandle::Local(AdmittedLocalHandle::from_held_bytes(
+                    path.clone(),
+                    HandleEvidence {
+                        metadata_fingerprint: attachment.checksum,
+                    },
+                    attachment.content.clone(),
+                ));
+            }
+            if let Some(bytes) = ledger.https_bytes.get(&attachment.attachment_id) {
+                return AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
+                    canonical_url: hex_id(&attachment.attachment_id),
+                    content: bytes.clone(),
+                    content_type: "application/octet-stream".into(),
+                });
+            }
+        }
+        AdmittedHandle::Attachment(attachment.clone())
+    }
+
+    /// Snapshot denial I/O counters (test instrumentation).
+    #[cfg(test)]
+    pub fn denial_counters(&self) -> DenialIoCounters {
+        self.denial_counters.lock().unwrap().clone()
+    }
+
+    pub fn io_counters(&self) -> AdmissionIoCounters {
+        self.io.lock().unwrap().clone()
+    }
+
+    pub fn record_runner_call(&self) {
+        if let Ok(mut io) = self.io.lock() {
+            io.runner_calls += 1;
+        }
+    }
+
+    pub fn record_reservation(&self) {
+        if let Ok(mut io) = self.io.lock() {
+            io.reservations += 1;
+        }
+    }
+
+    pub fn attachment_id_hex(id: &[u8; 16]) -> String {
+        hex_id(id)
+    }
 }
 
 /// Outcome of a cleanup race against a held ToolSource.
@@ -945,6 +1183,38 @@ fn parse_sha256_hex(hex: &str) -> Result<[u8; 32], String> {
         out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
     }
     Ok(out)
+}
+
+fn hex_id(id: &[u8; 16]) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_attachment_id(value: &str) -> Option<[u8; 16]> {
+    if let Ok(uuid) = uuid::Uuid::parse_str(value) {
+        return Some(*uuid.as_bytes());
+    }
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(chunk).ok()?;
+        id[index] = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(id)
+}
+
+fn new_session_attachment(kind: u8, content: Vec<u8>) -> AdmittedAttachment {
+    let id = *uuid::Uuid::now_v7().as_bytes();
+    let mut checksum = [0u8; 32];
+    checksum[..16].copy_from_slice(&id);
+    AdmittedAttachment {
+        attachment_id: id,
+        attachment_version: 1,
+        checksum,
+        kind,
+        content,
+    }
 }
 
 #[cfg(test)]

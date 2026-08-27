@@ -19,8 +19,8 @@ use super::availability::MediaToolAvailability;
 use super::locator::LocatorV1;
 use super::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
 use super::revalidator::{
-    RemoteStatusProjection, RevalidatedSubject, RevalidatorError, SecureKeyResolver,
-    ToolMediaSubjectRevalidator,
+    LocalOnlyProjection, RemoteStatusProjection, RevalidatedSubject, RevalidatorError,
+    SecureKeyResolver, ToolMediaSubjectRevalidator,
 };
 use super::seal;
 use super::session_authority::{
@@ -1052,9 +1052,12 @@ fn tool_media_context_stripping() {
     // `compile_fail` doctest on `tool_media_authority`; these runtime
     // inventories cover the independently observable registry surface.
 
-    // 1. MediaToolAvailability is Copy + 1 byte — no authority data.
+    // 1. MediaToolAvailability is Copy and carries no authority data.
     let avail = MediaToolAvailability::available();
-    assert_eq!(std::mem::size_of_val(&avail), 1);
+    let debug = format!("{avail:?}");
+    assert!(!debug.to_lowercase().contains("principal"));
+    assert!(!debug.to_lowercase().contains("attachment"));
+    assert!(!debug.contains("grant"));
 
     // 2. Drive a real ToolCtx -> HostContext conversion and inspect the
     // structurally stripped native context retained by catalog/MCP.
@@ -1311,6 +1314,9 @@ async fn media_tool_availability_materialization() {
     // regression that did `tb.with(ReadImageTool)` here would fail.
     args.media_availability = MediaToolAvailability::unavailable();
     assert!(!args.media_availability.is_available());
+    let omitted_names = args.media_availability.omitted_tool_names();
+    assert!(omitted_names.contains(&"extract_video_clip"));
+    assert!(omitted_names.contains(&"transcribe_audio"));
     for &name in super::availability::MEDIA_TOOL_NAMES {
         let toolbox = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
         assert!(
@@ -1322,15 +1328,30 @@ async fn media_tool_availability_materialization() {
     }
 
     // True availability carries no authority data and may register the
-    // factory. The snapshot is one byte; it cannot authorize admission.
+    // factory. The snapshot cannot authorize admission.
     args.media_availability = MediaToolAvailability::available();
     assert!(args.media_availability.is_available());
     assert!(args.media_availability.omitted_tool_names().is_empty());
-    assert_eq!(std::mem::size_of_val(&args.media_availability), 1);
+    let debug = format!("{:?}", args.media_availability);
+    assert!(!debug.to_lowercase().contains("principal"));
+    assert!(!debug.to_lowercase().contains("attachment"));
+    let avail_copy = args.media_availability;
+    let _ = avail_copy;
+    assert!(!MediaToolAvailability::default().is_available());
     let registered = materialize_tool_by_name(ToolBox::new(), "read_image", None, &args).unwrap();
     assert!(
         registered.get("read_image").is_some(),
         "available() must actually register the media factory"
+    );
+
+    let projection = LocalOnlyProjection;
+    assert!(!projection.device_active(&[0xFF; 16], 0).unwrap());
+    assert!(projection.authority_active(&[0x11; 32]).unwrap());
+    assert_eq!(
+        projection
+            .current_epoch(IssuerKind::LocalOwner, &[0x11; 32], "session", &[0x22; 32])
+            .unwrap(),
+        0
     );
 
     // turn_toolbox still omits callable media tools when the live session

@@ -854,7 +854,7 @@ baseline, unaffected by `redact.enabled = false`); a trusted harness receives
 its raw prompt only after explicit configuration. No harness, trusted or
 untrusted, receives Cockpit-provided secret environment values — the former
 `auth_env_vars` field is retired. Harness custody is separate from
-provider/model `ModelTrust` and from `LlmMode` posture.
+provider/model `ModelTrust` and from agent-definition posture.
 
 The shell sandbox is filesystem-only and does not restrict network access. It
 has no native Windows backend: Windows shell commands are unconfined and require

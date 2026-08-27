@@ -7,8 +7,8 @@
 //!
 //! - **Provider scope** edits the concrete `context` / `cache` / `shrink`
 //!   / `timeout` / `wire_api` values on the [`ProviderEntry`] (always present),
-//!   plus provider-only transport security, backup fallback, `mode`,
-//!   `inline_think`, and tool-call-correction hinting settings.
+//!   plus provider-only transport security, backup fallback, `inline_think`,
+//!   and tool-call-correction hinting settings.
 //! - **Model scope** edits the `Option<…>` overrides on a single
 //!   [`ModelEntry`]: each config group is either overridden (present) or
 //!   inherits the provider value. Editing a field sets the override; `x`
@@ -23,7 +23,7 @@
 //!   5. Cost rank
 //!   6. Subagent available
 //!   7. Model instructions (model scope only)
-//!   8. Auto-compact ctx % (default 60)
+//!   8. Auto-compact ctx % (default 80)
 //!   9. Auto-prune (on | off | inherit; default on) — the master switch for
 //!      automatic pruning; off protects the provider prompt cache entirely
 //!   10. Auto-prune ctx % (default 50)
@@ -36,16 +36,15 @@
 //!   17. Wire API (auto | completions | responses; hidden for native Anthropic)
 //!   18. xAI multi-agent tools beta access (on | off; xAI/Grok providers only)
 //!   19. Backup model (provider:model)
-//!   20. Mode (defensive | normal | frontier | inherit)
-//!   21. Inline `<think>` (on | off | inherit) — the inline-`<think>`
+//!   20. Inline `<think>` (on | off | inherit) — the inline-`<think>`
 //!       reasoning-extraction toggle, a tri-state at **both** scopes (model
 //!       override → provider override → global default,
 //!       implementation note).
-//!   22. Hint tool-call corrections (on | off | inherit)
+//!   21. Hint tool-call corrections (on | off | inherit)
 //!
 //! Percentages, cache time, and timeout thresholds are inline numeric text edits
 //! (`Enter` opens the edit, validated/clamped on commit). Cache mode, shrink
-//! strategy, wire API, mode, inline think, hint corrections, and provider-only
+//! strategy, wire API, inline think, hint corrections, and provider-only
 //! transport security cycle in place on `Enter`; backup model is a text edit. A
 //! bottom-of-list `[save changes]` row (and the `s` accelerator) commits to
 //! disk and stays; Back (`Esc`/`h`/`←`) writes the working state into the parent
@@ -58,7 +57,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use super::descriptor::{FieldKind, SettingDescriptor, SettingStore};
 
 use crate::tui::textfield::TextField;
-use cockpit_config::extended::LlmMode;
 use cockpit_config::providers::{
     BackupConfig, CacheConfig, CacheMode, CapabilitySource, CapabilityStatus,
     ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES,
@@ -140,7 +138,6 @@ pub(super) enum ProviderSettingId {
     /// (implementation note). Free-text edit; empty clears
     /// it (no fallback).
     Backup,
-    Mode,
     DefaultThinkingMode,
     /// Per-model inline-`<think>` extraction toggle. Model scope only.
     InlineThink,
@@ -184,14 +181,12 @@ pub(super) const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::TimeoutIdleSecs,
     ProviderSettingId::WireApi,
     ProviderSettingId::Backup,
-    ProviderSettingId::Mode,
     ProviderSettingId::DefaultThinkingMode,
     ProviderSettingId::InlineThink,
     ProviderSettingId::HintToolCallCorrections,
     ProviderSettingId::XaiMultiAgentToolsBeta,
 ];
 
-const AUTO_COMPACT_FLOOR_PCT: u8 = 60;
 const AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT: u8 = 80;
 
 impl ProviderSettingId {
@@ -245,7 +240,6 @@ impl ProviderSettingId {
             Self::TimeoutIdleSecs => "Idle threshold (s)",
             Self::WireApi => "Wire API",
             Self::Backup => "Backup model (provider:model)",
-            Self::Mode => "Mode",
             Self::DefaultThinkingMode => "Default thinking mode",
             Self::InlineThink => "Extract inline <think> tags",
             Self::HintToolCallCorrections => "Hint tool-call corrections",
@@ -282,9 +276,6 @@ impl ProviderSettingId {
             Self::InlineThink => Some(
                 "extract strips literal <think> blocks from assistant text, stores them as reasoning, and leaves display to Interface -> Thinking display. It does not request more reasoning from the model.",
             ),
-            Self::Mode => Some(
-                "Steering tier for new turns: defensive (weaker models, explicit guidance), normal (strong models, terse), frontier (top-tier models, high autonomy). inherit falls through to the provider, then the global llm mode. Steering only: mode never changes provider eligibility, data custody, or redaction — Trust alone decides whether inference requests are sent raw, and no mode or locality implies trust. Separate from Interface -> Thinking display.",
-            ),
             Self::DefaultThinkingMode => Some(
                 "Legacy thinking-mode default for models that support thinking modes but not typed reasoning effort. Active /model thinking selections still win.",
             ),
@@ -316,7 +307,7 @@ impl ProviderSettingId {
                 "auto uses fetched/default max-output metadata. Enter an explicit completion limit only when detection is wrong.",
             ),
             Self::AutoCompactPct => Some(
-                "At or above this % of the context window, the conversation is auto-compacted. auto uses the mode/toolbox-aware default: 80% for normal/frontier agents that can self-compact, otherwise 60%. The most recent compact_keep_recent_turns complete exchanges (4 by default; 0 disables the tail) survive verbatim, subject to the context budget. Unrelated to the prune thresholds below.",
+                "At or above this % of the context window, the conversation is auto-compacted. auto uses the 80% default. The most recent compact_keep_recent_turns complete exchanges (4 by default; 0 disables the tail) survive verbatim, subject to the context budget. Unrelated to the prune thresholds below.",
             ),
             Self::CompactNudgePct => Some(
                 "At or above this % of the context window (60% by default), the root agent is nudged to call request_compact when that MCP tool is available.",
@@ -352,7 +343,7 @@ impl ProviderSettingId {
                 "Fallback request target used after inference thresholds; leave blank for no backup.",
             ),
             Self::TrustPolicy => Some(
-                "Data custody only, independent of Mode and locality: inference requests to a trusted model may be sent raw, including secrets and environment values, while inference requests to an untrusted model are redacted. Trusted is meant for a self-hosted or no-log endpoint you are content to hold raw content. Marking an external provider trusted sends it raw secrets and environment values. Exports and client display stay redacted regardless of trust.",
+                "Data custody only, independent of locality: inference requests to a trusted model may be sent raw, including secrets and environment values, while inference requests to an untrusted model are redacted. Trusted is meant for a self-hosted or no-log endpoint you are content to hold raw content. Marking an external provider trusted sends it raw secrets and environment values. Exports and client display stay redacted regardless of trust.",
             ),
             Self::Location => {
                 Some("Locality is routing metadata only; local and trusted are separate decisions.")
@@ -400,15 +391,8 @@ pub(super) struct SettingsEditor {
     /// Backup-model fallback target (implementation note).
     /// `None` = no backup (provider scope) / inherit the provider backup (model
     /// scope); `Some` pins a `(provider, model)`. Tracks its own override via
-    /// `is_some()` like `mode`. Edited as free text `provider:model`.
+    /// `is_some()` like `inline_think`. Edited as free text `provider:model`.
     backup: Option<BackupConfig>,
-    /// `None` = mode undefined (inherit). Cycles
-    /// undefined→defensive→normal→frontier→undefined.
-    mode: Option<LlmMode>,
-    /// Effective mode after inheritance. This leaves `mode` free to track
-    /// override state while giving unset auto-compact previews a mode default.
-    effective_mode: LlmMode,
-    mode_inherit_value: LlmMode,
     /// Per-model/provider legacy thinking-mode default. Active `/model`
     /// choices still win. `None` inherits.
     default_thinking_mode: Option<ThinkingMode>,
@@ -450,8 +434,8 @@ pub(super) struct SettingsEditor {
     provider_trust_confirm_ready_at: Option<Instant>,
     provider_trust_confirm_lockout: Duration,
     /// Per-group "is this overridden on the model" flags. Always true for
-    /// provider scope (the values are concrete). `mode` tracks override via
-    /// `mode.is_some()` directly, so it has no flag here.
+    /// provider scope (the values are concrete). Fields that are themselves
+    /// `Option` track override via `is_some()` and have no flag here.
     context_present: bool,
     cache_present: bool,
     active_prompt_cache_retention: Option<PromptCacheRetention>,
@@ -499,12 +483,9 @@ impl SettingsEditor {
             timeout: entry.timeout.clone(),
             wire_api: entry.wire_api,
             backup: entry.backup.clone(),
-            mode: entry.mode,
-            effective_mode: entry.mode.unwrap_or_default(),
-            mode_inherit_value: LlmMode::default(),
             default_thinking_mode: entry.default_thinking_mode,
             // Provider-tier inline-`<think>` override (tri-state: inherit
-            // global / on / off), mirroring the `mode` tri-state.
+            // global / on / off).
             inline_think: entry.inline_think,
             // Provider-tier hint-tool-call-corrections override (tri-state),
             // mirroring `inline_think`.
@@ -592,9 +573,6 @@ impl SettingsEditor {
             .filter(|w| !w.is_auto())
             .or_else(|| (!entry.wire_api.is_auto()).then_some(entry.wire_api))
             .unwrap_or(WireApi::Auto);
-        let mode = model.and_then(|m| m.mode);
-        let mode_inherit_value = entry.mode.unwrap_or_default();
-        let effective_mode = mode.unwrap_or(mode_inherit_value);
         let model_client_side_tools = model.map(|m| &m.capabilities.client_side_tools);
         let xai_multi_agent_tools_beta_present =
             model_client_side_tools.is_some_and(|capability| !capability.is_empty());
@@ -613,21 +591,18 @@ impl SettingsEditor {
             },
             cursor: 0,
             context,
-            // Auto-prune tracks its override via `is_some()` (like `mode`):
-            // seed from the model's own override only, so an unset model
-            // shows "inherit".
+            // Auto-prune tracks its override via `is_some()` (like
+            // `inline_think`): seed from the model's own override only, so an
+            // unset model shows "inherit".
             auto_prune: model.and_then(|m| m.auto_prune),
             cache,
             shrink,
             timeout,
             wire_api,
-            // Backup tracks its override via `is_some()` (like `mode`): seed
-            // from the model's own override only, not the inherited provider
-            // value, so an unset model shows "inherit".
+            // Backup tracks its override via `is_some()` (like `inline_think`):
+            // seed from the model's own override only, not the inherited
+            // provider value, so an unset model shows "inherit".
             backup: model.and_then(|m| m.backup.clone()),
-            mode,
-            effective_mode,
-            mode_inherit_value,
             default_thinking_mode: model.and_then(|m| m.default_thinking_mode),
             inline_think: model.and_then(|m| m.inline_think),
             hint_tool_call_corrections: model.and_then(|m| m.hint_tool_call_corrections),
@@ -775,7 +750,7 @@ impl SettingsEditor {
         }
         fields.extend([ShrinkStrategy, TimeoutTtftSecs, TimeoutIdleSecs]);
         // Wire API precedes the xAI opt-in; both sit between the timeout rows
-        // and the backup/mode tail.
+        // and the backup tail.
         if show_wire_api {
             fields.push(WireApi);
         }
@@ -784,7 +759,6 @@ impl SettingsEditor {
         }
         fields.extend([
             Backup,
-            Mode,
             DefaultThinkingMode,
             InlineThink,
             HintToolCallCorrections,
@@ -859,7 +833,6 @@ impl SettingsEditor {
             }
             ProviderSettingId::WireApi => self.wire_api_present,
             ProviderSettingId::Backup => self.backup.is_some(),
-            ProviderSettingId::Mode => self.mode.is_some(),
             ProviderSettingId::DefaultThinkingMode => self.default_thinking_mode.is_some(),
             ProviderSettingId::InlineThink => self.inline_think.is_some(),
             ProviderSettingId::HintToolCallCorrections => self.hint_tool_call_corrections.is_some(),
@@ -1025,13 +998,6 @@ impl SettingsEditor {
                 Some(b) => format!("{}:{}", b.provider, b.model),
                 None => "none".to_string(),
             },
-            ProviderSettingId::Mode => match self.mode {
-                Some(LlmMode::Defensive) => "defensive".to_string(),
-                Some(LlmMode::Normal) => "normal".to_string(),
-                Some(LlmMode::Frontier) => "frontier".to_string(),
-                None if self.is_model_scope() => "inherit".to_string(),
-                None => "inherit (global llm mode)".to_string(),
-            },
             ProviderSettingId::DefaultThinkingMode => match self.default_thinking_mode {
                 Some(ThinkingMode::Off) => "off".to_string(),
                 Some(ThinkingMode::Low) => "low".to_string(),
@@ -1109,7 +1075,6 @@ impl SettingsEditor {
             | ProviderSettingId::CapabilityReasoning
             | ProviderSettingId::CapabilityStructuredOutputs
             | ProviderSettingId::Backup
-            | ProviderSettingId::Mode
             | ProviderSettingId::DefaultThinkingMode
             | ProviderSettingId::AutoPruneEnabled
             | ProviderSettingId::InlineThink
@@ -1177,10 +1142,6 @@ impl SettingsEditor {
                 self.wire_api_edited = true;
             }
             ProviderSettingId::Backup => self.backup = None,
-            ProviderSettingId::Mode => {
-                self.mode = None;
-                self.refresh_effective_mode();
-            }
             ProviderSettingId::DefaultThinkingMode => self.default_thinking_mode = None,
             ProviderSettingId::AutoPruneEnabled => self.auto_prune = None,
             ProviderSettingId::InlineThink => self.inline_think = None,
@@ -1389,16 +1350,6 @@ impl SettingsEditor {
                     };
                     self.wire_api_present = true;
                 }
-            }
-            ProviderSettingId::Mode => {
-                // inherit → defensive → normal → frontier → inherit
-                self.mode = match self.mode {
-                    Some(LlmMode::Defensive) => Some(LlmMode::Normal),
-                    Some(LlmMode::Normal) => Some(LlmMode::Frontier),
-                    Some(LlmMode::Frontier) => None,
-                    None => Some(LlmMode::Defensive),
-                };
-                self.refresh_effective_mode();
             }
             ProviderSettingId::DefaultThinkingMode => {
                 // inherit → off → low → medium → high → inherit
@@ -1646,14 +1597,7 @@ impl SettingsEditor {
     }
 
     fn auto_compact_auto_value(&self) -> u8 {
-        match self.effective_mode {
-            LlmMode::Defensive => AUTO_COMPACT_FLOOR_PCT,
-            LlmMode::Normal | LlmMode::Frontier => AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT,
-        }
-    }
-
-    fn refresh_effective_mode(&mut self) {
-        self.effective_mode = self.mode.unwrap_or(self.mode_inherit_value);
+        AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT
     }
 
     pub(super) fn commit_text(
@@ -2296,7 +2240,6 @@ impl SettingsEditor {
                 entry.timeout = self.timeout.clone();
                 entry.wire_api = self.wire_api;
                 entry.backup = self.backup.clone();
-                entry.mode = self.mode;
                 entry.default_thinking_mode = self.default_thinking_mode;
                 entry.inline_think = self.inline_think;
                 entry.hint_tool_call_corrections = self.hint_tool_call_corrections;
@@ -2327,7 +2270,7 @@ impl SettingsEditor {
 
 /// Apply the editor's working state to a model row's `Option<…>` override
 /// fields: a present group writes `Some(value)`, an absent group writes
-/// `None` (inherit). `mode` writes its `Option` directly.
+/// `None` (inherit). Tri-state fields write their `Option` directly.
 fn apply_model_overrides(m: &mut ModelEntry, e: &SettingsEditor) {
     m.context = if e.context_present {
         Some(e.context.clone())
@@ -2359,9 +2302,8 @@ fn apply_model_overrides(m: &mut ModelEntry, e: &SettingsEditor) {
         // including clearing a recovered endpoint back to auto.
         m.wire_api_provenance = WireApiProvenance::UserConfigured;
     }
-    // Backup tracks presence via its `Option` directly (like `mode`).
+    // Backup tracks presence via its `Option` directly (like `inline_think`).
     m.backup = e.backup.clone();
-    m.mode = e.mode;
     m.default_thinking_mode = e.default_thinking_mode;
     m.auto_prune = e.auto_prune;
     m.trust = e.trust;
@@ -2588,16 +2530,15 @@ mod tests {
 
     use super::*;
 
-    /// AC6 (provider/model editor half). Custody language and harness posture
-    /// stay in separate rows with separate copy, and the trust row carries the
-    /// explicit raw-secrets warning.
+    /// AC6 (provider/model editor half). The trust row carries custody
+    /// language and the explicit raw-secrets warning.
     #[test]
-    fn trust_and_mode_help_stay_orthogonal() {
+    fn trust_help_describes_custody_only() {
         let trust = ProviderSettingId::TrustPolicy
             .help_text()
             .expect("trust row has help");
         assert!(
-            trust.contains("Data custody only, independent of Mode and locality"),
+            trust.contains("Data custody only, independent of locality"),
             "trust help: {trust}"
         );
         assert!(
@@ -2613,22 +2554,6 @@ mod tests {
         assert!(
             trust.contains("Exports and client display stay redacted regardless of trust"),
             "trust help: {trust}"
-        );
-
-        let mode = ProviderSettingId::Mode
-            .help_text()
-            .expect("mode row has help");
-        assert!(
-            mode.contains("mode never changes provider eligibility, data custody, or redaction"),
-            "mode help: {mode}"
-        );
-        assert!(
-            mode.contains("no mode or locality implies trust"),
-            "mode help: {mode}"
-        );
-        assert!(
-            !mode.to_ascii_lowercase().contains("self-hosted"),
-            "mode help must not recommend trust by locality: {mode}"
         );
     }
 
@@ -2700,7 +2625,6 @@ mod tests {
             auto_prune: None,
             timeout: None,
             backup: None,
-            mode: None,
             inline_think: None,
             hint_tool_call_corrections: None,
             text_embedded_recovery: None,
@@ -2866,61 +2790,17 @@ mod tests {
     }
 
     #[test]
-    fn mode_cycles_defensive_normal_frontier_inherit() {
-        let entry = provider_with_model();
-        let mut e = SettingsEditor::for_provider("p", &entry);
-        // Move to the Mode row (computed from the field order).
-        e.cursor = e
-            .fields()
-            .iter()
-            .position(|f| *f == ProviderSettingId::Mode)
-            .unwrap();
-        assert_eq!(
-            e.value_str(ProviderSettingId::Mode),
-            "inherit (global llm mode)"
-        );
-        e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(ProviderSettingId::Mode), "defensive");
-        e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(ProviderSettingId::Mode), "normal");
-        e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(ProviderSettingId::Mode), "frontier");
-        e.handle_key(press(KeyCode::Enter));
-        assert_eq!(
-            e.value_str(ProviderSettingId::Mode),
-            "inherit (global llm mode)"
-        );
-        // Writeback: inherit → None.
-        let mut entry2 = entry.clone();
-        e.write_into(&mut entry2);
-        assert!(entry2.mode.is_none());
-    }
-
-    #[test]
-    fn unset_auto_compact_edit_seed_uses_effective_mode_default() {
+    fn unset_auto_compact_edit_seed_uses_flat_default() {
         let mut entry = provider_with_model();
         entry.context.auto_compact_pct = None;
-        entry.mode = Some(LlmMode::Normal);
 
         let mut provider = SettingsEditor::for_provider("p", &entry);
         provider.begin_numeric_edit(ProviderSettingId::AutoCompactPct);
         assert_eq!(provider.buf.text(), "80");
 
         let mut model = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(model.value_str(ProviderSettingId::Mode), "inherit");
         model.begin_numeric_edit(ProviderSettingId::AutoCompactPct);
         assert_eq!(model.buf.text(), "80");
-
-        model.editing = None;
-        model.cursor = model
-            .fields()
-            .iter()
-            .position(|f| *f == ProviderSettingId::Mode)
-            .unwrap();
-        model.handle_key(press(KeyCode::Enter));
-        assert_eq!(model.value_str(ProviderSettingId::Mode), "defensive");
-        model.begin_numeric_edit(ProviderSettingId::AutoCompactPct);
-        assert_eq!(model.buf.text(), "60");
     }
 
     /// Auto-prune master-switch row: tri-state at both scopes, tracked via
@@ -3031,7 +2911,7 @@ mod tests {
 
         // Model scope: the row is present as the last field.
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(e.field_count(), 32);
+        assert_eq!(e.field_count(), 31);
         assert_eq!(
             *e.fields().last().unwrap(),
             ProviderSettingId::HintToolCallCorrections
@@ -3077,11 +2957,10 @@ mod tests {
     #[test]
     fn inline_think_provider_scope_tri_state_cycles_and_writes_back() {
         let entry = provider_with_model();
-        // Provider scope now also shows the inline-`<think>` tri-state row,
-        // mirroring the `mode` tri-state.
+        // Provider scope now also shows the inline-`<think>` tri-state row.
         let mut prov = SettingsEditor::for_provider("p", &entry);
         assert!(prov.fields().contains(&ProviderSettingId::InlineThink));
-        assert_eq!(prov.field_count(), 24);
+        assert_eq!(prov.field_count(), 23);
         // Seeded from the provider's (unset) override → inherit default.
         assert_eq!(
             prov.value_str(ProviderSettingId::InlineThink),
@@ -3215,33 +3094,22 @@ mod tests {
         assert_eq!(m.trust, Some(ModelTrust::Untrusted));
     }
 
-    /// AC3, picker surface. All six trust/mode pairs must go *through the
+    /// AC3, picker surface. Trusted and untrusted must go *through the
     /// editor* — cycled with real key events, read back through the rendered
     /// row values, and written into the entry — and come out as exactly the
-    /// pair that was submitted.
+    /// value that was submitted.
     ///
-    /// The failure this prevents is a picker change that silently rejects,
-    /// rewrites, or hides a combination. `trusted + defensive` is the one most
-    /// at risk: a "defensive posture means a cloud model, so it cannot be
-    /// trusted" shortcut would drop it, and a
-    /// "trusted means self-hosted, so it must be frontier" shortcut would
-    /// rewrite it. Custody and posture are independent, so neither is allowed.
+    /// The failure this prevents is a picker change that silently rejects or
+    /// rewrites trust. Custody is independent of locality: trusted is meant
+    /// for a self-hosted or no-log endpoint you are content to hold raw
+    /// content, not inferred from any other axis.
     #[test]
-    fn trust_mode_cartesian_configuration_through_the_picker() {
+    fn trust_configuration_through_the_picker() {
         /// Model scope cycles `inherit → trusted → untrusted → inherit`.
         fn trust_presses(trust: ModelTrust) -> usize {
             match trust {
                 ModelTrust::Trusted => 1,
                 ModelTrust::Untrusted => 2,
-            }
-        }
-        /// Model scope cycles `inherit → defensive → normal → frontier →
-        /// inherit`.
-        fn mode_presses(mode: LlmMode) -> usize {
-            match mode {
-                LlmMode::Defensive => 1,
-                LlmMode::Normal => 2,
-                LlmMode::Frontier => 3,
             }
         }
         fn cycle_to(e: &mut SettingsEditor, field: ProviderSettingId, times: usize) {
@@ -3251,72 +3119,31 @@ mod tests {
             }
         }
 
-        let combos = [
-            (ModelTrust::Trusted, LlmMode::Defensive),
-            (ModelTrust::Trusted, LlmMode::Normal),
-            (ModelTrust::Trusted, LlmMode::Frontier),
-            (ModelTrust::Untrusted, LlmMode::Defensive),
-            (ModelTrust::Untrusted, LlmMode::Normal),
-            (ModelTrust::Untrusted, LlmMode::Frontier),
-        ];
-        assert_eq!(combos.len(), 6, "the product must stay complete");
-
-        for (trust, mode) in combos {
+        for trust in [ModelTrust::Trusted, ModelTrust::Untrusted] {
             let entry = provider_with_model();
+            let mut e = SettingsEditor::for_model("p", &entry, "m1");
+            assert!(e.fields().contains(&ProviderSettingId::TrustPolicy));
 
-            // Submit both dimensions in each order: neither may depend on
-            // having been set before the other.
-            for mode_first in [true, false] {
-                let mut e = SettingsEditor::for_model("p", &entry, "m1");
-                assert!(e.fields().contains(&ProviderSettingId::TrustPolicy));
-                assert!(
-                    e.fields().contains(&ProviderSettingId::Mode),
-                    "{trust:?}/{mode:?}: neither row may be hidden by the other dimension"
-                );
+            cycle_to(&mut e, ProviderSettingId::TrustPolicy, trust_presses(trust));
 
-                if mode_first {
-                    cycle_to(&mut e, ProviderSettingId::Mode, mode_presses(mode));
-                    cycle_to(&mut e, ProviderSettingId::TrustPolicy, trust_presses(trust));
-                } else {
-                    cycle_to(&mut e, ProviderSettingId::TrustPolicy, trust_presses(trust));
-                    cycle_to(&mut e, ProviderSettingId::Mode, mode_presses(mode));
-                }
+            let expected_trust = match trust {
+                ModelTrust::Trusted => "trusted",
+                ModelTrust::Untrusted => "untrusted",
+            };
+            assert_eq!(
+                e.value_str(ProviderSettingId::TrustPolicy),
+                expected_trust,
+                "{trust:?}: the picker must not rewrite trust"
+            );
 
-                // Rendered rows show exactly what was submitted.
-                let expected_trust = match trust {
-                    ModelTrust::Trusted => "trusted",
-                    ModelTrust::Untrusted => "untrusted",
-                };
-                assert_eq!(
-                    e.value_str(ProviderSettingId::TrustPolicy),
-                    expected_trust,
-                    "{trust:?}/{mode:?} (mode_first={mode_first}): the picker must not rewrite trust"
-                );
-                assert_eq!(
-                    e.value_str(ProviderSettingId::Mode),
-                    mode.as_str(),
-                    "{trust:?}/{mode:?} (mode_first={mode_first}): the picker must not rewrite mode"
-                );
+            let mut written = entry.clone();
+            e.write_into(&mut written);
+            let m = written.models.iter().find(|m| m.id == "m1").unwrap();
+            assert_eq!(m.trust, Some(trust), "{trust:?}");
 
-                // Written state keeps both, and the effective config resolves
-                // back to the submitted pair.
-                let mut written = entry.clone();
-                e.write_into(&mut written);
-                let m = written.models.iter().find(|m| m.id == "m1").unwrap();
-                assert_eq!(m.trust, Some(trust), "{trust:?}/{mode:?}");
-                assert_eq!(m.mode, Some(mode), "{trust:?}/{mode:?}");
-
-                let mut cfg = ProvidersConfig::default();
-                cfg.providers.insert("p".into(), written);
-                assert_eq!(cfg.resolve_trust("p", "m1"), trust, "{trust:?}/{mode:?}");
-                for global in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-                    assert_eq!(
-                        cfg.resolve_mode("p", "m1", global),
-                        mode,
-                        "{trust:?}/{mode:?}: the submitted mode survives any global posture"
-                    );
-                }
-            }
+            let mut cfg = ProvidersConfig::default();
+            cfg.providers.insert("p".into(), written);
+            assert_eq!(cfg.resolve_trust("p", "m1"), trust, "{trust:?}");
         }
     }
 
@@ -3443,8 +3270,9 @@ mod tests {
 
     #[test]
     fn backup_model_scope_seeds_from_own_override_only() {
-        // Model scope: backup tracks its override via the Option (like `mode`),
-        // seeded from the model's OWN backup, not the inherited provider one.
+        // Model scope: backup tracks its override via the Option (like
+        // `inline_think`), seeded from the model's OWN backup, not the
+        // inherited provider one.
         let mut entry = provider_with_model();
         entry.backup = Some(BackupConfig {
             provider: "prov-level".into(),
@@ -3797,7 +3625,7 @@ mod tests {
     #[test]
     fn model_settings_and_quick_edit_same_retention_preference() {
         use crate::tui::quick_dialog::{QuickCurrent, QuickDialog, QuickModelChoice, QuickOutcome};
-        use cockpit_config::extended::{ApprovalMode, LlmMode};
+        use cockpit_config::extended::ApprovalMode;
         use cockpit_core::container::{ContainerAvailability, ContainerRuntimeKind};
         use cockpit_proto::SandboxMode;
 
@@ -3819,7 +3647,6 @@ mod tests {
         );
 
         let current_quick_retention = || QuickCurrent {
-            llm_mode: LlmMode::Defensive,
             recursion_enabled: true,
             recursion_depth: 2,
             sandbox_mode: SandboxMode::Sandbox,
@@ -3847,10 +3674,9 @@ mod tests {
                 model_id: "m1".to_string(),
                 label: "p/m1".to_string(),
                 trust: ModelTrust::Trusted,
-                mode: LlmMode::Normal,
             }],
         );
-        for _ in 0..4 {
+        for _ in 0..3 {
             quick.handle_key(press(KeyCode::Tab));
         }
         quick.handle_key(press(KeyCode::Down));

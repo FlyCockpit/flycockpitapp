@@ -603,7 +603,6 @@ impl QuickDialog {
 impl Tab {
     fn label(self) -> &'static str {
         match self {
-            Tab::Mode => "Mode",
             Tab::Recursion => "Recursion",
             Tab::Sandbox => "Sandbox",
             Tab::Permissions => "Permissions",
@@ -611,10 +610,6 @@ impl Tab {
             Tab::Model => "Model",
         }
     }
-}
-
-fn mode_options() -> &'static [LlmMode] {
-    &[LlmMode::Frontier, LlmMode::Normal, LlmMode::Defensive]
 }
 
 fn approval_options() -> &'static [ApprovalMode] {
@@ -738,14 +733,6 @@ fn recursion_description(choice: RecursionChoice) -> &'static str {
     }
 }
 
-fn mode_description(mode: LlmMode) -> &'static str {
-    match mode {
-        LlmMode::Frontier => "top-tier steering",
-        LlmMode::Normal => "standard strong-model steering",
-        LlmMode::Defensive => "explicit defensive steering",
-    }
-}
-
 fn approval_description(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Manual => "you approve anything that leaves the sandbox",
@@ -760,7 +747,6 @@ mod tests {
 
     fn current() -> QuickCurrent {
         QuickCurrent {
-            llm_mode: LlmMode::Defensive,
             recursion_enabled: true,
             recursion_depth: 2,
             sandbox_mode: SandboxMode::Sandbox,
@@ -797,7 +783,6 @@ mod tests {
             model_id: model.to_string(),
             label: label.to_string(),
             trust: ModelTrust::Trusted,
-            mode: LlmMode::Normal,
         }
     }
 
@@ -817,17 +802,17 @@ mod tests {
 
     #[test]
     fn tab_forward_and_back() {
-        assert_eq!(TABS.len(), 6);
+        assert_eq!(TABS.len(), 5);
         let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
-        assert_eq!(dialog.active_tab(), Tab::Mode);
-        dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.active_tab(), Tab::Recursion);
+        dialog.handle_key(key(KeyCode::Tab));
+        assert_eq!(dialog.active_tab(), Tab::Sandbox);
         dialog.handle_key(shift_tab());
-        assert_eq!(dialog.active_tab(), Tab::Mode);
-        for _ in 0..6 {
+        assert_eq!(dialog.active_tab(), Tab::Recursion);
+        for _ in 0..5 {
             dialog.handle_key(key(KeyCode::Tab));
         }
-        assert_eq!(dialog.active_tab(), Tab::Mode);
+        assert_eq!(dialog.active_tab(), Tab::Recursion);
     }
 
     #[test]
@@ -836,20 +821,20 @@ mod tests {
         dialog.handle_key(key(KeyCode::Char('h')));
         assert_eq!(dialog.active_tab(), Tab::Model);
         dialog.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(dialog.active_tab(), Tab::Mode);
-        dialog.handle_key(key(KeyCode::Right));
         assert_eq!(dialog.active_tab(), Tab::Recursion);
-        dialog.handle_key(key(KeyCode::Down));
-        let recursion_cursor = dialog.active_cursor();
         dialog.handle_key(key(KeyCode::Right));
+        assert_eq!(dialog.active_tab(), Tab::Sandbox);
+        dialog.handle_key(key(KeyCode::Down));
+        let sandbox_cursor = dialog.active_cursor();
+        dialog.handle_key(key(KeyCode::Right));
+        assert_eq!(dialog.active_tab(), Tab::Permissions);
+        dialog.handle_key(key(KeyCode::Left));
         assert_eq!(dialog.active_tab(), Tab::Sandbox);
         dialog.handle_key(key(KeyCode::Left));
         assert_eq!(dialog.active_tab(), Tab::Recursion);
-        dialog.handle_key(key(KeyCode::Left));
-        assert_eq!(dialog.active_tab(), Tab::Mode);
         dialog.handle_key(key(KeyCode::Right));
-        assert_eq!(dialog.active_tab(), Tab::Recursion);
-        assert_eq!(dialog.active_cursor(), recursion_cursor);
+        assert_eq!(dialog.active_tab(), Tab::Sandbox);
+        assert_eq!(dialog.active_cursor(), sandbox_cursor);
     }
 
     #[test]
@@ -879,7 +864,7 @@ mod tests {
         assert_eq!(
             dialog.commit(),
             QuickCommit {
-                llm_mode: Some(LlmMode::Normal),
+                recursion: Some((true, 1)),
                 ..QuickCommit::default()
             }
         );
@@ -893,7 +878,7 @@ mod tests {
         assert_eq!(
             outcome,
             Some(QuickOutcome::Commit(QuickCommit {
-                llm_mode: Some(LlmMode::Normal),
+                recursion: Some((true, 1)),
                 ..QuickCommit::default()
             }))
         );
@@ -913,8 +898,8 @@ mod tests {
         dialog.handle_key(key(KeyCode::Up));
         dialog.handle_key(key(KeyCode::Char(' ')));
         let snapshot = dialog.snapshot();
-        assert!(snapshot.contains("> normal"));
-        assert!(snapshot.contains("defensive"));
+        assert!(snapshot.contains("> 1"));
+        assert!(snapshot.contains("2"));
         assert!(snapshot.contains("current"));
         assert!(snapshot.contains("staged"));
     }
@@ -922,7 +907,6 @@ mod tests {
     #[test]
     fn recursion_options_have_no_zero() {
         let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
-        dialog.handle_key(key(KeyCode::Tab));
         let snapshot = dialog.snapshot();
         assert!(snapshot.contains("off"));
         for depth in 1..=6 {
@@ -934,9 +918,7 @@ mod tests {
     #[test]
     fn sandbox_tab_stages_container_mode() {
         let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
-        for _ in 0..2 {
-            dialog.handle_key(key(KeyCode::Tab));
-        }
+        dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.active_tab(), Tab::Sandbox);
         assert_eq!(dialog.active_cursor(), 1);
 
@@ -955,9 +937,7 @@ mod tests {
     #[test]
     fn sandbox_tab_network_toggle_requires_staged_container_mode() {
         let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
-        for _ in 0..2 {
-            dialog.handle_key(key(KeyCode::Tab));
-        }
+        dialog.handle_key(key(KeyCode::Tab));
 
         for _ in 0..3 {
             dialog.handle_key(key(KeyCode::Down));
@@ -998,9 +978,7 @@ mod tests {
             None,
         );
         let mut dialog = QuickDialog::open(current, vec![model("p/a")]);
-        for _ in 0..2 {
-            dialog.handle_key(key(KeyCode::Tab));
-        }
+        dialog.handle_key(key(KeyCode::Tab));
         dialog.handle_key(key(KeyCode::Down));
         dialog.handle_key(key(KeyCode::Char(' ')));
 
@@ -1015,7 +993,7 @@ mod tests {
     #[test]
     fn disabled_empty_favorite_model_tab() {
         let mut dialog = QuickDialog::open(current(), Vec::new());
-        for _ in 0..5 {
+        for _ in 0..4 {
             dialog.handle_key(key(KeyCode::Tab));
         }
         assert_eq!(dialog.active_tab(), Tab::Model);

@@ -447,14 +447,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
-        name: "llm-mode",
-        description: "Switch LLM steering mode (arg: toggle/defend/normal; bare = toggle)",
-        takes_args: true,
-        run: run_llm_mode,
-        available: available_always,
-        describe: describe_llm_mode,
-    },
-    SlashCommand {
         name: "mcp",
         description: "Manage MCP servers (arg: settings/list/on/off/toggle [id]; bare = list)",
         takes_args: true,

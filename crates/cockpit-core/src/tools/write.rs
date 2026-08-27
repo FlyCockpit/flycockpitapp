@@ -5,7 +5,7 @@
 //! created without a read record, using create-new semantics so they are never
 //! overwritten by a stale absence check.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::io::Write as _;
 
 #[cfg(unix)]
@@ -421,6 +421,10 @@ struct ParentPrep {
     parent_directory: Option<std::fs::File>,
     #[cfg(unix)]
     bindings: Vec<HeldDirectoryBinding>,
+    #[cfg(windows)]
+    parent_directory: Option<std::fs::File>,
+    #[cfg(windows)]
+    bindings: Vec<windows_parent::DirectoryBinding>,
 }
 
 #[derive(Default)]
@@ -429,6 +433,10 @@ struct CreatedDirectories {
     paths: Vec<std::path::PathBuf>,
     #[cfg(unix)]
     bindings: Vec<CreatedDirectoryBinding>,
+    #[cfg(windows)]
+    paths: Vec<std::path::PathBuf>,
+    #[cfg(windows)]
+    bindings: Vec<windows_parent::CreatedDirectoryBinding>,
 }
 
 #[cfg(unix)]
@@ -451,6 +459,8 @@ impl CreatedDirectories {
     fn rollback(&self) {
         #[cfg(unix)]
         rollback_created_directory_bindings(&self.bindings);
+        #[cfg(windows)]
+        windows_parent::rollback(&self.bindings);
     }
 }
 
@@ -477,7 +487,7 @@ fn rollback_created_directory_bindings(bindings: &[CreatedDirectoryBinding]) {
 }
 
 impl ParentPrep {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn none() -> Self {
         Self {
             disclosure: None,
@@ -485,6 +495,10 @@ impl ParentPrep {
             #[cfg(unix)]
             parent_directory: None,
             #[cfg(unix)]
+            bindings: Vec::new(),
+            #[cfg(windows)]
+            parent_directory: None,
+            #[cfg(windows)]
             bindings: Vec::new(),
         }
     }
@@ -535,7 +549,7 @@ async fn create_new_and_release(
 /// Name the created portion below the nearest pre-existing ancestor as
 /// `created directories: <first-created>/…/<parent>`. A single created
 /// component omits the ellipsis.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn format_created_directories_line(created: &[std::path::PathBuf]) -> Option<String> {
     let first = created.first()?.file_name()?;
     let last = created.last()?.file_name()?;
@@ -551,7 +565,7 @@ fn format_created_directories_line(created: &[std::path::PathBuf]) -> Option<Str
 }
 
 fn revalidate_prepared_parent(prep: &ParentPrep) -> Result<()> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = prep;
     #[cfg(unix)]
     {
@@ -576,6 +590,8 @@ fn revalidate_prepared_parent(prep: &ParentPrep) -> Result<()> {
             }
         }
     }
+    #[cfg(windows)]
+    windows_parent::revalidate(&prep.bindings)?;
     Ok(())
 }
 
@@ -585,8 +601,11 @@ struct CreatedFileIdentity {
     inode: u64,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 struct CreatedFileIdentity;
+
+#[cfg(windows)]
+type CreatedFileIdentity = windows_parent::Identity;
 
 #[cfg(unix)]
 fn remove_new_file(prep: &ParentPrep, path: &std::path::Path, identity: &CreatedFileIdentity) {
@@ -611,8 +630,15 @@ fn remove_new_file(prep: &ParentPrep, path: &std::path::Path, identity: &Created
     let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &name, 0);
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn remove_new_file(_prep: &ParentPrep, _path: &std::path::Path, _identity: &CreatedFileIdentity) {}
+
+#[cfg(windows)]
+fn remove_new_file(prep: &ParentPrep, path: &std::path::Path, identity: &CreatedFileIdentity) {
+    if let (Some(parent), Some(name)) = (prep.parent_directory.as_ref(), path.file_name()) {
+        windows_parent::remove_relative_if_identity(parent, name, false, *identity);
+    }
+}
 
 #[cfg(unix)]
 fn ensure_parent_dirs(path: &std::path::Path) -> Result<ParentPrep> {
@@ -670,21 +696,18 @@ fn ensure_parent_dirs(path: &std::path::Path) -> Result<ParentPrep> {
     Ok(prep)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn ensure_parent_dirs(path: &std::path::Path) -> Result<ParentPrep> {
+    windows_parent::prepare(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn ensure_parent_dirs(path: &std::path::Path) -> Result<ParentPrep> {
     if !path.is_absolute() {
         bail!("secure new-file target must be absolute");
     }
-    for component in path.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            bail!(
-                "refused: secure new-file target `{}` contains unresolved traversal",
-                path.display()
-            );
-        }
-    }
     bail!(
-        "refused: secure new-file creation is unavailable on this platform because handle-relative no-reparse creation is not implemented"
+        "refused: secure new-file creation is unavailable on this platform because handle-relative no-link creation is not implemented"
     )
 }
 
@@ -991,7 +1014,16 @@ fn create_new_file(
     Ok(identity)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn create_new_file(
+    prep: &ParentPrep,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<CreatedFileIdentity> {
+    windows_parent::create_file(prep, path, bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn create_new_file(
     _prep: &ParentPrep,
     _path: &std::path::Path,
@@ -1001,6 +1033,490 @@ fn create_new_file(
         std::io::ErrorKind::Unsupported,
         "secure handle-relative new-file creation is unavailable on this platform",
     ))
+}
+
+// Win32 has no `openat`; the native equivalent is `NtCreateFile` with a held
+// `RootDirectory`. `OBJ_DONT_REPARSE` makes each lookup fail closed if the
+// named component is a reparse point. This mirrors the already-audited held
+// Windows walk used by daemon agent installation.
+#[cfg(windows)]
+mod windows_parent {
+    use std::ffi::{OsStr, c_void};
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use std::path::{Component, Path, PathBuf, Prefix};
+    use std::{fs::File, ptr};
+
+    use anyhow::{Context, Result, bail, ensure};
+
+    use super::{CreatedDirectories, ParentPrep, format_created_directories_line};
+
+    type Handle = *mut c_void;
+    const INVALID_HANDLE: Handle = -1_isize as Handle;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+    const OBJ_DONT_REPARSE: u32 = 0x1000;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const FILE_OPEN: u32 = 1;
+    const FILE_CREATE: u32 = 2;
+    const FILE_DIRECTORY_FILE: u32 = 0x1;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const OPEN_EXISTING: u32 = 3;
+    const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+    const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
+    const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32 as i32;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: Handle,
+        object_name: *const UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut c_void,
+        security_quality_of_service: *mut c_void,
+    }
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: isize,
+        information: usize,
+    }
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_low: u32,
+        creation_high: u32,
+        access_low: u32,
+        access_high: u32,
+        write_low: u32,
+        write_high: u32,
+        volume_serial: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[repr(C)]
+    struct Disposition {
+        delete_file: u8,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file: *mut Handle,
+            access: u32,
+            attributes: *const ObjectAttributes,
+            io: *mut IoStatusBlock,
+            allocation: *const i64,
+            file_attributes: u32,
+            share: u32,
+            disposition: u32,
+            options: u32,
+            ea: *const c_void,
+            ea_len: u32,
+        ) -> i32;
+        fn NtSetInformationFile(
+            file: Handle,
+            io: *mut IoStatusBlock,
+            information: *const c_void,
+            length: u32,
+            class: u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            creation: u32,
+            flags: u32,
+            template: Handle,
+        ) -> Handle;
+        fn GetFileInformationByHandle(
+            file: Handle,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    pub(super) struct Identity {
+        volume: u32,
+        index: u64,
+    }
+    pub(super) struct DirectoryBinding {
+        parent: File,
+        name: Vec<u16>,
+        identity: Identity,
+    }
+    pub(super) struct CreatedDirectoryBinding {
+        parent: File,
+        name: Vec<u16>,
+        identity: Identity,
+    }
+
+    fn wide_component(value: &OsStr) -> Result<Vec<u16>> {
+        let value = value.encode_wide().collect::<Vec<_>>();
+        ensure!(
+            !value.is_empty() && value.len() <= u16::MAX as usize / 2,
+            "invalid Windows path component"
+        );
+        ensure!(!value.contains(&0), "Windows path component contains NUL");
+        Ok(value)
+    }
+
+    fn identity(file: &File, directory: bool) -> Result<Identity> {
+        let mut info = unsafe { std::mem::zeroed::<ByHandleFileInformation>() };
+        ensure!(
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0,
+            "querying held Windows path identity failed"
+        );
+        ensure!(
+            info.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "refused: held Windows path is a reparse point"
+        );
+        ensure!(
+            if directory {
+                file.metadata()?.is_dir()
+            } else {
+                file.metadata()?.is_file()
+            },
+            "refused: held Windows path has the wrong type"
+        );
+        Ok(Identity {
+            volume: info.volume_serial,
+            index: (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+        })
+    }
+
+    fn open_relative(
+        parent: &File,
+        name: &[u16],
+        disposition: u32,
+        kind: u32,
+        access: u32,
+    ) -> std::result::Result<File, i32> {
+        let mut name = name.to_vec();
+        let unicode = UnicodeString {
+            length: (name.len() * 2) as u16,
+            maximum_length: (name.len() * 2) as u16,
+            buffer: name.as_mut_ptr(),
+        };
+        let attributes = ObjectAttributes {
+            length: size_of::<ObjectAttributes>() as u32,
+            root_directory: parent.as_raw_handle(),
+            object_name: &unicode,
+            attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            security_descriptor: ptr::null_mut(),
+            security_quality_of_service: ptr::null_mut(),
+        };
+        let mut io = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let mut raw = ptr::null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                access,
+                &attributes,
+                &mut io,
+                ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_ALL,
+                disposition,
+                kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                ptr::null(),
+                0,
+            )
+        };
+        if status < 0 || raw.is_null() {
+            Err(status)
+        } else {
+            Ok(unsafe { File::from_raw_handle(raw) })
+        }
+    }
+
+    fn open_root(path: &Path) -> Result<(File, Vec<std::ffi::OsString>)> {
+        let mut components = path.components();
+        let prefix = match components.next() {
+            Some(Component::Prefix(prefix)) => prefix,
+            _ => bail!("secure new-file target must be an absolute Windows path"),
+        };
+        ensure!(
+            matches!(components.next(), Some(Component::RootDir)),
+            "secure new-file target must be rooted"
+        );
+        ensure!(
+            matches!(
+                prefix.kind(),
+                Prefix::Disk(_)
+                    | Prefix::VerbatimDisk(_)
+                    | Prefix::UNC(_, _)
+                    | Prefix::VerbatimUNC(_, _)
+            ),
+            "secure new-file target must use a drive or UNC root"
+        );
+        let mut root = PathBuf::from(prefix.as_os_str());
+        root.push("\\");
+        let wide = root
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_ALL,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        ensure!(
+            raw != INVALID_HANDLE,
+            "opening held Windows filesystem root failed"
+        );
+        let root = unsafe { File::from_raw_handle(raw) };
+        identity(&root, true)?;
+        let rest = components
+            .map(|component| match component {
+                Component::Normal(name) => Ok(name.to_os_string()),
+                Component::CurDir => Ok(std::ffi::OsString::new()),
+                _ => bail!("secure new-file target contains unresolved traversal"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((root, rest))
+    }
+
+    pub(super) fn prepare(path: &Path) -> Result<ParentPrep> {
+        let parent = path
+            .parent()
+            .context("secure new-file target has no parent")?;
+        let (mut current, components) = open_root(parent)?;
+        let mut built = PathBuf::new();
+        let mut created = CreatedDirectories::default();
+        let mut bindings = Vec::new();
+        let walk = (|| -> Result<()> {
+            for name in components.into_iter().filter(|name| !name.is_empty()) {
+                built.push(&name);
+                let wide = wide_component(&name)?;
+                let mut made = false;
+                let next = match open_relative(&current, &wide, FILE_OPEN, FILE_DIRECTORY_FILE,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE) {
+                    Ok(file) => file,
+                    Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => {
+                        match open_relative(&current, &wide, FILE_CREATE, FILE_DIRECTORY_FILE,
+                            GENERIC_READ | GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE) {
+                            Ok(file) => { made = true; file }
+                            Err(STATUS_OBJECT_NAME_COLLISION) => open_relative(&current, &wide, FILE_OPEN,
+                                FILE_DIRECTORY_FILE, GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+                                .map_err(|status| anyhow::anyhow!("opening concurrently-created Windows directory failed with NTSTATUS {status:#x}"))?,
+                            Err(status) => bail!("creating held Windows directory failed with NTSTATUS {status:#x}"),
+                        }
+                    }
+                    Err(status) => bail!("opening held Windows directory failed with NTSTATUS {status:#x}"),
+                };
+                let id = match identity(&next, true) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        if made {
+                            let _ = mark_delete(&next);
+                        }
+                        return Err(error);
+                    }
+                };
+                if made {
+                    let rollback_parent = match current.try_clone() {
+                        Ok(parent) => parent,
+                        Err(error) => {
+                            remove_wide_if_identity(&current, &wide, true, id);
+                            return Err(error.into());
+                        }
+                    };
+                    created.paths.push(built.clone());
+                    created.bindings.push(CreatedDirectoryBinding {
+                        parent: rollback_parent,
+                        name: wide.clone(),
+                        identity: id,
+                    });
+                }
+                bindings.push(DirectoryBinding {
+                    parent: current.try_clone()?,
+                    name: wide,
+                    identity: id,
+                });
+                current = next;
+            }
+            Ok(())
+        })();
+        if let Err(error) = walk {
+            created.rollback();
+            return Err(error);
+        }
+        let disclosure = format_created_directories_line(&created.paths);
+        let prep = ParentPrep {
+            disclosure,
+            created,
+            parent_directory: Some(current),
+            bindings,
+        };
+        if let Err(error) = revalidate(&prep.bindings) {
+            prep.created.rollback();
+            return Err(error);
+        }
+        Ok(prep)
+    }
+
+    pub(super) fn revalidate(bindings: &[DirectoryBinding]) -> Result<()> {
+        for binding in bindings {
+            let file = open_relative(
+                &binding.parent,
+                &binding.name,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )
+            .map_err(|status| {
+                anyhow::anyhow!("refused: prepared Windows parent changed (NTSTATUS {status:#x})")
+            })?;
+            ensure!(
+                identity(&file, true)? == binding.identity,
+                "refused: prepared Windows parent component changed identity"
+            );
+        }
+        Ok(())
+    }
+
+    fn mark_delete(file: &File) -> Result<()> {
+        let disposition = Disposition { delete_file: 1 };
+        let mut io = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle(),
+                &mut io,
+                (&raw const disposition).cast(),
+                size_of::<Disposition>() as u32,
+                13,
+            )
+        };
+        ensure!(
+            status >= 0,
+            "held Windows deletion failed with NTSTATUS {status:#x}"
+        );
+        Ok(())
+    }
+
+    pub(super) fn remove_relative_if_identity(
+        parent: &File,
+        name: &OsStr,
+        directory: bool,
+        expected: Identity,
+    ) {
+        let Ok(name) = wide_component(name) else {
+            return;
+        };
+        remove_wide_if_identity(parent, &name, directory, expected);
+    }
+
+    fn remove_wide_if_identity(parent: &File, name: &[u16], directory: bool, expected: Identity) {
+        let kind = if directory {
+            FILE_DIRECTORY_FILE
+        } else {
+            FILE_NON_DIRECTORY_FILE
+        };
+        let Ok(file) = open_relative(
+            parent,
+            name,
+            FILE_OPEN,
+            kind,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        ) else {
+            return;
+        };
+        if identity(&file, directory).ok() == Some(expected) {
+            let _ = mark_delete(&file);
+        }
+    }
+
+    pub(super) fn rollback(bindings: &[CreatedDirectoryBinding]) {
+        for binding in bindings.iter().rev() {
+            remove_wide_if_identity(&binding.parent, &binding.name, true, binding.identity);
+        }
+    }
+
+    pub(super) fn create_file(
+        prep: &ParentPrep,
+        path: &Path,
+        bytes: &[u8],
+    ) -> std::io::Result<Identity> {
+        let parent = prep
+            .parent_directory
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("missing held Windows parent"))?;
+        let name = wide_component(
+            path.file_name()
+                .ok_or_else(|| std::io::Error::other("missing Windows filename"))?,
+        )
+        .map_err(std::io::Error::other)?;
+        let mut file = open_relative(
+            parent,
+            &name,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+            GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )
+        .map_err(|status| {
+            let kind = if status == STATUS_OBJECT_NAME_COLLISION {
+                std::io::ErrorKind::AlreadyExists
+            } else {
+                std::io::ErrorKind::Other
+            };
+            std::io::Error::new(
+                kind,
+                format!("held Windows file create failed with NTSTATUS {status:#x}"),
+            )
+        })?;
+        let result = (|| -> Result<Identity> {
+            let id = match identity(&file, false) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let _ = mark_delete(&file);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = file.write_all(bytes) {
+                let _ = mark_delete(&file);
+                return Err(error.into());
+            }
+            Ok(id)
+        })();
+        result.map_err(std::io::Error::other)
+    }
 }
 
 #[cfg(test)]
@@ -2105,16 +2621,32 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(unix))]
-    fn new_file_creation_fails_closed_without_handle_relative_no_reparse_support() {
+    #[cfg(windows)]
+    fn windows_new_file_creation_uses_held_parent_with_existing_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let error = ensure_parent_dirs(&tmp.path().join("new.txt"))
-            .err()
-            .unwrap()
-            .to_string();
+        let path = tmp.path().join("new.txt");
+        let prep = ensure_parent_dirs(&path).unwrap();
 
-        assert!(error.contains("handle-relative no-reparse"), "{error}");
-        assert!(!tmp.path().join("new.txt").exists());
+        create_new_file(&prep, &path, b"body").unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "body");
+        assert!(prep.disclosure.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_new_file_creation_creates_and_discloses_nested_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/deep/new.txt");
+        let prep = ensure_parent_dirs(&path).unwrap();
+
+        create_new_file(&prep, &path, b"body").unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "body");
+        assert_eq!(
+            prep.disclosure.as_deref(),
+            Some("created directories: nested/…/deep")
+        );
     }
 
     #[tokio::test]

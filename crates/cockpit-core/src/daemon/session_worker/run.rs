@@ -5177,9 +5177,32 @@ pub(super) async fn run_worker(
                                     interrupt_id = %row.interrupt_id,
                                     "loading unrecoverable interrupt lifecycle decision failed"
                                 );
+                                settle_unrecoverable_interrupt(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
+                                    session_id,
+                                    row.interrupt_id,
+                                    false,
+                                    interrupt_restart_notice_text(
+                                        row.interrupt_id,
+                                        validate_parked_interrupt_payload(&row),
+                                    ),
+                                )
+                                .await;
                                 continue;
                             }
                         };
+                        let waiting_host = matches!(
+                            row.state,
+                            crate::db::needs_attention::InterruptState::Open
+                                | crate::db::needs_attention::InterruptState::Parked
+                        ) && linked_decision
+                            .as_ref()
+                            .is_some_and(|decision| !decision.state.is_terminal());
+                        if waiting_host {
+                            continue;
+                        }
                         settle_unrecoverable_interrupt(
                             &session,
                             &event_tx,

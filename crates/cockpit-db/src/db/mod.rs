@@ -5679,9 +5679,13 @@ mod tests {
             // Tombstones are global UUID receipts with no session column FK.
             // Monetary reservations and debt are immutable billing receipts;
             // deleting a session must not erase spend or unblock its scopes.
+            // Sidecar intents outlive the session row so boot can delete
+            // files that the cascading payload delete can no longer see.
             if name == "run_invocations"
                 || name == "run_invocation_tombstones"
                 || name == "image_spend_reservations"
+                || name == "task_delegation_sidecar_cleanup_intents"
+                || name == "task_delegation_sidecar_prepare_intents"
             {
                 continue;
             }

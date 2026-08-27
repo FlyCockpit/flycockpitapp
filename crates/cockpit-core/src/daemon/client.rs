@@ -458,6 +458,7 @@ enum DiscoverAttachPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartWaitPlan {
+    WaitForReplacement,
     Spawn,
     FailWedged,
 }
@@ -496,6 +497,9 @@ fn discover_attach_plan(
 
 fn after_restart_wait(mode: LifecycleMode, error: SharedWaitError) -> RestartWaitPlan {
     match error {
+        SharedWaitError::Released if !ephemeral_may_spawn_private(mode) => {
+            RestartWaitPlan::WaitForReplacement
+        }
         SharedWaitError::Released => RestartWaitPlan::Spawn,
         SharedWaitError::Wedged if ephemeral_may_spawn_private(mode) => RestartWaitPlan::Spawn,
         SharedWaitError::Wedged => RestartWaitPlan::FailWedged,
@@ -560,6 +564,31 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                             });
                         }
                         Err(error) => match after_restart_wait(mode, error) {
+                            RestartWaitPlan::WaitForReplacement => {
+                                tracing::info!(
+                                    "canonical daemon pid released; waiting for the restart replacement"
+                                );
+                                match wait_for_shared_daemon(&discovered.paths.socket, None).await {
+                                    Ok(client) => {
+                                        return Ok(ConnectedDaemon {
+                                            endpoint: local_daemon_endpoint(
+                                                &discovered.paths.socket,
+                                            ),
+                                            client,
+                                            owns_daemon: false,
+                                            socket: discovered.paths.socket,
+                                            startup_notice,
+                                            owned_daemon_guard: None,
+                                            owned_in_process_guard: None,
+                                        });
+                                    }
+                                    Err(_) => {
+                                        tracing::info!(
+                                            "restart replacement never bound; spawning a replacement"
+                                        );
+                                    }
+                                }
+                            }
                             RestartWaitPlan::Spawn => {
                                 tracing::info!(
                                     "canonical daemon pid released or never bound; spawning a replacement"

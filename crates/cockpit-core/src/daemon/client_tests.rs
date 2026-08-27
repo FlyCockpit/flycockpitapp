@@ -535,7 +535,7 @@ fn discover_attach_plan_restart_release_spawns_instead_of_failing() {
             LifecycleMode::AttachOrAutoPromote,
             SharedWaitError::Released
         ),
-        RestartWaitPlan::Spawn
+        RestartWaitPlan::WaitForReplacement
     );
     assert_eq!(
         after_restart_wait(LifecycleMode::AlwaysEphemeral, SharedWaitError::Released),

@@ -5989,7 +5989,8 @@ impl Db {
     /// the session; retaining an old claim across a crash would otherwise
     /// strand a still-pending user steer forever. An accepted row is *not*
     /// released here: that would let a fresh epoch re-accept and re-run an
-    /// already-dispatched continuation.
+    /// already-dispatched continuation. A completed, undelivered row *is*
+    /// released so the successor epoch can perform receipt-only acknowledgement.
     pub async fn begin_late_user_decision_steer_recovery(
         &self,
         session_id: Uuid,
@@ -5999,7 +6000,8 @@ impl Db {
             conn.execute(
                 "UPDATE agent_decision_steers
                  SET claimed_recovery_epoch = NULL
-                 WHERE session_id = ?1 AND execution_state = 'pending'
+                 WHERE session_id = ?1
+                   AND execution_state IN ('pending', 'completed')
                    AND delivered_at_unix_ms IS NULL
                    AND claimed_recovery_epoch IS NOT NULL
                    AND claimed_recovery_epoch <> ?2",
@@ -6365,8 +6367,8 @@ impl Db {
                          ),
                          'payload_bytes', length(CAST(payload_json AS BLOB))
                      )
-                 WHERE steer_id = ?2 AND session_id = ?3
-                   AND continuation_id = ?4 AND agent_instance_id = ?5
+                 WHERE steer_id = ?3 AND session_id = ?4
+                   AND continuation_id = ?5 AND agent_instance_id = ?6
                    AND delivered_at_unix_ms IS NULL
                    AND execution_state = 'pending'
                    AND claimed_recovery_epoch = ?1
@@ -12682,11 +12684,24 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            db.resolve_decision_request(
+        let claimed = match db
+            .claim_decision_request(
                 session_id,
                 decision.decision_request_id,
                 decision.revision,
+                now,
+            )
+            .await
+            .unwrap()
+        {
+            DecisionTransitionOutcome::Transitioned(row) => row,
+            other => panic!("auto-resolve fixture lost its resolving claim: {other:?}"),
+        };
+        assert!(matches!(
+            db.resolve_decision_request(
+                session_id,
+                claimed.decision_request_id,
+                claimed.revision,
                 DecisionState::AutoResolved,
                 r#"{"source":"test-auto"}"#,
                 now + 1,
@@ -13132,15 +13147,21 @@ mod tests {
         db.begin_late_user_decision_steer_recovery(session.session_id, waiting_recovery_epoch)
             .await
             .unwrap();
-        assert!(
-            db.accepted_late_user_decision_steers_for_recovery(
+        let waiting_recovered = db
+            .accepted_late_user_decision_steers_for_recovery(
                 session.session_id,
                 resumed_owner.agent_instance_id,
                 waiting_recovery_epoch,
             )
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap();
+        assert_eq!(
+            waiting_recovered
+                .iter()
+                .map(|row| row.steer_id)
+                .collect::<Vec<_>>(),
+            vec![steer.steer_id],
+            "recovery attaches the accepted checkpoint even while the continuation is parked on a later question"
         );
         assert!(matches!(
             db.resolve_decision_request(

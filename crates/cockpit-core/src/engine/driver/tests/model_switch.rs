@@ -2264,7 +2264,7 @@ async fn active_frame_tool_surface_refresh_failure_emits_its_own_notice() {
         write_malformed_agent_override(tmp.path(), "builder");
 
         driver
-            .refresh_active_tool_surface_for_turn(active_idx, &tx)
+            .refresh_active_tool_surface_for_turn(active_idx, None, &tx)
             .await;
 
         assert_eq!(

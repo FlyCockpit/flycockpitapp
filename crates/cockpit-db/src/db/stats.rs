@@ -1105,7 +1105,7 @@ mod tests {
     async fn recovery_percentages() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
+        let _ = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
         // 10 calls: 6 clean, 2 recovered (shape_repair), 1 relational
         // (not malformed), 1 hard-fail.
         for _ in 0..6 {
@@ -1113,7 +1113,7 @@ mod tests {
                 &db,
                 sid,
                 "p1",
-                cid,
+                Uuid::new_v4(),
                 "qwen",
                 1000,
                 "builder",
@@ -1129,7 +1129,7 @@ mod tests {
                 &db,
                 sid,
                 "p1",
-                cid,
+                Uuid::new_v4(),
                 "qwen",
                 1000,
                 "builder",
@@ -1152,7 +1152,7 @@ mod tests {
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1167,7 +1167,7 @@ mod tests {
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1216,13 +1216,13 @@ mod tests {
     async fn recovery_by_llm_mode_groups_and_percentages() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
+        let _ = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         tce_with_dims(
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1242,7 +1242,7 @@ mod tests {
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1258,7 +1258,7 @@ mod tests {
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1306,13 +1306,13 @@ mod tests {
     async fn recovery_by_llm_mode_buckets_null_mode_as_unknown() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
+        let _ = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         tce_with_dims(
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1345,14 +1345,14 @@ mod tests {
     async fn recovery_hard_fail_shapes_group_by_mode_tool_fingerprint() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
+        let _ = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         for _ in 0..2 {
             tce_with_dims(
                 &db,
                 sid,
                 "p1",
-                cid,
+                Uuid::new_v4(),
                 "qwen",
                 1000,
                 "builder",
@@ -1369,7 +1369,7 @@ mod tests {
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1385,7 +1385,7 @@ mod tests {
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1433,13 +1433,13 @@ mod tests {
     async fn recovery_hard_fail_shapes_bucket_null_fingerprint() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
+        let _ = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         tce_with_dims(
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1471,14 +1471,14 @@ mod tests {
     async fn recovery_hard_fail_shapes_limited_to_twenty() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
+        let _ = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         for idx in 0..25 {
             tce_with_dims(
                 &db,
                 sid,
                 "p1",
-                cid,
+                Uuid::new_v4(),
                 "qwen",
                 1000,
                 "builder",
@@ -1506,13 +1506,13 @@ mod tests {
     async fn recovery_existing_sections_unchanged_by_new_dimensions() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
+        let _ = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         tce_with_dims(
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1532,7 +1532,7 @@ mod tests {
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1548,7 +1548,7 @@ mod tests {
             &db,
             sid,
             "p1",
-            cid,
+            Uuid::new_v4(),
             "qwen",
             1000,
             "builder",
@@ -1596,7 +1596,7 @@ mod tests {
     async fn language_top8_and_other_folding() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "m", "p", 1000, 1, 1, 0).await;
+        let _ = ic(&db, sid, "p1", "m", "p", 1000, 1, 1, 0).await;
         // 9 distinct languages so one folds into Other. Use descending
         // counts so the fold target is deterministic.
         let langs = [
@@ -1616,7 +1616,7 @@ mod tests {
                     &db,
                     sid,
                     "p1",
-                    cid,
+                    Uuid::new_v4(),
                     "m",
                     1000,
                     "builder",
@@ -1634,7 +1634,7 @@ mod tests {
                 &db,
                 sid,
                 "p1",
-                cid,
+                Uuid::new_v4(),
                 "m",
                 1000,
                 "builder",
@@ -1650,7 +1650,7 @@ mod tests {
                 &db,
                 sid,
                 "p1",
-                cid,
+                Uuid::new_v4(),
                 "m",
                 1000,
                 "builder",
@@ -1816,22 +1816,37 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
         let cid = ic_with_cache_creation(&db, sid, "p1", "m", "p", 1000, 100, 20, 5, 7).await;
-        for tool in ["read", "grep"] {
-            tce(
-                &db,
-                sid,
-                "p1",
-                cid,
-                "m",
-                1000,
-                "builder",
-                tool,
-                Some("a.rs"),
-                Recovery::Clean,
-                false,
-            )
-            .await;
-        }
+        // Schema uniqueness allows one tool event per call_id. The first row
+        // attributes the inference call; a second distinct call_id must not
+        // fan the same tokens out to another role.
+        tce(
+            &db,
+            sid,
+            "p1",
+            cid,
+            "m",
+            1000,
+            "builder",
+            "read",
+            Some("a.rs"),
+            Recovery::Clean,
+            false,
+        )
+        .await;
+        tce(
+            &db,
+            sid,
+            "p1",
+            Uuid::new_v4(),
+            "m",
+            1000,
+            "builder",
+            "grep",
+            Some("a.rs"),
+            Recovery::Clean,
+            false,
+        )
+        .await;
 
         let r = db
             .read(|conn| {

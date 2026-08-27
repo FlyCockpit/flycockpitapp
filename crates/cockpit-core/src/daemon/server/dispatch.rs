@@ -23789,6 +23789,11 @@ pub(super) async fn attach(
     };
     if let Some(max_seq) = replay_max_seq {
         if !history.is_empty() {
+            let max_seq = history
+                .iter()
+                .map(history_entry_seq)
+                .max()
+                .unwrap_or(max_seq);
             state.pending_replay.push(proto::Event::HistoryReplay {
                 session_id,
                 entries: history,
@@ -25545,6 +25550,19 @@ fn agent_decision_settlement_wire(
         crate::agent_tree::DecisionSettlement::Retry => "retry",
     };
     (status.to_string(), decision.state.as_str().to_string())
+}
+
+fn history_entry_seq(entry: &proto::HistoryEntry) -> i64 {
+    match entry {
+        proto::HistoryEntry::InterruptDecision { seq, .. }
+        | proto::HistoryEntry::User { seq, .. }
+        | proto::HistoryEntry::UserNote { seq, .. }
+        | proto::HistoryEntry::Assistant { seq, .. }
+        | proto::HistoryEntry::ToolCall { seq, .. }
+        | proto::HistoryEntry::InferenceError { seq, .. }
+        | proto::HistoryEntry::CompactBoundary { seq, .. }
+        | proto::HistoryEntry::Subagent { seq, .. } => *seq,
+    }
 }
 
 pub(super) fn paused_work_to_proto(

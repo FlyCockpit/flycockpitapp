@@ -88,6 +88,7 @@ async fn emit_org_logging_indicator_via_daemon(client: &ScopedDaemonClient<'_>, 
 async fn enforce_noninteractive_workspace_trust_via_daemon(
     client: &ScopedDaemonClient<'_>,
     cwd: &Path,
+    seed_if_unset: bool,
 ) -> Result<()> {
     let trust_root = crate::config::trust::resolve_trust_root(cwd)?;
     let project_root = trust_root.root.display().to_string();
@@ -106,6 +107,14 @@ async fn enforce_noninteractive_workspace_trust_via_daemon(
             mode: None,
             config_generation,
         } => {
+            if !seed_if_unset {
+                bail!(
+                    "{}",
+                    crate::config::trust::WorkspaceTrustError::Unset {
+                        root: trust_root.root,
+                    }
+                );
+            }
             let set = client
                 .request(crate::daemon::proto::Request::SetWorkspaceTrust {
                     project_root,
@@ -261,12 +270,13 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     } else {
         OwnedSessionMode::AttachOrEphemeral
     };
+    let seed_unset_trust = args.cwd.is_none() && project_alias.is_none();
 
     let result = crate::daemon::client::run_owned_daemon(mode, |client| {
         Box::pin(async move {
             // Preflight via daemon RPCs — the CLI never opens SQLite.
             emit_org_logging_indicator_via_daemon(&client, &cwd).await;
-            enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd)
+            enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd, seed_unset_trust)
                 .await
                 .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
             let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
@@ -442,7 +452,7 @@ pub(crate) async fn attach_send_pump(
         Some(root) => root.to_path_buf(),
         None => std::env::current_dir().context("resolving cwd")?,
     };
-    enforce_noninteractive_workspace_trust_via_daemon(client, &cwd).await?;
+    enforce_noninteractive_workspace_trust_via_daemon(client, &cwd, true).await?;
     let project_root = cwd.to_string_lossy().into_owned();
     let requested_session = options.session;
     let model_override = parse_model_override(options.model_override, requested_session.is_some())?;

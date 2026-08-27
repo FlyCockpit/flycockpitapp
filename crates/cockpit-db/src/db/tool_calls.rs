@@ -861,7 +861,7 @@ mod tests {
         let mk = |tool: &str, ts: i64, hard_fail: bool, recovery: Recovery| ToolCallEvent {
             event_id: Uuid::new_v4(),
             session_id: sid,
-            call_id: "c".into(),
+            call_id: Uuid::new_v4().to_string(),
             parent_call_id: None,
             parent_child_index: None,
             provider_item_id: None,
@@ -983,7 +983,7 @@ mod tests {
         let ev = ToolCallEvent {
             event_id: Uuid::new_v4(),
             session_id: sid,
-            call_id: "c".into(),
+            call_id: Uuid::new_v4().to_string(),
             parent_call_id: None,
             parent_child_index: None,
             provider_item_id: None,
@@ -1037,7 +1037,7 @@ mod tests {
         let mk = |model: &str, fp: Option<&str>, ts: i64| ToolCallEvent {
             event_id: Uuid::new_v4(),
             session_id: sid,
-            call_id: "c".into(),
+            call_id: Uuid::new_v4().to_string(),
             parent_call_id: None,
             parent_child_index: None,
             provider_item_id: None,
@@ -1126,7 +1126,7 @@ mod tests {
         let raw = ToolCallEventRaw {
             event_id: Uuid::new_v4().to_string(),
             session_id: Uuid::new_v4().to_string(),
-            call_id: "c".into(),
+            call_id: Uuid::new_v4().to_string(),
             parent_call_id: None,
             parent_child_index: None,
             provider_item_id: None,

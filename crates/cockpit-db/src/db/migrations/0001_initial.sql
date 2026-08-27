@@ -493,6 +493,11 @@ CREATE TABLE media_ingress_admission_receipts (
     CHECK (width > 0 AND height > 0)
 );
 
+CREATE INDEX idx_media_ingress_publication_intents_session
+    ON media_ingress_publication_intents(session_id);
+CREATE INDEX idx_media_ingress_admission_receipts_session
+    ON media_ingress_admission_receipts(session_id);
+
 CREATE TRIGGER media_attachment_component_compatibility_insert
 BEFORE INSERT ON media_attachment_components
 WHEN NOT EXISTS (
@@ -2145,7 +2150,15 @@ CREATE TABLE needs_attention (
         OR
         (parked_tool IS NOT NULL AND parked_args_json IS NOT NULL AND parked_call_id IS NOT NULL AND parked_resume_json IS NOT NULL)
     ),
-    CHECK (state <> 'executing' OR parked_tool IS NOT NULL),
+    -- Tool-call parks must carry their replay anchor. A linked QuestionTool
+    -- question row may enter `executing` without one: its continuation is the
+    -- question payload, and settlement cannot add parked_* after bind.
+    CHECK (
+        state <> 'executing'
+        OR parked_tool IS NOT NULL
+        OR question_json IS NOT NULL
+        OR questions_json IS NOT NULL
+    ),
     CHECK ((state = 'resolved') = (resolved_at IS NOT NULL)),
     CHECK (state IN ('executing', 'interrupted', 'resolved') OR response_json IS NULL),
     CHECK (state <> 'executing' OR response_json IS NOT NULL),
@@ -2547,8 +2560,8 @@ CREATE TABLE session_events (
         'permission_decision', 'interrupt_decision', 'tool_rejected',
         'primary_swap', 'inference_failure', 'failed_turn_recovery',
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
-        'goal_progress_diagnostic', 'resource_promotion', 'notice', 'agent_tree',
-        'model_switch', 'hook_run', 'tool_call_scheduling'
+        'goal_progress_diagnostic', 'resource_promotion', 'notice',
+        'model_switch', 'hook_run', 'tool_call_scheduling', 'agent_tree'
     )),
     agent       TEXT,                              -- emitting agent, when known
     call_id     TEXT,                              -- correlation key, when applicable

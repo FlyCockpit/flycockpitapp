@@ -24,12 +24,18 @@
 //! can be detected on a per-line basis without buffering. Clients
 //! refuse envelopes whose `v` is outside the supported range.
 
+pub mod acp;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod capability_ceiling;
 pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
+pub use acp::{
+    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpProvenanceV1,
+    AcpForwardedMcpTransportV1, AcpNameValuePairV1, AcpSessionAdmissionMethodV1,
+    ResolveCodeRootInterruptResultV1, ResolveCodeRootInterruptV1,
+};
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,

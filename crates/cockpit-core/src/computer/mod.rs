@@ -17,6 +17,7 @@ pub mod coordinator;
 pub mod frame;
 pub mod guidance;
 pub mod host_identity;
+pub mod live_loop;
 pub mod observation;
 pub mod platform;
 pub mod target;

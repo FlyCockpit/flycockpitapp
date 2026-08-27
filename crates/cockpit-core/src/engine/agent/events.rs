@@ -618,14 +618,6 @@ pub enum TurnEvent {
     /// `Plan`, `/build` → `Build`, `plan.md §4.6.d`). Emitted by the driver
     /// so the client chrome's active-agent slot tracks the new primary.
     PrimarySwapped { name: String },
-    /// The active `llm_mode` was switched live (`/llm-mode`,
-    /// implementation note). The client tracks `mode` so
-    /// its `/llm-mode` toggle + cache-break warning resolve against the
-    /// authoritative current value.
-    LlmModeChanged {
-        mode: crate::config::extended::LlmMode,
-    },
-
     /// A `question` tool raised an interrupt (GOALS §3b): the agent is
     /// blocked until the user answers. The TUI opens the answering
     /// dialog from this; the answer round-trips back to the daemon as

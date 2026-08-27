@@ -2,15 +2,6 @@
 
 use super::*;
 
-fn llm_mode_from_label(value: &str) -> Option<crate::config::extended::LlmMode> {
-    match value {
-        "defensive" => Some(crate::config::extended::LlmMode::Defensive),
-        "normal" => Some(crate::config::extended::LlmMode::Normal),
-        "frontier" => Some(crate::config::extended::LlmMode::Frontier),
-        _ => None,
-    }
-}
-
 impl Session {
     /// Whether any sandboxing mode is active for this session right now.
     /// Kept as a derived helper so native file-tool checks can remain boolean.
@@ -264,37 +255,6 @@ impl Session {
         selection: crate::config::providers::ActiveModelRef,
     ) {
         *self.model_selection.lock().unwrap() = Some(selection);
-    }
-
-    pub fn session_llm_mode_raw(&self) -> Option<String> {
-        self.session_llm_mode.lock().unwrap().clone()
-    }
-
-    pub fn session_llm_mode(&self) -> Option<crate::config::extended::LlmMode> {
-        self.session_llm_mode_raw()
-            .and_then(|mode| llm_mode_from_label(&mode))
-    }
-
-    pub fn set_session_llm_mode(&self, mode: crate::config::extended::LlmMode) -> Result<()> {
-        let raw = mode.as_str().to_string();
-        *self.session_llm_mode.lock().unwrap() = Some(raw.clone());
-        if self.stage_pending_row(|row| {
-            row.session_llm_mode = Some(raw.clone());
-        }) {
-            return Ok(());
-        }
-        let session_id = self.id;
-        self.db
-            .blocking_write_for_sync_maintenance(move |conn| {
-                conn.execute(
-                    "UPDATE sessions SET session_llm_mode = ?1 WHERE session_id = ?2",
-                    params![raw, session_id.to_string()],
-                )
-                .context("setting session llm mode")?;
-                Ok(())
-            })
-            .context("persisting session llm mode")?;
-        Ok(())
     }
 
     pub fn tool_surface_override_json(&self) -> Option<String> {

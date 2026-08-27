@@ -77,8 +77,7 @@ pub fn is_builtin_primary(name: &str) -> bool {
 /// available.
 pub const FALLBACK_PRIMARY: &str = "Build";
 
-/// The builtin primary selected for brand-new default sessions in Defensive
-/// mode.
+/// The shipped single-model-defensive preset primary.
 pub const DEFENSIVE_PRIMARY: &str = "Careful";
 
 /// Resolve the primary agent for a session (issue #75): the mode axis no
@@ -147,7 +146,7 @@ fn def(name: &str, description: &str, mode: AgentMode, tools: &[&str], prompt: &
 }
 
 /// Build an embedded default. `prompt` is the single canonical body (issue
-/// #75: the per-`llm_mode` defensive/normal/frontier body trios are merged
+/// #75: the former per-mode defensive/normal/frontier body trios are merged
 /// into one). The `normal` parameter is retained for call-site compatibility
 /// but is now ignored — the merged `.md` file already carries the canonical
 /// body. Per-model overrides are empty for embedded defaults.
@@ -171,7 +170,7 @@ fn def_with_normal(
     } else {
         Some(builtin_vnext(name, mode))
     };
-    AgentDef {
+    let mut def = AgentDef {
         name: name.to_string(),
         description: description.to_string(),
         mode,
@@ -200,7 +199,7 @@ fn def_with_normal(
 /// Stamp an embedded built-in def with its explicit issue-#75 posture:
 /// capabilities, tool steering, and context policy. This makes agent
 /// definitions the sole policy artifact — no code path resolves posture from
-/// the session-global `LlmMode` for shipped defs.
+/// the session-global steering mode for shipped defs.
 ///
 /// - `Careful` (the shipped single-model-defensive preset): verbose steering,
 ///   60% auto-compact floor, conservative inline caps, no extra capabilities.

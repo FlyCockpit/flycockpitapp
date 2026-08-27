@@ -373,12 +373,6 @@
         "class": "bounded_event",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "llm_mode_changed"
-      },
-      {
-        "class": "bounded_event",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
         "tag": "session_ended"
       },
       {
@@ -1192,18 +1186,6 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "set_agent"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "set_llm_mode"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "set_session_llm_mode"
       },
       {
         "class": "bounded_request_response",

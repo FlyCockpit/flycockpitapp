@@ -19,11 +19,11 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
 
 pub struct TaskTool {
     description: String,
-    /// The explicit, steering [`LlmMode::Defensive`] description, built
+    /// The explicit, steering verbose description, built
     /// from the same subagent list (implementation note).
     verbose_description: String,
     parameters: Value,
-    /// The defensive parameter schema — same shape + `enum` + required set
+    /// The verbose parameter schema — same shape + `enum` + required set
     /// as `parameters`, with explicit parameter descriptions.
     verbose_parameters: Value,
 }
@@ -73,11 +73,11 @@ impl TaskTool {
         let description = format!(
             "Delegate {list}: `intent` plus optional `payload`. @file/@file:XX-YY/@dir/ or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
         );
-        // Defensive (`LlmMode::Defensive`) steering: decompose harder and
+        // Verbose steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
         // in its own context and returns a small report
         // (implementation note). Single-writer +
-        // leaf-termination are unchanged — they hold in every LLM mode.
+        // leaf-termination are unchanged — they hold under every steering.
         let verbose_description = format!(
             "Hand a single, well-scoped piece of work to a subagent ({list}) instead of doing it \
              yourself inline. Prefer this for any non-trivial sub-task: break the work into \

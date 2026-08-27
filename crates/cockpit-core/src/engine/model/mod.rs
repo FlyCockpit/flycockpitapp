@@ -55,7 +55,6 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::extended::LlmMode;
 use crate::config::providers::{ModelPolicyError, RedactedRendering, ResolvedSensitiveModelPolicy};
 use crate::engine::agent::TurnEvent;
 use crate::engine::retry;
@@ -605,9 +604,8 @@ impl Model {
         cfg.route_configured_model_custody(
             provider_id,
             model_id,
-            // Custody never consults harness posture; the reported mode is
-            // diagnostic only and this path has no global posture to report.
-            LlmMode::default(),
+            // Custody never consults harness posture; this path has no
+            // posture to report.
             Arc::new(SessionRedactionRendering::new(session_table)),
         )
     }

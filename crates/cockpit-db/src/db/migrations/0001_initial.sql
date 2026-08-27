@@ -63,7 +63,6 @@ CREATE TABLE sessions (
     ),
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
     active_model_revision INTEGER NOT NULL DEFAULT 0 CHECK (active_model_revision >= 0),
-    session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
     session_entry_mode TEXT NOT NULL DEFAULT 'code'
         CHECK (session_entry_mode IN ('code', 'assistant', 'computer')),
     tool_surface_override_json TEXT CHECK (
@@ -1099,10 +1098,8 @@ CREATE TABLE tool_call_events (
     truncated           INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
     duration_ms         INTEGER,
 
-    -- tool-call mining across versions: CARGO_PKG_VERSION at call time,
-    -- and the LLM steering mode (defensive/normal) at call time.
+    -- tool-call mining across versions: CARGO_PKG_VERSION at call time.
     cockpit_version     TEXT    DEFAULT NULL,
-    llm_mode            TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')),
 
     -- §12 repair shape fingerprint: a short stable hash of the malformed
     -- input shape (tool :: sorted[ instance_path | error_code | expected |
@@ -2295,7 +2292,7 @@ SELECT
     model, provider, project_id, project_root,
     tool, path, language,
     recovery_kind, recovery_stage, hard_fail,
-    llm_mode, shape_fingerprint,
+    shape_fingerprint,
 
     CASE
         WHEN recovery_kind IS NOT NULL
@@ -2580,7 +2577,6 @@ CREATE TABLE session_events (
     origin_principal TEXT,                         -- remote principal attribution
     provider_id TEXT,                              -- authoring model provider id, NULL for model-less events
     model_id TEXT,                                 -- authoring model id, NULL for model-less events
-    llm_mode TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')), -- authoring LLM mode, NULL for model-less events
     model_trust TEXT,                              -- write-time resolved model trust, NULL for model-less events
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );

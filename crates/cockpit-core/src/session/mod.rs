@@ -300,7 +300,6 @@ pub struct Session {
     /// Complete session selection, including invocation preferences that are
     /// not part of the provider/model identity.
     model_selection: Mutex<Option<crate::config::providers::ActiveModelRef>>,
-    session_llm_mode: Mutex<Option<String>>,
     /// Immutable daemon-owned setup metadata. It is never consulted for
     /// agent/model/sandbox/approval authority.
     session_entry_mode: crate::daemon::proto::SessionEntryMode,
@@ -968,7 +967,6 @@ pub struct ToolCallRow {
     pub output: String,
     pub truncated: bool,
     pub duration_ms: u64,
-    pub llm_mode: crate::config::extended::LlmMode,
     /// §12 repair shape-fingerprint (implementation note).
     /// `Some` on a recovered or unrepairable call (the call was malformed),
     /// `None` on a clean call. Persisted so `cockpit debug failed-calls` can

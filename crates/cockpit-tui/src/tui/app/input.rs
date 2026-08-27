@@ -1329,38 +1329,6 @@ impl App {
             }
         }
 
-        if let Some(mut picker) = self.footer_mode_picker {
-            match key.code {
-                KeyCode::Esc => {
-                    self.footer_mode_picker = None;
-                    self.footer_selection = None;
-                    return true;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    picker.prev();
-                    self.footer_mode_picker = Some(picker);
-                    return true;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    picker.next();
-                    self.footer_mode_picker = Some(picker);
-                    return true;
-                }
-                KeyCode::Enter => {
-                    self.footer_mode_picker = None;
-                    self.footer_selection = None;
-                    self.set_footer_llm_mode(picker.selected_mode());
-                    return true;
-                }
-                _ if !is_modifier_only(&key) => {
-                    self.footer_mode_picker = None;
-                    self.footer_selection = None;
-                    return false;
-                }
-                _ => return true,
-            }
-        }
-
         let Some(selected) = self.footer_selection else {
             return false;
         };
@@ -2782,8 +2750,11 @@ impl App {
         let quoted = cockpit_core::tags::quote_tracked_tags(&paste_wire, &self.accepted_tags);
         let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
-        let tag_policy =
-            cockpit_core::tags::TagPolicy::new_for_mode(&self.launch.cwd, allow, self.llm_mode);
+        let tag_policy = cockpit_core::tags::TagPolicy::new_for_caps(
+            &self.launch.cwd,
+            allow,
+            cockpit_core::tags::TagInlineCaps::STANDARD,
+        );
         let expanded = cockpit_core::tags::expand_tags_with_policy(&quoted, &tag_policy);
         // Attach any buffered `/git` blocks to this message's wire text
         // (GOALS §1l). The displayed user message keeps the original

@@ -2479,36 +2479,6 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "mode:option<enum16:LlmMode>",
-      "fcorRoles": [
-        {
-          "field": "mode",
-          "role": "param",
-          "type": "Option<LlmMode>"
-        }
-      ],
-      "fcorSchema": "mode:Option<LlmMode>",
-      "strategy": "nonrepeatable_dispatch",
-      "tag": "set_llm_mode"
-    },
-    {
-      "class": "idempotent_adapter_mutation",
-      "evidence": "desired_state_generation_and_observed_digest",
-      "fcorCanonicalSchema": "mode:enum16:LlmMode",
-      "fcorRoles": [
-        {
-          "field": "mode",
-          "role": "param",
-          "type": "LlmMode"
-        }
-      ],
-      "fcorSchema": "mode:LlmMode",
-      "strategy": "durable_desired_state",
-      "tag": "set_session_llm_mode"
-    },
-    {
-      "class": "nonrepeatable_mutation",
-      "evidence": null,
       "fcorCanonicalSchema": "override_json:string|persist_session:bool|prune_after_switch:bool|monty_nudge:option<string>",
       "fcorRoles": [
         {

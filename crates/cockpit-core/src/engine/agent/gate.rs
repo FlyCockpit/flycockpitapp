@@ -565,7 +565,7 @@ mod safety_gate_tests {
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session: Arc::new(session),
             cwd: root.to_path_buf(),

@@ -877,14 +877,13 @@ pub struct ToolCtx {
     /// model-visible arguments. `bash` may echo it in sandbox failure text so
     /// the model can call `escalate` with the required id.
     pub current_tool_call_id: Option<String>,
-    /// The active LLM-mode of the calling agent. Read by tools that vary
-    /// *behavior* (not just description prose) on the defensive/normal axis —
-    /// today only `bash`, which appends a defensive-mode-only file/search
-    /// routing nudge to its result body
-    /// (implementation note). Mirrors
-    /// `agent.llm_mode` at the dispatch site; `Normal` in test/headless
-    /// contexts so the nudge is silent there.
-    pub llm_mode: crate::config::extended::LlmMode,
+    /// The tool-description steering of the calling agent (issue #75). Read
+    /// by tools that vary *behavior* (not just description prose) on the
+    /// verbose/terse axis — today only `bash`, which appends a
+    /// verbose-steering-only file/search routing nudge to its result body
+    /// (implementation note). Mirrors `agent.tool_steering` at the dispatch
+    /// site; `Terse` in test/headless contexts so the nudge is silent there.
+    pub tool_steering: crate::agents::ToolSteering,
     pub locks: Arc<crate::locks::LockManager>,
     pub session: Arc<crate::session::Session>,
     pub cwd: std::path::PathBuf,
@@ -1084,55 +1083,36 @@ pub fn definition_of(
 /// [`definition_of`] above is the *description-verbosity* seam — it changes
 /// how a tool's schema reads, never what the engine will accept. This is the
 /// separate **behavioral** seam: a real capability check the engine consults
-/// before *acting*, so a mode can disable a feature outright rather than just
+/// before *acting*, so a def can disable a feature outright rather than just
 /// rewording its prose. [`Capability::enabled`] is the single predicate; the
 /// engine calls it at the point of action (e.g. before minting a re-query
 /// handle or honoring a `resume_handle`/`seed`), so a disabled capability is
 /// rejected/inert regardless of what the model asked for.
-///
-/// [`LlmMode`]: crate::config::extended::LlmMode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     /// Re-queryable read-only noninteractive subagents + seeded tool calls
     /// (GOALS §3c): the follow-up handle, `resume_handle` rehydration, and
-    /// `seed` injection. Available outside defensive mode.
+    /// `seed` injection. Available only to agent defs that grant it.
     FollowupSeed,
-    /// Explicit sandbox escalation reruns. Available only to stronger modes;
-    /// defensive mode gets the separate human-offer path instead.
+    /// Explicit sandbox escalation reruns. Available only to agent defs that
+    /// grant it; the conservative `Careful`/`standard` posture gets the
+    /// separate human-offer path instead.
     SandboxEscalate,
     /// Forking the delegating agent's transcript into a noninteractive child.
-    /// Available only to frontier mode.
+    /// Available only to agent defs that grant it.
     ForkContext,
     /// Parallel write-capable task fan-out in one worktree with hard scoped
-    /// write confinement. Available only to frontier mode.
+    /// write confinement. Available only to agent defs that grant it.
     ScopedParallelWrite,
 }
 
 impl Capability {
-    /// Whether this capability is available under `posture` (issue #75).
-    /// When the posture carries a declared grant set, membership decides;
-    /// otherwise the legacy [`LlmMode`] gate applies (Stage 2 fallback).
-    /// Disabled capabilities are gated at the engine's point of action, not
-    /// merely hidden in description text.
+    /// Whether this capability is available under `posture` (issue #75):
+    /// membership in the agent def's resolved grant set decides. Disabled
+    /// capabilities are gated at the engine's point of action, not merely
+    /// hidden in description text.
     pub fn enabled(self, posture: &crate::agents::PostureResolution) -> bool {
         posture.capability_enabled(self)
-    }
-
-    /// The legacy mode gate, retained as the not-yet-declared fallback. Once
-    /// Stage 5 closes the ratchet this is reachable only through
-    /// [`PostureResolution::legacy`].
-    pub fn enabled_for_mode(self, mode: crate::config::extended::LlmMode) -> bool {
-        use crate::config::extended::LlmMode;
-        match self {
-            // Follow-up/seed is a stronger-model affordance: the weak-model
-            // (defensive) target re-spawns cold instead (GOALS §3c).
-            Capability::FollowupSeed | Capability::SandboxEscalate => {
-                matches!(mode, LlmMode::Normal | LlmMode::Frontier)
-            }
-            Capability::ForkContext | Capability::ScopedParallelWrite => {
-                matches!(mode, LlmMode::Frontier)
-            }
-        }
     }
 }
 

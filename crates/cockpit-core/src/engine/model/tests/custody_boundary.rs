@@ -23,8 +23,6 @@ use crate::config::providers::{
 use crate::engine::model::Model;
 use crate::redact::RedactionTable;
 
-use crate::config::extended::LlmMode;
-
 const SECRET: &str = "sk-live-custody-boundary-secret";
 const PLACEHOLDER: &str = "[custody-redacted]";
 
@@ -36,13 +34,12 @@ fn secret_table() -> Arc<RedactionTable> {
     )
 }
 
-/// A keyless OpenAI-compatible provider carrying an explicit trust *and* an
-/// explicit mode, so every assertion below is made with both dimensions set.
-fn provider(trust: ModelTrust, mode: LlmMode) -> ProviderEntry {
+/// A keyless OpenAI-compatible provider carrying an explicit trust, so every
+/// assertion below is made with the trust dimension set.
+fn provider(trust: ModelTrust) -> ProviderEntry {
     ProviderEntry {
         url: "http://127.0.0.1:1/v1".into(),
         trust: Some(trust),
-        mode: Some(mode),
         models: vec![ModelEntry {
             id: "m".into(),
             subagent_invokable: Some(true),
@@ -52,12 +49,12 @@ fn provider(trust: ModelTrust, mode: LlmMode) -> ProviderEntry {
     }
 }
 
-fn config(mode: LlmMode) -> ProvidersConfig {
+fn config() -> ProvidersConfig {
     let mut cfg = ProvidersConfig::default();
     cfg.providers
-        .insert("selfhosted".into(), provider(ModelTrust::Trusted, mode));
+        .insert("selfhosted".into(), provider(ModelTrust::Trusted));
     cfg.providers
-        .insert("cloud".into(), provider(ModelTrust::Untrusted, mode));
+        .insert("cloud".into(), provider(ModelTrust::Untrusted));
     cfg
 }
 
@@ -78,56 +75,51 @@ fn active(provider: &str) -> ActiveModelRef {
 ///
 /// Trusted (self-hosted / no-log) keeps raw content — that is the supported
 /// outcome, not a leak. Untrusted (cloud, may retain logs) is always redacted.
-/// Both hold for every harness posture: custody never reads mode.
 #[test]
 fn model_policy_custody_requirements_are_type_enforced_on_the_active_model_path() {
-    for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        let mut cfg = config(mode);
+    let mut cfg = config();
 
-        cfg.active_model = Some(active("cloud"));
-        let untrusted = Model::from_config_with_env(&cfg, secret_table(), |_| Some("k".into()))
-            .expect("keyless openai-compat build");
-        assert!(
-            !untrusted.redact_table().scrub(SECRET).contains(SECRET),
-            "{mode:?}: an untrusted active model must always receive a redacted rendering"
-        );
+    cfg.active_model = Some(active("cloud"));
+    let untrusted = Model::from_config_with_env(&cfg, secret_table(), |_| Some("k".into()))
+        .expect("keyless openai-compat build");
+    assert!(
+        !untrusted.redact_table().scrub(SECRET).contains(SECRET),
+        "an untrusted active model must always receive a redacted rendering"
+    );
 
-        cfg.active_model = Some(active("selfhosted"));
-        let trusted = Model::from_config_with_env(&cfg, secret_table(), |_| Some("k".into()))
-            .expect("keyless openai-compat build");
-        assert_eq!(
-            trusted.redact_table().scrub(SECRET),
-            SECRET,
-            "{mode:?}: a trusted active model's raw custody must survive the custody route"
-        );
-    }
+    cfg.active_model = Some(active("selfhosted"));
+    let trusted = Model::from_config_with_env(&cfg, secret_table(), |_| Some("k".into()))
+        .expect("keyless openai-compat build");
+    assert_eq!(
+        trusted.redact_table().scrub(SECRET),
+        SECRET,
+        "a trusted active model's raw custody must survive the custody route"
+    );
 }
 
 /// AC4, configured utility/background path. `for_provider` bypasses active-model
 /// selection but is not thereby exempt: it routes custody the same way.
 #[test]
 fn model_policy_custody_requirements_are_type_enforced_on_the_utility_model_path() {
-    for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        let cfg = config(mode);
+    let cfg = config();
 
-        let untrusted =
-            Model::for_provider_with_env(&cfg, "cloud", "m", secret_table(), |_| Some("k".into()))
-                .expect("keyless openai-compat build");
-        assert!(
-            !untrusted.redact_table().scrub(SECRET).contains(SECRET),
-            "{mode:?}: an untrusted utility target must always receive a redacted rendering"
-        );
+    let untrusted =
+        Model::for_provider_with_env(&cfg, "cloud", "m", secret_table(), |_| Some("k".into()))
+            .expect("keyless openai-compat build");
+    assert!(
+        !untrusted.redact_table().scrub(SECRET).contains(SECRET),
+        "an untrusted utility target must always receive a redacted rendering"
+    );
 
-        let trusted = Model::for_provider_with_env(&cfg, "selfhosted", "m", secret_table(), |_| {
-            Some("k".into())
-        })
-        .expect("keyless openai-compat build");
-        assert_eq!(
-            trusted.redact_table().scrub(SECRET),
-            SECRET,
-            "{mode:?}: a trusted utility target keeps raw custody"
-        );
-    }
+    let trusted = Model::for_provider_with_env(&cfg, "selfhosted", "m", secret_table(), |_| {
+        Some("k".into())
+    })
+    .expect("keyless openai-compat build");
+    assert_eq!(
+        trusted.redact_table().scrub(SECRET),
+        SECRET,
+        "a trusted utility target keeps raw custody"
+    );
 }
 
 /// The grant is destination-bound. A completed trusted selection for one target
@@ -137,7 +129,7 @@ fn model_policy_custody_requirements_are_type_enforced_on_the_utility_model_path
 /// reusing the result.
 #[test]
 fn raw_custody_requires_a_grant_minted_for_this_exact_target() {
-    let mut cfg = config(LlmMode::Normal);
+    let mut cfg = config();
     // A second trusted model on the same provider: the provider class matches,
     // only the model id differs.
     cfg.providers
@@ -180,7 +172,7 @@ fn raw_custody_requires_a_grant_minted_for_this_exact_target() {
 /// enforced.
 #[test]
 fn an_untrusted_route_never_releases_raw_bytes() {
-    let cfg = config(LlmMode::Frontier);
+    let cfg = config();
     let table = secret_table();
     let route = Model::configured_custody_route(&cfg, "cloud", "m", &table)
         .expect("a configured untrusted target routes");
@@ -201,7 +193,7 @@ fn an_untrusted_route_never_releases_raw_bytes() {
 /// pins the opposite.
 #[test]
 fn an_unroutable_configured_target_falls_closed_to_redacted() {
-    let cfg = config(LlmMode::Normal);
+    let cfg = config();
     let table = secret_table();
 
     assert!(
@@ -256,7 +248,7 @@ fn the_redaction_opt_out_still_collects_a_real_table() {
     let origins = table.entries_for_debug();
     assert!(
         origins.iter().any(|origin| origin.contains("API_KEY")),
-        "the opt-out must not skip collection: the dotenv secret must be in the table; \
+        "the opt-out must not skip collection: the dotenv secret **** be in the table; \
          origins: {origins:?}"
     );
     assert_eq!(
@@ -277,35 +269,33 @@ fn the_redaction_opt_out_still_collects_a_real_table() {
 /// exception, and a global config flag is enough to open it.
 #[test]
 fn an_untrusted_route_redacts_even_when_redaction_is_disabled_in_config() {
-    for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        let mut cfg = config(mode);
-        let (_tmp, table) = disabled_config_table();
+    let mut cfg = config();
+    let (_tmp, table) = disabled_config_table();
 
-        let route = Model::configured_custody_route(&cfg, "cloud", "m", &table)
-            .expect("a configured untrusted target routes");
-        assert!(
-            !Model::effective_redact_table_for(&route, "cloud", "m", table.clone())
-                .scrub(SECRET)
-                .contains(SECRET),
-            "{mode:?}: the config opt-out must not reach an untrusted route"
-        );
+    let route = Model::configured_custody_route(&cfg, "cloud", "m", &table)
+        .expect("a configured untrusted target routes");
+    assert!(
+        !Model::effective_redact_table_for(&route, "cloud", "m", table.clone())
+            .scrub(SECRET)
+            .contains(SECRET),
+        "the config opt-out must not reach an untrusted route"
+    );
 
-        // ...and on the two real construction paths, not just the chokepoint.
-        cfg.active_model = Some(active("cloud"));
-        let untrusted = Model::from_config_with_env(&cfg, table.clone(), |_| Some("k".into()))
-            .expect("keyless openai-compat build");
-        assert!(
-            !untrusted.redact_table().scrub(SECRET).contains(SECRET),
-            "{mode:?}: untrusted active model leaked the secret with redaction disabled"
-        );
+    // ...and on the two real construction paths, not just the chokepoint.
+    cfg.active_model = Some(active("cloud"));
+    let untrusted = Model::from_config_with_env(&cfg, table.clone(), |_| Some("k".into()))
+        .expect("keyless openai-compat build");
+    assert!(
+        !untrusted.redact_table().scrub(SECRET).contains(SECRET),
+        "untrusted active model leaked the secret with redaction disabled"
+    );
 
-        let utility = Model::for_provider_with_env(&cfg, "cloud", "m", table, |_| Some("k".into()))
-            .expect("keyless openai-compat build");
-        assert!(
-            !utility.redact_table().scrub(SECRET).contains(SECRET),
-            "{mode:?}: untrusted utility target leaked the secret with redaction disabled"
-        );
-    }
+    let utility = Model::for_provider_with_env(&cfg, "cloud", "m", table, |_| Some("k".into()))
+        .expect("keyless openai-compat build");
+    assert!(
+        !utility.redact_table().scrub(SECRET).contains(SECRET),
+        "untrusted utility target leaked the secret with redaction disabled"
+    );
 }
 
 /// The other direction of the same decision: the opt-out is still honored where
@@ -315,59 +305,32 @@ fn an_untrusted_route_redacts_even_when_redaction_is_disabled_in_config() {
 /// above would have silently removed the opt-out entirely.
 #[test]
 fn a_trusted_route_still_receives_raw_when_redaction_is_disabled_in_config() {
-    for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        let mut cfg = config(mode);
-        let (_tmp, table) = disabled_config_table();
+    let mut cfg = config();
+    let (_tmp, table) = disabled_config_table();
 
-        let route = Model::configured_custody_route(&cfg, "selfhosted", "m", &table)
-            .expect("a configured trusted target routes");
-        assert_eq!(
-            Model::effective_redact_table_for(&route, "selfhosted", "m", table.clone())
-                .scrub(SECRET),
-            SECRET,
-            "{mode:?}: a trusted route must still honor the redaction opt-out"
-        );
+    let route = Model::configured_custody_route(&cfg, "selfhosted", "m", &table)
+        .expect("a configured trusted target routes");
+    assert_eq!(
+        Model::effective_redact_table_for(&route, "selfhosted", "m", table.clone()).scrub(SECRET),
+        SECRET,
+        "a trusted route must still honor the redaction opt-out"
+    );
 
-        cfg.active_model = Some(active("selfhosted"));
-        let trusted = Model::from_config_with_env(&cfg, table.clone(), |_| Some("k".into()))
+    cfg.active_model = Some(active("selfhosted"));
+    let trusted = Model::from_config_with_env(&cfg, table.clone(), |_| Some("k".into()))
+        .expect("keyless openai-compat build");
+    assert_eq!(
+        trusted.redact_table().scrub(SECRET),
+        SECRET,
+        "trusted active model must receive raw content"
+    );
+
+    let utility =
+        Model::for_provider_with_env(&cfg, "selfhosted", "m", table, |_| Some("k".into()))
             .expect("keyless openai-compat build");
-        assert_eq!(
-            trusted.redact_table().scrub(SECRET),
-            SECRET,
-            "{mode:?}: trusted active model must receive raw content"
-        );
-
-        let utility =
-            Model::for_provider_with_env(&cfg, "selfhosted", "m", table, |_| Some("k".into()))
-                .expect("keyless openai-compat build");
-        assert_eq!(
-            utility.redact_table().scrub(SECRET),
-            SECRET,
-            "{mode:?}: trusted utility target must receive raw content"
-        );
-    }
-}
-
-/// Custody is orthogonal to posture on the construction path too: the same
-/// target resolves the same custody class under every harness mode, and mode
-/// alone never moves a model between raw and redacted.
-#[test]
-fn configured_custody_is_identical_across_every_harness_mode() {
-    let table = secret_table();
-    for target in ["selfhosted", "cloud"] {
-        let mut classes = Vec::new();
-        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            let cfg = config(mode);
-            let route = Model::configured_custody_route(&cfg, target, "m", &table).unwrap();
-            classes.push((
-                route.custody,
-                route.trusted_custody_grant().is_some(),
-                Model::effective_redact_table_for(&route, target, "m", table.clone()).scrub(SECRET),
-            ));
-        }
-        assert!(
-            classes.windows(2).all(|w| w[0] == w[1]),
-            "{target}: harness posture must not change custody or redaction: {classes:?}"
-        );
-    }
+    assert_eq!(
+        utility.redact_table().scrub(SECRET),
+        SECRET,
+        "trusted utility target must receive raw content"
+    );
 }

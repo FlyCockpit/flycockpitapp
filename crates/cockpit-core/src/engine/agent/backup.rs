@@ -220,23 +220,16 @@ pub async fn turn_with_backup(
         };
         // Every dispatched target renders ITS OWN effective posture AND its own
         // model-specific system context. The primary (attempt 0) already carries
-        // both; each failover/backup candidate is a DIFFERENT model (and may
-        // resolve a different effective mode), so re-render this child's
-        // model-dependent surface (model-specific composed system + role body +
-        // tool schemas/descriptions + `llm_mode`) for the candidate before the
-        // turn. The toolbox (and any grants) is preserved intact — only its
-        // rendering switches.
+        // both; each failover/backup candidate is a DIFFERENT model, so re-render
+        // this child's model-dependent surface (model-specific composed system +
+        // role body + tool schemas/descriptions + tool steering) for the
+        // candidate before the turn. The toolbox (and any grants) is preserved
+        // intact — only its rendering switches.
         let repostured: Option<Agent> = if let Some(i) = current {
             let candidate_arc: &Arc<Model> = candidates[i];
-            let candidate_mode = config.providers().resolve_mode(
-                candidate_arc.provider_id(),
-                candidate_arc.model_id_ref(),
-                config.extended().llm_mode,
-            );
             match crate::engine::builtin::reposture_agent_for_candidate(
                 agent,
                 candidate_arc,
-                candidate_mode,
                 &session,
                 &cwd,
                 &session.db,
@@ -1346,7 +1339,8 @@ mod backup_fallback_tests {
             model,
             params: ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
             context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,

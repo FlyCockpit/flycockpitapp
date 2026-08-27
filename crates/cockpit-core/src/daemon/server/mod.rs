@@ -899,10 +899,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             done: _,
             total: _,
         }
-        | proto::Event::LlmModeChanged {
-            session_id: _,
-            mode: _,
-        }
         // Redacted LOCAL image-control `config_changed` event. Its change set
         // carries only the `cockpit_proto::image_control` safe projections
         // (every secret-bearing field — credential_ref/headers/graph_json/

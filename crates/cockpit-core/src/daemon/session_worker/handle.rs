@@ -2201,16 +2201,6 @@ pub enum SessionWork {
     SetAgent {
         name: String,
     },
-    /// Switch the active `llm_mode` live (`/llm-mode`,
-    /// implementation note). `mode = None` toggles.
-    SetLlmMode {
-        mode: Option<crate::config::extended::LlmMode>,
-    },
-    /// Switch LLM mode for this session only (`/quick`). Does not persist
-    /// `llm_mode`.
-    SetSessionLlmMode {
-        mode: crate::config::extended::LlmMode,
-    },
     SetToolSurfaceOverride {
         override_json: String,
         persist_session: bool,

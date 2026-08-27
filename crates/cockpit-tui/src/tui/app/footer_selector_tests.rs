@@ -1,11 +1,10 @@
 use super::{
-    App, FooterAgentPicker, FooterHitArea, FooterModePicker, FooterPickerKind, FooterPickerRowHit,
-    HistoryEntry, Overlay,
+    App, FooterAgentPicker, FooterHitArea, FooterPickerKind, FooterPickerRowHit, HistoryEntry,
+    Overlay,
 };
 use crate::tui::agent_runner::{AgentRunner, ControlRequest};
 use crate::tui::settings::Dialog;
 use cockpit_client::presentation::{ControlRequestId, ControlRequestOutcome, TurnEvent};
-use cockpit_config::extended::LlmMode;
 use cockpit_proto::Request;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
@@ -62,25 +61,6 @@ fn write_model_config(root: &std::path::Path) {
     .unwrap();
 }
 
-fn write_favorite_model_config(root: &std::path::Path) {
-    let cockpit = root.join(".cockpit");
-    fs::create_dir_all(&cockpit).unwrap();
-    let config_path = cockpit.join("config.json");
-    fs::write(
-        &config_path,
-        r#"{"active_model":{"provider":"p","model":"a"}}"#,
-    )
-    .unwrap();
-    let provider_path =
-        cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
-    fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
-    fs::write(
-        provider_path,
-        r#"{"url":"https://example.test","models":[{"id":"a","favorite":true},{"id":"b","favorite":true}]}"#,
-    )
-    .unwrap();
-}
-
 fn plain_lines(app: &App) -> Vec<&str> {
     app.history
         .iter()
@@ -107,49 +87,6 @@ fn footer_enter_opens_selector_for_each_axis() {
     app.footer_selection = Some(crate::tui::chrome::FooterControl::Model);
     app.handle_key(press(KeyCode::Enter));
     assert!(matches!(app.overlay, Overlay::ModelPicker(_)));
-}
-
-#[test]
-fn quick_dialog_space_stages_without_daemon_request_enter_commits() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    write_favorite_model_config(tmp.path());
-    let (mut app, mut rx) = app_with_runner(&tmp);
-    let config_path = tmp.path().join(".cockpit").join("config.json");
-    let before = fs::read_to_string(&config_path).unwrap();
-
-    app.open_quick_dialog();
-    assert!(matches!(app.overlay, Overlay::Quick(_)));
-
-    // Mode tab opens on the current defensive row. Move to normal and
-    // stage it locally; no request should be sent until Enter.
-    app.handle_key(press(KeyCode::Up));
-    app.handle_key(press(KeyCode::Char(' ')));
-    assert!(
-        rx.try_recv().is_err(),
-        "Space must not send daemon requests"
-    );
-    assert!(
-        matches!(app.overlay, Overlay::Quick(_)),
-        "Space keeps the dialog open"
-    );
-
-    app.handle_key(press(KeyCode::Enter));
-    assert!(
-        !matches!(app.overlay, Overlay::Quick(_)),
-        "Enter closes after commit"
-    );
-    match rx.try_recv().expect("quick commit sends a request").request {
-        Request::SetSessionLlmMode { mode } => {
-            assert_eq!(mode, cockpit_config::extended::LlmMode::Normal);
-        }
-        other => panic!("expected session-only LLM mode request, got {other:?}"),
-    }
-    assert_eq!(
-        fs::read_to_string(&config_path).unwrap(),
-        before,
-        "/quick must not write config defaults"
-    );
 }
 
 #[test]
@@ -195,30 +132,6 @@ fn agent_picker_mouse_row_commits_through_set_agent() {
     assert!(matches!(
         control_rx.try_recv().unwrap().request,
         Request::SetAgent { name } if name == "Build"
-    ));
-}
-
-#[test]
-fn mode_picker_mouse_row_commits_through_llm_mode_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (mut app, mut control_rx) = app_with_runner(&tmp);
-    app.mouse_capture = true;
-    app.llm_mode = LlmMode::Normal;
-    app.footer_mode_picker = Some(FooterModePicker::new(LlmMode::Normal));
-    app.footer_picker_row_hits = vec![FooterPickerRowHit {
-        kind: FooterPickerKind::Mode,
-        index: 2,
-        rect: Rect::new(0, 5, 20, 1),
-    }];
-
-    app.handle_mouse(click(1, 5));
-
-    assert!(app.footer_mode_picker.is_none());
-    assert!(matches!(
-        control_rx.try_recv().unwrap().request,
-        Request::SetLlmMode {
-            mode: Some(LlmMode::Frontier)
-        }
     ));
 }
 

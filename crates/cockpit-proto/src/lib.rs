@@ -79,7 +79,7 @@ pub use session_setup::{
 pub mod session_override;
 pub use session_override::{
     AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
-    AgentModeControlV1, AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
+    AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
     AgentSandboxControlV1, AgentSessionOverrideFieldV1, AgentSessionOverrideStatusV1,
     AgentVerificationControlV1, AgentVerificationReductionV1, AgentVerificationRegionV1,
 };
@@ -2411,7 +2411,7 @@ pub struct LiveStatus {
 
 #[allow(unused_imports)]
 pub use cockpit_config::{
-    config::extended::{ApprovalMode, LlmMode},
+    config::extended::ApprovalMode,
     config::providers::{ActiveModelRef, PromptCacheRetention, ThinkingMode},
     config::sandbox_mode::SandboxMode,
 };

@@ -236,13 +236,3 @@ pub(super) fn update_live_foreground(
 pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig) -> &'static str {
     cfg.default_primary_agent.agent_name()
 }
-
-pub(crate) fn initial_active_agent_for_llm_mode(
-    cfg: &crate::config::extended::ExtendedConfig,
-    _llm_mode: crate::config::extended::LlmMode,
-) -> String {
-    // Issue #75: the mode axis no longer selects the primary; the configured
-    // default (`defaultPrimaryAgent`) governs. The `_llm_mode` parameter is
-    // retained for call-site stability until Stage 7 removes the mode entirely.
-    crate::agents::resolve_primary(None, initial_active_agent(cfg))
-}

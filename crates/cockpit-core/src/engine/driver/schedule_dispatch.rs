@@ -548,7 +548,6 @@ impl Driver {
                     output: row.output,
                     truncated: false,
                     duration_ms: row.duration_ms,
-                    llm_mode: row.llm_mode,
                     // The schedule meta-tool's fixed minimal-schema repair fingerprint is not
                     // threaded through `ScheduleToolCallRecord`; the §12 fingerprint telemetry
                     // covers the per-tool dispatch path.

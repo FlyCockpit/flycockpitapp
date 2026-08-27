@@ -64,7 +64,6 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Sleep};
 
-use crate::config::extended::LlmMode;
 use crate::engine::agent::{
     Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome, turn_with_backup,
 };
@@ -201,23 +200,6 @@ pub enum DriverControl {
     /// the foreground (stack depth > 1) or the name is already active.
     SwapPrimary {
         name: String,
-    },
-    /// Switch the active `llm_mode` live (`/llm-mode`,
-    /// implementation note). Rebuilds the root-frame
-    /// agent so its tool-description verbosity + per-mode prompt re-render;
-    /// busts the cached system prefix (the TUI shows the cache-break warning
-    /// via the shared helper, suppressed on a no-cache provider). Root
-    /// history is preserved — same conversation, new steering. When
-    /// `prune_after_switch` is true, the successful rebuild immediately runs
-    /// through the ordinary prune path so stale mode-specific tool text is not
-    /// retained. A no-op when an interactive subagent holds the foreground or
-    /// the mode is unchanged.
-    /// `mode = None` toggles against the driver's authoritative current value
-    /// (the `/llm-mode` / `toggle` default action); `Some(_)` sets it
-    /// explicitly.
-    SetLlmMode {
-        mode: Option<crate::config::extended::LlmMode>,
-        prune_after_switch: bool,
     },
     /// Replace the root agent's session-scoped tool surface. Applied only at
     /// idle while the root frame is foreground; refused while an interactive
@@ -668,7 +650,6 @@ struct ScheduleDispatch {
 
 struct ScheduleToolCallRecord {
     agent: String,
-    llm_mode: crate::config::extended::LlmMode,
     call_id: String,
     provider_item_id: Option<String>,
     provider_call_id: Option<String>,
@@ -774,11 +755,9 @@ impl Drop for InvocationApprovalGuard {
 }
 
 /// Per-node session-override axes consumed at a turn boundary that apply to the
-/// active frame (modes AC5). `None` fields keep the config-resolved values.
+/// active frame. `None` fields keep the config-resolved values.
 #[derive(Default)]
 struct ConsumedNodeOverride {
-    /// Non-escalating LLM mode for this frame's next turn.
-    llm_mode: Option<crate::config::extended::LlmMode>,
     /// Daemon-validated `(provider, model)` rebind for this frame's next turn.
     model: Option<(String, String)>,
 }
@@ -2176,8 +2155,7 @@ impl Driver {
         let initial_tools = root.tools.clone();
         session.set_active_tool_names(
             initial_tools.names(),
-            crate::engine::tool::Capability::SandboxEscalate
-                .enabled(&crate::agents::PostureResolution::legacy(root.llm_mode)),
+            crate::engine::tool::Capability::SandboxEscalate.enabled(&root.posture),
         );
         Self {
             session,
@@ -2458,10 +2436,6 @@ impl Driver {
             self.session.set_sandbox_mode(sandbox);
         }
         ConsumedNodeOverride {
-            llm_mode: effective
-                .llm_mode
-                .as_deref()
-                .and_then(crate::daemon::agent_session_override::mode_from_label),
             model: effective
                 .model
                 .map(|binding| (binding.provider, binding.model)),
@@ -2471,11 +2445,10 @@ impl Driver {
     async fn refresh_active_model_for_turn(
         &mut self,
         active_idx: usize,
-        // Per-node session override axes consumed at this turn boundary (modes
-        // AC5): when present they replace the config-resolved model/mode for THIS
-        // frame only, so an ancestor or sibling frame is never affected. The
-        // daemon already authorized them (non-escalating mode; hard-compatible
-        // model).
+        // Per-node session override axes consumed at this turn boundary: when
+        // present they replace the config-resolved model for THIS frame only,
+        // so an ancestor or sibling frame is never affected. The daemon
+        // already authorized the hard-compatible model rebind.
         consumed: ConsumedNodeOverride,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Option<Arc<crate::engine::model::Model>> {
@@ -2489,26 +2462,18 @@ impl Driver {
                 running.model_id_ref().to_string(),
             ),
         };
-        let old_llm_mode = self.stack[active_idx].agent.llm_mode;
         match self.build_live_model_for_running(&running, &provider, &model) {
             Ok(new_model) => {
-                let llm_mode = consumed
-                    .llm_mode
-                    .unwrap_or_else(|| self.effective_llm_mode_for(&provider, &model));
                 let new_model = Arc::new(new_model);
                 // Pin the rebound model so the subsequent tool-surface rebuild
-                // cannot let a frontmatter `model:` revert it (modes AC5). Only
-                // pinned when this frame actually carries a model override.
+                // cannot let a frontmatter `model:` revert it. Only pinned when
+                // this frame actually carries a model override.
                 let model_pin = consumed.model.is_some().then(|| new_model.clone());
                 let selection = self.active_selection_for_model(&new_model);
-                let refreshed =
-                    self.replace_frame_model(active_idx, new_model, llm_mode, &selection);
+                let refreshed = self.replace_frame_model(active_idx, new_model, &selection);
                 self.stack[active_idx].agent = Arc::new(refreshed);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
-                if old_llm_mode != llm_mode {
-                    let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
-                }
                 self.active_model_refresh_failure_notice = None;
                 model_pin
             }
@@ -2546,12 +2511,10 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) {
         let model = self.stack[active_idx].agent.model.clone();
-        let llm_mode = self.stack[active_idx].agent.llm_mode;
         let selection = self.active_selection_for_model(&model);
         match self.try_rebuild_frame_with_model(
             active_idx,
             model.clone(),
-            llm_mode,
             &selection,
             model_pin.clone(),
         ) {
@@ -2563,8 +2526,8 @@ impl Driver {
             }
             Err(e) if active_idx == 0 => {
                 tracing::warn!(error = %e, "refreshing root tool surface from config fell back to default Build");
-                let rebuilt = self
-                    .rebuild_frame_with_model(active_idx, model, llm_mode, &selection, model_pin);
+                let rebuilt =
+                    self.rebuild_frame_with_model(active_idx, model, &selection, model_pin);
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
@@ -3304,9 +3267,7 @@ impl Driver {
             .await;
             self.session.set_active_tool_names(
                 tools.names(),
-                crate::engine::tool::Capability::SandboxEscalate.enabled(
-                    &crate::agents::PostureResolution::legacy(frame.agent.llm_mode),
-                ),
+                crate::engine::tool::Capability::SandboxEscalate.enabled(&frame.agent.posture),
             );
         }
     }
@@ -3970,7 +3931,7 @@ impl Driver {
             lock_identity: agent.name.clone().clone(),
             write_scope: None,
             current_tool_call_id: None,
-            llm_mode: agent.llm_mode,
+            tool_steering: agent.tool_steering,
             locks: self.locks.clone(),
             session: self.session.clone(),
             cwd: self.cwd.clone(),
@@ -5316,12 +5277,6 @@ impl Driver {
             }
             DriverControl::SwapPrimary { name } => {
                 self.swap_primary(&name, tx).await;
-            }
-            DriverControl::SetLlmMode {
-                mode,
-                prune_after_switch,
-            } => {
-                self.set_llm_mode(mode, prune_after_switch, tx).await;
             }
             DriverControl::SetToolSurfaceOverride {
                 selection,
@@ -7817,7 +7772,6 @@ impl Driver {
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
-        llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
     ) -> Agent {
         let mut refreshed = (*self.stack[frame_idx].agent).clone();
@@ -7829,7 +7783,8 @@ impl Driver {
         let prompt_cache_retention =
             self.resolve_prompt_cache_retention_for_selection(&new_model, selection);
         refreshed.model = new_model;
-        refreshed.llm_mode = llm_mode;
+        // Posture (tool_steering/capabilities/context_policy) comes from the
+        // agent def and is model-independent, so a model swap preserves it.
         refreshed.params = crate::engine::model::ModelParams {
             additional_params,
             endpoint_recovery_additional_params,
@@ -7845,11 +7800,10 @@ impl Driver {
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
-        llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
         // A per-node model override to pin as `model_override` so it wins over a
-        // frontmatter `model:` in `resolve_agent_model` (modes AC5). `None` for
-        // ordinary rebuilds, preserving the previous behaviour.
+        // frontmatter `model:` in `resolve_agent_model`. `None` for ordinary
+        // rebuilds, preserving the previous behaviour.
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> (String, crate::engine::builtin::SpawnArgs) {
         let name = self.stack[frame_idx].agent.name.clone();
@@ -7862,7 +7816,6 @@ impl Driver {
         // noninteractive delegations run off-stack, so rebuilding a stack frame
         // must preserve the interactive recall/todo/goal tool surface.
         let mut args = self.spawn_args(true);
-        args.llm_mode = llm_mode;
         args.model = new_model;
         args.model_override = model_pin;
         args.delegation_model = None;
@@ -7885,12 +7838,10 @@ impl Driver {
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
-        llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> Result<Agent> {
-        let (name, args) =
-            self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection, model_pin);
+        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
         crate::engine::builtin::load(&name, &args)
     }
 
@@ -7898,29 +7849,15 @@ impl Driver {
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
-        llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> Agent {
-        let (name, args) =
-            self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection, model_pin);
+        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
         // `builtin::load` honors a user override of a bundled primary; fall back
         // to the same agent name's default build on a load failure so the swap
         // never strands the session without a primary.
         crate::engine::builtin::load(&name, &args)
             .unwrap_or_else(|_| crate::engine::builtin::default_build(&args))
-    }
-
-    fn effective_llm_mode_for(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> crate::config::extended::LlmMode {
-        self.live_providers_config()
-            .map(|providers| {
-                providers.resolve_mode(provider, model, self.config.extended().llm_mode)
-            })
-            .unwrap_or_else(|_| self.stack[0].agent.llm_mode)
     }
 
     /// Re-resolve the reasoning-param fragment for `model` from the config's
@@ -8103,76 +8040,6 @@ impl Driver {
             .await;
     }
 
-    /// Switch the active `llm_mode` live (`/llm-mode`). Rebuilds the
-    /// root-frame agent under the new mode so its tool-description verbosity
-    /// and per-mode prompt re-render, preserving the root history (same
-    /// conversation, new steering). Busts the cached system prefix — the
-    /// client warns the user (suppressed on a no-cache provider via the
-    /// shared cache-break helper) before sending the switch. When requested by
-    /// the control caller, a successful rebuild immediately runs the ordinary
-    /// prune path. Only the root frame at idle is touched; a deeper
-    /// interactive subagent frame is left alone. No-op when the mode is
-    /// unchanged or a subagent holds the foreground.
-    async fn set_llm_mode(
-        &mut self,
-        requested: Option<crate::config::extended::LlmMode>,
-        prune_after_switch: bool,
-        tx: &mpsc::Sender<TurnEvent>,
-    ) {
-        // Resolve the target: an explicit mode, or a toggle against the
-        // authoritative current value (the `/llm-mode` default action).
-        let current = self.stack[0].agent.llm_mode;
-        let mode = requested.unwrap_or_else(|| current.cycled());
-        if self.stack.len() != 1 {
-            tracing::warn!(
-                requested = %mode.as_str(),
-                "llm_mode switch ignored: an interactive subagent holds the foreground"
-            );
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: format!(
-                        "LLM mode switch to `{}` was refused because an interactive subagent holds the foreground.",
-                        mode.as_str()
-                    ),
-                })
-                .await;
-            return;
-        }
-        if current == mode {
-            return;
-        }
-        let name = self.stack[0].agent.name.clone();
-        // Spawn args start from the current root agent; override only the mode
-        // for the rebuilt root.
-        let mut args = self.spawn_args(true);
-        args.llm_mode = mode;
-        match crate::engine::builtin::load(&name, &args) {
-            Ok(agent) => {
-                self.stack[0].agent = Arc::new(agent);
-                // Rebind the job authority's fork context to the rebuilt
-                // primary (single-authority rule), same as `swap_primary`.
-                self.schedule.set_agent(self.stack[0].agent.clone());
-                tracing::info!(mode = %mode.as_str(), "llm_mode switched");
-                let _ = tx.send(TurnEvent::LlmModeChanged { mode }).await;
-                self.emit_context_projection(tx).await;
-                if prune_after_switch {
-                    self.do_prune(false, tx).await;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, requested = %mode.as_str(), "llm_mode switch failed to reload agent");
-                let _ = tx
-                    .send(TurnEvent::Notice {
-                        text: format!(
-                            "LLM mode switch to `{}` failed — {e:#}. Keeping the current mode active.",
-                            mode.as_str()
-                        ),
-                    })
-                    .await;
-            }
-        }
-    }
-
     async fn set_tool_surface_override(
         &mut self,
         selection: crate::agents::ToolSurfaceSelection,
@@ -8326,15 +8193,14 @@ impl Driver {
     fn effective_auto_compact_pct(
         &self,
         ctx_cfg: &crate::config::providers::ContextConfig,
-        mode: LlmMode,
         context_policy: Option<&crate::agents::ContextPolicy>,
         can_self_compact: bool,
     ) -> u8 {
         if let Some(explicit) = ctx_cfg.auto_compact_pct {
             return explicit;
         }
-        // Issue #75: the def's contextPolicy.autoCompactPct overrides the
-        // mode-derived floor; the default is 80 (CAPABLE_MODE_DEFAULT_PCT).
+        // Issue #75: the def's contextPolicy.autoCompactPct is the sole
+        // posture-derived floor; the default is 80 (CAPABLE_MODE_DEFAULT_PCT).
         if let Some(policy) = context_policy
             && let Some(pct) = policy.auto_compact_pct
         {
@@ -8343,10 +8209,7 @@ impl Driver {
         if !can_self_compact {
             return AUTO_COMPACT_FLOOR_PCT;
         }
-        match mode {
-            LlmMode::Defensive => AUTO_COMPACT_FLOOR_PCT,
-            LlmMode::Normal | LlmMode::Frontier => AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT,
-        }
+        AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT
     }
 
     fn effective_root_auto_compact_pct(
@@ -8354,9 +8217,8 @@ impl Driver {
         ctx_cfg: &crate::config::providers::ContextConfig,
     ) -> u8 {
         let frame = self.stack.first();
-        let mode = frame.map(|f| f.agent.llm_mode).unwrap_or_default();
         let policy = frame.and_then(|f| f.agent.context_policy.as_ref());
-        self.effective_auto_compact_pct(ctx_cfg, mode, policy, self.root_can_self_compact())
+        self.effective_auto_compact_pct(ctx_cfg, policy, self.root_can_self_compact())
     }
 
     /// Last provider-reported input usage, with a debug-build-only threshold
@@ -8609,13 +8471,14 @@ impl Driver {
         &self,
         text: &str,
         cwd: &std::path::Path,
-        llm_mode: crate::config::extended::LlmMode,
+        context_policy: Option<&crate::agents::ContextPolicy>,
         child_agent: &str,
     ) -> String {
         let text = self.expand_skill_tags(text, child_agent);
         let mut allow = crate::config::extended::resolve_gitignore_allow(cwd);
         allow.extend(self.session.gitignore_session_allow());
-        let policy = crate::tags::TagPolicy::new_for_mode(cwd, allow, llm_mode);
+        let caps = crate::tags::TagInlineCaps::for_context_policy(context_policy);
+        let policy = crate::tags::TagPolicy::new_for_caps(cwd, allow, caps);
         crate::tags::expand_assembly_tags_with_policy(&text, &policy).wire
     }
 
@@ -8965,11 +8828,10 @@ impl Driver {
         // handle footer. The handle rides the report so both the user-facing
         // event and the parent's tool_result carry it.
         // Seeding a re-query handle for the finished child is a child-execution
-        // capability, so it is gated on the CHILD's own resolved posture — the
-        // child was built with its selected model's mode — not the root frame's.
-        let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(
-            &crate::agents::PostureResolution::legacy(child.agent.llm_mode),
-        );
+        // capability, so it is gated on the CHILD's own resolved posture (from
+        // its def), not the root frame's.
+        let followup_enabled =
+            crate::engine::tool::Capability::FollowupSeed.enabled(&child.agent.posture);
         let followup_handle = if followup_enabled
             && crate::engine::builtin::is_followup_eligible(&child.agent.name)
         {
@@ -8984,7 +8846,12 @@ impl Driver {
             report
         };
         let parent = self.stack.last().expect("stack never empty").agent.clone();
-        let report = self.expand_handoff_tags(&report, &self.cwd, parent.llm_mode, &parent.name);
+        let report = self.expand_handoff_tags(
+            &report,
+            &self.cwd,
+            parent.context_policy.as_ref(),
+            &parent.name,
+        );
         let task_call_id = child
             .answering
             .as_ref()
@@ -11393,7 +11260,7 @@ impl Driver {
                         }
                     };
                     let child_routing = ChildRoutingMetadata::from_model(&child.model);
-                    let child_llm_mode = child.llm_mode;
+                    let child_context_policy = child.context_policy.clone();
                     self.emit_subagent_routing_amend(
                         tx,
                         &child_agent,
@@ -11504,8 +11371,12 @@ impl Driver {
                             &child_agent,
                         )
                         .await;
-                    let brief =
-                        self.expand_handoff_tags(&brief, &self.cwd, child_llm_mode, &child_agent);
+                    let brief = self.expand_handoff_tags(
+                        &brief,
+                        &self.cwd,
+                        child_context_policy.as_ref(),
+                        &child_agent,
+                    );
                     // Render the handoff brief for the interactive child's
                     // resolved custody class before it is dispatched: an
                     // untrusted (cloud) child gets the session redaction-table
@@ -11900,7 +11771,6 @@ impl Driver {
                     // tool_result.
                     let active_agent = &self.stack.last().unwrap().agent;
                     let agent_name = active_agent.name.clone();
-                    let llm_mode = active_agent.llm_mode;
                     let _ = tx
                         .send(TurnEvent::ToolStart {
                             agent: agent_name.clone(),
@@ -11982,7 +11852,6 @@ impl Driver {
                     }
                     self.record_schedule_tool_call(ScheduleToolCallRecord {
                         agent: agent_name.clone(),
-                        llm_mode,
                         call_id: task_call_id.clone(),
                         provider_item_id: task_provider_item_id.clone(),
                         provider_call_id: task_function_call_id.clone(),
@@ -12084,12 +11953,6 @@ impl Driver {
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
-            // The root frame's posture. This is the authoritative mode only for
-            // a root/primary build; a DELEGATED child re-resolves its own
-            // posture from its selected model at build time
-            // ([`crate::engine::builtin::child_llm_mode_for_model`]), so this
-            // value is just the baseline a non-delegated spawn keeps.
-            llm_mode: self.stack[0].agent.llm_mode,
             // A plan-level model override propagates to the whole delegation
             // tree so every spawned agent runs under it.
             model_override: self.model_override.clone(),

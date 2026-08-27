@@ -2032,24 +2032,6 @@ async fn relay_agent_tree_events(
     }
 }
 
-pub(super) fn persistent_llm_mode_control(
-    mode: crate::config::extended::LlmMode,
-) -> crate::engine::driver::DriverControl {
-    crate::engine::driver::DriverControl::SetLlmMode {
-        mode: Some(mode),
-        prune_after_switch: true,
-    }
-}
-
-pub(super) fn session_llm_mode_control(
-    mode: crate::config::extended::LlmMode,
-) -> crate::engine::driver::DriverControl {
-    crate::engine::driver::DriverControl::SetLlmMode {
-        mode: Some(mode),
-        prune_after_switch: false,
-    }
-}
-
 pub(super) fn tool_surface_override_control(
     selection: crate::agents::ToolSurfaceSelection,
     prune_after_switch: bool,
@@ -2059,23 +2041,6 @@ pub(super) fn tool_surface_override_control(
         selection,
         prune_after_switch,
         monty_nudge,
-    }
-}
-
-pub(super) fn stored_session_llm_mode(
-    session: &Session,
-) -> Option<crate::config::extended::LlmMode> {
-    let raw = session.session_llm_mode_raw()?;
-    match session.session_llm_mode() {
-        Some(mode) => Some(mode),
-        None => {
-            tracing::warn!(
-                session_id = %session.id,
-                mode = %raw,
-                "stored session llm mode is invalid; falling back to resolved config mode"
-            );
-            None
-        }
     }
 }
 
@@ -4407,8 +4372,6 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         | SessionWork::ResolveInterrupt { .. }
         | SessionWork::SetActiveModel { .. }
         | SessionWork::SetAgent { .. }
-        | SessionWork::SetLlmMode { .. }
-        | SessionWork::SetSessionLlmMode { .. }
         | SessionWork::SetToolSurfaceOverride { .. }
         | SessionWork::SetGoalSettingsOverride { .. }
         | SessionWork::SetDelegationRecursion { .. }
@@ -4675,23 +4638,14 @@ pub(super) async fn run_worker(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let extended_cfg = start_config.extended.clone();
-    // Effective LLM mode = active model `mode` override → active provider
-    // `mode` override → the persisted global `llm_mode`
-    // (implementation note). Re-resolved here so a
-    // model/provider that pins a mode takes effect at session start (and on a
-    // `/model` change, which restarts the worker on the new active model). A
-    // live `/llm-mode` toggle still overrides this for the running session via
-    // `DriverControl::SetLlmMode`.
-    let llm_mode = stored_session_llm_mode(&session).unwrap_or_else(|| {
-        resolve_effective_llm_mode(&session, &start_config.providers, extended_cfg.llm_mode)
-    });
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
     // configured default when it's unset/unknown. Removed stored primaries
-    // force the release default (`Build`).
+    // force the release default (`Build`). Issue #75: the mode axis no longer
+    // selects the primary — `defaultPrimaryAgent` governs.
     let root_agent_name = match session.assistant_name.clone() {
         Some(name) => name,
-        None => resolve_root_agent(session_id, &session.db, &extended_cfg, llm_mode).await,
+        None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
     };
     if session.assistant_name.is_none()
         && let Some(text) =
@@ -4818,7 +4772,6 @@ pub(super) async fn run_worker(
         // The daemon root is always the user-facing interactive agent —
         // it gets the cross-session recall tools.
         interactive: true,
-        llm_mode,
         // Plan-level model override (`plan-duplication-and-model-override.md`):
         // when set, the root and every spawned subagent run under it.
         model_override: model_override.clone(),
@@ -10362,53 +10315,6 @@ pub(super) async fn run_worker(
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::SwapPrimary { name },
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                    )
-                    .await
-                    {
-                        break WorkerStop::DriverFailed;
-                    }
-                }
-                SessionWork::SetLlmMode { mode } => {
-                    // Resolve toggle against the current config value (the
-                    // single source of truth shared with `/settings` + the
-                    // config file), persist the resolved value so a resume keeps
-                    // it, then route the explicit mode to the driver to rebuild
-                    // the root agent in place.
-                    let current = config_snapshot
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .extended
-                        .llm_mode;
-                    let resolved = mode.unwrap_or_else(|| current.cycled());
-                    if let Err(e) = persist_llm_mode(&project_root, resolved) {
-                        tracing::warn!(error = %e, "persisting llm_mode failed");
-                    }
-                    if !send_driver_control_or_fail(
-                        &driver_control_tx,
-                        persistent_llm_mode_control(resolved),
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                    )
-                    .await
-                    {
-                        break WorkerStop::DriverFailed;
-                    }
-                }
-                SessionWork::SetSessionLlmMode { mode } => {
-                    if let Err(error) = session.set_session_llm_mode(mode) {
-                        tracing::warn!(%error, session_id = %session_id, "persisting session llm mode failed");
-                    }
-                    if !send_driver_control_or_fail(
-                        &driver_control_tx,
-                        session_llm_mode_control(mode),
                         &event_tx,
                         &turn_completions,
                         &redaction,

@@ -433,7 +433,7 @@ mod tests {
             lock_identity: "helper".to_string(),
             write_scope: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session: Arc::new(session),
             cwd: canonical.clone(),

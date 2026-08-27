@@ -831,7 +831,6 @@ mod tests {
                 model_trust: trust,
                 provider_id: trust.map(|_| "provider-a"),
                 model_id: trust.map(|_| "model-a"),
-                llm_mode: trust.map(|_| "normal"),
                 ..Default::default()
             },
             &json!({ "text": text }),
@@ -876,7 +875,6 @@ mod tests {
             SessionEventContext {
                 provider_id: Some("provider-a"),
                 model_id: Some("model-a"),
-                llm_mode: Some("normal"),
                 model_trust: Some("untrusted"),
                 ..Default::default()
             },
@@ -1053,7 +1051,6 @@ mod tests {
                 model_trust: Some("trusted"),
                 provider_id: Some("provider-a"),
                 model_id: Some("trusted-model"),
-                llm_mode: Some("normal"),
                 ..Default::default()
             },
             &json!({"tool": "bash", "output": "secretamber trusted"}),
@@ -1069,7 +1066,6 @@ mod tests {
                 model_trust: Some("untrusted"),
                 provider_id: Some("provider-a"),
                 model_id: Some("untrusted-model"),
-                llm_mode: Some("normal"),
                 ..Default::default()
             },
             &json!({"tool": "bash", "output": "secretamber visible"}),

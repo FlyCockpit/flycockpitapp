@@ -1462,25 +1462,6 @@ pub enum Request {
         name: String,
     },
 
-    /// Switch the active `llm_mode` for the attached session live
-    /// (`/llm-mode`, implementation note). `mode = None`
-    /// toggles between `normal`/`defensive` against the daemon's
-    /// authoritative current value; `Some(_)` sets it explicitly. Busts the
-    /// cached system prefix (the client shows the cache-break warning, unless
-    /// the provider doesn't cache). Acked with the resulting mode via
-    /// [`Event::LlmModeChanged`].
-    SetLlmMode {
-        #[serde(default)]
-        mode: Option<LlmMode>,
-    },
-
-    /// Switch the active `llm_mode` for the attached session without writing
-    /// the config default. Used by `/quick`; acknowledged with
-    /// [`Event::LlmModeChanged`].
-    SetSessionLlmMode {
-        mode: LlmMode,
-    },
-
     /// Replace the attached session's tool-surface override and rebuild the
     /// root agent at the next idle/control boundary. The payload is serialized
     /// `agents::ToolSurfaceSelection`; kept JSON here so the wire crate does
@@ -3874,8 +3855,6 @@ macro_rules! request_variants {
             (Request::SetDefaultModel { .. }, "set_default_model");
             (Request::SetActiveModel { .. }, "set_active_model");
             (Request::SetAgent { .. }, "set_agent");
-            (Request::SetLlmMode { .. }, "set_llm_mode");
-            (Request::SetSessionLlmMode { .. }, "set_session_llm_mode");
             (Request::SetToolSurfaceOverride { .. }, "set_tool_surface_override");
             (Request::SetGoalSettingsOverride { .. }, "set_goal_settings_override");
             (Request::SetApprovalMode { .. }, "set_approval_mode");
@@ -4180,8 +4159,6 @@ macro_rules! command {
             (Request::SetDefaultModel { default_update_id, provider, model, reasoning_effort, thinking_mode, prompt_cache_retention, clear }, "set_default_model", owner_only, attached, true, local_only, none, serialized, none, "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool", [default_update_id: Uuid => param, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider), reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param, clear: bool => param]);
             (Request::SetActiveModel { selection_id, provider, model, persist_as_default, trigger, reasoning_effort, thinking_mode, prompt_cache_retention }, "set_active_model", custom(authorize_set_active_model), attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>", [selection_id: Uuid => param, provider: String => provider_model_left(model), model: String => provider_model_right(provider), persist_as_default: bool => param, trigger: ActiveModelSwitchTrigger => param, reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param]);
             (Request::SetAgent { name }, "set_agent", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "name:String", [name: String => param]);
-            (Request::SetLlmMode { mode }, "set_llm_mode", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "mode:Option<LlmMode>", [mode: Option<LlmMode> => param]);
-            (Request::SetSessionLlmMode { mode }, "set_session_llm_mode", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:LlmMode", [mode: LlmMode => param]);
             (Request::SetToolSurfaceOverride { override_json, persist_session, prune_after_switch, monty_nudge }, "set_tool_surface_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>", [override_json: String => param, persist_session: bool => param, prune_after_switch: bool => param, monty_nudge: Option<String> => param]);
             (Request::SetGoalSettingsOverride { override_json, persist_session }, "set_goal_settings_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:Option<String>|persist_session:bool", [override_json: Option<String> => param, persist_session: bool => param]);
             (Request::SetApprovalMode { mode }, "set_approval_mode", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "mode:ApprovalMode", [mode: ApprovalMode => param]);
@@ -4684,7 +4661,6 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Option<EnvSnapshotWire>" => "option<struct:EnvSnapshotWire:v1>",
         "Option<RunInvocationOptions>" => "option<struct:RunInvocationOptions:v1>",
         "Option<LeakRotationState>" => "option<enum16:LeakRotationState>",
-        "Option<LlmMode>" => "option<enum16:LlmMode>",
         "Option<PromptCacheRetention>" => "option<enum16:PromptCacheRetention>",
         "Option<SandboxMode>" => "option<enum16:SandboxMode>",
         "Option<cockpit_config::config::providers::ThinkingMode>" => "option<enum16:ThinkingMode>",
@@ -4715,7 +4691,6 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         | "ExportSessionKind"
         | "GoalDisposition"
         | "LeakRotationDisposition"
-        | "LlmMode"
         | "OnUnlistedModelsFetch"
         | "LspControlAction"
         | "SecretStorePlacement"

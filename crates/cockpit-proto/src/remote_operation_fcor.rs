@@ -336,11 +336,6 @@ canonical_unit_enum16!(cockpit_config::config::extended::ApprovalMode, {
     Auto = 2,
     Yolo = 3,
 });
-canonical_unit_enum16!(cockpit_config::config::extended::LlmMode, {
-    Defensive = 1,
-    Normal = 2,
-    Frontier = 3,
-});
 canonical_unit_enum16!(cockpit_config::config::sandbox_mode::SandboxMode, {
     Off = 1,
     Sandbox = 2,
@@ -1627,18 +1622,6 @@ mod tests {
         check!(
             "approval_mode.yolo",
             cockpit_config::config::extended::ApprovalMode::Yolo
-        );
-        check!(
-            "llm_mode.defensive",
-            cockpit_config::config::extended::LlmMode::Defensive
-        );
-        check!(
-            "llm_mode.normal",
-            cockpit_config::config::extended::LlmMode::Normal
-        );
-        check!(
-            "llm_mode.frontier",
-            cockpit_config::config::extended::LlmMode::Frontier
         );
         check!(
             "sandbox_mode.off",

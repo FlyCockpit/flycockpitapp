@@ -3063,7 +3063,6 @@ mod tests {
             output: output.into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -3109,7 +3108,6 @@ mod tests {
             output: body.into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -3158,7 +3156,6 @@ mod tests {
             output: "body".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -3651,7 +3648,6 @@ mod tests {
             output: "{\"snapshot\":\"unavailable\"}".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -4358,7 +4354,6 @@ mod tests {
             output: "Skill body".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -4444,7 +4439,6 @@ mod tests {
             output: "seed body".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -4549,7 +4543,6 @@ mod tests {
                 },
                 truncated: false,
                 duration_ms: 1,
-                llm_mode: crate::config::extended::LlmMode::default(),
                 shape_fingerprint: None,
                 hint: None,
             })
@@ -6606,12 +6599,8 @@ mod tests {
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
             db.read(move |conn| {
-                let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
-                    conn,
-                    session_id,
-                    &cfg,
-                    cfg.llm_mode,
-                );
+                let root_agent =
+                    crate::daemon::session_worker::resolve_root_agent_conn(conn, session_id, &cfg);
                 let history = history_snapshot_conn(conn, session_id, &root_agent)?;
                 let paused = Db::paused_session_work_conn(conn, session_id)?;
                 let row = Db::get_session_conn(conn, session_id)?;
@@ -6909,7 +6898,6 @@ mod tests {
             output: "ok".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })

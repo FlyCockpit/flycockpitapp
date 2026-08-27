@@ -480,7 +480,7 @@ fn external_journal_lines(db: Option<&crate::db::Db>) -> (Vec<String>, bool) {
 }
 
 fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -> String {
-    crate::daemon::session_worker::initial_active_agent_for_llm_mode(extended, extended.llm_mode)
+    crate::daemon::session_worker::initial_active_agent(extended).to_string()
 }
 
 async fn database_lines(

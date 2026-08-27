@@ -8,16 +8,16 @@
 //!   safe descriptions, and reference mechanisms only, forever.
 //!
 //! The invariant is one-directional: a raw sensitive value must never reach an
-//! untrusted model. Nothing widens that — not a mode, not a tool, not a grant.
+//! untrusted model. Nothing widens that — not a steering posture, not a tool,
+//! not a grant.
 //!
-//! `LlmMode` is an independent harness-steering posture. It selects context
-//! variants and defensive tool-definition prose. It never decides whether an
-//! already-selected provider sees a raw literal, whether a provider is
-//! eligible for a sensitive request, or any sealed authorization outcome.
-//! This module is where that orthogonality is made structural: the resolver
-//! below takes both axes and reads only one of them.
+//! Steering posture (formerly `LlmMode`) is an independent harness-steering
+//! axis that selects context variants and verbose tool-definition prose. It
+//! never decides whether an already-selected provider sees a raw literal,
+//! whether a provider is eligible for a sensitive request, or any sealed
+//! authorization outcome. This module is where that orthogonality is made
+//! structural: the resolver below reads only `trust`.
 
-use crate::config::extended::LlmMode;
 use crate::config::providers::ModelTrust;
 
 /// Whether a caller may receive a raw literal at all.
@@ -43,19 +43,19 @@ impl SealedLiteralCustody {
     }
 }
 
-/// Both posture axes of a caller, presented together on purpose.
+/// The custody request: the caller's trust axis.
 ///
-/// Carrying `mode` here is what makes the orthogonality claim testable: the
-/// predicate is handed the mode and demonstrably ignores it.
+/// Carrying only `trust` makes the orthogonality claim structural: the
+/// predicate is handed the trust axis and resolves custody from it alone.
+/// Steering posture is not part of custody (issue #75).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealedCustodyRequest {
     pub trust: ModelTrust,
-    pub mode: LlmMode,
 }
 
 impl SealedCustodyRequest {
-    pub fn new(trust: ModelTrust, mode: LlmMode) -> Self {
-        Self { trust, mode }
+    pub fn new(trust: ModelTrust) -> Self {
+        Self { trust }
     }
 
     /// Resolve custody for this caller.
@@ -66,10 +66,10 @@ impl SealedCustodyRequest {
 
 /// The custody predicate.
 ///
-/// Deliberately a single `match` on `trust`. `request.mode` is never read; any
-/// future edit that reads it is both an orthogonality regression and a
-/// custody-gate regression, and is caught by
-/// `trust_and_mode_are_orthogonal_for_sealed_values`.
+/// Deliberately a single `match` on `trust`. There is no steering axis to
+/// read; any future edit that introduces one is both an orthogonality
+/// regression and a custody-gate regression, and is caught by
+/// `trust_alone_decides_sealed_value_custody`.
 pub fn sealed_literal_custody(request: SealedCustodyRequest) -> SealedLiteralCustody {
     match request.trust {
         ModelTrust::Trusted => SealedLiteralCustody::RawLiteralPermitted,
@@ -77,20 +77,13 @@ pub fn sealed_literal_custody(request: SealedCustodyRequest) -> SealedLiteralCus
     }
 }
 
-/// Custody from trust alone, for call sites that have no mode in hand.
+/// Custody from trust alone, for call sites that have no steering in hand.
 ///
 /// Identical by construction to [`sealed_literal_custody`] — trust is the
 /// whole input either way.
 pub fn sealed_literal_custody_for_trust(trust: ModelTrust) -> SealedLiteralCustody {
-    sealed_literal_custody(SealedCustodyRequest {
-        trust,
-        // Any mode resolves identically; `Defensive` is `LlmMode::default()`.
-        mode: LlmMode::default(),
-    })
+    sealed_literal_custody(SealedCustodyRequest { trust })
 }
-
-/// Every `LlmMode`, for exhaustive orthogonality proofs.
-pub const ALL_LLM_MODES: [LlmMode; 3] = [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier];
 
 /// Every `ModelTrust`, for exhaustive custody proofs.
 pub const ALL_MODEL_TRUSTS: [ModelTrust; 2] = [ModelTrust::Trusted, ModelTrust::Untrusted];

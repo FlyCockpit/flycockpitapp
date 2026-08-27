@@ -1650,7 +1650,9 @@ mod tests {
         assert!(!marker.starts_with("[elided:"));
         assert!(!Elision::is_marker(&marker));
         assert!(!Elision::contains_marker(&marker));
-        assert!(!Elision::contains_marker(&format!("wrote `x.rs`\n{marker}")));
+        assert!(!Elision::contains_marker(&format!(
+            "wrote `x.rs`\n{marker}"
+        )));
     }
 
     #[test]

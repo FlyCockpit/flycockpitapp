@@ -46,7 +46,10 @@ const MIN_TOKENS_SAVED: usize = 96;
 pub const APPLIED_MARKER_PREFIX: &str = "[applied:";
 
 pub fn applied_marker(byte_len: usize) -> String {
-    format!("[applied: {n} bytes — see result diff]", n = format_byte_count(byte_len))
+    format!(
+        "[applied: {n} bytes — see result diff]",
+        n = format_byte_count(byte_len)
+    )
 }
 
 pub fn is_applied_marker(value: &str) -> bool {
@@ -354,11 +357,11 @@ mod tests {
         assert_eq!(elide_applied_write_edit_args(&mut history), 1);
         let args = first_call_args(&history[0]);
         assert_eq!(args["path"], json!("src/lib.rs"));
+        assert_eq!(args["content"], json!(applied_marker(content.len())));
         assert_eq!(
-            args["content"],
-            json!(applied_marker(content.len()))
+            object_keys(&args),
+            vec!["path".to_string(), "content".to_string()]
         );
-        assert_eq!(object_keys(&args), vec!["path".to_string(), "content".to_string()]);
         assert_eq!(elide_applied_write_edit_args(&mut history), 0);
     }
 
@@ -595,11 +598,7 @@ mod tests {
     #[test]
     fn read_and_other_tools_are_untouched() {
         let mut history = vec![
-            assistant_call(
-                "r1",
-                "read",
-                json!({ "path": "src/lib.rs" }),
-            ),
+            assistant_call("r1", "read", json!({ "path": "src/lib.rs" })),
             crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                 "r1".to_string(),
                 None,

@@ -30,7 +30,6 @@ pub(crate) mod compact_draft;
 pub mod deferred;
 pub mod deleg_shrink;
 pub mod delegation_prompt_prune;
-pub mod write_edit_arg_elision;
 pub mod docs_pipeline;
 pub mod driver;
 pub mod envelope;
@@ -102,6 +101,7 @@ pub(crate) mod trusted_child_acquisition;
 #[allow(dead_code)]
 pub(crate) mod trusted_child_acquisition_coordinator;
 pub mod validation_hint;
+pub mod write_edit_arg_elision;
 
 pub use agent::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress,

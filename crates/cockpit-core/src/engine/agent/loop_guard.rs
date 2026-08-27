@@ -265,7 +265,10 @@ mod loop_collapse_tests {
         let content = long_write_content();
         let full = serde_json::json!({ "path": "src/x.rs", "content": content });
         let elided = crate::engine::write_edit_arg_elision::args_for_loop_hash("write", &full);
-        assert_ne!(elided, full, "large write args must stub for the hash projection");
+        assert_ne!(
+            elided, full,
+            "large write args must stub for the hash projection"
+        );
 
         let available = ["write", "read"];
         let mut history: Vec<Message> = Vec::new();

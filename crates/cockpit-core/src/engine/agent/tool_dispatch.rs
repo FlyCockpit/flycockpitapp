@@ -4540,9 +4540,16 @@ mod tests {
         let mut live_history = Vec::new();
         push_assistant_call(&mut live_history, &call);
 
-        execute_ordinary_call(&env, &mut live_history, &call, "write", Recovery::Clean, None)
-            .await
-            .unwrap();
+        execute_ordinary_call(
+            &env,
+            &mut live_history,
+            &call,
+            "write",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
 
         let live_args = write_call_args(&live_history);
         assert_eq!(live_args["path"], serde_json::json!("big.rs"));
@@ -4564,7 +4571,10 @@ mod tests {
             serde_json::json!(content),
             "durable audit rows keep full args"
         );
-        assert_eq!(rows[0].original_input_json["content"], serde_json::json!(content));
+        assert_eq!(
+            rows[0].original_input_json["content"],
+            serde_json::json!(content)
+        );
 
         let replayed =
             crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")

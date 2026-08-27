@@ -23,10 +23,18 @@ pub async fn snapshot(
     project_root: String,
     config_generation: u64,
     selection_id: String,
+    session_id: String,
+    expected_daemon_instance_id: Option<String>,
+    expected_session_id: Option<String>,
 ) -> Result<Response, ErrorPayload> {
     ensure_current_generation(config_generation)?;
+    let daemon_instance_id = crate::daemon::server::inventory::daemon_instance_id().to_owned();
+    // A read is the rehydration path after reconnect/restart, so it returns
+    // the daemon's current identity even when the caller's last projection
+    // belonged to an older boot. Mutations below reject that mismatch.
+    let _ = (expected_daemon_instance_id, expected_session_id);
     let project_id = canonical_project_id(&project_root)?;
-    let (models, resolution) = configured_projection(ctx, &project_root, config_generation).await?;
+    let (models, resolution) = configured_projection(ctx, &project_id, config_generation).await?;
     let snapshot = ctx
         .db
         .image_sidecar_snapshot(project_id.clone())
@@ -35,6 +43,8 @@ pub async fn snapshot(
     Ok(Response::ImageSidecarAuthoritySnapshot(
         ImageSidecarAuthoritySnapshotV1 {
             schema_version: 1,
+            daemon_instance_id,
+            session_id,
             project_id,
             config_generation,
             selection_id,
@@ -59,8 +69,17 @@ pub async fn create_grant(
     scope: ImageSidecarGrantScopeV1,
     session_id: Option<String>,
     invocation_id: Option<String>,
+    authority_session_id: String,
+    expected_daemon_instance_id: Option<String>,
+    expected_session_id: Option<String>,
 ) -> Result<Response, ErrorPayload> {
     ensure_current_generation(config_generation)?;
+    ensure_identity(
+        crate::daemon::server::inventory::daemon_instance_id(),
+        &authority_session_id,
+        expected_daemon_instance_id.as_deref(),
+        expected_session_id.as_deref(),
+    )?;
     // There is no production handoff that can consume this authority yet. Do
     // not turn an opaque candidate into a standing grant whose destination can
     // never be revalidated. In particular, no caller-provided URL reaches the
@@ -104,6 +123,10 @@ async fn configured_projection(
         .providers
         .iter()
         .flat_map(|(provider, entry)| entry.models.iter().map(move |model| (provider, model)))
+        // Catalog discovery is not a user configuration grant. Preserve a
+        // configured value elsewhere in the form, but never offer a fetched
+        // `manual = false` row as a new sidecar destination.
+        .filter(|(_, model)| model.manual)
         .map(|(provider, model)| {
             let capability = providers.resolve_effective_model_capabilities(
                 provider,
@@ -113,15 +136,13 @@ async fn configured_projection(
             ImageSidecarModelOptionV1 {
                 provider: provider.clone(),
                 model: model.id.clone(),
+                configured: model.manual,
                 image_capable: capability.image_input.status
                     == cockpit_config::config::providers::CapabilityStatus::Supported,
-                // A configured manual model is authoritative; fetched catalog
-                // entries are fresh only when their provider has refresh evidence.
-                fresh: model.manual
-                    || providers
-                        .providers
-                        .get(provider)
-                        .is_some_and(|entry| entry.models_fetched_at.is_some()),
+                // The resolved capability is stamped by the same config
+                // generation that fences this projection. Do not substitute a
+                // provider catalog timestamp for the model capability source.
+                fresh: capability.image_input.source_generation == config_generation,
             }
         })
         .collect::<Vec<_>>();
@@ -179,8 +200,18 @@ pub async fn revoke_grant(
     selection_id: String,
     grant_id: String,
     expected_version: u64,
+    session_id: String,
+    expected_daemon_instance_id: Option<String>,
+    expected_session_id: Option<String>,
 ) -> Result<Response, ErrorPayload> {
     ensure_current_generation(config_generation)?;
+    let daemon_instance_id = crate::daemon::server::inventory::daemon_instance_id().to_owned();
+    ensure_identity(
+        &daemon_instance_id,
+        &session_id,
+        expected_daemon_instance_id.as_deref(),
+        expected_session_id.as_deref(),
+    )?;
     let project_id = canonical_project_id(&project_root)?;
     let Some((grant, entity_version)) = ctx
         .db
@@ -197,12 +228,31 @@ pub async fn revoke_grant(
     Ok(Response::ImageSidecarGrantMutated(
         ImageSidecarGrantMutationV1 {
             schema_version: 1,
+            daemon_instance_id,
+            session_id,
             config_generation,
             selection_id,
             entity_version,
             grant: grant_projection(&grant),
         },
     ))
+}
+
+fn ensure_identity(
+    daemon_instance_id: &str,
+    session_id: &str,
+    expected_daemon_instance_id: Option<&str>,
+    expected_session_id: Option<&str>,
+) -> Result<(), ErrorPayload> {
+    if expected_daemon_instance_id.is_some_and(|expected| expected != daemon_instance_id)
+        || expected_session_id.is_some_and(|expected| expected != session_id)
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "image-sidecar authority identity changed; reload before continuing".into(),
+        });
+    }
+    Ok(())
 }
 
 fn ensure_current_generation(expected: u64) -> Result<(), ErrorPayload> {

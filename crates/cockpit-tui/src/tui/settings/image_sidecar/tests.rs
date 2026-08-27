@@ -202,6 +202,77 @@ fn cap_only_save_preserves_configured_models_when_catalog_is_unavailable() {
 }
 
 #[test]
+fn sidecar_save_preserves_existing_discovered_selection_without_offering_it_again() {
+    let retained = SidecarModelRef {
+        provider: "catalog-only".into(),
+        model: "vision".into(),
+    };
+    let mut form = SidecarFormState {
+        trusted_default: Some(retained.clone()),
+        models: vec![SidecarModelOption {
+            provider: "configured".into(),
+            model: "vision".into(),
+            configured: true,
+            image_capable: true,
+            fresh: true,
+        }],
+        ..SidecarFormState::default()
+    };
+    form.set_central_cap(7);
+    assert!(
+        form.selectable_models()
+            .iter()
+            .all(|model| model.provider != retained.provider)
+    );
+    assert_eq!(
+        form.to_selection_config()
+            .trusted_primary_default
+            .expect("retained selection"),
+        SidecarProviderModel {
+            provider: retained.provider,
+            model: retained.model,
+        }
+    );
+}
+
+#[test]
+fn sidecar_editors_expose_a_named_dirty_save_control() {
+    let mut page = page_with(SidecarPageKind::ModeEditor);
+    let save = page
+        .named_actions()
+        .into_iter()
+        .find(|(action, _, _)| matches!(action, SidecarAction::SaveSelection))
+        .expect("mode editor must expose Save changes");
+    assert!(!save.1);
+    assert_eq!(save.2, Some(REASON_NO_PENDING_CHANGES));
+    page.session.form.local_edits_preserved = true;
+    assert!(
+        page.named_actions()
+            .into_iter()
+            .any(|(action, enabled, reason)| {
+                matches!(action, SidecarAction::SaveSelection) && enabled && reason.is_none()
+            })
+    );
+}
+
+#[test]
+fn sidecar_releases_only_the_matching_rejected_config_save() {
+    let mut session = SidecarSession::new(SidecarPrincipal::local_owner());
+    session.save_pending = true;
+    session.save_operation_id = Some("save-a".into());
+    session.save_base_revision = Some("safe-revision".into());
+    session.busy = true;
+    assert!(!session.complete_config_rejection("save-b", "conflict"));
+    assert!(session.save_pending);
+    assert!(session.busy);
+    assert!(session.complete_config_rejection("save-a", "conflict"));
+    assert!(!session.save_pending);
+    assert!(!session.busy);
+    assert_eq!(session.conflict.as_deref(), Some("conflict"));
+    assert!(session.save_base_revision.is_none());
+}
+
+#[test]
 fn image_sidecar_settings_resolver_form_matrix() {
     let mut form = SidecarFormState::default();
     form.models = vec![
@@ -985,6 +1056,9 @@ fn image_sidecar_settings_state_action_registry() {
     for kind in SidecarPageKind::ALL {
         for (w, h) in [(100, 30), (80, 24), (60, 16)] {
             let mut page = page_with(kind);
+            if kind == SidecarPageKind::ModeEditor {
+                page.session.conflict = Some("reload before reapplying".into());
+            }
             page.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
             page.session.reducer.invocations = vec![sample_invocation()];
             page.session.form.models = vec![SidecarModelOption {
@@ -1063,7 +1137,7 @@ fn image_sidecar_settings_state_action_registry() {
 
     assert_eq!(
         seen_actions.len(),
-        18,
+        20,
         "every SidecarAction variant must be emitted by the state registry"
     );
 }

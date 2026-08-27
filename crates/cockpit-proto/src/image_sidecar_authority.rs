@@ -56,6 +56,9 @@ pub struct ImageSidecarInvocationV1 {
 pub struct ImageSidecarModelOptionV1 {
     pub provider: String,
     pub model: String,
+    /// This entry was explicitly configured by the user, rather than merely
+    /// discovered in a provider catalog.
+    pub configured: bool,
     pub image_capable: bool,
     pub fresh: bool,
 }
@@ -79,6 +82,11 @@ pub struct ImageSidecarResolutionV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageSidecarAuthoritySnapshotV1 {
     pub schema_version: u8,
+    /// Stable for one daemon boot. A TUI must discard a completion from a
+    /// different daemon, even when its client-generated selection id matches.
+    pub daemon_instance_id: String,
+    /// The attached local session that owned this projection.
+    pub session_id: String,
     pub project_id: String,
     pub config_generation: u64,
     pub selection_id: String,
@@ -95,6 +103,8 @@ pub struct ImageSidecarAuthoritySnapshotV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageSidecarGrantMutationV1 {
     pub schema_version: u8,
+    pub daemon_instance_id: String,
+    pub session_id: String,
     pub config_generation: u64,
     pub selection_id: String,
     pub entity_version: u64,

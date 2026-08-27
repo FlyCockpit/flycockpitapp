@@ -8118,12 +8118,18 @@ async fn handle_serialized_request_impl(
             project_root,
             config_generation,
             selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
         } => {
+            let authority_session_id = require_attached(state)?.handle.session_id.to_string();
             crate::daemon::image_sidecar_authority::snapshot(
                 ctx,
                 project_root,
                 config_generation,
                 selection_id,
+                authority_session_id,
+                expected_daemon_instance_id,
+                expected_session_id,
             )
             .await
         }
@@ -8132,12 +8138,15 @@ async fn handle_serialized_request_impl(
             project_root,
             config_generation,
             selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
             grant_candidate_id,
             purpose,
             scope,
             session_id,
             invocation_id,
         } => {
+            let authority_session_id = require_attached(state)?.handle.session_id.to_string();
             crate::daemon::image_sidecar_authority::create_grant(
                 ctx,
                 project_root,
@@ -8148,6 +8157,9 @@ async fn handle_serialized_request_impl(
                 scope,
                 session_id,
                 invocation_id,
+                authority_session_id,
+                expected_daemon_instance_id,
+                expected_session_id,
             )
             .await
         }
@@ -8156,9 +8168,12 @@ async fn handle_serialized_request_impl(
             project_root,
             config_generation,
             selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
             grant_id,
             expected_version,
         } => {
+            let authority_session_id = require_attached(state)?.handle.session_id.to_string();
             crate::daemon::image_sidecar_authority::revoke_grant(
                 ctx,
                 project_root,
@@ -8166,6 +8181,9 @@ async fn handle_serialized_request_impl(
                 selection_id,
                 grant_id,
                 expected_version,
+                authority_session_id,
+                expected_daemon_instance_id,
+                expected_session_id,
             )
             .await
         }
@@ -16153,12 +16171,23 @@ async fn handle_concurrent_request_impl(
             project_root,
             config_generation,
             selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
         } => {
+            let authority_session_id = shared
+                .attached
+                .as_ref()
+                .ok_or_else(|| bad_request("image-sidecar settings require an attached session"))?
+                .session_id()
+                .to_string();
             crate::daemon::image_sidecar_authority::snapshot(
                 &ctx,
                 project_root,
                 config_generation,
                 selection_id,
+                authority_session_id,
+                expected_daemon_instance_id,
+                expected_session_id,
             )
             .await
         }

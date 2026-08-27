@@ -672,7 +672,8 @@ pub(super) enum GenerationAction {
 
 /// Sealed image-sidecar settings action vocabulary.
 ///
-/// Named actions: set mode/default/override, clear override, save central
+/// Named actions: set mode/default/override, clear override, save selection
+/// and central
 /// policy, refresh health, create grant, revoke grant, and open
 /// resolver/invocation detail. Each is visible, disabled with a stable
 /// reason, or intentionally non-action; no keyboard-only action is allowed.
@@ -685,7 +686,9 @@ pub(super) enum SidecarAction {
     SetOverride(SidecarModelRef),
     ClearOverride,
     SetCentralCap(u64),
+    SaveSelection,
     SaveCentralPolicy,
+    ReloadSelection,
     RefreshHealth,
     CreateGrant,
     SelectGrantScope(cockpit_core::image_sidecar::GrantScope),
@@ -898,7 +901,9 @@ impl SettingsPointerAction {
             Self::Sidecar(SidecarAction::SetOverride(_)) => "set override",
             Self::Sidecar(SidecarAction::ClearOverride) => "clear override",
             Self::Sidecar(SidecarAction::SetCentralCap(_)) => "set central cap",
+            Self::Sidecar(SidecarAction::SaveSelection) => "Save changes",
             Self::Sidecar(SidecarAction::SaveCentralPolicy) => "Save",
+            Self::Sidecar(SidecarAction::ReloadSelection) => "Reload current settings",
             Self::Sidecar(SidecarAction::RefreshHealth) => "refresh health",
             Self::Sidecar(SidecarAction::CreateGrant) => "create grant",
             Self::Sidecar(SidecarAction::SelectGrantScope(

@@ -1222,6 +1222,8 @@ enum PendingSettingsOperation {
     },
     SidecarAuthority {
         target: SettingsEffectTarget,
+        expected_daemon_instance_id: Option<String>,
+        expected_session_id: Option<String>,
     },
     ProviderCatalog {
         project_root: String,
@@ -1311,7 +1313,7 @@ impl PendingSettingsOperation {
                 revision: Some(expected_revision.clone()),
             },
             Self::ExtendedRefresh { target, .. }
-            | Self::SidecarAuthority { target }
+            | Self::SidecarAuthority { target, .. }
             | Self::ProjectShadowSnapshot { target, .. }
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
@@ -2848,7 +2850,7 @@ pub struct SettingsCx {
     completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
     completed_image_spend: Option<ImageSpendCompletion>,
-    completed_image_sidecar: Vec<(SettingsEffectTarget, Result<Response, String>)>,
+    completed_image_sidecar: Vec<SidecarAuthorityCompletion>,
     pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
     completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
     after_extended_commit: Vec<(SettingsEffectTarget, Request, &'static str)>,
@@ -2881,6 +2883,11 @@ pub struct SettingsCx {
     /// Opaque revision of the raw authoritative layer corresponding to
     /// `extended_base`.
     extended_revision: Option<String>,
+    /// Correlation id of the most recently queued extended-config CAS. The
+    /// sidecar editor records it so a terminal rejection can release only its
+    /// own busy state.
+    last_extended_save_operation_id: Option<String>,
+    completed_extended_save_rejections: BTreeMap<String, String>,
     /// Malformed known extended-config fields reported by the daemon during
     /// the most recent authoritative load.
     pub(super) extended_warnings: Vec<String>,
@@ -2974,6 +2981,13 @@ enum ImageSpendCompletion {
         page_instance_id: uuid::Uuid,
         message: String,
     },
+}
+
+struct SidecarAuthorityCompletion {
+    target: SettingsEffectTarget,
+    expected_daemon_instance_id: Option<String>,
+    expected_session_id: Option<String>,
+    response: Result<Response, String>,
 }
 
 #[derive(Clone)]
@@ -3227,8 +3241,14 @@ impl SettingsCx {
             // Extended and typed-document drafts are intentionally untouched:
             // the authoritative rejection proves their base revision was not
             // consumed, so the user can correct and submit the same draft.
-            PendingSettingsOperation::ExtendedSave { .. }
-            | PendingSettingsOperation::TypedDocumentEdit { .. } => {}
+            PendingSettingsOperation::ExtendedSave {
+                client_operation_id,
+                ..
+            } => {
+                self.completed_extended_save_rejections
+                    .insert(client_operation_id, message.clone());
+            }
+            PendingSettingsOperation::TypedDocumentEdit { .. } => {}
             _ => {
                 tracing::warn!("terminal settlement received for a non-settling settings action");
             }
@@ -3368,6 +3388,30 @@ impl SettingsCx {
         project_root: String,
         selection_id: String,
     ) {
+        let (expected_daemon_instance_id, expected_session_id) = match &request {
+            Request::GetImageSidecarAuthoritySnapshot {
+                expected_daemon_instance_id,
+                expected_session_id,
+                ..
+            }
+            | Request::CreateImageSidecarGrant {
+                expected_daemon_instance_id,
+                expected_session_id,
+                ..
+            }
+            | Request::RevokeImageSidecarGrant {
+                expected_daemon_instance_id,
+                expected_session_id,
+                ..
+            } => (
+                expected_daemon_instance_id.clone(),
+                expected_session_id.clone(),
+            ),
+            _ => {
+                self.extended_warnings = vec!["invalid image-sidecar authority request".into()];
+                return;
+            }
+        };
         let target = SettingsEffectTarget {
             surface: "settings.image-sidecar-authority",
             owner: project_root,
@@ -3376,7 +3420,11 @@ impl SettingsCx {
         let operation_id = self.enqueue_daemon_effect(target.clone(), request);
         self.pending_settings.insert(
             operation_id,
-            PendingSettingsOperation::SidecarAuthority { target },
+            PendingSettingsOperation::SidecarAuthority {
+                target,
+                expected_daemon_instance_id,
+                expected_session_id,
+            },
         );
     }
 
@@ -3384,11 +3432,23 @@ impl SettingsCx {
         &mut self,
         project_root: &str,
         selection_id: &str,
+        daemon_instance_id: &str,
+        session_id: &str,
     ) -> Option<Result<Response, String>> {
         let mut matching = None;
-        for (target, response) in self.completed_image_sidecar.drain(..) {
-            if target.owner == project_root && target.revision.as_deref() == Some(selection_id) {
-                matching = Some(response);
+        for completion in self.completed_image_sidecar.drain(..) {
+            if completion.target.owner == project_root
+                && completion.target.revision.as_deref() == Some(selection_id)
+                && completion
+                    .expected_daemon_instance_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == daemon_instance_id)
+                && completion
+                    .expected_session_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == session_id)
+            {
+                matching = Some(completion.response);
             }
             // Every other identity belongs to a closed/replaced page. It is
             // intentionally discarded rather than retained for a later page.
@@ -3528,6 +3588,7 @@ impl SettingsCx {
         let requested_path = self.extended_path.display().to_string();
         let snapshot_session_id = settings_snapshot_session_id().to_owned();
         let client_operation_id = uuid::Uuid::new_v4().to_string();
+        self.last_extended_save_operation_id = Some(client_operation_id.clone());
         let patch = cockpit_proto::ExtendedConfigPatch {
             operations: operations.clone(),
             materialize: false,
@@ -3570,6 +3631,16 @@ impl SettingsCx {
             },
         );
         Ok(SettingsSaveOutcome::Queued)
+    }
+
+    pub(super) fn last_extended_save_operation_id(&self) -> Option<&str> {
+        self.last_extended_save_operation_id.as_deref()
+    }
+
+    pub(super) fn extended_save_rejection(&self, operation_id: &str) -> Option<&str> {
+        self.completed_extended_save_rejections
+            .get(operation_id)
+            .map(String::as_str)
     }
 
     fn queue_after_extended_commit(
@@ -4031,10 +4102,19 @@ impl SettingsCx {
                     })],
                 }
             }
-            PendingSettingsOperation::SidecarAuthority { target } => {
+            PendingSettingsOperation::SidecarAuthority {
+                target,
+                expected_daemon_instance_id,
+                expected_session_id,
+            } => {
                 if completion.target == target {
                     self.completed_image_sidecar
-                        .push((target, completion.response));
+                        .push(SidecarAuthorityCompletion {
+                            target,
+                            expected_daemon_instance_id,
+                            expected_session_id,
+                            response: completion.response,
+                        });
                 }
             }
             PendingSettingsOperation::Followup { label, target } => {
@@ -6082,6 +6162,12 @@ impl SettingsDialog {
                     self.page
                         .downcast_ref::<image_sidecar::SidecarPage>()
                         .map_or("", |page| page.session.reducer.selection_id.as_str()),
+                    self.page
+                        .downcast_ref::<image_sidecar::SidecarPage>()
+                        .map_or("", |page| page.session.reducer.daemon_instance.as_str()),
+                    self.page
+                        .downcast_ref::<image_sidecar::SidecarPage>()
+                        .map_or("", |page| page.session.reducer.session_id.as_str()),
                 );
                 if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
                     page.apply_authoritative_settings_completion(&self.cx, sidecar_completion);
@@ -6662,6 +6748,8 @@ impl SettingsDialog {
                 extended,
                 extended_base,
                 extended_revision,
+                last_extended_save_operation_id: None,
+                completed_extended_save_rejections: BTreeMap::new(),
                 extended_warnings,
                 mcp_config,
                 mcp_authored_config: cockpit_core::mcp::config::McpConfig::default(),
@@ -7659,6 +7747,8 @@ impl SettingsPage for RootPage {
                                     project_root: project_id.clone(),
                                     config_generation,
                                     selection_id: selection_id.clone(),
+                                    expected_daemon_instance_id: None,
+                                    expected_session_id: None,
                                 },
                                 project_id.clone(),
                                 selection_id.clone(),

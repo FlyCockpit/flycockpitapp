@@ -6229,6 +6229,8 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
         }
         proto::Response::ImageSidecarAuthoritySnapshot(snapshot) => {
             snapshot.schema_version == 1
+                && !snapshot.daemon_instance_id.is_empty()
+                && !snapshot.session_id.is_empty()
                 && snapshot.project_id.len() <= 4096
                 && snapshot.selection_id.len() <= 128
                 && snapshot.grants.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
@@ -6258,6 +6260,8 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
         }
         proto::Response::ImageSidecarGrantMutated(mutation) => {
             mutation.schema_version == 1
+                && !mutation.daemon_instance_id.is_empty()
+                && !mutation.session_id.is_empty()
                 && mutation.selection_id.len() <= 128
                 && mutation.grant.grant_id.len() <= 128
                 && mutation.grant.destination.len() <= 2048

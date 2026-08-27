@@ -129,6 +129,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
         cache_ttl_secs: 3600,
         connect_timeout_secs: None,
         timeout_secs: None,
+        profiles: BTreeMap::new(),
     };
     // Validate required fields per transport up front.
     match transport {

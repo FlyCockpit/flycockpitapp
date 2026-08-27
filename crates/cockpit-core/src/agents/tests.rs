@@ -770,6 +770,7 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         prompt: "body".into(),
         prompt_overrides: std::collections::BTreeMap::new(),
         package_files: None,
+        mcp_bindings: Vec::new(),
         private_subagents: std::collections::BTreeMap::new(),
         source: "x.md".into(),
     }

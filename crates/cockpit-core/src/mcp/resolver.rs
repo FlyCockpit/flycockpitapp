@@ -51,8 +51,7 @@ impl McpScope {
     }
 }
 
-/// Implicit profile name for today's flat `auth` block.
-pub const DEFAULT_PROFILE: &str = "default";
+pub use super::config::DEFAULT_PROFILE;
 
 /// One server in the effective catalog, including the layer that defined it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +183,33 @@ impl EffectiveCatalog {
     pub fn get(&self, name: &str) -> Option<&CatalogEntry> {
         self.servers.get(name).filter(|entry| entry.is_live())
     }
+
+    fn apply_bindings(&mut self, bindings: &[crate::agents::McpBinding]) {
+        if bindings.is_empty() {
+            return;
+        }
+        let wanted: BTreeMap<&str, &str> = bindings
+            .iter()
+            .map(|binding| (binding.server.as_str(), binding.profile.as_str()))
+            .collect();
+        let mut next = BTreeMap::new();
+        for (name, mut entry) in std::mem::take(&mut self.servers) {
+            let Some(profile) = wanted.get(name.as_str()).copied() else {
+                continue;
+            };
+            if entry.server.auth_for_profile(profile).is_none() {
+                tracing::warn!(
+                    server = %name,
+                    profile,
+                    "skipping MCP binding that names an unknown credential profile"
+                );
+                continue;
+            }
+            entry.profile = profile.to_string();
+            next.insert(name, entry);
+        }
+        self.servers = next;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,6 +239,7 @@ pub struct EffectiveCatalogResolver {
     /// when the agent is rebuilt.
     agent_layer: Option<McpConfig>,
     agent_reserved_rejected: bool,
+    bindings: Vec<crate::agents::McpBinding>,
     inner: Mutex<Option<CachedCatalog>>,
 }
 
@@ -223,6 +250,7 @@ impl EffectiveCatalogResolver {
             config_generation: std::sync::atomic::AtomicU64::new(0),
             agent_layer: None,
             agent_reserved_rejected: false,
+            bindings: Vec::new(),
             inner: Mutex::new(Some(CachedCatalog {
                 fingerprint: CatalogFingerprint {
                     layers: Vec::new(),
@@ -239,12 +267,13 @@ impl EffectiveCatalogResolver {
             config_generation: std::sync::atomic::AtomicU64::new(0),
             agent_layer: None,
             agent_reserved_rejected: false,
+            bindings: Vec::new(),
             inner: Mutex::new(None),
         })
     }
 
     pub fn with_config_generation(cwd: impl Into<PathBuf>, generation: u64) -> Arc<Self> {
-        Self::for_agent_layer(cwd, generation, None, false)
+        Self::for_agent_layer(cwd, generation, None, false, Vec::new())
     }
 
     pub fn for_agent(
@@ -253,7 +282,7 @@ impl EffectiveCatalogResolver {
         def: &crate::agents::AgentDef,
     ) -> Arc<Self> {
         let (layer, reserved) = parse_agent_package_mcp(def);
-        Self::for_agent_layer(cwd, generation, layer, reserved)
+        Self::for_agent_layer(cwd, generation, layer, reserved, def.mcp_bindings.clone())
     }
 
     fn for_agent_layer(
@@ -261,12 +290,14 @@ impl EffectiveCatalogResolver {
         generation: u64,
         agent_layer: Option<McpConfig>,
         agent_reserved_rejected: bool,
+        bindings: Vec<crate::agents::McpBinding>,
     ) -> Arc<Self> {
         Arc::new(Self {
             cwd: cwd.into(),
             config_generation: std::sync::atomic::AtomicU64::new(generation),
             agent_layer,
             agent_reserved_rejected,
+            bindings,
             inner: Mutex::new(None),
         })
     }
@@ -277,6 +308,7 @@ impl EffectiveCatalogResolver {
             config_generation: std::sync::atomic::AtomicU64::new(0),
             agent_layer: None,
             agent_reserved_rejected: catalog.reserved_builtin_rejected,
+            bindings: Vec::new(),
             inner: Mutex::new(Some(CachedCatalog {
                 fingerprint: CatalogFingerprint {
                     layers: Vec::new(),
@@ -347,6 +379,7 @@ impl EffectiveCatalogResolver {
             self.agent_layer.as_ref(),
         );
         catalog.reserved_builtin_rejected |= self.agent_reserved_rejected;
+        catalog.apply_bindings(&self.bindings);
         catalog
     }
 }
@@ -582,6 +615,7 @@ mod tests {
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,
                 timeout_secs: None,
+                profiles: BTreeMap::new(),
             },
         );
         let catalog = EffectiveCatalog::from_mcp_config(&cfg);
@@ -606,6 +640,7 @@ mod tests {
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,
             timeout_secs: None,
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -707,6 +742,30 @@ mod tests {
             assert_eq!(catalog.servers["agent_only"].source, McpScope::Agent);
             assert_eq!(catalog.servers["global_only"].source, McpScope::Global);
         });
+    }
+
+    #[test]
+    fn bindings_select_profile_and_hide_unbound_servers() {
+        let mut catalog = EffectiveCatalog::default();
+        catalog.merge_layer(named_cfg("alpha", "https://a/mcp"), McpScope::Global);
+        catalog.merge_layer(named_cfg("beta", "https://b/mcp"), McpScope::Global);
+        catalog.servers.get_mut("alpha").unwrap().server.profiles.insert(
+            "admin".into(),
+            crate::mcp::config::Auth::Header(crate::mcp::config::HeaderAuth {
+                header: "Authorization".into(),
+                value: "Bearer $ADMIN".into(),
+                credential_ref: None,
+            }),
+        );
+        catalog.apply_bindings(&[
+            crate::agents::McpBinding {
+                server: "alpha".into(),
+                profile: "admin".into(),
+            },
+        ]);
+        assert!(catalog.servers.contains_key("alpha"));
+        assert!(!catalog.servers.contains_key("beta"));
+        assert_eq!(catalog.servers["alpha"].profile, "admin");
     }
 
     #[test]

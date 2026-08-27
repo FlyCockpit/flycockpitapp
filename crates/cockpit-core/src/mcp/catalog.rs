@@ -75,12 +75,15 @@ async fn list_tools_for_entry(
     entry: &CatalogEntry,
     context: McpConnectContext,
 ) -> Result<Vec<ToolDescriptor>> {
+    let cfg = entry
+        .server
+        .with_selected_profile(&entry.name, &entry.profile)?;
     list_tools_cached_identified(
         &entry.name,
-        &entry.server,
+        &cfg,
         entry.source,
         &entry.profile,
-        context,
+        context.with_profile(entry.profile.clone()),
     )
     .await
 }
@@ -309,7 +312,9 @@ pub async fn invoke(
         }
         bail!("unknown MCP server `{server}`");
     };
-    let server_cfg = &entry.server;
+    let server_cfg = entry
+        .server
+        .with_selected_profile(server, &entry.profile)?;
     if !server_cfg.enabled {
         bail!("MCP server `{server}` is disabled");
     }
@@ -360,7 +365,12 @@ pub async fn invoke(
         }
         bail!("unknown MCP tool `{server}.{tool}`");
     }
-    let mut conn = client::connect_with_context(server, server_cfg, connect_context(host)).await?;
+    let mut conn = client::connect_with_context(
+        server,
+        &server_cfg,
+        connect_context(host).with_profile(entry.profile.clone()),
+    )
+    .await?;
     // `tools/call` is a distinct remote effect from client initialization.
     // Recheck the task-local capability after discovery/connect and directly
     // before the outbound request is issued.
@@ -483,6 +493,7 @@ mod tests {
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,
             timeout_secs: None,
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -564,6 +575,7 @@ for line in sys.stdin:
             cache_ttl_secs: 0,
             connect_timeout_secs: None,
             timeout_secs: None,
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -734,6 +746,7 @@ for line in sys.stdin:
                 cache_ttl_secs: 0,
                 connect_timeout_secs: None,
                 timeout_secs: None,
+                profiles: BTreeMap::new(),
             },
         );
 
@@ -907,6 +920,7 @@ for line in sys.stdin:
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,
                 timeout_secs: None,
+                profiles: BTreeMap::new(),
             },
         );
         let host = HostContext::empty_for_tests();

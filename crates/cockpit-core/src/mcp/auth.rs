@@ -26,14 +26,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use super::config::{Auth, OauthAuth, ServerConfig};
+use super::config::{Auth, DEFAULT_PROFILE, OauthAuth, ServerConfig};
 
 const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The credential-store key for a server's OAuth tokens.
 pub fn cred_key(server: &str) -> String {
-    format!("mcp:{server}")
+    cred_key_for(server, crate::mcp::config::DEFAULT_PROFILE)
+}
+
+pub fn cred_key_for(server: &str, profile: &str) -> String {
+    if profile == crate::mcp::config::DEFAULT_PROFILE {
+        format!("mcp:{server}")
+    } else {
+        format!("mcp:{server}:{profile}")
+    }
 }
 
 /// Every named-secret id this server's auth references: header/env credential
@@ -44,31 +52,77 @@ pub fn named_secret_references(
     server: &str,
     cfg: &ServerConfig,
 ) -> std::collections::BTreeSet<String> {
+    named_secret_references_for(server, cfg, crate::mcp::config::DEFAULT_PROFILE)
+}
+
+pub fn named_secret_references_for(
+    server: &str,
+    cfg: &ServerConfig,
+    profile: &str,
+) -> std::collections::BTreeSet<String> {
     let mut refs: std::collections::BTreeSet<String> =
         cfg.env_credential_refs.values().cloned().collect();
-    match &cfg.auth {
-        Auth::Header(header) => {
-            if let Some(name) = &header.credential_ref {
-                refs.insert(name.clone());
-            }
-        }
-        Auth::Env(env) => {
-            refs.extend(env.credential_refs.values().cloned());
-        }
-        Auth::Oauth(_) => {
-            refs.insert(cred_key(server));
-        }
-        Auth::None => {}
+    collect_auth_secret_refs(&mut refs, server, profile, &cfg.auth);
+    for (name, auth) in &cfg.profiles {
+        collect_auth_secret_refs(&mut refs, server, name, auth);
+    }
+    if let Ok(selected) = cfg.auth_for_profile_named(server, profile) {
+        collect_auth_secret_refs(&mut refs, server, profile, selected);
     }
     refs
 }
 
+fn collect_auth_secret_refs(
+    refs: &mut std::collections::BTreeSet<String>,
+    server: &str,
+    profile: &str,
+    auth: &Auth,
+) {
+    match auth {
+        Auth::Header(header) => {
+            if let Some(name) = &header.credential_ref {
+                refs.insert(name.clone());
+            }
+            refs.insert(header_cred_key_for(server, profile));
+        }
+        Auth::Env(env) => {
+            refs.extend(env.credential_refs.values().cloned());
+            for env_name in env.vars.keys().chain(env.credential_refs.keys()) {
+                refs.insert(auth_env_cred_key_for(server, profile, env_name));
+            }
+        }
+        Auth::Oauth(_) => {
+            refs.insert(cred_key_for(server, profile));
+            if profile == crate::mcp::config::DEFAULT_PROFILE {
+                refs.insert(format!("mcp:{server}"));
+            }
+        }
+        Auth::None => {}
+    }
+}
+
 pub fn header_cred_key(server: &str) -> String {
-    format!("mcp:{server}:header")
+    header_cred_key_for(server, crate::mcp::config::DEFAULT_PROFILE)
+}
+
+pub fn header_cred_key_for(server: &str, profile: &str) -> String {
+    if profile == crate::mcp::config::DEFAULT_PROFILE {
+        format!("mcp:{server}:header")
+    } else {
+        format!("mcp:{server}:{profile}:header")
+    }
 }
 
 pub fn auth_env_cred_key(server: &str, env_name: &str) -> String {
-    format!("mcp:{server}:auth-env:{env_name}")
+    auth_env_cred_key_for(server, crate::mcp::config::DEFAULT_PROFILE, env_name)
+}
+
+pub fn auth_env_cred_key_for(server: &str, profile: &str, env_name: &str) -> String {
+    if profile == crate::mcp::config::DEFAULT_PROFILE {
+        format!("mcp:{server}:auth-env:{env_name}")
+    } else {
+        format!("mcp:{server}:{profile}:auth-env:{env_name}")
+    }
 }
 
 pub fn base_env_cred_key(server: &str, env_name: &str) -> String {
@@ -165,9 +219,9 @@ fn resolve_static_inner(
             }
         }
     }
-    // Base subprocess env (stdio) with $VAR resolution.
+    // Base subprocess env (stdio) with $VAR / `$secret:` resolution.
     for (k, v) in &cfg.env {
-        let r = crate::envref::resolve(v);
+        let r = crate::envref::resolve_with_store(v, store);
         out.env.insert(k.clone(), r.value);
         out.missing_env.extend(r.missing);
         out.missing_env.extend(r.errors);
@@ -183,7 +237,7 @@ fn resolve_static_inner(
                     out.missing_env.push(format!("credential:{credential_ref}"));
                 }
             } else {
-                let r = crate::envref::resolve(&h.value);
+                let r = crate::envref::resolve_with_store(&h.value, store);
                 if r.has_missing() || r.has_errors() {
                     out.missing_env.extend(r.missing.iter().cloned());
                     for missing in &r.missing {
@@ -214,7 +268,7 @@ fn resolve_static_inner(
                 }
             }
             for (k, v) in &e.vars {
-                let r = crate::envref::resolve(v);
+                let r = crate::envref::resolve_with_store(v, store);
                 out.env.insert(k.clone(), r.value);
                 out.missing_env.extend(r.missing);
                 out.missing_env.extend(r.errors);
@@ -264,6 +318,23 @@ pub async fn oauth_bearer_with_store(
     store: Option<&mut crate::credentials::CredentialStore>,
     project_root: Option<&str>,
 ) -> Result<Option<String>> {
+    oauth_bearer_with_store_for(
+        server,
+        crate::mcp::config::DEFAULT_PROFILE,
+        cfg,
+        store,
+        project_root,
+    )
+    .await
+}
+
+pub async fn oauth_bearer_with_store_for(
+    server: &str,
+    profile: &str,
+    cfg: &ServerConfig,
+    store: Option<&mut crate::credentials::CredentialStore>,
+    project_root: Option<&str>,
+) -> Result<Option<String>> {
     let Auth::Oauth(oauth) = &cfg.auth else {
         return Ok(None);
     };
@@ -271,7 +342,7 @@ pub async fn oauth_bearer_with_store(
         Some(store) => store,
         None => anyhow::bail!("MCP server `{server}` requires an injected credential store"),
     };
-    let key = cred_key(server);
+    let key = cred_key_for(server, profile);
     let mut tokens = stored_tokens_from_store(store, &key)?.ok_or_else(|| {
         anyhow::anyhow!(
             "MCP server `{server}` requires OAuth — run `authenticate` in /settings → MCP first"
@@ -691,12 +762,55 @@ mod tests {
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,
             timeout_secs: None,
+            profiles: BTreeMap::new(),
         }
     }
 
     #[test]
     fn cred_key_namespaces_server() {
         assert_eq!(cred_key("github"), "mcp:github");
+        assert_eq!(cred_key_for("github", DEFAULT_PROFILE), "mcp:github");
+        assert_eq!(cred_key_for("github", "admin"), "mcp:github:admin");
+        assert_eq!(
+            header_cred_key_for("github", "admin"),
+            "mcp:github:admin:header"
+        );
+    }
+
+    #[test]
+    fn header_secret_refs_are_reported_missing_without_store() {
+        let mut cfg = base_server();
+        cfg.auth = Auth::Header(crate::mcp::config::HeaderAuth {
+            header: "Authorization".into(),
+            value: "Bearer $secret:foo".into(),
+            credential_ref: None,
+        });
+        let resolved = resolve_static_for_server("svc", &cfg);
+        assert!(
+            resolved
+                .missing_env
+                .iter()
+                .any(|m| m.contains("secret:foo")),
+            "store-backed resolver must see $secret: refs, got {:?}",
+            resolved.missing_env
+        );
+    }
+
+    #[test]
+    fn named_secret_references_include_profile_keys() {
+        let mut cfg = base_server();
+        cfg.auth = Auth::Header(crate::mcp::config::HeaderAuth {
+            header: "Authorization".into(),
+            value: "Bearer $secret:foo".into(),
+            credential_ref: None,
+        });
+        cfg.profiles.insert(
+            "admin".into(),
+            Auth::Oauth(crate::mcp::config::OauthAuth::default()),
+        );
+        let refs = named_secret_references_for("svc", &cfg, "admin");
+        assert!(refs.contains("mcp:svc:admin"), "{refs:?}");
+        assert!(refs.contains("mcp:svc:header"), "{refs:?}");
     }
 
     #[test]

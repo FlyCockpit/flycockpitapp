@@ -2107,6 +2107,7 @@ mod tests {
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,
                 timeout_secs: None,
+                profiles: BTreeMap::new(),
             },
         );
         let calls = Arc::new(AtomicUsize::new(0));

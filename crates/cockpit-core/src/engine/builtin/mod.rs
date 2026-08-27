@@ -4271,6 +4271,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("graph-user.md"),
         };
@@ -4320,6 +4321,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
@@ -4442,6 +4444,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-with-disabled-tool.md"),
         };
@@ -4544,6 +4547,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("Build.md"),
         };
@@ -4605,6 +4609,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
@@ -4648,6 +4653,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
@@ -4698,6 +4704,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
@@ -4794,6 +4801,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
@@ -5213,6 +5221,7 @@ mod tests {
                 prompt: "body".to_string(),
                 prompt_overrides: std::collections::BTreeMap::new(),
                 package_files: None,
+        mcp_bindings: Vec::new(),
                 private_subagents: std::collections::BTreeMap::new(),
                 source: tmp.path().join(format!("user-{tool}.md")),
             };
@@ -6615,6 +6624,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::from("builder.md"),
         };
@@ -6668,6 +6678,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-reader.md"),
         };
@@ -6869,6 +6880,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }

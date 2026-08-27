@@ -241,6 +241,18 @@ impl PostureResolution {
     }
 }
 
+/// Binding of one MCP server onto an agent, with a named credential profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpBinding {
+    pub server: String,
+    #[serde(default = "default_mcp_profile")]
+    pub profile: String,
+}
+
+fn default_mcp_profile() -> String {
+    crate::mcp::config::DEFAULT_PROFILE.to_string()
+}
+
 /// A fully-resolved agent definition: the embedded default for a
 /// built-in, or a user-authored file on disk. The `model`/`temperature`/
 /// `tools` here are what the engine builds the agent from — an edited
@@ -336,6 +348,11 @@ pub struct AgentDef {
     /// pre-package `to_markdown()` preimage.
     #[serde(skip)]
     pub package_files: Option<BTreeMap<String, Vec<u8>>>,
+    /// Per-agent MCP bindings (`mcpBindings` in frontmatter): which servers
+    /// this agent gets, and with which credential profile. Empty means every
+    /// catalog server with the implicit `default` profile.
+    #[serde(default, skip)]
+    pub mcp_bindings: Vec<McpBinding>,
     /// Private subagent definitions loaded from `subagents/<child>.md`.
     /// Resolvable only through this parent's `allowed_children` (Stage 3).
     #[serde(skip)]
@@ -1325,6 +1342,8 @@ fn parse_agent_with_scope(
         tool_steering: Option<ToolSteering>,
         #[serde(rename = "contextPolicy", default)]
         context_policy: Option<ContextPolicy>,
+        #[serde(rename = "mcpBindings", default)]
+        mcp_bindings: Vec<McpBinding>,
     }
 
     if fm_raw.trim().is_empty() {
@@ -1480,6 +1499,7 @@ fn parse_agent_with_scope(
         prompt: body.trim_start_matches('\n').trim_end().to_string(),
         prompt_overrides: std::collections::BTreeMap::new(),
         package_files: None,
+        mcp_bindings: fm.mcp_bindings,
         private_subagents: BTreeMap::new(),
         source,
     })

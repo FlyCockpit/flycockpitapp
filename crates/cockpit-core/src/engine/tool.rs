@@ -1490,6 +1490,7 @@ mod capability_tests {
             prompt: String::new(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+        mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         };

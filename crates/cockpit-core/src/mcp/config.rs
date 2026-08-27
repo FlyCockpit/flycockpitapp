@@ -193,6 +193,11 @@ pub struct ServerConfig {
     /// message. Defaults to 120.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+
+    /// Named credential profiles. Omitted in existing configs; the flat
+    /// [`Self::auth`] block is the implicit `default` profile.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, Auth>,
 }
 
 /// Whether this server carries credential-store references, OAuth state, or
@@ -206,7 +211,13 @@ pub fn server_has_credential_material(server: &ServerConfig) -> bool {
     {
         return true;
     }
-    match &server.auth {
+    server
+        .iter_auth_profiles()
+        .any(|(_, auth)| auth_has_credential_material(auth))
+}
+
+fn auth_has_credential_material(auth: &Auth) -> bool {
+    match auth {
         Auth::Header(header) => {
             header.credential_ref.is_some()
                 || (!header.value.trim().is_empty() && !header.value.trim_start().starts_with('$'))
@@ -282,17 +293,60 @@ impl ServerConfig {
     }
 
     pub fn validate_transport_auth(&self, name: &str) -> Result<()> {
-        match (&self.transport, &self.auth) {
-            (Transport::Stdio, Auth::Oauth(_) | Auth::Header(_)) => {
-                anyhow::bail!("MCP server `{name}` uses incompatible stdio auth")
+        for (profile, auth) in self.iter_auth_profiles() {
+            match (&self.transport, auth) {
+                (Transport::Stdio, Auth::Oauth(_) | Auth::Header(_)) => {
+                    anyhow::bail!(
+                        "MCP server `{name}` profile `{profile}` uses incompatible stdio auth"
+                    )
+                }
+                (Transport::Streamable | Transport::Sse, Auth::Env(_)) => {
+                    anyhow::bail!(
+                        "MCP server `{name}` profile `{profile}` uses env auth on a remote transport"
+                    )
+                }
+                _ => {}
             }
-            (Transport::Streamable | Transport::Sse, Auth::Env(_)) => {
-                anyhow::bail!("MCP server `{name}` uses env auth on a remote transport")
-            }
-            _ => Ok(()),
         }
+        Ok(())
+    }
+
+    /// Auth block for `profile`. The implicit `default` profile is the flat
+    /// `auth` field unless `profiles.default` is present.
+    pub fn auth_for_profile(&self, profile: &str) -> Option<&Auth> {
+        if let Some(auth) = self.profiles.get(profile) {
+            return Some(auth);
+        }
+        if profile == DEFAULT_PROFILE {
+            return Some(&self.auth);
+        }
+        None
+    }
+
+    pub fn auth_for_profile_named(&self, server: &str, profile: &str) -> Result<&Auth> {
+        self.auth_for_profile(profile).ok_or_else(|| {
+            anyhow::anyhow!("MCP server `{server}` has no credential profile `{profile}`")
+        })
+    }
+
+    pub fn iter_auth_profiles(&self) -> impl Iterator<Item = (&str, &Auth)> {
+        let skip_flat = self.profiles.contains_key(DEFAULT_PROFILE);
+        let flat = (!skip_flat).then_some((DEFAULT_PROFILE, &self.auth));
+        flat.into_iter()
+            .chain(self.profiles.iter().map(|(k, v)| (k.as_str(), v)))
+    }
+
+    /// Clone this config with `auth` set to the selected profile so connect
+    /// paths keep a single auth block.
+    pub fn with_selected_profile(&self, server: &str, profile: &str) -> Result<Self> {
+        let mut out = self.clone();
+        out.auth = self.auth_for_profile_named(server, profile)?.clone();
+        Ok(out)
     }
 }
+
+/// Implicit profile name for today's flat `auth` block.
+pub const DEFAULT_PROFILE: &str = "default";
 
 /// The whole `mcp.json` document.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -463,31 +517,38 @@ pub fn redact_config_for_owner_view(config: &mut McpConfig) {
                 *value = OWNER_VIEW_REDACTED_SENTINEL.to_string();
             }
         }
-        match &mut server.auth {
-            Auth::Header(header) => {
-                if !header.value.trim_start().starts_with('$') {
-                    header.value = OWNER_VIEW_REDACTED_SENTINEL.to_string();
-                }
-            }
-            Auth::Env(env) => {
-                for value in env.vars.values_mut() {
-                    if !value.trim_start().starts_with('$') {
-                        *value = OWNER_VIEW_REDACTED_SENTINEL.to_string();
-                    }
-                }
-            }
-            Auth::Oauth(oauth) => {
-                oauth.authorize_url = oauth
-                    .authorize_url
-                    .as_deref()
-                    .map(cockpit_proto::redact_url_for_owner_view);
-                oauth.token_url = oauth
-                    .token_url
-                    .as_deref()
-                    .map(cockpit_proto::redact_url_for_owner_view);
-            }
-            Auth::None => {}
+        redact_auth(&mut server.auth);
+        for auth in server.profiles.values_mut() {
+            redact_auth(auth);
         }
+    }
+}
+
+fn redact_auth(auth: &mut Auth) {
+    match auth {
+        Auth::Header(header) => {
+            if !header.value.trim_start().starts_with('$') {
+                header.value = OWNER_VIEW_REDACTED_SENTINEL.to_string();
+            }
+        }
+        Auth::Env(env) => {
+            for value in env.vars.values_mut() {
+                if !value.trim_start().starts_with('$') {
+                    *value = OWNER_VIEW_REDACTED_SENTINEL.to_string();
+                }
+            }
+        }
+        Auth::Oauth(oauth) => {
+            oauth.authorize_url = oauth
+                .authorize_url
+                .as_deref()
+                .map(cockpit_proto::redact_url_for_owner_view);
+            oauth.token_url = oauth
+                .token_url
+                .as_deref()
+                .map(cockpit_proto::redact_url_for_owner_view);
+        }
+        Auth::None => {}
     }
 }
 
@@ -588,6 +649,47 @@ pub fn restore_owner_view_redactions(
             }
             _ => {}
         }
+        for (profile, auth) in &mut server.profiles {
+            let Some(prior_auth) = prior_server.profiles.get(profile) else {
+                continue;
+            };
+            match (auth, prior_auth) {
+                (Auth::Header(header), Auth::Header(prior_header)) => {
+                    if header.value == OWNER_VIEW_REDACTED_SENTINEL {
+                        header.value.clone_from(&prior_header.value);
+                        stage_restored_literal(
+                            &mut restored,
+                            header.credential_ref.as_ref(),
+                            || crate::mcp::auth::header_cred_key_for(name, profile),
+                            &prior_header.value,
+                        );
+                    }
+                }
+                (Auth::Env(env), Auth::Env(prior_env)) => {
+                    for (key, value) in &mut env.vars {
+                        if value == OWNER_VIEW_REDACTED_SENTINEL
+                            && let Some(prior_value) = prior_env.vars.get(key)
+                        {
+                            value.clone_from(prior_value);
+                            stage_restored_literal(
+                                &mut restored,
+                                env.credential_refs.get(key),
+                                || crate::mcp::auth::auth_env_cred_key_for(name, profile, key),
+                                prior_value,
+                            );
+                        }
+                    }
+                }
+                (Auth::Oauth(oauth), Auth::Oauth(prior_oauth)) => {
+                    restore_redacted_url(
+                        &mut oauth.authorize_url,
+                        prior_oauth.authorize_url.as_deref(),
+                    );
+                    restore_redacted_url(&mut oauth.token_url, prior_oauth.token_url.as_deref());
+                }
+                _ => {}
+            }
+        }
     }
     restored
 }
@@ -613,6 +715,7 @@ mod tests {
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,
             timeout_secs: None,
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -815,6 +918,7 @@ mod tests {
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,
                 timeout_secs: None,
+                profiles: BTreeMap::new(),
             },
         );
 
@@ -928,6 +1032,51 @@ mod tests {
     fn empty_doc_is_default() {
         assert!(McpConfig::parse("").unwrap().servers.is_empty());
         assert!(McpConfig::parse("{}").unwrap().servers.is_empty());
+    }
+
+    #[test]
+    fn flat_auth_round_trips_without_profiles_key() {
+        let raw = r#"{ "servers": { "s": {
+          "transport": "streamable", "endpoint": "https://x/mcp",
+          "auth": { "kind": "header", "value": "Bearer $T" }
+        } } }"#;
+        let cfg = McpConfig::parse(raw).unwrap();
+        assert!(cfg.servers["s"].profiles.is_empty());
+        assert_eq!(
+            cfg.servers["s"]
+                .auth_for_profile(DEFAULT_PROFILE)
+                .unwrap()
+                .kind_str(),
+            "header"
+        );
+        let dumped = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            dumped["servers"]["s"].get("profiles").is_none(),
+            "implicit default must not emit a profiles object: {dumped}"
+        );
+    }
+
+    #[test]
+    fn named_profiles_select_independently_of_flat_auth() {
+        let raw = r#"{ "servers": { "s": {
+          "transport": "streamable", "endpoint": "https://x/mcp",
+          "auth": { "kind": "header", "value": "Bearer $USER" },
+          "profiles": {
+            "admin": { "kind": "header", "value": "Bearer $ADMIN" },
+            "user": { "kind": "header", "value": "Bearer $USER" }
+          }
+        } } }"#;
+        let cfg = McpConfig::parse(raw).unwrap();
+        let server = &cfg.servers["s"];
+        assert_eq!(
+            server.auth_for_profile("admin").unwrap().kind_str(),
+            "header"
+        );
+        let Auth::Header(admin) = server.auth_for_profile("admin").unwrap() else {
+            panic!("admin profile");
+        };
+        assert_eq!(admin.value, "Bearer $ADMIN");
+        assert!(server.auth_for_profile("missing").is_none());
     }
 
     #[test]

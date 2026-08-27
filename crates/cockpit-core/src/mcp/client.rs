@@ -20,7 +20,7 @@ use super::transport::{
     stdio::{StdioAbandonScope, StdioClient, StdioRuntimeContext},
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct McpConnectContext {
     cancel: Option<CancellationToken>,
     stdio_abandon_scope: Option<StdioAbandonScope>,
@@ -32,6 +32,21 @@ pub struct McpConnectContext {
     /// [`Self::from_tool_ctx`]); resolution then only sees `mcp:` secrets owned
     /// by this server/root.
     project_root: Option<String>,
+    credential_profile: String,
+}
+
+impl Default for McpConnectContext {
+    fn default() -> Self {
+        Self {
+            cancel: None,
+            stdio_abandon_scope: None,
+            approver: None,
+            approval_mode: ApprovalMode::default(),
+            vault: None,
+            project_root: None,
+            credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
+        }
+    }
 }
 
 impl McpConnectContext {
@@ -46,7 +61,13 @@ impl McpConnectContext {
             approval_mode: ctx.session.approval_mode(),
             vault: Some(ctx.session.secret_vault().clone()),
             project_root: Some(ctx.session.project_root.display().to_string()),
+            credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
         }
+    }
+
+    pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
+        self.credential_profile = profile.into();
+        self
     }
 
     async fn authorize_connect(&self, name: &str, cfg: &ServerConfig) -> Result<()> {
@@ -94,12 +115,12 @@ fn server_requires_secret_store(cfg: &ServerConfig) -> bool {
     if !cfg.env_credential_refs.is_empty() {
         return true;
     }
-    match &cfg.auth {
+    cfg.iter_auth_profiles().any(|(_, auth)| match auth {
         Auth::Header(header) => header.credential_ref.is_some(),
         Auth::Env(env) => !env.credential_refs.is_empty(),
         Auth::Oauth(_) => true,
         Auth::None => false,
-    }
+    })
 }
 
 /// Build and `initialize` a client for `server`, applying its auth.
@@ -143,7 +164,7 @@ pub async fn connect_with_context(
                 vault.clone(),
                 crate::secret_ownership::OWNER_KIND_MCP,
                 project_root,
-                &auth::named_secret_references(name, cfg),
+                &auth::named_secret_references_for(name, cfg, &context.credential_profile),
                 // The MCP connect boundary has no cross-config scan; sole-ownership
                 // of an unclaimed legacy name is unprovable, so never lazily claim
                 // (fail closed on unclaimed). Owned `mcp:` names still resolve.
@@ -160,8 +181,14 @@ pub async fn connect_with_context(
     }
     let mut resolved = auth::resolve_static_for_server_with_store(name, cfg, store.as_ref());
     // OAuth bearer (async; refreshes if expired) → Authorization header.
-    if let Some(bearer) =
-        auth::oauth_bearer_with_store(name, cfg, store.as_mut(), canonical_root.as_deref()).await?
+    if let Some(bearer) = auth::oauth_bearer_with_store_for(
+        name,
+        &context.credential_profile,
+        cfg,
+        store.as_mut(),
+        canonical_root.as_deref(),
+    )
+    .await?
     {
         resolved.headers.insert("Authorization".to_string(), bearer);
     }
@@ -277,6 +304,7 @@ mod tests {
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,
             timeout_secs: None,
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -294,6 +322,7 @@ mod tests {
             cache_ttl_secs: 0,
             connect_timeout_secs: None,
             timeout_secs: None,
+            profiles: BTreeMap::new(),
         }
     }
 

@@ -186,6 +186,7 @@ fn def_with_normal(
         prompt: body,
         prompt_overrides: std::collections::BTreeMap::new(),
         package_files: None,
+        mcp_bindings: Vec::new(),
         private_subagents: std::collections::BTreeMap::new(),
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),

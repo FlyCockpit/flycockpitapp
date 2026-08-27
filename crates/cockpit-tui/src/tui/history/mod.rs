@@ -1014,14 +1014,7 @@ pub fn render_entry(
             new,
         } => {
             let lines = crate::tui::diff::render_diff(
-                tool,
-                path,
-                old,
-                new,
-                diff_style,
-                width,
-                emojis,
-                file_icons,
+                tool, path, old, new, diff_style, width, emojis, file_icons,
             );
             let continuations = vec![false; lines.len()];
             Rendered {
@@ -1040,7 +1033,15 @@ pub fn render_entry(
             calls,
             view_offset,
             follow,
-        } => render_toolbox(calls, *view_offset, *follow, width, emojis, file_icons, elided),
+        } => render_toolbox(
+            calls,
+            *view_offset,
+            *follow,
+            width,
+            emojis,
+            file_icons,
+            elided,
+        ),
         HistoryEntry::ToolLine {
             tool,
             summary,

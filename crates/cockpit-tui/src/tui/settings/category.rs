@@ -109,9 +109,7 @@ fn cycle_file_icons(v: FileIconsSetting) -> FileIconsSetting {
 
 fn file_icons_label(v: FileIconsSetting) -> &'static str {
     match v {
-        FileIconsSetting::Auto => {
-            "auto (default — nerd-font icons on kitty/WezTerm/Ghostty)"
-        }
+        FileIconsSetting::Auto => "auto (default — nerd-font icons on kitty/WezTerm/Ghostty)",
         FileIconsSetting::On => "on (always show file-type icons on write/edit)",
         FileIconsSetting::Off => "off (no file-type icons)",
     }

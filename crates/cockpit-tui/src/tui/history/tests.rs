@@ -1155,13 +1155,15 @@ fn tool_progress_narrow_width_degrades() {
         unit: "files".to_string(),
     });
 
-    let without_bar =
-        line_text(&render_toolbox(&[call.clone()], 0, true, 25, false, false, &no_elided()).lines[0]);
+    let without_bar = line_text(
+        &render_toolbox(&[call.clone()], 0, true, 25, false, false, &no_elided()).lines[0],
+    );
     assert!(!without_bar.contains('['), "{without_bar}");
     assert!(without_bar.contains("3/10 files"), "{without_bar}");
 
-    let without_unit =
-        line_text(&render_toolbox(&[call.clone()], 0, true, 18, false, false, &no_elided()).lines[0]);
+    let without_unit = line_text(
+        &render_toolbox(&[call.clone()], 0, true, 18, false, false, &no_elided()).lines[0],
+    );
     assert!(!without_unit.contains("files"), "{without_unit}");
     assert!(without_unit.contains("3/10"), "{without_unit}");
 
@@ -1281,7 +1283,15 @@ fn mcp_call_without_children_renders_as_today() {
         ToolCallState::Success,
     );
 
-    let lines = rendered_text(&render_toolbox(&[call], 0, true, 120, false, false, &no_elided()));
+    let lines = rendered_text(&render_toolbox(
+        &[call],
+        0,
+        true,
+        120,
+        false,
+        false,
+        &no_elided(),
+    ));
 
     assert_eq!(
         lines,
@@ -1959,7 +1969,15 @@ fn toolbox_expanded_shows_read_output_but_not_unlock_output() {
     unlock.expanded = true;
     unlock.output = "SHOULD_NOT_SHOW".into();
 
-    let r = render_toolbox(&[bash, read, unlock], 0, true, 80, false, false, &no_elided());
+    let r = render_toolbox(
+        &[bash, read, unlock],
+        0,
+        true,
+        80,
+        false,
+        false,
+        &no_elided(),
+    );
     let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
     assert!(joined.contains("file_a") && joined.contains("file_b"));
@@ -2024,7 +2042,15 @@ fn toolbox_expands_only_the_selected_call() {
     collapsed.full_input = "cmd2\nSHOULD_NOT_SHOW".into();
     collapsed.output = "neighbor output".into();
 
-    let r = render_toolbox(&[expanded, collapsed], 0, true, 80, false, false, &no_elided());
+    let r = render_toolbox(
+        &[expanded, collapsed],
+        0,
+        true,
+        80,
+        false,
+        false,
+        &no_elided(),
+    );
     let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
     assert!(joined.contains("continued"));
@@ -2261,7 +2287,13 @@ fn write_edit_lines_show_file_type_icon_from_summary_path() {
     assert!(!bash_emoji.contains(rust_icon), "{bash_emoji:?}");
     assert!(!bash_emoji.is_empty(), "bash still shows its emoji glyph");
 
-    for tool in ["edit", "writeunlock", "editunlock", "plan_write", "plan_edit"] {
+    for tool in [
+        "edit",
+        "writeunlock",
+        "editunlock",
+        "plan_write",
+        "plan_edit",
+    ] {
         let call = mk_call(tool, "src/main.rs", ToolCallState::Success);
         let (glyph, _) = tool_call_glyph_label(&call, false, true);
         assert!(

@@ -40,10 +40,7 @@ pub fn glyph_for_tool_path(tool: &str, path: &str) -> Option<&'static str> {
 pub fn glyph_for_path(path: &str) -> &'static str {
     let path = path.trim();
     let p = Path::new(path);
-    let file_name = p
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path);
+    let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(path);
 
     if let Some(glyph) = glyph_for_filename(file_name) {
         return glyph;
@@ -303,13 +300,93 @@ mod tests {
     /// Extensions covered by `crates/cockpit-db/src/db/lang.rs` plus the
     /// extra TypeScript suffixes from the intel/highlight tables.
     const LANG_EXTENSIONS: &[&str] = &[
-        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "html", "htm", "css", "scss", "sass", "less",
-        "vue", "svelte", "py", "pyi", "go", "rb", "rake", "java", "kt", "kts", "swift", "scala",
-        "cs", "fs", "fsi", "c", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "h", "m", "mm", "zig",
-        "nim", "sh", "bash", "zsh", "fish", "ps1", "lua", "pl", "pm", "php", "r", "json", "jsonc",
-        "json5", "toml", "yaml", "yml", "xml", "sql", "proto", "graphql", "gql", "md", "markdown",
-        "tex", "rst", "dockerfile", "makefile", "mk", "nix", "tf", "tfvars", "hcl", "ex", "exs",
-        "erl", "hrl", "elm", "dart", "ml", "mli", "hs", "lhs", "clj", "cljs", "cljc", "edn", "mts",
+        "rs",
+        "ts",
+        "tsx",
+        "js",
+        "jsx",
+        "mjs",
+        "cjs",
+        "html",
+        "htm",
+        "css",
+        "scss",
+        "sass",
+        "less",
+        "vue",
+        "svelte",
+        "py",
+        "pyi",
+        "go",
+        "rb",
+        "rake",
+        "java",
+        "kt",
+        "kts",
+        "swift",
+        "scala",
+        "cs",
+        "fs",
+        "fsi",
+        "c",
+        "cc",
+        "cpp",
+        "cxx",
+        "hpp",
+        "hh",
+        "hxx",
+        "h",
+        "m",
+        "mm",
+        "zig",
+        "nim",
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "ps1",
+        "lua",
+        "pl",
+        "pm",
+        "php",
+        "r",
+        "json",
+        "jsonc",
+        "json5",
+        "toml",
+        "yaml",
+        "yml",
+        "xml",
+        "sql",
+        "proto",
+        "graphql",
+        "gql",
+        "md",
+        "markdown",
+        "tex",
+        "rst",
+        "dockerfile",
+        "makefile",
+        "mk",
+        "nix",
+        "tf",
+        "tfvars",
+        "hcl",
+        "ex",
+        "exs",
+        "erl",
+        "hrl",
+        "elm",
+        "dart",
+        "ml",
+        "mli",
+        "hs",
+        "lhs",
+        "clj",
+        "cljs",
+        "cljc",
+        "edn",
+        "mts",
         "cts",
     ];
 
@@ -394,10 +471,7 @@ mod tests {
             "plan_edit",
         ] {
             assert!(is_file_icon_tool(tool), "{tool}");
-            assert_eq!(
-                glyph_for_tool_path(tool, "src/lib.rs"),
-                Some(ICON_RUST)
-            );
+            assert_eq!(glyph_for_tool_path(tool, "src/lib.rs"), Some(ICON_RUST));
         }
         assert!(!is_file_icon_tool("bash"));
         assert!(!is_file_icon_tool("read"));
@@ -459,9 +533,7 @@ mod tests {
             Some("iTerm.app"),
             None
         ));
-        assert!(!file_icons_supported_from_env(
-            None, None, None, None, None
-        ));
+        assert!(!file_icons_supported_from_env(None, None, None, None, None));
         assert!(!file_icons_supported_from_env(
             None,
             Some("xterm-kitty-invalid"),

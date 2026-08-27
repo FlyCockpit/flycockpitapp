@@ -2335,10 +2335,7 @@ pub fn spawn(
             if crate::agents::is_builtin_primary(&active)
                 || crate::agents::is_removed_primary(&active)
             {
-                crate::agents::resolve_primary(
-                    Some(&active),
-                    initial_active_agent(extended_cfg),
-                )
+                crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
             } else {
                 initial_active_agent(extended_cfg).to_string()
             }

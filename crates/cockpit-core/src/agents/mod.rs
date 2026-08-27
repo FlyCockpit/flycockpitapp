@@ -42,8 +42,8 @@ mod vnext;
 
 pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
-    BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent,
-    is_builtin_primary, is_hidden_primary, is_removed_primary, resolve_primary,
+    BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent, is_builtin_primary,
+    is_hidden_primary, is_removed_primary, resolve_primary,
 };
 pub use invariants::validate_invariants;
 pub use profile::{
@@ -121,9 +121,8 @@ impl ToolSteering {
     pub fn from_llm_mode(mode: crate::config::extended::LlmMode) -> Self {
         match mode {
             crate::config::extended::LlmMode::Defensive => Self::Verbose,
-            crate::config::extended::LlmMode::Normal | crate::config::extended::LlmMode::Frontier => {
-                Self::Terse
-            }
+            crate::config::extended::LlmMode::Normal
+            | crate::config::extended::LlmMode::Frontier => Self::Terse,
         }
     }
 }
@@ -144,9 +143,17 @@ pub enum InlineCapsProfile {
 /// `auto_compact_pct = 80`, `inline_caps = Standard`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ContextPolicy {
-    #[serde(rename = "autoCompactPct", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "autoCompactPct",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auto_compact_pct: Option<u8>,
-    #[serde(rename = "inlineCaps", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "inlineCaps",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub inline_caps: Option<InlineCapsProfile>,
 }
 
@@ -176,10 +183,7 @@ impl PostureResolution {
     /// session would have used. When `def.capabilities` is `Some`, the
     /// declared set is authoritative; when `None`, the legacy mode gate
     /// applies (Stage 2 fallback).
-    pub fn from_def(
-        def: &AgentDef,
-        legacy_mode: crate::config::extended::LlmMode,
-    ) -> Self {
+    pub fn from_def(def: &AgentDef, legacy_mode: crate::config::extended::LlmMode) -> Self {
         Self {
             declared: def.capabilities.clone(),
             legacy_mode,
@@ -774,7 +778,9 @@ where
         type Value = BTreeMap<String, ToolDescriptionSpec>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a map of tool names to bare strings or `{normal, frontier, defensive}` maps")
+            f.write_str(
+                "a map of tool names to bare strings or `{normal, frontier, defensive}` maps",
+            )
         }
 
         fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -1480,9 +1486,8 @@ fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
     // stem (minus `.md`) is the override key (model-slot name or model id).
     let mut overrides: BTreeMap<String, String> = BTreeMap::new();
     let mut first_override_def: Option<AgentDef> = None;
-    let entries = std::fs::read_dir(&agent_dir).map_err(|e| {
-        anyhow::anyhow!("reading agent dir {}: {e}", agent_dir.display())
-    })?;
+    let entries = std::fs::read_dir(&agent_dir)
+        .map_err(|e| anyhow::anyhow!("reading agent dir {}: {e}", agent_dir.display()))?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();

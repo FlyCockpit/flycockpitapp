@@ -77,15 +77,8 @@ impl TagInlineCaps {
     /// Resolve caps from an agent def's `contextPolicy.inlineCaps` (issue #75).
     /// Falls back to the mode-derived caps when the def does not declare a
     /// profile.
-    pub fn for_def(
-        def: &crate::agents::AgentDef,
-        mode: LlmMode,
-    ) -> Self {
-        match def
-            .context_policy
-            .as_ref()
-            .and_then(|p| p.inline_caps)
-        {
+    pub fn for_def(def: &crate::agents::AgentDef, mode: LlmMode) -> Self {
+        match def.context_policy.as_ref().and_then(|p| p.inline_caps) {
             Some(crate::agents::InlineCapsProfile::Conservative) => Self {
                 max_bytes: OUTPUT_BYTE_CAP,
                 max_lines: 500,

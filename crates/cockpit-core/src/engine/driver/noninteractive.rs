@@ -4979,8 +4979,9 @@ impl Driver {
         let parent_request_llm_mode = self.stack[0].agent.llm_mode;
         if batch_refusal.is_none()
             && has_write_capable_entry
-            && !crate::engine::tool::Capability::ScopedParallelWrite
-                .enabled(&crate::agents::PostureResolution::legacy(parent_request_llm_mode))
+            && !crate::engine::tool::Capability::ScopedParallelWrite.enabled(
+                &crate::agents::PostureResolution::legacy(parent_request_llm_mode),
+            )
         {
             batch_refusal = Some(
                 "parallel write-capable task batches require the `scopedParallelWrite` capability on this agent; use sequential delegation instead"

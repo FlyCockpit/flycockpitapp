@@ -609,16 +609,10 @@ mod tests {
     #[tokio::test]
     async fn base_description_carries_suggested_paths_guidance() {
         let tool = EscalateTool;
-        let normal = crate::engine::tool::definition_of(
-            &tool,
-            crate::agents::ToolSteering::Terse,
-            None,
-        );
-        let frontier = crate::engine::tool::definition_of(
-            &tool,
-            crate::agents::ToolSteering::Terse,
-            None,
-        );
+        let normal =
+            crate::engine::tool::definition_of(&tool, crate::agents::ToolSteering::Terse, None);
+        let frontier =
+            crate::engine::tool::definition_of(&tool, crate::agents::ToolSteering::Terse, None);
         assert!(normal.description.contains("prefer suggested_paths"));
         assert_eq!(normal.description, frontier.description);
     }

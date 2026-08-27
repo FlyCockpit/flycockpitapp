@@ -1064,9 +1064,7 @@ pub fn definition_of(
             tool.verbose_parameters()
                 .unwrap_or_else(|| tool.parameters()),
         ),
-        crate::agents::ToolSteering::Terse => {
-            (tool.description().to_string(), tool.parameters())
-        }
+        crate::agents::ToolSteering::Terse => (tool.description().to_string(), tool.parameters()),
     };
     // Per-agent axis: an override for the active steering wins over the base
     // description. Schema is intentionally untouched.
@@ -1389,7 +1387,13 @@ impl ToolBox {
     /// overrides are the ones registered via [`Self::with_override`] at
     /// construction time.
     pub fn definitions(&self, steering: crate::agents::ToolSteering) -> Vec<ToolDefinition> {
-        if let Some(cached) = self.definition_cache.lock().unwrap().get(&steering).cloned() {
+        if let Some(cached) = self
+            .definition_cache
+            .lock()
+            .unwrap()
+            .get(&steering)
+            .cloned()
+        {
             return cached;
         }
         let definitions: Vec<ToolDefinition> = self
@@ -1439,41 +1443,30 @@ mod capability_tests {
     /// The follow-up/seed capability is disabled only for defensive mode.
     #[test]
     fn followup_seed_is_enabled_outside_defensive_mode() {
-        assert!(Capability::FollowupSeed.enabled(&PostureResolution::legacy(
-            LlmMode::Normal
-        )));
-        assert!(Capability::FollowupSeed.enabled(&PostureResolution::legacy(
-            LlmMode::Frontier
-        )));
-        assert!(!Capability::FollowupSeed.enabled(&PostureResolution::legacy(
-            LlmMode::Defensive
-        )));
+        assert!(Capability::FollowupSeed.enabled(&PostureResolution::legacy(LlmMode::Normal)));
+        assert!(Capability::FollowupSeed.enabled(&PostureResolution::legacy(LlmMode::Frontier)));
+        assert!(!Capability::FollowupSeed.enabled(&PostureResolution::legacy(LlmMode::Defensive)));
     }
 
     #[test]
     fn fork_context_capability_is_frontier_only() {
-        assert!(!Capability::ForkContext.enabled(&PostureResolution::legacy(
-            LlmMode::Normal
-        )));
-        assert!(Capability::ForkContext.enabled(&PostureResolution::legacy(
-            LlmMode::Frontier
-        )));
-        assert!(!Capability::ForkContext.enabled(&PostureResolution::legacy(
-            LlmMode::Defensive
-        )));
+        assert!(!Capability::ForkContext.enabled(&PostureResolution::legacy(LlmMode::Normal)));
+        assert!(Capability::ForkContext.enabled(&PostureResolution::legacy(LlmMode::Frontier)));
+        assert!(!Capability::ForkContext.enabled(&PostureResolution::legacy(LlmMode::Defensive)));
     }
 
     #[test]
     fn scoped_parallel_write_capability_is_frontier_only() {
-        assert!(!Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(
-            LlmMode::Normal
-        )));
-        assert!(Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(
-            LlmMode::Frontier
-        )));
-        assert!(!Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(
-            LlmMode::Defensive
-        )));
+        assert!(
+            !Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(LlmMode::Normal))
+        );
+        assert!(
+            Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(LlmMode::Frontier))
+        );
+        assert!(
+            !Capability::ScopedParallelWrite
+                .enabled(&PostureResolution::legacy(LlmMode::Defensive))
+        );
     }
 
     /// Issue #75 Stage 2: a declared grant set overrides the legacy mode
@@ -2589,7 +2582,8 @@ mod llm_mode_tests {
     fn definition_of_partial_override_falls_back_per_mode() {
         let tool = tools::read::ReadTool;
         let ov = ToolDescOverride {
-            text: Some("only normal is overridden".to_string()),            verbose_text: None,
+            text: Some("only normal is overridden".to_string()),
+            verbose_text: None,
         };
         assert_eq!(
             definition_of(&tool, crate::agents::ToolSteering::Terse, Some(&ov)).description,
@@ -2658,7 +2652,8 @@ mod llm_mode_tests {
             .with_override(
                 "read",
                 ToolDescOverride {
-                    text: Some("Build: skim before delegating".to_string()),                    verbose_text: None,
+                    text: Some("Build: skim before delegating".to_string()),
+                    verbose_text: None,
                 },
             );
         let builder_box = ToolBox::new()
@@ -2666,7 +2661,8 @@ mod llm_mode_tests {
             .with_override(
                 "read",
                 ToolDescOverride {
-                    text: Some("builder: read the file you will edit yourself".to_string()),                    verbose_text: None,
+                    text: Some("builder: read the file you will edit yourself".to_string()),
+                    verbose_text: None,
                 },
             );
         let a = &build_box.definitions(crate::agents::ToolSteering::Terse)[0];
@@ -2691,11 +2687,14 @@ mod llm_mode_tests {
             .with_override(
                 "read",
                 ToolDescOverride {
-                    text: Some("agent intent".to_string()),                    verbose_text: Some("agent intent, explicit".to_string()),
+                    text: Some("agent intent".to_string()),
+                    verbose_text: Some("agent intent, explicit".to_string()),
                 },
             );
-        let first = serde_json::to_string(&tb.definitions(crate::agents::ToolSteering::Terse)).unwrap();
-        let second = serde_json::to_string(&tb.definitions(crate::agents::ToolSteering::Terse)).unwrap();
+        let first =
+            serde_json::to_string(&tb.definitions(crate::agents::ToolSteering::Terse)).unwrap();
+        let second =
+            serde_json::to_string(&tb.definitions(crate::agents::ToolSteering::Terse)).unwrap();
         assert_eq!(first, second, "tools array must be byte-stable per render");
 
         // An all-`None` override is a no-op: the box serializes identically to
@@ -2706,12 +2705,15 @@ mod llm_mode_tests {
         let empty_override = no_override.clone().with_override(
             "read",
             ToolDescOverride {
-                text: None,                verbose_text: None,
+                text: None,
+                verbose_text: None,
             },
         );
         assert_eq!(
-            serde_json::to_string(&no_override.definitions(crate::agents::ToolSteering::Terse)).unwrap(),
-            serde_json::to_string(&empty_override.definitions(crate::agents::ToolSteering::Terse)).unwrap(),
+            serde_json::to_string(&no_override.definitions(crate::agents::ToolSteering::Terse))
+                .unwrap(),
+            serde_json::to_string(&empty_override.definitions(crate::agents::ToolSteering::Terse))
+                .unwrap(),
             "an empty override must not change the serialized tools array"
         );
     }

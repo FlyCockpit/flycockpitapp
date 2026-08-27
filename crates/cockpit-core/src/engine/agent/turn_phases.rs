@@ -1163,7 +1163,8 @@ pub(crate) async fn run_turn(
     phase_09_terminal_text_emit();
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
-    let mut tools = active_tools.definitions(crate::agents::ToolSteering::from_llm_mode(agent.llm_mode));
+    let mut tools =
+        active_tools.definitions(crate::agents::ToolSteering::from_llm_mode(agent.llm_mode));
     // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
     // untrusted, tool-capable completion route advertises `report_leak`
     // (schema-only — NEVER a generic `Tool`; the sensitive-turn barrier

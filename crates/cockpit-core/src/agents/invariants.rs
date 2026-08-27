@@ -218,9 +218,7 @@ pub(crate) fn validate_posture_fields(def: &AgentDef) -> Result<()> {
 fn validate_context_policy(policy: &ContextPolicy) -> Result<()> {
     if let Some(pct) = policy.auto_compact_pct {
         if !(10..=95).contains(&pct) {
-            bail!(
-                "contextPolicy.autoCompactPct must be between 10 and 95 (got `{pct}`)"
-            );
+            bail!("contextPolicy.autoCompactPct must be between 10 and 95 (got `{pct}`)");
         }
     }
     Ok(())

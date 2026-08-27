@@ -1336,6 +1336,8 @@ export const queueTargetSchema = z
   })
   .passthrough();
 export type QueueTarget = z.infer<typeof queueTargetSchema>;
+export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
+export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
 export const queueItemSchema = z
   .object({
     id: uuidSchema,
@@ -1343,6 +1345,7 @@ export const queueItemSchema = z
     text: z.string(),
     display_text: z.string().optional(),
     target: queueTargetSchema,
+    delivery_class: queueDeliveryClassSchema.default("steering"),
   })
   .passthrough();
 export type QueueItem = z.infer<typeof queueItemSchema>;

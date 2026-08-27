@@ -4710,6 +4710,7 @@ fn queue_item_from_proto(item: proto::QueueItem) -> cockpit_proto::QueueItem {
         text: item.text,
         display_text: item.display_text,
         target: queue_target_from_proto(item.target),
+        delivery_class: item.delivery_class,
     }
 }
 

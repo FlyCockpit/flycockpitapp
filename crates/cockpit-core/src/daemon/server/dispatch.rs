@@ -5049,6 +5049,65 @@ async fn handle_serialized_request_impl(
             })
         }
 
+        Request::SetQueuedUserMessageClass {
+            queue_item_id,
+            delivery_class,
+        } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SetQueuedUserMessageClass {
+                    queue_item_id,
+                    delivery_class,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SetQueuedUserMessageClassResult {
+                applied: result.applied,
+                reason: result.reason,
+                item: result.item,
+                queue: result.queue,
+            })
+        }
+
+        Request::PromoteQueuedUserMessages { delivery_class } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::PromoteQueuedUserMessages {
+                    delivery_class,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::PromoteQueuedUserMessagesResult {
+                applied: result.applied,
+                queue: result.queue,
+            })
+        }
+
+        Request::SendNowQueuedUserMessage { queue_item_id } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SendNowQueuedUserMessage {
+                    queue_item_id,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SendNowQueuedUserMessageResult {
+                applied: result.applied,
+                reason: result.reason,
+                item: result.item,
+                queue: result.queue,
+            })
+        }
+
         Request::ResumePausedWork { session_id } => {
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {

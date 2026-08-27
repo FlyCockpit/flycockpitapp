@@ -8726,6 +8726,14 @@ pub(super) async fn run_worker(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
+                    submission.delivery_class = {
+                        let snapshot = config_snapshot
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        proto::QueueDeliveryClass::from_steering_setting(
+                            snapshot.extended.queued_messages_as_steering,
+                        )
+                    };
                     let receipt = submission
                         .client_submissions
                         .first()
@@ -9331,6 +9339,48 @@ pub(super) async fn run_worker(
                         applied: !removed_items.is_empty(),
                         reason,
                         removed_items: removed_items.into_iter().map(queue_item_to_proto).collect(),
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    }));
+                }
+                SessionWork::SetQueuedUserMessageClass {
+                    queue_item_id,
+                    delivery_class,
+                    respond_to,
+                } => {
+                    let (result, item, snapshot) = driver_input_queue
+                        .set_delivery_class(queue_item_id, delivery_class)
+                        .await;
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(Ok(proto::SetQueuedUserMessageClassResult {
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        item: item.map(queue_item_to_proto),
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    }));
+                }
+                SessionWork::PromoteQueuedUserMessages {
+                    delivery_class,
+                    respond_to,
+                } => {
+                    let snapshot = driver_input_queue
+                        .set_all_delivery_class(delivery_class)
+                        .await;
+                    let _ = respond_to.send(Ok(proto::PromoteQueuedUserMessagesResult {
+                        applied: true,
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    }));
+                }
+                SessionWork::SendNowQueuedUserMessage {
+                    queue_item_id,
+                    respond_to,
+                } => {
+                    let (result, item, snapshot) =
+                        driver_input_queue.mark_send_now(queue_item_id).await;
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(Ok(proto::SendNowQueuedUserMessageResult {
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        item: item.map(queue_item_to_proto),
                         queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
                     }));
                 }

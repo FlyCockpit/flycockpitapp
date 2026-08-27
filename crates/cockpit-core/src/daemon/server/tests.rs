@@ -16248,6 +16248,21 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "SessionWork::RemoveEditableQueuedUserMessages delivered to attached worker",
         },
         MutatingDispatchCase {
+            kind: "set_queued_user_message_class",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::SetQueuedUserMessageClass delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "promote_queued_user_messages",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::PromoteQueuedUserMessages delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "send_now_queued_user_message",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::SendNowQueuedUserMessage delivered to attached worker",
+        },
+        MutatingDispatchCase {
             kind: "resume_paused_work",
             effect_class: Durable,
             observation: "paused_session_work status becomes resumed",
@@ -17046,6 +17061,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "remove_queued_user_message"
         | "remove_newest_queued_user_message"
         | "remove_editable_queued_user_messages"
+        | "set_queued_user_message_class"
+        | "promote_queued_user_messages"
+        | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
         | "resolve_interrupt"
@@ -17257,6 +17275,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("remove_queued_user_message"),
         authz_session_writer("remove_newest_queued_user_message"),
         authz_session_writer("remove_editable_queued_user_messages"),
+        authz_session_writer("set_queued_user_message_class"),
+        authz_session_writer("promote_queued_user_messages"),
+        authz_session_writer("send_now_queued_user_message"),
         authz_session_writer("resume_paused_work"),
         authz_session_writer("cancel_paused_work"),
         authz_session_writer("repair_resume"),
@@ -18315,6 +18336,9 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "remove_queued_user_message"
             | "remove_newest_queued_user_message"
             | "remove_editable_queued_user_messages"
+            | "set_queued_user_message_class"
+            | "promote_queued_user_messages"
+            | "send_now_queued_user_message"
             | "resume_paused_work"
             | "cancel_paused_work"
             | "repair_resume"
@@ -18430,6 +18454,16 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "remove_editable_queued_user_messages" => {
             Request::RemoveEditableQueuedUserMessages { target_id: None }
         }
+        "set_queued_user_message_class" => Request::SetQueuedUserMessageClass {
+            queue_item_id: Uuid::new_v4(),
+            delivery_class: proto::QueueDeliveryClass::Steering,
+        },
+        "promote_queued_user_messages" => Request::PromoteQueuedUserMessages {
+            delivery_class: proto::QueueDeliveryClass::Steering,
+        },
+        "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
+            queue_item_id: Uuid::new_v4(),
+        },
         "resume_paused_work" => Request::ResumePausedWork { session_id },
         "cancel_paused_work" => Request::CancelPausedWork { session_id },
         "repair_resume" => Request::RepairResume { session_id },
@@ -20585,6 +20619,9 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "remove_queued_user_message"
         | "remove_newest_queued_user_message"
         | "remove_editable_queued_user_messages"
+        | "set_queued_user_message_class"
+        | "promote_queued_user_messages"
+        | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
         | "resolve_interrupt"
@@ -20801,6 +20838,9 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "remove_queued_user_message"
         | "remove_newest_queued_user_message"
         | "remove_editable_queued_user_messages"
+        | "set_queued_user_message_class"
+        | "promote_queued_user_messages"
+        | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
         | "resolve_interrupt"
@@ -21115,6 +21155,16 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "remove_editable_queued_user_messages" => Request::RemoveEditableQueuedUserMessages {
             target_id: Some("root".into()),
         },
+        "set_queued_user_message_class" => Request::SetQueuedUserMessageClass {
+            queue_item_id: Uuid::from_u128(1),
+            delivery_class: proto::QueueDeliveryClass::Held,
+        },
+        "promote_queued_user_messages" => Request::PromoteQueuedUserMessages {
+            delivery_class: proto::QueueDeliveryClass::Steering,
+        },
+        "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
+            queue_item_id: Uuid::from_u128(1),
+        },
         "repair_resume" => Request::RepairResume { session_id },
         "cancel_turn" => Request::CancelTurn,
         "resolve_interrupt" => Request::ResolveInterrupt {
@@ -21289,6 +21339,57 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         }))
                         .unwrap();
                 }
+                (
+                    "set_queued_user_message_class",
+                    SessionWork::SetQueuedUserMessageClass {
+                        queue_item_id,
+                        delivery_class,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(queue_item_id, Uuid::from_u128(1));
+                    assert_eq!(delivery_class, proto::QueueDeliveryClass::Held);
+                    respond_to
+                        .send(Ok(proto::SetQueuedUserMessageClassResult {
+                            applied: true,
+                            reason: proto::RemoveQueuedUserMessageReason::Removed,
+                            item: Some(proto_queue_item("classed")),
+                            queue: Vec::new(),
+                        }))
+                        .unwrap();
+                }
+                (
+                    "promote_queued_user_messages",
+                    SessionWork::PromoteQueuedUserMessages {
+                        delivery_class,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(delivery_class, proto::QueueDeliveryClass::Steering);
+                    respond_to
+                        .send(Ok(proto::PromoteQueuedUserMessagesResult {
+                            applied: true,
+                            queue: Vec::new(),
+                        }))
+                        .unwrap();
+                }
+                (
+                    "send_now_queued_user_message",
+                    SessionWork::SendNowQueuedUserMessage {
+                        queue_item_id,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(queue_item_id, Uuid::from_u128(1));
+                    respond_to
+                        .send(Ok(proto::SendNowQueuedUserMessageResult {
+                            applied: true,
+                            reason: proto::RemoveQueuedUserMessageReason::Removed,
+                            item: Some(proto_queue_item("now")),
+                            queue: Vec::new(),
+                        }))
+                        .unwrap();
+                }
                 ("repair_resume", SessionWork::RepairResume { respond_to }) => {
                     respond_to.send(Ok(())).unwrap();
                 }
@@ -21451,6 +21552,24 @@ async fn assert_worker_delivery_happy(kind: &str) {
             assert!(matches!(
                 response,
                 Response::RemoveQueuedUserMessagesResult { .. }
+            ));
+        }
+        "set_queued_user_message_class" => {
+            assert!(matches!(
+                response,
+                Response::SetQueuedUserMessageClassResult { .. }
+            ));
+        }
+        "promote_queued_user_messages" => {
+            assert!(matches!(
+                response,
+                Response::PromoteQueuedUserMessagesResult { .. }
+            ));
+        }
+        "send_now_queued_user_message" => {
+            assert!(matches!(
+                response,
+                Response::SendNowQueuedUserMessageResult { .. }
             ));
         }
         "set_delegation_recursion" => {
@@ -21631,6 +21750,16 @@ async fn assert_attached_required_malformed(kind: &str) {
         "remove_editable_queued_user_messages" => {
             Request::RemoveEditableQueuedUserMessages { target_id: None }
         }
+        "set_queued_user_message_class" => Request::SetQueuedUserMessageClass {
+            queue_item_id: Uuid::new_v4(),
+            delivery_class: proto::QueueDeliveryClass::Steering,
+        },
+        "promote_queued_user_messages" => Request::PromoteQueuedUserMessages {
+            delivery_class: proto::QueueDeliveryClass::Steering,
+        },
+        "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
+            queue_item_id: Uuid::new_v4(),
+        },
         "repair_resume" => Request::RepairResume {
             session_id: Uuid::new_v4(),
         },
@@ -24611,6 +24740,9 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "remove_queued_user_message",
         "remove_newest_queued_user_message",
         "remove_editable_queued_user_messages",
+        "set_queued_user_message_class",
+        "promote_queued_user_messages",
+        "send_now_queued_user_message",
         "cancel_turn",
         "steer_delegation",
         "resolve_interrupt",
@@ -24959,6 +25091,34 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 target_id: Some("root".into()),
             },
             kind: "remove_editable_queued_user_messages",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::SetQueuedUserMessageClass {
+                queue_item_id: Uuid::new_v4(),
+                delivery_class: proto::QueueDeliveryClass::Steering,
+            },
+            kind: "set_queued_user_message_class",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::PromoteQueuedUserMessages {
+                delivery_class: proto::QueueDeliveryClass::Steering,
+            },
+            kind: "promote_queued_user_messages",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::SendNowQueuedUserMessage {
+                queue_item_id: Uuid::new_v4(),
+            },
+            kind: "send_now_queued_user_message",
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,

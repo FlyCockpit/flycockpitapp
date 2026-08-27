@@ -3394,6 +3394,37 @@ pub struct ActiveSubagent {
     pub label: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueDeliveryClass {
+    /// Delivered at the focused agent's next turn boundary (mid-run).
+    #[default]
+    Steering,
+    /// Delivered after the run completes.
+    Held,
+}
+
+impl QueueDeliveryClass {
+    pub fn from_steering_setting(queued_messages_as_steering: bool) -> Self {
+        if queued_messages_as_steering {
+            Self::Steering
+        } else {
+            Self::Held
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Steering => Self::Held,
+            Self::Held => Self::Steering,
+        }
+    }
+
+    pub fn is_steering(self) -> bool {
+        matches!(self, Self::Steering)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
     pub id: Uuid,
@@ -3403,6 +3434,11 @@ pub struct QueueItem {
     pub display_text: Option<String>,
     #[serde(default)]
     pub target: QueueTarget,
+    /// Per-message delivery class. Defaults to steering so older wire
+    /// snapshots and struct literals stay valid; enqueue overwrites this
+    /// from `queuedMessagesAsSteering`.
+    #[serde(default)]
+    pub delivery_class: QueueDeliveryClass = QueueDeliveryClass::Steering,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -6647,6 +6683,7 @@ mod tests {
                 depth: 0,
                 task_call_id: None,
             },
+            delivery_class: QueueDeliveryClass::Held,
         };
 
         let response = Envelope::response(
@@ -6665,6 +6702,7 @@ mod tests {
                     assert_eq!(got.status, QueueItemStatus::Queued);
                     assert_eq!(got.display_text.as_deref(), Some("queued @file"));
                     assert_eq!(got.target.id, "root");
+                    assert_eq!(got.delivery_class, QueueDeliveryClass::Held);
                     assert_eq!(queue.len(), 1);
                 }
                 other => panic!("unexpected response: {other:?}"),
@@ -6688,6 +6726,7 @@ mod tests {
                 assert_eq!(got_session, session_id);
                 assert_eq!(queue[0].id, item_id);
                 assert_eq!(queue[0].target.agent, "Build");
+                assert_eq!(queue[0].delivery_class, QueueDeliveryClass::Held);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -6749,6 +6788,71 @@ mod tests {
             } => assert_eq!(target_id.as_deref(), Some("root")),
             other => panic!("unexpected request: {other:?}"),
         }
+
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::SetQueuedUserMessageClass {
+                queue_item_id: item_id,
+                delivery_class: QueueDeliveryClass::Held,
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        match back.body {
+            Body::Request {
+                request:
+                    Request::SetQueuedUserMessageClass {
+                        queue_item_id,
+                        delivery_class,
+                    },
+                ..
+            } => {
+                assert_eq!(queue_item_id, item_id);
+                assert_eq!(delivery_class, QueueDeliveryClass::Held);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::PromoteQueuedUserMessages {
+                delivery_class: QueueDeliveryClass::Steering,
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        match back.body {
+            Body::Request {
+                request: Request::PromoteQueuedUserMessages { delivery_class },
+                ..
+            } => assert_eq!(delivery_class, QueueDeliveryClass::Steering),
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::SendNowQueuedUserMessage {
+                queue_item_id: item_id,
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        match back.body {
+            Body::Request {
+                request: Request::SendNowQueuedUserMessage { queue_item_id },
+                ..
+            } => assert_eq!(queue_item_id, item_id),
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let missing_class: QueueItem = serde_json::from_value(serde_json::json!({
+            "id": item_id,
+            "status": "queued",
+            "text": "legacy",
+            "target": { "id": "root", "agent": "Build", "depth": 0 }
+        }))
+        .unwrap();
+        assert_eq!(missing_class.delivery_class, QueueDeliveryClass::Steering);
 
         let request = Envelope::request(
             Uuid::new_v4(),

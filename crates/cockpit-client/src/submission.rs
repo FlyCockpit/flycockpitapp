@@ -115,6 +115,9 @@ pub struct ClientUserSubmission {
     #[serde(default)]
     pub client_submissions: Vec<ClientSubmissionReceipt>,
     pub queue_target: Option<cockpit_proto::QueueTarget>,
+    #[serde(default)]
+    pub delivery_class: cockpit_proto::QueueDeliveryClass =
+        cockpit_proto::QueueDeliveryClass::Steering,
     #[serde(skip)]
     pub pending_terminal_disposition: Option<PendingSubmissionTerminalDisposition>,
     pub run_invocation_id: Option<Uuid>,

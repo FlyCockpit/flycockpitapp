@@ -651,6 +651,24 @@ pub enum Request {
         target_id: Option<String>,
     },
 
+    /// Set the delivery class of one queued user message that has not yet
+    /// started folding.
+    SetQueuedUserMessageClass {
+        queue_item_id: Uuid,
+        delivery_class: QueueDeliveryClass,
+    },
+
+    /// Set the delivery class of every pending queued user message.
+    PromoteQueuedUserMessages {
+        delivery_class: QueueDeliveryClass,
+    },
+
+    /// Escalate one queued user message for delivery as soon as it is
+    /// safe. Never aborts an in-flight tool call mid-execution.
+    SendNowQueuedUserMessage {
+        queue_item_id: Uuid,
+    },
+
     /// Explicitly resume durable work that was paused during daemon shutdown.
     /// Safe work continues through the normal driver/tool approval path; work
     /// that needs an interactive approval remains parked until a client can
@@ -3969,6 +3987,9 @@ macro_rules! request_variants {
             (Request::RemoveQueuedUserMessage { .. }, "remove_queued_user_message");
             (Request::RemoveNewestQueuedUserMessage { .. }, "remove_newest_queued_user_message");
             (Request::RemoveEditableQueuedUserMessages { .. }, "remove_editable_queued_user_messages");
+            (Request::SetQueuedUserMessageClass { .. }, "set_queued_user_message_class");
+            (Request::PromoteQueuedUserMessages { .. }, "promote_queued_user_messages");
+            (Request::SendNowQueuedUserMessage { .. }, "send_now_queued_user_message");
             (Request::ResumePausedWork { .. }, "resume_paused_work");
             (Request::CancelPausedWork { .. }, "cancel_paused_work");
             (Request::RepairResume { .. }, "repair_resume");
@@ -4273,6 +4294,9 @@ macro_rules! command {
             (Request::RemoveQueuedUserMessage { queue_item_id }, "remove_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "queue_item_id:Uuid", [queue_item_id: Uuid => queue]);
             (Request::RemoveNewestQueuedUserMessage { target_id }, "remove_newest_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>", [target_id: Option<String> => param]);
             (Request::RemoveEditableQueuedUserMessages { target_id }, "remove_editable_queued_user_messages", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>", [target_id: Option<String> => param]);
+            (Request::SetQueuedUserMessageClass { queue_item_id, delivery_class }, "set_queued_user_message_class", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "queue_item_id:Uuid|delivery_class:QueueDeliveryClass", [queue_item_id: Uuid => queue, delivery_class: QueueDeliveryClass => param]);
+            (Request::PromoteQueuedUserMessages { delivery_class }, "promote_queued_user_messages", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "delivery_class:QueueDeliveryClass", [delivery_class: QueueDeliveryClass => param]);
+            (Request::SendNowQueuedUserMessage { queue_item_id }, "send_now_queued_user_message", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "queue_item_id:Uuid", [queue_item_id: Uuid => queue]);
             (Request::ResumePausedWork { session_id }, "resume_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
@@ -4926,6 +4950,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         | "LeakRotationDisposition"
         | "OnUnlistedModelsFetch"
         | "LspControlAction"
+        | "QueueDeliveryClass"
         | "SecretStorePlacement"
         | "UsageKind"
         | "WorkspaceTrustMode"

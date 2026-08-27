@@ -2787,6 +2787,13 @@ impl App {
             .into_iter()
             .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
+        let delivery_class = cockpit_proto::QueueDeliveryClass::from_steering_setting(
+            self.extended.queued_messages_as_steering,
+        );
+        let queue_target = self
+            .foreground_input_target
+            .clone()
+            .unwrap_or_else(|| cockpit_proto::QueueTarget::root(""));
         let submission = cockpit_client::submission::ClientUserSubmission {
             expected_model_state_generation: self
                 .active_model_state_confirmed
@@ -2802,6 +2809,8 @@ impl App {
             tag_expansions: tag_expansions.clone(),
             images: paste_images,
             forced_skill: None,
+            delivery_class,
+            queue_target: Some(queue_target.clone()),
             ..Default::default()
         };
         // A model switch is itself the earlier ordered intent. Attach this
@@ -2873,11 +2882,13 @@ impl App {
             crate::tui::structured_paste::user_submission_wire_digest(&submission);
         let was_busy = self.busy;
         let optimistic_queue_item = if was_busy {
-            let item = optimistic_queue_item_with_id(
+            let mut item = optimistic_queue_item_with_id(
                 client_submission_id,
                 wire.clone(),
                 Some(submitted.clone()),
             );
+            item.delivery_class = delivery_class;
+            item.target = queue_target;
             self.queue.push(item.clone());
             Some(item)
         } else {

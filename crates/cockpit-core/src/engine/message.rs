@@ -16,7 +16,9 @@ use base64::Engine as _;
 use tokio::sync::{Mutex, Notify, watch};
 use uuid::Uuid;
 
-pub use crate::daemon::proto::{QueueItem as QueuedUserMessage, QueueItemStatus, QueueTarget};
+pub use crate::daemon::proto::{
+    QueueDeliveryClass, QueueItem as QueuedUserMessage, QueueItemStatus, QueueTarget,
+};
 pub use cockpit_client::image_upload::SubmissionImage;
 pub use cockpit_client::submission::{
     ClientSubmissionReceipt, ClientUserSubmission as UserSubmission,
@@ -41,6 +43,11 @@ struct QueuedSubmission {
     id: Uuid,
     submission: UserSubmission,
     target: QueueTarget,
+    delivery_class: QueueDeliveryClass,
+    /// Escalation flag: deliver as soon as a safe boundary exists.
+    /// Distinct from [`QueueDeliveryClass`]; send-now never changes the
+    /// stored class of sibling messages.
+    send_now: bool,
     not_before: Option<tokio::time::Instant>,
 }
 
@@ -175,6 +182,8 @@ impl UserSubmissionQueue {
             );
             state.pending.push_back(QueuedSubmission {
                 id,
+                delivery_class: submission.delivery_class,
+                send_now: false,
                 submission,
                 target,
                 not_before: None,
@@ -276,6 +285,8 @@ impl UserSubmissionQueue {
             state.started_targets.remove(&id);
             state.pending.push_front(QueuedSubmission {
                 id,
+                delivery_class: submission.delivery_class,
+                send_now: false,
                 submission,
                 target,
                 not_before: (!delay.is_zero()).then(|| tokio::time::Instant::now() + delay),
@@ -542,6 +553,118 @@ impl UserSubmissionQueue {
             snapshot_pending(&state)
         };
         self.publish(snapshot);
+    }
+
+    /// Change the delivery class of one pending item. Folding/started
+    /// items are not rewritten.
+    pub async fn set_delivery_class(
+        &self,
+        id: Uuid,
+        delivery_class: QueueDeliveryClass,
+    ) -> (
+        RemoveQueuedMessageResult,
+        Option<QueuedUserMessage>,
+        Vec<QueuedUserMessage>,
+    ) {
+        let (result, item, snapshot) = {
+            let mut state = self.inner.lock().await;
+            if let Some(pending) = state.pending.iter_mut().find(|item| item.id == id) {
+                pending.delivery_class = delivery_class;
+                pending.submission.delivery_class = delivery_class;
+                let item = queued_message_from_submission(pending);
+                (
+                    RemoveQueuedMessageResult::Removed,
+                    Some(item),
+                    snapshot_pending(&state),
+                )
+            } else if state.started.contains(&id) {
+                (
+                    RemoveQueuedMessageResult::AlreadyStarted,
+                    None,
+                    snapshot_pending(&state),
+                )
+            } else {
+                (
+                    RemoveQueuedMessageResult::NotFound,
+                    None,
+                    snapshot_pending(&state),
+                )
+            }
+        };
+        if matches!(result, RemoveQueuedMessageResult::Removed) {
+            self.publish(snapshot.clone());
+        }
+        (result, item, snapshot)
+    }
+
+    /// Set every pending item to `delivery_class`. Original queue order
+    /// is preserved; folding/started items are left alone.
+    pub async fn set_all_delivery_class(
+        &self,
+        delivery_class: QueueDeliveryClass,
+    ) -> Vec<QueuedUserMessage> {
+        let snapshot = {
+            let mut state = self.inner.lock().await;
+            for pending in &mut state.pending {
+                pending.delivery_class = delivery_class;
+                pending.submission.delivery_class = delivery_class;
+            }
+            snapshot_pending(&state)
+        };
+        self.publish(snapshot.clone());
+        snapshot
+    }
+
+    /// Mark one pending item for send-now escalation. The stored class is
+    /// unchanged so siblings keep their classes.
+    pub async fn mark_send_now(
+        &self,
+        id: Uuid,
+    ) -> (
+        RemoveQueuedMessageResult,
+        Option<QueuedUserMessage>,
+        Vec<QueuedUserMessage>,
+    ) {
+        let (result, item, snapshot) = {
+            let mut state = self.inner.lock().await;
+            if let Some(pending) = state.pending.iter_mut().find(|item| item.id == id) {
+                pending.send_now = true;
+                let item = queued_message_from_submission(pending);
+                (
+                    RemoveQueuedMessageResult::Removed,
+                    Some(item),
+                    snapshot_pending(&state),
+                )
+            } else if state.started.contains(&id) {
+                (
+                    RemoveQueuedMessageResult::AlreadyStarted,
+                    None,
+                    snapshot_pending(&state),
+                )
+            } else {
+                (
+                    RemoveQueuedMessageResult::NotFound,
+                    None,
+                    snapshot_pending(&state),
+                )
+            }
+        };
+        if matches!(result, RemoveQueuedMessageResult::Removed) {
+            self.publish(snapshot.clone());
+            self.notify.notify_one();
+        }
+        (result, item, snapshot)
+    }
+
+    pub async fn has_send_now_for(&self, target_id: Option<&str>) -> bool {
+        let state = self.inner.lock().await;
+        match target_id {
+            Some(target_id) => state
+                .pending
+                .iter()
+                .any(|item| item.send_now && item.target.id == target_id),
+            None => state.pending.iter().any(|item| item.send_now),
+        }
     }
 
     #[cfg(test)]
@@ -822,6 +945,7 @@ impl UserSubmissionQueue {
             submission.queue_item_ids.push(item.id);
         }
         submission.queue_target = Some(item.target);
+        submission.delivery_class = item.delivery_class;
         QueuePop::Item(Box::new(submission))
     }
 
@@ -914,6 +1038,7 @@ fn queued_message_from_submission(item: &QueuedSubmission) -> QueuedUserMessage 
         text: item.submission.text.clone(),
         display_text: item.submission.display_text.clone(),
         target: item.target.clone(),
+        delivery_class: item.delivery_class,
     }
 }
 
@@ -2359,6 +2484,65 @@ mod tests {
         assert_eq!(
             queue.recv_for(Some(&child.id)).await.map(|s| s.text),
             Some("child pending".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_delivery_class_round_trips_on_snapshot_and_set() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+
+        let mut steering = UserSubmission::text("steer me");
+        steering.delivery_class = QueueDeliveryClass::Steering;
+        let mut held = UserSubmission::text("hold me");
+        held.delivery_class = QueueDeliveryClass::Held;
+
+        let (steer_id, _) = queue.push(steering, target.clone()).await;
+        let (hold_id, snapshot) = queue.push(held, target.clone()).await;
+        assert_eq!(snapshot[0].delivery_class, QueueDeliveryClass::Steering);
+        assert_eq!(snapshot[1].delivery_class, QueueDeliveryClass::Held);
+        assert_eq!(snapshot[0].target.agent, "Build");
+        assert_eq!(snapshot[1].id, hold_id);
+
+        let (result, item, snapshot) = queue
+            .set_delivery_class(hold_id, QueueDeliveryClass::Steering)
+            .await;
+        assert_eq!(result, RemoveQueuedMessageResult::Removed);
+        assert_eq!(
+            item.map(|item| item.delivery_class),
+            Some(QueueDeliveryClass::Steering)
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|item| item.delivery_class == QueueDeliveryClass::Steering)
+        );
+
+        let snapshot = queue
+            .set_all_delivery_class(QueueDeliveryClass::Held)
+            .await;
+        assert!(
+            snapshot
+                .iter()
+                .all(|item| item.delivery_class == QueueDeliveryClass::Held)
+        );
+
+        let (result, item, _) = queue.mark_send_now(steer_id).await;
+        assert_eq!(result, RemoveQueuedMessageResult::Removed);
+        assert_eq!(item.map(|item| item.id), Some(steer_id));
+        assert!(queue.has_send_now_for(Some(&target.id)).await);
+
+        let mut drained = Vec::new();
+        queue
+            .drain_into_for(&mut drained, 16, Some(&target.id))
+            .await;
+        assert_eq!(
+            drained
+                .iter()
+                .map(|item| item.delivery_class)
+                .collect::<Vec<_>>(),
+            vec![QueueDeliveryClass::Held, QueueDeliveryClass::Held]
         );
     }
 }

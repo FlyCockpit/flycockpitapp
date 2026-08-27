@@ -1544,6 +1544,7 @@ fn scrub_queue_item(item: &mut proto::QueueItem, redact: &RedactionTable) {
         text,
         display_text,
         target: _,
+        delivery_class: _,
     } = item;
     scrub_string(text, redact);
     scrub_option_string(display_text, redact);

@@ -106,6 +106,30 @@ pub enum Response {
         queue: Vec<QueueItem>,
     },
 
+    /// Result of [`Request::SetQueuedUserMessageClass`].
+    SetQueuedUserMessageClassResult {
+        applied: bool,
+        reason: RemoveQueuedUserMessageReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<QueueItem>,
+        queue: Vec<QueueItem>,
+    },
+
+    /// Result of [`Request::PromoteQueuedUserMessages`].
+    PromoteQueuedUserMessagesResult {
+        applied: bool,
+        queue: Vec<QueueItem>,
+    },
+
+    /// Result of [`Request::SendNowQueuedUserMessage`].
+    SendNowQueuedUserMessageResult {
+        applied: bool,
+        reason: RemoveQueuedUserMessageReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<QueueItem>,
+        queue: Vec<QueueItem>,
+    },
+
     Attached {
         session_id: Uuid,
         /// Authoritative immutable entry setup read from the session by the
@@ -1390,6 +1414,9 @@ macro_rules! response_variants {
             (Response::TerminalIngress { .. }, "terminal_ingress");
             (Response::RemoveQueuedUserMessageResult { .. }, "remove_queued_user_message_result");
             (Response::RemoveQueuedUserMessagesResult { .. }, "remove_queued_user_messages_result");
+            (Response::SetQueuedUserMessageClassResult { .. }, "set_queued_user_message_class_result");
+            (Response::PromoteQueuedUserMessagesResult { .. }, "promote_queued_user_messages_result");
+            (Response::SendNowQueuedUserMessageResult { .. }, "send_now_queued_user_message_result");
             (Response::Attached { .. }, "attached");
             (Response::SubagentTranscript { .. }, "subagent_transcript");
             (Response::Sessions { .. }, "sessions");

@@ -1034,6 +1034,16 @@ async fn dispatch_one(
     ctx: &ToolCtx,
     current_tool_call_id: Option<&str>,
 ) -> Result<ToolOutput> {
+    // This is the common native-tool effect boundary.  Keep the durable
+    // lineage query here rather than letting individual filesystem and shell
+    // tools rely on the stale `ToolCtx` snapshot.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable at this tool boundary: {error:#}"
+            ))
+        })?;
     guard_redaction_placeholder_tool_args(name, &args, ctx).await?;
     tool_timeout::dispatch_with_default_timeout(tools, name, args, ctx, current_tool_call_id).await
 }
@@ -1148,20 +1158,7 @@ async fn dispatch_one_timed(
     current_tool_call_id: Option<&str>,
 ) -> (Result<ToolOutput>, u64) {
     let start = Instant::now();
-    // Tool contexts are turn snapshots. Consult the durable lease ledger at
-    // every native dispatch boundary so a concurrent expiry/revocation fails
-    // closed before this call can reach a filesystem, shell, or harness tool.
-    let result = if let Some(lease) = ctx.workspace_lease.as_deref() {
-        match lease.revalidate_for_tools(&ctx.session.db).await {
-            Ok(()) => dispatch_one(tools, name, args, ctx, current_tool_call_id).await,
-            Err(error) => Err(crate::engine::tool::invalid_input(format!(
-                "workspace lease `{}` is unavailable at this tool boundary: {error:#}",
-                lease.id
-            ))),
-        }
-    } else {
-        dispatch_one(tools, name, args, ctx, current_tool_call_id).await
-    };
+    let result = dispatch_one(tools, name, args, ctx, current_tool_call_id).await;
     (result, start.elapsed().as_millis() as u64)
 }
 

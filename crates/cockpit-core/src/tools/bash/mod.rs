@@ -335,6 +335,15 @@ pub(crate) async fn rerun_escalated_bash_confined(
     args: Value,
     ctx: &ToolCtx,
 ) -> Result<ToolOutput> {
+    // Escalated bash is invoked by the approval path rather than the ordinary
+    // tool dispatcher, so it must cross the same durable lease fence itself.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable before escalated bash: {error:#}"
+            ))
+        })?;
     let tool = BashTool::new();
     call_bash_inner(
         &tool.prelude,

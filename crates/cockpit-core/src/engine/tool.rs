@@ -993,6 +993,19 @@ pub struct ToolCtx {
     pub resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
 }
 
+impl ToolCtx {
+    /// Revalidate durable workspace authority at an effect boundary.  The
+    /// typed lease in a tool context is a confinement snapshot, never a
+    /// durable authorization cache; ephemeral same-root/subdirectory tokens
+    /// intentionally remain preflight/test-only and have no ledger row.
+    pub async fn revalidate_workspace_lease_effect_boundary(&self) -> Result<()> {
+        if let Some(lease) = self.workspace_lease.as_deref() {
+            lease.revalidate_for_tools(&self.session.db).await?;
+        }
+        Ok(())
+    }
+}
+
 /// A per-agent description override for a single tool, carried on the
 /// [`ToolBox`] alongside the tool itself. The **same tool ID and the same
 /// SCHEMA** are shared across every agent — only the *description text* is

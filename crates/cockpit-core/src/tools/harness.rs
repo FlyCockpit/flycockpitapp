@@ -327,6 +327,17 @@ impl Tool for HarnessInvokeTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         crate::tools::bash::reject_retired_sealed_child_bindings(&args)?;
+        // An external harness is an OS subprocess, not a Cockpit native tool.
+        // We do not yet have an OS confinement primitive that can prove every
+        // configured harness operation stays within a workspace lease's
+        // read/write/execute authority.  Refuse leased callers rather than
+        // letting `direct` mode inherit ambient host access or minting an
+        // unrelated isolated lease.
+        if ctx.workspace_lease.is_some() {
+            return Err(invalid_input(
+                "harness_invoke is unavailable to workspace-leased children until external harnesses have OS-enforced lease confinement",
+            ));
+        }
         let args: HarnessInvokeArgs = typed_args(args)?;
         let harness_name = normalize_harness_selector(&args.harness, &ctx.config)?;
         if args.prompt.trim().is_empty() {
@@ -760,6 +771,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cannot invoke harnesses"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn workspace_leased_child_cannot_invoke_an_unconfined_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
+            crate::workspace_lease::WorkspaceLeaseKind::SameRoot,
+            tmp.path().to_path_buf(),
+            crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+            crate::workspace_lease::now_unix_ms().saturating_add(60_000),
+        )));
+        let err = HarnessInvokeTool
+            .call(
+                serde_json::json!({"harness": "missing", "prompt": "do work"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("workspace-leased children"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

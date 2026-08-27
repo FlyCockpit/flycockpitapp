@@ -260,6 +260,28 @@ pub fn worktree_remove(repo: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the primary checkout for a linked worktree before removing that
+/// worktree. `git worktree list --porcelain` reports the main worktree first;
+/// use that surviving checkout for follow-up repository operations such as
+/// deleting the private branch. Never fall back to the linked checkout: it
+/// will be gone after `worktree remove`.
+pub fn primary_worktree_root(linked_worktree: &Path) -> Result<PathBuf> {
+    let listed = run_git_checked(linked_worktree, &["worktree", "list", "--porcelain"])?;
+    let primary = listed
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree "))
+        .filter(|path| !path.is_empty())
+        .context("git did not report a primary worktree")?;
+    let primary = resolve_git_path(Path::new(primary))?;
+    let linked = resolve_git_path(linked_worktree)?;
+    if primary == linked {
+        anyhow::bail!(
+            "managed worktree is unexpectedly the primary checkout; refusing cleanup without a surviving repository location"
+        );
+    }
+    Ok(primary)
+}
+
 /// Prune stale worktree administrative entries (after a manual dir removal).
 pub fn worktree_prune(repo: &Path) -> Result<()> {
     run_git_checked(repo, &["worktree", "prune"])?;

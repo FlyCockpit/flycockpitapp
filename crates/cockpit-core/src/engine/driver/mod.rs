@@ -11616,7 +11616,12 @@ impl Driver {
                                     {
                                         Ok(None)
                                     } else {
-                                        self.resolve_child_cwd(cwd.as_deref(), None)
+                                        self.resolve_child_cwd(
+                                            cwd.as_deref(),
+                                            self.stack
+                                                .last()
+                                                .and_then(|frame| frame.agent.workspace_lease.as_deref()),
+                                        )
                                             .map(|child| Some(child.resolved))
                                     };
                                     match requested_child {
@@ -11629,7 +11634,13 @@ impl Driver {
                                                 self.stack.last().and_then(|frame| {
                                                     frame.agent.workspace_lease.as_deref()
                                                 }),
-                                                &self.cwd,
+                                                self.stack
+                                                    .last()
+                                                    .and_then(|frame| {
+                                                        frame.agent.workspace_lease.as_deref()
+                                                    })
+                                                    .map(|lease| lease.visibility_root.as_path())
+                                                    .unwrap_or(self.cwd.as_path()),
                                                 requested_child.as_deref(),
                                                 kind,
                                             )
@@ -11700,25 +11711,27 @@ impl Driver {
                             continue;
                         }
                     };
-                    let preflight_write_scope = match noninteractive::resolve_write_scope(
-                        write_scope.as_deref(),
-                        &child_cwd.resolved,
-                        &self.cwd,
-                    ) {
-                        Ok(scope) => scope,
-                        Err(err) => {
-                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                                &self.session.db,
-                                [selected_workspace_lease.as_ref()],
-                            )
-                            .await;
-                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    let preflight_write_scope =
+                        match noninteractive::resolve_write_scope_for_workspace_lease(
+                            write_scope.as_deref(),
+                            &child_cwd.resolved,
+                            &child_cwd.resolved,
+                            selected_workspace_lease.as_ref(),
+                        ) {
+                            Ok(scope) => scope,
+                            Err(err) => {
+                                crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                    &self.session.db,
+                                    [selected_workspace_lease.as_ref()],
+                                )
+                                .await;
+                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id, task_provider_item_id, task_function_call_id, "task",
                                 prepend_task_repair_notes(format!("Error: {err}"), &repair_notes),
                             );
-                            continue;
-                        }
-                    };
+                                continue;
+                            }
+                        };
                     let parent_agent = self.stack.last().unwrap().agent.name.clone();
                     let parent_vnext_grant = self
                         .stack
@@ -11855,7 +11868,12 @@ impl Driver {
                                         let requested_child = if kind == crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree {
                                             Ok(None)
                                         } else {
-                                            self.resolve_child_cwd(entry.cwd.as_deref(), None)
+                                            self.resolve_child_cwd(
+                                                entry.cwd.as_deref(),
+                                                self.stack
+                                                    .last()
+                                                    .and_then(|frame| frame.agent.workspace_lease.as_deref()),
+                                            )
                                                 .map(|child| Some(child.resolved))
                                         };
                                         match requested_child {
@@ -11868,7 +11886,15 @@ impl Driver {
                                                     self.stack.last().and_then(|frame| {
                                                         frame.agent.workspace_lease.as_deref()
                                                     }),
-                                                    &self.cwd,
+                                                    self.stack
+                                                        .last()
+                                                        .and_then(|frame| {
+                                                            frame.agent.workspace_lease.as_deref()
+                                                        })
+                                                        .map(|lease| {
+                                                            lease.visibility_root.as_path()
+                                                        })
+                                                        .unwrap_or(self.cwd.as_path()),
                                                     requested_child.as_deref(),
                                                     kind,
                                                 )
@@ -11956,18 +11982,22 @@ impl Driver {
                         .zip(child_cwds.iter())
                         .zip(child_workspace_leases.iter())
                     {
-                        let child_write_scope = match noninteractive::resolve_write_scope(
-                            entry.write_scope.as_deref(),
-                            &child_cwd.resolved,
-                            &self.cwd,
-                        ) {
-                            Ok(scope) => scope,
-                            Err(err) => {
-                                unknown_agent_error =
-                                    Some(format!("Error: batch entry `{}`: {err}", entry.label));
-                                break;
-                            }
-                        };
+                        let child_write_scope =
+                            match noninteractive::resolve_write_scope_for_workspace_lease(
+                                entry.write_scope.as_deref(),
+                                &child_cwd.resolved,
+                                &child_cwd.resolved,
+                                workspace_lease.as_ref(),
+                            ) {
+                                Ok(scope) => scope,
+                                Err(err) => {
+                                    unknown_agent_error = Some(format!(
+                                        "Error: batch entry `{}`: {err}",
+                                        entry.label
+                                    ));
+                                    break;
+                                }
+                            };
                         if let Some(err) = grant_rejection(GrantRejectionInput {
                             parent_cwd: &self.cwd,
                             cwd: &child_cwd.resolved,
@@ -12662,10 +12692,13 @@ impl Driver {
         requested: Option<&str>,
         workspace_lease: Option<&crate::workspace_lease::WorkspaceLease>,
     ) -> Result<ChildCwd, String> {
-        let root = self.cwd.canonicalize().map_err(|e| {
+        let root_source = workspace_lease
+            .map(|lease| lease.visibility_root.as_path())
+            .unwrap_or(self.cwd.as_path());
+        let root = root_source.canonicalize().map_err(|e| {
             format!(
-                "Error: could not resolve session cwd `{}`: {e}",
-                self.cwd.display()
+                "Error: could not resolve child workspace root `{}`: {e}",
+                root_source.display()
             )
         })?;
         let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -12689,7 +12722,7 @@ impl Driver {
             ));
         }
         if !cockpit_host::path_containment::contained_under(&root, &resolved)
-            && !crate::workspace_lease::authorizes_managed_worktree_cwd(workspace_lease, &resolved)
+            && !workspace_lease.is_some_and(|lease| lease.covers_cwd(&resolved))
         {
             return Err(format!(
                 "Error: cwd `{raw}` resolves outside trusted workspace `{}`",

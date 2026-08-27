@@ -1037,6 +1037,21 @@ fn resolve_write_scope(
     base: &std::path::Path,
     workspace: &std::path::Path,
 ) -> Result<Option<std::path::PathBuf>, String> {
+    resolve_write_scope_for_workspace_lease(scope, base, workspace, None)
+}
+
+/// Resolve an explicit write scope against the selected lease's visibility
+/// boundary when a delegated child runs in a host-managed worktree.  The
+/// session project root remains the boundary for ordinary children; a managed
+/// worktree is a distinct repository checkout and must not be rejected merely
+/// because it is outside that root.  The later grant intersection still
+/// enforces parent-scope overlap and durable writer-conflict rules.
+pub(super) fn resolve_write_scope_for_workspace_lease(
+    scope: Option<&str>,
+    base: &std::path::Path,
+    workspace: &std::path::Path,
+    workspace_lease: Option<&crate::workspace_lease::WorkspaceLease>,
+) -> Result<Option<std::path::PathBuf>, String> {
     let Some(scope) = scope.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -1047,11 +1062,14 @@ fn resolve_write_scope(
             requested.display()
         )
     })?;
-    if !cockpit_host::path_containment::contained_under(workspace, &effective) {
+    let visibility = workspace_lease
+        .map(|lease| lease.visibility_root.as_path())
+        .unwrap_or(workspace);
+    if !cockpit_host::path_containment::contained_under(visibility, &effective) {
         return Err(format!(
             "`write_scope` `{}` resolves outside the workspace `{}`",
             effective.display(),
-            workspace.display()
+            visibility.display()
         ));
     }
     Ok(Some(effective))
@@ -1090,7 +1108,7 @@ fn resolve_recursive_vnext_child_cwd(
         return Err(format!("cwd `{raw}` does not exist or is not a directory"));
     }
     if !cockpit_host::path_containment::contained_under(&workspace, &resolved)
-        && !crate::workspace_lease::authorizes_managed_worktree_cwd(workspace_lease, &resolved)
+        && !workspace_lease.is_some_and(|lease| lease.covers_cwd(&resolved))
     {
         return Err(format!(
             "cwd `{raw}` resolves outside trusted workspace `{}`",
@@ -1135,7 +1153,7 @@ async fn resolve_recursive_vnext_workspace_lease(
                         requested_cwd,
                         parent_cwd,
                         workspace,
-                        None,
+                        parent_workspace_lease,
                     )?)
                 };
             crate::workspace_lease::issue_task_workspace_lease(
@@ -1386,7 +1404,7 @@ impl Driver {
         let scope = resolve_write_scope(
             task.write_scope.as_deref(),
             &task.child_cwd.resolved,
-            &self.cwd,
+            &task.child_cwd.resolved,
         )
         .map_err(|e| format!("Error: {e}"))?;
         if task.child_agent == "docs" {
@@ -1430,9 +1448,12 @@ impl Driver {
         let child_recursion = self
             .resolve_task_recursion(&entry.child_agent, entry.remaining_depth, &entry.model)
             .map_err(|e| format!("Error: batch entry `{}`: {e}", entry.label))?;
-        let scope =
-            resolve_write_scope(entry.write_scope.as_deref(), &child_cwd.resolved, &self.cwd)
-                .map_err(|e| format!("Error: batch entry `{}`: {e}", entry.label))?;
+        let scope = resolve_write_scope(
+            entry.write_scope.as_deref(),
+            &child_cwd.resolved,
+            &child_cwd.resolved,
+        )
+        .map_err(|e| format!("Error: batch entry `{}`: {e}", entry.label))?;
         if entry.child_agent == "docs" {
             let docs_args = self.spawn_args_delegated_in_cwd(
                 &child_cwd.resolved,
@@ -2719,9 +2740,13 @@ impl Driver {
                 )
             })
             .map_err(anyhow::Error::msg)?;
-            let resolved_write_scope =
-                resolve_write_scope(write_scope.as_deref(), &child_cwd.resolved, &self.cwd)
-                    .map_err(anyhow::Error::msg)?;
+            let resolved_write_scope = resolve_write_scope_for_workspace_lease(
+                write_scope.as_deref(),
+                &child_cwd.resolved,
+                &child_cwd.resolved,
+                recovered_workspace_lease.as_ref(),
+            )
+            .map_err(anyhow::Error::msg)?;
             let resolved_write_scope =
                 recovered_workspace_lease
                     .as_ref()
@@ -2859,34 +2884,37 @@ impl Driver {
         // child's OWN resolved posture — never a parent-frame fallback for a
         // different selected model; `docs` resolves its posture from the model its
         // stages actually build under (`docs-resolver`).
-        let resolved_write_scope =
-            match resolve_write_scope(write_scope.as_deref(), &child_cwd.resolved, &self.cwd) {
-                Ok(scope) => scope,
-                Err(err) => {
-                    grace_retain_task_workspace_lease(
-                        &self.session.db,
-                        self.session.id,
-                        self.stack.last().and_then(|frame| frame.agent_instance_id),
-                        workspace_lease.as_deref(),
-                    )
-                    .await;
-                    return Ok(SingleNoninteractiveCompletion {
-                        child_agent,
-                        task_call_id,
-                        task_provider_item_id,
-                        task_function_call_id,
-                        report: format!("Error: {err}"),
-                        failed: true,
-                        failure: None,
-                        partial_progress: DelegationPartialProgress::default(),
-                        new_handle: None,
-                        snapshot: NoninteractiveDelegationSnapshot::empty(),
-                        shrink: None,
-                        repair_notes,
-                        child_routing: None,
-                    });
-                }
-            };
+        let resolved_write_scope = match resolve_write_scope(
+            write_scope.as_deref(),
+            &child_cwd.resolved,
+            &child_cwd.resolved,
+        ) {
+            Ok(scope) => scope,
+            Err(err) => {
+                grace_retain_task_workspace_lease(
+                    &self.session.db,
+                    self.session.id,
+                    self.stack.last().and_then(|frame| frame.agent_instance_id),
+                    workspace_lease.as_deref(),
+                )
+                .await;
+                return Ok(SingleNoninteractiveCompletion {
+                    child_agent,
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    report: format!("Error: {err}"),
+                    failed: true,
+                    failure: None,
+                    partial_progress: DelegationPartialProgress::default(),
+                    new_handle: None,
+                    snapshot: NoninteractiveDelegationSnapshot::empty(),
+                    shrink: None,
+                    repair_notes,
+                    child_routing: None,
+                });
+            }
+        };
         // Check reachability before resolving the child's execution surface.
         // Surface resolution intentionally reads the child configuration from
         // the selected cwd, but an unknown child must retain the parent-facing
@@ -5249,7 +5277,7 @@ impl Driver {
             let resolved_write_scope = match resolve_write_scope(
                 entry.write_scope.as_deref(),
                 &child_cwd.resolved,
-                &self.cwd,
+                &child_cwd.resolved,
             ) {
                 Ok(scope) => scope,
                 Err(err) => {
@@ -7780,10 +7808,15 @@ async fn prepare_recovered_recursive_noninteractive_executor(
         )
         .map_err(anyhow::Error::msg)
     })?;
+    let parent_visibility_root = parent_agent
+        .workspace_lease
+        .as_deref()
+        .map(|lease| lease.visibility_root.as_path())
+        .unwrap_or(session.project_root.as_path());
     let child_cwd = resolve_recursive_vnext_child_cwd(
         Some(raw_cwd),
         parent_cwd,
-        &session.project_root,
+        parent_visibility_root,
         recovered_workspace_lease.as_ref(),
     )
     .map_err(anyhow::Error::msg)?;
@@ -7792,12 +7825,13 @@ async fn prepare_recovered_recursive_noninteractive_executor(
         .as_ref()
         .context("recovered recursive executor parent has no vNext grant")?
         .clone();
-    let write_scope = resolve_write_scope(
+    let write_scope = resolve_write_scope_for_workspace_lease(
         launch
             .get("write_scope")
             .and_then(serde_json::Value::as_str),
         &child_cwd,
-        &session.project_root,
+        &child_cwd,
+        recovered_workspace_lease.as_ref(),
     )
     .map_err(anyhow::Error::msg)?;
     if let Some(error) =
@@ -9782,6 +9816,11 @@ pub(crate) async fn run_noninteractive_resumable(
                 // legacy interactive handoff, preserving cwd and write_scope
                 // for the recursive child admission.
                 let parent_grant = agent.vnext_grant.as_ref().expect("guarded above").clone();
+                let parent_visibility_root = agent
+                    .workspace_lease
+                    .as_deref()
+                    .map(|lease| lease.visibility_root.as_path())
+                    .unwrap_or(session.project_root.as_path());
                 let _vnext_admission = match recursive_vnext_admissions.try_admit(&agent, 1) {
                     Ok(permits) => permits,
                     Err(error) => {
@@ -9802,7 +9841,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     &parent_grant,
                     agent.workspace_lease.as_deref(),
                     &cwd,
-                    &session.project_root,
+                    parent_visibility_root,
                     requested_cwd.as_deref(),
                     requested_lease.as_deref(),
                 )
@@ -9827,7 +9866,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     _ => resolve_recursive_vnext_child_cwd(
                         requested_cwd.as_deref(),
                         &cwd,
-                        &session.project_root,
+                        parent_visibility_root,
                         live_lease.as_ref(),
                     ),
                 };
@@ -9849,10 +9888,11 @@ pub(crate) async fn run_noninteractive_resumable(
                         continue;
                     }
                 };
-                let resolved_write_scope = match resolve_write_scope(
+                let resolved_write_scope = match resolve_write_scope_for_workspace_lease(
                     write_scope.as_deref(),
                     &child_cwd,
-                    &session.project_root,
+                    &child_cwd,
+                    live_lease.as_ref(),
                 ) {
                     Ok(scope) => scope,
                     Err(error) => {
@@ -10261,6 +10301,11 @@ pub(crate) async fn run_noninteractive_resumable(
                     }
                 };
                 let parent_grant = agent.vnext_grant.as_ref().expect("guarded above").clone();
+                let parent_visibility_root = agent
+                    .workspace_lease
+                    .as_deref()
+                    .map(|lease| lease.visibility_root.as_path())
+                    .unwrap_or(session.project_root.as_path());
                 let mut prepared = Vec::with_capacity(entries.len());
                 let mut issued_workspace_leases = Vec::with_capacity(entries.len());
                 let mut rejection = None;
@@ -10279,7 +10324,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         &parent_grant,
                         agent.workspace_lease.as_deref(),
                         &cwd,
-                        &session.project_root,
+                        parent_visibility_root,
                         entry.cwd.as_deref(),
                         entry.workspace_lease.as_deref(),
                     )
@@ -10313,10 +10358,11 @@ pub(crate) async fn run_noninteractive_resumable(
                             break;
                         }
                     };
-                    let resolved_write_scope = match resolve_write_scope(
+                    let resolved_write_scope = match resolve_write_scope_for_workspace_lease(
                         entry.write_scope.as_deref(),
                         &child_cwd,
-                        &session.project_root,
+                        &child_cwd,
+                        live_lease.as_ref(),
                     ) {
                         Ok(scope) => scope,
                         Err(error) => {

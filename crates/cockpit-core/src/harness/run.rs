@@ -697,9 +697,7 @@ fn excerpt(text: &str, token_cap: usize) -> String {
 /// removes it. Crash recovery marks the matching workspace lease `uncertain`
 /// instead of deleting the path.
 struct Worktree {
-    repo: PathBuf,
     path: PathBuf,
-    branch: String,
     lease_id: uuid::Uuid,
 }
 
@@ -731,12 +729,7 @@ impl Worktree {
         crate::git::assert_worktree_destination_under(&worktrees, &path)?;
         let branch = format!("cockpit-lease/{lease_id}");
         crate::git::worktree_add(&repo, &path, &branch, &head)?;
-        Ok(Some(Self {
-            repo,
-            path,
-            branch,
-            lease_id,
-        }))
+        Ok(Some(Self { path, lease_id }))
     }
 
     /// Capture tracked and untracked changes without mutating the index.
@@ -754,27 +747,15 @@ impl Worktree {
         Ok(out)
     }
 
-    /// Leave the managed worktree in place (grace-retain / pin). Force-delete
-    /// is reserved for [`Self::explicit_clean`].
+    /// Leave the managed worktree in place (grace-retain / pin). Explicit
+    /// deletion is daemon-owned by `workspace_lease` so it can verify the
+    /// durable owner and complete the Git and DB lifecycle atomically.
     fn grace_retain(self) {
         tracing::debug!(
             path = %self.path.display(),
             lease = %self.lease_id,
             "retaining managed harness worktree"
         );
-    }
-
-    /// Host-authorized removal. Callers must have already transitioned the
-    /// durable lease toward cleanup; this never runs on Drop or normal
-    /// worker completion.
-    fn explicit_clean(self) {
-        if let Err(e) = crate::git::worktree_remove(&self.repo, &self.path) {
-            tracing::debug!(error = %e, "harness worktree remove failed; pruning");
-            let _ = crate::git::worktree_prune(&self.repo);
-        }
-        if let Err(e) = crate::git::branch_delete(&self.repo, &self.branch) {
-            tracing::debug!(error = %e, "harness worktree branch delete failed");
-        }
     }
 }
 
@@ -1784,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_worktree_roots_under_daemon_state_and_explicit_clean_is_host_only() {
+    fn managed_worktree_roots_under_daemon_state_and_normal_completion_retains_it() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let state = tmp.path().join("state");
@@ -1818,10 +1799,10 @@ mod tests {
             "untracked files without git add -A: {diff}"
         );
         let path = wt.path.clone();
-        wt.explicit_clean();
+        wt.grace_retain();
         assert!(
-            !path.exists(),
-            "only explicit host cleanup removes the worktree"
+            path.exists(),
+            "normal harness completion must retain the managed worktree"
         );
     }
 

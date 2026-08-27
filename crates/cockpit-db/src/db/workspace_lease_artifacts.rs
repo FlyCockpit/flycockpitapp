@@ -490,6 +490,41 @@ fn lease_for_owner(
 ) -> Result<Option<WorkspaceLeaseRow>> {
     conn.query_row(&format!("SELECT {LEASE_COLS} FROM workspace_leases WHERE workspace_lease_id=?1 AND session_id=?2 AND agent_instance_id=?3"), params![lease.to_string(),session.to_string(),agent.to_string()], map_lease).optional().context("loading authorized workspace lease")
 }
+
+/// A task lease is issued by its direct parent, but is deliberately carried by
+/// that parent's child and may be used to issue a bounded grandchild lease.
+/// Authorize that narrow hand-off by walking only the durable agent-tree
+/// ancestry from the requesting agent to the row owner.  A sibling, another
+/// root, or a cross-session UUID cannot manufacture this relationship.
+fn lease_for_agent_tree_lineage(
+    conn: &Connection,
+    session: Uuid,
+    agent: Uuid,
+    lease: Uuid,
+) -> Result<Option<WorkspaceLeaseRow>> {
+    conn.query_row(
+        &format!(
+            "WITH RECURSIVE ancestors(agent_instance_id) AS (\
+                 SELECT ?3\
+                 UNION\
+                 SELECT parent.parent_agent_instance_id\
+                   FROM agent_instances parent\
+                   JOIN ancestors child\
+                     ON parent.agent_instance_id = child.agent_instance_id\
+                  WHERE parent.session_id = ?2\
+                    AND parent.parent_agent_instance_id IS NOT NULL\
+             )\
+             SELECT {LEASE_COLS} FROM workspace_leases\
+              WHERE workspace_lease_id = ?1\
+                AND session_id = ?2\
+                AND agent_instance_id IN ancestors"
+        ),
+        params![lease.to_string(), session.to_string(), agent.to_string()],
+        map_lease,
+    )
+    .optional()
+    .context("loading workspace lease authorized by agent-tree lineage")
+}
 fn artifact_for_owner(
     conn: &Connection,
     session: Uuid,
@@ -621,6 +656,18 @@ impl Db {
         let id = Uuid::new_v4();
         self.transaction(move |conn| {
             if !scope_is_owned_active(conn,input.session_id,input.agent_instance_id,input.write_scope_lease_id,&input.canonical_root,None)? { bail!("write scope is not active at this workspace root and owned by this agent"); }
+            if let Some(parent_id) = input.parent_workspace_lease_id {
+                let parent = lease_for_agent_tree_lineage(
+                    conn,
+                    input.session_id,
+                    input.agent_instance_id,
+                    parent_id,
+                )?
+                .context("parent workspace lease is not owned by this agent or an ancestor")?;
+                if !workspace_lease_lineage_is_live(conn, &parent, now)? {
+                    bail!("parent workspace lease is revoked, expired, or no longer live");
+                }
+            }
             conn.execute("INSERT INTO workspace_leases (workspace_lease_id,session_id,agent_instance_id,write_scope_lease_id,parent_workspace_lease_id,canonical_repository_id,canonical_root,kind,allowed_ops,host_issued,base_sha_digest,base_ref_digest,managed_path,private_ref_digest,state,expires_at_unix_ms,revision,terminal_reason,uncertain_reason,pinned_at_unix_ms,pinned_by_agent_instance_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11,?12,?13,'active',?14,0,NULL,NULL,NULL,NULL,?15,?15)", params![id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.write_scope_lease_id.to_string(),input.parent_workspace_lease_id.map(|value| value.to_string()),input.canonical_repository_id,input.canonical_root,input.kind.as_str(),i64::from(input.allowed_ops),input.base_sha_digest.as_str(),input.base_ref_digest.as_str(),input.managed_path,input.private_ref_digest.as_str(),input.expires_at_unix_ms,now]).context("inserting workspace lease")?;
             lease_for_owner(conn,input.session_id,input.agent_instance_id,id)?.context("created workspace lease missing")
         }).await
@@ -654,6 +701,18 @@ impl Db {
             if !scope_is_host_active(conn, input.session_id, input.write_scope_lease_id)? {
                 bail!("host write scope is not active for this workspace lease session");
             }
+            if let Some(parent_id) = input.parent_workspace_lease_id {
+                let parent = lease_for_agent_tree_lineage(
+                    conn,
+                    input.session_id,
+                    input.agent_instance_id,
+                    parent_id,
+                )?
+                .context("parent workspace lease is not owned by this agent or an ancestor")?;
+                if !workspace_lease_lineage_is_live(conn, &parent, now)? {
+                    bail!("parent workspace lease is revoked, expired, or no longer live");
+                }
+            }
             conn.execute("INSERT INTO workspace_leases (workspace_lease_id,session_id,agent_instance_id,write_scope_lease_id,parent_workspace_lease_id,canonical_repository_id,canonical_root,kind,allowed_ops,host_issued,base_sha_digest,base_ref_digest,managed_path,private_ref_digest,state,expires_at_unix_ms,revision,terminal_reason,uncertain_reason,pinned_at_unix_ms,pinned_by_agent_instance_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10,?11,?12,?13,'active',?14,0,NULL,NULL,NULL,NULL,?15,?15)", params![id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.write_scope_lease_id.to_string(),input.parent_workspace_lease_id.map(|value| value.to_string()),input.canonical_repository_id,input.canonical_root,input.kind.as_str(),i64::from(input.allowed_ops),input.base_sha_digest.as_str(),input.base_ref_digest.as_str(),input.managed_path,input.private_ref_digest.as_str(),input.expires_at_unix_ms,now]).context("inserting host workspace lease")?;
             lease_for_owner(conn,input.session_id,input.agent_instance_id,id)?.context("created host workspace lease missing")
         }).await
@@ -677,7 +736,7 @@ impl Db {
         now: i64,
     ) -> Result<Option<WorkspaceLeaseRow>> {
         self.read(move |c| {
-            let Some(row) = lease_for_owner(c, session, agent, id)? else {
+            let Some(row) = lease_for_agent_tree_lineage(c, session, agent, id)? else {
                 return Ok(None);
             };
             Ok(workspace_lease_lineage_is_live(c, &row, now)?.then_some(row))
@@ -696,7 +755,7 @@ impl Db {
         if new_expiry <= now {
             bail!("renewed expiry must be in the future");
         }
-        self.transaction(move |c| { let Some(current)=lease_for_owner(c,session,agent,id)? else { return Ok(LeaseCasOutcome::RevisionConflict) }; if current.state.is_terminal(){return Ok(LeaseCasOutcome::AlreadyTerminal(current))}; if current.state != WorkspaceLeaseState::Active || current.expires_at_unix_ms <= now || current.revision != expected_revision || !scope_is_owned_active(c,session,agent,current.write_scope_lease_id,&current.canonical_root,None)? { return Ok(LeaseCasOutcome::RevisionConflict) }; c.execute("UPDATE workspace_leases SET expires_at_unix_ms=?1,revision=revision+1,updated_at_unix_ms=?2 WHERE workspace_lease_id=?3 AND revision=?4 AND state='active' AND expires_at_unix_ms>?2",params![new_expiry,now,id.to_string(),expected_revision])?; Ok(LeaseCasOutcome::Transitioned(lease_for_owner(c,session,agent,id)?.context("renewed lease missing")?)) }).await
+        self.transaction(move |c| { let Some(current)=lease_for_owner(c,session,agent,id)? else { return Ok(LeaseCasOutcome::RevisionConflict) }; if current.state.is_terminal(){return Ok(LeaseCasOutcome::AlreadyTerminal(current))}; if current.state != WorkspaceLeaseState::Active || current.expires_at_unix_ms <= now || current.revision != expected_revision || !workspace_lease_lineage_is_live(c,&current,now)? { return Ok(LeaseCasOutcome::RevisionConflict) }; c.execute("UPDATE workspace_leases SET expires_at_unix_ms=?1,revision=revision+1,updated_at_unix_ms=?2 WHERE workspace_lease_id=?3 AND revision=?4 AND state='active' AND expires_at_unix_ms>?2",params![new_expiry,now,id.to_string(),expected_revision])?; Ok(LeaseCasOutcome::Transitioned(lease_for_owner(c,session,agent,id)?.context("renewed lease missing")?)) }).await
     }
     pub async fn expire_workspace_lease(
         &self,
@@ -848,7 +907,7 @@ impl Db {
         now: i64,
     ) -> Result<TaskArtifactRow> {
         let id = Uuid::new_v4();
-        self.transaction(move |c| { let lease=lease_for_owner(c,input.session_id,input.agent_instance_id,input.source_workspace_lease_id)?.context("source workspace lease is not owned")?; if lease.state != WorkspaceLeaseState::Active || lease.expires_at_unix_ms <= now || !scope_is_owned_active(c,input.session_id,input.agent_instance_id,lease.write_scope_lease_id,&lease.canonical_root,None)? { bail!("source workspace lease is unavailable for artifact production"); } let parent=input.parent_result.encode()?; c.execute("INSERT INTO task_artifacts (artifact_id,source_workspace_lease_id,session_id,agent_instance_id,base_head_digest,base_ref_digest,base_index_digest,touched_manifest_digest,untracked_manifest_digest,ordered_patch_digest,validation_receipt_digest,parent_result_json,state,revision,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'produced',0,?13,?13)",params![id.to_string(),input.source_workspace_lease_id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.base_head_digest.as_str(),input.base_ref_digest.as_str(),input.base_index_digest.as_str(),input.touched_manifest_digest.as_str(),input.untracked_manifest_digest.as_str(),input.ordered_patch_digest.as_str(),input.validation_receipt_digest.as_str(),parent,now])?; artifact_for_owner(c,input.session_id,input.agent_instance_id,id)?.context("created artifact missing") }).await
+        self.transaction(move |c| { let lease=lease_for_owner(c,input.session_id,input.agent_instance_id,input.source_workspace_lease_id)?.context("source workspace lease is not owned")?; if !workspace_lease_lineage_is_live(c,&lease,now)? { bail!("source workspace lease is unavailable for artifact production"); } let parent=input.parent_result.encode()?; c.execute("INSERT INTO task_artifacts (artifact_id,source_workspace_lease_id,session_id,agent_instance_id,base_head_digest,base_ref_digest,base_index_digest,touched_manifest_digest,untracked_manifest_digest,ordered_patch_digest,validation_receipt_digest,parent_result_json,state,revision,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'produced',0,?13,?13)",params![id.to_string(),input.source_workspace_lease_id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.base_head_digest.as_str(),input.base_ref_digest.as_str(),input.base_index_digest.as_str(),input.touched_manifest_digest.as_str(),input.untracked_manifest_digest.as_str(),input.ordered_patch_digest.as_str(),input.validation_receipt_digest.as_str(),parent,now])?; artifact_for_owner(c,input.session_id,input.agent_instance_id,id)?.context("created artifact missing") }).await
     }
     pub async fn task_artifact(
         &self,
@@ -1175,6 +1234,123 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // Host-issued rows bind to the daemon root write scope, not an
+        // agent-owned scope. Both artifact production and renewal must still
+        // use that live host provenance rather than rejecting the row through
+        // the agent-owned validation path.
+        let renewed = db
+            .renew_workspace_lease(session, owner_id, id, lease.revision, 200, 11)
+            .await
+            .unwrap();
+        let LeaseCasOutcome::Transitioned(renewed) = renewed else {
+            panic!("host-issued lease renewal must retain CAS semantics");
+        };
+        let artifact = db
+            .create_task_artifact(
+                artifact_input(session, owner_id, renewed.workspace_lease_id),
+                12,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact.source_workspace_lease_id,
+            renewed.workspace_lease_id
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_host_lease_authorizes_only_agent_tree_descendants() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, parent, _) = owner(&db, 10).await;
+        let child = db
+            .create_agent_instance(
+                NewAgentInstance {
+                    session_id: session,
+                    parent_agent_instance_id: Some(parent),
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                11,
+            )
+            .await
+            .unwrap();
+        let unrelated = db
+            .create_agent_instance(
+                NewAgentInstance {
+                    session_id: session,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                11,
+            )
+            .await
+            .unwrap();
+        let host_scope = Uuid::new_v4();
+        db.insert_write_scope_lease(WriteScopeLeaseRow {
+            lease_id: host_scope,
+            parent_lease_id: None,
+            session_id: session,
+            task_id: None,
+            scope_path: "/repo".into(),
+            generation: 8,
+            state: "active".into(),
+            owner_id: "session-root".into(),
+            version: 0,
+            created_at_wall_ms: 11,
+            updated_at_wall_ms: 11,
+            released_at_wall_ms: None,
+        })
+        .await
+        .unwrap();
+        let parent_lease = db
+            .create_host_workspace_lease(
+                lease_input(session, parent, host_scope, 100),
+                Uuid::new_v4(),
+                12,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            db.workspace_lease_for_tools(
+                session,
+                child.agent_instance_id,
+                parent_lease.workspace_lease_id,
+                13,
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "a direct child can use its issuing parent's selected lease"
+        );
+        let mut grandchild_lease = lease_input(session, child.agent_instance_id, host_scope, 100);
+        grandchild_lease.parent_workspace_lease_id = Some(parent_lease.workspace_lease_id);
+        grandchild_lease.managed_path = "agents/grandchild".into();
+        assert!(
+            db.create_host_workspace_lease(grandchild_lease, Uuid::new_v4(), 13)
+                .await
+                .is_ok(),
+            "a child can issue a descendant lease only through its inherited parent lease"
+        );
+        assert!(
+            db.workspace_lease_for_tools(
+                session,
+                unrelated.agent_instance_id,
+                parent_lease.workspace_lease_id,
+                13,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "an unrelated agent cannot adopt an ancestor's lease"
+        );
     }
 
     #[tokio::test]
@@ -1209,6 +1385,32 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_workspace_lease_insert_rechecks_parent_lineage_transactionally() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, agent, scope) = owner(&db, 10).await;
+        let parent = db
+            .create_workspace_lease(lease_input(session, agent, scope, 100), 10)
+            .await
+            .unwrap();
+        db.grace_retain_workspace_lease(
+            session,
+            agent,
+            parent.workspace_lease_id,
+            parent.revision,
+            11,
+        )
+        .await
+        .unwrap();
+        let mut child = lease_input(session, agent, scope, 100);
+        child.parent_workspace_lease_id = Some(parent.workspace_lease_id);
+        child.managed_path = "agents/revoked-parent-child".into();
+        assert!(
+            db.create_workspace_lease(child, 12).await.is_err(),
+            "a child insert must not race a revoked parent snapshot"
         );
     }
 

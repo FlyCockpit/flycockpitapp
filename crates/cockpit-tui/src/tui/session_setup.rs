@@ -1,19 +1,13 @@
-//! Read-only session-setup picker overlay.
+//! Session-setup panel: agent, model, tools, and MCPs for the attached session.
 //!
-//! Renders the daemon-owned [`SessionSetupSnapshotV1`]: installed-agent
-//! candidates (kept distinct by scope so a same-named global and workspace
-//! install never collapse), each candidate's model slots with author
-//! recommendations ordered ahead of other compatible offerings, visibly
-//! unmatched recommendations, and closed daemon-owned locked/unavailable
-//! reasons. The snapshot DTO carries no provider profile handles, credentials,
-//! or filesystem paths, so none can be rendered here. Colour is supplementary:
-//! every distinction is also carried by text so the no-colour projection is
-//! equivalent.
+//! Renders the daemon-owned [`SessionSetupSnapshotV1`]. Installed-agent
+//! candidates stay distinct by scope so a same-named global and workspace
+//! install never collapse. Colour is supplementary: every distinction is also
+//! carried by text so the no-colour projection is equivalent.
 //!
-//! This overlay is deliberately read-only. Changing a slot's model binding is
-//! a session-override *mutation* that belongs to the later override-mutation
-//! increment (it needs the per-node `agent_instance_id` + revision transaction
-//! that this read-only endpoint does not accept).
+//! The pane is used as a full-body overlay (`/session-setup`) and as an inline
+//! panel below the banner on a fresh session. Mutations are emitted as
+//! [`SessionSetupOutcome`] values; the app owns daemon RPCs.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -31,11 +25,55 @@ use cockpit_proto::{
 
 use crate::tui::pane::Pane;
 
-/// Outcome of a key press: whether the overlay should close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Outcome of a key press. The overlay/app applies mutations; the pane never
+/// talks to the daemon itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionSetupOutcome {
     Stay,
     Close,
+    /// Re-resolve the session's primary agent (existing `/agent` swap path).
+    SelectAgent {
+        name: String,
+    },
+    /// Session-only model rebind for the root node's primary slot.
+    SelectModel {
+        slot_id: String,
+        choice_id: String,
+    },
+    /// Whole-selection tool-surface replace for this session.
+    SetToolSurface {
+        override_json: String,
+    },
+    /// Add an MCP server at an explicit scope.
+    AddMcp {
+        scope: SessionSetupMcpScope,
+        name: String,
+        transport: String,
+        endpoint: Option<String>,
+        command: Option<String>,
+        auth: String,
+    },
+    Notice {
+        message: String,
+    },
+}
+
+/// MCP write target chosen in the Add-MCP dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionSetupMcpScope {
+    Global,
+    Workspace,
+    Agent,
+}
+
+impl SessionSetupMcpScope {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+            Self::Agent => "agent",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,17 +86,23 @@ enum Status {
     Error(String),
 }
 
-/// The session-setup picker overlay pane. It keeps only the flattened display
-/// rows (derived from the last snapshot) plus selection/status — the raw
-/// snapshot need not be retained since this surface is read-only.
+/// Session-setup pane. Retains the last snapshot so Enter can emit a payload
+/// and so reopening after collapse still shows current values.
 pub(crate) struct SessionSetupPane {
     status: Status,
     /// Ratatui selection/viewport state over the flat display rows.
     list: ListState,
     /// Flat display rows derived from the last applied snapshot.
     rows: Vec<DisplayRow>,
+    /// Last applied snapshot. Retained so activations name concrete ids.
+    snapshot: Option<SessionSetupSnapshotV1>,
     /// Supplementary colour. `false` yields a plain, equivalent projection.
     color: bool,
+    /// Inline notice (refusals, locked rows, lint). Presentation-only.
+    notice: Option<String>,
+    /// When `true`, render without the full-body title chrome so the panel
+    /// can sit below the banner box.
+    inline: bool,
 }
 
 /// One rendered line, pre-classified so colour is purely supplementary and the
@@ -69,6 +113,21 @@ struct DisplayRow {
     text: String,
     /// Selectable rows anchor the cursor; headers/detail are skipped.
     selectable: bool,
+    payload: RowPayload,
+}
+
+/// What Enter does for a selectable row. `None` is navigable but inert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowPayload {
+    None,
+    Agent {
+        name: String,
+        locked: bool,
+    },
+    ModelChoice {
+        slot_id: String,
+        choice_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,18 +146,35 @@ enum RowKind {
 impl SessionSetupPane {
     /// A fresh pane awaiting its first snapshot.
     pub(crate) fn loading(color: bool) -> Self {
+        Self::loading_mode(color, false)
+    }
+
+    /// Inline panel below the banner (fresh-session placement).
+    pub(crate) fn loading_inline(color: bool) -> Self {
+        Self::loading_mode(color, true)
+    }
+
+    fn loading_mode(color: bool, inline: bool) -> Self {
         Self {
             status: Status::Loading,
             list: ListState::default(),
             rows: Vec::new(),
+            snapshot: None,
             color,
+            notice: None,
+            inline,
         }
+    }
+
+    pub(crate) fn is_inline(&self) -> bool {
+        self.inline
     }
 
     /// Apply a daemon snapshot, rebuilding the flat rows and clamping the
     /// cursor to the first selectable row.
     pub(crate) fn apply_snapshot(&mut self, snapshot: SessionSetupSnapshotV1) {
         self.rows = build_rows(&snapshot);
+        self.snapshot = Some(snapshot);
         self.status = Status::Ready;
         let first = self.rows.iter().position(|row| row.selectable);
         self.list.select(first);
@@ -107,6 +183,14 @@ impl SessionSetupPane {
     /// Record a fixed, daemon-independent error message.
     pub(crate) fn set_error(&mut self, message: impl Into<String>) {
         self.status = Status::Error(message.into());
+    }
+
+    pub(crate) fn set_notice(&mut self, message: impl Into<String>) {
+        self.notice = Some(message.into());
+    }
+
+    pub(crate) fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     fn selectable_indices(&self) -> impl Iterator<Item = usize> + '_ {
@@ -133,6 +217,32 @@ impl SessionSetupPane {
         self.list.select(Some(selectable[next]));
     }
 
+    fn selected_payload(&self) -> Option<&RowPayload> {
+        let index = self.list.selected()?;
+        Some(&self.rows.get(index)?.payload)
+    }
+
+    fn activate_selection(&mut self) -> SessionSetupOutcome {
+        match self.selected_payload().cloned().unwrap_or(RowPayload::None) {
+            RowPayload::None => SessionSetupOutcome::Stay,
+            RowPayload::Agent { name, locked } => {
+                if locked {
+                    self.notice = Some(format!("Agent `{name}` is locked and cannot be selected."));
+                    SessionSetupOutcome::Stay
+                } else {
+                    SessionSetupOutcome::SelectAgent { name }
+                }
+            }
+            RowPayload::ModelChoice {
+                slot_id,
+                choice_id,
+            } => SessionSetupOutcome::SelectModel {
+                slot_id,
+                choice_id,
+            },
+        }
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> SessionSetupOutcome {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => SessionSetupOutcome::Close,
@@ -144,18 +254,22 @@ impl SessionSetupPane {
                 self.move_selection(false);
                 SessionSetupOutcome::Stay
             }
+            KeyCode::Enter => self.activate_selection(),
             _ => SessionSetupOutcome::Stay,
         }
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Session setup ");
+        let title = if self.inline {
+            " Session setup (Tab: composer) "
+        } else {
+            " Session setup "
+        };
+        let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let lines: Vec<Line<'static>> = match &self.status {
+        let mut lines: Vec<Line<'static>> = match &self.status {
             Status::Loading => vec![Line::from(Span::raw("Loading session setup…"))],
             Status::Error(message) => vec![Line::from(styled(
                 message.clone(),
@@ -168,10 +282,56 @@ impl SessionSetupPane {
                 .map(|row| Line::from(styled(row.text.clone(), row.kind, self.color)))
                 .collect(),
         };
+        if let Some(notice) = &self.notice {
+            lines.insert(
+                0,
+                Line::from(styled(notice.clone(), RowKind::CandidateLocked, self.color)),
+            );
+        }
 
         let items: Vec<ListItem<'static>> = lines.into_iter().map(ListItem::new).collect();
         let list = List::new(items).highlight_symbol("› ");
         frame.render_stateful_widget(list, inner, &mut self.list);
+    }
+
+    /// Lines for the inline panel (no outer overlay chrome). Used by the
+    /// session-view renderer so the panel sits below the banner box.
+    pub(crate) fn inline_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from(styled(
+            "Session setup".to_string(),
+            RowKind::CandidateSelected,
+            self.color,
+        ))];
+        if let Some(notice) = &self.notice {
+            lines.push(Line::from(styled(
+                notice.clone(),
+                RowKind::CandidateLocked,
+                self.color,
+            )));
+        }
+        match &self.status {
+            Status::Loading => lines.push(Line::from(Span::raw("Loading session setup…"))),
+            Status::Error(message) => lines.push(Line::from(styled(
+                message.clone(),
+                RowKind::CandidateLocked,
+                self.color,
+            ))),
+            Status::Ready => {
+                for row in &self.rows {
+                    lines.push(Line::from(styled(
+                        row.text.clone(),
+                        row.kind,
+                        self.color,
+                    )));
+                }
+            }
+        }
+        lines.push(Line::from(styled(
+            "Enter activates · j/k move · Tab composer".to_string(),
+            RowKind::Unmatched,
+            self.color,
+        )));
+        lines
     }
 }
 
@@ -233,7 +393,20 @@ fn candidate_header(candidate: &SessionSetupAgentCandidateV1) -> DisplayRow {
         kind,
         text,
         selectable: true,
+        payload: RowPayload::Agent {
+            name: agent_name(record),
+            locked: candidate.locked_reason.is_some(),
+        },
     }
+}
+
+fn agent_name(record: &AgentInstallationRecordV1) -> String {
+    record
+        .source_agent_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(&record.source_agent_id)
+        .to_string()
 }
 
 /// One choice line. Author-suggested / exact-alias offerings are marked so the
@@ -270,6 +443,10 @@ fn choice_row(choice: &AgentInstallationChoiceV1) -> DisplayRow {
         kind,
         text,
         selectable: true,
+        payload: RowPayload::ModelChoice {
+            slot_id: choice.slot_id.clone(),
+            choice_id: choice.choice_id.clone(),
+        },
     }
 }
 
@@ -285,6 +462,7 @@ fn unmatched_row(rec: &AgentInstallationUnmatchedRecommendationV1) -> DisplayRow
         kind: RowKind::Unmatched,
         text,
         selectable: false,
+        payload: RowPayload::None,
     }
 }
 
@@ -306,6 +484,7 @@ fn slot_rows(slot: &SessionSetupModelSlotV1, out: &mut Vec<DisplayRow>) {
         },
         text: header_text,
         selectable: false,
+        payload: RowPayload::None,
     });
     // Choices are already ordered by the daemon: exact alias / author-suggested
     // first, then other hard-compatible offerings. Render in that exact order;
@@ -337,6 +516,7 @@ fn build_rows(snapshot: &SessionSetupSnapshotV1) -> Vec<DisplayRow> {
             kind: RowKind::Blank,
             text: String::new(),
             selectable: false,
+            payload: RowPayload::None,
         });
     }
     rows
@@ -606,5 +786,93 @@ mod tests {
             "source_digest must not render"
         );
         assert!(!text.contains("publisher/repo:agents/reviewer.md"));
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn modes_session_setup_enter_on_agent_candidate_emits_select_agent() {
+        let snap = snapshot(vec![candidate(
+            "authored/reviewer",
+            Global,
+            false,
+            Vec::new(),
+            None,
+        )]);
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap);
+        let outcome = pane.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            outcome,
+            SessionSetupOutcome::SelectAgent {
+                name: "reviewer".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_enter_on_locked_agent_stays_with_notice() {
+        let snap = snapshot(vec![candidate(
+            "authored/reviewer",
+            Global,
+            false,
+            Vec::new(),
+            Some(SessionSetupLockedReasonV1::RebindRequired),
+        )]);
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap);
+        let outcome = pane.handle_key(press(KeyCode::Enter));
+        assert_eq!(outcome, SessionSetupOutcome::Stay);
+        assert!(
+            pane.notice()
+                .is_some_and(|notice| notice.contains("locked")),
+            "locked agent must surface a notice, not a silent no-op"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_agent_rows_carry_payload() {
+        let snap = snapshot(vec![candidate(
+            "authored/reviewer",
+            Global,
+            true,
+            Vec::new(),
+            None,
+        )]);
+        let rows = build_rows(&snap);
+        let agent = rows
+            .iter()
+            .find(|row| matches!(row.payload, RowPayload::Agent { .. }))
+            .expect("agent candidate row");
+        assert!(agent.selectable);
+        match &agent.payload {
+            RowPayload::Agent { name, locked } => {
+                assert_eq!(name, "reviewer");
+                assert!(!*locked);
+            }
+            other => panic!("expected agent payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modes_session_setup_inline_loading_is_distinct_from_overlay() {
+        let inline = SessionSetupPane::loading_inline(false);
+        assert!(inline.is_inline());
+        assert!(!SessionSetupPane::loading(false).is_inline());
+        let lines = inline.inline_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("Loading session setup")),
+            "inline loading state must render a loading line"
+        );
     }
 }

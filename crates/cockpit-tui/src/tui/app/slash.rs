@@ -712,8 +712,8 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
-        name: "setup",
-        description: "Daemon-owned session setup: installed agents, model slots, and bindings (read-only)",
+        name: "session-setup",
+        description: "Session setup panel: agent, model, tools, and MCPs for this session",
         takes_args: false,
         run: run_session_setup,
         available: available_always,
@@ -3710,6 +3710,14 @@ mod table_tests {
             );
         }
         assert_eq!(names.len(), SLASH_COMMANDS.len());
+        assert!(
+            names.contains("setup"),
+            "wizard /setup must remain registered"
+        );
+        assert!(
+            names.contains("session-setup"),
+            "session setup pane must be /session-setup, not a second /setup"
+        );
 
         for alias in HIDDEN_SLASH_ALIASES {
             assert!(

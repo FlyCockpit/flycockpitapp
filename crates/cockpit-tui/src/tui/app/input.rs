@@ -1088,12 +1088,7 @@ impl App {
                 return false;
             }
             Overlay::SessionSetup(mut pane) => {
-                match pane.handle_key(key) {
-                    crate::tui::session_setup::SessionSetupOutcome::Close => {}
-                    crate::tui::session_setup::SessionSetupOutcome::Stay => {
-                        self.overlay = Overlay::SessionSetup(pane);
-                    }
-                }
+                self.apply_session_setup_outcome(pane.handle_key(key), pane, true);
                 return false;
             }
             Overlay::AgentTree(mut pane) => {

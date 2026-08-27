@@ -1,7 +1,9 @@
-//! App-side wiring for the read-only session-setup overlay: open, fetch the
-//! daemon-owned snapshot, and apply the result into the open pane.
+//! App-side wiring for the session-setup overlay and inline panel: open,
+//! fetch the daemon-owned snapshot, apply results, and dispatch mutations.
 
 use super::*;
+
+use crate::tui::session_setup::{SessionSetupOutcome, SessionSetupPane};
 
 /// Async-action name for the session-setup snapshot fetch. `Replace` policy
 /// keyed on this name coalesces bursts (e.g. repeated `AgentTreeChanged`
@@ -9,15 +11,111 @@ use super::*;
 const SESSION_SETUP_SNAPSHOT_ACTION: &str = "session_setup.snapshot";
 
 impl App {
-    /// Open the read-only session-setup overlay and schedule its first
-    /// snapshot fetch. The daemon owns the snapshot; before attach the pane
-    /// shows a fixed unavailable message rather than any local guess.
+    /// Open the session-setup overlay and schedule its first snapshot fetch.
+    /// The daemon owns the snapshot; before attach the pane shows a fixed
+    /// unavailable message rather than any local guess.
     pub(super) fn open_session_setup(&mut self) {
         // Colour is supplementary here; render with styling and let the
         // terminal honour NO_COLOR. The plain projection is exercised by tests.
-        self.overlay =
-            Overlay::SessionSetup(crate::tui::session_setup::SessionSetupPane::loading(true));
+        self.overlay = Overlay::SessionSetup(SessionSetupPane::loading(true));
         self.request_session_setup_snapshot_refresh();
+    }
+
+    /// Dispatch a pane outcome. `as_overlay` keeps the overlay open on Stay.
+    pub(super) fn apply_session_setup_outcome(
+        &mut self,
+        outcome: SessionSetupOutcome,
+        mut pane: SessionSetupPane,
+        as_overlay: bool,
+    ) {
+        match outcome {
+            SessionSetupOutcome::Close => {
+                if as_overlay {
+                    // Overlay dismissed; inline panel (if still expanded) is unchanged.
+                }
+            }
+            SessionSetupOutcome::Stay => {
+                if as_overlay {
+                    self.overlay = Overlay::SessionSetup(pane);
+                } else {
+                    self.session_setup_inline = Some(pane);
+                }
+            }
+            SessionSetupOutcome::SelectAgent { name } => {
+                if as_overlay {
+                    self.overlay = Overlay::SessionSetup(pane);
+                } else {
+                    self.session_setup_inline = Some(pane);
+                }
+                self.swap_primary_agent(&name);
+                self.request_session_setup_snapshot_refresh();
+            }
+            SessionSetupOutcome::SelectModel {
+                slot_id,
+                choice_id,
+            } => {
+                if as_overlay {
+                    self.overlay = Overlay::SessionSetup(pane);
+                } else {
+                    self.session_setup_inline = Some(pane);
+                }
+                self.submit_session_setup_model_override(slot_id, choice_id);
+            }
+            SessionSetupOutcome::SetToolSurface { override_json } => {
+                if as_overlay {
+                    self.overlay = Overlay::SessionSetup(pane);
+                } else {
+                    self.session_setup_inline = Some(pane);
+                }
+                self.submit_session_setup_tool_surface(override_json);
+            }
+            SessionSetupOutcome::AddMcp {
+                scope,
+                name,
+                transport,
+                endpoint,
+                command,
+                auth,
+            } => {
+                if as_overlay {
+                    self.overlay = Overlay::SessionSetup(pane);
+                } else {
+                    self.session_setup_inline = Some(pane);
+                }
+                self.submit_session_setup_add_mcp(
+                    scope, name, transport, endpoint, command, auth,
+                );
+            }
+            SessionSetupOutcome::Notice { message } => {
+                pane.set_notice(message);
+                if as_overlay {
+                    self.overlay = Overlay::SessionSetup(pane);
+                } else {
+                    self.session_setup_inline = Some(pane);
+                }
+            }
+        }
+    }
+
+    fn submit_session_setup_model_override(&mut self, _slot_id: String, _choice_id: String) {
+        // Wired in the model-section stage; kept as a named seam so Enter on
+        // a choice row is never a silent no-op at the outcome layer.
+    }
+
+    fn submit_session_setup_tool_surface(&mut self, _override_json: String) {
+        // Wired in the tools-section stage.
+    }
+
+    fn submit_session_setup_add_mcp(
+        &mut self,
+        _scope: crate::tui::session_setup::SessionSetupMcpScope,
+        _name: String,
+        _transport: String,
+        _endpoint: Option<String>,
+        _command: Option<String>,
+        _auth: String,
+    ) {
+        // Wired in the MCP-section stage.
     }
 
     /// Schedule an async `GetSessionSetupSnapshot` fetch for the attached
@@ -25,8 +123,12 @@ impl App {
     /// no attached runner, since the snapshot is daemon-owned.
     pub(super) fn request_session_setup_snapshot_refresh(&mut self) {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            let message = "Session setup is only available once attached to a session.";
             if let Overlay::SessionSetup(pane) = &mut self.overlay {
-                pane.set_error("Session setup is only available once attached to a session.");
+                pane.set_error(message);
+            }
+            if let Some(pane) = self.session_setup_inline.as_mut() {
+                pane.set_error(message);
             }
             return;
         };
@@ -103,14 +205,21 @@ impl App {
             );
         }
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
+            pane.apply_snapshot(snapshot.clone());
+        }
+        if let Some(pane) = self.session_setup_inline.as_mut() {
             pane.apply_snapshot(snapshot);
         }
     }
 
-    /// Surface a fixed error into the open session-setup overlay.
+    /// Surface a fixed error into the open session-setup overlay/inline panel.
     pub(super) fn apply_session_setup_snapshot_error(&mut self, error: String) {
+        let message = format!("Session setup could not be loaded: {error}");
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
-            pane.set_error(format!("Session setup could not be loaded: {error}"));
+            pane.set_error(message.clone());
+        }
+        if let Some(pane) = self.session_setup_inline.as_mut() {
+            pane.set_error(message);
         }
     }
 }

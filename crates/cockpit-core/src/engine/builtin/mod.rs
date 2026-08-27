@@ -520,6 +520,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "question",
         "schedule",
         "spawn",
+        "worktree_orchestrate",
         "mcp",
         "webfetch",
         "websearch",
@@ -745,6 +746,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Delegation",
+            name: "worktree_orchestrate",
+            summary: "Optional worktree fan-out, commitless merge, and uncommitted apply.",
+            condition: Some("optional coding-path capability"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Delegation",
             name: "return",
             summary: "Return from a delegated agent.",
             condition: Some("delegated agents"),
@@ -958,6 +965,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::artifact_search::ArtifactSearchTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
+        Arc::new(tools::worktree_orchestrate::WorktreeOrchestrateTool),
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
         Arc::new(tools::use_sealed_value::UseSealedValueTool::new()),
@@ -1065,6 +1073,9 @@ fn materialize_tool_by_name(
             args.swarm_depth,
             args.swarm_max_depth,
         ))),
+        "worktree_orchestrate" => tb.with(Arc::new(
+            tools::worktree_orchestrate::WorktreeOrchestrateTool,
+        )),
         "task" => {
             let Some(def) = def else {
                 bail!(

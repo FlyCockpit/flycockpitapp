@@ -1012,7 +1012,10 @@ fn computer_guidance_compile_context_inserts_only_compiler_literals() {
         .find("Observe immediately before every computer action.")
         .unwrap();
     let batch_idx = compiled_str.find("Execute at most two").unwrap();
-    assert!(obs_idx < batch_idx, "kinds emit in fixed discriminant order");
+    assert!(
+        obs_idx < batch_idx,
+        "kinds emit in fixed discriminant order"
+    );
 
     // Byte-identical: compose_and_compile is deterministic.
     let compiled2 = compose_and_compile(&session_rules, &persistent_rules);

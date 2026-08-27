@@ -14,9 +14,7 @@
 //! (the TUI already holds the layered config + providers), so no new daemon
 //! RPC is required for the trace.
 
-use cockpit_core::computer::guidance::{
-    EnablementLayers, EnablementResolution, EnablementValue,
-};
+use cockpit_core::computer::guidance::{EnablementLayers, EnablementResolution, EnablementValue};
 
 /// One contributing layer in the trace, with a stable display label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +132,12 @@ mod tests {
         assert!(!trace.has_disable_veto);
         assert_eq!(trace.config_generation, 7);
         assert_eq!(trace.layers.len(), 4);
-        assert!(trace.layers.iter().all(|l| l.value == EnablementValue::Absent));
+        assert!(
+            trace
+                .layers
+                .iter()
+                .all(|l| l.value == EnablementValue::Absent)
+        );
         let lines = render_trace_lines(&trace);
         assert!(lines[0].contains("disabled"));
         assert!(lines.iter().any(|l| l.contains("config generation: 7")));

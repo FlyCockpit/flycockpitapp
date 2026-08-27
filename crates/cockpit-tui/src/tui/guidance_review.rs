@@ -54,8 +54,12 @@ impl GuidanceReviewAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewOutcome {
     Rejected,
-    AcceptedSession { installed: Vec<ComputerGuidanceRuleV1> },
-    AcceptedPersistent { installed: Vec<ComputerGuidanceRuleV1> },
+    AcceptedSession {
+        installed: Vec<ComputerGuidanceRuleV1>,
+    },
+    AcceptedPersistent {
+        installed: Vec<ComputerGuidanceRuleV1>,
+    },
     /// The dispatcher was unavailable (stub/transport not yet wired).
     Unavailable(String),
 }
@@ -66,10 +70,8 @@ pub enum ReviewOutcome {
 /// work); tests inject a recording implementation.
 pub trait GuidanceReviewDispatcher {
     fn reject(&self, proposal_id: &[u8; 16]) -> anyhow::Result<()>;
-    fn accept_session(
-        &self,
-        proposal_id: &[u8; 16],
-    ) -> anyhow::Result<Vec<ComputerGuidanceRuleV1>>;
+    fn accept_session(&self, proposal_id: &[u8; 16])
+    -> anyhow::Result<Vec<ComputerGuidanceRuleV1>>;
     fn accept_persistent(
         &self,
         proposal_id: &[u8; 16],
@@ -236,21 +238,17 @@ mod tests {
             self.rejects.lock().unwrap().push(*id);
             Ok(())
         }
-        fn accept_session(
-            &self,
-            id: &[u8; 16],
-        ) -> anyhow::Result<Vec<ComputerGuidanceRuleV1>> {
+        fn accept_session(&self, id: &[u8; 16]) -> anyhow::Result<Vec<ComputerGuidanceRuleV1>> {
             self.sessions.lock().unwrap().push(*id);
             Ok(vec![ComputerGuidanceRuleV1::PointerVerification(
                 PointerVerification::BeforeEveryPointerAction,
             )])
         }
-        fn accept_persistent(
-            &self,
-            id: &[u8; 16],
-        ) -> anyhow::Result<Vec<ComputerGuidanceRuleV1>> {
+        fn accept_persistent(&self, id: &[u8; 16]) -> anyhow::Result<Vec<ComputerGuidanceRuleV1>> {
             self.persistents.lock().unwrap().push(*id);
-            Ok(vec![ComputerGuidanceRuleV1::MaxReversibleBatch { max_actions: 4 }])
+            Ok(vec![ComputerGuidanceRuleV1::MaxReversibleBatch {
+                max_actions: 4,
+            }])
         }
     }
 

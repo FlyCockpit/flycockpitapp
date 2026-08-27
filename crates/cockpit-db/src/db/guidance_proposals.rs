@@ -216,24 +216,24 @@ pub struct GuidanceProposalReceiptInsert<'a> {
 
 fn validate_hex64(s: &str, field: &str) -> Result<()> {
     if s.len() != 64
-        || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         || s != s.to_ascii_lowercase()
     {
-        anyhow::bail!(
-            "guidance proposal {field} must be 64 lowercase hexadecimal characters"
-        );
+        anyhow::bail!("guidance proposal {field} must be 64 lowercase hexadecimal characters");
     }
     Ok(())
 }
 
 fn validate_hex16(s: &str, field: &str) -> Result<()> {
     if s.len() != 32
-        || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         || s != s.to_ascii_lowercase()
     {
-        anyhow::bail!(
-            "guidance proposal {field} must be 32 lowercase hexadecimal characters"
-        );
+        anyhow::bail!("guidance proposal {field} must be 32 lowercase hexadecimal characters");
     }
     Ok(())
 }
@@ -390,14 +390,10 @@ impl Db {
     ) -> Result<bool> {
         // Invariant: accepted_scope is non-None only on a transition to
         // accepted.
-        if to_state == GuidanceProposalReceiptState::Accepted
-            && accepted_scope.is_none()
-        {
+        if to_state == GuidanceProposalReceiptState::Accepted && accepted_scope.is_none() {
             anyhow::bail!("accepted_scope must be set when transitioning to accepted");
         }
-        if to_state != GuidanceProposalReceiptState::Accepted
-            && accepted_scope.is_some()
-        {
+        if to_state != GuidanceProposalReceiptState::Accepted && accepted_scope.is_some() {
             anyhow::bail!("accepted_scope must be None unless transitioning to accepted");
         }
 
@@ -405,23 +401,25 @@ impl Db {
         let to_state_str = to_state.as_str().to_string();
         let from_state_str = from_state.as_str().to_string();
         let accepted_scope_str = accepted_scope.map(|s| s.as_str().to_string());
-        let transitioned_at = transitioned_at_unix_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
+        let transitioned_at =
+            transitioned_at_unix_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
         self.write(move |conn| {
-            let changed = conn.execute(
-                "UPDATE guidance_proposal_receipts
+            let changed = conn
+                .execute(
+                    "UPDATE guidance_proposal_receipts
                  SET state = ?1,
                      accepted_scope = ?2,
                      transitioned_at_unix_ms = ?3
                  WHERE proposal_id = ?4 AND state = ?5",
-                params![
-                    to_state_str,
-                    accepted_scope_str,
-                    transitioned_at,
-                    proposal_id,
-                    from_state_str,
-                ],
-            )
-            .context("CAS guidance proposal receipt state")?;
+                    params![
+                        to_state_str,
+                        accepted_scope_str,
+                        transitioned_at,
+                        proposal_id,
+                        from_state_str,
+                    ],
+                )
+                .context("CAS guidance proposal receipt state")?;
             Ok(changed == 1)
         })
         .await
@@ -517,7 +515,11 @@ mod tests {
         format!("{n:032x}{n:032x}")
     }
 
-    fn insert<'a>(proposal: &'a str, session: &'a str, delegation: &'a str) -> GuidanceProposalReceiptInsert<'a> {
+    fn insert<'a>(
+        proposal: &'a str,
+        session: &'a str,
+        delegation: &'a str,
+    ) -> GuidanceProposalReceiptInsert<'a> {
         GuidanceProposalReceiptInsert {
             proposal_id: proposal,
             session_id: session,
@@ -538,7 +540,11 @@ mod tests {
         db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
             .await
             .unwrap();
-        let row = db.guidance_proposal_receipt(&hex16(1)).await.unwrap().unwrap();
+        let row = db
+            .guidance_proposal_receipt(&hex16(1))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, GuidanceProposalReceiptState::Created);
         assert!(row.accepted_scope.is_none());
         assert_eq!(
@@ -568,12 +574,14 @@ mod tests {
             .insert_guidance_proposal_receipt(insert(&hex16(4), "s1", "d1"))
             .await
             .unwrap_err();
-        assert_eq!(
-            err,
-            CreateReceiptError::DelegationCapExceeded(3)
-        );
+        assert_eq!(err, CreateReceiptError::DelegationCapExceeded(3));
         // Zero side effects: no 4th receipt, counter unchanged.
-        assert!(db.guidance_proposal_receipt(&hex16(4)).await.unwrap().is_none());
+        assert!(
+            db.guidance_proposal_receipt(&hex16(4))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
                 .await
@@ -622,7 +630,11 @@ mod tests {
             .await
             .unwrap()
         );
-        let row = db.guidance_proposal_receipt(&hex16(1)).await.unwrap().unwrap();
+        let row = db
+            .guidance_proposal_receipt(&hex16(1))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, GuidanceProposalReceiptState::Accepted);
         assert_eq!(
             row.accepted_scope,
@@ -642,7 +654,11 @@ mod tests {
             .unwrap()
         );
         // State unchanged.
-        let row = db.guidance_proposal_receipt(&hex16(1)).await.unwrap().unwrap();
+        let row = db
+            .guidance_proposal_receipt(&hex16(1))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, GuidanceProposalReceiptState::Accepted);
     }
 
@@ -697,7 +713,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let stale = db.list_stale_created_guidance_proposal_receipts().await.unwrap();
+        let stale = db
+            .list_stale_created_guidance_proposal_receipts()
+            .await
+            .unwrap();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].proposal_id, hex16(2));
     }
@@ -732,7 +751,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, 1);
-        let row = db.guidance_proposal_receipt(&hex16(1)).await.unwrap().unwrap();
+        let row = db
+            .guidance_proposal_receipt(&hex16(1))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, GuidanceProposalReceiptState::ExpiredOnRestart);
     }
 

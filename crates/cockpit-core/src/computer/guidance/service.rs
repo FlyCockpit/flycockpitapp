@@ -28,14 +28,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use cockpit_db::Db;
 use cockpit_db::db::guidance_proposals::{
     CreateReceiptError, GuidanceProposalAcceptedScope, GuidanceProposalCounterScope,
     GuidanceProposalReceiptInsert, GuidanceProposalReceiptState,
 };
-use cockpit_db::Db;
 use tracing::warn;
 
-use super::audit::{AuditEventKind, Disposition, GuidanceScope, domains, domain_digest};
+use super::audit::{AuditEventKind, Disposition, GuidanceScope, domain_digest, domains};
 use super::enablement::resolve_guidance_enablement;
 use super::lifecycle::{PendingProposalStore, ProposalId, ProposalScopeKey};
 use super::{
@@ -205,7 +205,8 @@ struct PersistentRuleKey {
 /// they survive restart. Session rules are intentionally memory-only.
 #[derive(Debug, Default)]
 pub struct AcceptedRulesStore {
-    session: std::sync::Mutex<std::collections::HashMap<SessionRuleKey, Vec<ComputerGuidanceRuleV1>>>,
+    session:
+        std::sync::Mutex<std::collections::HashMap<SessionRuleKey, Vec<ComputerGuidanceRuleV1>>>,
     persistent:
         std::sync::Mutex<std::collections::HashMap<PersistentRuleKey, Vec<ComputerGuidanceRuleV1>>>,
 }
@@ -215,28 +216,29 @@ impl AcceptedRulesStore {
         Self::default()
     }
 
-    fn install_session(
-        &self,
-        key: SessionRuleKey,
-        rules: Vec<ComputerGuidanceRuleV1>,
-    ) {
-        let mut guard = self.session.lock().expect("accepted session rules mutex poisoned");
+    fn install_session(&self, key: SessionRuleKey, rules: Vec<ComputerGuidanceRuleV1>) {
+        let mut guard = self
+            .session
+            .lock()
+            .expect("accepted session rules mutex poisoned");
         let existing = guard.entry(key).or_default();
         *existing = super::apply_accepted(existing, &rules);
     }
 
-    fn install_persistent(
-        &self,
-        key: PersistentRuleKey,
-        rules: Vec<ComputerGuidanceRuleV1>,
-    ) {
-        let mut guard = self.persistent.lock().expect("accepted persistent rules mutex poisoned");
+    fn install_persistent(&self, key: PersistentRuleKey, rules: Vec<ComputerGuidanceRuleV1>) {
+        let mut guard = self
+            .persistent
+            .lock()
+            .expect("accepted persistent rules mutex poisoned");
         let existing = guard.entry(key).or_default();
         *existing = super::apply_accepted(existing, &rules);
     }
 
     fn clear_session(&self, session_id: &[u8; 16]) {
-        let mut guard = self.session.lock().expect("accepted session rules mutex poisoned");
+        let mut guard = self
+            .session
+            .lock()
+            .expect("accepted session rules mutex poisoned");
         guard.retain(|k, _| k.session_id != *session_id);
     }
 
@@ -324,7 +326,9 @@ pub enum TransitionProposalError {
     /// The durable CAS did not match (e.g. accept after expiry) — no rule
     /// install (AC: edge cases).
     #[error("guidance proposal CAS conflict: current state is not the expected {expected:?}")]
-    CasConflict { expected: GuidanceProposalReceiptState },
+    CasConflict {
+        expected: GuidanceProposalReceiptState,
+    },
     /// A durable failure.
     #[error("guidance proposal durable transition failed: {0}")]
     Storage(String),
@@ -404,8 +408,14 @@ impl GuidanceProposalService {
 
     /// Create a pending proposal (the production proposal-create path, AC1/AC4/AC11).
     ///
+    /// The caller resolves the enablement trace up front via
+    /// [`Self::enablement_trace`] (which reads the layered config) and passes
+    /// it in; this keeps the create path pure and hermetic — the enablement
+    /// decision is made before any receipt, and the trace's config generation
+    /// is stamped onto the durable receipt.
+    ///
     /// Ordering:
-    /// 1. Resolve enablement; hard-deny before any receipt when disabled.
+    /// 1. Enablement gate: hard-deny before any receipt when disabled (AC11).
     /// 2. Validate the proposal (1..=6 unique kinds).
     /// 3. Reserve the scope in memory (fails `AlreadyPending` before durable
     ///    work).
@@ -418,11 +428,10 @@ impl GuidanceProposalService {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_proposal(
         &mut self,
-        providers: &crate::config::providers::ProvidersConfig,
-        cwd: &Path,
+        enablement: &GuidanceEnablementTrace,
+        project_identity: &[u8],
         provider_id: &str,
         model_id: &str,
-        project_identity: &[u8],
         session_id: [u8; 16],
         delegation_id: [u8; 16],
         proposal_id: [u8; 16],
@@ -431,8 +440,7 @@ impl GuidanceProposalService {
         now_unix_ms: i64,
     ) -> Result<(), CreateProposalError> {
         // 1. Enablement gate (AC11).
-        let trace = self.enablement_trace(providers, cwd, provider_id, model_id);
-        if !trace.resolution.enabled {
+        if !enablement.resolution.enabled {
             return Err(CreateProposalError::Disabled);
         }
 
@@ -468,7 +476,7 @@ impl GuidanceProposalService {
             canonical_project_digest: &hex32(&project_d),
             provider_digest: &hex32(&provider_d),
             model_digest: &hex32(&model_d),
-            config_generation: trace.config_generation as i64,
+            config_generation: enablement.config_generation as i64,
             rule_kind_bits: rule_kind_bits as i64,
             created_at_unix_ms: now_unix_ms,
             expires_at_unix_ms,
@@ -476,12 +484,12 @@ impl GuidanceProposalService {
         if let Err(err) = self.db.insert_guidance_proposal_receipt(insert).await {
             self.pending.release(&key, pid);
             return Err(match err {
-                CreateReceiptError::DelegationCapExceeded(n) => CreateProposalError::CapExceeded(
-                    format!("delegation {n}/{MAX_DELEGATION}"),
-                ),
-                CreateReceiptError::SessionCapExceeded(n) => CreateProposalError::CapExceeded(
-                    format!("session {n}/{MAX_SESSION}"),
-                ),
+                CreateReceiptError::DelegationCapExceeded(n) => {
+                    CreateProposalError::CapExceeded(format!("delegation {n}/{MAX_DELEGATION}"))
+                }
+                CreateReceiptError::SessionCapExceeded(n) => {
+                    CreateProposalError::CapExceeded(format!("session {n}/{MAX_SESSION}"))
+                }
                 CreateReceiptError::DuplicateProposalId(id) => {
                     CreateProposalError::Storage(format!("duplicate proposal id {id}"))
                 }
@@ -498,7 +506,7 @@ impl GuidanceProposalService {
             canonical_project_digest: project_d,
             provider_digest: provider_d,
             model_digest: model_d,
-            config_generation: trace.config_generation,
+            config_generation: enablement.config_generation,
             rule_kind_bits,
             disposition: None,
             scope: None,
@@ -553,8 +561,13 @@ impl GuidanceProposalService {
         proposal_id: [u8; 16],
         now_unix_ms: i64,
     ) -> Result<Vec<ComputerGuidanceRuleV1>, TransitionProposalError> {
-        self.accept(scope, proposal_id, GuidanceProposalAcceptedScope::Session, now_unix_ms)
-            .await
+        self.accept(
+            scope,
+            proposal_id,
+            GuidanceProposalAcceptedScope::Session,
+            now_unix_ms,
+        )
+        .await
     }
 
     /// Accept a pending proposal as persistent (machine-local) rules (AC8).
@@ -564,8 +577,13 @@ impl GuidanceProposalService {
         proposal_id: [u8; 16],
         now_unix_ms: i64,
     ) -> Result<Vec<ComputerGuidanceRuleV1>, TransitionProposalError> {
-        self.accept(scope, proposal_id, GuidanceProposalAcceptedScope::Persistent, now_unix_ms)
-            .await
+        self.accept(
+            scope,
+            proposal_id,
+            GuidanceProposalAcceptedScope::Persistent,
+            now_unix_ms,
+        )
+        .await
     }
 
     async fn accept(
@@ -722,7 +740,10 @@ impl GuidanceProposalService {
     /// Enumerate expired pending proposals (injected clock) without mutating.
     /// The caller (coordinator tick) commits each durable expiry CAS + audit,
     /// then [`Self::remove_expired`] drops memory (AC5).
-    pub fn expired_candidates(&self, now_unix_secs: i64) -> Vec<super::lifecycle::ProposalCandidate> {
+    pub fn expired_candidates(
+        &self,
+        now_unix_secs: i64,
+    ) -> Vec<super::lifecycle::ProposalCandidate> {
         self.pending.expired_candidates(now_unix_secs)
     }
 
@@ -842,12 +863,12 @@ impl GuidanceProposalService {
         provider_digest: &[u8; 32],
         model_digest: &[u8; 32],
     ) -> Vec<u8> {
-        let session = self
-            .accepted
-            .session_rules(session_id, project_digest, provider_digest, model_digest);
-        let persistent = self
-            .accepted
-            .persistent_rules(project_digest, provider_digest, model_digest);
+        let session =
+            self.accepted
+                .session_rules(session_id, project_digest, provider_digest, model_digest);
+        let persistent =
+            self.accepted
+                .persistent_rules(project_digest, provider_digest, model_digest);
         super::compose_and_compile(&session, &persistent)
     }
 
@@ -859,10 +880,7 @@ impl GuidanceProposalService {
     }
 
     /// The current durable counter for a delegation (for diagnostics / tests).
-    pub async fn delegation_counter(
-        &self,
-        delegation_id: &[u8; 16],
-    ) -> Result<i64, anyhow::Error> {
+    pub async fn delegation_counter(&self, delegation_id: &[u8; 16]) -> Result<i64, anyhow::Error> {
         self.db
             .guidance_proposal_counter(
                 GuidanceProposalCounterScope::Delegation,
@@ -920,11 +938,12 @@ impl GuidanceProposalService {
             config_generation: row.config_generation as u64,
             rule_kind_bits: row.rule_kind_bits as u16,
             disposition: match to {
-                GuidanceProposalReceiptState::Expired | GuidanceProposalReceiptState::ExpiredOnRestart => {
-                    Some(Disposition::Expired)
-                }
+                GuidanceProposalReceiptState::Expired
+                | GuidanceProposalReceiptState::ExpiredOnRestart => Some(Disposition::Expired),
                 GuidanceProposalReceiptState::Accepted => match accepted_scope {
-                    Some(GuidanceProposalAcceptedScope::Session) => Some(Disposition::AcceptedSession),
+                    Some(GuidanceProposalAcceptedScope::Session) => {
+                        Some(Disposition::AcceptedSession)
+                    }
                     Some(GuidanceProposalAcceptedScope::Persistent) => {
                         Some(Disposition::AcceptedPersistent)
                     }
@@ -996,7 +1015,7 @@ mod tests {
         let err = svc
             .create_proposal(
                 &providers_disabled(),
-        Path::new("/x"),
+                Path::new("/x"),
                 "p",
                 "m",
                 b"project",
@@ -1135,7 +1154,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let accepted = svc.accept_session(&scope_session, id16(9), 2000).await.unwrap();
+        let accepted = svc
+            .accept_session(&scope_session, id16(9), 2000)
+            .await
+            .unwrap();
         assert_eq!(accepted.len(), 1);
 
         // Create + accept persistent (max_actions=5, same kind) under a
@@ -1195,8 +1217,10 @@ mod tests {
             }
         }
         let db = Arc::new(Db::open_in_memory().unwrap());
-        let mut svc =
-            GuidanceProposalService::with_audit_writer(db.clone(), Arc::new(Recording(recorded.clone())));
+        let mut svc = GuidanceProposalService::with_audit_writer(
+            db.clone(),
+            Arc::new(Recording(recorded.clone())),
+        );
         svc.create_proposal(
             &providers_enabled(),
             Path::new("/x"),
@@ -1224,9 +1248,16 @@ mod tests {
         assert_eq!(n, 1);
         // Exactly one expired audit append.
         let kinds = recorded.lock().unwrap();
-        assert!(kinds.iter().any(|k| *k == AuditEventKind::GuidanceProposalCreated));
+        assert!(
+            kinds
+                .iter()
+                .any(|k| *k == AuditEventKind::GuidanceProposalCreated)
+        );
         assert_eq!(
-            kinds.iter().filter(|k| **k == AuditEventKind::GuidanceProposalExpired).count(),
+            kinds
+                .iter()
+                .filter(|k| **k == AuditEventKind::GuidanceProposalExpired)
+                .count(),
             1
         );
         // No counter re-increment.

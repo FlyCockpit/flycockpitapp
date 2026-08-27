@@ -203,13 +203,16 @@ const ALL_TOOL_TIERS: &[ToolTier] = &[
     ToolTier::Disabled,
 ];
 const SAFETY_TOOL_TIERS: &[ToolTier] = &[ToolTier::Enabled];
+const DIRECT_NATIVE_MEDIA_TIERS: &[ToolTier] = &[ToolTier::Enabled, ToolTier::Disabled];
 
 pub fn known_tool_names() -> &'static [&'static str] {
     invariants::known_tool_names()
 }
 
 pub fn legal_tool_tiers(tool: &str) -> &'static [ToolTier] {
-    if is_safety_tool(tool) {
+    if tool == "read_image" {
+        DIRECT_NATIVE_MEDIA_TIERS
+    } else if is_safety_tool(tool) {
         SAFETY_TOOL_TIERS
     } else {
         ALL_TOOL_TIERS

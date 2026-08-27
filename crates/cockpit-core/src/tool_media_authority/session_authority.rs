@@ -11,10 +11,18 @@
 //! zero content opens/reads, fetches, reservations, derivatives, or subprocess
 //! calls.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::revalidator::RevalidatedSubject;
+
+/// Image media kind (FCM2 wire code).
+const IMAGE_KIND: u8 = 1;
 
 /// An admitted local-path handle — authority-owned, no-follow, with evidence.
 ///
@@ -129,6 +137,173 @@ pub enum AdmissionDenial {
     HandleReplacement,
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("source is not an image attachment")]
+    NotImage,
+}
+
+/// Closed source arm for `read_image`. Exactly one of attachment/path/url.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadImageSource {
+    Attachment { attachment_id: Uuid },
+    Path { path: String },
+    Url { url: String },
+}
+
+/// Immutable attachment identity yielded by source admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImmutableAttachmentIdentity {
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub checksum: [u8; 32],
+    pub kind: u8,
+}
+
+/// Short-lived source lease. Held only for source-to-derivative processing.
+pub struct ToolSource {
+    shared: Arc<ToolSourceShared>,
+    released: bool,
+}
+
+struct ToolSourceShared {
+    bytes: Vec<u8>,
+    identity: ImmutableAttachmentIdentity,
+    release_count: AtomicU64,
+    held: AtomicBool,
+    model_leases: AtomicU64,
+    preview_leases: AtomicU64,
+    released_notify: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
+}
+
+impl std::fmt::Debug for ToolSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolSource")
+            .field("attachment_id", &self.shared.identity.attachment_id)
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolSource {
+    fn new(bytes: Vec<u8>, identity: ImmutableAttachmentIdentity) -> Self {
+        Self {
+            shared: Arc::new(ToolSourceShared {
+                bytes,
+                identity,
+                release_count: AtomicU64::new(0),
+                held: AtomicBool::new(true),
+                model_leases: AtomicU64::new(0),
+                preview_leases: AtomicU64::new(0),
+                released_notify: Mutex::new(Vec::new()),
+            }),
+            released: false,
+        }
+    }
+
+    /// Authority-owned source bytes. Never a second open by spelling.
+    pub fn bytes(&self) -> Result<&[u8], AdmissionDenial> {
+        if self.released || !self.shared.held.load(Ordering::SeqCst) {
+            return Err(AdmissionDenial::Internal(
+                "tool source released".to_string(),
+            ));
+        }
+        Ok(&self.shared.bytes)
+    }
+
+    pub fn identity(&self) -> &ImmutableAttachmentIdentity {
+        &self.shared.identity
+    }
+
+    /// Release the source lease. Idempotent; Drop also releases.
+    pub fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.shared.release_count.fetch_add(1, Ordering::SeqCst);
+        self.shared.held.store(false, Ordering::SeqCst);
+        let waiters = std::mem::take(&mut *self.shared.released_notify.lock().unwrap());
+        for tx in waiters {
+            let _ = tx.send(());
+        }
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.released || !self.shared.held.load(Ordering::SeqCst)
+    }
+
+    pub fn release_count(&self) -> u64 {
+        self.shared.release_count.load(Ordering::SeqCst)
+    }
+
+    pub fn model_lease_count(&self) -> u64 {
+        self.shared.model_leases.load(Ordering::SeqCst)
+    }
+
+    pub fn preview_lease_count(&self) -> u64 {
+        self.shared.preview_leases.load(Ordering::SeqCst)
+    }
+
+    fn wait_until_released(&self) {
+        if !self.shared.held.load(Ordering::SeqCst) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.shared.released_notify.lock().unwrap().push(tx);
+        if !self.shared.held.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = rx.recv();
+    }
+}
+
+impl Drop for ToolSource {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Admitted read-image source: identity plus the held ToolSource lease.
+pub struct AdmittedReadImage {
+    pub identity: ImmutableAttachmentIdentity,
+    pub tool_source: ToolSource,
+}
+
+/// Reservation for a read-image derivative. Cancelled on drop unless completed.
+pub struct DerivativeReservation {
+    pub id: Uuid,
+    completed: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl DerivativeReservation {
+    pub fn is_completed(&self) -> bool {
+        self.completed.load(Ordering::SeqCst)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn complete(&self) {
+        self.completed.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AuthorityActivity {
+    pub reservations: AtomicU64,
+    pub derivative_writes: AtomicU64,
+    pub model_leases: AtomicU64,
+    pub preview_leases: AtomicU64,
+    pub source_releases: AtomicU64,
+    pub decode_opens: AtomicU64,
+}
+
+struct ImageRegistry {
+    bytes: HashMap<[u8; 16], Vec<u8>>,
+    identities: HashMap<[u8; 16], ImmutableAttachmentIdentity>,
+    live_leases: HashMap<[u8; 16], Arc<ToolSourceShared>>,
+    cleanup_requested: HashMap<[u8; 16], Arc<AtomicBool>>,
 }
 
 /// The attachment resolver trait — resolves session attachments by id.
@@ -179,6 +354,8 @@ pub struct SessionMediaAuthority {
     attachment_resolver: Arc<dyn AttachmentResolver>,
     local_path_policy: Arc<dyn LocalPathPolicy>,
     retained_https_policy: Arc<dyn RetainedHttpsPolicy>,
+    registry: Mutex<ImageRegistry>,
+    activity: Arc<AuthorityActivity>,
 }
 
 impl std::fmt::Debug for SessionMediaAuthority {
@@ -203,6 +380,13 @@ impl SessionMediaAuthority {
             attachment_resolver,
             local_path_policy,
             retained_https_policy,
+            registry: Mutex::new(ImageRegistry {
+                bytes: HashMap::new(),
+                identities: HashMap::new(),
+                live_leases: HashMap::new(),
+                cleanup_requested: HashMap::new(),
+            }),
+            activity: Arc::new(AuthorityActivity::default()),
         }
     }
 
@@ -289,6 +473,276 @@ impl SessionMediaAuthority {
 
         self.retained_https_policy.admit(session_id, url)
     }
+    pub fn activity(&self) -> Arc<AuthorityActivity> {
+        Arc::clone(&self.activity)
+    }
+
+    pub fn live_lease_ids(&self) -> Vec<Uuid> {
+        self.registry
+            .lock()
+            .unwrap()
+            .live_leases
+            .keys()
+            .copied()
+            .map(Uuid::from_bytes)
+            .collect()
+    }
+
+    /// Seed attachment bytes for tests (and in-memory path/URL registration).
+    pub fn insert_attachment_bytes(&self, id: [u8; 16], bytes: Vec<u8>) {
+        self.registry.lock().unwrap().bytes.insert(id, bytes);
+    }
+
+    /// Admit a read-image source. The only source admission the consumer may use.
+    ///
+    /// An existing attachment is checked for session/project/image identity.
+    /// A path/URL is admitted and registered atomically as a session-owned
+    /// typed image attachment. Yields the immutable identity plus a held
+    /// [`ToolSource`]. The consumer must not look up or authorize again.
+    pub fn admit_read_image_source(
+        &self,
+        subject: &RevalidatedSubject,
+        source: ReadImageSource,
+    ) -> Result<AdmittedReadImage, AdmissionDenial> {
+        if subject.session_id != self.subject.session_id
+            || subject.project_digest != self.subject.project_digest
+            || subject.principal_digest != self.subject.principal_digest
+            || subject.authorization_epoch != self.subject.authorization_epoch
+        {
+            return Err(AdmissionDenial::SubjectMismatch);
+        }
+        let session_hex = super::revalidator::hex::encode(&self.subject.session_id);
+        match source {
+            ReadImageSource::Attachment { attachment_id } => {
+                self.admit_attachment(&session_hex, attachment_id)
+            }
+            ReadImageSource::Path { path } => self.admit_path_as_image(&session_hex, &path),
+            ReadImageSource::Url { url } => self.admit_url_as_image(&session_hex, &url),
+        }
+    }
+
+    fn admit_attachment(
+        &self,
+        session_hex: &str,
+        attachment_id: Uuid,
+    ) -> Result<AdmittedReadImage, AdmissionDenial> {
+        let id_bytes = *attachment_id.as_bytes();
+        if self.cleanup_wins_before_decode(&id_bytes) {
+            return Err(AdmissionDenial::AttachmentNotFound);
+        }
+        let att = self.resolve_attachment(session_hex, &id_bytes)?;
+        if att.kind != IMAGE_KIND {
+            return Err(AdmissionDenial::AttachmentNotFound);
+        }
+        let bytes = self
+            .lookup_bytes(&id_bytes)
+            .ok_or(AdmissionDenial::AttachmentNotFound)?;
+        let identity = ImmutableAttachmentIdentity {
+            attachment_id,
+            attachment_version: att.attachment_version,
+            checksum: att.checksum,
+            kind: att.kind,
+        };
+        Ok(self.hold_source(identity, bytes))
+    }
+
+    fn admit_path_as_image(
+        &self,
+        session_hex: &str,
+        path: &str,
+    ) -> Result<AdmittedReadImage, AdmissionDenial> {
+        let handle = self.admit_local_path(session_hex, path)?;
+        let bytes = std::fs::read(handle.canonical_path())
+            .map_err(|e| AdmissionDenial::Internal(e.to_string()))?;
+        Ok(self.register_bytes(bytes))
+    }
+
+    fn admit_url_as_image(
+        &self,
+        session_hex: &str,
+        url: &str,
+    ) -> Result<AdmittedReadImage, AdmissionDenial> {
+        let source = self.admit_retained_https(session_hex, url)?;
+        Ok(self.register_bytes(source.content().to_vec()))
+    }
+
+    fn register_bytes(&self, bytes: Vec<u8>) -> AdmittedReadImage {
+        let attachment_id = Uuid::now_v7();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let checksum: [u8; 32] = hasher.finalize().into();
+        let identity = ImmutableAttachmentIdentity {
+            attachment_id,
+            attachment_version: 1,
+            checksum,
+            kind: IMAGE_KIND,
+        };
+        {
+            let mut registry = self.registry.lock().unwrap();
+            registry
+                .bytes
+                .insert(*attachment_id.as_bytes(), bytes.clone());
+            registry
+                .identities
+                .insert(*attachment_id.as_bytes(), identity.clone());
+        }
+        self.hold_source(identity, bytes)
+    }
+
+    fn lookup_bytes(&self, id: &[u8; 16]) -> Option<Vec<u8>> {
+        self.registry.lock().unwrap().bytes.get(id).cloned()
+    }
+
+    fn hold_source(
+        &self,
+        identity: ImmutableAttachmentIdentity,
+        bytes: Vec<u8>,
+    ) -> AdmittedReadImage {
+        let source = ToolSource::new(bytes, identity.clone());
+        self.registry.lock().unwrap().live_leases.insert(
+            *identity.attachment_id.as_bytes(),
+            Arc::clone(&source.shared),
+        );
+        AdmittedReadImage {
+            identity,
+            tool_source: source,
+        }
+    }
+
+    fn cleanup_wins_before_decode(&self, id: &[u8; 16]) -> bool {
+        self.registry
+            .lock()
+            .unwrap()
+            .cleanup_requested
+            .get(id)
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    /// Reserve a derivative of `source`. Denials before this have zero write.
+    pub fn reserve_read_image_derivative(
+        &self,
+        _source: &ImmutableAttachmentIdentity,
+    ) -> Result<DerivativeReservation, AdmissionDenial> {
+        self.activity.reservations.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        crate::media_image::test_hooks::bump(|c| {
+            c.reservation.fetch_add(1, Ordering::SeqCst);
+        });
+        Ok(DerivativeReservation {
+            id: Uuid::now_v7(),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Persist the encoded derivative against an existing reservation.
+    pub fn register_read_image_derivative(
+        &self,
+        reservation: DerivativeReservation,
+        bytes: &[u8],
+        _mime: &str,
+        _width: u32,
+        _height: u32,
+        checksum_hex: &str,
+    ) -> Result<ImmutableAttachmentIdentity, AdmissionDenial> {
+        if reservation.is_cancelled() {
+            return Err(AdmissionDenial::Internal(
+                "derivative reservation cancelled".to_string(),
+            ));
+        }
+        self.activity
+            .derivative_writes
+            .fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        crate::media_image::test_hooks::bump(|c| {
+            c.derivative_write.fetch_add(1, Ordering::SeqCst);
+        });
+        let attachment_id = reservation.id;
+        let checksum =
+            parse_sha256_hex(checksum_hex).map_err(|e| AdmissionDenial::Internal(e.to_string()))?;
+        let identity = ImmutableAttachmentIdentity {
+            attachment_id,
+            attachment_version: 1,
+            checksum,
+            kind: IMAGE_KIND,
+        };
+        {
+            let mut registry = self.registry.lock().unwrap();
+            registry
+                .bytes
+                .insert(*attachment_id.as_bytes(), bytes.to_vec());
+            registry
+                .identities
+                .insert(*attachment_id.as_bytes(), identity.clone());
+        }
+        reservation.complete();
+        Ok(identity)
+    }
+
+    /// Cancel a reservation and drop any partial derivative exactly once.
+    pub fn cancel_derivative(&self, reservation: &DerivativeReservation) {
+        if reservation.completed.load(Ordering::SeqCst) {
+            return;
+        }
+        if reservation.cancelled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut registry = self.registry.lock().unwrap();
+        registry.bytes.remove(reservation.id.as_bytes());
+        registry.identities.remove(reservation.id.as_bytes());
+    }
+
+    /// Cleanup racing source processing: wait on a held lease, or win before decode.
+    pub fn request_source_cleanup(&self, attachment_id: Uuid) -> CleanupRace {
+        let id = *attachment_id.as_bytes();
+        let (lease, already_held) = {
+            let mut registry = self.registry.lock().unwrap();
+            let flag = registry
+                .cleanup_requested
+                .entry(id)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            let lease = registry.live_leases.get(&id).cloned();
+            if lease.is_none() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            (lease, flag)
+        };
+        match lease {
+            Some(shared) if shared.held.load(Ordering::SeqCst) => {
+                let proxy = ToolSource {
+                    shared,
+                    released: false,
+                };
+                proxy.wait_until_released();
+                std::mem::forget(proxy);
+                already_held.store(true, Ordering::SeqCst);
+                CleanupRace::WaitedForLease
+            }
+            _ => {
+                already_held.store(true, Ordering::SeqCst);
+                CleanupRace::WonBeforeDecode
+            }
+        }
+    }
+}
+
+/// Outcome of a cleanup race against a held ToolSource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupRace {
+    WaitedForLease,
+    WonBeforeDecode,
+}
+
+fn parse_sha256_hex(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err("checksum must be 64 hex chars".into());
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

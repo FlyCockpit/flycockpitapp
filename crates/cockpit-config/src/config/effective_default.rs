@@ -50,10 +50,8 @@ use crate::config::dirs::{
 };
 use crate::config::files::{
     ConfigMutationLock, atomic_write_leaf_from_retained_directory,
-    prepare_atomic_write_from_retained_directory,
-    read_file_nofollow, read_file_nofollow_bounded,
-    read_optional_leaf_from_directory_handle,
-    remove_leaf_from_retained_directory,
+    prepare_atomic_write_from_retained_directory, read_file_nofollow, read_file_nofollow_bounded,
+    read_optional_leaf_from_directory_handle, remove_leaf_from_retained_directory,
 };
 use crate::config::providers::{ActiveModelRef, ActiveModelWriteMode, ConfigDoc, ProvidersConfig};
 
@@ -68,8 +66,7 @@ const KEY_LEN: usize = 16;
 /// A journal is metadata-only; accepting more than one workspace-config leaf
 /// before its correlation has been classified would let an untrusted sidecar
 /// force an unbounded ambient recovery allocation.
-const MAX_EFFECTIVE_DEFAULT_JOURNAL_BYTES: usize =
-    crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES;
+const MAX_EFFECTIVE_DEFAULT_JOURNAL_BYTES: usize = crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES;
 /// Ambient recovery only needs a bounded preflight scan to discover a
 /// capability-owned retained journal before it derives any canonical target
 /// identity. More candidates are an adversarial/ambiguous sidecar state, not
@@ -249,9 +246,8 @@ fn note_ambient_recovery_lock_acquisition_for_tests() {}
 pub type RetainedMutationHook = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[cfg(any(test, feature = "test-support"))]
-static RETAINED_MUTATION_HOOK: std::sync::OnceLock<
-    std::sync::Mutex<Option<RetainedMutationHook>>,
-> = std::sync::OnceLock::new();
+static RETAINED_MUTATION_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<RetainedMutationHook>>> =
+    std::sync::OnceLock::new();
 
 /// Deterministic seam for the last authority fence: the hook runs only after
 /// the retained journal has durably recorded its authority binding and before
@@ -268,8 +264,7 @@ static RETAINED_AUTHORITY_FENCE_HOOK: std::sync::OnceLock<
 /// a canonical lock identity. It lets tests replace that pathname with a
 /// retained journal and prove the locked re-read exits without touching it.
 #[cfg(any(test, feature = "test-support"))]
-pub type AmbientRecoveryClassificationHook =
-    std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
+pub type AmbientRecoveryClassificationHook = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[cfg(any(test, feature = "test-support"))]
 static AMBIENT_RECOVERY_CLASSIFICATION_HOOK: std::sync::OnceLock<
@@ -282,8 +277,7 @@ static AMBIENT_RECOVERY_CLASSIFICATION_HOOK: std::sync::OnceLock<
 /// mutable pathname. Tests replace A with a retained B here and prove the
 /// second bounded classification rejects B without observing it further.
 #[cfg(any(test, feature = "test-support"))]
-pub type AmbientMutationClassificationHook =
-    std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
+pub type AmbientMutationClassificationHook = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[cfg(any(test, feature = "test-support"))]
 static AMBIENT_MUTATION_CLASSIFICATION_HOOK: std::sync::OnceLock<
@@ -683,9 +677,7 @@ impl TransactionCorrelation {
         match self {
             Self::ModelSelection { session_id, .. }
             | Self::DefaultUpdate { session_id, .. }
-            | Self::RetainedDefaultUpdate { session_id, .. } => {
-                *session_id
-            }
+            | Self::RetainedDefaultUpdate { session_id, .. } => *session_id,
         }
     }
 
@@ -1002,9 +994,7 @@ impl RetainedEffectiveDefaultPendingFinalization {
             record.transaction_id == transaction_id
                 && matches!(
                     record.phase,
-                    JournalPhase::Prepared
-                        | JournalPhase::Committed
-                        | JournalPhase::Compensating
+                    JournalPhase::Prepared | JournalPhase::Committed | JournalPhase::Compensating
                 ),
             "retained default journal changed before authority fence"
         );
@@ -1433,10 +1423,7 @@ impl CapturedEffectiveDefaultLayerProjection {
     }
 
     fn inherited_default(&self) -> Result<Option<ActiveModelRef>> {
-        let lower = self
-            .layers
-            .get(..self.target_index)
-            .unwrap_or_default();
+        let lower = self.layers.get(..self.target_index).unwrap_or_default();
         Ok(ConfigDoc::providers_from_workspace_layer_snapshots(lower)?.active_model)
     }
 
@@ -1460,7 +1447,10 @@ impl CapturedEffectiveDefaultLayerProjection {
             .get(self.target_index)
             .and_then(|layer| layer.config_json.as_deref())
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-            .is_some_and(|raw| raw.get("active_model").is_some_and(|value| !value.is_null()))
+            .is_some_and(|raw| {
+                raw.get("active_model")
+                    .is_some_and(|value| !value.is_null())
+            })
     }
 }
 
@@ -1498,8 +1488,14 @@ impl RetainedEffectiveDefaultTarget {
         ensure_single_leaf(&config_leaf)?;
         ensure_single_leaf(&journal_leaf)?;
         ensure_single_leaf(&backup_leaf)?;
-        ensure!(canonical_config_path.is_absolute(), "retained config target path is not absolute");
-        ensure!(project_root.is_absolute(), "retained config project root is not absolute");
+        ensure!(
+            canonical_config_path.is_absolute(),
+            "retained config target path is not absolute"
+        );
+        ensure!(
+            project_root.is_absolute(),
+            "retained config project root is not absolute"
+        );
         let journal_path = journal_path_for_config(&canonical_config_path);
         let expected_journal = journal_path
             .file_name()
@@ -1538,8 +1534,12 @@ impl RetainedEffectiveDefaultTarget {
         project_root: &Path,
         target: &ResolvedTarget,
     ) -> Result<CapturedEffectiveDefaultTarget> {
-        let project_root = std::fs::canonicalize(project_root)
-            .with_context(|| format!("canonicalizing effective-default project root {}", project_root.display()))?;
+        let project_root = std::fs::canonicalize(project_root).with_context(|| {
+            format!(
+                "canonicalizing effective-default project root {}",
+                project_root.display()
+            )
+        })?;
         let leaf = target
             .path
             .file_name()
@@ -1618,7 +1618,8 @@ impl RetainedEffectiveDefaultTarget {
     }
 
     fn write_journal(&self, record: &JournalRecord) -> Result<()> {
-        let pretty = serde_json::to_string_pretty(record).context("serializing retained journal")?;
+        let pretty =
+            serde_json::to_string_pretty(record).context("serializing retained journal")?;
         self.write_private_leaf(&self.journal_leaf, format!("{pretty}\n").as_bytes())
     }
 
@@ -1693,7 +1694,6 @@ impl RetainedEffectiveDefaultTarget {
         )
     }
 
-
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             directory: self.directory.try_clone()?,
@@ -1728,13 +1728,14 @@ fn capture_ambient_config_layer_snapshot(
         if !crate::config::files::directory_handle_matches_path(&directory, parent)? {
             continue;
         }
-        let snapshot = crate::config::files::snapshot_workspace_config_layer_from_retained_config_directory(
-            &directory,
-            &leaf,
-            &canonical_config_path,
-            None,
-            None,
-        )?;
+        let snapshot =
+            crate::config::files::snapshot_workspace_config_layer_from_retained_config_directory(
+                &directory,
+                &leaf,
+                &canonical_config_path,
+                None,
+                None,
+            )?;
         if crate::config::files::directory_handle_matches_path(&directory, parent)? {
             return Ok(snapshot);
         }
@@ -1749,7 +1750,10 @@ fn capture_ambient_config_layer_snapshot(
 fn capture_ambient_mutation(
     project_root: &Path,
     selected: &ResolvedTarget,
-) -> Result<(CapturedEffectiveDefaultTarget, CapturedEffectiveDefaultLayerProjection)> {
+) -> Result<(
+    CapturedEffectiveDefaultTarget,
+    CapturedEffectiveDefaultLayerProjection,
+)> {
     let mut projection = CapturedEffectiveDefaultLayerProjection::capture_lower(selected)?;
     let target = RetainedEffectiveDefaultTarget::capture_ambient(project_root, selected)?;
     projection.push_captured_target(&target)?;
@@ -1939,8 +1943,7 @@ enum AmbientJournalClassification {
 }
 
 fn classify_ambient_journal(journal_path: &Path) -> Result<AmbientJournalClassification> {
-    let Some(raw) =
-        read_file_nofollow_bounded(journal_path, MAX_EFFECTIVE_DEFAULT_JOURNAL_BYTES)?
+    let Some(raw) = read_file_nofollow_bounded(journal_path, MAX_EFFECTIVE_DEFAULT_JOURNAL_BYTES)?
     else {
         return Ok(AmbientJournalClassification::Absent);
     };
@@ -1975,14 +1978,20 @@ fn ambient_parent_contains_retained_journal(config_path: &Path) -> Result<bool> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(error).with_context(|| {
-                format!("enumerating effective-default journals in {}", parent.display())
+                format!(
+                    "enumerating effective-default journals in {}",
+                    parent.display()
+                )
             });
         }
     };
     let mut candidates = 0usize;
     for entry in entries {
         let entry = entry.with_context(|| {
-            format!("enumerating effective-default journals in {}", parent.display())
+            format!(
+                "enumerating effective-default journals in {}",
+                parent.display()
+            )
         })?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -2153,8 +2162,8 @@ pub(crate) fn project_retained_effective_default_bytes(
     let Some(journal) = journal else {
         return Ok(current);
     };
-    let record: JournalRecord = serde_json::from_slice(journal)
-        .context("parsing retained effective-default journal")?;
+    let record: JournalRecord =
+        serde_json::from_slice(journal).context("parsing retained effective-default journal")?;
 
     // A stale/foreign artifact must not make an otherwise selected config
     // unreadable.  The artifact is not this leaf's transaction: the exact
@@ -2182,7 +2191,8 @@ pub(crate) fn project_retained_effective_default_bytes(
     // bytes, exactly as `masked_layers` does for pathname reads.
     if record.needs_session_authority() || record.correlation.is_some() {
         anyhow::ensure!(
-            current_digest == record.old_config_digest || current_digest == record.new_config_digest,
+            current_digest == record.old_config_digest
+                || current_digest == record.new_config_digest,
             "retained config bytes do not match the effective-default journal"
         );
         return Ok(Some(prior()?.to_vec()));
@@ -2391,17 +2401,15 @@ fn recover_one(
     run_ambient_recovery_classification_hook_for_tests();
     note_ambient_recovery_target_canonicalization_for_tests();
     let (target, mut projection) = capture_ambient_recovery_mutation(config_path, &initial)?;
-    if target
-        .load_journal()?
-        .as_ref()
-        .is_some_and(|record| {
-            record
-                .correlation
-                .as_ref()
-                .is_some_and(TransactionCorrelation::is_retained_default_update)
-        })
-    {
-        tracing::debug!("leaving newly captured retained default-update journal for capability recovery");
+    if target.load_journal()?.as_ref().is_some_and(|record| {
+        record
+            .correlation
+            .as_ref()
+            .is_some_and(TransactionCorrelation::is_retained_default_update)
+    }) {
+        tracing::debug!(
+            "leaving newly captured retained default-update journal for capability recovery"
+        );
         return Ok(Vec::new());
     }
     note_ambient_recovery_lock_acquisition_for_tests();
@@ -2420,7 +2428,10 @@ fn recover_one(
 fn capture_ambient_recovery_mutation(
     config_path: &Path,
     record: &JournalRecord,
-) -> Result<(CapturedEffectiveDefaultTarget, CapturedEffectiveDefaultLayerProjection)> {
+) -> Result<(
+    CapturedEffectiveDefaultTarget,
+    CapturedEffectiveDefaultLayerProjection,
+)> {
     if record.project_root.is_empty() || !Path::new(&record.project_root).is_absolute() {
         anyhow::bail!("effective-default journal project root is missing or not absolute");
     }
@@ -2437,10 +2448,8 @@ fn capture_ambient_recovery_mutation(
     // Every pathname-backed layer snapshot is acquired before the target
     // directory is captured. Once the target exists, recovery only touches
     // those immutable bytes and its held directory capability.
-    let non_target_layers = CapturedEffectiveDefaultLayerProjection::capture_all_except_target(
-        &paths,
-        target_index,
-    )?;
+    let non_target_layers =
+        CapturedEffectiveDefaultLayerProjection::capture_all_except_target(&paths, target_index)?;
     let selected = ResolvedTarget {
         path: selected_path.clone(),
         scope: record.scope.clone(),
@@ -2464,7 +2473,10 @@ fn sweep_orphans(config_path: &Path) {
     // The retained-correlation preflight is intentionally the only pathname
     // observation before capture. A retained record belongs to its attached
     // worker and is invisible to ambient cleanup.
-    if !matches!(ambient_parent_contains_retained_journal(config_path), Ok(false)) {
+    if !matches!(
+        ambient_parent_contains_retained_journal(config_path),
+        Ok(false)
+    ) {
         return;
     }
     let Ok(target) = capture_ambient_orphan_target(config_path) else {
@@ -2475,7 +2487,8 @@ fn sweep_orphans(config_path: &Path) {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    let first_scan = SWEPT_DIRECTORIES.with(|swept| swept.borrow_mut().insert(directory_key.clone()));
+    let first_scan =
+        SWEPT_DIRECTORIES.with(|swept| swept.borrow_mut().insert(directory_key.clone()));
     if !first_scan {
         return;
     }
@@ -2523,16 +2536,16 @@ fn sweep_captured_orphans_locked(target: &CapturedEffectiveDefaultTarget) {
         Ok(leaves) => {
             for leaf in leaves {
                 let display = target.display_path(&leaf);
-                if let Err(error) = remove_leaf_from_retained_directory(
-                    &target.directory,
-                    &leaf,
-                    &display,
-                ) {
+                if let Err(error) =
+                    remove_leaf_from_retained_directory(&target.directory, &leaf, &display)
+                {
                     tracing::debug!(%error, "could not sweep a stale effective-default temporary");
                 }
             }
         }
-        Err(error) => tracing::debug!(%error, "could not enumerate retained effective-default temporaries"),
+        Err(error) => {
+            tracing::debug!(%error, "could not enumerate retained effective-default temporaries")
+        }
     }
 }
 
@@ -2697,7 +2710,10 @@ pub fn mutate_effective_default_retained(
     correlation: TransactionCorrelation,
 ) -> Result<RetainedEffectiveDefaultPendingFinalization, EffectiveDefaultError> {
     let scope_label = target.scope_label();
-    if !matches!(&correlation, TransactionCorrelation::RetainedDefaultUpdate { .. }) {
+    if !matches!(
+        &correlation,
+        TransactionCorrelation::RetainedDefaultUpdate { .. }
+    ) {
         return Err(EffectiveDefaultError::new(
             "the retained config-only default backend requires a default-update correlation",
             "effective_default_invalid_correlation",
@@ -2715,7 +2731,10 @@ pub fn mutate_effective_default_retained(
     }
     target.verify_binding().map_err(|error| {
         EffectiveDefaultError::new(
-            safe_cause("the retained config authority changed before mutation", &error),
+            safe_cause(
+                "the retained config authority changed before mutation",
+                &error,
+            ),
             "effective_default_authority_changed",
             Some(scope_label.to_string()),
         )
@@ -2726,7 +2745,10 @@ pub fn mutate_effective_default_retained(
     // used by an ambient writer for this exact canonical target.
     let lock = target.acquire_lock().map_err(|error| {
         EffectiveDefaultError::new(
-            safe_cause("the retained config mutation lock could not be acquired", &error),
+            safe_cause(
+                "the retained config mutation lock could not be acquired",
+                &error,
+            ),
             "effective_default_lock_failed",
             Some(scope_label.to_string()),
         )
@@ -2735,13 +2757,20 @@ pub fn mutate_effective_default_retained(
     // We never discard a correlated transaction without delivering its one
     // terminal result. A later retained recovery pass owns it; this request
     // fails closed instead of overwriting its journal/backup pair.
-    if target.load_journal().map_err(|error| {
-        EffectiveDefaultError::new(
-            safe_cause("the retained default-model journal could not be read", &error),
-            "effective_default_recovery_blocked",
-            Some(scope_label.to_string()),
-        )
-    })?.is_some() {
+    if target
+        .load_journal()
+        .map_err(|error| {
+            EffectiveDefaultError::new(
+                safe_cause(
+                    "the retained default-model journal could not be read",
+                    &error,
+                ),
+                "effective_default_recovery_blocked",
+                Some(scope_label.to_string()),
+            )
+        })?
+        .is_some()
+    {
         return Err(EffectiveDefaultError::new(
             "another default-model update for this configuration layer is still pending; run `cockpit doctor` to inspect it",
             "effective_default_journal_conflict",
@@ -2813,7 +2842,10 @@ pub fn mutate_effective_default_retained(
 
     if let Err(error) = target.write_private_leaf(&target.backup_leaf, &old_bytes) {
         return Err(EffectiveDefaultError::new(
-            safe_cause("the retained private rollback snapshot could not be prepared", &error),
+            safe_cause(
+                "the retained private rollback snapshot could not be prepared",
+                &error,
+            ),
             "effective_default_backup_failed",
             Some(scope_label.to_string()),
         ));
@@ -2821,7 +2853,10 @@ pub fn mutate_effective_default_retained(
     if let Err(error) = target.write_journal(&record) {
         let _ = target.remove_leaf(&target.backup_leaf);
         return Err(EffectiveDefaultError::new(
-            safe_cause("the retained default-model journal could not be prepared", &error),
+            safe_cause(
+                "the retained default-model journal could not be prepared",
+                &error,
+            ),
             "effective_default_journal_failed",
             Some(scope_label.to_string()),
         ));
@@ -2834,7 +2869,10 @@ pub fn mutate_effective_default_retained(
             &old_bytes,
             &record,
             scope_label,
-            &safe_cause("the retained config authority changed before replacement", &error),
+            &safe_cause(
+                "the retained config authority changed before replacement",
+                &error,
+            ),
         );
     }
 
@@ -2844,7 +2882,10 @@ pub fn mutate_effective_default_retained(
             &old_bytes,
             &record,
             scope_label,
-            &safe_cause("the retained config replacement could not be committed", &error),
+            &safe_cause(
+                "the retained config replacement could not be committed",
+                &error,
+            ),
         );
     }
     crash_point!(scope_label, AfterConfigReplaced);
@@ -2854,7 +2895,10 @@ pub fn mutate_effective_default_retained(
             &old_bytes,
             &record,
             scope_label,
-            &safe_cause("the retained config authority changed after replacement", &error),
+            &safe_cause(
+                "the retained config authority changed after replacement",
+                &error,
+            ),
         );
     }
 
@@ -2869,7 +2913,10 @@ pub fn mutate_effective_default_retained(
             &old_bytes,
             &record,
             scope_label,
-            &safe_cause("the retained committed journal phase could not be recorded", &error),
+            &safe_cause(
+                "the retained committed journal phase could not be recorded",
+                &error,
+            ),
         );
     }
     crash_point!(scope_label, AfterCommittedMarker);
@@ -2880,7 +2927,10 @@ pub fn mutate_effective_default_retained(
             &old_bytes,
             &record,
             scope_label,
-            &safe_cause("the retained config authority changed before completion", &error),
+            &safe_cause(
+                "the retained config authority changed before completion",
+                &error,
+            ),
         );
     }
 
@@ -2891,7 +2941,10 @@ pub fn mutate_effective_default_retained(
     let finalization_target = target.try_clone().map_err(|error| {
         EffectiveDefaultError::pending(
             scope_label,
-            &safe_cause("the retained config authority could not be preserved for terminal finalization", &error),
+            &safe_cause(
+                "the retained config authority could not be preserved for terminal finalization",
+                &error,
+            ),
         )
     })?;
     Ok(RetainedEffectiveDefaultPendingFinalization {
@@ -2933,7 +2986,10 @@ fn retained_restore_or_pending(
         Err(error) => {
             return Err(EffectiveDefaultError::pending(
                 scope_label,
-                &format!("{cause}; {}", safe_cause("the retained config could not be re-read", &error)),
+                &format!(
+                    "{cause}; {}",
+                    safe_cause("the retained config could not be re-read", &error)
+                ),
             ));
         }
     };
@@ -2948,7 +3004,10 @@ fn retained_restore_or_pending(
         if let Err(error) = target.write_private_leaf(&target.config_leaf, old_bytes) {
             return Err(EffectiveDefaultError::pending(
                 scope_label,
-                &format!("{cause}; {}", safe_cause("the retained config could not be restored", &error)),
+                &format!(
+                    "{cause}; {}",
+                    safe_cause("the retained config could not be restored", &error)
+                ),
             ));
         }
     }
@@ -2966,7 +3025,10 @@ fn retained_restore_or_pending(
         )),
         Err(error) => Err(EffectiveDefaultError::pending(
             scope_label,
-            &format!("{cause}; {}", safe_cause("the retained journal could not be removed", &error)),
+            &format!(
+                "{cause}; {}",
+                safe_cause("the retained journal could not be removed", &error)
+            ),
         )),
     }
 }
@@ -3083,18 +3145,21 @@ pub fn recover_retained_effective_default_journal(
         } else if current_digest != record.new_config_digest {
             anyhow::bail!("retained config changed concurrently during forward recovery");
         }
-        record.correlation.clone().map(|correlation| RecoveredTransaction {
-            correlation,
-            outcome: RecoveredOutcome::Applied {
-                selection: record.expected_effective.clone(),
-                // The caller refreshes the exact retained worker snapshot
-                // before publishing this receipt; generation zero prevents a
-                // path-derived resolution generation from being fabricated.
-                generation: 0,
-            },
-            scope_label: target.scope_label().to_string(),
-            requested: record.requested.clone(),
-        })
+        record
+            .correlation
+            .clone()
+            .map(|correlation| RecoveredTransaction {
+                correlation,
+                outcome: RecoveredOutcome::Applied {
+                    selection: record.expected_effective.clone(),
+                    // The caller refreshes the exact retained worker snapshot
+                    // before publishing this receipt; generation zero prevents a
+                    // path-derived resolution generation from being fabricated.
+                    generation: 0,
+                },
+                scope_label: target.scope_label().to_string(),
+                requested: record.requested.clone(),
+            })
     } else {
         if current_digest == record.new_config_digest {
             let Some(prior) = target.read_leaf(&target.backup_leaf)? else {
@@ -3110,15 +3175,18 @@ pub fn recover_retained_effective_default_journal(
             anyhow::bail!("retained config changed concurrently during compensation");
         }
         let config_bytes = target.read_config()?;
-        record.correlation.clone().map(|correlation| RecoveredTransaction {
-            correlation,
-            outcome: RecoveredOutcome::Restored {
-                restored: active_model_from_config_bytes(&config_bytes),
-                session: SessionCompensation::NotApplicable,
-            },
-            scope_label: target.scope_label().to_string(),
-            requested: record.requested.clone(),
-        })
+        record
+            .correlation
+            .clone()
+            .map(|correlation| RecoveredTransaction {
+                correlation,
+                outcome: RecoveredOutcome::Restored {
+                    restored: active_model_from_config_bytes(&config_bytes),
+                    session: SessionCompensation::NotApplicable,
+                },
+                scope_label: target.scope_label().to_string(),
+                requested: record.requested.clone(),
+            })
     };
 
     let transactions = transaction.into_iter().collect::<Vec<_>>();
@@ -3175,15 +3243,14 @@ pub fn mutate_effective_default(
     // Capture the selected parent before the mutation touches any sidecar.
     // This is the ambient-to-capability handoff: a subsequent A→B directory
     // replacement can never redirect the probe or lock below to B.
-    let (captured_target, mut captured_projection) = capture_ambient_mutation(cwd, &target).map_err(
-        |error| {
+    let (captured_target, mut captured_projection) = capture_ambient_mutation(cwd, &target)
+        .map_err(|error| {
             EffectiveDefaultError::new(
                 safe_cause("the effective-default target could not be captured", &error),
                 "effective_default_target_changed",
                 Some(scope_label.clone()),
             )
-        },
-    )?;
+        })?;
     if let Some(authority) = correlation
         .as_ref()
         .and_then(TransactionCorrelation::default_update_authority)
@@ -3205,7 +3272,10 @@ pub fn mutate_effective_default(
     note_ambient_mutation_writable_probe_for_tests();
     captured_target.ensure_writable().map_err(|error| {
         EffectiveDefaultError::new(
-            safe_cause("the highest-precedence config layer is not writable", &error),
+            safe_cause(
+                "the highest-precedence config layer is not writable",
+                &error,
+            ),
             "effective_default_target_unwritable",
             Some(scope_label.clone()),
         )
@@ -3277,7 +3347,10 @@ pub fn mutate_effective_default(
         .load_journal()
         .map_err(|error| {
             EffectiveDefaultError::new(
-                safe_cause("the pending default-model journal could not be re-read", &error),
+                safe_cause(
+                    "the pending default-model journal could not be re-read",
+                    &error,
+                ),
                 "effective_default_recovery_blocked",
                 Some(scope_label.clone()),
             )
@@ -3302,7 +3375,10 @@ pub fn mutate_effective_default(
         })?;
     let current = captured_projection.providers().map_err(|error| {
         EffectiveDefaultError::new(
-            safe_cause("the captured effective configuration could not be projected", &error),
+            safe_cause(
+                "the captured effective configuration could not be projected",
+                &error,
+            ),
             "effective_default_read_failed",
             Some(scope_label.clone()),
         )
@@ -3317,7 +3393,10 @@ pub fn mutate_effective_default(
         None => {
             let inherited = captured_projection.inherited_default().map_err(|error| {
                 EffectiveDefaultError::new(
-                    safe_cause("the captured inherited default could not be projected", &error),
+                    safe_cause(
+                        "the captured inherited default could not be projected",
+                        &error,
+                    ),
                     "effective_default_read_failed",
                     Some(scope_label.clone()),
                 )
@@ -3343,7 +3422,10 @@ pub fn mutate_effective_default(
         // let a stale request claim the other writer's model as its own.
         let reloaded = captured_projection.providers().map_err(|error| {
             EffectiveDefaultError::new(
-                safe_cause("the captured effective configuration could not be projected", &error),
+                safe_cause(
+                    "the captured effective configuration could not be projected",
+                    &error,
+                ),
                 "effective_default_read_failed",
                 Some(scope_label.clone()),
             )
@@ -3402,7 +3484,10 @@ fn ambient_captured_mutation_journal_fence(
 ) -> Result<(), EffectiveDefaultError> {
     let record = target.load_journal().map_err(|error| {
         EffectiveDefaultError::new(
-            safe_cause("the pending default-model journal could not be classified", &error),
+            safe_cause(
+                "the pending default-model journal could not be classified",
+                &error,
+            ),
             "effective_default_recovery_blocked",
             Some(scope_label.to_string()),
         )
@@ -3483,16 +3568,18 @@ fn mutate_under_lock(
     // appears in journal metadata, traces, events, or diagnostics. A crash
     // between here and the prepared record leaves an orphan backup with no
     // journal, which `sweep_orphans` removes on the next pass.
-    target.write_private_leaf(&target.backup_leaf, &old_bytes).map_err(|error| {
-        EffectiveDefaultError::new(
-            safe_cause(
-                "the private rollback snapshot could not be prepared",
-                &error,
-            ),
-            "effective_default_backup_failed",
-            Some(scope_label.to_string()),
-        )
-    })?;
+    target
+        .write_private_leaf(&target.backup_leaf, &old_bytes)
+        .map_err(|error| {
+            EffectiveDefaultError::new(
+                safe_cause(
+                    "the private rollback snapshot could not be prepared",
+                    &error,
+                ),
+                "effective_default_backup_failed",
+                Some(scope_label.to_string()),
+            )
+        })?;
 
     let journal_session = match session.as_ref() {
         None => JournalSession::None,
@@ -3537,7 +3624,10 @@ fn mutate_under_lock(
     let prepared_directory = target.directory.try_clone().map_err(|error| {
         let error = anyhow::Error::from(error);
         EffectiveDefaultError::new(
-            safe_cause("the captured config directory could not be retained", &error),
+            safe_cause(
+                "the captured config directory could not be retained",
+                &error,
+            ),
             "effective_default_read_failed",
             Some(scope_label.to_string()),
         )
@@ -3699,12 +3789,17 @@ fn mutate_under_lock(
             );
         }
     };
-    let reloaded = projection.projected_after_target_config(&persisted).map_err(|error| {
-        EffectiveDefaultError::pending(
-            scope_label,
-            &safe_cause("the captured effective configuration could not be projected", &error),
-        )
-    })?;
+    let reloaded = projection
+        .projected_after_target_config(&persisted)
+        .map_err(|error| {
+            EffectiveDefaultError::pending(
+                scope_label,
+                &safe_cause(
+                    "the captured effective configuration could not be projected",
+                    &error,
+                ),
+            )
+        })?;
     if reloaded.active_model != expected_effective {
         return converge_captured(
             target,
@@ -4014,15 +4109,21 @@ fn recover_captured_under_lock(
                     committed.phase = JournalPhase::Committed;
                     target.write_journal(&committed)?;
                 }
-                let transaction = record.correlation.clone().map(|correlation| RecoveredTransaction {
-                    correlation,
-                    outcome: RecoveredOutcome::Applied {
-                        selection: effective,
-                        generation: crate::config::providers::next_load_effective_generation().max(1),
-                    },
-                    scope_label: scope_label.clone(),
-                    requested: record.requested.clone(),
-                });
+                let transaction =
+                    record
+                        .correlation
+                        .clone()
+                        .map(|correlation| RecoveredTransaction {
+                            correlation,
+                            outcome: RecoveredOutcome::Applied {
+                                selection: effective,
+                                generation:
+                                    crate::config::providers::next_load_effective_generation()
+                                        .max(1),
+                            },
+                            scope_label: scope_label.clone(),
+                            requested: record.requested.clone(),
+                        });
                 if let (Some(transaction), Some(sink)) =
                     (transaction.as_ref(), recovery.sink.as_deref_mut())
                 {
@@ -4043,15 +4144,18 @@ fn recover_captured_under_lock(
 
     let session_outcome = compensate_captured(target, &record, recovery.sessions.as_deref_mut())?;
     let config_bytes = target.read_config()?;
-    let transaction = record.correlation.clone().map(|correlation| RecoveredTransaction {
-        correlation,
-        outcome: RecoveredOutcome::Restored {
-            restored: active_model_from_config_bytes(&config_bytes),
-            session: session_outcome,
-        },
-        scope_label,
-        requested: record.requested.clone(),
-    });
+    let transaction = record
+        .correlation
+        .clone()
+        .map(|correlation| RecoveredTransaction {
+            correlation,
+            outcome: RecoveredOutcome::Restored {
+                restored: active_model_from_config_bytes(&config_bytes),
+                session: session_outcome,
+            },
+            scope_label,
+            requested: record.requested.clone(),
+        });
     if let (Some(transaction), Some(sink)) = (transaction.as_ref(), recovery.sink.as_deref_mut()) {
         sink.accept(transaction)?;
     }

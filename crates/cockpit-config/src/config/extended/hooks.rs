@@ -389,7 +389,10 @@ impl fmt::Debug for HookExecutionProvenance {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ambient => formatter.write_str("HookExecutionProvenance::Ambient"),
-            Self::RetainedRelative { components, authority } => formatter
+            Self::RetainedRelative {
+                components,
+                authority,
+            } => formatter
                 .debug_struct("HookExecutionProvenance::RetainedRelative")
                 .field("component_count", &components.len())
                 .field("authority_bound", &authority.is_some())

@@ -210,8 +210,9 @@ impl cockpit_config::config::extended::hooks::RetainedWindowsHookWorkingDirector
     }
 
     fn revalidate_before_spawn(&self) -> std::result::Result<(), String> {
-        WindowsWorkspaceExecutionLease::revalidate_before_spawn(self)
-            .map_err(|error| format!("Windows retained hook cwd lease verification failed: {error:#}"))
+        WindowsWorkspaceExecutionLease::revalidate_before_spawn(self).map_err(|error| {
+            format!("Windows retained hook cwd lease verification failed: {error:#}")
+        })
     }
 }
 
@@ -282,7 +283,8 @@ impl HeldWorkspaceDirectoryAuthority {
         for component in components {
             validate_component(component)?;
         }
-        self.imp.read_regular_executable_file_bounded(components, max_bytes)
+        self.imp
+            .read_regular_executable_file_bounded(components, max_bytes)
     }
 
     /// Clone the retained root handle for a lower-layer, capability-neutral
@@ -1561,9 +1563,7 @@ mod imp {
                 )?;
                 verify_directory_handle(&parent)?;
             }
-            let wide = std::ffi::OsStr::new(leaf)
-                .encode_wide()
-                .collect::<Vec<_>>();
+            let wide = std::ffi::OsStr::new(leaf).encode_wide().collect::<Vec<_>>();
             let mut file = open_relative(
                 &parent,
                 &wide,
@@ -1599,9 +1599,7 @@ mod imp {
                 )?;
                 verify_directory_handle(&parent)?;
             }
-            let wide = std::ffi::OsStr::new(leaf)
-                .encode_wide()
-                .collect::<Vec<_>>();
+            let wide = std::ffi::OsStr::new(leaf).encode_wide().collect::<Vec<_>>();
             let mut file = open_relative(
                 &parent,
                 &wide,
@@ -1648,9 +1646,7 @@ mod imp {
                 )?;
                 verify_directory_handle(&parent)?;
             }
-            let wide = std::ffi::OsStr::new(leaf)
-                .encode_wide()
-                .collect::<Vec<_>>();
+            let wide = std::ffi::OsStr::new(leaf).encode_wide().collect::<Vec<_>>();
             let mut file = open_relative(
                 &parent,
                 &wide,
@@ -2412,11 +2408,7 @@ mod imp {
         pub(super) fn read_regular_file(&self, _: &[&str]) -> Result<Vec<u8>> {
             anyhow::bail!("held workspace directory authority is unavailable")
         }
-        pub(super) fn read_regular_file_bounded(
-            &self,
-            _: &[&str],
-            _: usize,
-        ) -> Result<Vec<u8>> {
+        pub(super) fn read_regular_file_bounded(&self, _: &[&str], _: usize) -> Result<Vec<u8>> {
             anyhow::bail!("held workspace directory authority is unavailable")
         }
         pub(super) fn read_regular_executable_file_bounded(

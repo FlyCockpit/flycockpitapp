@@ -2409,10 +2409,7 @@ mod tests {
         )
         .unwrap();
         let claimed = s.short_id();
-        let mut competitor = db
-            .new_session_row(&s.project_id, "/x", "a")
-            .await
-            .unwrap();
+        let mut competitor = db.new_session_row(&s.project_id, "/x", "a").await.unwrap();
         competitor.short_id = Some(claimed.clone());
         let inserted = db.insert_session_row(&competitor).await.unwrap();
         assert_eq!(inserted.short_id.as_deref(), Some(claimed.as_str()));

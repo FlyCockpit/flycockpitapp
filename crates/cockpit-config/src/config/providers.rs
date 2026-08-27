@@ -216,9 +216,9 @@ pub use fetch_status::{
     provider_model_fetch_display_state, provider_model_fetch_reason_display,
 };
 pub use io::{
-    ActiveModelWriteMode, ConfigDoc, RetainedProviderModelFavoriteTarget,
-    RetainedProviderModelFavoriteLock, RetainedProviderModelFavoriteWriteError,
+    ActiveModelWriteMode, ConfigDoc, RetainedProviderModelFavoriteLock,
     RetainedProviderModelFavoritePostWriteVerifier, RetainedProviderModelFavoritePreWriteVerifier,
+    RetainedProviderModelFavoriteTarget, RetainedProviderModelFavoriteWriteError,
     RetainedProviderModelFavoriteWriteReceipt, RetainedProviderModelSource, is_xai_grok_provider,
     retained_provider_model_source_from_workspace_layer_snapshots,
 };
@@ -229,12 +229,13 @@ pub use io::{load_effective_call_count, load_provider_raw_file, reset_load_effec
 /// The one authoritative effective-default mutation API. Nothing else in the
 /// workspace may write `active_model`.
 pub use crate::config::effective_default::{
-    DefaultUpdateAuthorityBinding, EffectiveDefaultError, EffectiveDefaultMutationResult, EffectiveDefaultScope,
-    JournalDiagnostic, JournalRecovery, RecoveredOutcome, RecoveredSink, RecoveredTransaction,
-    ResolvedTarget, SessionCompensation, SessionDefaultParticipant, SessionRevisionAuthority,
-    TransactionCorrelation, journal_diagnostics, journal_path_for_layer, mutate_effective_default,
-    recover_all_effective_default_journals, recover_effective_default_journal,
-    recover_layer_journals, resolve_effective_default_write_target,
+    DefaultUpdateAuthorityBinding, EffectiveDefaultError, EffectiveDefaultMutationResult,
+    EffectiveDefaultScope, JournalDiagnostic, JournalRecovery, RecoveredOutcome, RecoveredSink,
+    RecoveredTransaction, ResolvedTarget, SessionCompensation, SessionDefaultParticipant,
+    SessionRevisionAuthority, TransactionCorrelation, journal_diagnostics, journal_path_for_layer,
+    mutate_effective_default, recover_all_effective_default_journals,
+    recover_effective_default_journal, recover_layer_journals,
+    resolve_effective_default_write_target,
 };
 
 #[cfg(any(test, feature = "test-support"))]

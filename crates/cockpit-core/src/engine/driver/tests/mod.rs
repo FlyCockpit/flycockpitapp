@@ -59,7 +59,9 @@ async fn late_steer_noncompletion_outcomes_never_complete_a_queued_receipt() {
             .await;
 
         assert_eq!(
-            response.await.expect("queued late steer must receive an outcome"),
+            response
+                .await
+                .expect("queued late steer must receive an outcome"),
             outcome,
             "{case} must retain the accepted checkpoint instead of completing it"
         );
@@ -103,7 +105,8 @@ async fn recovery_activation_gate_blocks_until_claim_and_abort_never_executes() 
 /// particular, `ResumeAccepted…` must not queue that stale prompt as a second
 /// user turn.
 #[tokio::test]
-async fn recovered_parked_interactive_late_steer_restores_one_permit_without_queueing_stale_prompt() {
+async fn recovered_parked_interactive_late_steer_restores_one_permit_without_queueing_stale_prompt()
+{
     let (mut driver, _tmp) = test_driver_without_network(1);
     let owner = uuid::Uuid::new_v4();
     let steer_id = uuid::Uuid::new_v4();
@@ -116,16 +119,18 @@ async fn recovered_parked_interactive_late_steer_restores_one_permit_without_que
         continuation_id,
         recovery_epoch,
     };
-    driver.recovered_interactive_late_steer_continuations.insert(
-        owner,
-        RecoveredInteractiveLateSteerContinuation {
-            permit,
-            continuation_id,
-            next_prompt: Message::user("stale accepted user body"),
-            has_parked_continuation: true,
-            pending_response: None,
-        },
-    );
+    driver
+        .recovered_interactive_late_steer_continuations
+        .insert(
+            owner,
+            RecoveredInteractiveLateSteerContinuation {
+                permit,
+                continuation_id,
+                next_prompt: Message::user("stale accepted user body"),
+                has_parked_continuation: true,
+                pending_response: None,
+            },
+        );
     let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let input_queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
     let (respond_to, mut response) = tokio::sync::oneshot::channel();
@@ -168,7 +173,9 @@ async fn recovered_parked_interactive_late_steer_restores_one_permit_without_que
         .restore_recovered_parked_late_steer(owner)
         .expect("a duplicate replay must not recreate a second receipt");
     assert!(
-        driver.recovered_interactive_late_steer_continuations.is_empty(),
+        driver
+            .recovered_interactive_late_steer_continuations
+            .is_empty(),
         "the parked phase has been consumed exactly once"
     );
     assert_eq!(driver.pending_late_user_steer_acks.len(), 1);
@@ -254,7 +261,11 @@ async fn recovered_parked_root_late_steer_uses_its_durable_checkpoint_once() {
     driver
         .restore_recovered_parked_late_steer(root)
         .expect("a duplicate root replay cannot create another receipt");
-    assert!(driver.recovered_interactive_late_steer_continuations.is_empty());
+    assert!(
+        driver
+            .recovered_interactive_late_steer_continuations
+            .is_empty()
+    );
     assert_eq!(driver.pending_late_user_steer_acks.len(), 1);
     assert_eq!(
         driver

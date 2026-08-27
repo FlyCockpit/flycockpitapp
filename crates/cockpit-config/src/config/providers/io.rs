@@ -129,9 +129,7 @@ impl std::error::Error for RetainedProviderModelFavoriteWriteError {
 pub type RetainedProviderModelFavoritePreWriteVerifier =
     Arc<dyn Fn() -> Result<()> + Send + Sync + 'static>;
 pub type RetainedProviderModelFavoritePostWriteVerifier =
-    Arc<
-        dyn Fn(&RetainedProviderModelFavoriteWriteReceipt) -> Result<()> + Send + Sync + 'static,
-    >;
+    Arc<dyn Fn(&RetainedProviderModelFavoriteWriteReceipt) -> Result<()> + Send + Sync + 'static>;
 
 impl std::fmt::Debug for RetainedProviderModelSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -307,7 +305,9 @@ impl RetainedProviderModelFavoriteTarget {
             .join(PROVIDERS_DIR)
             .join(&provider_leaf);
         let source_lock = RetainedProviderModelFavoriteLock::new(
-            config_directory.try_clone().context("cloning retained config directory")?,
+            config_directory
+                .try_clone()
+                .context("cloning retained config directory")?,
             canonical_config_path.clone(),
         )?;
         Ok(Self {
@@ -373,10 +373,7 @@ impl RetainedProviderModelFavoriteTarget {
         Ok(())
     }
 
-    fn verify_post_write(
-        &self,
-        receipt: &RetainedProviderModelFavoriteWriteReceipt,
-    ) -> Result<()> {
+    fn verify_post_write(&self, receipt: &RetainedProviderModelFavoriteWriteReceipt) -> Result<()> {
         if let Some(verifier) = &self.post_write_verifier {
             verifier(receipt)?;
         }
@@ -430,7 +427,10 @@ impl RetainedProviderModelFavoriteTarget {
     pub fn write_model_favorite(
         &self,
         favorite: bool,
-    ) -> std::result::Result<RetainedProviderModelFavoriteWriteReceipt, RetainedProviderModelFavoriteWriteError> {
+    ) -> std::result::Result<
+        RetainedProviderModelFavoriteWriteReceipt,
+        RetainedProviderModelFavoriteWriteError,
+    > {
         self.verify_pre_write()
             .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
         let _locks = self
@@ -497,19 +497,17 @@ impl RetainedProviderModelFavoriteTarget {
             // so never classify this as pre-write rejection or overwrite a
             // concurrent external update. The receipt lets a new attachment
             // inspect the retained authority's actual final bytes.
-            return Err(RetainedProviderModelFavoriteWriteError::DurableButUnpublished {
-                receipt,
-                cause,
-            });
+            return Err(
+                RetainedProviderModelFavoriteWriteError::DurableButUnpublished { receipt, cause },
+            );
         }
         if let Err(cause) = self.verify_post_write(&receipt) {
             // The post-write fence can race an external writer. Deliberately
             // retain whatever bytes now exist: a compensation write could
             // clobber that external state after the durable boundary.
-            return Err(RetainedProviderModelFavoriteWriteError::DurableButUnpublished {
-                receipt,
-                cause,
-            });
+            return Err(
+                RetainedProviderModelFavoriteWriteError::DurableButUnpublished { receipt, cause },
+            );
         }
         Ok(receipt)
     }
@@ -707,7 +705,8 @@ impl ConfigDoc {
         snapshot: &crate::config::WorkspaceConfigLayerSnapshot,
     ) -> Result<ProvidersConfig> {
         let bytes = snapshot.config_json.as_deref().unwrap_or(b"{}");
-        let text = std::str::from_utf8(bytes).context("workspace config.json is not valid UTF-8")?;
+        let text =
+            std::str::from_utf8(bytes).context("workspace config.json is not valid UTF-8")?;
         let mut raw: Value = if text.trim().is_empty() {
             Value::Object(Map::new())
         } else {
@@ -746,10 +745,9 @@ impl ConfigDoc {
     ) -> Result<ProvidersConfig> {
         let mut merged = Value::Object(Map::new());
         for snapshot in snapshots {
-            let layer = serde_json::to_value(Self::providers_from_workspace_layer_snapshot(
-                snapshot,
-            )?)
-            .context("serializing retained workspace provider layer")?;
+            let layer =
+                serde_json::to_value(Self::providers_from_workspace_layer_snapshot(snapshot)?)
+                    .context("serializing retained workspace provider layer")?;
             deep_merge_value(&mut merged, &layer);
         }
         serde_json::from_value(merged)

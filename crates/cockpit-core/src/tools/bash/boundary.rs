@@ -45,9 +45,7 @@ pub fn command_directory_escape(
                 // Redirect handling is suppressed inside `[[ … ]]` (see the
                 // `in_double_bracket` note above); the operator otherwise falls
                 // through to the normal separator/command-start bookkeeping.
-                if !in_double_bracket
-                    && let Some(kind) = redirect_kind(op, operand)
-                {
+                if !in_double_bracket && let Some(kind) = redirect_kind(op, operand) {
                     // The word following a redirection operator is consumed by
                     // the redirection, not by the command, so it must never be
                     // re-read as a program or a command operand. Target-file
@@ -334,7 +332,8 @@ fn literal_path_operand_command(program: Option<&str>) -> bool {
 /// Other `dd` operands (`bs=`, `count=`, `conv=`, …) are not paths and are
 /// intentionally ignored.
 fn dd_file_operand(word: &str) -> Option<&str> {
-    word.strip_prefix("if=").or_else(|| word.strip_prefix("of="))
+    word.strip_prefix("if=")
+        .or_else(|| word.strip_prefix("of="))
 }
 
 /// Last path component of a program word, treating both `/` and `\` as
@@ -376,9 +375,9 @@ fn is_command_wrapper(word: &str) -> bool {
 /// for one.
 fn looks_like_assignment(word: &str) -> bool {
     match word.find('=') {
-        Some(eq) if eq > 0 => word[..eq].char_indices().all(|(idx, c)| {
-            c == '_' || c.is_ascii_alphabetic() || (idx > 0 && c.is_ascii_digit())
-        }),
+        Some(eq) if eq > 0 => word[..eq]
+            .char_indices()
+            .all(|(idx, c)| c == '_' || c.is_ascii_alphabetic() || (idx > 0 && c.is_ascii_digit())),
         _ => false,
     }
 }
@@ -1185,9 +1184,7 @@ mod tests {
         let (_tmp, root, cwd, _outside) = boundary_fixture();
         // `<<<` supplies literal text on stdin; the token is not opened as a
         // file, and (critically) must not be scanned as `cat`'s path operand.
-        assert!(
-            command_directory_escape("cat <<< ../../outside", &cwd, &root, None).is_none()
-        );
+        assert!(command_directory_escape("cat <<< ../../outside", &cwd, &root, None).is_none());
     }
 
     #[test]
@@ -1203,8 +1200,7 @@ mod tests {
         // A leading redirect (`> f cmd …`) is valid bash; the command that
         // follows the redirect target must still be gated on its own operands.
         assert_eq!(
-            command_directory_escape("> ./out.txt cat ../../outside", &cwd, &root, None)
-                .as_deref(),
+            command_directory_escape("> ./out.txt cat ../../outside", &cwd, &root, None).as_deref(),
             Some(outside.as_path())
         );
     }

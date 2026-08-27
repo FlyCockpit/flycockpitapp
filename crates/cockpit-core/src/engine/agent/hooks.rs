@@ -882,9 +882,7 @@ pub trait CommandRunner: Send + Sync {
             // spelling only to retain their existing captured-cwd assertion.
             // The production runner below revalidates the lease immediately
             // before `CreateProcess`.
-            HookWorkingDirectory::RetainedWindowsDirectory(directory) => {
-                directory.canonical_path()
-            }
+            HookWorkingDirectory::RetainedWindowsDirectory(directory) => directory.canonical_path(),
         };
         self.run(
             launch.executable(),
@@ -1293,15 +1291,8 @@ pub(crate) async fn spawn_real_hook_child_for_test(
     stdin: &str,
     timeout: Duration,
 ) -> (String, bool, bool) {
-    let output = spawn_real_hook_child(
-        executable,
-        args,
-        env,
-        working_directory,
-        stdin,
-        timeout,
-    )
-    .await;
+    let output =
+        spawn_real_hook_child(executable, args, env, working_directory, stdin, timeout).await;
     (output.stdout, output.spawn_failed, output.timed_out)
 }
 

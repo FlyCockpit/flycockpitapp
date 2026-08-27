@@ -296,9 +296,7 @@ async fn prune_watermark_cleared_for_popped_child_depth() {
     );
     assert!(driver.prune_watermark.contains_key(&2));
 
-    let _ = driver
-        .pop_child_with_envelope(None, None, &[], &tx)
-        .await;
+    let _ = driver.pop_child_with_envelope(None, None, &[], &tx).await;
 
     assert_eq!(
         driver.prune_watermark.get(&1).copied(),

@@ -380,7 +380,7 @@ impl Tool for AddPackageTool {
             true,
             &current_rationale,
         )
-            .await
+        .await
         {
             Ok(row) => row,
             Err(e) => {

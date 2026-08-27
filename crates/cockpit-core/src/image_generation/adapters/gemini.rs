@@ -180,7 +180,7 @@ impl ImageGenerationAdapter for GeminiImagesAdapter {
         &self,
         request: &ImageGenerationHandoffRequest,
     ) -> ImageGenerationHandoffResult {
-        let input = match self.plan_source.resolve(request).await {
+        let mut input = match self.plan_source.resolve(request).await {
             GeminiImagesPlanResolution::Resolved(input) => *input,
             GeminiImagesPlanResolution::Unresolvable { safe_reason } => {
                 return ImageGenerationHandoffResult::DefinitivelyRejected {
@@ -188,6 +188,7 @@ impl ImageGenerationAdapter for GeminiImagesAdapter {
                 };
             }
         };
+        input.request.prompt = request.sealed_prompt.payload.clone();
         // The pure builder validates the request against the checked-in catalog;
         // a build failure means no request was ever sent.
         let built = match build_interactions_request(&input.request) {
@@ -486,6 +487,10 @@ mod tests {
             external_operation_id: uuid::Uuid::now_v7(),
             provider_request_identity: "request:1".into(),
             provider_idempotency_identity: "idempotency:1".into(),
+            sealed_prompt: crate::image_generation_job::SealedImageGenerationPromptV1::bind(
+                "fixture prompt".into(),
+            )
+            .unwrap(),
         }
     }
 
@@ -506,9 +511,9 @@ mod tests {
         assert_eq!(submissions.len(), 1);
         assert!(
             submissions[0]
-                .windows(b"serene mountain lake".len())
-                .any(|w| w == b"serene mountain lake"),
-            "request body must carry the prompt text"
+                .windows(b"fixture prompt".len())
+                .any(|w| w == b"fixture prompt"),
+            "request body must carry the sealed dispatch prompt, not plan-source text"
         );
     }
 

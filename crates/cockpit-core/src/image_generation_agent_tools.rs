@@ -192,6 +192,9 @@ pub enum GenerateImageRiskTier {
 pub struct ImageGenerationPlanProjection {
     pub destinations: Vec<ProjectionDestination>,
     pub prompt_collapsed: bool,
+    /// SHA-256 of the protected prompt payload. It binds human approval without
+    /// exposing text to the projection, interrupt, audit, or status surfaces.
+    pub prompt_digest: String,
     pub references: Vec<ProjectionReference>,
     pub sizes: Vec<ProjectionSize>,
     pub formats: Vec<String>,
@@ -965,7 +968,54 @@ impl Tool for GenerateImageTool {
         // any provider contact. The composite authorization decision is
         // computed centrally before dispatch.
         validate_generate_image_args(&args)?;
-        let dispatch_args = parse_generate_image_dispatch_args(&args)?;
+        let mut dispatch_args = parse_generate_image_dispatch_args(&args)?;
+
+        // Use the same native write-path authority as every other filesystem
+        // writing tool before the image-specific approval is raised. Opening a
+        // private directory proves containment, not that this agent/session was
+        // authorized to write there.
+        let requested_output = crate::tools::common::resolve(&dispatch_args.directory, &ctx.cwd);
+        crate::tools::write::enforce_requested_write_scope(ctx, &requested_output, self.name())?;
+        let checked_output = crate::tools::sandbox::check_native_access(
+            ctx,
+            &requested_output,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
+        crate::tools::sandbox::recheck_native_access_effect_boundary(
+            &checked_output,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
+        dispatch_args.directory = checked_output.display().to_string();
+        dispatch_args.normal_write_path_digest = Some(crate::intel::hex_lower(&Sha256::digest(
+            dispatch_args.directory.as_bytes(),
+        )));
+
+        // `local_path` is not a durable attachment identity. Admit it through
+        // the normal read-path authority, then fail closed until it has been
+        // registered as a typed session attachment; this prevents the old path
+        // from being silently dropped while a provider still receives a request.
+        for reference in &dispatch_args.references {
+            if let ImageReferenceTag::LocalPath { local_path } = reference {
+                let requested = crate::tools::common::resolve(local_path, &ctx.cwd);
+                let checked = crate::tools::sandbox::check_native_access(
+                    ctx,
+                    &requested,
+                    crate::tools::shell_sandbox::SandboxPathAccess::Read,
+                )
+                .await?;
+                crate::tools::sandbox::recheck_native_access_effect_boundary(
+                    &checked,
+                    crate::tools::shell_sandbox::SandboxPathAccess::Read,
+                )
+                .await?;
+                return Ok(ToolOutput::text(
+                    "Local image paths must be registered as session attachments before image generation; no job was created."
+                        .to_string(),
+                ));
+            }
+        }
 
         // Route through the session-scoped dispatch funnel, which owns the
         // central [`crate::approval::Approver`] chokepoint and durable job
@@ -1095,6 +1145,7 @@ fn parse_generate_image_dispatch_args(
         base_stem,
         targets,
         references,
+        normal_write_path_digest: None,
     })
 }
 
@@ -1361,6 +1412,7 @@ mod tests {
                 adapter_kind: "openai_images".to_string(),
             }],
             prompt_collapsed: true,
+            prompt_digest: "0".repeat(64),
             references: Vec::new(),
             sizes: vec![ProjectionSize {
                 target_id: "t1".to_string(),

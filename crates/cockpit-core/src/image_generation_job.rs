@@ -44,7 +44,8 @@ use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
 use cockpit_db::image_spend::{ProjectKey, SessionId, SpendScopeKeys};
 use cockpit_db::media_attachments::{
-    AcquireMediaComponentLeaseInput, AcquiredMediaComponentLease, MediaComponentLeaseKind,
+    AcquireMediaComponentLeaseInput, AcquireMediaReferenceInput, AcquiredMediaComponentLease,
+    MediaComponentLeaseKind, MediaReferenceConsumerKind,
 };
 
 use crate::media_reservation::{
@@ -58,8 +59,8 @@ pub use cockpit_db::image_generation_plan::{
     MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
     MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS, OutputDirectoryAuthorityV1,
     OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1, ResolvedOutputV1,
-    ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
-    TypedParameterV1, VectorSanitizerProvenanceV1,
+    ResourceReservationV1, SealedImageGenerationPromptV1, SpendReservationPlanV1,
+    TargetDestinationV1, TargetPlanV1, TypedParameterV1, VectorSanitizerProvenanceV1,
 };
 use cockpit_host::private_fs::held_directory::{
     HeldArtifactEvidence, HeldDirectoryEffectOutcome, HeldDirectoryRecovery, HeldSealOutcome,
@@ -116,6 +117,10 @@ pub struct ImageGenerationHandoffRequest {
     pub external_operation_id: Uuid,
     pub provider_request_identity: String,
     pub provider_idempotency_identity: String,
+    /// Protected payload read only from the sealed immutable plan immediately
+    /// before provider handoff. Its digest is part of the plan digest and it is
+    /// never included in status, audit, or scheduler evidence.
+    pub sealed_prompt: SealedImageGenerationPromptV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1478,6 +1483,17 @@ impl ImageGenerationDispatcher {
         let (job_id, slot_id, attempt_number, _) = dispatching.identity();
         let (provider_request_identity, provider_idempotency_identity) =
             dispatching.provider_dispatch_identity();
+        let sealed_prompt = self
+            .db
+            .read(move |conn| {
+                let (canonical, digest): (Vec<u8>, String) = conn.query_row(
+                    "SELECT canonical_plan,plan_digest FROM image_generation_plans WHERE job_id=?1",
+                    [job_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                Ok(ImageGenerationPlanV1::from_canonical(&canonical, &digest)?.sealed_prompt)
+            })
+            .await?;
         let request = ImageGenerationHandoffRequest {
             job_id,
             slot_id,
@@ -1485,6 +1501,7 @@ impl ImageGenerationDispatcher {
             external_operation_id: dispatching.operation().operation_id,
             provider_request_identity: provider_request_identity.to_owned(),
             provider_idempotency_identity: provider_idempotency_identity.to_owned(),
+            sealed_prompt,
         };
         let result = adapter.handoff(&request).await;
         result.validate()?;
@@ -1567,9 +1584,45 @@ pub struct ImageGenerationJobService {
     db: cockpit_db::Db,
 }
 
+/// A remembered approval that is committed in the same SQLite transaction as
+/// the queued image job. Keeping this write beside the graph insert prevents a
+/// post-commit grant failure from returning an error for a job that a retry
+/// could duplicate.
+#[derive(Debug, Clone)]
+pub struct ImageGenerationStandingGrant {
+    pub scope: crate::approval::store::Scope,
+    pub session_id: Uuid,
+    pub project_id: String,
+    pub plan_digest: String,
+    pub destination_binding_digest: String,
+    pub output_path_authority: String,
+}
+
 impl ImageGenerationJobService {
     pub fn new(db: cockpit_db::Db) -> Self {
         Self { db }
+    }
+
+    /// Retire preflight-only component leases when a job never reaches the
+    /// transactional ownership transfer. This is deliberately idempotent at
+    /// the caller boundary: failed queue creation and incompatible preflight
+    /// must not pin user media until daemon restart recovery.
+    async fn release_untransferred_reference_leases(
+        db: cockpit_db::Db,
+        leases: Vec<AcquiredMediaComponentLease>,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        db.transaction(move |conn| {
+            for lease in leases {
+                cockpit_db::Db::release_media_component_lease_conn(
+                    conn,
+                    lease.lease_id,
+                    now_unix_ms,
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Resolve preflight, then commit the plan as a `queued` job. Returns
@@ -1580,6 +1633,8 @@ impl ImageGenerationJobService {
         request: ImageGenerationRequestV1,
         authority: ImageGenerationResolutionAuthorityV1,
         media_snapshots: Vec<ImageGenerationMediaSnapshotInput>,
+        reference_leases: Vec<AcquiredMediaComponentLease>,
+        standing_grant: Option<ImageGenerationStandingGrant>,
         created_at_unix_ms: i64,
     ) -> Result<ImageGenerationJobCreation> {
         let plan = match resolve_image_generation(request, authority)? {
@@ -1645,6 +1700,56 @@ impl ImageGenerationJobService {
                     &media,
                     created_at_unix_ms,
                 )?;
+                // Preflight leases are only short-lived evidence. Transfer
+                // their ownership to job-scoped durable references before the
+                // queued graph becomes visible, then retire every lease in
+                // this same transaction.
+                let job_consumer_id = job_id.to_string();
+                for lease in &reference_leases {
+                    cockpit_db::Db::acquire_media_reference_conn(
+                        conn,
+                        AcquireMediaReferenceInput {
+                            reference_id: Uuid::now_v7(),
+                            attachment_id: lease.attachment_id,
+                            expected_version: lease.attachment_version,
+                            session_id: lease.owner_session_id,
+                            project_digest: &lease.canonical_project_digest,
+                            consumer_kind: MediaReferenceConsumerKind::Job,
+                            consumer_id: &job_consumer_id,
+                            now_unix_ms: created_at_unix_ms,
+                        },
+                    )?;
+                    cockpit_db::Db::release_media_component_lease_conn(
+                        conn,
+                        lease.lease_id,
+                        created_at_unix_ms,
+                    )?;
+                }
+                if let Some(grant) = standing_grant {
+                    let session_id = match grant.scope {
+                        crate::approval::store::Scope::Session => Some(grant.session_id.to_string()),
+                        crate::approval::store::Scope::Project => None,
+                        crate::approval::store::Scope::Once
+                        | crate::approval::store::Scope::Global => {
+                            anyhow::bail!("image generation standing grant scope is invalid")
+                        }
+                    };
+                    conn.execute(
+                        "INSERT OR REPLACE INTO image_generation_grants \
+                         (grant_id,scope,session_id,project_id,plan_digest,destination_binding_digest,output_path_authority,verdict,granted_at_unix_ms,revoked_at_unix_ms) \
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,'allow',?8,NULL)",
+                        params![
+                            Uuid::now_v7().to_string(),
+                            grant.scope.as_str(),
+                            session_id,
+                            grant.project_id,
+                            grant.plan_digest,
+                            grant.destination_binding_digest,
+                            grant.output_path_authority,
+                            created_at_unix_ms,
+                        ],
+                    )?;
+                }
                 Ok(ImageGenerationJobCreation::Queued { job_id })
             })
             .await
@@ -1653,9 +1758,9 @@ impl ImageGenerationJobService {
 
 use crate::approval::{Approver, AuthorizationRequest, Decision};
 use crate::image_generation_agent_tools::{
-    BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS, BudgetDisposition, ImageGenerationPlanProjection,
-    ImageReferenceTag, LocationClass, PlanDigest, ProjectionDestination, ProjectionReference,
-    ProjectionSize, SpendPolicyChoice, TypedParameter, plan_projection_digest,
+    BudgetDisposition, ImageGenerationPlanProjection, ImageReferenceTag, LocationClass, PlanDigest,
+    ProjectionDestination, ProjectionReference, ProjectionSize, SpendPolicyChoice, TypedParameter,
+    plan_projection_digest,
 };
 use cockpit_db::image_spend::{BudgetPolicy, CurrentImageSpendPolicy, ImageSpendSettings};
 
@@ -1697,6 +1802,11 @@ pub struct GenerateImageDispatchArgs {
     /// Typed reference tags (attachment id or daemon-local path). Raw URLs and
     /// provider JSON are rejected upstream at the schema layer.
     pub references: Vec<ImageReferenceTag>,
+    /// Internal capability minted only by the native tool's normal write-path
+    /// authority check. It binds that check to the exact effective directory;
+    /// callers that bypass the tool cannot turn an opened directory into an
+    /// authorization fact.
+    pub(crate) normal_write_path_digest: Option<String>,
 }
 
 /// One resolved per-target entry inside [`GenerateImageDispatchArgs`].
@@ -1820,13 +1930,6 @@ impl OutputPathAuthorityId {
     pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
         Self(value.into())
     }
-
-    /// Test-only raw constructor. `#[cfg(test)]`-gated so production cannot
-    /// bypass [`Self::from_verified_output_directory`].
-    #[cfg(all(test, feature = "extended"))]
-    pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
 }
 
 pub struct ImageGenerationDispatchService {
@@ -1921,7 +2024,14 @@ impl ImageGenerationDispatchService {
         approver: &Approver,
         args: &GenerateImageDispatchArgs,
     ) -> Result<GenerateImageDispatchOutcome> {
-        let _gate = self.config_gate.read().await;
+        // Take only a short snapshot lock. Human approval can wait indefinitely;
+        // retaining the config lock while it is parked would block reload and
+        // make every later queue operation observe stale configuration.
+        let dispatch_config_generation = {
+            let _gate = self.config_gate.read().await;
+            self.config_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
         let mut resolved_args = args.clone();
         if resolved_args.targets.len() == 1
             && resolved_args.targets[0].target_id == DEFAULT_IMAGE_TARGET_MARKER
@@ -1943,6 +2053,24 @@ impl ImageGenerationDispatchService {
                 reason: DISPATCH_NO_TARGETS.to_string(),
             });
         }
+        // The durable v1 request/plan graph has one output shape and typed
+        // parameter set for every selected target. Do not silently globalize
+        // the first target's overrides: reject heterogeneous requests before
+        // preflight or authorization until the plan carries a per-target
+        // request envelope end to end.
+        let first_target = &resolved_args.targets[0];
+        if resolved_args.targets.iter().skip(1).any(|target| {
+            target.samples != first_target.samples
+                || target.width != first_target.width
+                || target.height != first_target.height
+                || target.format != first_target.format
+                || target.parameters != first_target.parameters
+                || target.reference_indices != first_target.reference_indices
+        }) {
+            return Ok(GenerateImageDispatchOutcome::Refused {
+                reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+            });
+        }
 
         // (1) Preflight: resolve every requested target to its sealed
         // destination (adapter kind + connected location class) via the image
@@ -1960,8 +2088,7 @@ impl ImageGenerationDispatchService {
         let extension = resolved_args.targets[0].format.clone();
         let held = match open_image_generation_output_directory(
             Path::new(&resolved_args.directory),
-            self.config_generation
-                .load(std::sync::atomic::Ordering::Acquire),
+            dispatch_config_generation,
             resolved_args.base_stem.clone(),
             extension,
         ) {
@@ -1975,7 +2102,10 @@ impl ImageGenerationDispatchService {
         let output_path_authority = held.authority().0.canonical_destination_digest.clone();
         let output_path_authority_id =
             OutputPathAuthorityId::from_verified_output_directory(held.authority());
-        let output_write_authorized = true;
+        let effective_output_path_digest =
+            crate::intel::hex_lower(&Sha256::digest(resolved_args.directory.as_bytes()));
+        let output_write_authorized = resolved_args.normal_write_path_digest.as_deref()
+            == Some(effective_output_path_digest.as_str());
         // Local-path references are not read-authorized at this seam yet; an
         // attachment-only reference set needs no local read authority.
         let path_read_authorized = resolved_args
@@ -2029,6 +2159,7 @@ impl ImageGenerationDispatchService {
         let projection = ImageGenerationPlanProjection {
             destinations: destinations.clone(),
             prompt_collapsed: true,
+            prompt_digest: crate::intel::hex_lower(&Sha256::digest(args.prompt.as_bytes())),
             references: resolved_args
                 .targets
                 .iter()
@@ -2135,32 +2266,56 @@ impl ImageGenerationDispatchService {
             });
         }
 
+        // Reacquire only after the human decision and fence the exact snapshot
+        // that was approved. A reload/removal/credential rotation while the
+        // prompt was open must never enqueue under the old binding.
+        let _commit_gate = self.config_gate.read().await;
+        if self
+            .config_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != dispatch_config_generation
+            || self.resolve_projection_destinations(&resolved_args)? != Some(destinations.clone())
+            || self.registry.destination_grant_binding_digest(&target_ids)
+                != Some(destination_grant_binding_digest.clone())
+        {
+            return Ok(GenerateImageDispatchOutcome::Refused {
+                reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+            });
+        }
+
         // (7) Allow: reserve spend + media, resolve, and commit the queued job.
-        let outcome = self
-            .commit_queued_job(session, &resolved_args, &policy, &plan_digest, held)
-            .await?;
-        if matches!(outcome, GenerateImageDispatchOutcome::Queued { .. })
-            && let Decision::Allow {
+        let standing_grant = match decision {
+            Decision::Allow {
                 scope:
                     scope @ (crate::approval::store::Scope::Session
                     | crate::approval::store::Scope::Project),
-            } = decision
-        {
-            // The durable job is the commit point for a remembered approval.
-            // If this write fails, surface an error instead of silently turning
-            // the user's requested scope into a one-time grant.
-            approver
-                .store()
-                .record_image_generation_grant(
-                    scope,
-                    &session.project_id,
-                    plan_digest.as_str(),
-                    &destination_grant_binding_digest,
-                    &output_path_authority,
-                )
-                .await?;
-        }
-        Ok(outcome)
+            } => Some(ImageGenerationStandingGrant {
+                scope,
+                session_id: session.id,
+                project_id: session.project_id.clone(),
+                plan_digest: plan_digest.as_str().to_string(),
+                destination_binding_digest: destination_grant_binding_digest,
+                output_path_authority,
+            }),
+            Decision::Allow {
+                scope: crate::approval::store::Scope::Once,
+            }
+            | Decision::Deny
+            | Decision::NoninteractiveDeny
+            | Decision::StandingReject { .. } => None,
+            Decision::Allow {
+                scope: crate::approval::store::Scope::Global,
+            } => unreachable!("image generation never offers global approval"),
+        };
+        self.commit_queued_job(
+            session,
+            &resolved_args,
+            &policy,
+            &plan_digest,
+            held,
+            standing_grant,
+        )
+        .await
     }
 
     /// Return the redacted, session-authorized status of an image-generation job.
@@ -2202,7 +2357,6 @@ impl ImageGenerationDispatchService {
                     owner_session_id: owner.session_id,
                     owner_principal_digest: &owner.principal_digest,
                     project_identity_digest: &owner.project_identity_digest,
-                    config_generation: owner.config_generation,
                 };
                 cockpit_db::Db::read_owned_image_generation_job_status_conn(conn, job_id, &scope)
             })
@@ -2275,7 +2429,6 @@ impl ImageGenerationDispatchService {
                     owner_session_id: owner.session_id,
                     owner_principal_digest: &owner.principal_digest,
                     project_identity_digest: &owner.project_identity_digest,
-                    config_generation: owner.config_generation,
                 };
                 cockpit_db::Db::request_owned_image_generation_cancellation_conn(
                     conn,
@@ -2504,6 +2657,7 @@ impl ImageGenerationDispatchService {
         policy: &CurrentImageSpendPolicy,
         plan_digest: &PlanDigest,
         held: HeldImageGenerationOutputDirectory,
+        standing_grant: Option<ImageGenerationStandingGrant>,
     ) -> Result<GenerateImageDispatchOutcome> {
         // Immutable request: target + reference ids strictly increasing.
         let mut target_ids: Vec<String> = args
@@ -2763,6 +2917,7 @@ impl ImageGenerationDispatchService {
             central_resources: vec![central_media],
             spend: spend_plan,
             output_authority: held.authority().clone(),
+            sealed_prompt: SealedImageGenerationPromptV1::bind(args.prompt.clone())?,
             targets,
         };
         let ImageGenerationResolutionV1::Ready(preflight) =
@@ -2868,10 +3023,23 @@ impl ImageGenerationDispatchService {
             })
             .collect();
         let creation = ImageGenerationJobService::new(self.db.clone())
-            .create_queued_job(request, authority, media_snapshots, created_at_unix_ms)
+            .create_queued_job(
+                request,
+                authority,
+                media_snapshots,
+                reference_leases.clone(),
+                standing_grant,
+                created_at_unix_ms,
+            )
             .await;
         match creation {
             Err(error) => {
+                ImageGenerationJobService::release_untransferred_reference_leases(
+                    self.db.clone(),
+                    reference_leases,
+                    created_at_unix_ms,
+                )
+                .await?;
                 Self::cancel_unqueued_media(&ledger, &media_claim, now_monotonic_ms).await?;
                 self.db
                     .cancel_image_spend_before_dispatch(spend.reservation_id, created_at_unix_ms)
@@ -2882,6 +3050,12 @@ impl ImageGenerationDispatchService {
                 Ok(GenerateImageDispatchOutcome::Queued { job_id })
             }
             Ok(ImageGenerationJobCreation::Incompatible(alternatives)) => {
+                ImageGenerationJobService::release_untransferred_reference_leases(
+                    self.db.clone(),
+                    reference_leases,
+                    created_at_unix_ms,
+                )
+                .await?;
                 Self::cancel_unqueued_media(&ledger, &media_claim, now_monotonic_ms).await?;
                 self.db
                     .cancel_image_spend_before_dispatch(spend.reservation_id, created_at_unix_ms)
@@ -2971,6 +3145,7 @@ pub struct ImageGenerationResolutionAuthorityV1 {
     central_resources: Vec<ResourceReservationV1>,
     spend: SpendReservationPlanV1,
     output_authority: VerifiedOutputDirectoryAuthority,
+    sealed_prompt: SealedImageGenerationPromptV1,
     targets: Vec<ImageGenerationTargetResolutionAuthorityV1>,
 }
 
@@ -4096,6 +4271,7 @@ pub struct ImageGenerationResolutionProofs<'a> {
     pub spend_attempts: &'a [AttemptMaximum],
     pub reference_leases: &'a [AcquiredMediaComponentLease],
     pub output: &'a HeldImageGenerationOutputDirectory,
+    pub sealed_prompt: SealedImageGenerationPromptV1,
     pub deadline_boot_id: Uuid,
     pub enqueue_started_monotonic_ms: u64,
     pub operation_deadline_monotonic_ms: u64,
@@ -4277,6 +4453,7 @@ impl ImageGenerationResolutionAuthorityV1 {
             central_resources,
             spend,
             output_authority: proofs.output.authority().clone(),
+            sealed_prompt: proofs.sealed_prompt,
             targets,
         })
     }
@@ -4402,6 +4579,7 @@ pub fn resolve_image_generation(
         central_resources: authority.central_resources,
         spend: authority.spend,
         output_authority: authority.output_authority,
+        sealed_prompt: authority.sealed_prompt,
         targets,
     })?;
     Ok(ImageGenerationResolutionV1::Ready(Box::new(plan)))
@@ -5600,6 +5778,7 @@ pub(crate) struct ImageGenerationPreflightInputV1 {
     pub central_resources: Vec<ResourceReservationV1>,
     pub spend: SpendReservationPlanV1,
     pub output_authority: VerifiedOutputDirectoryAuthority,
+    pub sealed_prompt: SealedImageGenerationPromptV1,
     pub targets: Vec<ImageGenerationPreflightTargetV1>,
 }
 
@@ -5698,6 +5877,7 @@ pub(crate) fn plan_image_generation(
         central_resources: input.central_resources,
         spend: input.spend,
         output_authority: input.output_authority.0,
+        sealed_prompt: input.sealed_prompt,
         targets,
     };
     plan.required_grants.sort();
@@ -6108,6 +6288,7 @@ mod tests {
             external_operation_id: Uuid::now_v7(),
             provider_request_identity: "request:1".into(),
             provider_idempotency_identity: "idempotency:1".into(),
+            sealed_prompt: SealedImageGenerationPromptV1::bind("fixture prompt".into()).unwrap(),
         };
         assert!(matches!(
             adapter.handoff(&request).await,
@@ -7705,6 +7886,7 @@ mod tests {
             central_resources: vec![per_attempt_resource.clone()],
             spend,
             output_authority: VerifiedOutputDirectoryAuthority(base.output_authority.clone()),
+            sealed_prompt: base.sealed_prompt.clone(),
             targets: vec![ImageGenerationTargetResolutionAuthorityV1 {
                 runtime: RuntimeTargetAuthorityV1 {
                     target_id: base_target.target_id.clone(),
@@ -7818,6 +8000,8 @@ mod tests {
                     canonical_bytes: media_bytes,
                     digest: media_digest,
                 }],
+                Vec::new(),
+                None,
                 1,
             )
             .await
@@ -10102,6 +10286,7 @@ mod tests {
             deadline_boot_id: deadline_boot(),
             enqueue_started_monotonic_ms: 100,
             operation_deadline_monotonic_ms: 400,
+            sealed_prompt: SealedImageGenerationPromptV1::bind("fixture prompt".into()).unwrap(),
             required_grants: vec![GrantRequirementV1 {
                 grant_kind: "image_generation".into(),
                 authority_digest: digest('3'),
@@ -10208,6 +10393,7 @@ mod tests {
                 central_resources: sealed.central_resources,
                 spend: sealed.spend,
                 output_authority: VerifiedOutputDirectoryAuthority(sealed.output_authority),
+                sealed_prompt: sealed.sealed_prompt,
                 targets: vec![ImageGenerationTargetResolutionAuthorityV1 {
                     runtime: RuntimeTargetAuthorityV1 {
                         target_id: target.target_id.clone(),

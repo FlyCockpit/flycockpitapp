@@ -1143,7 +1143,7 @@ impl Approver {
         );
 
         // 3. Grant-matching seam (fails closed this increment; see below).
-        let grant_matches = self.image_generation_grant_matches(&facts).await;
+        let matching_grant_scope = self.image_generation_grant_matches(&facts).await;
 
         // 4. Approval-mode dispatch over the shared session mode.
         match self.approval_mode() {
@@ -1162,10 +1162,20 @@ impl Approver {
                 Ok(Decision::Allow { scope: Scope::Once })
             }
             crate::config::extended::ApprovalMode::Manual => {
-                if grant_matches {
+                if let Some(scope) = matching_grant_scope {
                     // A matching standing grant is an explicit prior user
-                    // decision — short-circuit to a standing allow.
-                    Ok(Decision::Allow { scope: Scope::Once })
+                    // decision — short-circuit to a standing allow and audit
+                    // the exact matched scope rather than inventing a prompt.
+                    let decision = Decision::Allow { scope };
+                    self.record_permission_decision(
+                        "generate_image",
+                        facts.plan_digest.as_str(),
+                        &[scope],
+                        decision,
+                        crate::approval::DecisionSource::AlreadyGranted,
+                    )
+                    .await;
+                    Ok(decision)
                 } else {
                     // No grant input available: ask the human. Never assume a
                     // grant that does not exist.
@@ -1176,8 +1186,19 @@ impl Approver {
                 // Auto auto-allows only a base-risk request already covered by a
                 // matching grant (the central safe-risk policy). Any elevated
                 // risk, or the absence of a grant, asks the human.
-                if grant_matches && matches!(risk_tier, GenerateImageRiskTier::Base) {
-                    Ok(Decision::Allow { scope: Scope::Once })
+                if let Some(scope) = matching_grant_scope
+                    && matches!(risk_tier, GenerateImageRiskTier::Base)
+                {
+                    let decision = Decision::Allow { scope };
+                    self.record_permission_decision(
+                        "generate_image",
+                        facts.plan_digest.as_str(),
+                        &[scope],
+                        decision,
+                        crate::approval::DecisionSource::AlreadyGranted,
+                    )
+                    .await;
+                    Ok(decision)
                 } else {
                     self.raise_image_generation_prompt(&facts).await
                 }
@@ -1196,9 +1217,12 @@ impl Approver {
     /// then project scope (bound to the live session's machine-local
     /// `project_id`). Fails closed on any lookup error or when no session is
     /// attached: no grant ever fakes an allow.
-    async fn image_generation_grant_matches(&self, facts: &ImageGenerationAuthzFacts<'_>) -> bool {
+    async fn image_generation_grant_matches(
+        &self,
+        facts: &ImageGenerationAuthzFacts<'_>,
+    ) -> Option<Scope> {
         let Some(session) = self.session.as_deref() else {
-            return false;
+            return None;
         };
         self.store
             .image_generation_grant_scope(
@@ -1304,9 +1328,17 @@ impl Approver {
                 },
             )
             .await?;
-        // Standing grants are persisted only by the dispatch service after it
-        // has durably committed the exact queued job. Recording one here would
-        // leave an authorization for an operation that failed before commit.
+        self.record_permission_decision(
+            "generate_image",
+            facts.plan_digest.as_str(),
+            &[Scope::Once, Scope::Session, Scope::Project],
+            decision,
+            crate::approval::DecisionSource::UserPrompt,
+        )
+        .await;
+        // Standing grants are persisted by the dispatch transaction after it
+        // has durably queued this exact job. The audit above records the human
+        // choice without creating an authorization for a failed queue commit.
         Ok(decision)
     }
 }

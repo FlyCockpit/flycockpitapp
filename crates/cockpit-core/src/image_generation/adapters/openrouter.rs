@@ -2089,7 +2089,7 @@ impl ImageGenerationAdapter for OpenrouterImagesAdapter {
         &self,
         request: &ImageGenerationHandoffRequest,
     ) -> ImageGenerationHandoffResult {
-        let input = match self.plan_source.resolve(request).await {
+        let mut input = match self.plan_source.resolve(request).await {
             OpenrouterImagesPlanResolution::Resolved(input) => *input,
             OpenrouterImagesPlanResolution::Unresolvable { safe_reason } => {
                 // No request was built or sent: definitive rejection, never
@@ -2099,6 +2099,7 @@ impl ImageGenerationAdapter for OpenrouterImagesAdapter {
                 };
             }
         };
+        input.request.prompt = request.sealed_prompt.payload.clone();
         let provider_origin = if input.apply_openrouter_attribution {
             ResolvedProviderOrigin::template("openrouter")
         } else {
@@ -3942,6 +3943,10 @@ mod tests {
             external_operation_id: uuid::Uuid::now_v7(),
             provider_request_identity: "request:1".into(),
             provider_idempotency_identity: "idempotency:1".into(),
+            sealed_prompt: crate::image_generation_job::SealedImageGenerationPromptV1::bind(
+                "fixture prompt".into(),
+            )
+            .unwrap(),
         }
     }
 

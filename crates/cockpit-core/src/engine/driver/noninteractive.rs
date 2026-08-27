@@ -7942,7 +7942,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         cancel: tokio_util::sync::CancellationToken::new(),
         shutdown_gate: agent.model.shutdown_gate(),
         approver: approver.clone(),
-        image_generation_dispatch: None,
+        image_generation_dispatch: session.image_generation_dispatch(),
         deferred_log,
         root_agent_frame: false,
         skill_write_origin: payload.resume.call_origin,

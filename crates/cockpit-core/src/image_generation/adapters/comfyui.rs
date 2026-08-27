@@ -706,6 +706,10 @@ mod tests {
             external_operation_id: uuid::Uuid::now_v7(),
             provider_request_identity: "request:1".into(),
             provider_idempotency_identity: "idempotency:1".into(),
+            sealed_prompt: crate::image_generation_job::SealedImageGenerationPromptV1::bind(
+                "fixture prompt".into(),
+            )
+            .unwrap(),
         }
     }
 

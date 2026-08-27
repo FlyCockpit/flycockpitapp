@@ -622,7 +622,7 @@ async fn load_without_row_clears_memory_view() {
 
 #[tokio::test]
 async fn loaded_brief_generation_is_persisted_and_compared() {
-    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (driver, _tmp) = test_driver_without_network(8);
     let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
         generation: 7,
         snapshot_history: vec![Message::user("snapshot"), Message::assistant("briefed")],
@@ -3104,7 +3104,7 @@ async fn compact_hooks_fire_pre_before_post_only_on_success() {
 async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
     use crate::engine::compact_draft::{CompactFitRung, CompactInputCoverage};
 
-    let (driver, _tmp) = test_driver_without_network(8);
+    let (mut driver, _tmp) = test_driver_without_network(8);
     let snapshot_history = vec![
         Message::user("first request"),
         Message::assistant("first response"),

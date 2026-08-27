@@ -2687,16 +2687,34 @@ async fn handle_send_user_message_v2(
             });
         }
     };
-    // TODO(#69): (a) reject non-Owner principals for local-direct ingress;
-    // (b) wire `Db::accept_message_with_attachments` via the transactional
+    if !state.principal.is_owner() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "local_owner_direct ingress requires the local owner".into(),
+        });
+    }
+    #[cfg(feature = "remote")]
+    if remote_operation.is_some() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "local_owner_direct ingress cannot carry a remote operation".into(),
+        });
+    }
+    // TODO(#69): (a) wire `Db::accept_message_with_attachments` via the transactional
     // acceptance seam (`MessageAcceptanceJoin` acquiring
     // `MediaReferenceConsumerKind::Message` references) instead of the
-    // ephemeral in-memory claim path; (c) resolve the typed
+    // ephemeral in-memory claim path; (b) resolve the typed
     // `MessageAttachmentIdentity` attachments to leased media bytes through
-    // the typed-upload pipeline. Until (c) lands, attachments are not yet
-    // carried into the engine; the durable FCM2 attachment identities live in
-    // `local.request.attachments`.
+    // the typed-upload pipeline. Until those land, reject attachments instead
+    // of acknowledging a text-only message after silently dropping media.
     let request = local.request;
+    if !request.attachments.is_empty() {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "typed message attachments are not yet available on the local send path"
+                .into(),
+        });
+    }
     handle_send_user_message(
         state,
         ctx,

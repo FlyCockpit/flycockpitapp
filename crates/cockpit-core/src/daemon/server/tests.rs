@@ -14983,7 +14983,7 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
     let project = tempfile::tempdir().unwrap();
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
-    let image_ref = proto::ImageAttachmentRef { id: Uuid::new_v4() };
+    let _image_ref = proto::ImageAttachmentRef { id: Uuid::new_v4() };
     let error = handle_request(
         Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
@@ -15257,7 +15257,7 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
         canonical_project_digest: [41; 32],
         model_config_generation: 0,
         canonical_model_digest: [42; 32],
-        request: crate::proto_crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
             text: source.clone(),
             display_text: Some(display.clone()),
@@ -15442,7 +15442,7 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
         canonical_project_digest: [51; 32],
         model_config_generation: 0,
         canonical_model_digest: [52; 32],
-        request: crate::proto_crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
             text: source.clone(),
             display_text: None,

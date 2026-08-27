@@ -2698,8 +2698,13 @@ impl Request {
                     ingress: MessageIngressV2::LocalOwnerDirect(local),
                 } = self
                 {
-                    if local.operation_id.is_nil() {
-                        return Err("operation_id must not be nil".to_string());
+                    if local.operation_id.get_version_num() != 7
+                        || local.operation_id.get_variant() != uuid::Variant::RFC4122
+                    {
+                        return Err("operation_id must be RFC UUIDv7".to_string());
+                    }
+                    if local.session_locator.is_empty() {
+                        return Err("session_locator must not be empty".to_string());
                     }
                     if local.operation_id == request.client_submission_id {
                         return Err("operation_id and client_submission_id must differ".to_string());
@@ -6356,10 +6361,13 @@ mod tests {
         };
         let json = serde_json::to_value(&send).unwrap();
         assert_eq!(json["request"], "send_user_message");
-        assert_eq!(json["params"]["client_submission_id"], id.to_string());
+        assert_eq!(
+            json["params"]["ingress"]["request"]["client_submission_id"],
+            id.to_string()
+        );
         // Empty options object is the run marker; absent dimensions omit/null.
         assert_eq!(
-            json["params"]["run_invocation_options"],
+            json["params"]["ingress"]["run_invocation_options"],
             serde_json::json!({})
         );
         assert!(json["params"].get("invocation_id").is_none());
@@ -6385,11 +6393,11 @@ mod tests {
         };
         let bounded_json = serde_json::to_value(&bounded_send).unwrap();
         assert_eq!(
-            bounded_json["params"]["run_invocation_options"]["max_turns"],
+            bounded_json["params"]["ingress"]["run_invocation_options"]["max_turns"],
             3
         );
         assert_eq!(
-            bounded_json["params"]["run_invocation_options"]["timeout_ms"],
+            bounded_json["params"]["ingress"]["run_invocation_options"]["timeout_ms"],
             60_000
         );
 
@@ -6417,7 +6425,7 @@ mod tests {
         };
         let mode_json = serde_json::to_value(&mode_send).unwrap();
         assert_eq!(
-            mode_json["params"]["run_invocation_options"]["approval_mode"],
+            mode_json["params"]["ingress"]["run_invocation_options"]["approval_mode"],
             "yolo"
         );
         // approval_mode is only under options — not daemon state/version fields.
@@ -6443,7 +6451,7 @@ mod tests {
         };
         let non_run_json = serde_json::to_value(&non_run).unwrap();
         assert!(
-            non_run_json["params"]
+            non_run_json["params"]["ingress"]
                 .get("run_invocation_options")
                 .is_none()
         );
@@ -6569,8 +6577,14 @@ mod tests {
         };
         request.validate_semantics().unwrap();
         let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["params"]["expected_model_state_generation"], 7);
-        assert_eq!(json["params"]["expected_model"]["provider"], "openai");
+        assert_eq!(
+            json["params"]["ingress"]["expected_model_state_generation"],
+            7
+        );
+        assert_eq!(
+            json["params"]["ingress"]["expected_model"]["provider"],
+            "openai"
+        );
 
         let invalid = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(

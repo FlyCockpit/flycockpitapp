@@ -5875,8 +5875,8 @@ mod tests {
     }
 
     #[test]
-    fn send_user_message_serializes_image_refs_not_raw_byte_arrays() {
-        let image_ref = ImageAttachmentRef { id: Uuid::new_v4() };
+    fn send_user_message_v2_serializes_typed_attachment_identity_without_raw_bytes() {
+        let attachment_id = Uuid::now_v7();
         let env = Envelope::request(
             Uuid::new_v4(),
             Request::SendUserMessageV2 {
@@ -5892,17 +5892,24 @@ mod tests {
                         display_text: None,
                         tag_expansions: Vec::new(),
                         forced_skill: None,
-                        attachments: Vec::new(),
+                        attachments: vec![crate::send_user_message_v2::MessageAttachmentIdentity {
+                            attachment_id,
+                            attachment_version: 1,
+                            checksum: [7; 32],
+                            kind: cockpit_db::media_attachments::MediaKind::Image,
+                        }],
                     },
                 ),
             },
         );
         let json = serde_json::to_value(&env).unwrap();
         let params = &json["params"];
-        assert!(params.get("images").is_none());
-        assert!(params["image_refs"].is_array());
+        assert!(params.get("image_refs").is_none());
+        let attachments = &params["ingress"]["request"]["attachments"];
+        assert!(attachments.is_array());
+        assert_eq!(attachments[0]["attachment_id"], attachment_id.to_string());
         assert!(
-            !serde_json::to_string(&params["image_refs"])
+            !serde_json::to_string(attachments)
                 .unwrap()
                 .contains("[1,2,3]")
         );

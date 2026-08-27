@@ -24,7 +24,7 @@ use cockpit_client::bulk_upload::{
     BulkUserMessageUploadError, INLINE_USER_MESSAGE_TEXT_BYTES, stage_opaque_user_text,
     user_message_needs_bulk,
 };
-use cockpit_client::image_upload::{ImageUploadError, upload_submission_images};
+use cockpit_client::image_upload::ImageUploadError;
 use cockpit_client::presentation::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
@@ -2569,21 +2569,18 @@ async fn try_spawn_inner(
                             })
                             .await
                     } else {
-                        let refs = upload_submission_images(&client, &sub.images)
-                            .await
-                            .map_err(classify_image_upload_error)?;
-                        // TODO(#69): convert uploaded `refs` (`ImageAttachmentRef`)
-                        // into typed `MessageAttachmentIdentity` records via the
-                        // typed-upload pipeline (Begin/FinalizeMediaUpload) and
-                        // send them as `ingress.request.attachments`. Until that
-                        // reshape lands, attachments are not yet carried over V2.
-                        let _ = refs;
+                        if !sub.images.is_empty() {
+                            return Err(UserSubmissionSendError::Rejected(
+                                "image attachments are unavailable until the typed-media V2 upload path is wired"
+                                    .into(),
+                            ));
+                        }
                         client
                             .request(Request::SendUserMessageV2 {
                                 ingress:
                                     cockpit_proto::send_user_message_v2::MessageIngressV2::local_direct(
                                         uuid::Uuid::now_v7(),
-                                        "local-owner",
+                                        session_id.to_string(),
                                         sub.expected_model_state_generation,
                                         sub.expected_model,
                                         None,
@@ -5197,7 +5194,7 @@ mod tests {
     #[tokio::test]
     async fn queue_ack_retains_exact_submission_until_durable_receipt_and_reconnect_retries_it() {
         let session_id = Uuid::new_v4();
-        let client_submission_id = Uuid::new_v4();
+        let client_submission_id = Uuid::now_v7();
         let attachment_epoch = Arc::new(AtomicU64::new(4));
         let (_submission_session_tx, submission_session_rx) =
             watch::channel(SubmissionSessionBinding::new(session_id, 0));

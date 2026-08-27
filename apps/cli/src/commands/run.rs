@@ -581,7 +581,7 @@ pub(crate) async fn attach_send_pump(
     let was_processing = is_processing(client, session_id).await?;
     let submitted_message = !prompt.trim().is_empty();
     // Sole invocation identity: allocated once before first SendUserMessage.
-    let client_submission_id = Uuid::new_v4();
+    let client_submission_id = Uuid::now_v7();
     if submitted_message {
         let use_bulk = cockpit_client::bulk_upload::user_message_needs_bulk(&prompt, None);
         if use_bulk && !options.image_data.is_empty() {
@@ -615,15 +615,16 @@ pub(crate) async fn attach_send_pump(
                 })
                 .await
         } else {
-            let image_refs = load_and_upload_images(client, options.image_data).await?;
-            // TODO(#69): convert `image_refs` into typed `MessageAttachmentIdentity`
-            // records via the typed-upload pipeline and send as V2 attachments.
-            let _ = image_refs;
+            if !options.image_data.is_empty() {
+                bail!(
+                    "image attachments are unavailable until the typed-media V2 upload path is wired"
+                );
+            }
             client
                 .request(Request::SendUserMessageV2 {
                     ingress: MessageIngressV2::local_direct(
                         Uuid::now_v7(),
-                        "session",
+                        session_id.to_string(),
                         None,
                         None,
                         options.run_invocation_options.clone(),
@@ -796,30 +797,6 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
         .into());
     }
     Ok(images)
-}
-
-async fn load_and_upload_images(
-    client: &ScopedDaemonClient<'_>,
-    images: &[Vec<u8>],
-) -> Result<Vec<proto::ImageAttachmentRef>> {
-    let typed = images
-        .iter()
-        .cloned()
-        .map(cockpit_client::image_upload::SubmissionImage::png)
-        .collect::<Vec<_>>();
-    match cockpit_client::image_upload::upload_submission_images(client, &typed).await {
-        Ok(refs) => Ok(refs),
-        Err(error) => Err(map_image_upload_error(error)),
-    }
-}
-
-fn map_image_upload_error(error: cockpit_client::image_upload::ImageUploadError) -> anyhow::Error {
-    match error {
-        cockpit_client::image_upload::ImageUploadError::Usage(message) => {
-            RunUsageError(message).into()
-        }
-        error => error.into(),
-    }
 }
 
 fn exit_run_error(format: OutputFormat, exit_code: i32, code: &str, message: &str) -> ! {
@@ -2164,9 +2141,12 @@ mod tests {
         };
         let json = serde_json::to_value(&send).unwrap();
         assert_eq!(json["request"], "send_user_message");
-        assert_eq!(json["params"]["client_submission_id"], id.to_string());
         assert_eq!(
-            json["params"]["run_invocation_options"]["approval_mode"],
+            json["params"]["ingress"]["request"]["client_submission_id"],
+            id.to_string()
+        );
+        assert_eq!(
+            json["params"]["ingress"]["run_invocation_options"]["approval_mode"],
             "yolo"
         );
         // Sole identity: no parallel invocation_id; no daemon-owned state fields.

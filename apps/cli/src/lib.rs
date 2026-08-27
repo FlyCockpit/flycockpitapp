@@ -303,7 +303,7 @@ pub mod integration {
                             None,
                             None,
                             crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
-                                client_submission_id: Uuid::new_v4(),
+                                client_submission_id: Uuid::now_v7(),
                                 text: text.into(),
                                 display_text,
                                 tag_expansions: tag_expansions

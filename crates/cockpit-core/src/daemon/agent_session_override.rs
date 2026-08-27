@@ -198,19 +198,23 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
         question,
         model: cockpit_proto::AgentModelControlV1 {
             effective: ctx.effective.as_ref().and_then(|o| {
-                o.model.as_ref().map(|binding| cockpit_proto::AgentModelRefV1 {
-                    provider_id: binding.provider.clone(),
-                    model_id: binding.model.clone(),
-                    is_default: false,
-                })
+                o.model
+                    .as_ref()
+                    .map(|binding| cockpit_proto::AgentModelRefV1 {
+                        provider_id: binding.provider.clone(),
+                        model_id: binding.model.clone(),
+                        is_default: false,
+                    })
             }),
             allowed: Vec::new(),
             pending: ctx.pending.as_ref().and_then(|o| {
-                o.model.as_ref().map(|binding| cockpit_proto::AgentModelRefV1 {
-                    provider_id: binding.provider.clone(),
-                    model_id: binding.model.clone(),
-                    is_default: false,
-                })
+                o.model
+                    .as_ref()
+                    .map(|binding| cockpit_proto::AgentModelRefV1 {
+                        provider_id: binding.provider.clone(),
+                        model_id: binding.model.clone(),
+                        is_default: false,
+                    })
             }),
             locked_reason: terminal_lock,
         },
@@ -244,7 +248,11 @@ pub fn resolve_node_model_override(
     if slot.unavailable_reason.is_some() {
         return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
     }
-    let Some(choice) = slot.choices.iter().find(|choice| choice.choice_id == choice_id) else {
+    let Some(choice) = slot
+        .choices
+        .iter()
+        .find(|choice| choice.choice_id == choice_id)
+    else {
         return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
     };
     let Some(provider) =

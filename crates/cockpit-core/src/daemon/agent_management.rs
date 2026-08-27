@@ -2697,8 +2697,8 @@ fn source_snapshot_parts(
 ) -> Result<(AgentSourceLayer, String, String, bool), ErrorPayload> {
     let project_override = project_agent_path(root, name)?;
     let write_target = project_agent_write_path(root, name)?;
-    let target_exists = nofollow_read(&project_override)?.is_some()
-        || nofollow_read(&write_target)?.is_some();
+    let target_exists =
+        nofollow_read(&project_override)?.is_some() || nofollow_read(&write_target)?.is_some();
     match crate::agents::find_override(root, name) {
         Some(source) => {
             let meta = std::fs::symlink_metadata(&source).map_err(internal)?;
@@ -2709,9 +2709,11 @@ fn source_snapshot_parts(
                 let def = crate::agents::resolve(root, name)
                     .map_err(bad_config)?
                     .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?;
-                let markdown = match def.package_files.as_ref().and_then(|files| {
-                    files.get("agent.md").cloned()
-                }) {
+                let markdown = match def
+                    .package_files
+                    .as_ref()
+                    .and_then(|files| files.get("agent.md").cloned())
+                {
                     Some(bytes) => String::from_utf8(bytes)
                         .map_err(|_| bad_request("agent definition is not valid UTF-8"))?,
                     None => def.to_markdown().map_err(bad_config)?,
@@ -3092,7 +3094,9 @@ fn classify_source_layer(root: &Path, source: &Path, target: &Path) -> AgentSour
             return AgentSourceLayer::Workspace;
         }
     } else if source.file_name().and_then(|n| n.to_str()) == Some("agent.md")
-        && source.parent().is_some_and(|parent| parent.parent() == target.parent())
+        && source
+            .parent()
+            .is_some_and(|parent| parent.parent() == target.parent())
     {
         return AgentSourceLayer::Workspace;
     }

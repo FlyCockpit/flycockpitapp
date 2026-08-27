@@ -2127,9 +2127,13 @@ fn configured_agent_dirs_extend_across_config_layers() {
     fs::write(first.join("config.json"), r#"{"agent_dirs":["agents-a"]}"#).unwrap();
     fs::write(second.join("config.json"), r#"{"agent_dirs":["agents-b"]}"#).unwrap();
 
-    let dirs = crate::config::trust::with_workspace_trust_policy(trusted_policy(tmp.path()), || {
-        configured_agent_dirs_for_paths(&[first.join("config.json"), second.join("config.json")])
-    });
+    let dirs =
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(tmp.path()), || {
+            configured_agent_dirs_for_paths(&[
+                first.join("config.json"),
+                second.join("config.json"),
+            ])
+        });
     assert!(
         dirs.iter().any(|dir| dir.ends_with("agents-a")),
         "earlier layer agent_dirs must be kept: {dirs:?}"

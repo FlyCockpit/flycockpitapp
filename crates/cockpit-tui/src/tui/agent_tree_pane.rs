@@ -1389,17 +1389,17 @@ mod tests {
         pane.apply_model_choices(setup);
         let view = pane.override_view.as_ref().expect("override view open");
         assert!(
-            view.rows
-                .iter()
-                .any(|row| matches!(
-                    &row.field,
-                    Some(AgentSessionOverrideFieldV1::Model { choice_id, .. })
-                        if choice_id == "a-choice"
-                )),
+            view.rows.iter().any(|row| matches!(
+                &row.field,
+                Some(AgentSessionOverrideFieldV1::Model { choice_id, .. })
+                    if choice_id == "a-choice"
+            )),
             "a sibling's unavailable same-named slot must not hide this node's choices"
         );
         assert!(
-            view.rows.iter().all(|row| !row.text.contains("unavailable")),
+            view.rows
+                .iter()
+                .all(|row| !row.text.contains("unavailable")),
             "focused node must not inherit another agent's unavailable reason"
         );
     }

@@ -2593,7 +2593,12 @@ fn snapshot_evidence_matches_current(
     let evidence = snapshot
         .bindings
         .iter()
-        .map(|binding| ((binding.slot_id.as_str(), binding.model_id.as_str()), binding))
+        .map(|binding| {
+            (
+                (binding.slot_id.as_str(), binding.model_id.as_str()),
+                binding,
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
     if evidence.len() != current.len() {
         return false;

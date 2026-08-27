@@ -2785,21 +2785,27 @@ fn vnext_reachable_subagents(
                 resolved.push(parent.name.clone());
             }
             AllowedChild::PortableRef { portable_agent_ref } => {
-                if let Some(private) = parent.private_subagents.get(portable_agent_ref).or_else(
-                    || {
-                        parent.private_subagents.values().find(|child| {
-                            child
-                                .vnext
-                                .as_ref()
-                                .is_some_and(|vnext| vnext.agent_id == *portable_agent_ref)
+                if let Some(private) =
+                    parent
+                        .private_subagents
+                        .get(portable_agent_ref)
+                        .or_else(|| {
+                            parent.private_subagents.values().find(|child| {
+                                child
+                                    .vnext
+                                    .as_ref()
+                                    .is_some_and(|vnext| vnext.agent_id == *portable_agent_ref)
+                            })
                         })
-                    },
-                ) {
+                {
                     if listings.iter().any(|listing| {
                         listing.name == private.name
-                            || listing.def.as_ref().ok().and_then(|def| def.vnext.as_ref()).is_some_and(
-                                |vnext| vnext.agent_id == *portable_agent_ref,
-                            )
+                            || listing
+                                .def
+                                .as_ref()
+                                .ok()
+                                .and_then(|def| def.vnext.as_ref())
+                                .is_some_and(|vnext| vnext.agent_id == *portable_agent_ref)
                     }) {
                         tracing::warn!(
                             parent = %parent.name,
@@ -2908,11 +2914,9 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
             )
         })?;
         if !allowed.is_empty()
-            && !allowed
-                .iter()
-                .any(|(allowed_provider, allowed_model)| {
-                    allowed_provider == provider && allowed_model == model
-                })
+            && !allowed.iter().any(|(allowed_provider, allowed_model)| {
+                allowed_provider == provider && allowed_model == model
+            })
         {
             bail!(
                 "parent-named model `{selector}` is not in the child slot allowed set: {allowed_label}"
@@ -2930,12 +2934,7 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
         if slot.models.is_empty() {
             return Ok(args.model.clone());
         }
-        return build_vnext_slot_model(
-            args,
-            &providers,
-            &default.provider_id,
-            &default.model_id,
-        );
+        return build_vnext_slot_model(args, &providers, &default.provider_id, &default.model_id);
     }
     Ok(args.model.clone())
 }
@@ -2972,7 +2971,9 @@ fn build_vnext_slot_model(
         ),
     }
     .with_context(|| format!("resolving vNext slot model {provider}/{model}"))?;
-    Ok(Arc::new(built.with_shutdown_gate(args.model.shutdown_gate())))
+    Ok(Arc::new(
+        built.with_shutdown_gate(args.model.shutdown_gate()),
+    ))
 }
 
 /// `Build` — the user-facing, **write-capable** primary agent. Owns the chat

@@ -10228,7 +10228,7 @@ mod tests {
             slot_id: "primary".into(),
             choices: Vec::new(),
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
-            default_choice_id: None,
+                default_choice_id: None,
                 recommendation_id: "requires-tools".into(),
                 canonical_upstream_identity: "upstream/tools".into(),
                 author_label: None,

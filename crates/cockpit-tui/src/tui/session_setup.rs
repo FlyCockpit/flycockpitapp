@@ -468,7 +468,7 @@ mod tests {
                 choice("local", "compatible", false, false),
             ],
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
-            default_choice_id: None,
+                default_choice_id: None,
                 recommendation_id: "missing".to_string(),
                 canonical_upstream_identity: "author/missing".to_string(),
                 author_label: None,

@@ -1075,10 +1075,7 @@ impl AgentDef {
     /// Resolve this definition's vNext grant, attaching package-private child
     /// identities so `permits_child` / reachable-subagent lookup prefer them
     /// over a same-named global agent.
-    pub fn resolve_vnext_grant(
-        &self,
-        host: &VnextHostPolicy,
-    ) -> Result<EffectiveVnextGrant> {
+    pub fn resolve_vnext_grant(&self, host: &VnextHostPolicy) -> Result<EffectiveVnextGrant> {
         let vnext = self
             .vnext
             .as_ref()
@@ -1589,32 +1586,32 @@ pub fn load_profile_definition_from_owned_path(
         load_from_dir(parent, dir_name)?
     } else {
         match source {
-        AgentProfileInstallationSource::Builtin => {
-            let name = installation
-                .source_agent_id
-                .strip_prefix("cockpit/")
-                .filter(|name| is_builtin_agent(name))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "builtin installation has an unprotected source agent identity `{}`",
-                        installation.source_agent_id
-                    )
-                })?;
-            load_builtin_override_from_file(owned_path, name)?
-        }
-        AgentProfileInstallationSource::Global
-        | AgentProfileInstallationSource::WorkspacePrivate => {
-            // These records are daemon-local state.  In particular, they
-            // retain the local-installation child-reference contract and may
-            // not be parsed through ordinary workspace discovery.
-            load_daemon_local_named_from_file(owned_path, &installation.source_agent_id)?
-        }
-        AgentProfileInstallationSource::WorkspaceShared => {
-            // The logical parse name is daemon-owned source metadata, not a
-            // user-facing display name.  The vNext identity check below is
-            // the authority boundary.
-            load_workspace_named_from_file(owned_path, &installation.source_agent_id)?
-        }
+            AgentProfileInstallationSource::Builtin => {
+                let name = installation
+                    .source_agent_id
+                    .strip_prefix("cockpit/")
+                    .filter(|name| is_builtin_agent(name))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "builtin installation has an unprotected source agent identity `{}`",
+                            installation.source_agent_id
+                        )
+                    })?;
+                load_builtin_override_from_file(owned_path, name)?
+            }
+            AgentProfileInstallationSource::Global
+            | AgentProfileInstallationSource::WorkspacePrivate => {
+                // These records are daemon-local state.  In particular, they
+                // retain the local-installation child-reference contract and may
+                // not be parsed through ordinary workspace discovery.
+                load_daemon_local_named_from_file(owned_path, &installation.source_agent_id)?
+            }
+            AgentProfileInstallationSource::WorkspaceShared => {
+                // The logical parse name is daemon-owned source metadata, not a
+                // user-facing display name.  The vNext identity check below is
+                // the authority boundary.
+                load_workspace_named_from_file(owned_path, &installation.source_agent_id)?
+            }
         }
     };
     let vnext = definition
@@ -1625,7 +1622,11 @@ pub fn load_profile_definition_from_owned_path(
         vnext.agent_id == installation.source_agent_id
             || installation.source_agent_id
                 == AgentDef::package_child_source_agent_id(
-                    installation.source_agent_id.rsplit_once('/').map(|(parent, _)| parent).unwrap_or(""),
+                    installation
+                        .source_agent_id
+                        .rsplit_once('/')
+                        .map(|(parent, _)| parent)
+                        .unwrap_or(""),
                     &definition.name,
                 )
             || installation
@@ -1709,7 +1710,9 @@ fn load_package(agent_dir: &Path, name: &str) -> Result<AgentDef> {
             let child_def = parse_agent(
                 child_text,
                 child,
-                agent_dir.join(PACKAGE_SUBAGENTS_DIR).join(format!("{child}.md")),
+                agent_dir
+                    .join(PACKAGE_SUBAGENTS_DIR)
+                    .join(format!("{child}.md")),
             )?;
             if child_def.mode == AgentMode::Primary {
                 bail!(
@@ -1717,7 +1720,10 @@ fn load_package(agent_dir: &Path, name: &str) -> Result<AgentDef> {
                 );
             }
             validate_invariants(&child_def)?;
-            if private_subagents.insert(child.to_string(), child_def).is_some() {
+            if private_subagents
+                .insert(child.to_string(), child_def)
+                .is_some()
+            {
                 bail!(
                     "agent package `{name}` ({}) has duplicate private subagent `{child}`",
                     agent_dir.display()
@@ -1765,9 +1771,8 @@ fn collect_package_files_inner(
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
-            anyhow::anyhow!("statting agent package file {}: {e}", path.display())
-        })?;
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| anyhow::anyhow!("statting agent package file {}: {e}", path.display()))?;
         if meta.file_type().is_symlink() {
             bail!(
                 "agent package {} contains a symlink ({})",

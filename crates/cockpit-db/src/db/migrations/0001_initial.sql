@@ -6884,3 +6884,53 @@ CREATE INDEX agent_profile_snapshots_session_root_lookup
 
 CREATE INDEX agent_model_bindings_lookup
     ON agent_model_bindings(installation_id, definition_digest, slot_id, retired_at_unix_ms);
+
+-- ---- message_tool_media_subject_bindings -----------------------------------
+-- Durable, server-private authenticated binding between an accepted message
+-- submission and the media subject authority that admitted its attachments.
+-- The locator is sealed with XChaCha20-Poly1305 using an HKDF-SHA-256 key
+-- derived from the referenced secure-key version. Core owns receipt/seal
+-- encoding; cockpit-db validates byte-shape constraints only and never
+-- depends on cockpit-core crypto types.
+CREATE TABLE message_tool_media_subject_bindings (
+    session_id             TEXT NOT NULL,
+    client_submission_id   BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16),
+    receipt_version        INTEGER NOT NULL CHECK (receipt_version = 1),
+    issuer_kind            INTEGER NOT NULL CHECK (issuer_kind IN (1, 2)),
+    principal_digest       BLOB NOT NULL CHECK (typeof(principal_digest) = 'blob' AND length(principal_digest) = 32),
+    project_digest         BLOB NOT NULL CHECK (typeof(project_digest) = 'blob' AND length(project_digest) = 32),
+    authorization_epoch    INTEGER NOT NULL CHECK (authorization_epoch >= 0),
+    subject_digest         BLOB NOT NULL CHECK (typeof(subject_digest) = 'blob' AND length(subject_digest) = 32),
+    seal_version           INTEGER NOT NULL CHECK (seal_version = 1),
+    key_namespace          TEXT NOT NULL CHECK (key_namespace = 'tool_media_subject_binding'),
+    key_version            INTEGER NOT NULL CHECK (key_version > 0),
+    nonce                  BLOB NOT NULL CHECK (typeof(nonce) = 'blob' AND length(nonce) = 24),
+    ciphertext             BLOB NOT NULL CHECK (typeof(ciphertext) = 'blob' AND length(ciphertext) > 16),
+    secure_key_reference_id TEXT NOT NULL UNIQUE,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (session_id, client_submission_id),
+    UNIQUE (session_id, client_submission_id, subject_digest),
+    FOREIGN KEY (session_id, client_submission_id)
+        REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE ON UPDATE RESTRICT
+);
+CREATE INDEX idx_message_tool_media_subject_bindings_epoch
+    ON message_tool_media_subject_bindings (session_id, authorization_epoch);
+
+-- ---- tool_media_authorization_epochs ---------------------------------------
+-- Per-(issuer, principal, session, project) monotonic epoch incremented on
+-- every authority-affecting control-state change (device revocation, authority
+-- status transition, local membership/read-path change, installation
+-- ownership change). A binding's authorization_epoch must match the current
+-- epoch for the key tuple to remain valid.
+CREATE TABLE tool_media_authorization_epochs (
+    issuer_kind            INTEGER NOT NULL CHECK (issuer_kind IN (1, 2)),
+    principal_digest       BLOB NOT NULL CHECK (typeof(principal_digest) = 'blob' AND length(principal_digest) = 32),
+    session_id             TEXT NOT NULL,
+    project_digest         BLOB NOT NULL CHECK (typeof(project_digest) = 'blob' AND length(project_digest) = 32),
+    epoch                  INTEGER NOT NULL CHECK (epoch >= 0),
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (issuer_kind, principal_digest, session_id, project_digest)
+);
+

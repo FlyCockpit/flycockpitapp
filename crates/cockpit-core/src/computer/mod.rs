@@ -19,6 +19,7 @@ pub mod guidance;
 pub mod host_identity;
 pub mod live_loop;
 pub mod observation;
+pub mod outcome_store;
 pub mod platform;
 pub mod target;
 
@@ -3634,6 +3635,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await

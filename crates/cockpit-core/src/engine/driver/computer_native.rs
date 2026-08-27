@@ -137,6 +137,8 @@ mod tests {
             target_adapter: None,
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-4o".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         ComputerActionCoordinator::open(backend, params)
             .await

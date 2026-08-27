@@ -2092,6 +2092,62 @@ impl OutcomeJournal {
 // ComputerActionCoordinator: one per delegation
 // ---------------------------------------------------------------------------
 
+/// Handoff journal trait for ambiguous physical handoff lifecycle.
+///
+/// Production wraps [`crate::external_journal::ExternalJournal`] with
+/// `OperationBody::ComputerInput` projections (target digest + action_count;
+/// no pixels). Tests inject a no-op implementation.
+///
+/// If the journal is unavailable / critical / dispatch-blocked for a physical
+/// handoff, the coordinator fails closed with zero input (AC15/AC16).
+#[async_trait]
+pub trait HandoffJournal: Send + Sync {
+    /// Prepare the handoff record (before `backend.execute`). Returns a
+    /// ticket on success; an error means fail-closed (zero input).
+    async fn prepare(
+        &self,
+        target_digest: &str,
+        action_count: u32,
+    ) -> Result<HandoffTicket, ComputerError>;
+
+    /// Begin dispatch — the only proof that `backend.execute` may proceed.
+    /// An error means fail-closed (zero input).
+    async fn begin_dispatch(&self, ticket: &HandoffTicket) -> Result<(), ComputerError>;
+
+    /// Record the outcome after `backend.execute` returns.
+    async fn complete(&self, ticket: &HandoffTicket, succeeded: bool);
+}
+
+/// A handoff journal ticket (opaque to the coordinator).
+#[derive(Debug, Clone)]
+pub struct HandoffTicket {
+    pub target_digest: String,
+    pub action_count: u32,
+}
+
+/// A no-op handoff journal for tests and pure-virtual coordinators.
+pub struct NoopHandoffJournal;
+
+#[async_trait]
+impl HandoffJournal for NoopHandoffJournal {
+    async fn prepare(
+        &self,
+        target_digest: &str,
+        action_count: u32,
+    ) -> Result<HandoffTicket, ComputerError> {
+        Ok(HandoffTicket {
+            target_digest: target_digest.to_string(),
+            action_count,
+        })
+    }
+
+    async fn begin_dispatch(&self, _ticket: &HandoffTicket) -> Result<(), ComputerError> {
+        Ok(())
+    }
+
+    async fn complete(&self, _ticket: &HandoffTicket, _succeeded: bool) {}
+}
+
 /// The dispatch state of a coordinated action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchState {
@@ -2184,6 +2240,14 @@ pub struct ComputerActionCoordinator {
     /// capture a frame or it was already taken. Never journaled or
     /// serialized.
     last_live_frame: Option<LiveComputerFrame>,
+    /// Durable outcome store for dedup/replay across restart (AC13/AC14).
+    outcome_store: Option<Arc<dyn super::outcome_store::ComputerOutcomeStore>>,
+    /// Handoff journal for ambiguous physical handoff lifecycle (AC15/AC16).
+    handoff_journal: Option<Arc<dyn HandoffJournal>>,
+    /// Per-item outcomes from the most recent batch dispatch (AC12). One
+    /// `BatchItemOutcome` per canonical backend item, including
+    /// `NotDispatched` tails on early stop.
+    batch_item_outcomes: Vec<BatchItemOutcome>,
 }
 
 impl std::fmt::Debug for ComputerActionCoordinator {
@@ -2215,6 +2279,14 @@ pub struct CoordinatorParams {
     pub provider_id: ProviderId,
     /// The model ID for this delegation (e.g. "claude-3-5-sonnet-20241022").
     pub model_id: ModelId,
+    /// Durable outcome store for dedup/replay across restart. Required for
+    /// physical targets; virtual/test coordinators may inject a memory store
+    /// or leave `None` (AC13/AC14).
+    pub outcome_store: Option<Arc<dyn super::outcome_store::ComputerOutcomeStore>>,
+    /// Handoff journal for ambiguous physical handoff lifecycle (ExternalJournal
+    /// prepare→dispatching→complete). Required for physical targets; virtual/test
+    /// coordinators may inject a no-op journal or leave `None` (AC15/AC16).
+    pub handoff_journal: Option<Arc<dyn HandoffJournal>>,
 }
 
 impl ComputerActionCoordinator {
@@ -2279,6 +2351,18 @@ impl ComputerActionCoordinator {
                         match arbiter.try_acquire(&physical_key, params.delegation_id.clone()) {
                             AcquireResult::Acquired(token) => {
                                 host_lease = Some(token);
+                                // Physical targets require a durable outcome
+                                // store and a handoff journal (AC14/AC16).
+                                // Virtual/test coordinators may inject a
+                                // memory store / no-op journal explicitly.
+                                //
+                                // DEFERRED ENFORCEMENT: requiring these at
+                                // open belongs to the live open-before-
+                                // advertise path. Until then, a physical open
+                                // without them proceeds (no caller regression);
+                                // callers that DO pass them get real durability.
+                                // The dispatch path fails closed at handoff
+                                // time if the journal is missing (AC15/AC16).
                             }
                             AcquireResult::Queued(handle) => {
                                 // SECURITY-CRITICAL fail-closed: production
@@ -2332,8 +2416,26 @@ impl ComputerActionCoordinator {
             host_effect_cancel: tokio_util::sync::CancellationToken::new(),
             verification: VerificationStateMachine::new(),
             last_live_frame: None,
-        })
-    }
+            outcome_store: params.outcome_store,
+            handoff_journal: params.handoff_journal,
+            batch_item_outcomes: Vec::new(),
+        };
+
+        // Rehydrate identity digests + sanitized outcomes for this session +
+        // delegation from the durable outcome store (AC13). This restores
+        // dedup state across restart.
+        if let Some(store) = &coordinator.outcome_store {
+            let entries = store.rehydrate(&coordinator.session_id, &coordinator.delegation_id);
+            for (identity, stored) in entries {
+                coordinator
+                    .journal
+                    .record(&identity.provider_call_id, stored.outcome);
+                coordinator.journal.record_identity(identity, stored.digest);
+            }
+        }
+
+        Ok(coordinator)
+    })
 
     /// The immutable display geometry obtained at open time.
     pub fn geometry(&self) -> &DisplayGeometry {
@@ -2487,8 +2589,107 @@ impl ComputerActionCoordinator {
         self.dispatch_states
             .insert(call_id.to_string(), DispatchState::Dispatching);
 
+        // ExternalJournal prepare→dispatching→complete around the physical
+        // backend.execute handoff (AC15/AC16). For physical targets
+        // (host_lease is Some), the handoff journal is required — fail closed
+        // with zero input if unavailable. Virtual/test targets may omit it.
+        let handoff_ticket = if self.host_lease.is_some() {
+            let journal = match self.handoff_journal.as_ref() {
+                Some(j) => j,
+                None => {
+                    tracing::error!(
+                        "physical computer handoff without an ExternalJournal — \
+                         fail closed with zero input (AC16)"
+                    );
+                    return ExecuteArtifacts {
+                        outcome: CoordinatedOutcome::Denied {
+                            reason: "physical computer handoff requires an external journal"
+                                .to_string(),
+                        },
+                        live_frame: None,
+                    };
+                }
+            };
+            let target_digest = target_evidence_binding_digest(
+                self.backend_kind,
+                self.host_lease.as_ref(),
+                self.virtual_display_uuid(),
+            );
+            match journal.prepare(&target_digest, actions.len() as u32).await {
+                Ok(ticket) => {
+                    // begin_dispatch is the only proof backend.execute may
+                    // proceed. If it fails, fail closed with zero input.
+                    if let Err(err) = journal.begin_dispatch(&ticket).await {
+                        tracing::error!(
+                            error = %err,
+                            "external journal begin_dispatch failed — \
+                             fail closed with zero input (AC15)"
+                        );
+                        return ExecuteArtifacts {
+                            outcome: CoordinatedOutcome::Denied {
+                                reason: "computer handoff journal dispatch refused"
+                                    .to_string(),
+                            },
+                            live_frame: None,
+                        };
+                    }
+                    Some(ticket)
+                }
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "external journal prepare failed — \
+                         fail closed with zero input (AC15)"
+                    );
+                    return ExecuteArtifacts {
+                        outcome: CoordinatedOutcome::Denied {
+                            reason: "computer handoff journal prepare failed".to_string(),
+                        },
+                        live_frame: None,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
         // Execute through the backend.
         let report: ComputerBatchReport = self.backend.execute(actions).await;
+
+        // Build per-item BatchItemOutcome from the report (AC12). One
+        // outcome per canonical backend item, including NotDispatched tails
+        // on early stop. Real batch_index 0..n-1 per canonical backend item.
+        let item_outcomes = match &report.failure {
+            None => (0..actions.len())
+                .map(|_| BatchItemOutcome::BackendCompleted)
+                .collect::<Vec<_>>(),
+            Some(failure) => {
+                let mut outcomes = Vec::with_capacity(actions.len());
+                let stop_index = failure.index.min(actions.len());
+                for _ in 0..stop_index {
+                    outcomes.push(BatchItemOutcome::BackendCompleted);
+                }
+                if stop_index < actions.len() {
+                    outcomes.push(BatchItemOutcome::Failed {
+                        error: failure.error.clone(),
+                    });
+                }
+                // Remaining items are NotDispatched — represented explicitly.
+                for _ in (stop_index + 1)..actions.len() {
+                    outcomes.push(BatchItemOutcome::NotDispatched);
+                }
+                outcomes
+            }
+        };
+        self.batch_item_outcomes = item_outcomes;
+
+        // Complete the handoff journal after backend.execute returns.
+        if let Some(ticket) = &handoff_ticket
+            && let Some(journal) = &self.handoff_journal
+        {
+            let succeeded = report.failure.is_none();
+            journal.complete(ticket, succeeded).await;
+        }
 
         // Record the final dispatch state.
         self.dispatch_states
@@ -3208,7 +3409,11 @@ impl ComputerActionCoordinator {
         let outcome = artifacts.outcome;
         self.last_live_frame = artifacts.live_frame;
         self.journal.record(call_id, outcome.clone());
-        self.journal.record_identity(identity, payload_digest);
+        self.journal.record_identity(identity.clone(), payload_digest.clone());
+        // Persist the terminal outcome to the durable store (AC13).
+        if let Some(store) = &self.outcome_store {
+            store.store(&identity, &outcome, &payload_digest);
+        }
         outcome
     }
 
@@ -3386,7 +3591,11 @@ impl ComputerActionCoordinator {
         let outcome = artifacts.outcome;
         self.last_live_frame = artifacts.live_frame;
         self.journal.record(call_id, outcome.clone());
-        self.journal.record_identity(identity, payload_digest);
+        self.journal.record_identity(identity.clone(), payload_digest.clone());
+        // Persist the terminal outcome to the durable store (AC13).
+        if let Some(store) = &self.outcome_store {
+            store.store(&identity, &outcome, &payload_digest);
+        }
         outcome
     }
 
@@ -3527,7 +3736,11 @@ impl ComputerActionCoordinator {
         let outcome = artifacts.outcome;
         self.last_live_frame = artifacts.live_frame;
         self.journal.record(call_id, outcome.clone());
-        self.journal.record_identity(identity, payload_digest);
+        self.journal.record_identity(identity.clone(), payload_digest.clone());
+        // Persist the terminal outcome to the durable store (AC13).
+        if let Some(store) = &self.outcome_store {
+            store.store(&identity, &outcome, &payload_digest);
+        }
         outcome
     }
 
@@ -3643,6 +3856,14 @@ impl ComputerActionCoordinator {
     /// Never journaled or serialized.
     pub fn take_last_live_frame(&mut self) -> Option<LiveComputerFrame> {
         self.last_live_frame.take()
+    }
+
+    /// Per-item outcomes from the most recent batch dispatch (AC12). One
+    /// `BatchItemOutcome` per canonical backend item, including
+    /// `NotDispatched` tails on early stop. Real `batch_index` 0..n-1
+    /// per canonical backend item.
+    pub fn batch_item_outcomes(&self) -> &[BatchItemOutcome] {
+        &self.batch_item_outcomes
     }
 
     /// The session ID this coordinator serves.
@@ -4276,6 +4497,8 @@ mod tests {
             target_adapter: None,
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         }
     }
 
@@ -4310,6 +4533,8 @@ mod tests {
             )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         }
     }
 
@@ -4937,6 +5162,8 @@ mod tests {
             )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator_a =
             ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_a)
@@ -4958,6 +5185,8 @@ mod tests {
             )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let result_b =
             ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_b).await;
@@ -5434,6 +5663,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -5710,6 +5941,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("anthropic".to_string()),
             model_id: ModelId("claude-3-5-sonnet".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -5739,6 +5972,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("anthropic".to_string()),
             model_id: ModelId("claude-3-5-sonnet".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -5767,6 +6002,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("anthropic".to_string()),
             model_id: ModelId("claude-3-5-sonnet".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -5876,6 +6113,8 @@ mod tests {
             ))),
             provider_id: ProviderId(provider.to_string()),
             model_id: ModelId(model.to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         }
     }
 
@@ -5969,6 +6208,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -6008,6 +6249,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -6239,6 +6482,8 @@ mod tests {
             target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(virtual_evidence()))),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -6277,6 +6522,8 @@ mod tests {
             target_adapter: None,
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -6342,6 +6589,8 @@ mod tests {
             )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -6404,6 +6653,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -6666,6 +6917,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -6878,6 +7131,8 @@ mod tests {
             ))),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -6918,6 +7173,8 @@ mod tests {
             target_adapter: None,
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -6953,6 +7210,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -7341,6 +7600,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("anthropic".to_string()),
             model_id: ModelId("claude-3-5-sonnet".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -7579,6 +7840,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -7616,6 +7879,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -7732,6 +7997,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -7780,6 +8047,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await

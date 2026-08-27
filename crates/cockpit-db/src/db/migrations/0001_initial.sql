@@ -6741,13 +6741,20 @@ CREATE TABLE agent_model_bindings (
     -- immutable accepted binding, rather than trusting a caller-provided bit.
     hard_capability_verified      INTEGER NOT NULL CHECK (hard_capability_verified = 1),
     binding_revision              INTEGER NOT NULL CHECK (binding_revision >= 1),
+    -- Exactly one live default per slot is enforced by the partial unique
+    -- index below. Durable identity is (provider_profile_handle, model_id),
+    -- never a positional choice_id.
+    is_default                    INTEGER NOT NULL CHECK (is_default IN (0, 1)),
     retired_at_unix_ms            INTEGER,
     created_at_unix_ms            INTEGER NOT NULL,
-    UNIQUE (installation_id, definition_digest, slot_id, binding_revision)
+    UNIQUE (installation_id, definition_digest, slot_id, model_id, binding_revision)
 );
 CREATE UNIQUE INDEX agent_model_bindings_current_slot
-    ON agent_model_bindings(installation_id, definition_digest, slot_id)
+    ON agent_model_bindings(installation_id, definition_digest, slot_id, model_id)
     WHERE retired_at_unix_ms IS NULL;
+CREATE UNIQUE INDEX agent_model_bindings_current_slot_default
+    ON agent_model_bindings(installation_id, definition_digest, slot_id)
+    WHERE retired_at_unix_ms IS NULL AND is_default = 1;
 
 -- The daemon installation service owns these operation rows.  They are
 -- deliberately separate from `agent_installations`: replay/recovery may

@@ -934,6 +934,20 @@ pub struct ModelSlot {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub suggested_models: Vec<ModelRecommendation>,
+    /// Allowed models for this slot. Empty preserves today's "any compatible
+    /// offering" binding behavior. Exactly one entry is the default (the first
+    /// entry, or an explicit `default: true`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<SlotModelRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SlotModelRef {
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
 }
 
 impl ModelSlot {
@@ -968,7 +982,29 @@ impl ModelSlot {
                 );
             }
         }
+        if !self.models.is_empty() {
+            let mut seen = BTreeSet::new();
+            for model in &self.models {
+                if model.provider_id.trim().is_empty() || model.model_id.trim().is_empty() {
+                    bail!("modelSlots.{slot_id}.models entries require providerId and modelId");
+                }
+                if !seen.insert((model.provider_id.as_str(), model.model_id.as_str())) {
+                    bail!("modelSlots.{slot_id}.models has duplicate (providerId, modelId)");
+                }
+            }
+            if self.models.iter().filter(|model| model.default).count() > 1 {
+                bail!("modelSlots.{slot_id}.models must mark exactly one default");
+            }
+        }
         Ok(())
+    }
+
+    /// The slot default `(provider_id, model_id)` when `models` is non-empty.
+    pub fn default_model(&self) -> Option<&SlotModelRef> {
+        self.models
+            .iter()
+            .find(|model| model.default)
+            .or_else(|| self.models.first())
     }
 }
 
@@ -1972,6 +2008,7 @@ mod tests {
                     locality: ModelLocality::Any,
                     allow_default_fallback: false,
                     suggested_models: vec![],
+                    models: Vec::new(),
                 },
             )]),
             delegation: DelegationPolicy::default(),
@@ -2435,6 +2472,23 @@ mod tests {
         assert_eq!(
             grant.delegation.as_ref().unwrap().default_child.as_deref(),
             Some(SELF_CHILD_REF)
+        );
+    }
+
+    #[test]
+    fn agent_vnext_empty_models_does_not_change_canonical_digest() {
+        let with_empty = valid();
+        let mut with_explicit_empty = valid();
+        with_explicit_empty
+            .model_slots
+            .get_mut("primary")
+            .unwrap()
+            .models = Vec::new();
+        let left = serde_yaml::to_string(&with_empty.model_slots).unwrap();
+        let right = serde_yaml::to_string(&with_explicit_empty.model_slots).unwrap();
+        assert_eq!(
+            left, right,
+            "empty models must skip_serializing for digest stability"
         );
     }
 

@@ -437,12 +437,14 @@ mod tests {
                 },
                 provenance_digest: digest(b"agent-tree-test-provenance"),
                 hard_capability_verified: true,
+                is_default: true,
             }],
         };
         let payload = serde_json::to_vec(&profile).unwrap();
         let binding_map = serde_json::to_vec(&AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                model_id: "test-model".into(),
                 binding_revision: 1,
             }],
         })
@@ -515,6 +517,7 @@ mod tests {
         let binding_map = serde_json::to_vec(&AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "child-utility".into(),
+                model_id: "test-model".into(),
                 binding_revision: 1,
             }],
         })

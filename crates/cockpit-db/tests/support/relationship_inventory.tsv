@@ -511,6 +511,7 @@ local	agent_model_bindings	created_at_unix_ms	non_relationship
 local	agent_model_bindings	definition_digest	local_identity
 local	agent_model_bindings	hard_capability_verified	non_relationship
 local	agent_model_bindings	installation_id	foreign
+local	agent_model_bindings	is_default	non_relationship
 local	agent_model_bindings	model_id	external
 local	agent_model_bindings	provenance_digest	external
 local	agent_model_bindings	provenance_payload	non_relationship

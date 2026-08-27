@@ -68,7 +68,7 @@ pub use vnext::{
     ModelLocality, ModelRecommendation, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded,
     PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, ProhibitedQuestionClass, ProviderAlias,
     QuestionOverride, QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SELF_CHILD_REF,
-    SelectorPredicate, ToolClass,
+    SelectorPredicate, SlotModelRef, ToolClass,
     VerificationAction, VerificationBudget, VerificationDispatch, VerificationEstimate,
     VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
     VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,

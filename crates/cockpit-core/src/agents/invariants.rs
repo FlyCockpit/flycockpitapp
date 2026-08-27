@@ -671,6 +671,7 @@ mod grant_tests {
                     locality: ModelLocality::Any,
                     allow_default_fallback: false,
                     suggested_models: Vec::new(),
+                    models: Vec::new(),
                 },
             )]),
             delegation: DelegationPolicy::default(),

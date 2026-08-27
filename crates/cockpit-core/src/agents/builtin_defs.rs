@@ -289,6 +289,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
                 locality: ModelLocality::Any,
                 allow_default_fallback: true,
                 suggested_models: Vec::new(),
+                models: Vec::new(),
             },
         )]),
         delegation,

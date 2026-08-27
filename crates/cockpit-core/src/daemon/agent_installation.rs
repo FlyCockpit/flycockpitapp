@@ -2910,6 +2910,7 @@ impl AgentInstallationService {
                         provenance_digest: sha256_hex(&payload),
                         provenance_payload: payload,
                         hard_capability_verified: true,
+                        is_default: true,
                     },
                     now,
                 )
@@ -6642,6 +6643,7 @@ pub(crate) mod session_setup_test_support {
                         provenance_digest: sha256_hex(&provenance_payload),
                         provenance_payload,
                         hard_capability_verified: true,
+                        is_default: true,
                     },
                     3,
                 )
@@ -6824,12 +6826,14 @@ pub(crate) mod session_setup_test_support {
                 },
                 provenance_digest: binding.provenance_digest.clone(),
                 hard_capability_verified: true,
+                is_default: true,
             }],
         };
         let canonical_snapshot_payload = serde_json::to_vec(&profile)?;
         let binding_revision_map_payload = serde_json::to_vec(&AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                model_id: "test-model".into(),
                 binding_revision: binding.binding_revision,
             }],
         })?;
@@ -6853,6 +6857,7 @@ pub(crate) mod session_setup_test_support {
                 expected_definition_digest: reviewer_digest,
                 expected_bindings: vec![AgentBindingExpectation {
                     slot_id: "primary".into(),
+                    model_id: "test-model".into(),
                     expected_binding_revision: binding.binding_revision,
                 }],
                 snapshot_schema_version: 1,
@@ -7616,6 +7621,7 @@ mod tests {
             locality: ModelLocality::Any,
             allow_default_fallback: false,
             suggested_models: recommendations,
+            models: Vec::new(),
         }
     }
 
@@ -10409,6 +10415,7 @@ mod tests {
                             provenance_digest: sha256_hex(&provenance_payload),
                             provenance_payload,
                             hard_capability_verified: true,
+                            is_default: true,
                         },
                         2,
                     )

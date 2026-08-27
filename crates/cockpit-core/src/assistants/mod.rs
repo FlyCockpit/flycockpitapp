@@ -304,6 +304,7 @@ pub fn vnext_for_private_assistant(installation_id: Uuid) -> VnextAgentDef {
                 locality: ModelLocality::Any,
                 allow_default_fallback: true,
                 suggested_models: Vec::new(),
+                models: Vec::new(),
             },
         )]),
         delegation: Default::default(),

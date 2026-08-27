@@ -147,6 +147,8 @@ pub struct AgentBindingInput {
     /// database refuses an unverified binding rather than persisting a later
     /// usable-looking invalid record.
     pub hard_capability_verified: bool,
+    /// Exactly one live binding per slot may be the default.
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +165,7 @@ pub struct AgentBindingRow {
     /// capabilities before this binding became selectable.
     pub hard_capability_verified: bool,
     pub binding_revision: u64,
+    pub is_default: bool,
     pub retired_at_unix_ms: Option<i64>,
     pub created_at_unix_ms: i64,
 }
@@ -201,6 +204,7 @@ pub enum RebindAgentOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentBindingExpectation {
     pub slot_id: String,
+    pub model_id: String,
     pub expected_binding_revision: u64,
 }
 
@@ -235,6 +239,8 @@ pub struct RedactedBindingEvidence {
     pub selected_provider_alias: ProviderAlias,
     pub provenance_digest: String,
     pub hard_capability_verified: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
 }
 
 /// A provider/model pair is an identity, not a free-form display alias.  The
@@ -538,6 +544,7 @@ pub struct AgentBindingRevisionMap {
 #[serde(deny_unknown_fields)]
 pub struct AgentBindingRevision {
     pub slot_id: String,
+    pub model_id: String,
     pub binding_revision: u64,
 }
 
@@ -1395,8 +1402,8 @@ pub fn bind_agent_model_conn(
     }
     let id = Uuid::now_v7();
     conn.execute(
-        "INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10)",
-        params![id.to_string(),installation_id.to_string(),definition_digest,binding.slot_id,binding.provider_profile_handle,binding.model_id,binding.provenance_payload,binding.provenance_digest,i64::try_from(next_revision)?,now_unix_ms],
+        "INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11)",
+        params![id.to_string(),installation_id.to_string(),definition_digest,binding.slot_id,binding.provider_profile_handle,binding.model_id,binding.provenance_payload,binding.provenance_digest,i64::try_from(next_revision)?,i64::from(binding.is_default),now_unix_ms],
     ).context("inserting agent model binding")?;
     conn.execute(
         "INSERT INTO agent_binding_receipts(installation_id,definition_digest,slot_id,idempotency_key,request_fingerprint,binding_id,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -1437,23 +1444,35 @@ pub fn rebind_agent_conn(
     for binding in &input.bindings {
         validate_binding(binding)?;
     }
-    let mut slots: HashSet<String> = HashSet::new();
+    let mut keys: HashSet<(String, String)> = HashSet::new();
     ensure!(
         input
             .bindings
             .iter()
-            .all(|binding| slots.insert(binding.slot_id.clone())),
-        "rebind request contains duplicate model slot ids"
+            .all(|binding| keys.insert((binding.slot_id.clone(), binding.model_id.clone()))),
+        "rebind request contains duplicate (slot, model) ids"
     );
     ensure!(
-        slots.contains("primary"),
+        keys.iter().any(|(slot, _)| slot == "primary"),
         "rebind request must provide the primary model slot"
     );
     conn.execute("UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE installation_id=?2 AND retired_at_unix_ms IS NULL", params![input.now_unix_ms,input.installation_id.to_string()]).context("retiring prior agent bindings")?;
+    let mut slot_revisions: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    for binding in &input.bindings {
+        if !slot_revisions.contains_key(&binding.slot_id) {
+            slot_revisions.insert(
+                binding.slot_id.clone(),
+                next_binding_revision(conn, input.installation_id, &binding.slot_id)?,
+            );
+        }
+    }
     for binding in &input.bindings {
         let id = Uuid::now_v7();
-        let revision = next_binding_revision(conn, input.installation_id, &binding.slot_id)?;
-        conn.execute("INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10)",params![id.to_string(),input.installation_id.to_string(),input.new_observed_digest,binding.slot_id,binding.provider_profile_handle,binding.model_id,binding.provenance_payload,binding.provenance_digest,i64::try_from(revision)?,input.now_unix_ms]).context("inserting rebound agent model slot")?;
+        let revision = *slot_revisions
+            .get(&binding.slot_id)
+            .expect("slot revision assigned");
+        conn.execute("INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11)",params![id.to_string(),input.installation_id.to_string(),input.new_observed_digest,binding.slot_id,binding.provider_profile_handle,binding.model_id,binding.provenance_payload,binding.provenance_digest,i64::try_from(revision)?,i64::from(binding.is_default),input.now_unix_ms]).context("inserting rebound agent model slot")?;
     }
     conn.execute("UPDATE installation_observations SET observed_digest=?2,observation_revision=observation_revision+1,review_state='reviewed',observed_at_unix_ms=?3 WHERE installation_id=?1",params![input.installation_id.to_string(),input.new_observed_digest,input.now_unix_ms]).context("promoting rebound agent observation")?;
     Ok(RebindAgentOutcome::Rebound(
@@ -2066,7 +2085,7 @@ fn current_binding(
     definition_digest: &str,
     slot_id: &str,
 ) -> Result<Option<AgentBindingRow>> {
-    conn.query_row("SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND slot_id=?3 AND retired_at_unix_ms IS NULL",params![installation_id.to_string(),definition_digest,slot_id],decode_binding).optional().context("looking up current agent model binding")
+    conn.query_row("SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND slot_id=?3 AND retired_at_unix_ms IS NULL AND is_default=1",params![installation_id.to_string(),definition_digest,slot_id],decode_binding).optional().context("looking up current agent model binding")
 }
 
 /// Public reads fail closed when the installation is tombstoned or its source
@@ -2100,7 +2119,7 @@ fn current_bindings_for_digest(
 ) -> Result<Vec<AgentBindingRow>> {
     let mut statement = conn
         .prepare(
-            "SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND retired_at_unix_ms IS NULL ORDER BY slot_id ASC",
+            "SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND retired_at_unix_ms IS NULL ORDER BY slot_id ASC",
         )
         .context("preparing current agent binding set lookup")?;
     statement
@@ -2144,9 +2163,12 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
             "effective delegation targets must be sorted and unique"
         );
     }
-    let mut slots: HashSet<String> = HashSet::new();
+    let mut keys: HashSet<(String, String)> = HashSet::new();
+    let mut defaults: HashSet<String> = HashSet::new();
     ensure!(
         value.bindings.iter().all(|binding| {
+            let distinct = keys.insert((binding.slot_id.clone(), binding.model_id.clone()));
+            let default_ok = !binding.is_default || defaults.insert(binding.slot_id.clone());
             !binding.slot_id.is_empty()
                 && !binding.provider_profile_handle.is_empty()
                 && !binding.model_id.is_empty()
@@ -2154,9 +2176,10 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
                 && !binding.selected_provider_alias.model_id.is_empty()
                 && binding.selected_provider_alias.model_id == binding.model_id
                 && binding.hard_capability_verified
-                && slots.insert(binding.slot_id.clone())
+                && distinct
+                && default_ok
         }),
-        "snapshot binding evidence must have distinct hard-compatible non-secret slots"
+        "snapshot binding evidence must have distinct hard-compatible (slot, model) rows and exactly one default per live slot"
     );
     validate_question_policy(&value.question_policy, &value.bindings)?;
     ensure!(
@@ -2497,17 +2520,18 @@ fn decode_canonical_binding_revision_map(
         canonical == payload,
         "{label} must use canonical JSON encoding"
     );
-    let mut slots: HashSet<String> = HashSet::new();
+    let mut keys: HashSet<(String, String)> = HashSet::new();
     ensure!(
         value.bindings.iter().all(|binding| {
             !binding.slot_id.is_empty()
+                && !binding.model_id.is_empty()
                 && binding.binding_revision > 0
-                && slots.insert(binding.slot_id.clone())
+                && keys.insert((binding.slot_id.clone(), binding.model_id.clone()))
         }),
-        "binding revision map must contain distinct non-zero slot revisions"
+        "binding revision map must contain distinct non-zero (slot, model) revisions"
     );
     ensure!(
-        slots.contains("primary"),
+        keys.iter().any(|(slot, _)| slot == "primary"),
         "binding revision map must include the primary slot"
     );
     Ok(value)
@@ -2517,34 +2541,49 @@ fn binding_map_matches_expectations(
     map: &AgentBindingRevisionMap,
     expected: &[AgentBindingExpectation],
 ) -> Result<bool> {
-    let mut expected_by_slot = std::collections::BTreeMap::new();
+    let mut expected_by_key = std::collections::BTreeMap::new();
     for item in expected {
-        if expected_by_slot
-            .insert(item.slot_id.as_str(), item.expected_binding_revision)
-            .is_some()
-        {
-            bail!("prepare request contains duplicate expected binding slots");
-        }
+        // Multiple models may share a slot; the conflict key is
+        // (slot_id, model_id), not slot_id alone.
+        expected_by_key.insert(
+            (item.slot_id.as_str(), item.model_id.as_str()),
+            item.expected_binding_revision,
+        );
     }
-    let map_by_slot = map
+    let map_by_key = map
         .bindings
         .iter()
-        .map(|item| (item.slot_id.as_str(), item.binding_revision))
+        .map(|item| {
+            (
+                (item.slot_id.as_str(), item.model_id.as_str()),
+                item.binding_revision,
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
-    Ok(map_by_slot == expected_by_slot)
+    Ok(map_by_key == expected_by_key)
 }
 
 fn binding_map_matches_current(map: &AgentBindingRevisionMap, current: &[AgentBindingRow]) -> bool {
-    let current_by_slot = current
+    let current_by_key = current
         .iter()
-        .map(|binding| (binding.slot_id.as_str(), binding.binding_revision))
+        .map(|binding| {
+            (
+                (binding.slot_id.as_str(), binding.model_id.as_str()),
+                binding.binding_revision,
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let map_by_slot = map
+    let map_by_key = map
         .bindings
         .iter()
-        .map(|binding| (binding.slot_id.as_str(), binding.binding_revision))
+        .map(|binding| {
+            (
+                (binding.slot_id.as_str(), binding.model_id.as_str()),
+                binding.binding_revision,
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
-    map_by_slot == current_by_slot
+    map_by_key == current_by_key
 }
 
 fn snapshot_evidence_matches_current(
@@ -2554,14 +2593,14 @@ fn snapshot_evidence_matches_current(
     let evidence = snapshot
         .bindings
         .iter()
-        .map(|binding| (binding.slot_id.as_str(), binding))
+        .map(|binding| ((binding.slot_id.as_str(), binding.model_id.as_str()), binding))
         .collect::<std::collections::BTreeMap<_, _>>();
     if evidence.len() != current.len() {
         return false;
     }
     current.iter().all(|binding| {
         evidence
-            .get(binding.slot_id.as_str())
+            .get(&(binding.slot_id.as_str(), binding.model_id.as_str()))
             .is_some_and(|actual| {
                 actual.binding_revision == binding.binding_revision
                     && actual.provider_profile_handle == binding.provider_profile_handle
@@ -2569,6 +2608,7 @@ fn snapshot_evidence_matches_current(
                     && actual.provenance_digest == binding.provenance_digest
                     && actual.hard_capability_verified
                     && binding.hard_capability_verified
+                    && actual.is_default == binding.is_default
             })
     })
 }
@@ -2589,7 +2629,7 @@ fn next_binding_revision(conn: &Connection, installation_id: Uuid, slot_id: &str
     }
 }
 fn binding_by_id(conn: &Connection, id: Uuid) -> Result<Option<AgentBindingRow>> {
-    conn.query_row("SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE binding_id=?1",[id.to_string()],decode_binding).optional().context("looking up agent model binding")
+    conn.query_row("SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE binding_id=?1",[id.to_string()],decode_binding).optional().context("looking up agent model binding")
 }
 fn binding_receipt_by_key(
     conn: &Connection,
@@ -2624,8 +2664,9 @@ fn decode_binding_offset(
         provenance_digest: row.get(offset + 7)?,
         hard_capability_verified: row.get::<_, i64>(offset + 8)? != 0,
         binding_revision: as_u64(row.get(offset + 9)?)?,
-        retired_at_unix_ms: row.get(offset + 10)?,
-        created_at_unix_ms: row.get(offset + 11)?,
+        is_default: row.get::<_, i64>(offset + 10)? != 0,
+        retired_at_unix_ms: row.get(offset + 11)?,
+        created_at_unix_ms: row.get(offset + 12)?,
     })
 }
 fn snapshot_for_session(
@@ -2756,6 +2797,7 @@ mod tests {
             provenance_digest: hex_digest(&payload),
             provenance_payload: payload,
             hard_capability_verified: true,
+            is_default: true,
         }
     }
 
@@ -2894,12 +2936,14 @@ mod tests {
                 selected_provider_alias: alias("model-a"),
                 provenance_digest: hex_digest(b"canonical-provenance:primary:model-a"),
                 hard_capability_verified: true,
+                is_default: true,
             }],
         })
         .unwrap();
         let revision_map = serde_json::to_vec(&AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                model_id: "test-model".into(),
                 binding_revision: 1,
             }],
         })
@@ -2922,6 +2966,7 @@ mod tests {
             expected_definition_digest: definition_digest,
             expected_bindings: vec![AgentBindingExpectation {
                 slot_id: "primary".into(),
+                model_id: "test-model".into(),
                 expected_binding_revision: 1,
             }],
             snapshot_schema_version: 1,
@@ -3388,6 +3433,7 @@ mod tests {
         let map = AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                model_id: "test-model".into(),
                 binding_revision: 2,
             }],
         };
@@ -3442,6 +3488,7 @@ mod tests {
                 selected_provider_alias: alias("model-b"),
                 provenance_digest: hex_digest(b"canonical-provenance:primary:model-b"),
                 hard_capability_verified: true,
+                is_default: true,
             }],
         };
         conflict.canonical_snapshot_payload = serde_json::to_vec(&snapshot).unwrap();
@@ -3670,6 +3717,7 @@ mod tests {
                 selected_provider_alias: alias("model-a"),
                 provenance_digest: hex_digest(b"canonical-provenance:primary:model-a"),
                 hard_capability_verified: true,
+                is_default: true,
             }],
         };
         input.canonical_snapshot_payload = serde_json::to_vec(&profile).unwrap();
@@ -3827,6 +3875,7 @@ mod tests {
             selected_provider_alias: alias("model-b"),
             provenance_digest: hex_digest(b"canonical-provenance:utility:model-b"),
             hard_capability_verified: true,
+            is_default: true,
         });
         profile.recommendations = vec![
             RedactedRecommendation {

@@ -411,6 +411,7 @@ impl ResolvedAgentProfile {
                 .values()
                 .map(|slot| AgentBindingRevision {
                     slot_id: slot.slot_id.clone(),
+                    model_id: slot.choice.binding.model_id.clone(),
                     binding_revision: slot.choice.binding.binding_revision,
                 })
                 .collect(),
@@ -421,6 +422,7 @@ impl ResolvedAgentProfile {
             .values()
             .map(|slot| AgentBindingExpectation {
                 slot_id: slot.slot_id.clone(),
+                model_id: slot.choice.binding.model_id.clone(),
                 expected_binding_revision: slot.choice.binding.binding_revision,
             })
             .collect();
@@ -728,7 +730,7 @@ fn bindings_by_slot(
     installation_id: Uuid,
     definition_digest: &str,
 ) -> Result<BTreeMap<String, AgentBindingRow>> {
-    let mut by_slot = BTreeMap::new();
+    let mut grouped: BTreeMap<String, Vec<AgentBindingRow>> = BTreeMap::new();
     for binding in bindings {
         ensure!(
             binding.installation_id == installation_id,
@@ -742,12 +744,19 @@ fn bindings_by_slot(
             binding.retired_at_unix_ms.is_none(),
             "retired binding cannot select a model slot"
         );
+        grouped
+            .entry(binding.slot_id.clone())
+            .or_default()
+            .push(binding.clone());
+    }
+    let mut by_slot = BTreeMap::new();
+    for (slot_id, rows) in grouped {
+        let defaults: Vec<_> = rows.iter().filter(|row| row.is_default).collect();
         ensure!(
-            by_slot
-                .insert(binding.slot_id.clone(), binding.clone())
-                .is_none(),
-            "multiple live bindings exist for one slot"
+            defaults.len() == 1,
+            "slot `{slot_id}` must have exactly one default live binding"
         );
+        by_slot.insert(slot_id, defaults[0].clone());
     }
     Ok(by_slot)
 }
@@ -1098,17 +1107,20 @@ fn snapshot_for(
         .collect();
     let bindings = slots
         .values()
-        .map(|slot| RedactedBindingEvidence {
-            slot_id: slot.slot_id.clone(),
-            binding_revision: slot.choice.binding.binding_revision,
-            provider_profile_handle: slot.choice.offering.provider_profile_handle.clone(),
-            model_id: slot.choice.offering.model_id.clone(),
-            selected_provider_alias: SnapshotProviderAlias {
-                provider_id: slot.choice.offering.provider_id.clone(),
+        .flat_map(|slot| {
+            std::iter::once(RedactedBindingEvidence {
+                slot_id: slot.slot_id.clone(),
+                binding_revision: slot.choice.binding.binding_revision,
+                provider_profile_handle: slot.choice.offering.provider_profile_handle.clone(),
                 model_id: slot.choice.offering.model_id.clone(),
-            },
-            provenance_digest: slot.choice.binding.provenance_digest.clone(),
-            hard_capability_verified: true,
+                selected_provider_alias: SnapshotProviderAlias {
+                    provider_id: slot.choice.offering.provider_id.clone(),
+                    model_id: slot.choice.offering.model_id.clone(),
+                },
+                provenance_digest: slot.choice.binding.provenance_digest.clone(),
+                hard_capability_verified: true,
+                is_default: slot.choice.binding.is_default,
+            })
         })
         .collect();
     Ok(RedactedAgentProfileSnapshot {
@@ -1635,6 +1647,7 @@ mod tests {
             provenance_payload: Vec::new(),
             provenance_digest: hex_digest(b"provenance"),
             hard_capability_verified: true,
+            is_default: true,
             binding_revision: 1,
             retired_at_unix_ms: None,
             created_at_unix_ms: 0,
@@ -1660,6 +1673,7 @@ mod tests {
                 .values()
                 .map(|slot| AgentBindingRevision {
                     slot_id: slot.slot_id.clone(),
+                    model_id: slot.choice.binding.model_id.clone(),
                     binding_revision: slot.choice.binding.binding_revision,
                 })
                 .collect(),
@@ -2150,6 +2164,7 @@ mod tests {
             locality: ModelLocality::Local,
             allow_default_fallback: false,
             suggested_models: Vec::new(),
+            models: Vec::new(),
         };
         let caps = EffectiveModelCapabilities {
             context_tokens: Some(64),
@@ -2170,6 +2185,7 @@ mod tests {
             locality: ModelLocality::Any,
             allow_default_fallback: false,
             suggested_models: Vec::new(),
+            models: Vec::new(),
         };
         let mut caps = EffectiveModelCapabilities {
             context_tokens: Some(64),
@@ -2589,6 +2605,7 @@ mod tests {
                     provenance_digest: hex_digest(&provenance_payload),
                     provenance_payload,
                     hard_capability_verified: true,
+                    is_default: true,
                 },
                 11,
             )
@@ -2656,6 +2673,7 @@ mod tests {
             AgentBindingRevisionMap {
                 bindings: vec![AgentBindingRevision {
                     slot_id: "primary".into(),
+                    model_id: "test-model".into(),
                     binding_revision: db_binding.binding_revision,
                 }],
             }
@@ -2714,6 +2732,7 @@ mod tests {
         let forged_revision_map = AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                model_id: "test-model".into(),
                 binding_revision: db_binding.binding_revision + 1,
             }],
         };

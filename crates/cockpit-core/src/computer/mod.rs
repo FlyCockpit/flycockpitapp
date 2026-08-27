@@ -3590,8 +3590,7 @@ mod tests {
         // direct helper `execute_openai_computer_call` does not carry
         // IDs/generations, journal handoff, or `not_dispatched` tails. The
         // new assertions below reject the old direct execution path.
-        use super::host_identity::HostInstallationId;
-        use super::target::{FakeTargetEvidenceAdapter, sample_physical_evidence};
+        use super::target::{FakeTargetEvidenceAdapter, sample_virtual_evidence};
         use coordinator::{
             ActionIdentity, ComputerActionCoordinator, ComputerApprovalTier, CoordinatedOutcome,
             CoordinatorParams, DelegationId, FakeComputerAuthorizer, ModelId, OwnerInstance,
@@ -3601,17 +3600,14 @@ mod tests {
         let backend = FakeBackend::failing_at(1, ComputerError::Refused("blocked".to_string()));
         let authorizer: std::sync::Arc<dyn coordinator::ComputerAuthorizer> =
             std::sync::Arc::new(FakeComputerAuthorizer::always_allow());
-        // Opens with a real focus generation via the target-evidence adapter so
+        // Opens with virtual evidence matching FakeBackend and a real focus
+        // generation so
         // the TypeText actions clear the focus-generation gate; the mid-batch
         // Failed { index: 1 } assertion is asserted against the coordinator
         // path.
-        let adapter = FakeTargetEvidenceAdapter::new(sample_physical_evidence(
-            HostInstallationId([1u8; 32]),
-            [2u8; 32],
-            [3u8; 32],
-            [4u8; 16],
-            1234,
-        ));
+        let mut evidence = sample_virtual_evidence([4u8; 16], 1);
+        evidence.focus_generation = 1;
+        let adapter = FakeTargetEvidenceAdapter::new(evidence);
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),

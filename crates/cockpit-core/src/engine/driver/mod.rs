@@ -1775,22 +1775,65 @@ impl Driver {
     /// native-computer request. Candidate scans leave geometry unset; this is
     /// the only path that turns that metadata into a live capability.
     async fn open_native_computer_for_active_frame(&mut self) {
-        let (candidate, provider_id, model_id) = {
+        // Endpoint recovery is live state. If an OpenAI-compatible model was
+        // confirmed onto Chat Completions after this frame opened, tear down
+        // the Responses-only coordinator and its unsendable continuations at
+        // the next turn boundary.
+        let retained_is_compatible = self.stack.last().is_some_and(|frame| {
+            frame.computer_coordinator.is_some()
+                && frame.computer_contract.is_some_and(|contract| {
+                    frame
+                        .agent
+                        .model
+                        .supports_native_computer_contract(contract)
+                })
+        });
+        if retained_is_compatible {
+            return;
+        }
+        if let Some(frame) = self.stack.last_mut()
+            && frame.computer_coordinator.is_some()
+        {
+            frame.computer_coordinator = None;
+            frame.computer_contract = None;
+            frame.pending_computer_continuations.clear();
+            if let Some(candidate) = Arc::make_mut(&mut frame.agent)
+                .params
+                .native_computer
+                .as_mut()
+            {
+                // Preserve capability metadata so a later config/probe change
+                // back to Responses can reopen. Geometry is live-open state
+                // and must be cleared while no coordinator exists.
+                candidate.geometry = None;
+            }
+            return;
+        }
+
+        let (candidate, provider_id, model_id, contract_supported) = {
             let Some(frame) = self.stack.last() else {
                 return;
             };
-            if frame.computer_coordinator.is_some() {
-                return;
-            }
             let Some(candidate) = frame.agent.params.native_computer.clone() else {
                 return;
             };
             (
-                candidate,
+                candidate.clone(),
                 frame.agent.model.provider_id().to_string(),
                 frame.agent.model.model_id_ref().to_string(),
+                frame
+                    .agent
+                    .model
+                    .supports_native_computer_contract(candidate.contract),
             )
         };
+        if !contract_supported {
+            // Keep the unopened capability candidate: an Auto endpoint can be
+            // corrected to Responses by an ordinary turn, after which this
+            // frame may open safely. Endpoint-scoped request params suppress
+            // the tool while the selected route is Completions.
+            return;
+        }
         let Some(approver) = self.approver.clone() else {
             Arc::make_mut(&mut self.stack.last_mut().expect("stack nonempty").agent)
                 .params

@@ -210,7 +210,17 @@ type CompleteOut = (Option<String>, Vec<AssistantContent>, Option<TokenUsage>);
 
 tokio::task_local! {
     static NATIVE_COMPUTER_ITEMS: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
-    static NATIVE_COMPUTER_CONTINUATIONS: std::sync::Mutex<Option<Vec<serde_json::Value>>>;
+    static NATIVE_COMPUTER_CONTINUATIONS: std::sync::Mutex<NativeComputerContinuationState>;
+}
+
+#[derive(Default)]
+struct NativeComputerContinuationState {
+    pending: Option<Vec<serde_json::Value>>,
+    /// Latched immediately before a request containing the continuation is
+    /// handed to the HTTP transport. It deliberately survives clearing the
+    /// pending batch so every retry/fallback layer can fail terminally on an
+    /// ambiguous send result.
+    dispatched: bool,
 }
 
 pub(crate) async fn with_native_computer_continuations<F: std::future::Future>(
@@ -218,7 +228,13 @@ pub(crate) async fn with_native_computer_continuations<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     NATIVE_COMPUTER_CONTINUATIONS
-        .scope(std::sync::Mutex::new(Some(continuations)), future)
+        .scope(
+            std::sync::Mutex::new(NativeComputerContinuationState {
+                pending: Some(continuations),
+                dispatched: false,
+            }),
+            future,
+        )
         .await
 }
 
@@ -239,7 +255,7 @@ pub(super) fn take_native_computer_continuations(
             let Ok(mut slot) = slot.lock() else {
                 return Vec::new();
             };
-            let compatible = slot.as_ref().is_some_and(|items| {
+            let compatible = slot.pending.as_ref().is_some_and(|items| {
                 !items.is_empty()
                     && items.iter().all(|item| {
                         let item_type = item.get("type").and_then(serde_json::Value::as_str);
@@ -254,7 +270,11 @@ pub(super) fn take_native_computer_continuations(
                     })
             });
             if compatible {
-                slot.take().unwrap_or_default()
+                let items = slot.pending.take().unwrap_or_default();
+                if !items.is_empty() {
+                    slot.dispatched = true;
+                }
+                items
             } else {
                 Vec::new()
             }
@@ -267,9 +287,19 @@ pub(super) fn take_native_computer_continuations(
 pub(crate) fn clear_native_computer_continuations() {
     let _ = NATIVE_COMPUTER_CONTINUATIONS.try_with(|slot| {
         if let Ok(mut slot) = slot.lock() {
-            *slot = None;
+            slot.pending = None;
         }
     });
+}
+
+/// Whether this logical provider turn has handed off a request containing a
+/// native computer continuation. Any later error is terminal because the
+/// provider's acceptance state is unknowable and the input action must never
+/// be followed by a retry/fallback that lacks its matching result.
+pub(crate) fn native_computer_continuation_was_dispatched() -> bool {
+    NATIVE_COMPUTER_CONTINUATIONS
+        .try_with(|slot| slot.lock().is_ok_and(|slot| slot.dispatched))
+        .unwrap_or(false)
 }
 
 pub(crate) async fn capture_native_computer_items<F: std::future::Future>(
@@ -994,6 +1024,29 @@ impl Model {
             }
             Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
             Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+        }
+    }
+
+    /// Whether this model's currently selected provider protocol can carry the
+    /// configured native-computer contract. In particular, OpenAI-compatible
+    /// models support native computer use only on Responses; an endpoint that
+    /// is configured, confirmed, or recovered to Chat Completions must not
+    /// open or retain a coordinator.
+    pub(crate) fn supports_native_computer_contract(
+        &self,
+        contract: crate::computer::ComputerToolContract,
+    ) -> bool {
+        match (self, contract) {
+            (Model::OpenAi { .. }, crate::computer::ComputerToolContract::OpenAiResponses) => {
+                self.current_wire_api() == crate::config::providers::WireApi::Responses
+            }
+            (Model::ChatGpt { .. }, crate::computer::ComputerToolContract::OpenAiResponses) => true,
+            (
+                Model::Anthropic { .. },
+                crate::computer::ComputerToolContract::Anthropic20251124
+                | crate::computer::ComputerToolContract::Anthropic20250124,
+            ) => true,
+            _ => false,
         }
     }
 

@@ -348,10 +348,12 @@ pub async fn turn_with_backup(
             }
 
             // Copy the decision out with no borrow of `result` held.
-            let attempt_rebuild = credentials_rejected_rebuild::should_attempt_credentials_rebuild(
-                credentials_rejected_rebuild::result_is_credentials_rejected(&result),
-                credentials_rebuild_used,
-            );
+            let attempt_rebuild =
+                !crate::engine::model::native_computer_continuation_was_dispatched()
+                    && credentials_rejected_rebuild::should_attempt_credentials_rebuild(
+                        credentials_rejected_rebuild::result_is_credentials_rejected(&result),
+                        credentials_rebuild_used,
+                    );
             if !attempt_rebuild {
                 break result;
             }
@@ -435,7 +437,9 @@ pub async fn turn_with_backup(
                 if let Some(i) = current {
                     tried.push(i);
                 }
-                let next = if crate::engine::model::failure_engages_backup(&class) {
+                let next = if !crate::engine::model::native_computer_continuation_was_dispatched()
+                    && crate::engine::model::failure_engages_backup(&class)
+                {
                     select_next_backup_candidate(
                         &candidate_providers,
                         &tried,

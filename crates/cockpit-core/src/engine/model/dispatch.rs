@@ -749,8 +749,7 @@ impl Model {
                     // these params live for the whole session, so doing this
                     // only on the swap retry would replay stale Responses
                     // controls on a later Chat Completions turn.
-                    let mut attempt_params = params.clone();
-                    attempt_params.additional_params = params.additional_params_for_wire(endpoint);
+                    let attempt_params = params_for_openai_wire(params, endpoint);
                     let attempt = || async {
                         retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // Each transport retry is a distinct display attempt.
@@ -889,6 +888,16 @@ impl Model {
                             break Ok(value);
                         }
                         Err(err) => {
+                            // A native computer continuation reports an input
+                            // operation that has already executed. Once that
+                            // provider-native result has crossed the request
+                            // handoff, an error is ambiguous: the provider may
+                            // have accepted it. Never replay it on the other
+                            // endpoint (which cannot represent Responses
+                            // computer output anyway).
+                            if crate::engine::model::native_computer_continuation_was_dispatched() {
+                                break Err(err);
+                            }
                             // The endpoint-swap fallback fires only when:
                             //   (a) the error is the narrow
                             //       `unsupported_api_for_model` signal (NOT any
@@ -1813,6 +1822,13 @@ fn params_for_openai_wire(
 ) -> ModelParams {
     let mut endpoint_params = params.clone();
     endpoint_params.additional_params = params.additional_params_for_wire(wire_api);
+    // OpenAI native computer calls and their continuations are a Responses
+    // protocol. Chat Completions has no matching input-item representation.
+    // This must be selected for every physical attempt because endpoint
+    // recovery can change the route underneath long-lived ModelParams.
+    if wire_api != crate::config::providers::WireApi::Responses {
+        endpoint_params.native_computer = None;
+    }
     endpoint_params
 }
 

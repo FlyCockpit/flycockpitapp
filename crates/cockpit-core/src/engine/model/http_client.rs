@@ -451,11 +451,13 @@ data: {"type":"content_block_stop","index":2}
             );
             let incompatible = inject_native_computer_continuations(anthropic.clone());
             assert_eq!(incompatible, anthropic);
+            assert!(!crate::engine::model::native_computer_continuation_was_dispatched());
 
             let openai =
                 bytes::Bytes::from_static(br#"{"input":[],"tools":[{"type":"computer"}]}"#);
             let first = inject_native_computer_continuations(openai.clone());
             assert!(String::from_utf8_lossy(&first).contains("call-once"));
+            assert!(crate::engine::model::native_computer_continuation_was_dispatched());
 
             let retry = inject_native_computer_continuations(openai.clone());
             assert_eq!(retry, openai);

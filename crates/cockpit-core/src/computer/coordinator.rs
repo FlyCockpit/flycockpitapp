@@ -413,27 +413,24 @@ impl std::error::Error for HostLockError {}
 /// contend — even inside a single process — which is precisely the harness the
 /// FIFO/contention tests rely on.
 ///
-/// On non-Unix targets there is no `flock`; the lock is the atomic
-/// exclusive **existence** of the lock file (`create_new`), mirroring the
-/// sealed-compartment / host-identity Windows idiom already in the tree. It is
-/// removed when the lock is released. This path is `cfg`-gated and is never
-/// exercised on Unix.
+/// On Windows the persistent lock file is opened with a zero share mode. The
+/// kernel rejects competing opens while the handle is live and closes the
+/// handle automatically on process death, so a crash cannot strand a stale
+/// existence-based lock. Other unsupported non-Unix targets fail closed
+/// instead of simulating a crash-unsafe lock.
 pub struct FileAdvisoryLock {
     /// Directory that holds the per-key lock files.
     root: std::path::PathBuf,
     /// Locks currently held by this instance, keyed by the arbiter key string.
-    /// The value owns the live descriptor (Unix) / lock-file path (non-Unix);
-    /// dropping/removing it releases the OS lock.
+    /// The value owns the live descriptor/handle; dropping it releases the OS
+    /// lock.
     held: HashMap<String, HeldFileLock>,
 }
 
 /// A single held OS lock file. The owned descriptor keeps the `flock` alive on
-/// Unix; the path allows the exclusive-create lock file to be removed on
-/// release on non-Unix targets (where there is no `flock`).
+/// Unix and the zero-share handle alive on Windows.
 struct HeldFileLock {
     _file: std::fs::File,
-    #[cfg(not(unix))]
-    path: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for FileAdvisoryLock {
@@ -570,22 +567,48 @@ fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> 
     Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
-    // Windows/non-Unix: no `flock`. The atomic exclusive create of the lock
-    // file itself is the lock (mirrors the sealed-compartment idiom). The file
-    // is removed on release so the next acquirer can create it.
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // A persistent named file plus share_mode(0) is a kernel-owned exclusive
+    // lease: competing processes cannot open it until this handle closes, and
+    // Windows closes all handles on process death. Unlike create_new/unlink,
+    // the file's continued existence after a crash is harmless and there is no
+    // stale-lock recovery race.
     match std::fs::OpenOptions::new()
-        .create_new(true)
+        .read(true)
         .write(true)
+        .create(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
     {
-        Ok(file) => Ok(file),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+        Ok(file) => {
+            let metadata = file
+                .metadata()
+                .map_err(|error| HostLockError::LockFileIo(error.to_string()))?;
+            if !metadata.file_type().is_file() {
+                return Err(HostLockError::LockFileIo(
+                    "lock path is not a regular file".to_string(),
+                ));
+            }
+            Ok(file)
+        }
+        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION.
+        Err(err) if matches!(err.raw_os_error(), Some(32 | 33)) => {
             Err(HostLockError::ContendedByOtherProcess)
         }
         Err(err) => Err(HostLockError::LockFileIo(err.to_string())),
     }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn os_lock_file(_path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+    Err(HostLockError::LockFileIo(
+        "host input advisory locks are unsupported on this platform".to_string(),
+    ))
 }
 
 impl OsAdvisoryLock for FileAdvisoryLock {
@@ -598,33 +621,16 @@ impl OsAdvisoryLock for FileAdvisoryLock {
         }
         let path = self.lock_path(key);
         let file = os_lock_file(&path)?;
-        self.held.insert(
-            key_str,
-            HeldFileLock {
-                _file: file,
-                #[cfg(not(unix))]
-                path,
-            },
-        );
+        self.held.insert(key_str, HeldFileLock { _file: file });
         Ok(())
     }
 
     fn release(&mut self, key: &PhysicalTargetKey) {
         let key_str = HostInputArbiter::key_string(key);
         if let Some(held) = self.held.remove(&key_str) {
-            // Unix: dropping the descriptor releases the `flock`; the lock file
-            // is intentionally left in place (like the host-identity lock).
-            // Non-Unix: remove the exclusive-create lock file after closing it.
-            #[cfg(not(unix))]
-            {
-                let HeldFileLock { _file, path } = held;
-                drop(_file);
-                let _ = std::fs::remove_file(&path);
-            }
-            #[cfg(unix)]
-            {
-                drop(held);
-            }
+            // Unix: descriptor drop releases flock. Windows: handle drop
+            // releases the zero-share lease. The persistent file is harmless.
+            drop(held);
         }
     }
 
@@ -2578,6 +2584,20 @@ impl ComputerActionCoordinator {
             return Err(CoordinatorOpenError::ZeroGeometry);
         }
 
+        // Rehydrate durable identity ownership before acquiring any physical
+        // host lease. Store corruption/unavailability is independent of the
+        // target and must not create even a transient input-capability owner.
+        // The coordinator's Drop remains the rollback guard for every error
+        // introduced after lease acquisition.
+        let rehydrated_entries = if let Some(store) = &params.outcome_store {
+            store
+                .rehydrate(&params.session_id, &params.delegation_id)
+                .await
+                .map_err(|error| CoordinatorOpenError::OutcomeStore(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+
         let observation_generation = ObservationEpoch(1);
         let mut focus_generation = TargetGeneration(0);
         let mut backend_kind = declared_backend_kind;
@@ -2707,20 +2727,12 @@ impl ComputerActionCoordinator {
             batch_item_outcomes: Vec::new(),
         };
 
-        // Rehydrate identity digests + sanitized outcomes for this session +
-        // delegation from the durable outcome store (AC13). This restores
-        // dedup state across restart.
-        if let Some(store) = &coordinator.outcome_store {
-            let entries = store
-                .rehydrate(&coordinator.session_id, &coordinator.delegation_id)
-                .await
-                .map_err(|error| CoordinatorOpenError::OutcomeStore(error.to_string()))?;
-            for (identity, stored) in entries {
-                coordinator
-                    .journal
-                    .record(&identity.provider_call_id, stored.outcome);
-                coordinator.journal.record_identity(identity, stored.digest);
-            }
+        // Populate the in-memory replay index from the pre-lease snapshot.
+        for (identity, stored) in rehydrated_entries {
+            coordinator
+                .journal
+                .record(&identity.provider_call_id, stored.outcome);
+            coordinator.journal.record_identity(identity, stored.digest);
         }
 
         Ok(coordinator)
@@ -4856,6 +4868,130 @@ mod tests {
         }
     }
 
+    /// Real durable sinks used by physical-coordinator unit fixtures. Keeping
+    /// these in one owned fixture prevents physical tests from bypassing the
+    /// production open contract with memory/no-op shims.
+    struct PhysicalTestSinks {
+        outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore>,
+        handoff_journal: Arc<dyn HandoffJournal>,
+        // Declared last so the live DB/journal handles above close before the
+        // temporary directory attempts removal.
+        _root: tempfile::TempDir,
+    }
+
+    impl PhysicalTestSinks {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("physical test data root");
+            let db = crate::db::Db::open(&root.path().join("computer-outcomes.db"))
+                .expect("open physical test outcome database");
+            let outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
+                Arc::new(super::super::outcome_store::SqliteOutcomeStore::new(
+                    db.clone(),
+                ));
+            let spool = crate::external_journal::spool::Spool::open_at(
+                &root.path().join("external-journal"),
+                crate::external_journal::spool::SpoolAccess::Create,
+            )
+            .expect("open physical test handoff spool");
+            let keys = crate::external_journal::keys::SpoolKeyRing::for_test(&[(1, [0x63; 32])], 1)
+                .expect("physical test handoff key ring");
+            let journal = Arc::new(crate::external_journal::ExternalJournal::new(
+                db, spool, keys,
+            ));
+            let handoff_journal: Arc<dyn HandoffJournal> = Arc::new(ExternalJournalHandoff::new(
+                journal,
+                crate::external_journal::projection::SafeToken::for_session(uuid::Uuid::new_v4()),
+            ));
+            Self {
+                outcome_store,
+                handoff_journal,
+                _root: root,
+            }
+        }
+
+        fn params(
+            &self,
+            authorizer: Arc<dyn ComputerAuthorizer>,
+            tier: ComputerApprovalTier,
+            arbiter: Arc<std::sync::Mutex<HostInputArbiter>>,
+        ) -> CoordinatorParams {
+            CoordinatorParams {
+                session_id: "session-1".to_string(),
+                delegation_id: DelegationId("delegation-1".to_string()),
+                tier,
+                owner_instance: OwnerInstance(1),
+                authorizer,
+                host_arbiter: Some(arbiter),
+                target_adapter: Some(Box::new(
+                    FakeTargetEvidenceAdapter::new(physical_evidence()),
+                )),
+                provider_id: ProviderId("openai".to_string()),
+                model_id: ModelId("gpt-5".to_string()),
+                outcome_store: Some(self.outcome_store.clone()),
+                handoff_journal: Some(self.handoff_journal.clone()),
+            }
+        }
+    }
+
+    struct RehydrateFailingOutcomeStore;
+
+    #[async_trait::async_trait]
+    impl super::super::outcome_store::ComputerOutcomeStore for RehydrateFailingOutcomeStore {
+        fn is_durable(&self) -> bool {
+            true
+        }
+
+        async fn reserve(
+            &self,
+            _identity: &ActionIdentity,
+            _digest: &ActionPayloadDigest,
+            _action_label: &str,
+        ) -> Result<
+            super::super::outcome_store::OutcomeReservation,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture unavailable".to_string(),
+            ))
+        }
+
+        async fn store(
+            &self,
+            _identity: &ActionIdentity,
+            _outcome: &CoordinatedOutcome,
+            _digest: &ActionPayloadDigest,
+        ) -> Result<(), super::super::outcome_store::OutcomeStoreError> {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture unavailable".to_string(),
+            ))
+        }
+
+        async fn lookup(
+            &self,
+            _identity: &ActionIdentity,
+        ) -> Result<
+            Option<super::super::outcome_store::StoredOutcome>,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture unavailable".to_string(),
+            ))
+        }
+
+        async fn rehydrate(
+            &self,
+            _session_id: &str,
+            _delegation_id: &DelegationId,
+        ) -> Result<
+            Vec<(ActionIdentity, super::super::outcome_store::StoredOutcome)>,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture rehydrate failed".to_string(),
+            ))
+        }
+    }
+
     #[test]
     fn canonical_computer_action_binding_hashes_exact_secret_bearing_actions() {
         // Approval records retain this digest rather than raw typed text. It
@@ -4948,12 +5084,9 @@ mod tests {
             .expect("coordinator open")
     }
 
-    /// Like [`make_coordinator_params`] but supplies a real target-evidence
-    /// adapter whose snapshot carries a nonzero focus generation, so a
-    /// coordinator opened with it satisfies the focus-generation gate for
-    /// type/key actions. `host_arbiter` stays `None`, so `open` acquires no
-    /// host lock (physical-open lock enforcement is deferred to the live-loop
-    /// wiring — see the deferral note at `open`).
+    /// Like [`make_coordinator_params`] but supplies matching virtual evidence
+    /// whose snapshot carries a nonzero focus generation, so a coordinator
+    /// opened with the virtual [`FakeBackend`] satisfies the type/key gate.
     fn make_coordinator_params_with_focus(
         authorizer: Arc<dyn ComputerAuthorizer>,
     ) -> CoordinatorParams {
@@ -4964,9 +5097,9 @@ mod tests {
             owner_instance: OwnerInstance(1),
             authorizer,
             host_arbiter: None,
-            target_adapter: Some(Box::new(
-                FakeTargetEvidenceAdapter::new(physical_evidence()),
-            )),
+            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(
+                ask_virtual_evidence(),
+            ))),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
@@ -5511,6 +5644,20 @@ mod tests {
         assert!(lock_b.try_lock(&key).is_ok());
         assert!(lock_b.is_locked(&key));
         lock_b.release(&key);
+
+        // Windows liveness is the zero-share kernel handle, not file
+        // existence. The persistent file remains after orderly release (and
+        // likewise after a crash), yet a fresh instance can immediately take
+        // the lock once the prior handle is closed.
+        #[cfg(windows)]
+        {
+            let path = lock_b.lock_path_for_test(&key);
+            assert!(path.is_file());
+            let mut lock_c = FileAdvisoryLock::with_root(root.clone()).expect("open lock c");
+            assert!(lock_c.try_lock(&key).is_ok());
+            lock_c.release(&key);
+            assert!(path.is_file());
+        }
 
         // A PRE-EXISTING lock file with broad permissions is tightened to
         // 0o600 on acquire (held-fd fchmod + verify) — `.mode(0o600)` only
@@ -6137,25 +6284,16 @@ mod tests {
 
         // Open a coordinator with the arbiter and a physical target adapter;
         // open() acquires the host lease for the target's physical key.
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
         let authorizer: Arc<dyn ComputerAuthorizer> =
             Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         // Simulate OS lock loss by externally releasing the OS-level lock for
         // the coordinator's key while the arbiter still records it as holder.
@@ -6471,24 +6609,16 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("anthropic".to_string()),
-            model_id: ModelId("claude-3-5-sonnet".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
-        let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         // Host lease should be acquired for physical displays.
         assert!(coordinator.host_lease().is_some());
@@ -6501,24 +6631,16 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("anthropic".to_string()),
-            model_id: ModelId("claude-3-5-sonnet".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         assert!(coordinator.host_lease().is_some());
 
@@ -6531,6 +6653,31 @@ mod tests {
             let key = physical_key();
             assert!(!arb.is_held(&key));
         }
+    }
+
+    #[tokio::test]
+    async fn computer_physical_open_store_rehydrate_failure_never_holds_host_lease() {
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(InMemoryOsAdvisoryLock::new()),
+            OwnerInstance(1),
+        )));
+        let sinks = PhysicalTestSinks::new();
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        params.outcome_store = Some(Arc::new(RehydrateFailingOutcomeStore));
+
+        let result = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await;
+
+        assert!(matches!(result, Err(CoordinatorOpenError::OutcomeStore(_))));
+        assert!(
+            !arbiter.lock().unwrap().is_held(&physical_key()),
+            "store rehydrate failure must occur before host lease acquisition"
+        );
     }
 
     #[tokio::test]
@@ -6707,24 +6854,19 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Ask,
-            owner_instance: OwnerInstance(1),
-            authorizer: authorizer.clone(),
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(
+            authorizer.clone(),
+            ComputerApprovalTier::Ask,
+            arbiter.clone(),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         // The host lease is acquired at open time.
         assert!(coordinator.host_lease().is_some());
@@ -6748,24 +6890,19 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Ask,
-            owner_instance: OwnerInstance(1),
-            authorizer: authorizer.clone(),
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(
+            authorizer.clone(),
+            ComputerApprovalTier::Ask,
+            arbiter.clone(),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         // First action — both leases composed.
         let actions = vec![OpenAiComputerAction::Screenshot];
@@ -6880,6 +7017,7 @@ mod tests {
     struct CountingBackend {
         inner: FakeBackend,
         input_actions: Arc<std::sync::atomic::AtomicUsize>,
+        kind: BackendKind,
     }
 
     impl CountingBackend {
@@ -6887,6 +7025,15 @@ mod tests {
             Self {
                 inner: FakeBackend::new(),
                 input_actions,
+                kind: BackendKind::VirtualDisplay,
+            }
+        }
+
+        fn physical(input_actions: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                inner: FakeBackend::new(),
+                input_actions,
+                kind: BackendKind::RealDesktopX11,
             }
         }
     }
@@ -6894,7 +7041,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ComputerBackend for CountingBackend {
         fn backend_kind(&self) -> BackendKind {
-            self.inner.backend_kind()
+            self.kind
         }
         async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
             self.inner.geometry().await
@@ -7090,22 +7237,9 @@ mod tests {
             call_count: call_count.clone(),
         });
         let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let backend = CountingBackend::new(input_actions.clone());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Ask,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(
-                FakeTargetEvidenceAdapter::new(physical_evidence()),
-            )),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
+        let backend = CountingBackend::physical(input_actions.clone());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Ask, arbiter.clone());
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
             .expect("coordinator open");
@@ -7419,24 +7553,16 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Ask,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Ask, arbiter.clone());
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         let actions = vec![OpenAiComputerAction::Screenshot];
         let _ = coordinator.execute_openai_call("call-1", &actions).await;
@@ -7712,24 +7838,16 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_ask());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
-        let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_ask());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         assert!(coordinator.host_lease().is_some());
         assert_eq!(coordinator.ask_lease_store().len(), 0);
@@ -8337,14 +8455,9 @@ mod tests {
 
     #[tokio::test]
     async fn computer_action_type_with_focus_generation_succeeds() {
-        // A coordinator with a target adapter (focus_generation > 0) allows
-        // type actions.
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let os_lock = InMemoryOsAdvisoryLock::new();
-        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
-            Box::new(os_lock),
-            OwnerInstance(1),
-        )));
+        // Matching virtual evidence with focus_generation > 0 allows type
+        // actions without pretending the virtual FakeBackend is physical.
+        let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let authorizer: Arc<dyn ComputerAuthorizer> =
             Arc::new(FakeComputerAuthorizer::always_allow());
         let params = CoordinatorParams {
@@ -8353,7 +8466,7 @@ mod tests {
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
             authorizer,
-            host_arbiter: Some(arbiter),
+            host_arbiter: None,
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
@@ -8380,19 +8493,14 @@ mod tests {
         // CoordinatedOutcome, the sanitized screenshot projection, and the
         // action payload digest.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let os_lock = InMemoryOsAdvisoryLock::new();
-        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
-            Box::new(os_lock),
-            OwnerInstance(1),
-        )));
+        let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
             authorizer,
-            host_arbiter: Some(arbiter),
+            host_arbiter: None,
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
@@ -8498,19 +8606,14 @@ mod tests {
         // Yolo: zero human prompts, zero semantic denials. Even destructive
         // and credential actions are dispatched.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_ask());
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let os_lock = InMemoryOsAdvisoryLock::new();
-        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
-            Box::new(os_lock),
-            OwnerInstance(1),
-        )));
+        let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
             authorizer: authorizer.clone(),
-            host_arbiter: Some(arbiter),
+            host_arbiter: None,
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
@@ -8548,19 +8651,14 @@ mod tests {
         // Ask: one coalesced decision for all action classes. Advisory class
         // never changes dispatch authorization.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let os_lock = InMemoryOsAdvisoryLock::new();
-        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
-            Box::new(os_lock),
-            OwnerInstance(1),
-        )));
+        let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
             tier: ComputerApprovalTier::Ask,
             owner_instance: OwnerInstance(1),
             authorizer: authorizer.clone(),
-            host_arbiter: Some(arbiter),
+            host_arbiter: None,
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),

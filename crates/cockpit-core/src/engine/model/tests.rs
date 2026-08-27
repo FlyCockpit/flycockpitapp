@@ -2024,6 +2024,59 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
 }
 
 #[test]
+fn computer_openai_native_tool_is_responses_endpoint_scoped() {
+    let params = ModelParams {
+        native_computer: Some(crate::computer::NativeComputerToolConfig {
+            contract: crate::computer::ComputerToolContract::OpenAiResponses,
+            geometry: Some(crate::computer::DisplayGeometry {
+                physical: crate::computer::PixelSize {
+                    width: 1280,
+                    height: 720,
+                },
+                logical: crate::computer::LogicalSize {
+                    width: 1280.0,
+                    height: 720.0,
+                },
+                scale_factor: crate::computer::ScaleFactor(1.0),
+            }),
+            approval_required: false,
+        }),
+        ..ModelParams::default()
+    };
+
+    let responses = params_for_openai_wire(&params, WireApi::Responses);
+    assert!(responses.native_computer.is_some());
+    assert_eq!(
+        openai_additional_params(&responses).unwrap()["tools"],
+        json!([{ "type": "computer" }])
+    );
+
+    let completions = params_for_openai_wire(&params, WireApi::Completions);
+    assert!(completions.native_computer.is_none());
+    assert!(
+        openai_additional_params(&completions)
+            .and_then(|value| value.get("tools").cloned())
+            .is_none(),
+        "Chat Completions must never advertise the Responses computer tool"
+    );
+
+    let completions_model =
+        openai_model_at_with_wire("http://localhost:1234/v1", WireApi::Completions, true);
+    assert!(
+        !completions_model.supports_native_computer_contract(
+            crate::computer::ComputerToolContract::OpenAiResponses
+        )
+    );
+    let responses_model =
+        openai_model_at_with_wire("http://localhost:1234/v1", WireApi::Responses, true);
+    assert!(
+        responses_model.supports_native_computer_contract(
+            crate::computer::ComputerToolContract::OpenAiResponses
+        )
+    );
+}
+
+#[test]
 fn assembled_request_task_tool_advertises_intent_envelope() {
     let task = crate::engine::tool::definition_of(
         &crate::tools::task::TaskTool::with_subagents(&["explore", "builder"]),

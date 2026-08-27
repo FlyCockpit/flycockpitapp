@@ -28,18 +28,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use cockpit_db::Db;
-use cockpit_db::db::guidance_proposals::{
-    CreateReceiptError, GuidanceProposalAcceptedScope, GuidanceProposalCounterScope,
-    GuidanceProposalReceiptInsert, GuidanceProposalReceiptState,
-};
-use tracing::warn;
-
 use super::audit::{AuditEventKind, Disposition, GuidanceScope, domain_digest, domains};
 use super::enablement::resolve_guidance_enablement;
 use super::lifecycle::{PendingProposalStore, ProposalId, ProposalScopeKey};
 use super::{
-    ComputerGuidanceRuleV1, EnablementResolution, PROPOSAL_EXPIRY_SECS_MILLIS, validate_proposal,
+    ComputerGuidanceRuleV1, EnablementResolution, PROPOSAL_EXPIRY_SECS_MILLIS, normalize_rationale,
+    validate_proposal,
+};
+use cockpit_db::Db;
+use cockpit_db::db::guidance_proposals::{
+    CreateReceiptError, GuidanceProposalAcceptedScope, GuidanceProposalCounterScope,
+    GuidanceProposalReceiptInsert, GuidanceProposalReceiptState,
 };
 
 // ---------------------------------------------------------------------------
@@ -148,30 +147,38 @@ pub struct GuidanceAuditEvent {
 /// `computer-audit-chain-completion` (pending). Until it lands, the
 /// [`StubGuidanceAuditWriter`] is used.
 pub trait GuidanceAuditWriter: Send + Sync {
+    /// Whether the writer can currently accept an append. Lifecycle methods
+    /// check this before changing durable state; `append` remains authoritative
+    /// because availability can change between the two calls.
+    fn is_available(&self) -> bool {
+        true
+    }
+
     /// Append one guidance-proposal audit event. Returns `Err` when the writer
     /// is unavailable so the orchestrator can fail closed (no silent undurable
     /// proposals).
     fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()>;
 }
 
-/// Placeholder writer used until the real audit-chain writer lands.
+/// Fail-closed writer used until the real audit-chain writer lands.
 ///
 /// TODO(computer-audit-chain-completion): replace with the real tamper-evident
-/// writer and enforce fail-closed at create time. The stub logs and succeeds so
-/// the lifecycle is exercisable in tests and the local TUI before the writer
-/// decision is made; it carries no typed rule values or rationale bytes.
+/// writer. No lifecycle mutation may be presented as audited while the writer
+/// is unavailable.
 #[derive(Debug, Default)]
 pub struct StubGuidanceAuditWriter;
 
 impl GuidanceAuditWriter for StubGuidanceAuditWriter {
+    fn is_available(&self) -> bool {
+        false
+    }
+
     fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
-        warn!(
-            kind = ?event.kind,
-            proposal_id = %hex16(&event.proposal_id),
-            "guidance proposal audit event emitted via stub writer; \
-             real audit-chain writer pending computer-audit-chain-completion"
-        );
-        Ok(())
+        anyhow::bail!(
+            "computer guidance audit writer unavailable for {:?} proposal {}",
+            event.kind,
+            hex16(&event.proposal_id)
+        )
     }
 }
 
@@ -323,6 +330,10 @@ pub enum TransitionProposalError {
     /// No pending proposal exists for this scope.
     #[error("no pending guidance proposal for this scope")]
     NotFound,
+    /// The review arrived at or after the proposal deadline. The service
+    /// expires it durably instead of applying the requested transition.
+    #[error("guidance proposal has expired")]
+    Expired,
     /// The durable CAS did not match (e.g. accept after expiry) — no rule
     /// install (AC: edge cases).
     #[error("guidance proposal CAS conflict: current state is not the expected {expected:?}")]
@@ -408,11 +419,8 @@ impl GuidanceProposalService {
 
     /// Create a pending proposal (the production proposal-create path, AC1/AC4/AC11).
     ///
-    /// The caller resolves the enablement trace up front via
-    /// [`Self::enablement_trace`] (which reads the layered config) and passes
-    /// it in; this keeps the create path pure and hermetic — the enablement
-    /// decision is made before any receipt, and the trace's config generation
-    /// is stamped onto the durable receipt.
+    /// The create path resolves the layered config itself, before any receipt,
+    /// and stamps that resolution's generation onto the durable receipt.
     ///
     /// Ordering:
     /// 1. Enablement gate: hard-deny before any receipt when disabled (AC11).
@@ -428,10 +436,11 @@ impl GuidanceProposalService {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_proposal(
         &mut self,
-        enablement: &GuidanceEnablementTrace,
-        project_identity: &[u8],
+        providers: &crate::config::providers::ProvidersConfig,
+        cwd: &Path,
         provider_id: &str,
         model_id: &str,
+        project_identity: &[u8],
         session_id: [u8; 16],
         delegation_id: [u8; 16],
         proposal_id: [u8; 16],
@@ -439,6 +448,7 @@ impl GuidanceProposalService {
         rationale: Option<String>,
         now_unix_ms: i64,
     ) -> Result<(), CreateProposalError> {
+        let enablement = self.enablement_trace(providers, cwd, provider_id, model_id);
         // 1. Enablement gate (AC11).
         if !enablement.resolution.enabled {
             return Err(CreateProposalError::Disabled);
@@ -447,6 +457,11 @@ impl GuidanceProposalService {
         // 2. Validate the proposal.
         let rule_kind_bits = validate_proposal(&rules)
             .map_err(|e| CreateProposalError::InvalidProposal(e.to_string()))?;
+        let rationale = match rationale {
+            Some(value) => normalize_rationale(&value)
+                .map_err(|e| CreateProposalError::InvalidProposal(e.to_string()))?,
+            None => None,
+        };
 
         let project_d = canonical_project_digest(project_identity);
         let provider_d = provider_digest(provider_id);
@@ -459,6 +474,12 @@ impl GuidanceProposalService {
             model_digest: model_d,
         };
         let pid = ProposalId(proposal_id);
+
+        if !self.audit.is_available() {
+            return Err(CreateProposalError::AuditUnavailable(
+                "computer guidance audit writer is not installed".to_string(),
+            ));
+        }
 
         // 3. Reserve the scope in memory (before durable work).
         self.pending
@@ -512,18 +533,16 @@ impl GuidanceProposalService {
             scope: None,
         };
         if let Err(e) = self.audit.append(&audit_event) {
-            // Fail closed: CAS the receipt to expired + append an expired audit,
-            // then release memory. No silent undurable proposal.
-            let _ = self
-                .cas_and_audit(
-                    &hex16(&proposal_id),
-                    GuidanceProposalReceiptState::Created,
-                    GuidanceProposalReceiptState::Expired,
-                    None,
-                    now_unix_ms,
-                    AuditEventKind::GuidanceProposalExpired,
-                )
-                .await;
+            // Fail closed: remove the unaudited receipt and restore both quota
+            // counters in one transaction. Nothing is installed in memory.
+            self.db
+                .rollback_created_guidance_proposal_receipt(&hex16(&proposal_id))
+                .await
+                .map_err(|rollback| {
+                    CreateProposalError::Storage(format!(
+                        "audit unavailable ({e}); durable rollback failed: {rollback}"
+                    ))
+                })?;
             self.pending.release(&key, pid);
             return Err(CreateProposalError::AuditUnavailable(e.to_string()));
         }
@@ -593,6 +612,11 @@ impl GuidanceProposalService {
         accepted_scope: GuidanceProposalAcceptedScope,
         now_unix_ms: i64,
     ) -> Result<Vec<ComputerGuidanceRuleV1>, TransitionProposalError> {
+        if !self.audit.is_available() {
+            return Err(TransitionProposalError::AuditUnavailable(
+                "computer guidance audit writer is not installed".to_string(),
+            ));
+        }
         let pid = ProposalId(proposal_id);
         // Read the typed values from memory (accept compiles the rules).
         let proposal = self
@@ -600,6 +624,20 @@ impl GuidanceProposalService {
             .get(scope)
             .ok_or(TransitionProposalError::NotFound)?
             .clone();
+        if proposal.proposal_id != pid {
+            return Err(TransitionProposalError::NotFound);
+        }
+        if proposal.is_expired_at(now_unix_ms / 1000) {
+            self.expire_candidate(
+                &super::lifecycle::ProposalCandidate {
+                    key: scope.clone(),
+                    proposal_id: pid,
+                },
+                now_unix_ms,
+            )
+            .await?;
+            return Err(TransitionProposalError::Expired);
+        }
 
         // Durable CAS: created -> accepted.
         let proposal_id_str = hex16(&proposal_id);
@@ -692,10 +730,31 @@ impl GuidanceProposalService {
         proposal_id: [u8; 16],
         now_unix_ms: i64,
     ) -> Result<(), TransitionProposalError> {
+        if !self.audit.is_available() {
+            return Err(TransitionProposalError::AuditUnavailable(
+                "computer guidance audit writer is not installed".to_string(),
+            ));
+        }
         let pid = ProposalId(proposal_id);
-        // Read exists (so the review UI had something to show).
-        if self.pending.get(scope).is_none() {
+        // Bind the caller's proposal capability to the exact pending scope.
+        let proposal = self
+            .pending
+            .get(scope)
+            .ok_or(TransitionProposalError::NotFound)?
+            .clone();
+        if proposal.proposal_id != pid {
             return Err(TransitionProposalError::NotFound);
+        }
+        if proposal.is_expired_at(now_unix_ms / 1000) {
+            self.expire_candidate(
+                &super::lifecycle::ProposalCandidate {
+                    key: scope.clone(),
+                    proposal_id: pid,
+                },
+                now_unix_ms,
+            )
+            .await?;
+            return Err(TransitionProposalError::Expired);
         }
 
         let proposal_id_str = hex16(&proposal_id);
@@ -902,6 +961,11 @@ impl GuidanceProposalService {
         now_unix_ms: i64,
         audit_kind: AuditEventKind,
     ) -> Result<bool, TransitionProposalError> {
+        if !self.audit.is_available() {
+            return Err(TransitionProposalError::AuditUnavailable(
+                "computer guidance audit writer is not installed".to_string(),
+            ));
+        }
         let applied = self
             .db
             .cas_guidance_proposal_receipt_state(
@@ -963,11 +1027,9 @@ impl GuidanceProposalService {
                 _ => None,
             },
         };
-        if let Err(e) = self.audit.append(&event) {
-            // The durable state already advanced; surface the audit failure but
-            // do not revert (a reverted CAS would leave a stale `created`).
-            warn!(error = %e, kind = ?audit_kind, "guidance proposal audit append failed after CAS");
-        }
+        self.audit
+            .append(&event)
+            .map_err(|e| TransitionProposalError::AuditUnavailable(e.to_string()))?;
         Ok(true)
     }
 }
@@ -982,8 +1044,19 @@ mod tests {
     use cockpit_db::Db;
     use std::sync::Mutex;
 
+    struct RecordingAuditWriter;
+
+    impl GuidanceAuditWriter for RecordingAuditWriter {
+        fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     fn fresh_service() -> GuidanceProposalService {
-        GuidanceProposalService::new(Arc::new(Db::open_in_memory().unwrap()))
+        GuidanceProposalService::with_audit_writer(
+            Arc::new(Db::open_in_memory().unwrap()),
+            Arc::new(RecordingAuditWriter),
+        )
     }
 
     fn id16(n: u8) -> [u8; 16] {
@@ -1061,14 +1134,15 @@ mod tests {
     async fn fourth_delegation_create_rejected_with_zero_side_effects() {
         let mut svc = fresh_service();
         for n in 1..=3u8 {
+            let model = format!("m{n}");
             svc.create_proposal(
                 &providers_enabled(),
                 Path::new("/x"),
                 "p",
-                "m",
+                &model,
                 b"project",
                 id16(1),
-                id16(n), // distinct delegations
+                id16(2),
                 id16(n),
                 vec![rule()],
                 None,
@@ -1085,7 +1159,7 @@ mod tests {
                 "m",
                 b"project",
                 id16(1),
-                id16(4),
+                id16(2),
                 id16(10),
                 vec![rule()],
                 None,
@@ -1096,7 +1170,7 @@ mod tests {
         assert!(matches!(err, CreateProposalError::CapExceeded(_)));
         // Zero side effects for the rejected 4th.
         assert_eq!(svc.pending_store().len(), 3);
-        assert_eq!(svc.delegation_counter(&id16(4)).await.unwrap(), 0);
+        assert_eq!(svc.delegation_counter(&id16(2)).await.unwrap(), 3);
     }
 
     #[tokio::test]

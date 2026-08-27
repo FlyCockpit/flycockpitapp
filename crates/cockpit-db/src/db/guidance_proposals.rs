@@ -214,6 +214,20 @@ pub struct GuidanceProposalReceiptInsert<'a> {
     pub expires_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+struct OwnedGuidanceProposalReceiptInsert {
+    proposal_id: String,
+    session_id: String,
+    delegation_id: String,
+    canonical_project_digest: String,
+    provider_digest: String,
+    model_digest: String,
+    config_generation: i64,
+    rule_kind_bits: i64,
+    created_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+}
+
 fn validate_hex64(s: &str, field: &str) -> Result<()> {
     if s.len() != 64
         || !s
@@ -271,7 +285,7 @@ impl Db {
             ));
         }
 
-        let insert = GuidanceProposalReceiptInsert {
+        let insert = OwnedGuidanceProposalReceiptInsert {
             proposal_id: insert.proposal_id.to_string(),
             session_id: insert.session_id.to_string(),
             delegation_id: insert.delegation_id.to_string(),
@@ -372,6 +386,51 @@ impl Db {
             Ok(typed) => typed,
             Err(other) => CreateReceiptError::Storage(other.to_string()),
         })
+    }
+
+    /// Roll back a just-created receipt when the mandatory audit append fails.
+    /// The delete and both counter decrements are one transaction and only
+    /// apply while the receipt is still `created`.
+    pub async fn rollback_created_guidance_proposal_receipt(
+        &self,
+        proposal_id: &str,
+    ) -> Result<bool> {
+        let proposal_id = proposal_id.to_string();
+        self.transaction(move |conn| {
+            let scopes = conn
+                .query_row(
+                    "SELECT session_id, delegation_id
+                     FROM guidance_proposal_receipts
+                     WHERE proposal_id = ?1 AND state = 'created'",
+                    [&proposal_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .context("reading guidance proposal scopes for rollback")?;
+            let Some((session_id, delegation_id)) = scopes else {
+                return Ok(false);
+            };
+            conn.execute(
+                "DELETE FROM guidance_proposal_receipts
+                 WHERE proposal_id = ?1 AND state = 'created'",
+                [&proposal_id],
+            )
+            .context("rolling back unaudited guidance proposal receipt")?;
+            conn.execute(
+                "UPDATE guidance_proposal_counters SET count = count - 1
+                 WHERE scope_kind = 'session' AND scope_id = ?1 AND count > 0",
+                [&session_id],
+            )
+            .context("rolling back guidance session counter")?;
+            conn.execute(
+                "UPDATE guidance_proposal_counters SET count = count - 1
+                 WHERE scope_kind = 'delegation' AND scope_id = ?1 AND count > 0",
+                [&delegation_id],
+            )
+            .context("rolling back guidance delegation counter")?;
+            Ok(true)
+        })
+        .await
     }
 
     /// Compare-and-swap a receipt's state. Returns `Ok(true)` when the

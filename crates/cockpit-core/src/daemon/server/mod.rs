@@ -4257,6 +4257,26 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered)
         .await
         .context("startup recovered effective-default receipt delivery failed")?;
+
+    // Guidance-proposal `expired_on_restart` reconciliation (issue #59, AC6):
+    // every receipt still `created` has unrecoverable memory-only values, so
+    // CAS each to `expired_on_restart` with exactly one expired audit append
+    // and no counter re-increment (creation already counted). The audit
+    // writer is stubbed until computer-audit-chain-completion lands.
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let guidance_svc = crate::computer::guidance::service::GuidanceProposalService::new(
+        std::sync::Arc::new(ctx.db.clone()),
+    );
+    let reconciled_guidance = guidance_svc
+        .reconcile_on_restart(now_unix_ms)
+        .await
+        .context("startup guidance-proposal expired_on_restart reconciliation failed")?;
+    if reconciled_guidance > 0 {
+        tracing::info!(
+            count = reconciled_guidance,
+            "reconciled stale guidance-proposal receipts to expired_on_restart"
+        );
+    }
     Ok(())
 }
 

@@ -261,20 +261,6 @@ struct ResolvedComputerUse {
     requires_approval: bool,
 }
 
-fn default_computer_geometry() -> crate::computer::DisplayGeometry {
-    crate::computer::DisplayGeometry {
-        physical: crate::computer::PixelSize {
-            width: 1024,
-            height: 768,
-        },
-        logical: crate::computer::LogicalSize {
-            width: 1024.0,
-            height: 768.0,
-        },
-        scale_factor: crate::computer::ScaleFactor(1.0),
-    }
-}
-
 fn resolved_computer_use_for_model(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
@@ -292,6 +278,11 @@ fn resolved_computer_use_for_model(
         model.model_id_ref(),
         providers.resolution_generation,
     );
+    // Candidate scan: read config/capability metadata only.  Geometry is
+    // None here — it is filled at the selected-delegation open-before-
+    // advertise step when the coordinator opens against the real backend.
+    // Candidate scans must NOT call ComputerActionCoordinator::open or
+    // acquire the host lock (AC18).
     let native_computer = (tier != crate::config::extended::ComputerUseMode::Disabled
         && caps.supports_image_input())
     .then(|| {
@@ -299,7 +290,7 @@ fn resolved_computer_use_for_model(
             .and_then(|capability| capability.contract)
             .map(|contract| crate::computer::NativeComputerToolConfig {
                 contract: contract.into(),
-                geometry: default_computer_geometry(),
+                geometry: None,
                 approval_required: tier == crate::config::extended::ComputerUseMode::Ask,
             })
     })
@@ -410,7 +401,7 @@ fn computer_subagent_candidate(
                 model.id.clone(),
                 crate::computer::NativeComputerToolConfig {
                     contract: contract.into(),
-                    geometry: default_computer_geometry(),
+                    geometry: None,
                     approval_required: tier == crate::config::extended::ComputerUseMode::Ask,
                 },
             ));

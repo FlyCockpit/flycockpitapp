@@ -53,6 +53,27 @@ pub struct DisplayGeometry {
     pub scale_factor: ScaleFactor,
 }
 
+impl DisplayGeometry {
+    /// Zero geometry — used only as a wire placeholder when the coordinator
+    /// has not yet opened (candidate scan).  Production replaces it with the
+    /// real backend-reported geometry at the open-before-advertise step.
+    /// The coordinator rejects zero geometry with
+    /// [`coordinator::CoordinatorOpenError::ZeroGeometry`].
+    pub fn zero() -> Self {
+        Self {
+            physical: PixelSize {
+                width: 0,
+                height: 0,
+            },
+            logical: LogicalSize {
+                width: 0.0,
+                height: 0.0,
+            },
+            scale_factor: ScaleFactor(1.0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelSize {
     pub width: u32,
@@ -1432,7 +1453,18 @@ pub struct NativeComputerWire {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeComputerToolConfig {
     pub contract: ComputerToolContract,
-    pub geometry: DisplayGeometry,
+    /// Geometry reported by the opened backend at the selected-delegation
+    /// open-before-advertise step. `None` means the coordinator has not yet
+    /// opened (candidate scan) or open failed (tool not advertised).
+    ///
+    /// Candidate/reachability scans construct this config with `geometry:
+    /// None` and must NOT call full [`coordinator::ComputerActionCoordinator::open`]
+    /// or acquire the host lock.  The wire builder falls back to 0×0 for
+    /// `None`, but production must replace `None` with `Some(opened.geometry)`
+    /// before the first model request that would advertise the tool
+    /// (open-before-advertise).  If open fails, `native_computer` stays
+    /// `None` entirely (AC17/AC18/AC19).
+    pub geometry: Option<DisplayGeometry>,
     /// True when the effective `computer_use` tier is `ask`.
     ///
     /// The gating prompt wires this bit so the following approval/redaction
@@ -1443,7 +1475,10 @@ pub struct NativeComputerToolConfig {
 
 impl NativeComputerToolConfig {
     pub fn wire(&self) -> NativeComputerWire {
-        native_computer_wire(self.contract, &self.geometry)
+        match &self.geometry {
+            Some(g) => native_computer_wire(self.contract, g),
+            None => native_computer_wire(self.contract, &DisplayGeometry::zero()),
+        }
     }
 }
 

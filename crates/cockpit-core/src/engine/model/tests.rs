@@ -1914,7 +1914,7 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
     let current = ModelParams {
         native_computer: Some(crate::computer::NativeComputerToolConfig {
             contract: crate::computer::ComputerToolContract::Anthropic20251124,
-            geometry: geometry.clone(),
+            geometry: Some(geometry.clone()),
             approval_required: false,
         }),
         additional_params: Some(
@@ -1952,7 +1952,7 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
     let older = ModelParams {
         native_computer: Some(crate::computer::NativeComputerToolConfig {
             contract: crate::computer::ComputerToolContract::Anthropic20250124,
-            geometry,
+            geometry: Some(geometry),
             approval_required: false,
         }),
         ..ModelParams::default()
@@ -1991,7 +1991,7 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
     let params = ModelParams {
         native_computer: Some(crate::computer::NativeComputerToolConfig {
             contract: crate::computer::ComputerToolContract::OpenAiResponses,
-            geometry: crate::computer::DisplayGeometry {
+            geometry: Some(crate::computer::DisplayGeometry {
                 physical: crate::computer::PixelSize {
                     width: 1280,
                     height: 720,
@@ -2001,7 +2001,7 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
                     height: 360.0,
                 },
                 scale_factor: crate::computer::ScaleFactor(2.0),
-            },
+            }),
             approval_required: false,
         }),
         ..ModelParams::default()

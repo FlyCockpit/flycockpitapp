@@ -180,7 +180,7 @@ fn task_artifact_transition_allowed(from: TaskArtifactState, to: TaskArtifactSta
     TASK_ARTIFACT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 impl TaskArtifactState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Produced => "produced",
             Self::Integrating => "integrating",
@@ -1086,6 +1086,60 @@ impl Db {
         })
         .await
     }
+
+    /// Session-owned artifacts surfaced to the parent. Rows carry only
+    /// redacted receipts; child transcripts are not stored here.
+    pub async fn list_task_artifacts_for_session(
+        &self,
+        session: Uuid,
+    ) -> Result<Vec<TaskArtifactRow>> {
+        self.read(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {ARTIFACT_COLS} FROM task_artifacts
+                 WHERE session_id=?1
+                 ORDER BY created_at_unix_ms, artifact_id"
+            ))?;
+            stmt.query_map(params![session.to_string()], map_artifact)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("listing session task artifacts")
+        })
+        .await
+    }
+
+    pub async fn list_task_artifact_integration_receipts_for_session(
+        &self,
+        session: Uuid,
+    ) -> Result<Vec<TaskArtifactIntegrationReceipt>> {
+        self.read(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT artifact_id,session_id,target_canonical_repository_id,target_canonical_root,target_head_digest,target_ref_digest,target_index_digest,changed_path_manifest_digest,target_write_scope_lease_id,expected_target_generation,expected_target_revision,created_at_unix_ms
+                 FROM task_artifact_integration_receipts
+                 WHERE session_id=?1
+                 ORDER BY created_at_unix_ms, artifact_id",
+            )?;
+            stmt.query_map(params![session.to_string()], map_receipt)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("listing session artifact integration receipts")
+        })
+        .await
+    }
+}
+
+fn map_receipt(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskArtifactIntegrationReceipt> {
+    Ok(TaskArtifactIntegrationReceipt {
+        artifact_id: uuid(row.get(0)?, 0)?,
+        session_id: uuid(row.get(1)?, 1)?,
+        target_canonical_repository_id: row.get(2)?,
+        target_canonical_root: row.get(3)?,
+        target_head_digest: digest(row.get(4)?, 4)?,
+        target_ref_digest: digest(row.get(5)?, 5)?,
+        target_index_digest: digest(row.get(6)?, 6)?,
+        changed_path_manifest_digest: digest(row.get(7)?, 7)?,
+        target_write_scope_lease_id: uuid(row.get(8)?, 8)?,
+        expected_target_generation: row.get::<_, i64>(9)? as u64,
+        expected_target_revision: row.get::<_, i64>(10)? as u64,
+        created_at_unix_ms: row.get(11)?,
+    })
 }
 
 #[cfg(test)]

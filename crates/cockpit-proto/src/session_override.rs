@@ -26,6 +26,12 @@ pub struct AgentEffectiveSettingsV1 {
     pub dto_version: u32,
     pub session_id: String,
     pub agent_instance_id: String,
+    /// Daemon-owned installation this node is bound to. Clients use it only to
+    /// select the matching session-setup candidate; it is never a credential
+    /// or provider-profile handle. Absent when the node has no prepared
+    /// profile snapshot (no slot choices to offer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<String>,
     /// Effective-settings revision for optimistic concurrency. A client echoes
     /// this exact value in [`crate::Request::ApplyAgentSessionOverride`]; a
     /// stale value is rejected without any state change, and each accepted
@@ -260,6 +266,7 @@ mod tests {
             dto_version: AGENT_EFFECTIVE_SETTINGS_DTO_VERSION,
             session_id: "s".to_string(),
             agent_instance_id: "a".to_string(),
+            installation_id: Some("inst-1".to_string()),
             override_revision: 3,
             terminal: false,
             sandbox: AgentSandboxControlV1 {

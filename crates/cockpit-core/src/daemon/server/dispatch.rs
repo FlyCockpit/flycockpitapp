@@ -23038,21 +23038,26 @@ async fn build_node_override_context(
     else {
         return Ok(None);
     };
-    let profile = match state.resolved_profile_snapshot_id {
-        Some(snapshot_id) => ctx
+    let (profile, installation_id) = match state.resolved_profile_snapshot_id {
+        Some(snapshot_id) => match ctx
             .db
             .agent_profile_snapshot_by_id(session_id, snapshot_id)
             .await
             .map_err(internal)?
-            .map(|row| row.reconstruct())
-            .transpose()
-            .map_err(internal)?,
-        None => None,
+        {
+            Some(row) => (
+                Some(row.reconstruct().map_err(internal)?),
+                Some(row.installation_id.to_string()),
+            ),
+            None => (None, None),
+        },
+        None => (None, None),
     };
     Ok(Some(
         crate::daemon::agent_session_override::NodeOverrideContext {
             session_id,
             agent_instance_id,
+            installation_id,
             state: state.state,
             override_revision: state.override_revision,
             pending: state.pending,
@@ -23138,14 +23143,15 @@ async fn get_agent_effective_settings_shared(
     })
 }
 
-/// Resolve a model-slot override against the daemon-owned setup snapshot. The
-/// client names a `(slot_id, choice_id)`; the daemon re-validates the choice is
-/// present and hard-compatible (no `unavailable_reason`) and derives the
-/// provider/model itself — the client never sends a provider handle.
+/// Resolve a model-slot override against the focused node's own installation.
+/// The client names a `(slot_id, choice_id)`; the daemon re-validates the
+/// choice is present and hard-compatible on that node only, and stores the
+/// credential-owning provider handle — the client never sends one.
 async fn resolve_model_override_field(
     ctx: &DaemonContext,
     att: &AttachedSession,
     session_id: Uuid,
+    installation_id: Option<&str>,
     slot_id: &str,
     choice_id: &str,
 ) -> std::result::Result<
@@ -23162,32 +23168,17 @@ async fn resolve_model_override_field(
             cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
         ));
     };
-    for candidate in &snapshot.candidates {
-        for slot in &candidate.slots {
-            if slot.slot_id != slot_id {
-                continue;
-            }
-            if slot.unavailable_reason.is_some() {
-                return Ok(Err(
-                    cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
-                ));
-            }
-            if let Some(choice) = slot.choices.iter().find(|c| c.choice_id == choice_id) {
-                return Ok(Ok(
-                    crate::db::agent_tree_decisions::StoredOverrideField::Model(
-                        crate::db::agent_tree_decisions::StoredModelBinding {
-                            slot_id: slot_id.to_string(),
-                            provider: choice.provider_id.clone(),
-                            model: choice.model_id.clone(),
-                        },
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(Err(
-        cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
-    ))
+    let providers = att.handle.config_snapshot().providers;
+    Ok(
+        crate::daemon::agent_session_override::resolve_node_model_override(
+            &snapshot,
+            installation_id,
+            slot_id,
+            choice_id,
+            &providers,
+        )
+        .map(crate::db::agent_tree_decisions::StoredOverrideField::Model),
+    )
 }
 
 pub(super) async fn apply_agent_session_override(
@@ -23237,7 +23228,15 @@ pub(super) async fn apply_agent_session_override(
     // Authorize the typed field into its storable form.
     let authorized = match &field {
         cockpit_proto::AgentSessionOverrideFieldV1::Model { slot_id, choice_id } => {
-            resolve_model_override_field(ctx, att, session_id, slot_id, choice_id).await?
+            resolve_model_override_field(
+                ctx,
+                att,
+                session_id,
+                node_ctx.installation_id.as_deref(),
+                slot_id,
+                choice_id,
+            )
+            .await?
         }
         other => crate::daemon::agent_session_override::authorize_non_model_field(other, &node_ctx),
     };

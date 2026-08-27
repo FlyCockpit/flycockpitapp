@@ -82,6 +82,10 @@ pub(crate) struct AgentTreePane {
 /// concatenation, rebuilt whenever either arrives.
 struct OverrideView {
     agent_instance_id: Uuid,
+    /// Installation this node is bound to, copied from the effective-settings
+    /// snapshot so model rows come from that node's candidate — never from the
+    /// session's selected candidate.
+    installation_id: Option<String>,
     override_revision: u64,
     terminal: bool,
     title: String,
@@ -173,6 +177,7 @@ impl AgentTreePane {
         let agent_instance_id = Uuid::parse_str(&snapshot.agent_instance_id).unwrap_or_default();
         let mut view = OverrideView {
             agent_instance_id,
+            installation_id: snapshot.installation_id.clone(),
             override_revision: snapshot.override_revision,
             terminal: snapshot.terminal,
             title: format!("Overrides — {}", short_id(agent_instance_id)),
@@ -188,19 +193,20 @@ impl AgentTreePane {
 
     /// Populate the model-rebind controls from a session-setup snapshot. The
     /// model choices are daemon-owned and hard-compatibility is re-validated on
-    /// apply, so the selected installation's slot choices are offered directly.
-    /// A no-op unless the per-node override controls are open (the two fetches
-    /// race; the effective-settings fetch creates the view).
+    /// apply. Slots are taken from the focused node's own installation, never
+    /// from the session's selected candidate. A no-op unless the per-node
+    /// override controls are open (the two fetches race; the effective-settings
+    /// fetch creates the view).
     pub(crate) fn apply_model_choices(&mut self, snapshot: SessionSetupSnapshotV1) {
         let Some(view) = self.override_view.as_mut() else {
             return;
         };
-        // Prefer the selected candidate; fall back to the first.
-        let candidate = snapshot
-            .candidates
-            .iter()
-            .find(|candidate| candidate.selected)
-            .or_else(|| snapshot.candidates.first());
+        let candidate = view.installation_id.as_ref().and_then(|installation_id| {
+            snapshot
+                .candidates
+                .iter()
+                .find(|candidate| &candidate.installation.installation_id == installation_id)
+        });
         view.model_rows = candidate
             .map(|candidate| build_model_rows(&candidate.slots, view.terminal))
             .unwrap_or_default();
@@ -999,6 +1005,7 @@ mod tests {
             dto_version: 1,
             session_id: Uuid::from_u128(1).to_string(),
             agent_instance_id: Uuid::from_u128(7).to_string(),
+            installation_id: Some("inst-1".to_string()),
             override_revision: revision,
             terminal,
             sandbox: cockpit_proto::AgentSandboxControlV1 {
@@ -1245,6 +1252,153 @@ mod tests {
                     choice_id: "c1".to_string(),
                 },
             }
+        );
+    }
+
+    fn setup_candidate(
+        installation_id: &str,
+        source_agent_id: &str,
+        selected: bool,
+        slots: Vec<SessionSetupModelSlotV1>,
+    ) -> cockpit_proto::SessionSetupAgentCandidateV1 {
+        cockpit_proto::SessionSetupAgentCandidateV1 {
+            installation: cockpit_proto::AgentInstallationRecordV1 {
+                installation_id: installation_id.to_string(),
+                scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                source_agent_id: source_agent_id.to_string(),
+                source_identity: "identity".to_string(),
+                source_revision: None,
+                source_digest: "digest".to_string(),
+                installation_revision: 1,
+                bindings: Vec::new(),
+            },
+            selected,
+            slots,
+            locked_reason: None,
+        }
+    }
+
+    #[test]
+    fn modes_session_setup_override_model_rows_use_focused_node_installation() {
+        let mut pane = AgentTreePane::loading(false);
+        let mut snapshot =
+            effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.installation_id = Some("inst-child".to_string());
+        pane.apply_effective_settings(snapshot);
+
+        let setup = SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: Uuid::from_u128(1).to_string(),
+            config_generation: 1,
+            revision: 0,
+            selected_installation_id: Some("inst-root".to_string()),
+            candidates: vec![
+                setup_candidate(
+                    "inst-root",
+                    "root-agent",
+                    true,
+                    vec![model_slot(
+                        "primary",
+                        vec![model_choice("root-choice", "anthropic", "opus", true)],
+                        None,
+                    )],
+                ),
+                setup_candidate(
+                    "inst-child",
+                    "child-agent",
+                    false,
+                    vec![model_slot(
+                        "primary",
+                        vec![model_choice("child-choice", "openai", "gpt", false)],
+                        None,
+                    )],
+                ),
+            ],
+        };
+        pane.apply_model_choices(setup);
+
+        let view = pane.override_view.as_ref().expect("override view open");
+        let actions: Vec<&str> = view
+            .rows
+            .iter()
+            .filter_map(|row| match &row.field {
+                Some(AgentSessionOverrideFieldV1::Model { choice_id, .. }) => {
+                    Some(choice_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["child-choice"],
+            "focused node must see only its own installation's slot choices"
+        );
+        assert!(
+            view.rows.iter().any(|row| row.text.contains("openai/gpt")),
+            "focused node slot labels come from its own candidate"
+        );
+        assert!(
+            view.rows
+                .iter()
+                .all(|row| !row.text.contains("anthropic/opus")),
+            "session-selected candidate slots must not leak onto another node"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_override_model_ignores_other_agent_unavailable_slot() {
+        let mut pane = AgentTreePane::loading(false);
+        let mut snapshot =
+            effective_settings(1, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.installation_id = Some("inst-a".to_string());
+        pane.apply_effective_settings(snapshot);
+
+        let setup = SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: Uuid::from_u128(1).to_string(),
+            config_generation: 1,
+            revision: 0,
+            selected_installation_id: Some("inst-b".to_string()),
+            candidates: vec![
+                setup_candidate(
+                    "inst-b",
+                    "agent-b",
+                    true,
+                    vec![model_slot(
+                        "primary",
+                        vec![model_choice("b-choice", "anthropic", "opus", true)],
+                        Some(
+                            cockpit_proto::SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel,
+                        ),
+                    )],
+                ),
+                setup_candidate(
+                    "inst-a",
+                    "agent-a",
+                    false,
+                    vec![model_slot(
+                        "primary",
+                        vec![model_choice("a-choice", "openai", "gpt", false)],
+                        None,
+                    )],
+                ),
+            ],
+        };
+        pane.apply_model_choices(setup);
+        let view = pane.override_view.as_ref().expect("override view open");
+        assert!(
+            view.rows
+                .iter()
+                .any(|row| matches!(
+                    &row.field,
+                    Some(AgentSessionOverrideFieldV1::Model { choice_id, .. })
+                        if choice_id == "a-choice"
+                )),
+            "a sibling's unavailable same-named slot must not hide this node's choices"
+        );
+        assert!(
+            view.rows.iter().all(|row| !row.text.contains("unavailable")),
+            "focused node must not inherit another agent's unavailable reason"
         );
     }
 }

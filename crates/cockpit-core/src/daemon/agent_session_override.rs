@@ -17,15 +17,19 @@
 //!     effective value via an explicit restrictiveness ordering, so an override
 //!     can only make a node stricter, never looser.
 //!
-//! The model axis is validated in the dispatch layer against the session-setup
-//! snapshot (hard-compatibility is daemon-owned there) and is not handled here.
+//! The model axis is resolved against the session-setup snapshot for the
+//! focused node's own installation. Dispatch loads that snapshot; the policy
+//! below scopes the `(slot_id, choice_id)` to that node and maps the wire
+//! display token back to the credential-owning provider handle.
 
+use cockpit_config::config::providers::ProvidersConfig;
 use cockpit_config::config::sandbox_mode::SandboxMode;
 use cockpit_proto::{
     AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
     AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
     AgentSandboxControlV1, AgentSessionOverrideFieldV1, AgentSessionOverrideStatusV1,
     AgentVerificationControlV1, AgentVerificationReductionV1, AgentVerificationRegionV1,
+    SessionSetupSnapshotV1,
 };
 use uuid::Uuid;
 
@@ -34,8 +38,8 @@ use crate::db::agent_installations::{
     VerificationEffectiveAction,
 };
 use crate::db::agent_tree_decisions::{
-    AgentInstanceState, StoredOverrideField, StoredQuestionOverride, StoredSessionOverride,
-    StoredVerificationReduction,
+    AgentInstanceState, StoredModelBinding, StoredOverrideField, StoredQuestionOverride,
+    StoredSessionOverride, StoredVerificationReduction,
 };
 
 /// All loaded facts needed to project effective settings and authorize a
@@ -45,6 +49,11 @@ use crate::db::agent_tree_decisions::{
 pub struct NodeOverrideContext {
     pub session_id: Uuid,
     pub agent_instance_id: Uuid,
+    /// Installation this node is bound to, when a profile snapshot exists.
+    /// Model-slot overrides are validated only against this installation's
+    /// session-setup candidate — never against a sibling or the session's
+    /// selected candidate.
+    pub installation_id: Option<String>,
     pub state: AgentInstanceState,
     pub override_revision: i64,
     pub pending: Option<StoredSessionOverride>,
@@ -181,12 +190,55 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
         dto_version: AGENT_EFFECTIVE_SETTINGS_DTO_VERSION,
         session_id: ctx.session_id.to_string(),
         agent_instance_id: ctx.agent_instance_id.to_string(),
+        installation_id: ctx.installation_id.clone(),
         override_revision: ctx.override_revision.max(0) as u64,
         terminal,
         sandbox,
         verification,
         question,
     }
+}
+
+/// Resolve a model-slot override against the focused node's own installation
+/// candidate. The client names a `(slot_id, choice_id)`; this re-validates the
+/// choice is present and hard-compatible on **that node** only, then stores the
+/// credential-owning provider handle (never the wire display token).
+pub fn resolve_node_model_override(
+    snapshot: &SessionSetupSnapshotV1,
+    installation_id: Option<&str>,
+    slot_id: &str,
+    choice_id: &str,
+    providers: &ProvidersConfig,
+) -> Result<StoredModelBinding, AgentSessionOverrideStatusV1> {
+    let Some(installation_id) = installation_id.filter(|id| !id.is_empty()) else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    let Some(candidate) = snapshot
+        .candidates
+        .iter()
+        .find(|candidate| candidate.installation.installation_id == installation_id)
+    else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    let Some(slot) = candidate.slots.iter().find(|slot| slot.slot_id == slot_id) else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    if slot.unavailable_reason.is_some() {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
+    let Some(choice) = slot.choices.iter().find(|choice| choice.choice_id == choice_id) else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    let Some(provider) =
+        crate::daemon::agent_installation::resolvable_provider_handle_for_choice(providers, choice)
+    else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    Ok(StoredModelBinding {
+        slot_id: slot_id.to_string(),
+        provider,
+        model: choice.model_id.clone(),
+    })
 }
 
 fn verification_region_dto(
@@ -420,6 +472,7 @@ mod tests {
         NodeOverrideContext {
             session_id: Uuid::from_u128(1),
             agent_instance_id: Uuid::from_u128(2),
+            installation_id: None,
             state: AgentInstanceState::Running,
             override_revision: 0,
             pending: None,
@@ -796,5 +849,284 @@ mod tests {
         // A region already turned off is not enabled and offers no reduction.
         let off = regions.iter().find(|r| r.region_id == "rule-off").unwrap();
         assert!(!off.enabled && !off.can_disable && !off.can_restrict);
+    }
+
+    fn custom_providers(handle: &str, model: &str) -> ProvidersConfig {
+        use cockpit_config::config::providers::{ModelEntry, ProviderEntry};
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            handle.to_string(),
+            ProviderEntry {
+                template: None,
+                models: vec![ModelEntry {
+                    id: model.to_string(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        providers
+    }
+
+    fn named_providers(entries: &[(&str, Option<&str>, &str)]) -> ProvidersConfig {
+        use cockpit_config::config::providers::{ModelEntry, ProviderEntry};
+        let mut providers = ProvidersConfig::default();
+        for (handle, template, model) in entries {
+            providers.providers.insert(
+                (*handle).to_string(),
+                ProviderEntry {
+                    template: template.map(str::to_string),
+                    models: vec![ModelEntry {
+                        id: (*model).to_string(),
+                        ..ModelEntry::default()
+                    }],
+                    ..ProviderEntry::default()
+                },
+            );
+        }
+        providers
+    }
+
+    fn model_choice(
+        choice_id: &str,
+        slot_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> cockpit_proto::AgentInstallationChoiceV1 {
+        cockpit_proto::AgentInstallationChoiceV1 {
+            choice_id: choice_id.to_string(),
+            slot_id: slot_id.to_string(),
+            offering_id: format!("offering-{choice_id}"),
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            recommendation_id: None,
+            canonical_upstream_identity: None,
+            author_label: None,
+            rationale: None,
+            author_suggested: false,
+            exact_alias_match: false,
+        }
+    }
+
+    fn candidate(
+        installation_id: &str,
+        selected: bool,
+        slots: Vec<cockpit_proto::SessionSetupModelSlotV1>,
+    ) -> cockpit_proto::SessionSetupAgentCandidateV1 {
+        cockpit_proto::SessionSetupAgentCandidateV1 {
+            installation: cockpit_proto::AgentInstallationRecordV1 {
+                installation_id: installation_id.to_string(),
+                scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                source_agent_id: installation_id.to_string(),
+                source_identity: "identity".to_string(),
+                source_revision: None,
+                source_digest: "digest".to_string(),
+                installation_revision: 1,
+                bindings: Vec::new(),
+            },
+            selected,
+            slots,
+            locked_reason: None,
+        }
+    }
+
+    fn slot(
+        slot_id: &str,
+        choices: Vec<cockpit_proto::AgentInstallationChoiceV1>,
+        unavailable: Option<cockpit_proto::SessionSetupUnavailableReasonV1>,
+    ) -> cockpit_proto::SessionSetupModelSlotV1 {
+        cockpit_proto::SessionSetupModelSlotV1 {
+            slot_id: slot_id.to_string(),
+            choices,
+            unmatched_recommendations: Vec::new(),
+            unavailable_reason: unavailable,
+        }
+    }
+
+    fn setup_snapshot(
+        selected: &str,
+        candidates: Vec<cockpit_proto::SessionSetupAgentCandidateV1>,
+    ) -> SessionSetupSnapshotV1 {
+        SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: Uuid::from_u128(1).to_string(),
+            config_generation: 1,
+            revision: 0,
+            selected_installation_id: Some(selected.to_string()),
+            candidates,
+        }
+    }
+
+    #[test]
+    fn model_override_stores_custom_provider_handle_not_display_token() {
+        let providers = custom_providers("profile-secret", "glm");
+        let snapshot = setup_snapshot(
+            "inst-a",
+            vec![candidate(
+                "inst-a",
+                true,
+                vec![slot(
+                    "primary",
+                    vec![model_choice(
+                        "choice-local-offering-0",
+                        "primary",
+                        "configured-provider-0",
+                        "glm",
+                    )],
+                    None,
+                )],
+            )],
+        );
+        let binding = resolve_node_model_override(
+            &snapshot,
+            Some("inst-a"),
+            "primary",
+            "choice-local-offering-0",
+            &providers,
+        )
+        .expect("custom-provider choice must resolve");
+        assert_eq!(binding.provider, "profile-secret");
+        assert_eq!(binding.model, "glm");
+        assert_ne!(
+            binding.provider, "configured-provider-0",
+            "display token must never be persisted as the live provider route"
+        );
+    }
+
+    #[test]
+    fn model_override_is_scoped_to_focused_node_installation() {
+        let providers = named_providers(&[
+            ("anthropic", Some("anthropic"), "opus"),
+            ("openai", Some("openai"), "gpt"),
+        ]);
+        let snapshot = setup_snapshot(
+            "inst-root",
+            vec![
+                candidate(
+                    "inst-root",
+                    true,
+                    vec![slot(
+                        "primary",
+                        vec![model_choice("root-choice", "primary", "anthropic", "opus")],
+                        None,
+                    )],
+                ),
+                candidate(
+                    "inst-child",
+                    false,
+                    vec![slot(
+                        "primary",
+                        vec![model_choice("child-choice", "primary", "openai", "gpt")],
+                        None,
+                    )],
+                ),
+            ],
+        );
+
+        let child = resolve_node_model_override(
+            &snapshot,
+            Some("inst-child"),
+            "primary",
+            "child-choice",
+            &providers,
+        )
+        .expect("child node may pick its own slot choice");
+        assert_eq!(child.provider, "openai");
+        assert_eq!(child.model, "gpt");
+
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                Some("inst-child"),
+                "primary",
+                "root-choice",
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "a parent choice_id must not apply to a child node sharing slot_id primary"
+        );
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                Some("inst-root"),
+                "primary",
+                "child-choice",
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "a child choice_id must not apply to the root node sharing slot_id primary"
+        );
+    }
+
+    #[test]
+    fn model_override_ignores_sibling_unavailable_same_named_slot() {
+        let providers = named_providers(&[("openai", Some("openai"), "gpt")]);
+        let snapshot = setup_snapshot(
+            "inst-b",
+            vec![
+                candidate(
+                    "inst-b",
+                    true,
+                    vec![slot(
+                        "primary",
+                        vec![model_choice("b-choice", "primary", "anthropic", "opus")],
+                        Some(
+                            cockpit_proto::SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel,
+                        ),
+                    )],
+                ),
+                candidate(
+                    "inst-a",
+                    false,
+                    vec![slot(
+                        "primary",
+                        vec![model_choice("a-choice", "primary", "openai", "gpt")],
+                        None,
+                    )],
+                ),
+            ],
+        );
+        let binding = resolve_node_model_override(
+            &snapshot,
+            Some("inst-a"),
+            "primary",
+            "a-choice",
+            &providers,
+        )
+        .expect("sibling unavailable same-named slot must not reject this node's choice");
+        assert_eq!(binding.provider, "openai");
+        assert_eq!(binding.model, "gpt");
+    }
+
+    #[test]
+    fn model_override_without_installation_link_is_incompatible() {
+        let providers = custom_providers("profile-secret", "glm");
+        let snapshot = setup_snapshot(
+            "inst-a",
+            vec![candidate(
+                "inst-a",
+                true,
+                vec![slot(
+                    "primary",
+                    vec![model_choice(
+                        "choice-local-offering-0",
+                        "primary",
+                        "configured-provider-0",
+                        "glm",
+                    )],
+                    None,
+                )],
+            )],
+        );
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                None,
+                "primary",
+                "choice-local-offering-0",
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible)
+        );
     }
 }

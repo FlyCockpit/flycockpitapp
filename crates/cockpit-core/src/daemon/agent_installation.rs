@@ -6243,6 +6243,36 @@ fn wire_provider_id(
     }
 }
 
+/// Map a session-setup / installation wire choice back to the config-map key
+/// `Model::for_provider` can look up. The wire `provider_id` is a display
+/// token for custom providers (`configured-provider-{index}`) and must never
+/// be persisted as the live route.
+pub(crate) fn resolvable_provider_handle_for_choice(
+    providers: &ProvidersConfig,
+    choice: &AgentInstallationChoiceV1,
+) -> Option<String> {
+    let offerings = setup_offerings(providers);
+    let mut handles = std::collections::BTreeSet::new();
+    for (index, offering) in offerings.iter().enumerate() {
+        let wire_id = wire_provider_id(offering, index);
+        if offering.model_id == choice.model_id
+            && (wire_id == choice.provider_id
+                || offering.provider_id == choice.provider_id
+                || offering.provider_profile_handle == choice.provider_id)
+        {
+            handles.insert(offering.provider_profile_handle.clone());
+        }
+    }
+    if providers.providers.contains_key(&choice.provider_id) {
+        handles.insert(choice.provider_id.clone());
+    }
+    if handles.len() == 1 {
+        handles.into_iter().next()
+    } else {
+        None
+    }
+}
+
 /// `--yes` is deliberately narrower than normal interactive ranking. A
 /// locally available model is never an implicit default unless it preserves
 /// both an author suggestion and its exact declared alias.
@@ -10957,6 +10987,39 @@ mod tests {
         assert!(!wire.contains("profile-secret"));
         let routes = durable_binding_routes(&offerings, &choices).expect("durable route");
         assert_eq!(routes[0].provider_profile_handle, "profile-secret");
+    }
+
+    #[test]
+    fn agent_installation_resolvable_handle_maps_custom_display_token() {
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "profile-secret".into(),
+            ProviderEntry {
+                template: None,
+                models: vec![ModelEntry {
+                    id: "glm".into(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let choice = AgentInstallationChoiceV1 {
+            choice_id: "choice-local-offering-0".into(),
+            slot_id: "primary".into(),
+            offering_id: "offering-0".into(),
+            provider_id: "configured-provider-0".into(),
+            model_id: "glm".into(),
+            recommendation_id: None,
+            canonical_upstream_identity: None,
+            author_label: None,
+            rationale: None,
+            author_suggested: false,
+            exact_alias_match: false,
+        };
+        assert_eq!(
+            resolvable_provider_handle_for_choice(&providers, &choice).as_deref(),
+            Some("profile-secret")
+        );
     }
 
     /// This target is intentionally exercised by `cargo test --release` in

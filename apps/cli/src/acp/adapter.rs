@@ -220,6 +220,15 @@ where
             }
             Err(err) => {
                 write_diagnostic(&mut stderr, &err);
+                if matches!(
+                    err,
+                    AcpFrameError::Io(_)
+                        | AcpFrameError::ContentLengthFraming
+                        | AcpFrameError::CarriageReturnFraming
+                ) {
+                    adapter.disconnect();
+                    return Err(io::Error::other(err));
+                }
                 if let Some(response) = match &err {
                     AcpFrameError::InvalidUtf8
                     | AcpFrameError::IncompleteEof { .. }

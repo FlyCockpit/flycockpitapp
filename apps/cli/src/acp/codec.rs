@@ -23,6 +23,8 @@ pub enum AcpFrameError {
     IncompleteEof { json_bytes: usize },
     EmbeddedLineBreak,
     ContentLengthFraming,
+    CarriageReturnFraming,
+    NonJsonObject,
     BatchArray,
     Empty,
     Io(String),
@@ -43,6 +45,10 @@ impl std::fmt::Display for AcpFrameError {
             }
             Self::EmbeddedLineBreak => f.write_str("ACP frame contains an embedded physical LF"),
             Self::ContentLengthFraming => f.write_str("ACP frame uses Content-Length/LSP framing"),
+            Self::CarriageReturnFraming => {
+                f.write_str("ACP frame uses forbidden carriage-return framing")
+            }
+            Self::NonJsonObject => f.write_str("ACP frame is not a JSON object"),
             Self::BatchArray => f.write_str("ACP v1 does not accept JSON-RPC batch arrays"),
             Self::Empty => f.write_str("ACP frame is empty"),
             Self::Io(message) => write!(f, "ACP stdio I/O error: {message}"),
@@ -131,20 +137,6 @@ impl<R: io::Read> AcpLineReader<R> {
         };
         let mut line: Vec<u8> = self.pending.drain(..=newline_at).collect();
         line.pop();
-        if line.last() == Some(&b'\r') {
-            counters.frames_rejected += 1;
-            return Err(AcpFrameError::EmbeddedLineBreak);
-        }
-        if line.contains(&b'\n') {
-            counters.frames_rejected += 1;
-            return Err(AcpFrameError::EmbeddedLineBreak);
-        }
-        if line.len() > ACP_JSON_FRAME_MAX_BYTES_V1 {
-            counters.frames_rejected += 1;
-            return Err(AcpFrameError::OverLimit {
-                json_bytes: line.len(),
-            });
-        }
         let json = match String::from_utf8(line) {
             Ok(json) => json,
             Err(_) => {
@@ -152,6 +144,24 @@ impl<R: io::Read> AcpLineReader<R> {
                 return Err(AcpFrameError::InvalidUtf8);
             }
         };
+        if looks_like_content_length(&json) {
+            counters.frames_rejected += 1;
+            return Err(AcpFrameError::ContentLengthFraming);
+        }
+        if json.contains('\r') {
+            counters.frames_rejected += 1;
+            return Err(AcpFrameError::CarriageReturnFraming);
+        }
+        if json.contains('\n') {
+            counters.frames_rejected += 1;
+            return Err(AcpFrameError::EmbeddedLineBreak);
+        }
+        if json.len() > ACP_JSON_FRAME_MAX_BYTES_V1 {
+            counters.frames_rejected += 1;
+            return Err(AcpFrameError::OverLimit {
+                json_bytes: json.len(),
+            });
+        }
         reject_non_acp_object(&json, counters)?;
         Ok(Some(AcpFrame { json }))
     }
@@ -313,14 +323,14 @@ pub fn reject_non_acp_object(
         counters.frames_rejected += 1;
         return Err(AcpFrameError::ContentLengthFraming);
     }
-    let trimmed = json.trim_start_matches([' ', '\t', '\r']);
+    let trimmed = json.trim_start_matches([' ', '\t']);
     if trimmed.starts_with('[') {
         counters.frames_rejected += 1;
         return Err(AcpFrameError::BatchArray);
     }
     if !trimmed.starts_with('{') {
         counters.frames_rejected += 1;
-        return Err(AcpFrameError::ContentLengthFraming);
+        return Err(AcpFrameError::NonJsonObject);
     }
     Ok(())
 }
@@ -387,20 +397,16 @@ mod tests {
     }
 
     #[test]
-    fn acp_transport_codec_cr_is_not_a_delimiter() {
-        let mut reader =
-            AcpLineReader::new(Cursor::new(b"{\"jsonrpc\":\"2.0\"}\r{\"id\":1}\n".to_vec()));
-        let mut counters = AcpTransportCounters::default();
-        let frame = reader.read_frame(&mut counters).unwrap().unwrap();
-        assert!(frame.json.contains('\r'));
-        assert!(frame.json.contains("{\"id\":1}"));
+    fn acp_transport_codec_rejects_carriage_return_framing() {
+        let err = read_one(b"{\"jsonrpc\":\"2.0\"}\r{\"id\":1}\n").unwrap_err();
+        assert!(matches!(err, AcpFrameError::CarriageReturnFraming));
     }
 
     #[test]
     fn acp_transport_codec_rejects_crlf() {
         let err =
             read_one(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\r\n").unwrap_err();
-        assert!(matches!(err, AcpFrameError::EmbeddedLineBreak));
+        assert!(matches!(err, AcpFrameError::CarriageReturnFraming));
     }
 
     #[test]
@@ -458,6 +464,21 @@ mod tests {
             WriteOutcome::Complete
         );
         assert_eq!(sink, format!("{json}\n").into_bytes());
+    }
+
+    #[test]
+    fn acp_transport_codec_writer_accepts_exact_max_before_appending_lf() {
+        let json = make_object_of_size(ACP_JSON_FRAME_MAX_BYTES_V1);
+        let mut sink = Vec::new();
+        let mut writer = AcpLineWriter::new(&mut sink);
+        let mut counters = AcpTransportCounters::default();
+        assert_eq!(
+            writer.write_json_value(&json, &mut counters).unwrap(),
+            WriteOutcome::Complete
+        );
+        assert_eq!(sink.len(), ACP_JSON_FRAME_MAX_BYTES_V1 + 1);
+        assert_eq!(&sink[..ACP_JSON_FRAME_MAX_BYTES_V1], json.as_bytes());
+        assert_eq!(sink[ACP_JSON_FRAME_MAX_BYTES_V1], b'\n');
     }
 
     #[test]

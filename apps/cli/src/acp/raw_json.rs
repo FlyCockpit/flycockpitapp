@@ -119,7 +119,9 @@ struct Parser<'a> {
     input: &'a str,
     pos: usize,
     root_id: Option<JsonRpcId>,
+    root_id_seen: bool,
     root_id_ambiguous: bool,
+    first_duplicate: Option<RawJsonErrorKind>,
 }
 
 pub fn parse_frame(input: &str) -> Result<ParsedFrame, RawJsonError> {
@@ -127,13 +129,18 @@ pub fn parse_frame(input: &str) -> Result<ParsedFrame, RawJsonError> {
         input,
         pos: 0,
         root_id: None,
+        root_id_seen: false,
         root_id_ambiguous: false,
+        first_duplicate: None,
     };
     parser.skip_ws();
     let root = parser.parse_value("", 0)?;
     parser.skip_ws();
     if parser.pos != parser.input.len() {
         return Err(parser.fail(RawJsonErrorKind::TrailingJunk));
+    }
+    if let Some(kind) = parser.first_duplicate {
+        return Err(parser.fail(kind));
     }
     let unambiguous_request_id = if parser.root_id_ambiguous {
         None
@@ -414,19 +421,15 @@ impl<'a> Parser<'a> {
             if self.bump() != Some(':') {
                 return Err(self.fail(RawJsonErrorKind::Syntax("expected colon")));
             }
-            if !seen.insert(name.clone()) {
-                if path.is_empty() && name == "id" {
-                    self.root_id_ambiguous = true;
-                    self.root_id = None;
-                }
-                return Err(self.fail(RawJsonErrorKind::DuplicateMember {
+            if !seen.insert(name.clone()) && self.first_duplicate.is_none() {
+                self.first_duplicate = Some(RawJsonErrorKind::DuplicateMember {
                     path: if path.is_empty() {
                         "<root>".to_string()
                     } else {
                         path.to_string()
                     },
-                    name,
-                }));
+                    name: name.clone(),
+                });
             }
             let child_path = if path.is_empty() {
                 name.clone()
@@ -435,10 +438,11 @@ impl<'a> Parser<'a> {
             };
             let value = self.parse_value(&child_path, depth + 1)?;
             if path.is_empty() && name == "id" {
-                if self.root_id.is_some() {
+                if self.root_id_seen {
                     self.root_id_ambiguous = true;
                     self.root_id = None;
                 } else if !self.root_id_ambiguous {
+                    self.root_id_seen = true;
                     self.root_id = json_rpc_id_from_node(&value, self.input);
                 }
             }
@@ -533,6 +537,37 @@ mod tests {
             err.unambiguous_request_id,
             Some(JsonRpcId::Number("7".into()))
         );
+    }
+
+    #[test]
+    fn acp_transport_raw_records_nested_duplicate_before_later_root_id() {
+        let err = parse_frame(
+            r#"{"jsonrpc":"2.0","method":"session/new","params":{"cwd":"/a","cwd":"/b","mcpServers":[]},"id":7}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            &err.kind,
+            &RawJsonErrorKind::DuplicateMember {
+                path: "params".into(),
+                name: "cwd".into(),
+            }
+        );
+        assert_eq!(
+            err.unambiguous_request_id,
+            Some(JsonRpcId::Number("7".into()))
+        );
+    }
+
+    #[test]
+    fn acp_transport_raw_duplicate_root_id_is_ambiguous() {
+        let err =
+            parse_frame(r#"{"jsonrpc":"2.0","id":7,"method":"initialize","id":8}"#).unwrap_err();
+        assert!(matches!(
+            &err.kind,
+            RawJsonErrorKind::DuplicateMember { path, name }
+                if path == "<root>" && name == "id"
+        ));
+        assert_eq!(err.unambiguous_request_id, None);
     }
 
     #[test]

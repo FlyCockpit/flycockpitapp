@@ -6,7 +6,7 @@ use super::bridge::{BridgeFacade, SessionAdmissionReceipt};
 use super::classify::{InboundMessage, classify};
 use super::codec::{
     ACP_FORWARDED_MCP_VECTOR_MAX_BYTES_V1, ACP_JSON_FRAME_MAX_BYTES_V1, AcpFrameError,
-    MemoryFrameSink,
+    AcpLineReader, MemoryFrameSink,
 };
 use super::dispatch::{
     SessionIngress, SessionIngressError, build_rpc_module, elicitation_is_rejected,
@@ -20,7 +20,7 @@ use super::registry::{
     RecordingResolve, RegistryError, ResolveCodeRootInterrupt, permission_params,
 };
 use cockpit_proto::ResolveCodeRootInterruptResultV1;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 
@@ -91,6 +91,14 @@ struct AtomicAck(Arc<AtomicUsize>);
 impl ApprovalAck for AtomicAck {
     fn ack_approval_delivery(&mut self, _delivery_id: &str) {
         self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct BrokenReader;
+
+impl Read for BrokenReader {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("simulated stdin failure"))
     }
 }
 
@@ -180,6 +188,53 @@ fn acp_transport_stdio_transcript_keeps_diagnostics_off_stdout() {
     assert!(stdout.ends_with('\n'));
     assert!(!stdout.contains("acp:"));
     assert!(stderr.contains("acp:"));
+}
+
+#[test]
+fn acp_transport_stdio_reader_io_is_terminal() {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let err = run_stdio_peer(
+        BrokenReader,
+        &mut stdout,
+        &mut stderr,
+        RecordingResolve::default(),
+        RecordingAck::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert!(stdout.is_empty());
+    assert!(
+        String::from_utf8(stderr)
+            .unwrap()
+            .contains("simulated stdin failure")
+    );
+}
+
+#[test]
+fn acp_transport_stdio_lsp_content_length_framing_is_terminal_without_body_response() {
+    let input = concat!(
+        "Content-Length: 65\r\n\r\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n"
+    );
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let err = run_stdio_peer(
+        Cursor::new(input.as_bytes()),
+        &mut stdout,
+        &mut stderr,
+        RecordingResolve::default(),
+        RecordingAck::default(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert!(stdout.is_empty());
+    assert!(
+        String::from_utf8(stderr)
+            .unwrap()
+            .contains("Content-Length/LSP framing")
+    );
 }
 
 #[test]
@@ -382,6 +437,26 @@ fn acp_transport_rejects_wrong_or_duplicate_jsonrpc_before_routing() {
 }
 
 #[test]
+fn acp_transport_duplicate_member_response_uses_only_a_later_unique_root_id() {
+    let mut peer = peer();
+    let response = send(
+        &mut peer,
+        r#"{"jsonrpc":"2.0","method":"session/new","params":{"cwd":"/a","cwd":"/b","mcpServers":[]},"id":7}"#,
+    )
+    .expect("unique root id remains available after a nested duplicate");
+    assert!(response.contains("\"code\":-32600"));
+    assert!(response.contains("\"id\":7"));
+    assert_no_transport_mutation(&peer.counters);
+
+    let response = send(
+        &mut peer,
+        r#"{"jsonrpc":"2.0","id":7,"method":"initialize","id":8}"#,
+    );
+    assert!(response.is_none(), "duplicate root id is ambiguous");
+    assert_no_transport_mutation(&peer.counters);
+}
+
+#[test]
 fn acp_transport_rejects_response_with_result_and_error_before_resolve() {
     let mut peer = peer();
     peer.registry
@@ -572,6 +647,17 @@ fn acp_transport_nested_mcp_vector_cap_and_outer_overflow() {
     let parsed = parse_frame(&params).unwrap();
     decode_session_new(&params, &parsed.root, &mut counters).unwrap();
 
+    let outer_at_limit = wrap_session_new_with_pad(ACP_JSON_FRAME_MAX_BYTES_V1, &nested_ok);
+    assert_eq!(outer_at_limit.len(), ACP_JSON_FRAME_MAX_BYTES_V1);
+    let mut transcript = outer_at_limit.as_bytes().to_vec();
+    transcript.push(b'\n');
+    let mut reader = AcpLineReader::new(Cursor::new(transcript));
+    let accepted = reader
+        .read_frame(&mut AcpTransportCounters::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.byte_len(), ACP_JSON_FRAME_MAX_BYTES_V1);
+
     let nested_over = mcp_servers_of_size(ACP_FORWARDED_MCP_VECTOR_MAX_BYTES_V1 + 1);
     let params = format!(r#"{{"cwd":"/tmp","mcpServers":{nested_over}}}"#);
     let parsed = parse_frame(&params).unwrap();
@@ -581,7 +667,16 @@ fn acp_transport_nested_mcp_vector_cap_and_outer_overflow() {
     assert_eq!(counters.dto_produced, 0);
 
     let outer = wrap_session_new_with_pad(ACP_JSON_FRAME_MAX_BYTES_V1 + 1, &nested_ok);
-    assert!(outer.len() > ACP_JSON_FRAME_MAX_BYTES_V1);
+    assert_eq!(outer.len(), ACP_JSON_FRAME_MAX_BYTES_V1 + 1);
+    let mut transcript = outer.as_bytes().to_vec();
+    transcript.push(b'\n');
+    let mut reader = AcpLineReader::new(Cursor::new(transcript));
+    assert!(matches!(
+        reader
+            .read_frame(&mut AcpTransportCounters::default())
+            .unwrap_err(),
+        AcpFrameError::OverLimit { .. }
+    ));
     assert!(matches!(
         super::codec::reject_non_acp_object(&outer, &mut AcpTransportCounters::default()),
         Ok(())

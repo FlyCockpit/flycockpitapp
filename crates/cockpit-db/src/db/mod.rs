@@ -1289,6 +1289,7 @@ fn backup_before_pending_migration(
         return Ok(());
     };
     create_migration_backup(conn, path, schema_version, reason)
+        .context("backing up database before pending migration")
 }
 
 fn create_migration_backup(
@@ -5111,13 +5112,16 @@ mod tests {
         .unwrap();
 
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (read_done_tx, read_done_rx) = mpsc::sync_channel(1);
         let slow_db = db.clone();
         let writer = tokio::spawn(async move {
             slow_db
                 .write(move |conn| {
                     conn.execute_batch("BEGIN IMMEDIATE;")?;
                     let _ = entered_tx.send(());
-                    std::thread::sleep(Duration::from_millis(100));
+                    read_done_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("reader should observe the open write transaction");
                     conn.execute("INSERT INTO wal_probe (value) VALUES (2)", [])?;
                     conn.execute_batch("COMMIT;")?;
                     Ok(())
@@ -5141,6 +5145,7 @@ mod tests {
             "read waited for slow writer: {:?}",
             start.elapsed()
         );
+        let _ = read_done_tx.send(());
         writer.await.unwrap().unwrap();
     }
 

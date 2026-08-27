@@ -46,7 +46,7 @@ impl AdmittedLocalHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandleEvidence {
     /// File metadata digest (inode/device/size). Never exposed to the model.
-    metadata_fingerprint: [u8; 32],
+    pub(crate) metadata_fingerprint: [u8; 32],
 }
 
 /// An admitted retained-HTTPS source — immutable, fetched once by the
@@ -54,11 +54,11 @@ pub struct HandleEvidence {
 #[derive(Debug, Clone)]
 pub struct AdmittedRetainedSource {
     /// The canonical URL that was admitted.
-    canonical_url: String,
+    pub(crate) canonical_url: String,
     /// Immutable fetched bytes.
-    content: Vec<u8>,
+    pub(crate) content: Vec<u8>,
     /// Content-Type from the fetch.
-    content_type: String,
+    pub(crate) content_type: String,
 }
 
 impl AdmittedRetainedSource {
@@ -76,10 +76,10 @@ impl AdmittedRetainedSource {
 /// An admitted attachment reference — resolved from session attachments.
 #[derive(Debug, Clone)]
 pub struct AdmittedAttachment {
-    attachment_id: [u8; 16],
-    attachment_version: u64,
-    checksum: [u8; 32],
-    kind: u8,
+    pub(crate) attachment_id: [u8; 16],
+    pub(crate) attachment_version: u64,
+    pub(crate) checksum: [u8; 32],
+    pub(crate) kind: u8,
 }
 
 impl AdmittedAttachment {

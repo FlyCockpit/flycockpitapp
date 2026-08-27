@@ -91,7 +91,6 @@ pub mod secure_key;
 pub mod session_goals;
 pub mod session_log;
 pub mod session_plan_docs;
-pub mod tool_media_subject_bindings;
 pub mod session_search;
 pub mod sessions;
 pub mod shadow_store;

@@ -87,6 +87,62 @@ fn media_catalog_pair_gates_complete_snapshot_fail_closed() {
 }
 
 #[test]
+fn audio_video_capability_matrix_from_runtime_flags() {
+    use crate::tool_media_authority::{AvRuntimeCapabilities, AvRuntimeProfile};
+
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: false,
+            ffmpeg_decode: true,
+            audio_encoder: true,
+            clip_encoders: true,
+        }
+        .profile(),
+        AvRuntimeProfile::None
+    );
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: true,
+            ffmpeg_decode: false,
+            audio_encoder: true,
+            clip_encoders: true,
+        }
+        .profile(),
+        AvRuntimeProfile::ProbeOnly
+    );
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: true,
+            ffmpeg_decode: true,
+            audio_encoder: false,
+            clip_encoders: true,
+        }
+        .profile(),
+        AvRuntimeProfile::Inspect
+    );
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: true,
+            ffmpeg_decode: true,
+            audio_encoder: true,
+            clip_encoders: false,
+        }
+        .profile(),
+        AvRuntimeProfile::ExtractAudio
+    );
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: true,
+            ffmpeg_decode: true,
+            audio_encoder: true,
+            clip_encoders: true,
+        }
+        .profile(),
+        AvRuntimeProfile::FullClip
+    );
+}
+
+#[test]
 fn dependency_headless_schema_and_shared_reason_are_stable() {
     let descriptor = ExternalRuntimeDescriptor::builder("runtime.test")
         .owner("test", "selected")

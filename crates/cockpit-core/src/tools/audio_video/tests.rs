@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -9,6 +10,11 @@ use crate::media_storage::{
     TYPED_AUDIO_CONTAINER_CODECS, TYPED_VIDEO_CONTAINER_CODECS, container_allows_audio_codec,
     container_allows_video_codec,
 };
+use crate::tool_media_authority::session_authority::{
+    AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, HandleEvidence,
+    LocalPathPolicy, RetainedHttpsPolicy,
+};
+use crate::tool_media_authority::{AdmissionDenial, NestedMediaSource, SessionMediaAuthority};
 
 const FORBIDDEN_KEYWORDS: &[&str] = &[
     "allOf",
@@ -29,12 +35,12 @@ enum AvKind {
     Video,
 }
 
-fn av_tools() -> [&'static dyn Tool; 4] {
+fn av_tools() -> [Box<dyn Tool>; 4] {
     [
-        &InspectAudioTool,
-        &InspectVideoTool,
-        &ExtractVideoClipTool,
-        &ExtractAudioTool,
+        Box::new(InspectAudioTool::new()),
+        Box::new(InspectVideoTool::new()),
+        Box::new(ExtractVideoClipTool::new()),
+        Box::new(ExtractAudioTool::new()),
     ]
 }
 
@@ -50,9 +56,16 @@ fn tool_kinds() -> [ToolKind; 4] {
 fn av_tool_schemas() -> Vec<(&'static str, Value)> {
     let mut schemas = Vec::new();
     for tool in av_tools() {
-        schemas.push((tool.name(), tool.parameters()));
+        let name: &'static str = match tool.name() {
+            "inspect_audio" => "inspect_audio",
+            "inspect_video" => "inspect_video",
+            "extract_video_clip" => "extract_video_clip",
+            "extract_audio" => "extract_audio",
+            other => panic!("unexpected A/V tool {other}"),
+        };
+        schemas.push((name, tool.parameters()));
         if let Some(defensive) = tool.defensive_parameters() {
-            schemas.push((tool.name(), defensive));
+            schemas.push((name, defensive));
         }
     }
     schemas
@@ -683,17 +696,28 @@ fn audio_video_tool_schema_rejects_malformed_nested_source_before_authority_bail
     }
 }
 
-#[tokio::test]
-async fn audio_video_tool_schema_fail_closed_validates_nested_source() {
+async fn call_without_authority(args: Value, kind: ToolKind) -> anyhow::Error {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = crate::tools::common::test_ctx(tmp.path());
+    let err = match kind {
+        ToolKind::InspectAudio => InspectAudioTool::new().call(args, &ctx).await,
+        ToolKind::InspectVideo => InspectVideoTool::new().call(args, &ctx).await,
+        ToolKind::ExtractVideoClip => ExtractVideoClipTool::new().call(args, &ctx).await,
+        ToolKind::ExtractAudio => ExtractAudioTool::new().call(args, &ctx).await,
+    }
+    .expect_err("expected a closed call");
+    err
+}
+
+#[tokio::test]
+async fn audio_video_tool_schema_fail_closed_validates_nested_source() {
     for kind in tool_kinds() {
         for instance in [
             json!({"source": {}}),
             json!({"source": {"url": "http://example.test/x"}}),
             json!({"source": {"attachment_id": "att-1"}, "path": "/tmp/a"}),
         ] {
-            let malformed = fail_closed(instance.clone(), kind, &ctx).await.unwrap_err();
+            let malformed = call_without_authority(instance.clone(), kind).await;
             assert!(
                 malformed
                     .downcast_ref::<crate::engine::tool::InvalidToolInput>()
@@ -707,9 +731,8 @@ async fn audio_video_tool_schema_fail_closed_validates_nested_source() {
                 "{instance} for {kind:?} must not reach the authority bail: {malformed}"
             );
         }
-        let well_formed = fail_closed(json!({"source": {"attachment_id": "att-1"}}), kind, &ctx)
-            .await
-            .unwrap_err();
+        let well_formed =
+            call_without_authority(json!({"source": {"attachment_id": "att-1"}}), kind).await;
         assert!(
             well_formed
                 .downcast_ref::<crate::engine::tool::InvalidToolInput>()
@@ -723,9 +746,7 @@ async fn audio_video_tool_schema_fail_closed_validates_nested_source() {
             "{well_formed}"
         );
 
-        let sampling = fail_closed(well_formed_sampling(), kind, &ctx)
-            .await
-            .unwrap_err();
+        let sampling = call_without_authority(well_formed_sampling(), kind).await;
         if kind == ToolKind::InspectVideo {
             assert!(
                 sampling
@@ -1129,4 +1150,559 @@ fn audio_video_process_specs_are_argv_only_and_capped() {
     assert!(spec.stdin_closed);
     assert_eq!(spec.environment.len(), 2);
     assert!(spec.stdout_limit > spec.stderr_limit);
+}
+
+fn argv_has_lone_double_dash(spec: &ProcessSpec) -> bool {
+    spec.argv.iter().any(|arg| arg == "--")
+}
+
+#[test]
+fn audio_video_argv_snapshots() {
+    let interval = Interval::checked(Milliseconds(1_500), Milliseconds(2_250)).unwrap();
+    let probe = probe_process("/held/source.wav");
+    let clip = clip_process(
+        "/held/video.mp4",
+        "/tmp/out.mp4",
+        &interval,
+        0,
+        22_050,
+        1,
+        15,
+        1,
+    );
+    let audio = audio_process("/held/audio.wav", "/tmp/out.wav", &interval, 0, 22_050, 1);
+    for spec in [&probe, &clip, &audio] {
+        assert!(
+            !argv_has_lone_double_dash(spec),
+            "{} argv must not contain a lone --: {:?}",
+            spec.program,
+            spec.argv
+        );
+        assert!(spec.stdin_closed);
+        assert_eq!(
+            spec.environment,
+            vec![("LC_ALL", "C".into()), ("LANG", "C".into())]
+        );
+    }
+    assert_eq!(
+        clip.argv
+            .iter()
+            .position(|arg| arg == "-ss")
+            .and_then(|i| clip.argv.get(i + 1))
+            .map(String::as_str),
+        Some("1.500")
+    );
+    assert_eq!(
+        clip.argv
+            .iter()
+            .position(|arg| arg == "-t")
+            .and_then(|i| clip.argv.get(i + 1))
+            .map(String::as_str),
+        Some("0.750")
+    );
+    assert_eq!(
+        audio
+            .argv
+            .iter()
+            .position(|arg| arg == "-ss")
+            .and_then(|i| audio.argv.get(i + 1))
+            .map(String::as_str),
+        Some("1.500")
+    );
+    let clip_ar = clip
+        .argv
+        .iter()
+        .position(|arg| arg == "-ar")
+        .and_then(|i| clip.argv.get(i + 1))
+        .unwrap();
+    let clip_ac = clip
+        .argv
+        .iter()
+        .position(|arg| arg == "-ac")
+        .and_then(|i| clip.argv.get(i + 1))
+        .unwrap();
+    assert_eq!(
+        clip_ar, "22050",
+        "clip must cap from source, never upsample to 48000"
+    );
+    assert_eq!(clip_ac, "1", "clip must not force 2ch when source is mono");
+    let audio_ar = audio
+        .argv
+        .iter()
+        .position(|arg| arg == "-ar")
+        .and_then(|i| audio.argv.get(i + 1))
+        .unwrap();
+    assert_eq!(audio_ar, "22050");
+    let vf = clip
+        .argv
+        .iter()
+        .position(|arg| arg == "-vf")
+        .and_then(|i| clip.argv.get(i + 1))
+        .unwrap();
+    assert!(
+        vf.contains("fps=15/1"),
+        "exact reduced fps rational, not a string expression: {vf}"
+    );
+    assert!(!vf.contains("source_fps"));
+    assert_eq!(format_ffmpeg_seconds(1_500), "1.500");
+    assert_eq!(reduced_fps_from_pts_ms(&[0, 40, 80, 120]), (24, 1));
+    assert_eq!(reduced_fps_from_pts_ms(&[0, 100, 200]), (10, 1));
+}
+
+struct FixtureAttachments {
+    by_id: std::collections::HashMap<[u8; 16], AdmittedAttachment>,
+    aliases: std::collections::HashMap<String, [u8; 16]>,
+    revoked: std::sync::atomic::AtomicBool,
+}
+
+impl AttachmentResolver for FixtureAttachments {
+    fn resolve(
+        &self,
+        _session_id: &str,
+        attachment_id: &[u8; 16],
+    ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(self.by_id.get(attachment_id).cloned())
+    }
+
+    fn resolve_alias(
+        &self,
+        _session_id: &str,
+        alias: &str,
+    ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(self
+            .aliases
+            .get(alias)
+            .and_then(|id| self.by_id.get(id))
+            .cloned())
+    }
+}
+
+struct FixturePaths {
+    swapped: std::sync::Mutex<Option<String>>,
+}
+
+impl LocalPathPolicy for FixturePaths {
+    fn authorize(
+        &self,
+        _session_id: &str,
+        path: &str,
+    ) -> Result<(std::path::PathBuf, HandleEvidence), AdmissionDenial> {
+        if path.contains("denied") {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        let held = self
+            .swapped
+            .lock()
+            .expect("swap lock")
+            .clone()
+            .unwrap_or_else(|| path.to_string());
+        Ok((
+            std::path::PathBuf::from(held),
+            HandleEvidence {
+                metadata_fingerprint: [0xAA; 32],
+            },
+        ))
+    }
+}
+
+struct FixtureHttps;
+
+impl RetainedHttpsPolicy for FixtureHttps {
+    fn admit(
+        &self,
+        _session_id: &str,
+        url: &str,
+    ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
+        if url.contains("denied") {
+            return Err(AdmissionDenial::HttpsDenied);
+        }
+        Ok(AdmittedRetainedSource {
+            canonical_url: url.to_string(),
+            content: b"fake-av-bytes".to_vec(),
+            content_type: "audio/mpeg".to_string(),
+        })
+    }
+}
+
+fn fixture_authority(session_id: [u8; 16]) -> (SessionMediaAuthority, Arc<FixtureAttachments>) {
+    use crate::tool_media_authority::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
+    use crate::tool_media_authority::revalidator::RevalidatedSubject;
+    let subject = RevalidatedSubject {
+        receipt: ToolMediaSubjectReceiptV1 {
+            issuer_kind: IssuerKind::LocalOwner,
+            principal_digest: [0x11; 32],
+            project_digest: [0x22; 32],
+            session_id,
+            authorization_epoch: 0,
+            subject_digest: [0x33; 32],
+        },
+        issuer_kind: IssuerKind::LocalOwner,
+        principal_digest: [0x11; 32],
+        project_digest: [0x22; 32],
+        session_id,
+        authorization_epoch: 0,
+    };
+    let att = AdmittedAttachment {
+        attachment_id: [0x44; 16],
+        attachment_version: 1,
+        checksum: [0x55; 32],
+        kind: 2,
+    };
+    let mut aliases = std::collections::HashMap::new();
+    aliases.insert("att-1".to_string(), [0x44; 16]);
+    let mut by_id = std::collections::HashMap::new();
+    by_id.insert([0x44; 16], att);
+    let attachments = Arc::new(FixtureAttachments {
+        by_id,
+        aliases,
+        revoked: std::sync::atomic::AtomicBool::new(false),
+    });
+    let authority = SessionMediaAuthority::new(
+        subject,
+        attachments.clone(),
+        Arc::new(FixturePaths {
+            swapped: std::sync::Mutex::new(None),
+        }),
+        Arc::new(FixtureHttps),
+    );
+    (authority, attachments)
+}
+
+fn authorized_ctx() -> (
+    tempfile::TempDir,
+    crate::engine::tool::ToolCtx,
+    Arc<SessionMediaAuthority>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = crate::tools::common::test_ctx(tmp.path());
+    ctx.media_availability = crate::tool_media_authority::MediaToolAvailability::available();
+    let session_id = *ctx.session.id.as_bytes();
+    let (authority, _) = fixture_authority(session_id);
+    let authority = Arc::new(authority);
+    ctx = ctx.with_media_authority(authority.clone());
+    (tmp, ctx, authority)
+}
+
+fn tool_for(kind: ToolKind, runner: Arc<dyn AvArgvRunner>) -> Box<dyn Tool> {
+    match kind {
+        ToolKind::InspectAudio => Box::new(InspectAudioTool::with_runner(runner)),
+        ToolKind::InspectVideo => Box::new(InspectVideoTool::with_runner(runner)),
+        ToolKind::ExtractVideoClip => Box::new(ExtractVideoClipTool::with_runner(runner)),
+        ToolKind::ExtractAudio => Box::new(ExtractAudioTool::with_runner(runner)),
+    }
+}
+
+#[tokio::test]
+async fn audio_video_source_execution() {
+    let (_tmp, ctx, authority) = authorized_ctx();
+    let runner = Arc::new(
+        FakeAvArgvRunner::new()
+            .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
+            .with_ffmpeg_bytes(DEFAULT_WAV_BYTES),
+    );
+    let branches = [
+        json!({"source": {"attachment_id": "att-1"}}),
+        json!({"source": {"path": "/held/media.bin"}}),
+        json!({"source": {"url": "https://example.test/media.bin"}}),
+    ];
+    for kind in tool_kinds() {
+        for args in &branches {
+            let before = authority.io_counters();
+            let tool = tool_for(kind, runner.clone());
+            let output = tool.call(args.clone(), &ctx).await.expect("happy path");
+            assert!(
+                !output
+                    .content
+                    .contains("media_attachment_authority_unavailable"),
+                "{kind:?} must not retain a permanent authority bail: {}",
+                output.content
+            );
+            let value: Value = serde_json::from_str(&output.content).expect("json result");
+            assert!(
+                value.get("attachment_id").is_some() || value.get("source_attachment_id").is_some()
+            );
+            let after = authority.io_counters();
+            if args["source"].get("path").is_some() {
+                assert!(after.path_authorizations > before.path_authorizations);
+                assert!(after.attachments_created > before.attachments_created);
+            }
+            if args["source"].get("url").is_some() {
+                assert!(after.fetches > before.fetches);
+                assert!(after.attachments_created > before.attachments_created);
+            }
+            if args["source"].get("attachment_id").is_some() {
+                assert_eq!(after.fetches, before.fetches);
+                assert_eq!(after.path_authorizations, before.path_authorizations);
+            }
+            if kind == ToolKind::ExtractAudio || kind == ToolKind::ExtractVideoClip {
+                assert!(value.get("reservation_id").is_some(), "{value}");
+                assert!(value.get("result").is_some(), "{value}");
+            }
+        }
+    }
+
+    let created = InspectAudioTool::with_runner(runner.clone())
+        .call(json!({"source": {"path": "/held/second.bin"}}), &ctx)
+        .await
+        .unwrap();
+    let created_json: Value = serde_json::from_str(&created.content).unwrap();
+    let id = created_json["attachment_id"].as_str().unwrap().to_string();
+    let before_reuse = authority.io_counters();
+    InspectAudioTool::with_runner(runner.clone())
+        .call(json!({"source": {"attachment_id": id}}), &ctx)
+        .await
+        .unwrap();
+    let after_reuse = authority.io_counters();
+    assert_eq!(after_reuse.fetches, before_reuse.fetches);
+    assert_eq!(
+        after_reuse.path_authorizations,
+        before_reuse.path_authorizations
+    );
+
+    for instance in malformed_nested_source_instances() {
+        let before = authority.io_counters();
+        let err = InspectAudioTool::with_runner(runner.clone())
+            .call(instance, &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::engine::tool::InvalidToolInput>()
+                .is_some()
+        );
+        let after = authority.io_counters();
+        assert_eq!(after.fetches, before.fetches);
+        assert_eq!(after.runner_calls, before.runner_calls);
+        assert_eq!(after.path_authorizations, before.path_authorizations);
+    }
+
+    let denied_path = InspectAudioTool::with_runner(runner.clone())
+        .call(json!({"source": {"path": "/held/denied.bin"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(denied_path.to_string().contains("source_denied"));
+    let denied_url = InspectAudioTool::with_runner(runner.clone())
+        .call(json!({"source": {"url": "https://denied.example/x"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(denied_url.to_string().contains("source_denied"));
+    let missing = InspectAudioTool::with_runner(runner.clone())
+        .call(json!({"source": {"attachment_id": "missing-id"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(missing.to_string().contains("source_denied"));
+
+    let swapped = parse_nested_source(&json!({"source": {"path": "/held/original.bin"}})).unwrap();
+    assert!(matches!(swapped, NestedMediaSource::Path(_)));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let stripped = crate::tools::common::test_ctx(tmp.path());
+    let mcp_err = InspectAudioTool::with_runner(runner)
+        .call(json!({"source": {"path": "/held/media.bin"}}), &stripped)
+        .await
+        .unwrap_err();
+    assert!(
+        mcp_err
+            .to_string()
+            .contains("media_attachment_authority_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn audio_video_provider_modality_gate() {
+    use crate::config::providers::CapabilityStatus;
+    use crate::tool_media_authority::{
+        AvRuntimeProfile, MediaToolAvailability, MediaToolAvailabilityReason,
+    };
+
+    let avail = MediaToolAvailability::available_with(
+        AvRuntimeProfile::FullClip,
+        CapabilityStatus::RequiresEntitlement,
+        CapabilityStatus::Unsupported,
+    );
+    assert!(!avail.exposes_direct_tool("inspect_audio"));
+    assert!(!avail.exposes_direct_tool("inspect_video"));
+    assert!(avail.exposes_direct_tool("extract_audio"));
+    assert!(avail.exposes_direct_tool("extract_video_clip"));
+    assert_eq!(
+        avail.reason_for("inspect_audio"),
+        MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
+    );
+    let rows = avail.av_availability_rows();
+    assert!(rows.iter().any(|row| {
+        row.tool == "inspect_audio"
+            && row.reason == MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
+            && !row.present
+    }));
+
+    let (_tmp, mut ctx, authority) = authorized_ctx();
+    ctx.media_availability = avail;
+    let runner = Arc::new(FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes()));
+    let before = authority.io_counters();
+    let err = ExtractAudioTool::with_runner(runner.clone())
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("model_capability_requires_entitlement")
+    );
+    let after = authority.io_counters();
+    assert_eq!(after.fetches, before.fetches);
+    assert_eq!(after.runner_calls, before.runner_calls);
+    assert_eq!(after.reservations, before.reservations);
+    assert_eq!(after.path_authorizations, before.path_authorizations);
+
+    ctx.media_availability = MediaToolAvailability::available_with(
+        AvRuntimeProfile::FullClip,
+        CapabilityStatus::Unknown,
+        CapabilityStatus::Unknown,
+    );
+    let err = ExtractVideoClipTool::with_runner(runner)
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("model_capability_unknown"));
+}
+
+#[tokio::test]
+async fn audio_video_bomb_ceiling() {
+    let (_tmp, ctx, _) = authorized_ctx();
+    let runner = FakeAvArgvRunner::new();
+    runner.bomb_stdout(MAX_PROCESS_STDOUT_BYTES + 16);
+    let err = InspectAudioTool::with_runner(Arc::new(runner))
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("resource_limit"), "{err}");
+
+    let corrupt = FakeAvArgvRunner::new();
+    corrupt.corrupt();
+    let err = InspectVideoTool::with_runner(Arc::new(corrupt))
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid_media"), "{err}");
+}
+
+#[tokio::test]
+async fn audio_video_fake_process_lifecycle() {
+    let (_tmp, mut ctx, _) = authorized_ctx();
+    let runner = FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes());
+    runner.force_timeout();
+    let err = InspectAudioTool::with_runner(Arc::new(runner.clone()))
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("deadline_exceeded"), "{err}");
+    assert!(
+        !runner.cleaned_paths().is_empty() || runner.calls().iter().all(|call| call.stdin_closed)
+    );
+
+    let cancel_runner = FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes());
+    ctx.cancel.cancel();
+    let err = InspectAudioTool::with_runner(Arc::new(cancel_runner.clone()))
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cancelled"), "{err}");
+
+    let (_tmp2, ctx2, _) = authorized_ctx();
+    let ok_runner = FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes());
+    InspectAudioTool::with_runner(Arc::new(ok_runner.clone()))
+        .call(json!({"source": {"path": "/held/ok.bin"}}), &ctx2)
+        .await
+        .unwrap();
+    let recorded = ok_runner.calls();
+    assert!(!recorded.is_empty());
+    for call in &recorded {
+        assert!(call.stdin_closed);
+        assert!(call.stderr_limit <= MAX_PROCESS_STDERR_BYTES);
+        assert_eq!(
+            call.environment,
+            vec![
+                ("LC_ALL".to_string(), "C".to_string()),
+                ("LANG".to_string(), "C".to_string())
+            ]
+        );
+        assert!(!call.argv.iter().any(|arg| arg == "--"));
+    }
+}
+
+#[test]
+fn audio_video_capability_matrix() {
+    use crate::config::providers::CapabilityStatus;
+    use crate::tool_media_authority::{
+        AvRuntimeCapabilities, AvRuntimeProfile, MediaToolAvailability,
+    };
+
+    let cases = [
+        (
+            AvRuntimeCapabilities {
+                ffprobe_compatible: false,
+                ..AvRuntimeCapabilities::default()
+            },
+            AvRuntimeProfile::None,
+            &[] as &[&str],
+        ),
+        (
+            AvRuntimeCapabilities {
+                ffprobe_compatible: true,
+                ffmpeg_decode: false,
+                audio_encoder: false,
+                clip_encoders: false,
+            },
+            AvRuntimeProfile::ProbeOnly,
+            &["inspect_audio"][..],
+        ),
+        (
+            AvRuntimeCapabilities {
+                ffprobe_compatible: true,
+                ffmpeg_decode: true,
+                audio_encoder: false,
+                clip_encoders: false,
+            },
+            AvRuntimeProfile::Inspect,
+            &["inspect_audio", "inspect_video"][..],
+        ),
+        (
+            AvRuntimeCapabilities {
+                ffprobe_compatible: true,
+                ffmpeg_decode: true,
+                audio_encoder: true,
+                clip_encoders: false,
+            },
+            AvRuntimeProfile::ExtractAudio,
+            &["inspect_audio", "inspect_video", "extract_audio"][..],
+        ),
+        (
+            AvRuntimeCapabilities {
+                ffprobe_compatible: true,
+                ffmpeg_decode: true,
+                audio_encoder: true,
+                clip_encoders: true,
+            },
+            AvRuntimeProfile::FullClip,
+            &[
+                "inspect_audio",
+                "inspect_video",
+                "extract_audio",
+                "extract_video_clip",
+            ][..],
+        ),
+    ];
+    for (caps, profile, tools) in cases {
+        assert_eq!(caps.profile(), profile);
+        let avail = MediaToolAvailability::available_with(
+            profile,
+            CapabilityStatus::Supported,
+            CapabilityStatus::Supported,
+        );
+        assert_eq!(avail.runtime_and_modality_exposed_av_tools(), tools);
+    }
 }

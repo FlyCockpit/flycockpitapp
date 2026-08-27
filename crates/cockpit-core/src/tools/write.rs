@@ -5,6 +5,7 @@
 //! created without a read record, using create-new semantics so they are never
 //! overwritten by a stale absence check.
 
+#[cfg(unix)]
 use std::io::Write as _;
 
 use anyhow::{Context, Result, bail};
@@ -203,13 +204,7 @@ impl Tool for WriteTool {
                 None,
             )
         } else {
-            create_new_and_release(
-                &path,
-                normalized.as_bytes(),
-                write_guard,
-                ctx.write_scope.as_deref(),
-            )
-            .await?
+            create_new_and_release(&path, normalized.as_bytes(), write_guard).await?
         };
         crate::assistants::identity::record_identity_write(ctx, &path).await?;
         if skill_validation.is_some() {
@@ -306,39 +301,60 @@ pub(crate) fn enforce_requested_write_scope(
 /// umask-derived; applied with `fchmod` on the held descriptor.
 #[cfg(unix)]
 const CREATED_DIR_MODE: libc::mode_t = 0o755;
+#[cfg(unix)]
+const CREATED_DIR_INITIAL_MODE: libc::mode_t = 0o700;
 
 #[cfg(test)]
 thread_local! {
+    #[cfg(unix)]
     static BEFORE_PARENT_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
     static AFTER_PARENT_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static AFTER_DIRECTORY_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     static BEFORE_FILE_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static AFTER_FILE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static FORCED_FILE_CREATE_ERROR: std::cell::RefCell<Option<std::io::Error>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_before_parent_create_hook(hook: impl FnOnce() + 'static) {
     BEFORE_PARENT_CREATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_after_parent_create_hook(hook: impl FnOnce() + 'static) {
     AFTER_PARENT_CREATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
+fn set_after_directory_create_hook(hook: impl FnOnce() + 'static) {
+    AFTER_DIRECTORY_CREATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(all(test, unix))]
 fn set_before_file_create_hook(hook: impl FnOnce() + 'static) {
     BEFORE_FILE_CREATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
+fn set_after_file_open_hook(hook: impl FnOnce() + 'static) {
+    AFTER_FILE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(all(test, unix))]
 fn set_forced_file_create_error(error: std::io::Error) {
     FORCED_FILE_CREATE_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
 }
 
+#[cfg(unix)]
 fn run_before_parent_create_hook() {
     #[cfg(test)]
     BEFORE_PARENT_CREATE.with(|slot| {
@@ -348,6 +364,7 @@ fn run_before_parent_create_hook() {
     });
 }
 
+#[cfg(unix)]
 fn run_after_parent_create_hook() {
     #[cfg(test)]
     AFTER_PARENT_CREATE.with(|slot| {
@@ -357,9 +374,29 @@ fn run_after_parent_create_hook() {
     });
 }
 
+#[cfg(unix)]
+fn run_after_directory_create_hook() {
+    #[cfg(test)]
+    AFTER_DIRECTORY_CREATE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 fn run_before_file_create_hook() {
     #[cfg(test)]
     BEFORE_FILE_CREATE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(unix)]
+fn run_after_file_open_hook() {
+    #[cfg(test)]
+    AFTER_FILE_OPEN.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
             hook();
         }
@@ -378,19 +415,15 @@ fn take_forced_file_create_error() -> Option<std::io::Error> {
 struct ParentPrep {
     disclosure: Option<String>,
     created: CreatedDirectories,
-    parent_path: std::path::PathBuf,
-    expected_parent: std::path::PathBuf,
-    stable_scope: Option<std::path::PathBuf>,
     #[cfg(unix)]
     parent_directory: Option<std::fs::File>,
     #[cfg(unix)]
-    parent_device: u64,
-    #[cfg(unix)]
-    parent_inode: u64,
+    bindings: Vec<HeldDirectoryBinding>,
 }
 
 #[derive(Default)]
 struct CreatedDirectories {
+    #[cfg(unix)]
     paths: Vec<std::path::PathBuf>,
     #[cfg(unix)]
     bindings: Vec<CreatedDirectoryBinding>,
@@ -404,14 +437,18 @@ struct CreatedDirectoryBinding {
     inode: u64,
 }
 
+#[cfg(unix)]
+struct HeldDirectoryBinding {
+    parent: std::fs::File,
+    name: std::ffi::CString,
+    device: u64,
+    inode: u64,
+}
+
 impl CreatedDirectories {
     fn rollback(&self) {
         #[cfg(unix)]
         rollback_created_directory_bindings(&self.bindings);
-        #[cfg(not(unix))]
-        for path in self.paths.iter().rev() {
-            let _ = std::fs::remove_dir(path);
-        }
     }
 }
 
@@ -438,19 +475,15 @@ fn rollback_created_directory_bindings(bindings: &[CreatedDirectoryBinding]) {
 }
 
 impl ParentPrep {
+    #[cfg(unix)]
     fn none() -> Self {
         Self {
             disclosure: None,
             created: CreatedDirectories::default(),
-            parent_path: std::path::PathBuf::new(),
-            expected_parent: std::path::PathBuf::new(),
-            stable_scope: None,
             #[cfg(unix)]
             parent_directory: None,
             #[cfg(unix)]
-            parent_device: 0,
-            #[cfg(unix)]
-            parent_inode: 0,
+            bindings: Vec::new(),
         }
     }
 }
@@ -459,10 +492,13 @@ async fn create_new_and_release(
     path: &std::path::Path,
     bytes: &[u8],
     guard: crate::locks::WriteGuard<'_>,
-    contain_under: Option<&std::path::Path>,
 ) -> Result<(crate::tools::common::WriteReleaseOutcome, Option<String>)> {
-    let prep = ensure_parent_dirs(path, contain_under)?;
+    let prep = ensure_parent_dirs(path)?;
     run_before_file_create_hook();
+    if let Err(error) = revalidate_prepared_parent(&prep) {
+        prep.created.rollback();
+        return Err(error);
+    }
     let created: std::io::Result<CreatedFileIdentity> =
         if let Some(error) = take_forced_file_create_error() {
             Err(error)
@@ -497,6 +533,7 @@ async fn create_new_and_release(
 /// Name the created portion below the nearest pre-existing ancestor as
 /// `created directories: <first-created>/…/<parent>`. A single created
 /// component omits the ellipsis.
+#[cfg(unix)]
 fn format_created_directories_line(created: &[std::path::PathBuf]) -> Option<String> {
     let first = created.first()?.file_name()?;
     let last = created.last()?.file_name()?;
@@ -511,54 +548,33 @@ fn format_created_directories_line(created: &[std::path::PathBuf]) -> Option<Str
     })
 }
 
-fn revalidate_parent_under_scope(
-    parent: &std::path::Path,
-    stable_scope: Option<&std::path::Path>,
-) -> Result<()> {
-    let Some(stable_scope) = stable_scope else {
-        return Ok(());
-    };
-    let parent_canon = std::fs::canonicalize(parent).with_context(|| {
-        format!(
-            "revalidate parent directory `{}` after creation",
-            parent.display()
-        )
-    })?;
-    if parent_canon.starts_with(stable_scope) {
-        return Ok(());
-    }
-    bail!(
-        "refused: parent directory `{}` canonicalizes outside write scope `{}`",
-        parent.display(),
-        stable_scope.display()
-    )
-}
-
 fn revalidate_prepared_parent(prep: &ParentPrep) -> Result<()> {
-    let parent = std::fs::canonicalize(&prep.parent_path).with_context(|| {
-        format!(
-            "revalidate prepared parent directory `{}`",
-            prep.parent_path.display()
-        )
-    })?;
-    if parent != prep.expected_parent {
-        bail!(
-            "refused: prepared parent directory `{}` changed before file creation completed",
-            prep.parent_path.display()
-        );
-    }
+    #[cfg(not(unix))]
+    let _ = prep;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::metadata(&prep.parent_path)?;
-        if metadata.dev() != prep.parent_device || metadata.ino() != prep.parent_inode {
-            bail!(
-                "refused: prepared parent directory `{}` changed identity",
-                prep.parent_path.display()
-            );
+        use std::os::fd::AsRawFd as _;
+
+        for binding in &prep.bindings {
+            let stat = cockpit_host::private_fs::held_fd::fstatat_nofollow(
+                binding.parent.as_raw_fd(),
+                &binding.name,
+            )
+            .with_context(|| {
+                format!(
+                    "refused: prepared parent component {:?} is no longer bound to its held directory",
+                    binding.name
+                )
+            })?;
+            if stat.st_dev as u64 != binding.device || stat.st_ino as u64 != binding.inode {
+                bail!(
+                    "refused: prepared parent component {:?} changed identity",
+                    binding.name
+                );
+            }
         }
     }
-    revalidate_parent_under_scope(&prep.parent_path, prep.stable_scope.as_deref())
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -594,165 +610,114 @@ fn remove_new_file(prep: &ParentPrep, path: &std::path::Path, identity: &Created
 }
 
 #[cfg(not(unix))]
-fn remove_new_file(_prep: &ParentPrep, path: &std::path::Path, _identity: &CreatedFileIdentity) {
-    let _ = std::fs::remove_file(path);
-}
+fn remove_new_file(_prep: &ParentPrep, _path: &std::path::Path, _identity: &CreatedFileIdentity) {}
 
-fn ensure_parent_dirs(
-    path: &std::path::Path,
-    contain_under: Option<&std::path::Path>,
-) -> Result<ParentPrep> {
+#[cfg(unix)]
+fn ensure_parent_dirs(path: &std::path::Path) -> Result<ParentPrep> {
     let Some(parent) = path.parent() else {
         return Ok(ParentPrep::none());
     };
     if parent.as_os_str().is_empty() {
         return Ok(ParentPrep::none());
     }
-    #[cfg(not(unix))]
-    if contain_under.is_some() {
-        bail!(
-            "refused: secure new-file creation is unavailable on this platform for scoped writes"
-        );
+    if !path.is_absolute() {
+        bail!("secure new-file target must be absolute");
     }
-    let stable_scope = contain_under
-        .map(std::fs::canonicalize)
-        .transpose()
-        .context("canonicalize write scope before parent creation")?;
-    let ancestor = cockpit_host::path_containment::nearest_existing_prefix(parent)
-        .with_context(|| format!("locate existing ancestor of parent `{}`", parent.display()))?;
-    let ancestor_canon = std::fs::canonicalize(&ancestor)
-        .with_context(|| format!("canonicalize existing ancestor `{}`", ancestor.display()))?;
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        ) {
+            bail!(
+                "refused: secure new-file target `{}` contains unresolved traversal",
+                path.display()
+            );
+        }
+    }
+    // `path` is the exact absolute spelling returned by the native-access gate.
+    // Freeze that spelling as the authority: after approval no cwd, write
+    // scope, temp directory, or external ancestor is canonicalized again. The
+    // race seam is before acquisition so tests can prove that every component
+    // is instead acquired no-follow from the non-substitutable filesystem root.
     run_before_parent_create_hook();
-    if parent.exists() && !parent.is_dir() {
-        bail!(
-            "cannot create `{}` — parent `{}` is not a directory",
-            path.display(),
-            parent.display()
-        );
-    }
 
     let mut created = CreatedDirectories::default();
-    #[cfg(unix)]
-    let parent_directory;
-    if parent.is_dir() {
-        #[cfg(unix)]
-        {
-            let parent_canon = std::fs::canonicalize(parent)?;
-            parent_directory = Some(open_directory_nofollow(&parent_canon)?);
-        }
-    } else {
-        match create_missing_parent_chain(path, parent, &ancestor, &ancestor_canon, &mut created) {
-            Ok(held_parent) => {
-                #[cfg(unix)]
-                {
-                    parent_directory = Some(held_parent);
-                }
-                #[cfg(not(unix))]
-                let _ = held_parent;
-            }
-            Err(err) => {
+    let held_parent = {
+        let root = cockpit_host::private_fs::held_fd::open_fs_root()
+            .context("open trusted filesystem root for new-file creation")?;
+        match create_parent_components(path, parent, root, parent, &mut created) {
+            Ok(parent) => parent,
+            Err(error) => {
                 created.rollback();
-                return Err(err);
+                return Err(error);
             }
         }
     };
 
     run_after_parent_create_hook();
-    if let Err(err) = revalidate_parent_under_scope(parent, stable_scope.as_deref()) {
-        created.rollback();
-        return Err(err);
-    }
-    let expected_parent = std::fs::canonicalize(parent)?;
-    #[cfg(unix)]
-    let (parent_device, parent_inode) = {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = parent_directory
-            .as_ref()
-            .context("missing held parent directory")?
-            .metadata()?;
-        (metadata.dev(), metadata.ino())
-    };
-    Ok(ParentPrep {
+    let prep = ParentPrep {
         disclosure: format_created_directories_line(&created.paths),
         created,
-        parent_path: parent.to_path_buf(),
-        expected_parent,
-        stable_scope,
-        #[cfg(unix)]
-        parent_directory,
-        #[cfg(unix)]
-        parent_device,
-        #[cfg(unix)]
-        parent_inode,
-    })
+        parent_directory: Some(held_parent.directory),
+        bindings: held_parent.bindings,
+    };
+    if let Err(error) = revalidate_prepared_parent(&prep) {
+        prep.created.rollback();
+        return Err(error);
+    }
+    Ok(prep)
 }
 
-fn create_missing_parent_chain(
-    path: &std::path::Path,
-    parent: &std::path::Path,
-    ancestor: &std::path::Path,
-    ancestor_canon: &std::path::Path,
-    created: &mut CreatedDirectories,
-) -> Result<CreatedParentHandle> {
-    let ancestor_meta = std::fs::symlink_metadata(&ancestor).with_context(|| {
-        format!(
-            "stat existing ancestor `{}` for `{}`",
-            ancestor.display(),
-            path.display()
-        )
-    })?;
-    if ancestor_meta.file_type().is_symlink() {
-        bail!(
-            "refused: intermediate path component `{}` is a symlink or not a directory",
-            ancestor.display()
-        );
+#[cfg(not(unix))]
+fn ensure_parent_dirs(path: &std::path::Path) -> Result<ParentPrep> {
+    if !path.is_absolute() {
+        bail!("secure new-file target must be absolute");
     }
-    if !ancestor_meta.is_dir() {
-        bail!(
-            "cannot create `{}` — parent `{}` is not a directory",
-            path.display(),
-            ancestor.display()
-        );
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            bail!(
+                "refused: secure new-file target `{}` contains unresolved traversal",
+                path.display()
+            );
+        }
     }
-    let created_relative = parent.strip_prefix(&ancestor).unwrap_or(parent);
-    let parent_handle =
-        create_parent_components(path, parent, &ancestor_canon, created_relative, created)?;
-    Ok(parent_handle)
+    bail!(
+        "refused: secure new-file creation is unavailable on this platform because handle-relative no-reparse creation is not implemented"
+    )
 }
 
 #[cfg(unix)]
-type CreatedParentHandle = std::fs::File;
-#[cfg(not(unix))]
-type CreatedParentHandle = ();
+struct HeldParent {
+    directory: std::fs::File,
+    bindings: Vec<HeldDirectoryBinding>,
+}
 
 #[cfg(unix)]
 fn create_parent_components(
     path: &std::path::Path,
     parent: &std::path::Path,
-    ancestor_canon: &std::path::Path,
+    mut current: std::fs::File,
     created_relative: &std::path::Path,
     created: &mut CreatedDirectories,
-) -> Result<std::fs::File> {
-    let mut current = open_directory_nofollow(ancestor_canon).with_context(|| {
-        format!(
-            "open existing ancestor `{}` for `{}`",
-            ancestor_canon.display(),
-            path.display()
-        )
-    })?;
-    let mut built = ancestor_canon.to_path_buf();
+) -> Result<HeldParent> {
+    let mut built = std::path::PathBuf::from("/");
+    let mut bindings = Vec::new();
     for component in created_relative.components() {
         match component {
             std::path::Component::Normal(name) => {
                 built.push(name);
-                current = open_or_create_directory_child(&current, name, &built, created)
-                    .with_context(|| {
-                        format!(
-                            "create parent directories for `{}` under `{}`",
-                            path.display(),
-                            parent.display()
-                        )
-                    })?;
+                let (next, binding) = open_or_create_directory_child(
+                    &current, name, &built, created,
+                )
+                .with_context(|| {
+                    format!(
+                        "create parent directories for `{}` under `{}`",
+                        path.display(),
+                        parent.display()
+                    )
+                })?;
+                bindings.push(binding);
+                current = next;
             }
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
@@ -765,41 +730,10 @@ fn create_parent_components(
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
         }
     }
-    Ok(current)
-}
-
-#[cfg(not(unix))]
-fn create_parent_components(
-    path: &std::path::Path,
-    parent: &std::path::Path,
-    ancestor_canon: &std::path::Path,
-    created_relative: &std::path::Path,
-    created: &mut CreatedDirectories,
-) -> Result<()> {
-    let mut current = ancestor_canon.to_path_buf();
-    for component in created_relative.components() {
-        current.push(component);
-        if !current.exists() {
-            created.paths.push(current.clone());
-        }
-    }
-    std::fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "create parent directories for `{}` under `{}`",
-            path.display(),
-            parent.display()
-        )
-    })?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_directory_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    Ok(HeldParent {
+        directory: current,
+        bindings,
+    })
 }
 
 #[cfg(unix)]
@@ -817,7 +751,7 @@ fn open_or_create_directory_child(
     name: &std::ffi::OsStr,
     child_path: &std::path::Path,
     created: &mut CreatedDirectories,
-) -> Result<std::fs::File> {
+) -> Result<(std::fs::File, HeldDirectoryBinding)> {
     use std::os::fd::AsRawFd as _;
 
     let cname = component_cstr(name)?;
@@ -826,12 +760,15 @@ fn open_or_create_directory_child(
         &cname,
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
     ) {
-        Ok(directory) => Ok(directory),
+        Ok(directory) => {
+            let binding = verified_directory_binding(parent, &cname, &directory, None, child_path)?;
+            Ok((directory, binding))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let we_created = match cockpit_host::private_fs::held_fd::mkdirat(
                 parent.as_raw_fd(),
                 &cname,
-                CREATED_DIR_MODE,
+                CREATED_DIR_INITIAL_MODE,
             ) {
                 Ok(()) => true,
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -842,6 +779,26 @@ fn open_or_create_directory_child(
                     ));
                 }
             };
+            let created_identity = if we_created {
+                // POSIX `mkdirat` does not return an fd or inode. This immediate
+                // no-follow stat is the earliest identity observation the API
+                // permits; all later open/chmod/rollback operations require the
+                // entry and held fd to keep matching it. A hostile process with
+                // directory-write authority can still win the irreducible
+                // mkdirat-to-fstatat interval, so callers must not share writable
+                // ancestors with an adversary when that stronger guarantee is
+                // required.
+                let stat = cockpit_host::private_fs::held_fd::fstatat_nofollow(
+                    parent.as_raw_fd(),
+                    &cname,
+                )?;
+                Some((stat.st_dev as u64, stat.st_ino as u64))
+            } else {
+                None
+            };
+            if we_created {
+                run_after_directory_create_hook();
+            }
             let directory = match cockpit_host::private_fs::held_fd::openat(
                 parent.as_raw_fd(),
                 &cname,
@@ -850,25 +807,42 @@ fn open_or_create_directory_child(
                 Ok(directory) => directory,
                 Err(err) => {
                     if we_created {
-                        let _ = cockpit_host::private_fs::held_fd::unlinkat(
-                            parent.as_raw_fd(),
-                            &cname,
-                            libc::AT_REMOVEDIR,
-                        );
+                        remove_directory_if_identity_matches(parent, &cname, created_identity);
                     }
                     return Err(refuse_symlink_or_non_dir(child_path, err));
                 }
             };
+            let binding = match verified_directory_binding(
+                parent,
+                &cname,
+                &directory,
+                created_identity,
+                child_path,
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    remove_directory_if_identity_matches(parent, &cname, created_identity);
+                    return Err(error);
+                }
+            };
             if we_created {
+                let rollback_parent = match parent.try_clone() {
+                    Ok(parent) => parent,
+                    Err(error) => {
+                        remove_directory_if_identity_matches(parent, &cname, created_identity);
+                        return Err(error).with_context(|| {
+                            format!(
+                                "retain rollback authority for created directory `{}`",
+                                child_path.display()
+                            )
+                        });
+                    }
+                };
                 if let Err(err) = cockpit_host::private_fs::held_fd::fchmod(
                     directory.as_raw_fd(),
                     CREATED_DIR_MODE,
                 ) {
-                    let _ = cockpit_host::private_fs::held_fd::unlinkat(
-                        parent.as_raw_fd(),
-                        &cname,
-                        libc::AT_REMOVEDIR,
-                    );
+                    remove_directory_if_identity_matches(parent, &cname, created_identity);
                     return Err(err).with_context(|| {
                         format!(
                             "setting mode of created directory `{}`",
@@ -876,19 +850,77 @@ fn open_or_create_directory_child(
                         )
                     });
                 }
-                use std::os::unix::fs::MetadataExt as _;
-                let metadata = directory.metadata()?;
+                let Some((device, inode)) = created_identity else {
+                    remove_directory_if_identity_matches(parent, &cname, created_identity);
+                    bail!("missing identity for directory created by this write");
+                };
                 created.paths.push(child_path.to_path_buf());
                 created.bindings.push(CreatedDirectoryBinding {
-                    parent: parent.try_clone()?,
-                    name: cname,
-                    device: metadata.dev(),
-                    inode: metadata.ino(),
+                    parent: rollback_parent,
+                    name: cname.clone(),
+                    device,
+                    inode,
                 });
             }
-            Ok(directory)
+            Ok((directory, binding))
         }
         Err(err) => Err(refuse_symlink_or_non_dir(child_path, err)),
+    }
+}
+
+#[cfg(unix)]
+fn verified_directory_binding(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    directory: &std::fs::File,
+    expected: Option<(u64, u64)>,
+    child_path: &std::path::Path,
+) -> Result<HeldDirectoryBinding> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = directory.metadata()?;
+    let opened = (metadata.dev(), metadata.ino());
+    let entry = cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), name)?;
+    let entry_identity = (entry.st_dev as u64, entry.st_ino as u64);
+    if entry.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || entry_identity != opened
+        || expected.is_some_and(|expected| expected != opened)
+    {
+        bail!(
+            "refused: directory component `{}` changed identity while it was being acquired",
+            child_path.display()
+        );
+    }
+    Ok(HeldDirectoryBinding {
+        parent: parent.try_clone()?,
+        name: name.to_owned(),
+        device: opened.0,
+        inode: opened.1,
+    })
+}
+
+#[cfg(unix)]
+fn remove_directory_if_identity_matches(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    identity: Option<(u64, u64)>,
+) {
+    use std::os::fd::AsRawFd as _;
+
+    let Some((device, inode)) = identity else {
+        return;
+    };
+    let Ok(stat) = cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), name)
+    else {
+        return;
+    };
+    if stat.st_dev as u64 == device && stat.st_ino as u64 == inode {
+        let _ = cockpit_host::private_fs::held_fd::unlinkat(
+            parent.as_raw_fd(),
+            name,
+            libc::AT_REMOVEDIR,
+        );
     }
 }
 
@@ -939,6 +971,17 @@ fn create_new_file(
         device: metadata.dev(),
         inode: metadata.ino(),
     };
+    // Opening the leaf empty lets a failed chain check remove it without ever
+    // disclosing `bytes`. Portable POSIX has no transaction that prevents a
+    // process with rename authority over an ancestor from moving that ancestor
+    // after this check; the final post-write check above is therefore cleanup,
+    // not a claim of namespace atomicity. The checks bracket the irreversible
+    // write as tightly as the available handle-relative API permits.
+    run_after_file_open_hook();
+    if let Err(error) = revalidate_prepared_parent(prep) {
+        remove_new_file(prep, path, &identity);
+        return Err(std::io::Error::other(error));
+    }
     if let Err(error) = file.write_all(bytes) {
         remove_new_file(prep, path, &identity);
         return Err(error);
@@ -949,19 +992,13 @@ fn create_new_file(
 #[cfg(not(unix))]
 fn create_new_file(
     _prep: &ParentPrep,
-    path: &std::path::Path,
-    bytes: &[u8],
+    _path: &std::path::Path,
+    _bytes: &[u8],
 ) -> std::io::Result<CreatedFileIdentity> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    if let Err(error) = file.write_all(bytes) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(error);
-    }
-    Ok(CreatedFileIdentity)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure handle-relative new-file creation is unavailable on this platform",
+    ))
 }
 
 #[cfg(test)]
@@ -1196,6 +1233,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn write_creates_new_file_without_prior_read() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1423,6 +1461,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn caged_skill_write_requires_prior_view() {
         let tmp = tempfile::tempdir().unwrap();
         let package = write_skill_package(
@@ -1450,6 +1489,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn uncaged_skill_write_does_not_require_view() {
         let tmp = tempfile::tempdir().unwrap();
         let package =
@@ -1498,20 +1538,19 @@ mod tests {
         let discovered = discover_skills(&ctx, &cfg.skills).unwrap();
         assert_eq!(discovered[0].frontmatter.description, "old");
         assert!(catalog_cache_contains(&ctx, &cfg.skills));
+        let plain = tmp.path().join("plain.md");
+        std::fs::write(&plain, "old").unwrap();
+        note_read(&ctx, &plain).await;
 
-        let out = write(&tmp.path().join("plain.md"), "hello", &ctx)
-            .await
-            .unwrap();
+        let out = write(&plain, "hello", &ctx).await.unwrap();
 
         assert!(!out.contains("[skill]"), "{out}");
         assert!(catalog_cache_contains(&ctx, &cfg.skills));
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("plain.md")).unwrap(),
-            "hello"
-        );
+        assert_eq!(std::fs::read_to_string(plain).unwrap(), "hello");
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn write_creating_new_file_needs_no_read_record() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1541,7 +1580,10 @@ mod tests {
         let outside = tmp.path().join("outside.txt");
         std::fs::create_dir_all(&scope).unwrap();
         std::fs::write(&outside, "readable").unwrap();
+        let inside = scope.join("inside.txt");
+        std::fs::write(&inside, "old").unwrap();
         ctx.write_scope = Some(scope.clone());
+        note_read(&ctx, &inside).await;
 
         let err = WriteTool
             .call(
@@ -1562,10 +1604,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(scope.join("inside.txt")).unwrap(),
-            "ok"
-        );
+        assert_eq!(std::fs::read_to_string(inside).unwrap(), "ok");
 
         let read = ReadTool
             .call(serde_json::json!({"path": "outside.txt"}), &ctx)
@@ -1575,6 +1614,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn missing_read_then_new_file_write_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1626,6 +1666,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn new_file_write_creates_missing_parent_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1645,6 +1686,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn nested_write_discloses_created_parent_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1675,6 +1717,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn write_into_existing_directory_does_not_disclose_created_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1726,6 +1769,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn single_created_parent_directory_discloses_without_ellipsis() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1747,6 +1791,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn created_directories_line_names_first_and_parent_components() {
         assert_eq!(
             format_created_directories_line(&[PathBuf::from("nested")]).as_deref(),
@@ -1816,6 +1861,109 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[cfg(unix)]
+    async fn unscoped_write_refuses_existing_parent_component_swapped_after_authorization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let outside = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        let parked = tmp.path().join("parked-existing");
+        std::fs::create_dir_all(existing.join("deep")).unwrap();
+        std::fs::create_dir_all(outside.path().join("deep")).unwrap();
+
+        let existing_for_hook = existing.clone();
+        let parked_for_hook = parked.clone();
+        let outside_for_hook = outside.path().to_path_buf();
+        set_before_parent_create_hook(move || {
+            std::fs::rename(existing_for_hook, parked_for_hook).unwrap();
+            std::os::unix::fs::symlink(outside_for_hook, existing).unwrap();
+        });
+
+        let error = WriteTool
+            .call(
+                serde_json::json!({
+                    "path": "existing/deep/file.txt",
+                    "content": "escaped"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("symlink") || error.contains("not a directory"),
+            "{error}"
+        );
+        assert!(!outside.path().join("deep/file.txt").exists());
+        assert!(!parked.join("deep/file.txt").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approved_external_target_refuses_ancestor_swapped_before_root_acquisition() {
+        let holder = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let approved = holder.path().join("approved");
+        let parked = holder.path().join("parked-approved");
+        std::fs::create_dir_all(&approved).unwrap();
+        let target = approved.join("nested/file.txt");
+
+        let approved_for_hook = approved.clone();
+        let outside_for_hook = outside.path().to_path_buf();
+        set_before_parent_create_hook(move || {
+            std::fs::rename(approved_for_hook, &parked).unwrap();
+            std::os::unix::fs::symlink(outside_for_hook, approved).unwrap();
+        });
+
+        let error = ensure_parent_dirs(&target).err().unwrap().to_string();
+
+        assert!(
+            error.contains("symlink") || error.contains("not a directory"),
+            "{error}"
+        );
+        assert!(!outside.path().join("nested").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn created_directory_reopen_refuses_substituted_entry_without_chmod_or_rollback() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested");
+        let parked = tmp.path().join("parked-created");
+        let nested_for_hook = nested.clone();
+        let parked_for_hook = parked.clone();
+        set_after_directory_create_hook(move || {
+            std::fs::rename(&nested_for_hook, &parked_for_hook).unwrap();
+            std::fs::create_dir(&nested_for_hook).unwrap();
+            std::fs::set_permissions(&nested_for_hook, std::fs::Permissions::from_mode(0o711))
+                .unwrap();
+        });
+
+        let error = ensure_parent_dirs(&tmp.path().join("nested/file.txt"))
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("changed identity"), "{error}");
+        assert!(
+            nested.is_dir(),
+            "foreign replacement must not be rolled back"
+        );
+        assert_eq!(
+            std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o711,
+            "foreign replacement must not be chmodded"
+        );
+        assert!(
+            parked.is_dir(),
+            "the displaced created inode remains untouched"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
     async fn write_revalidates_parent_directory_after_mkdir() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
@@ -1846,7 +1994,10 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("canonicalizes outside write scope"), "{err}");
+        assert!(
+            err.contains("changed") || err.contains("authorized root"),
+            "{err}"
+        );
         assert!(!outside.join("deep/file.txt").exists());
         assert!(!scope.join("nested/deep/file.txt").is_file());
     }
@@ -1888,6 +2039,36 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[cfg(unix)]
+    async fn leaf_open_rechecks_parent_before_writing_content_and_removes_empty_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let parent = tmp.path().join("nested/deep");
+        let parked = tmp.path().join("parked-deep");
+        let parent_for_hook = parent.clone();
+        let parked_for_hook = parked.clone();
+        set_after_file_open_hook(move || {
+            std::fs::rename(parent_for_hook, parked_for_hook).unwrap();
+        });
+
+        let error = WriteTool
+            .call(
+                serde_json::json!({
+                    "path": "nested/deep/file.txt",
+                    "content": "must not be disclosed"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("changed identity"), "{error}");
+        assert!(!parked.join("file.txt").exists());
+        assert!(!parent.join("file.txt").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
     async fn concurrent_parent_creator_is_not_disclosed_as_ours() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1910,17 +2091,32 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn unscoped_new_file_with_external_existing_parent_is_not_rejected() {
         let external = tempfile::tempdir().unwrap();
         let path = external.path().join("file.txt");
-        let prep = ensure_parent_dirs(&path, None).unwrap();
+        let prep = ensure_parent_dirs(&path).unwrap();
 
         create_new_file(&prep, &path, b"body").unwrap();
 
         assert_eq!(std::fs::read_to_string(path).unwrap(), "body");
     }
 
+    #[test]
+    #[cfg(not(unix))]
+    fn new_file_creation_fails_closed_without_handle_relative_no_reparse_support() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = ensure_parent_dirs(&tmp.path().join("new.txt"))
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("handle-relative no-reparse"), "{error}");
+        assert!(!tmp.path().join("new.txt").exists());
+    }
+
     #[tokio::test]
+    #[cfg(unix)]
     async fn failed_create_rolls_back_directories_this_call_created() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1947,7 +2143,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "forced create failure",
         ));
-        let err = create_new_and_release(&path, b"new\n", guard, Some(tmp.path()))
+        let err = create_new_and_release(&path, b"new\n", guard)
             .await
             .unwrap_err();
 
@@ -1958,6 +2154,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn failed_create_does_not_remove_preexisting_ancestor() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -1986,7 +2183,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "forced create failure",
         ));
-        let _ = create_new_and_release(&path, b"new\n", guard, Some(tmp.path()))
+        let _ = create_new_and_release(&path, b"new\n", guard)
             .await
             .unwrap_err();
 
@@ -2029,11 +2226,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[cfg(unix)]
-    async fn revised_write_into_new_directory_discloses_and_hardens() {
-        // Issue #76 revise mode redispatches through the same WriteTool, so
-        // parent-dir disclosure and containment hardening apply by construction.
-        // `x-cockpit-may-create` remains a repair-only annotation and is not
-        // consulted here.
+    async fn scoped_nested_write_discloses_and_hardens() {
+        // This is direct WriteTool coverage for scoped nested creation. It is
+        // intentionally not described as verification-redispatch coverage:
+        // issue #76's verification engine and revise mode are not implemented
+        // in this branch, so no genuine dispatcher-level revise path exists yet.
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
         let scope = tmp.path().join("scope");
@@ -2125,6 +2322,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn new_file_create_does_not_grant_future_blind_overwrite() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -2235,7 +2433,7 @@ mod tests {
     }
 
     #[tokio::test]
-
+    #[cfg(unix)]
     async fn create_new_race_reports_file_now_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -2260,7 +2458,7 @@ mod tests {
 
         let raced = path.clone();
         set_before_file_create_hook(move || std::fs::write(raced, "raced\n").unwrap());
-        let err = create_new_and_release(&path, b"new\n", guard, Some(tmp.path()))
+        let err = create_new_and_release(&path, b"new\n", guard)
             .await
             .unwrap_err();
 
@@ -2332,24 +2530,28 @@ mod tests {
         assert!(out.content.contains("soul_edit_mode=human_only"), "{out:?}");
         assert!(identity_ctx.locks.holder(&soul).is_none());
 
-        let blocked_parent = tmp.path().join("not-a-dir");
-        std::fs::write(&blocked_parent, "file blocks directory creation").unwrap();
-        let target = blocked_parent.join("child.txt");
-        let err = WriteTool
-            .call(
-                serde_json::json!({
-                    "path": "not-a-dir/child.txt",
-                    "content": "new\n"
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("not a directory"), "{err}");
-        assert!(ctx.locks.holder(&target).is_none());
+        #[cfg(unix)]
+        {
+            let blocked_parent = tmp.path().join("not-a-dir");
+            std::fs::write(&blocked_parent, "file blocks directory creation").unwrap();
+            let target = blocked_parent.join("child.txt");
+            let err = WriteTool
+                .call(
+                    serde_json::json!({
+                        "path": "not-a-dir/child.txt",
+                        "content": "new\n"
+                    }),
+                    &ctx,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not a directory"), "{err}");
+            assert!(ctx.locks.holder(&target).is_none());
+        }
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn new_file_write_reports_parent_not_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -2600,6 +2802,9 @@ mod tests {
     async fn write_json_syntax_notes_are_advisory() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
+        let path = tmp.path().join("bad.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        note_read(&ctx, &path).await;
         let out = WriteTool
             .call(
                 serde_json::json!({"path": "bad.json", "content": "{\n"}),
@@ -2624,6 +2829,9 @@ mod tests {
     async fn write_json_success_note() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
+        let path = tmp.path().join("ok.json");
+        std::fs::write(&path, "{\"old\":true}\n").unwrap();
+        note_read(&ctx, &path).await;
         let out = WriteTool
             .call(
                 serde_json::json!({"path": "ok.json", "content": "{}\n"}),

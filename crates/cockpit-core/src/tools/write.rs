@@ -203,8 +203,14 @@ impl Tool for WriteTool {
                 None,
             )
         } else {
-            create_new_and_release(&path, normalized.as_bytes(), write_guard, create_new_file)
-                .await?
+            create_new_and_release(
+                &path,
+                normalized.as_bytes(),
+                write_guard,
+                create_new_file,
+                ctx.write_scope.as_deref().unwrap_or(&ctx.cwd),
+            )
+            .await?
         };
         crate::assistants::identity::record_identity_write(ctx, &path).await?;
         if skill_validation.is_some() {
@@ -297,17 +303,77 @@ pub(crate) fn enforce_requested_write_scope(
     enforce_write_scope(ctx, &effective, tool)
 }
 
+/// Workspace parent directories created for a new file. Explicit rather than
+/// umask-derived; applied with `fchmod` on the held descriptor.
+#[cfg(unix)]
+const CREATED_DIR_MODE: libc::mode_t = 0o755;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PARENT_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_PARENT_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_before_parent_create_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_PARENT_CREATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn set_after_parent_create_hook(hook: impl FnOnce() + 'static) {
+    AFTER_PARENT_CREATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+fn run_before_parent_create_hook() {
+    #[cfg(test)]
+    BEFORE_PARENT_CREATE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+fn run_after_parent_create_hook() {
+    #[cfg(test)]
+    AFTER_PARENT_CREATE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+struct ParentPrep {
+    disclosure: Option<String>,
+    created_paths: Vec<std::path::PathBuf>,
+}
+
+impl ParentPrep {
+    fn none() -> Self {
+        Self {
+            disclosure: None,
+            created_paths: Vec::new(),
+        }
+    }
+}
+
 async fn create_new_and_release(
     path: &std::path::Path,
     bytes: &[u8],
     guard: crate::locks::WriteGuard<'_>,
     create_file: impl FnOnce(&std::path::Path, &[u8]) -> std::io::Result<()>,
+    contain_under: &std::path::Path,
 ) -> Result<(
     crate::tools::common::WriteReleaseOutcome,
     Option<String>,
 )> {
-    let created_directories = ensure_parent_dirs(path)?;
-    create_file(path, bytes).map_err(|err| {
+    let prep = ensure_parent_dirs(path, contain_under)?;
+    let created = create_file(path, bytes);
+    if created.is_err() {
+        rollback_created_dirs(&prep.created_paths);
+    }
+    created.map_err(|err| {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
             anyhow::anyhow!(
                 "cannot create `{}` — file now exists; read it before overwriting",
@@ -320,7 +386,7 @@ async fn create_new_and_release(
     let persist_ok = guard.release_after_write().await;
     Ok((
         crate::tools::common::WriteReleaseOutcome { persist_ok },
-        created_directories,
+        prep.disclosure,
     ))
 }
 
@@ -346,13 +412,49 @@ fn format_created_directories_line(created_relative: &std::path::Path) -> String
     }
 }
 
-fn ensure_parent_dirs(path: &std::path::Path) -> Result<Option<String>> {
+fn rollback_created_dirs(created: &[std::path::PathBuf]) {
+    for path in created.iter().rev() {
+        let _ = std::fs::remove_dir(path);
+    }
+}
+
+fn revalidate_parent_under_scope(
+    parent: &std::path::Path,
+    contain_under: &std::path::Path,
+) -> Result<()> {
+    let parent_canon = std::fs::canonicalize(parent).with_context(|| {
+        format!(
+            "revalidate parent directory `{}` after creation",
+            parent.display()
+        )
+    })?;
+    let scope_canon = std::fs::canonicalize(contain_under).with_context(|| {
+        format!(
+            "revalidate write scope `{}` after parent creation",
+            contain_under.display()
+        )
+    })?;
+    if parent_canon.starts_with(&scope_canon) {
+        return Ok(());
+    }
+    bail!(
+        "refused: parent directory `{}` canonicalizes outside write scope `{}`",
+        parent.display(),
+        contain_under.display()
+    )
+}
+
+fn ensure_parent_dirs(
+    path: &std::path::Path,
+    contain_under: &std::path::Path,
+) -> Result<ParentPrep> {
     let Some(parent) = path.parent() else {
-        return Ok(None);
+        return Ok(ParentPrep::none());
     };
     if parent.as_os_str().is_empty() {
-        return Ok(None);
+        return Ok(ParentPrep::none());
     }
+    run_before_parent_create_hook();
     if parent.exists() && !parent.is_dir() {
         bail!(
             "cannot create `{}` — parent `{}` is not a directory",
@@ -360,23 +462,146 @@ fn ensure_parent_dirs(path: &std::path::Path) -> Result<Option<String>> {
             parent.display()
         );
     }
-    if parent.is_dir() {
-        return Ok(None);
+
+    let mut created_paths = Vec::new();
+    let disclosure = if parent.is_dir() {
+        None
+    } else {
+        match create_missing_parent_chain(path, parent, &mut created_paths) {
+            Ok(disclosure) => disclosure,
+            Err(err) => {
+                rollback_created_dirs(&created_paths);
+                return Err(err);
+            }
+        }
+    };
+
+    run_after_parent_create_hook();
+    if let Err(err) = revalidate_parent_under_scope(parent, contain_under) {
+        rollback_created_dirs(&created_paths);
+        return Err(err);
     }
-    let (ancestor, _) = cockpit_host::path_containment::nearest_existing_ancestor(parent)
-        .with_context(|| {
+    Ok(ParentPrep {
+        disclosure,
+        created_paths,
+    })
+}
+
+fn create_missing_parent_chain(
+    path: &std::path::Path,
+    parent: &std::path::Path,
+    created_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<Option<String>> {
+    let ancestor = cockpit_host::path_containment::nearest_existing_prefix(parent).with_context(
+        || {
             format!(
                 "locate existing ancestor of parent `{}` for `{}`",
                 parent.display(),
                 path.display()
             )
-        })?;
+        },
+    )?;
+    let ancestor_meta = std::fs::symlink_metadata(&ancestor).with_context(|| {
+        format!(
+            "stat existing ancestor `{}` for `{}`",
+            ancestor.display(),
+            path.display()
+        )
+    })?;
+    if ancestor_meta.file_type().is_symlink() {
+        bail!(
+            "refused: intermediate path component `{}` is a symlink or not a directory",
+            ancestor.display()
+        );
+    }
+    if !ancestor_meta.is_dir() {
+        bail!(
+            "cannot create `{}` — parent `{}` is not a directory",
+            path.display(),
+            ancestor.display()
+        );
+    }
+    let ancestor_canon = std::fs::canonicalize(&ancestor).with_context(|| {
+        format!(
+            "canonicalize existing ancestor `{}` for `{}`",
+            ancestor.display(),
+            path.display()
+        )
+    })?;
     let created_relative = parent.strip_prefix(&ancestor).unwrap_or(parent);
     let disclosure = if created_relative.as_os_str().is_empty() {
         None
     } else {
         Some(format_created_directories_line(created_relative))
     };
+    create_parent_components(path, parent, &ancestor_canon, created_relative, created_paths)?;
+    Ok(disclosure)
+}
+
+#[cfg(unix)]
+fn create_parent_components(
+    path: &std::path::Path,
+    parent: &std::path::Path,
+    ancestor_canon: &std::path::Path,
+    created_relative: &std::path::Path,
+    created_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    let mut current = open_directory_nofollow(ancestor_canon).with_context(|| {
+        format!(
+            "open existing ancestor `{}` for `{}`",
+            ancestor_canon.display(),
+            path.display()
+        )
+    })?;
+    let mut built = ancestor_canon.to_path_buf();
+    for component in created_relative.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                built.push(name);
+                current = open_or_create_directory_child(&current, name, &built, created_paths)
+                    .with_context(|| {
+                        format!(
+                            "create parent directories for `{}` under `{}`",
+                            path.display(),
+                            parent.display()
+                        )
+                    })?;
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                bail!(
+                    "cannot create `{}` — unresolved parent traversal in `{}`",
+                    path.display(),
+                    parent.display()
+                );
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_parent_components(
+    path: &std::path::Path,
+    parent: &std::path::Path,
+    ancestor_canon: &std::path::Path,
+    created_relative: &std::path::Path,
+    created_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    let mut current = parent
+        .strip_prefix(created_relative)
+        .unwrap_or(parent)
+        .to_path_buf();
+    if current.as_os_str().is_empty() {
+        current = ancestor_canon.to_path_buf();
+    }
+    for component in created_relative.components() {
+        current.push(component);
+        if !current.exists() {
+            created_paths.push(current.clone());
+        }
+    }
     std::fs::create_dir_all(parent).with_context(|| {
         format!(
             "create parent directories for `{}` under `{}`",
@@ -384,7 +609,103 @@ fn ensure_parent_dirs(path: &std::path::Path) -> Result<Option<String>> {
             parent.display()
         )
     })?;
-    Ok(disclosure)
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn component_cstr(name: &std::ffi::OsStr) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    if name.is_empty() || name == "." || name == ".." || name.as_bytes().contains(&b'/') {
+        bail!("unsafe path component {name:?}");
+    }
+    std::ffi::CString::new(name.as_bytes()).context("path component contains NUL")
+}
+
+#[cfg(unix)]
+fn open_or_create_directory_child(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    child_path: &std::path::Path,
+    created_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd as _;
+
+    let cname = component_cstr(name)?;
+    match cockpit_host::private_fs::held_fd::openat(
+        parent.as_raw_fd(),
+        &cname,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    ) {
+        Ok(directory) => Ok(directory),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let we_created = match cockpit_host::private_fs::held_fd::mkdirat(
+                parent.as_raw_fd(),
+                &cname,
+                CREATED_DIR_MODE,
+            ) {
+                Ok(()) => true,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(err) => {
+                    return Err(err).context(format!(
+                        "creating directory component `{}`",
+                        child_path.display()
+                    ));
+                }
+            };
+            let directory = match cockpit_host::private_fs::held_fd::openat(
+                parent.as_raw_fd(),
+                &cname,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            ) {
+                Ok(directory) => directory,
+                Err(err) => {
+                    if we_created {
+                        let _ = cockpit_host::private_fs::held_fd::unlinkat(
+                            parent.as_raw_fd(),
+                            &cname,
+                            libc::AT_REMOVEDIR,
+                        );
+                    }
+                    return Err(refuse_symlink_or_non_dir(child_path, err));
+                }
+            };
+            if we_created {
+                cockpit_host::private_fs::held_fd::fchmod(directory.as_raw_fd(), CREATED_DIR_MODE)
+                    .with_context(|| {
+                        format!(
+                            "setting mode of created directory `{}`",
+                            child_path.display()
+                        )
+                    })?;
+                created_paths.push(child_path.to_path_buf());
+            }
+            Ok(directory)
+        }
+        Err(err) => Err(refuse_symlink_or_non_dir(child_path, err)),
+    }
+}
+
+#[cfg(unix)]
+fn refuse_symlink_or_non_dir(path: &std::path::Path, err: std::io::Error) -> anyhow::Error {
+    match err.raw_os_error() {
+        Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => anyhow::anyhow!(
+            "refused: intermediate path component `{}` is a symlink or not a directory",
+            path.display()
+        ),
+        _ => anyhow::Error::new(err).context(format!(
+            "opening directory component `{}` without following links",
+            path.display()
+        )),
+    }
 }
 
 fn create_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1197,6 +1518,200 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    async fn write_refuses_symlinked_intermediate_planted_between_check_and_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let scope = tmp.path().join("scope");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&scope).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        ctx.write_scope = Some(scope.clone());
+
+        let nested = scope.join("nested");
+        let outside_for_hook = outside.clone();
+        set_before_parent_create_hook(move || {
+            std::os::unix::fs::symlink(&outside_for_hook, &nested).unwrap();
+        });
+
+        let err = WriteTool
+            .call(
+                serde_json::json!({
+                    "path": "scope/nested/deep/file.txt",
+                    "content": "escaped"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("symlink") || err.contains("not a directory"),
+            "{err}"
+        );
+        assert!(!outside.join("deep").exists());
+        assert!(!outside.join("deep/file.txt").exists());
+        assert!(!scope.join("nested/deep/file.txt").exists());
+        assert!(ctx.locks.holder(&scope.join("nested/deep/file.txt")).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    async fn write_revalidates_parent_directory_after_mkdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let scope = tmp.path().join("scope");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&scope).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        ctx.write_scope = Some(scope.clone());
+
+        let nested = scope.join("nested");
+        let parked = tmp.path().join("parked-nested");
+        let outside_for_hook = outside.clone();
+        set_after_parent_create_hook(move || {
+            std::fs::rename(&nested, &parked).unwrap();
+            std::fs::create_dir_all(outside_for_hook.join("deep")).unwrap();
+            std::os::unix::fs::symlink(&outside_for_hook, &nested).unwrap();
+        });
+
+        let err = WriteTool
+            .call(
+                serde_json::json!({
+                    "path": "scope/nested/deep/file.txt",
+                    "content": "escaped"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("canonicalizes outside write scope"),
+            "{err}"
+        );
+        assert!(!outside.join("deep/file.txt").exists());
+        assert!(!scope.join("nested/deep/file.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn failed_create_rolls_back_directories_this_call_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let path = tmp.path().join("nested/deep/file.txt");
+
+        ctx.locks
+            .acquire(&path, &ctx.lock_identity, ctx.session.id)
+            .await
+            .unwrap();
+        let guard = ctx
+            .locks
+            .begin_write_after_wait(
+                &path,
+                &ctx.lock_identity,
+                ctx.session.id,
+                "write",
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let err = create_new_and_release(
+            &path,
+            b"new\n",
+            guard,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "forced create failure",
+                ))
+            },
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("forced create failure"), "{err}");
+        assert!(!tmp.path().join("nested/deep").exists());
+        assert!(!tmp.path().join("nested").exists());
+        assert!(ctx.locks.holder(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_create_does_not_remove_preexisting_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("keep")).unwrap();
+        std::fs::write(tmp.path().join("keep/marker.txt"), "stay").unwrap();
+        let path = tmp.path().join("keep/nested/file.txt");
+
+        ctx.locks
+            .acquire(&path, &ctx.lock_identity, ctx.session.id)
+            .await
+            .unwrap();
+        let guard = ctx
+            .locks
+            .begin_write_after_wait(
+                &path,
+                &ctx.lock_identity,
+                ctx.session.id,
+                "write",
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let _ = create_new_and_release(
+            &path,
+            b"new\n",
+            guard,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "forced create failure",
+                ))
+            },
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(tmp.path().join("keep").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("keep/marker.txt")).unwrap(),
+            "stay"
+        );
+        assert!(!tmp.path().join("keep/nested").exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn created_parent_directories_use_explicit_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        WriteTool
+            .call(
+                serde_json::json!({"path": "nested/deep/file.txt", "content": "body"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let nested_mode =
+            std::fs::metadata(tmp.path().join("nested")).unwrap().permissions().mode() & 0o777;
+        let deep_mode =
+            std::fs::metadata(tmp.path().join("nested/deep")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(nested_mode, 0o755);
+        assert_eq!(deep_mode, 0o755);
+    }
+
     #[tokio::test]
     async fn new_file_create_does_not_grant_future_blind_overwrite() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1331,14 +1846,20 @@ mod tests {
             .await
             .unwrap();
 
-        let err = create_new_and_release(&path, b"new\n", guard, |path, _| {
-            std::fs::write(path, "raced\n")?;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map(|_| ())
-        })
+        let err = create_new_and_release(
+            &path,
+            b"new\n",
+            guard,
+            |path, _| {
+                std::fs::write(path, "raced\n")?;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map(|_| ())
+            },
+            tmp.path(),
+        )
         .await
         .unwrap_err();
 

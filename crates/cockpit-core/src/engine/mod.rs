@@ -30,6 +30,7 @@ pub(crate) mod compact_draft;
 pub mod deferred;
 pub mod deleg_shrink;
 pub mod delegation_prompt_prune;
+pub mod write_edit_arg_elision;
 pub mod docs_pipeline;
 pub mod driver;
 pub mod envelope;

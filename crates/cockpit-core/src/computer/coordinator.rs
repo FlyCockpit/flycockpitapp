@@ -1973,6 +1973,30 @@ pub enum CoordinatedOutcome {
     UnsupportedProviderVariant { detail: String },
 }
 
+/// The side-channel result of executing a coordinated computer action.
+///
+/// `outcome` is the sanitized, `Clone`, journalable terminal receipt — the
+/// only value durable sinks may record.  `live_frame` is a short-lived owner
+/// of screenshot pixels, borrowed through the screenshot boundary for
+/// continuation assembly only; it is dropped immediately after the transient
+/// provider request is built.  It is **not** `Clone` or `Serialize`.
+pub struct ExecuteArtifacts {
+    /// The sanitized terminal outcome. Journal/durable store records only this.
+    pub outcome: CoordinatedOutcome,
+    /// The live frame owning screenshot bytes, for continuation assembly only.
+    /// Dropped immediately after `build_continuation` consumes it.
+    pub live_frame: Option<LiveComputerFrame>,
+}
+
+impl std::fmt::Debug for ExecuteArtifacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecuteArtifacts")
+            .field("outcome", &self.outcome)
+            .field("has_live_frame", &self.live_frame.is_some())
+            .finish()
+    }
+}
+
 /// Translate the coordinator's concrete backend result into the durable
 /// terminal receipt for an approval capability.  In particular, an in-flight
 /// cancellation remains `None` (submission unknown), while a pre-dispatch
@@ -2154,6 +2178,12 @@ pub struct ComputerActionCoordinator {
     /// exists (separate prompt); do not fabricate pointer coordinates or
     /// claim Guarded/Stable promotions here (AC22).
     verification: VerificationStateMachine,
+    /// The live frame from the most recent dispatch, for transient
+    /// continuation assembly only. Retrieved by [`take_last_live_frame`]
+    /// after an `execute_*` call; `None` if the last dispatch did not
+    /// capture a frame or it was already taken. Never journaled or
+    /// serialized.
+    last_live_frame: Option<LiveComputerFrame>,
 }
 
 impl std::fmt::Debug for ComputerActionCoordinator {
@@ -2301,6 +2331,7 @@ impl ComputerActionCoordinator {
             denied: None,
             host_effect_cancel: tokio_util::sync::CancellationToken::new(),
             verification: VerificationStateMachine::new(),
+            last_live_frame: None,
         })
     }
 
@@ -2391,13 +2422,15 @@ impl ComputerActionCoordinator {
 
     /// Execute a batch of backend actions through the coordinator. This is
     /// the core dispatch path: authorization → pre-handoff check → commit
-    /// dispatching → backend handoff → record outcome.
+    /// dispatching → backend handoff → record outcome. Returns
+    /// [`ExecuteArtifacts`] carrying the sanitized outcome (journalable) and
+    /// the live frame (for transient continuation assembly only).
     async fn dispatch_backend_batch(
         &mut self,
         call_id: &str,
         actions: &[ComputerAction],
         _action_label: &str,
-    ) -> CoordinatedOutcome {
+    ) -> ExecuteArtifacts {
         // Generation-check BEFORE committing dispatching state, so a cancel
         // between the check and the irreversible dispatching commit is still
         // pre-handoff (zero input).  The `Dispatching` state is committed
@@ -2406,7 +2439,10 @@ impl ComputerActionCoordinator {
         if let Err(reason) = self.pre_handoff_check() {
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-            return CoordinatedOutcome::Invalidated { reason };
+            return ExecuteArtifacts {
+                outcome: CoordinatedOutcome::Invalidated { reason },
+                live_frame: None,
+            };
         }
 
         // The human approval is for the exact post-parser action batch and
@@ -2435,9 +2471,12 @@ impl ComputerActionCoordinator {
         {
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-            return CoordinatedOutcome::Denied {
-                reason: "computer action approval is no longer live for this backend handoff"
-                    .to_string(),
+            return ExecuteArtifacts {
+                outcome: CoordinatedOutcome::Denied {
+                    reason: "computer action approval is no longer live for this backend handoff"
+                        .to_string(),
+                },
+                live_frame: None,
             };
         }
 
@@ -2456,9 +2495,12 @@ impl ComputerActionCoordinator {
             .insert(call_id.to_string(), DispatchState::Completed);
 
         if let Some(failure) = report.failure {
-            return CoordinatedOutcome::Failed {
-                failure,
-                screenshot: None,
+            return ExecuteArtifacts {
+                outcome: CoordinatedOutcome::Failed {
+                    failure,
+                    screenshot: None,
+                },
+                live_frame: None,
             };
         }
 
@@ -2467,41 +2509,50 @@ impl ComputerActionCoordinator {
         // after successful input → `Completed` with `screenshot: None` (and
         // no live frame).  No second input dispatch (AC11).
         if self.pre_handoff_check().is_err() {
-            return CoordinatedOutcome::Completed {
-                completed: report.completed,
-                screenshot: None,
+            return ExecuteArtifacts {
+                outcome: CoordinatedOutcome::Completed {
+                    completed: report.completed,
+                    screenshot: None,
+                },
+                live_frame: None,
             };
         }
 
         // Capture a screenshot (transient frame through the boundary).
-        let screenshot = self.capture_screenshot(call_id).await;
+        let (screenshot, live_frame) = self.capture_screenshot(call_id).await;
 
         // Backend completion is not semantic success (the prompt calls this
         // `backend_completed`). The provider/agent interprets the observation.
         // No automatic retry. The `Completed` variant IS `backend_completed`.
-        CoordinatedOutcome::Completed {
-            completed: report.completed,
-            screenshot,
+        ExecuteArtifacts {
+            outcome: CoordinatedOutcome::Completed {
+                completed: report.completed,
+                screenshot,
+            },
+            live_frame,
         }
     }
 
-    /// Capture a screenshot through the screenshot boundary. Returns only the
-    /// sanitized projection for durable sinks. The live frame is dropped after
-    /// the transient provider request is built (by the caller).
-    async fn capture_screenshot(&mut self, call_id: &str) -> Option<SanitizedComputerFrame> {
-        let capture = self
-            .backend
-            .execute_one(&ComputerAction::CaptureFull)
-            .await
-            .ok()?;
+    /// Capture a screenshot through the screenshot boundary. Returns the
+    /// sanitized projection for durable sinks **and** the live frame for
+    /// transient provider request assembly. The caller must drop the live
+    /// frame immediately after `build_continuation` consumes it.
+    async fn capture_screenshot(
+        &mut self,
+        call_id: &str,
+    ) -> (Option<SanitizedComputerFrame>, Option<LiveComputerFrame>) {
+        let capture = match self.backend.execute_one(&ComputerAction::CaptureFull).await {
+            Ok(c) => c,
+            Err(_) => return (None, None),
+        };
         let ComputerActionOutcome::Captured(capture_frame) = capture else {
-            return None;
+            return (None, None);
         };
         let dims = FrameDimensions::from_capture(&capture_frame);
         let reservation: Box<dyn MediaReservationHandle> = Box::new(
             InMemoryReservationHandle::new(Arc::new(std::sync::atomic::AtomicBool::new(false))),
         );
-        let live = LiveComputerFrame::try_new(
+        let live = match LiveComputerFrame::try_new(
             capture_frame.png,
             ScreenshotMediaType::Png,
             dims,
@@ -2510,13 +2561,15 @@ impl ComputerActionCoordinator {
             CaptureEpoch(self.observation_generation.0),
             reservation,
             None,
-        )
-        .ok()?;
+        ) {
+            Ok(live) => live,
+            Err(_) => return (None, None),
+        };
         let sanitized = live.sanitized();
-        // The live frame is dropped here; the caller builds transient provider
-        // requests separately if needed. Only the sanitized projection is
-        // returned.
-        Some(sanitized)
+        // Return both: the sanitized projection for durable sinks and the
+        // live frame for transient continuation assembly. The caller drops
+        // the live frame after building the transient provider request.
+        (Some(sanitized), Some(live))
     }
 
     /// Authorize a computer action through the central authorizer.
@@ -3029,6 +3082,8 @@ impl ComputerActionCoordinator {
         call_id: &str,
         actions: &[OpenAiComputerAction],
     ) -> CoordinatedOutcome {
+        // Clear any stale live frame from a previous dispatch.
+        self.last_live_frame = None;
         // Build the backend action list + action identity BEFORE any dedup, so
         // the identity check is the PRIMARY dedup key. A reused (session,
         // delegation, provider_call_id, batch_index) with a DIFFERENT payload is
@@ -3147,12 +3202,51 @@ impl ComputerActionCoordinator {
         }
 
         // Dispatch through the backend.
-        let outcome = self
+        let artifacts = self
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;
+        let outcome = artifacts.outcome;
+        self.last_live_frame = artifacts.live_frame;
         self.journal.record(call_id, outcome.clone());
         self.journal.record_identity(identity, payload_digest);
         outcome
+    }
+
+    /// Execute a [`NativeComputerCall`] through the coordinator, returning
+    /// [`ExecuteArtifacts`] with both the sanitized outcome (journalable) and
+    /// the live frame (for transient continuation assembly only). This is the
+    /// single entry point the live loop calls.
+    pub async fn execute_native_call(
+        &mut self,
+        call: &NativeComputerCall,
+    ) -> ExecuteArtifacts {
+        match call {
+            NativeComputerCall::OpenAi { call_id, actions } => {
+                let outcome = self.execute_openai_call(call_id, actions).await;
+                let live_frame = self.take_last_live_frame();
+                ExecuteArtifacts { outcome, live_frame }
+            }
+            NativeComputerCall::Anthropic20251124 { tool_use_id, action } => {
+                let outcome = self
+                    .execute_anthropic_20251124_call(tool_use_id, action)
+                    .await;
+                let live_frame = self.take_last_live_frame();
+                ExecuteArtifacts { outcome, live_frame }
+            }
+            NativeComputerCall::Anthropic20250124 { tool_use_id, action } => {
+                let outcome = self
+                    .execute_anthropic_20250124_call(tool_use_id, action)
+                    .await;
+                let live_frame = self.take_last_live_frame();
+                ExecuteArtifacts { outcome, live_frame }
+            }
+            NativeComputerCall::UnsupportedVariant { detail, .. } => ExecuteArtifacts {
+                outcome: CoordinatedOutcome::UnsupportedProviderVariant {
+                    detail: detail.clone(),
+                },
+                live_frame: None,
+            },
+        }
     }
 
     /// Execute an Anthropic 2025-11-24 computer call through the coordinator.
@@ -3184,6 +3278,8 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20251124ComputerAction,
     ) -> CoordinatedOutcome {
+        // Clear any stale live frame from a previous dispatch.
+        self.last_live_frame = None;
         // Identity is the PRIMARY dedup key (built before any dedup), so a reused
         // call id with a DIFFERENT payload is an identity_conflict with zero
         // dispatch rather than a stale DuplicateReplay (AC14).
@@ -3284,9 +3380,11 @@ impl ComputerActionCoordinator {
             return outcome;
         }
 
-        let outcome = self
+        let artifacts = self
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;
+        let outcome = artifacts.outcome;
+        self.last_live_frame = artifacts.live_frame;
         self.journal.record(call_id, outcome.clone());
         self.journal.record_identity(identity, payload_digest);
         outcome
@@ -3321,6 +3419,8 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20250124ComputerAction,
     ) -> CoordinatedOutcome {
+        // Clear any stale live frame from a previous dispatch.
+        self.last_live_frame = None;
         // Identity is the PRIMARY dedup key (built before any dedup), so a reused
         // call id with a DIFFERENT payload is an identity_conflict with zero
         // dispatch rather than a stale DuplicateReplay (AC14).
@@ -3421,9 +3521,11 @@ impl ComputerActionCoordinator {
             return outcome;
         }
 
-        let outcome = self
+        let artifacts = self
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;
+        let outcome = artifacts.outcome;
+        self.last_live_frame = artifacts.live_frame;
         self.journal.record(call_id, outcome.clone());
         self.journal.record_identity(identity, payload_digest);
         outcome
@@ -3532,6 +3634,15 @@ impl ComputerActionCoordinator {
     /// qualification deferred until backend pointer evidence exists).
     pub fn verification(&self) -> &VerificationStateMachine {
         &self.verification
+    }
+
+    /// Take the live frame from the most recent dispatch, for transient
+    /// continuation assembly only. Returns `None` if the last dispatch did
+    /// not capture a frame or it was already taken. The caller must drop
+    /// the frame immediately after `build_continuation` consumes it.
+    /// Never journaled or serialized.
+    pub fn take_last_live_frame(&mut self) -> Option<LiveComputerFrame> {
+        self.last_live_frame.take()
     }
 
     /// The session ID this coordinator serves.

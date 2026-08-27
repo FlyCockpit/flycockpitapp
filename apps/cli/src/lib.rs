@@ -46,8 +46,8 @@ pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
     diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
     knowledge, locks, mcp, media_reservation, model_system_prompt, packages, providers, redact,
-    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools,
-    user_agent, welcome, wizard,
+    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools, user_agent, welcome,
+    wizard,
 };
 
 /// Narrow process-boundary fixtures used by the CLI's integration tests.
@@ -242,9 +242,9 @@ pub mod integration {
                     initial_model: None,
                     no_sandbox: false,
                     interactive,
-                    session_entry_mode: session_id.is_none().then_some(
-                        crate::daemon::proto::SessionEntryMode::Code,
-                    ),
+                    session_entry_mode: session_id
+                        .is_none()
+                        .then_some(crate::daemon::proto::SessionEntryMode::Code),
                     model_override: None,
                     client_protocol_version: self.inner.negotiated().version,
                     env_snapshot: None,
@@ -710,6 +710,15 @@ async fn install_cli_trust_policy(project: Option<&Path>) -> anyhow::Result<()> 
 }
 
 fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
+    // `--ephemeral` starts a private daemon that cannot share the exclusive
+    // ledger lock with a persistent instance. Do not auto-promote one here;
+    // the run path reads trust from the daemon it actually owns.
+    if matches!(
+        command,
+        Some(Command::Run(args)) if args.ephemeral
+    ) {
+        return false;
+    }
     !matches!(
         command,
         Some(Command::Debug(crate::cli::DebugCommand::Paths))

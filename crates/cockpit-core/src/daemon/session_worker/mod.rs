@@ -52,9 +52,13 @@ pub(crate) const EVENT_BROADCAST_CAPACITY: usize = 1024;
 /// debug builds even though the worker futures are boxed at their spawn
 /// boundaries: the limiting factor is poll-stack depth, not future size.
 /// Measurements on Linux x86_64 found 2 MiB failed and 2.5 MiB passed, but
-/// repeated full-workspace stress remained flaky at 4 MiB. Production and
-/// live-worker integration tests therefore share this 8 MiB ceiling.
-pub const TOKIO_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// repeated full-workspace stress remained flaky at 4 MiB. Agent-tree
+/// recovery plus the deferred-session persist that must precede those
+/// durable rows overflowed the previous 8 MiB ceiling on the first
+/// attach/send of a new session. The first approval-interrupt turn then
+/// overflowed 16 MiB. Production and live-worker integration tests
+/// therefore share this 32 MiB ceiling.
+pub const TOKIO_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 const LOCK_SNAPSHOT_WORK_LIMIT: usize = 4;
 static LOCK_SNAPSHOT_WORK: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -517,12 +521,12 @@ pub use effective_sandbox::{
     evaluate_set_sandbox, sandbox_capability_snapshot, sandbox_capability_snapshot_with_reasons,
     sandbox_mode_available, sandbox_mode_selectable, unpublished_host_capability_snapshot,
 };
+pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime};
 pub use handle::{
     InteractiveClientGuard, OversizedRunInvocationAdmission, OversizedTextArtifactAdmission,
     ReplaceConfigSnapshotResult, SessionConfigHandle, SessionConfigSnapshot, SessionWork,
     SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
 };
-pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime};
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 pub(crate) use helpers::daemon_no_sandbox;
 #[allow(unused_imports)]

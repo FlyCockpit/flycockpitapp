@@ -2565,13 +2565,9 @@ impl DaemonContext {
             registry.set_scheduler(handle.clone());
         }
         let host_capabilities = crate::host_capabilities::HostCapabilitySnapshotStore::new();
-        let host_capability_probes = crate::host_capabilities::HostCapabilityProbeInputs::production(
-            canonical_cwd.clone(),
-        );
-        registry.set_host_capabilities(
-            host_capabilities.clone(),
-            host_capability_probes.clone(),
-        );
+        let host_capability_probes =
+            crate::host_capabilities::HostCapabilityProbeInputs::production(canonical_cwd.clone());
+        registry.set_host_capabilities(host_capabilities.clone(), host_capability_probes.clone());
         struct DaemonMediaClock(Instant);
         impl crate::media_reservation::MonotonicClock for DaemonMediaClock {
             fn now_ms(&self) -> u64 {
@@ -3598,15 +3594,17 @@ pub(crate) async fn boot_with_db(
         .await
         .context("fencing prior-process host capability refresh executions")?;
     if fenced_refreshes > 0 {
-        tracing::warn!(fenced_refreshes, "fenced global host capability refresh executions from a prior daemon process");
+        tracing::warn!(
+            fenced_refreshes,
+            "fenced global host capability refresh executions from a prior daemon process"
+        );
     }
     anyhow::ensure!(
-        !db
-            .has_executing_host_capability_refresh_operations(
-                crate::agent_tree::daemon_host_capability_refresh_authority(),
-            )
-            .await
-            .context("checking global host capability refresh execution fence")?,
+        !db.has_executing_host_capability_refresh_operations(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+        )
+        .await
+        .context("checking global host capability refresh execution fence")?,
         "host capability refresh execution fence remains live after boot reconciliation"
     );
     #[cfg_attr(test, allow(unused_mut))]
@@ -3621,7 +3619,7 @@ pub(crate) async fn boot_with_db(
             crate::agent_tree::daemon_host_capability_refresh_authority(),
         )
         .await
-            .context("loading published host capability refresh receipt")?
+        .context("loading published host capability refresh receipt")?
     {
         Some(receipt) => {
             let snapshot: cockpit_proto::HostCapabilitySnapshot = serde_json::from_str(
@@ -3632,7 +3630,8 @@ pub(crate) async fn boot_with_db(
                 snapshot.generation == receipt.generation,
                 "durable host capability refresh receipt generation disagrees with its snapshot"
             );
-            ctx.host_capabilities.observe_durable_generation(receipt.generation);
+            ctx.host_capabilities
+                .observe_durable_generation(receipt.generation);
             ctx.host_capabilities
                 .publish_committed(snapshot)
                 .map_err(anyhow::Error::msg)
@@ -3830,7 +3829,8 @@ pub(crate) async fn boot_with_db(
                                 fix_command,
                             } => cockpit_proto::SecretStoreSnapshot {
                                 intent: cockpit_proto::SecretStoreIntent::Keyring,
-                                effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
+                                effective_placement:
+                                    cockpit_proto::SecretStorePlacement::Unavailable,
                                 fail_closed_reason: Some(reason.clone()),
                                 fix_command: fix_command.clone(),
                             },
@@ -6392,8 +6392,8 @@ mod sessions_remote;
 mod tests;
 
 pub use attachments::validate_png_attachment_blocking;
-pub use dispatch::request_shutdown;
 pub(crate) use dispatch::CONFIG_PUBLICATION_RPC_LOCK;
+pub use dispatch::request_shutdown;
 pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> {
     dispatch::spawn_lock_sweeper(ctx)
 }

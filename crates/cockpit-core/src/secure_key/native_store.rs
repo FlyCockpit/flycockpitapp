@@ -25,6 +25,29 @@ pub trait NativeKeyStore: Send + Sync {
 /// Production adapter: uses keyring_core::Entry against the default store.
 pub struct KeyringNativeStore;
 
+/// zbus's blocking Secret Service API calls `block_on`. That panics on a
+/// Tokio worker (daemon boot, `DaemonContext::new`, vault first-run). Run
+/// the entry op on a dedicated thread whenever a runtime is already active.
+fn with_keyring_off_runtime<T, F>(op: F) -> Result<T, SecureKeyError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, SecureKeyError> + Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::Builder::new()
+            .name("cockpit-keyring-io".into())
+            .spawn(op)
+            .map_err(|e| SecureKeyError::Unavailable(format!("keyring io thread: {e}")))?
+            .join()
+            .unwrap_or_else(|_| {
+                Err(SecureKeyError::Unavailable(
+                    "keyring io thread panicked".into(),
+                ))
+            });
+    }
+    op()
+}
+
 impl NativeKeyStore for KeyringNativeStore {
     fn set_secret(
         &self,
@@ -32,30 +55,43 @@ impl NativeKeyStore for KeyringNativeStore {
         account: &str,
         secret: &[u8],
     ) -> Result<(), SecureKeyError> {
-        let entry =
-            keyring_core::Entry::new(service, account).map_err(super::error::map_keyring_error)?;
-        entry
-            .set_secret(secret)
-            .map_err(super::error::map_keyring_error)
+        let service = service.to_owned();
+        let account = account.to_owned();
+        let secret = secret.to_vec();
+        with_keyring_off_runtime(move || {
+            let entry = keyring_core::Entry::new(&service, &account)
+                .map_err(super::error::map_keyring_error)?;
+            entry
+                .set_secret(&secret)
+                .map_err(super::error::map_keyring_error)
+        })
     }
 
     fn get_secret(&self, service: &str, account: &str) -> Result<TempSecret, SecureKeyError> {
-        let entry =
-            keyring_core::Entry::new(service, account).map_err(super::error::map_keyring_error)?;
-        let bytes = entry
-            .get_secret()
-            .map_err(super::error::map_keyring_error)?;
-        Ok(TempSecret::from_vec(bytes))
+        let service = service.to_owned();
+        let account = account.to_owned();
+        with_keyring_off_runtime(move || {
+            let entry = keyring_core::Entry::new(&service, &account)
+                .map_err(super::error::map_keyring_error)?;
+            let bytes = entry
+                .get_secret()
+                .map_err(super::error::map_keyring_error)?;
+            Ok(TempSecret::from_vec(bytes))
+        })
     }
 
     fn delete_secret(&self, service: &str, account: &str) -> Result<(), SecureKeyError> {
-        let entry =
-            keyring_core::Entry::new(service, account).map_err(super::error::map_keyring_error)?;
-        match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(e) => Err(super::error::map_keyring_error(e)),
-        }
+        let service = service.to_owned();
+        let account = account.to_owned();
+        with_keyring_off_runtime(move || {
+            let entry = keyring_core::Entry::new(&service, &account)
+                .map_err(super::error::map_keyring_error)?;
+            match entry.delete_credential() {
+                Ok(()) => Ok(()),
+                Err(keyring_core::Error::NoEntry) => Ok(()),
+                Err(e) => Err(super::error::map_keyring_error(e)),
+            }
+        })
     }
 }
 

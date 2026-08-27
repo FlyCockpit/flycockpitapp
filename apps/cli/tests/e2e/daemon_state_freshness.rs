@@ -73,6 +73,19 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
     home.trust_project();
+    // `trust set` starts a persistent daemon that holds the exclusive boot
+    // lock. Ephemeral and persistent cannot share that lock; stop the
+    // trust-started process before the explicit ephemeral daemon boots.
+    let stop_trust_daemon = home
+        .cockpit()
+        .args(["daemon", "stop", "--grace", "0"])
+        .output()
+        .expect("stop trust-started persistent daemon");
+    assert_success(
+        "stop trust-started persistent daemon",
+        &stop_trust_daemon,
+        &home,
+    );
 
     let ephemeral_socket = home
         .socket_path()
@@ -213,17 +226,23 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     );
 }
 
-#[test]
-fn daemon_refuses_newer_migration_ledger() {
-    let home = IsolatedHome::new();
-    let initialize = home
-        .cockpit()
-        .args(["doctor", "--offline"])
+#[tokio::test]
+async fn daemon_refuses_newer_migration_ledger() {
+    // Doctor is read-only and never materializes SQLite. Boot (then stop) a
+    // real daemon so the ledger exists before we seed a future migration row.
+    let daemon = SpawnedDaemon::start().await;
+    let stop = daemon
+        .command()
+        .args(["daemon", "stop", "--grace", "0"])
         .output()
-        .expect("initialize current database");
-    assert_failure("doctor without providers", &initialize, &home);
+        .expect("stop daemon before seeding newer migration ledger");
+    assert_success(
+        "stop daemon before seeding newer migration ledger",
+        &stop,
+        daemon.home(),
+    );
 
-    let conn = Connection::open(home.db_path()).expect("open current DB");
+    let conn = Connection::open(daemon.db_path()).expect("open current DB");
     let fingerprint: String = conn
         .query_row(
             "SELECT schema_fingerprint FROM schema_version WHERE version = ?1",
@@ -243,12 +262,12 @@ fn daemon_refuses_newer_migration_ledger() {
     .expect("seed newer migration ledger");
     drop(conn);
 
-    let output = home
-        .cockpit()
+    let output = daemon
+        .command()
         .args(["daemon", "start", "--foreground"])
         .output()
         .expect("start daemon against newer migration ledger");
-    assert_failure("newer-ledger daemon start", &output, &home);
+    assert_failure("newer-ledger daemon start", &output, daemon.home());
     let text = output_text(&output);
     assert!(
         text.contains("incompatible prerelease database schema v2")
@@ -256,14 +275,15 @@ fn daemon_refuses_newer_migration_ledger() {
         "{text}"
     );
     assert!(
-        !home.pid_file().exists(),
+        !daemon.home().pid_file().exists(),
         "newer-ledger daemon pid file survived"
     );
     assert!(
-        !home.socket_path().exists(),
+        !daemon.socket_path().exists(),
         "newer-ledger daemon socket survived"
     );
-    let endpoint = home
+    let endpoint = daemon
+        .home()
         .pid_file()
         .parent()
         .expect("daemon state dir")

@@ -19,16 +19,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
+use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
-use thiserror::Error;
 use uuid::Uuid;
 
 use crate::config::extended::ExtendedConfig;
 use crate::config::providers::{ActiveModelRef, ProvidersConfig};
 use crate::config::trust::{
-    WorkspaceTrustError, WorkspaceTrustPolicy,
-    resolve_workspace_trust_policy_with_revision_from_db,
+    WorkspaceTrustError, WorkspaceTrustPolicy, resolve_workspace_trust_policy_with_revision_from_db,
 };
 use crate::daemon::EventSender;
 use crate::daemon::server::CONFIG_PUBLICATION_RPC_LOCK;
@@ -557,16 +556,12 @@ fn next_generation(state: &mut WorkerState) -> WorkerGeneration {
 fn forget_generation_from_inner(inner: &Inner, session_id: Uuid, generation: WorkerGeneration) {
     let retained_by_activation = {
         let mut workers = crate::sync::lock_or_recover(&inner.workers);
-        if workers
-            .live
-            .get(&session_id)
-            .is_some_and(|entry| {
-                entry.generation == generation
-                    && entry.activation_leases == 0
-                    && (!entry.terminal_closing.load(Ordering::Acquire)
-                        || entry.terminal_cleanup_complete.load(Ordering::Acquire))
-            })
-        {
+        if workers.live.get(&session_id).is_some_and(|entry| {
+            entry.generation == generation
+                && entry.activation_leases == 0
+                && (!entry.terminal_closing.load(Ordering::Acquire)
+                    || entry.terminal_cleanup_complete.load(Ordering::Acquire))
+        }) {
             workers.live.remove(&session_id);
             false
         } else {
@@ -1195,8 +1190,8 @@ impl SessionRegistry {
         // a later ambient `COCKPIT_CONFIG` redirect, this preserves exact
         // provenance for global provider/model choices so an attached
         // SetModelFavorite can mutate only its observed retained source.
-        let mut workspace_layer = workspace_root_authority
-            .capture_retained_config_source_chain(&trust_policy)?;
+        let mut workspace_layer =
+            workspace_root_authority.capture_retained_config_source_chain(&trust_policy)?;
         let (mut providers_cfg, mut extended_cfg) = self
             .inner
             .config_source
@@ -1204,7 +1199,7 @@ impl SessionRegistry {
                 &project_root,
                 &trust_policy,
                 &workspace_layer,
-        )?;
+            )?;
         let mut hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
         let config_watch_paths = workspace_root_authority.config_watch_paths();
         if let (Some(initial), Some(pinned)) = (&initial_model, model_override) {
@@ -1226,7 +1221,9 @@ impl SessionRegistry {
             session_worker::initial_active_agent_for_llm_mode(&extended_cfg, llm_mode);
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
-        // un-written. The worker persists it on the first user message.
+        // un-written until `start_worker` flushes it, immediately before
+        // durable lifecycle rows (agent-tree, write-scope) that foreign-key
+        // to `sessions`.
         let mut session = Session::create_deferred(
             self.inner.db.clone(),
             project_root,
@@ -1265,8 +1262,8 @@ impl SessionRegistry {
         if current_trust.revision != trust_revision || current_trust.policy != trust_policy {
             trust_policy = current_trust.policy;
             trust_revision = current_trust.revision;
-            workspace_layer = workspace_root_authority
-                .capture_retained_config_source_chain(&trust_policy)?;
+            workspace_layer =
+                workspace_root_authority.capture_retained_config_source_chain(&trust_policy)?;
             (providers_cfg, extended_cfg) = self
                 .inner
                 .config_source
@@ -1305,8 +1302,8 @@ impl SessionRegistry {
     }
 
     /// Create a new assistant session through the normal daemon worker path,
-    /// preserving deferred-persistence semantics. The session row is not
-    /// inserted until the worker receives the first user message.
+    /// preserving deferred-persistence semantics until `start_worker` flushes
+    /// the row, immediately before durable lifecycle setup.
     pub async fn create_assistant_session(
         &self,
         assistant_name: &str,
@@ -1335,8 +1332,8 @@ impl SessionRegistry {
                 &trust_policy,
             )?,
         );
-        let mut workspace_layer = workspace_root_authority
-            .capture_retained_config_source_chain(&trust_policy)?;
+        let mut workspace_layer =
+            workspace_root_authority.capture_retained_config_source_chain(&trust_policy)?;
         let (mut providers_cfg, mut extended_cfg) = self
             .inner
             .config_source
@@ -1344,7 +1341,7 @@ impl SessionRegistry {
                 &project_root,
                 &trust_policy,
                 &workspace_layer,
-        )?;
+            )?;
         let mut hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
         let config_watch_paths = workspace_root_authority.config_watch_paths();
         let active = initial_model
@@ -1382,8 +1379,8 @@ impl SessionRegistry {
         if current_trust.revision != trust_revision || current_trust.policy != trust_policy {
             trust_policy = current_trust.policy;
             trust_revision = current_trust.revision;
-            workspace_layer = workspace_root_authority
-                .capture_retained_config_source_chain(&trust_policy)?;
+            workspace_layer =
+                workspace_root_authority.capture_retained_config_source_chain(&trust_policy)?;
             (providers_cfg, extended_cfg) = self
                 .inner
                 .config_source
@@ -1455,8 +1452,8 @@ impl SessionRegistry {
                 &trust_policy,
             )?,
         );
-        let mut workspace_layer = workspace_root_authority
-            .capture_retained_config_source_chain(&trust_policy)?;
+        let mut workspace_layer =
+            workspace_root_authority.capture_retained_config_source_chain(&trust_policy)?;
         let (mut providers_cfg, mut extended_cfg) = self
             .inner
             .config_source
@@ -1464,7 +1461,7 @@ impl SessionRegistry {
                 &session.project_root,
                 &trust_policy,
                 &workspace_layer,
-        )?;
+            )?;
         let mut hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
         let config_watch_paths = workspace_root_authority.config_watch_paths();
         // Async pre-resolve referenced command-backed secrets before the sync
@@ -1481,8 +1478,8 @@ impl SessionRegistry {
         if current_trust.revision != trust_revision || current_trust.policy != trust_policy {
             trust_policy = current_trust.policy;
             trust_revision = current_trust.revision;
-            workspace_layer = workspace_root_authority
-                .capture_retained_config_source_chain(&trust_policy)?;
+            workspace_layer =
+                workspace_root_authority.capture_retained_config_source_chain(&trust_policy)?;
             (providers_cfg, extended_cfg) = self
                 .inner
                 .config_source
@@ -1772,6 +1769,13 @@ impl SessionRegistry {
                 .set_active_model_ref(staged_recovery)
                 .context("committing recovered session model after worker validation")?;
         }
+        // Agent-tree and write-scope rows foreign-key to `sessions`. Flush
+        // the deferred row here, after every fallible construction step and
+        // the recovery model commit, so a new worker never inserts those
+        // dependents against a missing parent.
+        session
+            .persist_if_needed()
+            .context("persisting deferred session before durable lifecycle setup")?;
         let terminal_lock_cleanup_gate = Arc::new(AsyncMutex::new(()));
         let terminal_closing = Arc::new(AtomicBool::new(false));
         let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));
@@ -2725,7 +2729,7 @@ mod tests {
 
     #[tokio::test]
     async fn modes_session_setup_preflight_authority_survives_config_override_change_for_every_start_path()
-    {
+     {
         fn write_explicit_model_config(path: &std::path::Path, model: &str) {
             let providers = path.parent().expect("config parent").join("providers");
             std::fs::create_dir_all(&providers).expect("create explicit provider directory");
@@ -2738,9 +2742,7 @@ mod tests {
             .expect("write explicit config");
             std::fs::write(
                 providers.join("lmstudio.json"),
-                format!(
-                    r#"{{"url":"http://127.0.0.1:9/v1","models":[{{"id":"{model}"}}]}}"#
-                ),
+                format!(r#"{{"url":"http://127.0.0.1:9/v1","models":[{{"id":"{model}"}}]}}"#),
             )
             .expect("write explicit provider");
         }
@@ -2765,14 +2767,10 @@ mod tests {
                 "worker snapshot must be the same preflight config"
             );
             assert!(
-                handle
-                    .config_snapshot()
-                    .hooks
-                    .hooks
-                    .iter()
-                    .any(|hook| hook.command.first().is_some_and(|command| {
-                        command == &format!("hook-{model}")
-                    })),
+                handle.config_snapshot().hooks.hooks.iter().any(|hook| hook
+                    .command
+                    .first()
+                    .is_some_and(|command| { command == &format!("hook-{model}") })),
                 "worker hooks must be the same preflight config"
             );
         }
@@ -2839,8 +2837,8 @@ mod tests {
         );
 
         let assistant_name = "preflight-authority";
-        let assistant_home = crate::assistants::default_home_dir(assistant_name)
-            .expect("canonical assistant home");
+        let assistant_home =
+            crate::assistants::default_home_dir(assistant_name).expect("canonical assistant home");
         crate::assistants::create_assistant(
             &reg.inner.db,
             crate::assistants::CreateAssistantSpec {
@@ -2854,13 +2852,7 @@ mod tests {
         .expect("create verified assistant");
         env.set_cockpit_config(&config_a);
         let assistant = reg
-            .create_assistant_session(
-                assistant_name,
-                workspace.clone(),
-                None,
-                false,
-                daemon_env(),
-            )
+            .create_assistant_session(assistant_name, workspace.clone(), None, false, daemon_env())
             .await
             .expect("assistant creation through preflight A");
         assert_preflight_model(&assistant, "model-a");
@@ -2873,7 +2865,11 @@ mod tests {
         let persisted = reg
             .inner
             .db
-            .create_session("provider", workspace.to_str().expect("workspace UTF-8"), "Build")
+            .create_session(
+                "provider",
+                workspace.to_str().expect("workspace UTF-8"),
+                "Build",
+            )
             .await
             .expect("durable session for resume");
         env.set_cockpit_config(&config_a);
@@ -3572,7 +3568,10 @@ mod tests {
                 .is_none(),
             "a closed generation A must fail before it can resume a successor"
         );
-        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+        assert!(matches!(
+            reg.claim_attach(session_id),
+            AttachClaim::Start(_)
+        ));
     }
 
     #[tokio::test]
@@ -3604,7 +3603,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+        assert!(matches!(
+            reg.claim_attach(session_id),
+            AttachClaim::Start(_)
+        ));
     }
 
     #[tokio::test]
@@ -3631,7 +3633,10 @@ mod tests {
             .expect("cleanup retry succeeds");
         drop(claim);
 
-        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+        assert!(matches!(
+            reg.claim_attach(session_id),
+            AttachClaim::Start(_)
+        ));
         assert!(
             reg.live_generation(session_id).is_none(),
             "the cleaned terminal generation is removed before a successor starts"
@@ -3649,17 +3654,19 @@ mod tests {
         };
         let generation = ticket.generation();
         let (handle, closed_rx) = test_handle_with_rx(&reg, session);
-        crate::sync::lock_or_recover(&reg.inner.workers).live.insert(
-            session_id,
-            WorkerEntry {
-                generation,
-                handle: handle.clone(),
-                activation_leases: 0,
-                terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
-                terminal_closing: Arc::new(AtomicBool::new(false)),
-                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
-            },
-        );
+        crate::sync::lock_or_recover(&reg.inner.workers)
+            .live
+            .insert(
+                session_id,
+                WorkerEntry {
+                    generation,
+                    handle: handle.clone(),
+                    activation_leases: 0,
+                    terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
+                    terminal_closing: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                },
+            );
         let result = Ok(handle);
         reg.finish_attach_start(ticket, &result);
 
@@ -3668,9 +3675,15 @@ mod tests {
             .expect("published Start generation must receive an activation lease");
         drop(closed_rx);
         reg.forget_generation(session_id, generation);
-        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Activating));
+        assert!(matches!(
+            reg.claim_attach(session_id),
+            AttachClaim::Activating
+        ));
         drop(claim);
-        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+        assert!(matches!(
+            reg.claim_attach(session_id),
+            AttachClaim::Start(_)
+        ));
     }
 
     #[tokio::test]
@@ -3688,17 +3701,19 @@ mod tests {
             _ => panic!("second attach must wait on the first generation"),
         };
         let (handle, closed_rx) = test_handle_with_rx(&reg, session);
-        crate::sync::lock_or_recover(&reg.inner.workers).live.insert(
-            session_id,
-            WorkerEntry {
-                generation,
-                handle: handle.clone(),
-                activation_leases: 0,
-                terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
-                terminal_closing: Arc::new(AtomicBool::new(false)),
-                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
-            },
-        );
+        crate::sync::lock_or_recover(&reg.inner.workers)
+            .live
+            .insert(
+                session_id,
+                WorkerEntry {
+                    generation,
+                    handle: handle.clone(),
+                    activation_leases: 0,
+                    terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
+                    terminal_closing: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                },
+            );
         let result = Ok(handle);
         reg.finish_attach_start(ticket, &result);
         wait_for_start(slot)
@@ -3710,9 +3725,15 @@ mod tests {
             .expect("Starting waiter must lease the exact published generation");
         drop(closed_rx);
         reg.forget_generation(session_id, generation);
-        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Activating));
+        assert!(matches!(
+            reg.claim_attach(session_id),
+            AttachClaim::Activating
+        ));
         drop(claim);
-        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+        assert!(matches!(
+            reg.claim_attach(session_id),
+            AttachClaim::Start(_)
+        ));
     }
 
     #[test]

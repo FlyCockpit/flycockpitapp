@@ -228,8 +228,8 @@ impl Session {
             "entry mode may only be set before a new session is persisted"
         );
         self.session_entry_mode = mode;
-        let staged = self
-            .stage_pending_row(|row| row.session_entry_mode = mode.as_str().to_string());
+        let staged =
+            self.stage_pending_row(|row| row.session_entry_mode = mode.as_str().to_string());
         anyhow::ensure!(
             staged,
             "deferred session row disappeared while setting entry mode"
@@ -285,11 +285,12 @@ impl Session {
     /// which are persisted from the start.
     ///
     /// This is the **only** flush point, and it MUST be called before any
-    /// row that references the session (tool_calls, inference_calls, locks,
-    /// …) so the FK/ordering invariant holds. The session worker calls it on
-    /// the first user message, ahead of dispatching it to the driver. The
-    /// stored row carries the latest provider/model so a model picked before
-    /// the first message survives the deferred write.
+    /// row that references the session (agent-tree, write-scope, tool_calls,
+    /// inference_calls, locks, …) so the FK/ordering invariant holds. The
+    /// registry flushes it after worker construction succeeds and before
+    /// spawn; the worker repeats it before durable lifecycle setup and again
+    /// on the first user message (idempotent). The stored row carries the
+    /// latest provider/model so a model picked before the flush survives.
     pub fn persist_if_needed(&self) -> Result<bool> {
         // Model mutation and the deferred INSERT share this lock so a picker
         // update cannot be overwritten by an older selection snapshot.

@@ -648,6 +648,12 @@ impl Db {
     pub fn open_default_read_only_diagnostic() -> Result<Self> {
         let path = Self::default_path()?;
         if !path.is_file() {
+            if let Some(blocker) = path.ancestors().skip(1).find(|p| p.exists() && !p.is_dir()) {
+                anyhow::bail!(
+                    "database path is not openable because {} is not a directory",
+                    blocker.display()
+                );
+            }
             anyhow::bail!("database does not exist at {}", path.display());
         }
         let diagnostic_lock = Arc::new(files::DatabaseDiagnosticLock::try_acquire(&path)?);
@@ -1337,6 +1343,13 @@ fn create_migration_backup_with_limit(
             remove_backup_candidate(&displaced)?;
         }
         prune_untrusted_migration_backups(path)?;
+        // A future ledger cannot be a trusted compiled-schema backup. The
+        // quarantine is the recovery artifact; the open path still has to
+        // prove incompatibility through `verify_ledger` so the user sees
+        // the schema refusal, not only the backup-trust failure.
+        if reason == "rejecting a future prerelease schema" {
+            return Ok(());
+        }
         return Err(error);
     }
     let displaced = handle_invalid_quarantine_occupant(path, &untrusted)?;

@@ -711,8 +711,11 @@ fn read_process_executable(_pid: u32) -> std::io::Result<PathBuf> {
     ))
 }
 
+/// Kernel existence probe (`kill(pid, 0)`). Used by restart to wait until a
+/// draining daemon has actually exited and released its exclusive boot lock,
+/// not merely unlinked its pid/socket files.
 #[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
+pub fn process_exists(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return true;
     };

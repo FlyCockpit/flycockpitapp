@@ -142,15 +142,19 @@ pub(crate) fn host_approval_response_allows(
 
 /// Validate the only response shapes that may terminally decline a real host
 /// approval.  Cancellation is explicit; a deny must be the exact `Single`
-/// option offered by that same persisted approval question.  In particular,
-/// a batch, multi-select, free-text value, foreign option ID, or an allow-like
-/// option cannot be laundered into the cancellation path.
+/// option offered by that same persisted approval question.  The structured
+/// `cockpit run` auto-deny sentinel is the one non-UI free-text envelope that
+/// may decline: it is the same protocol constant already decoded as
+/// [`Decision::NoninteractiveDeny`]. Arbitrary free-text, a batch,
+/// multi-select, foreign option ID, or an allow-like option cannot be
+/// laundered into the cancellation path.
 pub(crate) fn host_approval_response_declines(
     response: &ResolveResponse,
     offered: &InterruptQuestionSet,
 ) -> bool {
     match response {
         ResolveResponse::Cancel => true,
+        ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL => true,
         ResolveResponse::Single { selected_id } => {
             let [InterruptQuestion::Single { options, .. }] = offered.questions.as_slice() else {
                 return false;
@@ -573,14 +577,18 @@ impl Approver {
                 input,
                 target,
             } => {
-                self.approve_mcp_tool_inner(server, tool, input, target).await
+                self.approve_mcp_tool_inner(server, tool, input, target)
+                    .await
             }
             AuthorizationRequest::CustomTool {
                 tool,
                 command,
                 input,
                 cwd,
-            } => self.approve_custom_tool_inner(tool, command, input, cwd).await,
+            } => {
+                self.approve_custom_tool_inner(tool, command, input, cwd)
+                    .await
+            }
             AuthorizationRequest::McpServerConnect { server, identity } => {
                 self.approve_mcp_server_connect_inner(server, identity)
                     .await
@@ -2299,8 +2307,7 @@ mod tests {
             action_class: "unknown",
             action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             lease_binding_digest: None,
-            target_evidence_binding_digest:
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         }
     }
 
@@ -2396,8 +2403,7 @@ mod tests {
             action_class: "unknown",
             action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             lease_binding_digest: None,
-            target_evidence_binding_digest:
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         }
     }
 
@@ -4549,13 +4555,25 @@ mod tests {
                 sandbox_escalation: None,
             }],
         };
-        assert!(host_approval_response_declines(&ResolveResponse::Cancel, &offered));
+        assert!(host_approval_response_declines(
+            &ResolveResponse::Cancel,
+            &offered
+        ));
         assert!(host_approval_response_declines(
             &ResolveResponse::Single {
                 selected_id: ApprovalOptionId::Reject.as_str().into(),
             },
             &offered,
         ));
+        assert!(
+            host_approval_response_declines(
+                &ResolveResponse::Freetext {
+                    text: NONINTERACTIVE_RUN_DENIAL.into(),
+                },
+                &offered,
+            ),
+            "the structured cockpit-run auto-deny sentinel must settle a parked host approval"
+        );
         for invalid in [
             ResolveResponse::Single {
                 selected_id: ApprovalOptionId::ApproveOnce.as_str().into(),
@@ -4566,14 +4584,16 @@ mod tests {
             ResolveResponse::Multi {
                 selected_ids: vec![ApprovalOptionId::Reject.as_str().into()],
             },
-            ResolveResponse::Freetext { text: "deny".into() },
+            ResolveResponse::Freetext {
+                text: "deny".into(),
+            },
             ResolveResponse::Batch {
                 responses: vec![ResolveResponse::Cancel],
             },
         ] {
             assert!(
                 !host_approval_response_declines(&invalid, &offered),
-                "only the exact Cancel or exact offered deny response may terminalize host approval"
+                "only Cancel, the offered deny, or the structured noninteractive sentinel may terminalize host approval"
             );
         }
     }

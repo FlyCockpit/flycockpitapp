@@ -541,11 +541,42 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                     owned_in_process_guard: None,
                 });
             }
+            if matches!(discovered.status, DaemonStatus::IncompatibleProtocol) {
+                if let Some(hello) = discovered.hello.as_ref() {
+                    anyhow::bail!(
+                        "{}",
+                        proto::incompatible_daemon_protocol_message(hello.protocol_version)
+                    );
+                } else {
+                    anyhow::bail!(
+                        "shared daemon pid is live but socket is unreachable: {}",
+                        discovered.paths.socket.display()
+                    );
+                }
+            }
+            if mode == LifecycleMode::AttachOrAutoPromote
+                && discovered.status == DaemonStatus::LivePidSocketUnreachable
+                && discovered.hello.is_none()
+            {
+                // Persistent attach only. The daemon binds its socket after
+                // boot, so `daemon restart` leaves a verified live pid with
+                // no hello until the replacement is ready. Ephemeral modes
+                // must not wait on that canonical child — they spawn their
+                // own path instead of stalling `cockpit run --ephemeral`.
+                let client = wait_for_daemon(&discovered.paths.socket).await?;
+                return Ok(ConnectedDaemon {
+                    endpoint: local_daemon_endpoint(&discovered.paths.socket),
+                    client,
+                    owns_daemon: false,
+                    socket: discovered.paths.socket,
+                    startup_notice: None,
+                    owned_daemon_guard: None,
+                    owned_in_process_guard: None,
+                });
+            }
             if matches!(
                 discovered.status,
-                DaemonStatus::IncompatibleProtocol
-                    | DaemonStatus::LivePidSocketUnreachable
-                    | DaemonStatus::UnverifiedPid
+                DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid
             ) {
                 if let Some(hello) = discovered.hello.as_ref() {
                     anyhow::bail!(
@@ -583,10 +614,38 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
             });
         }
         LifecycleMode::AlwaysEphemeral => {
-            // Always spawn fresh on a unique pid+nonce ephemeral path
-            // (Layer B). It never touches the canonical socket, so it
-            // coexists with a persistent daemon — no "already running"
-            // bail needed.
+            // A persistent daemon holds the exclusive ledger boot lock.
+            // A second process cannot open that database, so "fresh
+            // ephemeral" cannot coexist with a live canonical owner.
+            // Attach to that owner instead of spawning a child that can
+            // never bind. When none is running, fall through to spawn.
+            let discovered = discover().await;
+            if matches!(discovered.status, DaemonStatus::Running) {
+                let client = connect_local_daemon(&discovered.paths.socket).await?;
+                return Ok(ConnectedDaemon {
+                    endpoint: local_daemon_endpoint(&discovered.paths.socket),
+                    client,
+                    owns_daemon: false,
+                    socket: discovered.paths.socket,
+                    startup_notice: None,
+                    owned_daemon_guard: None,
+                    owned_in_process_guard: None,
+                });
+            }
+            if discovered.status == DaemonStatus::LivePidSocketUnreachable
+                && discovered.hello.is_none()
+            {
+                let client = wait_for_daemon(&discovered.paths.socket).await?;
+                return Ok(ConnectedDaemon {
+                    endpoint: local_daemon_endpoint(&discovered.paths.socket),
+                    client,
+                    owns_daemon: false,
+                    socket: discovered.paths.socket,
+                    startup_notice: None,
+                    owned_daemon_guard: None,
+                    owned_in_process_guard: None,
+                });
+            }
         }
     }
 

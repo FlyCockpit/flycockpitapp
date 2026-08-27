@@ -410,7 +410,7 @@ fn external_journal_lines(db: Option<&crate::db::Db>) -> (Vec<String>, bool) {
     let Some(db) = db else {
         return (
             vec!["status: unavailable (requires daemon)".to_string()],
-            true,
+            false,
         );
     };
     let now_wall_ms = chrono::Utc::now().timestamp_millis();
@@ -503,6 +503,19 @@ async fn database_lines(
                     "integrity: unavailable because Cockpit rejected the schema before integrity checks"
                         .to_string(),
                 );
+            } else if is_absent_database(&message) {
+                // Fresh install / never-used home: doctor is read-only and
+                // must not create SQLite. Absence is informational, not a
+                // failed open of an existing file.
+                lines.push(format!(
+                    "openability: informational ({})",
+                    one_line(&message)
+                ));
+                lines.push("schema: unavailable because no database file exists yet".to_string());
+                lines
+                    .push("integrity: unavailable because no database file exists yet".to_string());
+                append_database_failure_guidance(&mut lines, &extended.retention);
+                return (lines, false);
             } else {
                 lines.push(format!("openability: FAILED ({})", one_line(&message)));
                 lines.push(
@@ -612,6 +625,10 @@ async fn database_lines(
     );
     lines.push(retention_line(&extended.retention));
     (lines, false)
+}
+
+fn is_absent_database(message: &str) -> bool {
+    message.contains("database does not exist at")
 }
 
 #[allow(dead_code)]

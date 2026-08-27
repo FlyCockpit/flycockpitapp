@@ -93,9 +93,20 @@ pub enum PublicCommand {
     Provider(ProvidersCommand),
     Setup(SetupArgs),
     Models(ModelsArgs),
+    /// Run the bundled jq-compatible JSON query applet.
+    #[command(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Jq(JqArgs),
     #[command(subcommand)]
     Daemon(DaemonCommand),
     Doctor(DoctorArgs),
+    /// Debug / introspection commands.
+    #[command(subcommand)]
+    Debug(DebugCommand),
     #[command(subcommand)]
     Session(SessionCommand),
     #[command(subcommand)]
@@ -122,8 +133,10 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Provider(args) => Command::Provider(args),
                 PublicCommand::Setup(args) => Command::Setup(args),
                 PublicCommand::Models(args) => Command::Models(args),
+                PublicCommand::Jq(args) => Command::Jq(args),
                 PublicCommand::Daemon(args) => Command::Daemon(args),
                 PublicCommand::Doctor(args) => Command::Doctor(args),
+                PublicCommand::Debug(args) => Command::Debug(args),
                 PublicCommand::Session(args) => Command::Session(args),
                 PublicCommand::Trust(args) => Command::Trust(args),
                 PublicCommand::Export(args) => Command::Export(args),
@@ -1655,11 +1668,15 @@ mod tests {
             Some(Command::Code)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "assistant"]).unwrap().command,
+            Cli::try_parse_from(["cockpit", "assistant"])
+                .unwrap()
+                .command,
             Some(Command::Assistant)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "computer"]).unwrap().command,
+            Cli::try_parse_from(["cockpit", "computer"])
+                .unwrap()
+                .command,
             Some(Command::Computer)
         ));
         assert!(matches!(

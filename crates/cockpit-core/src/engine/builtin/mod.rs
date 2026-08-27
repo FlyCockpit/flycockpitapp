@@ -1065,18 +1065,18 @@ pub(crate) fn materialize_tool_by_name(
         {
             tb
         }
-        "inspect_audio" if media_unavailable => {
-            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::InspectAudioTool::new()))
-        }
-        "inspect_video" if media_unavailable => {
-            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::InspectVideoTool::new()))
-        }
-        "extract_video_clip" if media_unavailable => {
-            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::ExtractVideoClipTool::new()))
-        }
-        "extract_audio" if media_unavailable => {
-            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::ExtractAudioTool::new()))
-        }
+        "inspect_audio" if media_unavailable => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::InspectAudioTool::new(),
+        )),
+        "inspect_video" if media_unavailable => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::InspectVideoTool::new(),
+        )),
+        "extract_video_clip" if media_unavailable => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::ExtractVideoClipTool::new(),
+        )),
+        "extract_audio" if media_unavailable => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::ExtractAudioTool::new(),
+        )),
         "transcribe_audio" if media_unavailable => tb.with_dormant_direct_native_media(Arc::new(
             tools::transcribe_audio::TranscribeAudioTool,
         )),

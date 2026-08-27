@@ -24,6 +24,7 @@ pub struct AvRunnerOutput {
     pub killed: bool,
     pub timed_out: bool,
     pub cleaned_temp_paths: Vec<PathBuf>,
+    pub captured_files: Vec<(PathBuf, Vec<u8>)>,
 }
 
 /// Injected argv runner used by A/V tools. Callers never spawn ffmpeg
@@ -51,6 +52,7 @@ async fn run_system_process(
     use tokio::io::AsyncReadExt as _;
 
     if cancel.is_cancelled() {
+        cleanup_temp_paths(&spec.temp_paths);
         bail!("cancelled");
     }
     let mut command = tokio::process::Command::new(spec.program);
@@ -68,25 +70,47 @@ async fn run_system_process(
     for (key, value) in &spec.environment {
         command.env(key, value);
     }
-    let mut child = command.spawn()?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup_temp_paths(&spec.temp_paths);
+            return Err(error.into());
+        }
+    };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_limit = spec.stdout_limit.max(1);
     let stderr_limit = spec.stderr_limit.max(1);
-    let read = async {
+    let read_stdout = async move {
         let mut out = Vec::new();
-        let mut err = Vec::new();
         if let Some(pipe) = stdout {
             pipe.take(stdout_limit as u64 + 1)
                 .read_to_end(&mut out)
                 .await?;
         }
+        if out.len() > stdout_limit {
+            bail!("resource_limit");
+        }
+        Ok::<_, anyhow::Error>(out)
+    };
+    let read_stderr = async move {
+        let mut err = Vec::new();
         if let Some(pipe) = stderr {
             pipe.take(stderr_limit as u64 + 1)
                 .read_to_end(&mut err)
                 .await?;
         }
-        Ok::<_, std::io::Error>((out, err))
+        if err.len() > stderr_limit {
+            bail!("resource_limit");
+        }
+        Ok::<_, anyhow::Error>(err)
+    };
+    let communicate = async {
+        let ((stdout, stderr), status) = tokio::try_join!(
+            async { tokio::try_join!(read_stdout, read_stderr) },
+            async { child.wait().await.map_err(anyhow::Error::from) },
+        )?;
+        Ok::<_, anyhow::Error>((stdout, stderr, status))
     };
     let deadline = spec.deadline;
     tokio::select! {
@@ -102,19 +126,30 @@ async fn run_system_process(
             cleanup_temp_paths(&spec.temp_paths);
             bail!("deadline_exceeded");
         }
-        result = read => {
-            let (stdout, stderr) = result?;
-            let status = child.wait().await?;
-            cleanup_temp_paths(&spec.temp_paths);
-            if stdout.len() > stdout_limit || stderr.len() > stderr_limit {
-                bail!("resource_limit");
+        result = communicate => {
+            let (stdout, stderr, status) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    cleanup_temp_paths(&spec.temp_paths);
+                    return Err(error);
+                }
+            };
+            if !status.success() {
+                cleanup_temp_paths(&spec.temp_paths);
+                bail!("media_process_failed: {}", String::from_utf8_lossy(&stderr));
             }
+            let captured_files = capture_files(&spec.capture_files, stdout_limit);
+            cleanup_temp_paths(&spec.temp_paths);
+            let captured_files = captured_files?;
             Ok(AvRunnerOutput {
                 stdout,
                 stderr,
                 killed: !status.success(),
                 timed_out: false,
                 cleaned_temp_paths: spec.temp_paths.clone(),
+                captured_files,
             })
         }
     }
@@ -257,6 +292,7 @@ impl AvArgvRunner for FakeAvArgvRunner {
                 killed: false,
                 timed_out: false,
                 cleaned_temp_paths: spec.temp_paths.clone(),
+                captured_files: Vec::new(),
             });
         }
         if let Some(size) = *self.inner.bomb_stdout.lock().expect("bomb lock") {
@@ -270,6 +306,7 @@ impl AvArgvRunner for FakeAvArgvRunner {
                 killed: false,
                 timed_out: false,
                 cleaned_temp_paths: spec.temp_paths.clone(),
+                captured_files: Vec::new(),
             });
         }
         let stdout = self
@@ -293,12 +330,19 @@ impl AvArgvRunner for FakeAvArgvRunner {
             bail!("resource_limit");
         }
         cleanup_recorded(self, spec);
+        let captured_files = spec
+            .capture_files
+            .iter()
+            .cloned()
+            .map(|path| (path, stdout.clone()))
+            .collect();
         Ok(AvRunnerOutput {
             stdout,
             stderr,
             killed: false,
             timed_out: false,
             cleaned_temp_paths: spec.temp_paths.clone(),
+            captured_files,
         })
     }
 }
@@ -351,15 +395,46 @@ pub const DEFAULT_MP4_BYTES: &[u8] = b"\0\0\0\x18ftypisom";
 
 /// Write retained bytes to a private temp path for file-based argv.
 pub fn write_private_temp(bytes: &[u8], suffix: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "cockpit-av-{}-{}",
-        std::process::id(),
-        uuid::Uuid::now_v7()
-    ));
-    std::fs::create_dir_all(&dir)?;
+    let dir = tempfile::Builder::new()
+        .prefix("cockpit-av-")
+        .tempdir()?
+        .keep();
     let path = dir.join(format!("source{suffix}"));
     std::fs::write(&path, bytes)?;
     Ok(path)
+}
+
+pub fn private_output_path(suffix: &str) -> Result<(PathBuf, PathBuf)> {
+    let dir = tempfile::Builder::new()
+        .prefix("cockpit-av-")
+        .tempdir()?
+        .keep();
+    Ok((dir.join(format!("derivative.{suffix}")), dir))
+}
+
+fn capture_files(paths: &[PathBuf], limit: usize) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    paths
+        .iter()
+        .map(|path| {
+            use std::io::Read as _;
+
+            let file = std::fs::File::open(path)
+                .map_err(|_| anyhow::anyhow!("media_derivative_missing"))?;
+            let declared = file
+                .metadata()
+                .map_err(|_| anyhow::anyhow!("media_derivative_missing"))?
+                .len();
+            if declared == 0 || declared > limit as u64 {
+                bail!("resource_limit");
+            }
+            let mut bytes = Vec::with_capacity(declared as usize);
+            file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.is_empty() || bytes.len() > limit {
+                bail!("resource_limit");
+            }
+            Ok((path.clone(), bytes))
+        })
+        .collect()
 }
 
 #[cfg(test)]

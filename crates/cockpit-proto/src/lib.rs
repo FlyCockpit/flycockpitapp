@@ -74,8 +74,8 @@ pub use provider_management::{
 pub mod session_setup;
 pub use session_setup::{
     SESSION_SETUP_DTO_VERSION, SessionSetupAgentCandidateV1, SessionSetupLockedReasonV1,
-    SessionSetupModelChoiceRouteV1, SessionSetupModelSlotV1, SessionSetupSnapshotV1,
-    SessionSetupUnavailableReasonV1,
+    SessionSetupMcpV1, SessionSetupModelChoiceRouteV1, SessionSetupModelSlotV1,
+    SessionSetupSnapshotV1, SessionSetupToolV1, SessionSetupUnavailableReasonV1,
 };
 pub mod session_override;
 pub use session_override::{

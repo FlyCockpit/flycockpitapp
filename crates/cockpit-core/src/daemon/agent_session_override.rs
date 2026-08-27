@@ -1143,6 +1143,16 @@ mod tests {
             config_generation: 1,
             revision: 0,
             selected_installation_id: Some(selected.to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
+            tool_surface_notice: None,
             candidates,
         }
     }

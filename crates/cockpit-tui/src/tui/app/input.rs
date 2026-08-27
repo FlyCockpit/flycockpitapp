@@ -854,6 +854,36 @@ impl App {
             return false;
         }
 
+        if matches!(self.overlay, Overlay::None)
+            && self.session_setup_inline_visible()
+            && self.question_dialog.is_none()
+            && self.daemon_prompt.is_none()
+            && !self.dialog.is_active()
+        {
+            if key.code == KeyCode::Tab {
+                self.session_setup_focused = !self.session_setup_focused;
+                return false;
+            }
+            let setup_nav = matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Char('j')
+                    | KeyCode::Char('k')
+                    | KeyCode::Char('q')
+            );
+            if self.session_setup_focused
+                && setup_nav
+                && let Some(mut pane) = self.session_setup_inline.take()
+            {
+                let outcome = pane.handle_key(key);
+                self.apply_session_setup_outcome(outcome, pane, false);
+                return false;
+            }
+        }
+
         match std::mem::take(&mut self.overlay) {
             Overlay::None => {}
             Overlay::ModelPicker(mut picker) => {
@@ -2543,6 +2573,7 @@ impl App {
         if submitted.is_empty() && self.composer.paste_is_empty() && pending_probe_ids.is_empty() {
             return false;
         }
+        self.collapse_session_setup_on_first_submit();
         // A selection in flight is deliberately *not* a missing-model state.
         // Build the exact submission below and hold it behind that correlated
         // transaction instead of opening configuration or losing paste/tag

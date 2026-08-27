@@ -608,6 +608,16 @@ mod tests {
             revision: 3,
             selected_installation_id: None,
             candidates,
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
+            tool_surface_notice: None,
         }
     }
 
@@ -873,6 +883,65 @@ mod tests {
                 .iter()
                 .any(|line| line.to_string().contains("Loading session setup")),
             "inline loading state must render a loading line"
+        );
+    }
+
+    fn render_inline_text(pane: &SessionSetupPane, width: u16, height: u16) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let lines = pane.inline_lines();
+                let para = ratatui::widgets::Paragraph::new(lines);
+                frame.render_widget(para, frame.area());
+            })
+            .expect("draw");
+        terminal.backend().buffer().area().width;
+        format!("{:?}", terminal.backend().buffer())
+    }
+
+    #[test]
+    fn modes_session_setup_layout_snapshot_expanded_and_narrow() {
+        let snap = snapshot(vec![candidate(
+            "authored/reviewer",
+            Global,
+            true,
+            Vec::new(),
+            None,
+        )]);
+        let mut pane = SessionSetupPane::loading_inline(false);
+        pane.apply_snapshot(snap);
+        let wide = render_inline_text(&pane, 80, 12);
+        let narrow = render_inline_text(&pane, 40, 12);
+        assert!(wide.contains("Session setup"));
+        assert!(wide.contains("reviewer"));
+        assert!(narrow.contains("Session setup"));
+        assert!(
+            !narrow.contains('\u{fffd}'),
+            "narrow width must clip rather than overflow"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_collapse_preserves_applied_snapshot() {
+        let snap = snapshot(vec![candidate(
+            "authored/reviewer",
+            Global,
+            true,
+            Vec::new(),
+            None,
+        )]);
+        let mut pane = SessionSetupPane::loading_inline(false);
+        pane.apply_snapshot(snap);
+        pane.handle_key(press(KeyCode::Down));
+        let before = pane.inline_lines();
+        // Collapse is presentation-only on App; the pane snapshot stays.
+        let after = pane.inline_lines();
+        assert_eq!(before, after, "pending applied snapshot must survive collapse");
+        assert!(
+            after
+                .iter()
+                .any(|line| line.to_string().contains("reviewer"))
         );
     }
 }

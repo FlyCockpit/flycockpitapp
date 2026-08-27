@@ -10,6 +10,9 @@ use crate::tui::session_setup::{SessionSetupOutcome, SessionSetupPane};
 /// invalidations) into a single in-flight request.
 const SESSION_SETUP_SNAPSHOT_ACTION: &str = "session_setup.snapshot";
 
+pub(super) const SESSION_SETUP_COLLAPSE_HINT: &str =
+    "Agent: /agents or /tree · Model: node override · Tools: /tools · MCP: /settings";
+
 impl App {
     /// Open the session-setup overlay and schedule its first snapshot fetch.
     /// The daemon owns the snapshot; before attach the pane shows a fixed
@@ -19,6 +22,41 @@ impl App {
         // terminal honour NO_COLOR. The plain projection is exercised by tests.
         self.overlay = Overlay::SessionSetup(SessionSetupPane::loading(true));
         self.request_session_setup_snapshot_refresh();
+    }
+
+    pub(super) fn session_setup_inline_visible(&self) -> bool {
+        !self.session_setup_collapsed && self.session_setup_inline.is_some()
+    }
+
+    pub(super) fn prepare_session_setup_for_fresh_session(&mut self) {
+        self.session_setup_collapsed = false;
+        self.session_setup_focused = true;
+        self.session_setup_collapse_hint = None;
+        self.session_setup_inline = Some(SessionSetupPane::loading_inline(true));
+        self.request_session_setup_snapshot_refresh();
+    }
+
+    pub(super) fn prepare_session_setup_for_resume(&mut self, has_user_history: bool) {
+        if has_user_history {
+            self.session_setup_collapsed = true;
+            self.session_setup_focused = false;
+            self.session_setup_collapse_hint = Some(SESSION_SETUP_COLLAPSE_HINT.to_string());
+            if self.session_setup_inline.is_none() {
+                self.session_setup_inline = Some(SessionSetupPane::loading_inline(true));
+            }
+            self.request_session_setup_snapshot_refresh();
+        } else {
+            self.prepare_session_setup_for_fresh_session();
+        }
+    }
+
+    pub(super) fn collapse_session_setup_on_first_submit(&mut self) {
+        if self.session_setup_collapsed {
+            return;
+        }
+        self.session_setup_collapsed = true;
+        self.session_setup_focused = false;
+        self.session_setup_collapse_hint = Some(SESSION_SETUP_COLLAPSE_HINT.to_string());
     }
 
     /// Dispatch a pane outcome. `as_overlay` keeps the overlay open on Stay.
@@ -32,6 +70,9 @@ impl App {
             SessionSetupOutcome::Close => {
                 if as_overlay {
                     // Overlay dismissed; inline panel (if still expanded) is unchanged.
+                } else {
+                    self.session_setup_focused = false;
+                    self.session_setup_inline = Some(pane);
                 }
             }
             SessionSetupOutcome::Stay => {
@@ -244,7 +285,7 @@ fn resolve_setup_config_model(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_setup_config_model;
+    use super::*;
     use cockpit_config::providers::{ModelEntry, ProviderEntry, ProvidersConfig};
 
     fn route(index: u32) -> cockpit_proto::SessionSetupModelChoiceRouteV1 {
@@ -338,5 +379,38 @@ mod tests {
             ],
             "the DTO's exact config indices preserve both slot entries instead of dropping an ambiguous display reverse-map"
         );
+    }
+
+    #[test]
+    fn modes_session_setup_fresh_session_shows_inline_until_first_submit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        assert!(app.session_setup_inline_visible());
+        assert!(!app.session_setup_collapsed);
+        app.collapse_session_setup_on_first_submit();
+        assert!(!app.session_setup_inline_visible());
+        assert!(app.session_setup_collapsed);
+        assert_eq!(
+            app.session_setup_collapse_hint.as_deref(),
+            Some(SESSION_SETUP_COLLAPSE_HINT)
+        );
+        assert!(
+            app.session_setup_inline.is_some(),
+            "collapse must not drop pane state so /session-setup can reopen current values"
+        );
+        app.collapse_session_setup_on_first_submit();
+        assert!(app.session_setup_collapsed, "second submit is a no-op");
+    }
+
+    #[test]
+    fn modes_session_setup_resume_with_user_history_starts_collapsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.prepare_session_setup_for_resume(true);
+        assert!(app.session_setup_collapsed);
+        assert!(!app.session_setup_inline_visible());
+        app.prepare_session_setup_for_resume(false);
+        assert!(!app.session_setup_collapsed);
+        assert!(app.session_setup_inline_visible());
     }
 }

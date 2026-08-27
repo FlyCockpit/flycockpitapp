@@ -21,9 +21,9 @@ pub const ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1: usize = 1_048_576;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
     OutboundRequestCapacityExhausted,
-    AttachmentAlreadyLive,
     ConnectionClosed,
     WriterOverflow,
+    InvalidIssuedOptions,
 }
 
 impl std::fmt::Display for RegistryError {
@@ -32,11 +32,11 @@ impl std::fmt::Display for RegistryError {
             Self::OutboundRequestCapacityExhausted => {
                 f.write_str("outbound_request_capacity_exhausted")
             }
-            Self::AttachmentAlreadyLive => {
-                f.write_str("one live permission request per attachment")
-            }
             Self::ConnectionClosed => f.write_str("ACP connection closed"),
             Self::WriterOverflow => f.write_str("outbound permission frame exceeds cap"),
+            Self::InvalidIssuedOptions => {
+                f.write_str("issued options do not match serialized permission request")
+            }
         }
     }
 }
@@ -114,6 +114,21 @@ impl Inner {
         }
         self.live_attachments.remove(&attachment);
     }
+
+    fn close_and_release_all(&mut self) {
+        self.connection_closed = true;
+        self.writable = false;
+        let ids: Vec<String> = self.entries.keys().cloned().collect();
+        for id in ids {
+            if self
+                .entries
+                .get(&id)
+                .is_some_and(|entry| entry.state != PermissionStateName::Released)
+            {
+                self.release_by_id(&id);
+            }
+        }
+    }
 }
 
 pub trait ResolveCodeRootInterrupt {
@@ -150,6 +165,7 @@ impl ApprovalAck for RecordingAck {
 }
 
 pub struct OutboundPermissionRegistry {
+    gate: Mutex<()>,
     inner: Mutex<Inner>,
 }
 
@@ -162,6 +178,7 @@ impl Default for OutboundPermissionRegistry {
 impl OutboundPermissionRegistry {
     pub fn new() -> Self {
         Self {
+            gate: Mutex::new(()),
             inner: Mutex::new(Inner::new()),
         }
     }
@@ -210,7 +227,7 @@ impl OutboundPermissionRegistry {
     }
 
     /// Allocate, serialize, charge, and bind atomically before any byte is visible.
-    pub fn reserve_permission(
+    pub(crate) fn reserve_permission(
         &self,
         attachment: String,
         delivery_id: String,
@@ -227,11 +244,9 @@ impl OutboundPermissionRegistry {
             || inner.live_attachments.contains(&attachment)
         {
             let _ = counters;
-            if inner.live_attachments.contains(&attachment) {
-                return Err(RegistryError::AttachmentAlreadyLive);
-            }
             return Err(RegistryError::OutboundRequestCapacityExhausted);
         }
+        let options = validated_issued_options(&params, &issued_options)?;
         let request_id = allocate_id(&mut inner);
         let frame = request(&request_id, "session/request_permission", params);
         prepare_outbound_json(&frame).map_err(|_| RegistryError::WriterOverflow)?;
@@ -243,7 +258,6 @@ impl OutboundPermissionRegistry {
         inner.charged_entries += 1;
         inner.charged_bytes += charge;
         inner.live_attachments.insert(attachment.clone());
-        let options: HashSet<String> = issued_options.into_iter().collect();
         inner.entries.insert(
             request_id.clone(),
             PermissionEntry {
@@ -264,7 +278,7 @@ impl OutboundPermissionRegistry {
         Ok(ReservedPermission { request_id, frame })
     }
 
-    pub fn complete_write(
+    pub(crate) fn complete_write(
         &self,
         request_id: &str,
         outcome: WriteOutcome,
@@ -288,9 +302,7 @@ impl OutboundPermissionRegistry {
                 Ok(())
             }
             WriteOutcome::Partial { .. } | WriteOutcome::Failed => {
-                inner.connection_closed = true;
-                inner.writable = false;
-                inner.release_by_id(request_id);
+                inner.close_and_release_all();
                 let _ = sink;
                 let _ = counters;
                 Err(RegistryError::ConnectionClosed)
@@ -308,6 +320,7 @@ impl OutboundPermissionRegistry {
         sink: &mut dyn FrameSink,
         counters: &mut AcpTransportCounters,
     ) -> Result<String, RegistryError> {
+        let _gate = self.gate.lock().expect("registry gate");
         let reserved = self.reserve_permission(
             attachment,
             delivery_id,
@@ -333,15 +346,16 @@ impl OutboundPermissionRegistry {
         ack: &mut dyn ApprovalAck,
         sink: &mut dyn FrameSink,
         counters: &mut AcpTransportCounters,
-    ) {
+    ) -> bool {
         let JsonRpcId::String(request_id) = id else {
-            return;
+            return false;
         };
         let parsed = match result.and_then(|node| parse_permission_outcome(node, input)) {
             Some(parsed) => parsed,
-            None => return,
+            None => return false,
         };
         let resolve_request = {
+            let _gate = self.gate.lock().expect("registry gate");
             let mut inner = self.inner.lock().expect("registry");
             match parsed {
                 PermissionOutcome::Cancelled => {
@@ -352,7 +366,7 @@ impl OutboundPermissionRegistry {
                     if issued {
                         inner.release_by_id(request_id);
                     }
-                    return;
+                    return false;
                 }
                 PermissionOutcome::Selected(choice) => {
                     let admissible = inner.entries.get(request_id).is_some_and(|entry| {
@@ -360,10 +374,10 @@ impl OutboundPermissionRegistry {
                             && entry.issued_options.contains(&choice)
                     });
                     if !admissible {
-                        return;
+                        return false;
                     }
                     let Some(entry) = inner.entries.get_mut(request_id) else {
-                        return;
+                        return false;
                     };
                     entry.state = PermissionStateName::TerminalReserved;
                     entry.selected_choice = Some(choice.clone());
@@ -377,51 +391,55 @@ impl OutboundPermissionRegistry {
             }
         };
         let Some(resolve_request) = resolve_request else {
-            return;
+            return false;
         };
         {
+            let _gate = self.gate.lock().expect("registry gate");
             let mut inner = self.inner.lock().expect("registry");
             if let Some(entry) = inner.entries.get_mut(request_id) {
                 if entry.state == PermissionStateName::TerminalReserved {
                     entry.state = PermissionStateName::Resolving;
                 } else {
-                    return;
+                    return false;
                 }
             } else {
-                return;
+                return false;
             }
         }
         counters.resolve_calls += 1;
         let outcome = resolve.resolve(resolve_request);
+        let _gate = self.gate.lock().expect("registry gate");
         let mut inner = self.inner.lock().expect("registry");
         let Some(entry) = inner.entries.get_mut(request_id) else {
-            return;
+            return false;
         };
         if entry.state != PermissionStateName::Resolving {
-            return;
+            return false;
         }
         entry.daemon_outcome = Some(outcome);
         entry.state = PermissionStateName::Terminal;
         let delivery_id = entry.delivery_id.clone();
-        drop(entry);
-        match outcome {
+        let closed_refusal = match outcome {
             ResolveCodeRootInterruptResultV1::Accepted
             | ResolveCodeRootInterruptResultV1::AlreadyResolvedSame => {
                 counters.approval_acks += 1;
-                inner.release_by_id(request_id);
-                drop(inner);
                 ack.ack_approval_delivery(&delivery_id);
+                inner.release_by_id(request_id);
+                false
             }
             ResolveCodeRootInterruptResultV1::AlreadyResolvedOther
             | ResolveCodeRootInterruptResultV1::Cancelled
             | ResolveCodeRootInterruptResultV1::Expired => {
                 inner.release_by_id(request_id);
+                true
             }
-        }
+        };
         let _ = sink;
+        closed_refusal
     }
 
     pub fn on_disconnect(&self, counters: &mut AcpTransportCounters) {
+        let _gate = self.gate.lock().expect("registry gate");
         let mut inner = self.inner.lock().expect("registry");
         inner.connection_closed = true;
         inner.writable = false;
@@ -443,27 +461,32 @@ impl OutboundPermissionRegistry {
         sink: &mut dyn FrameSink,
         counters: &mut AcpTransportCounters,
     ) {
-        let mut queued = Vec::new();
-        {
-            let mut inner = self.inner.lock().expect("registry");
-            let ids: Vec<String> = inner.entries.keys().cloned().collect();
-            for id in ids {
-                let issued = inner
-                    .entries
-                    .get(&id)
-                    .is_some_and(|entry| entry.state == PermissionStateName::Issued);
-                if !issued {
-                    continue;
-                }
-                if inner.writable {
-                    queued.push(cancel_request_notification(&id));
-                    counters.cancel_notifications_queued += 1;
-                }
-                inner.release_by_id(&id);
+        let _gate = self.gate.lock().expect("registry gate");
+        let mut inner = self.inner.lock().expect("registry");
+        let ids: Vec<String> = inner.entries.keys().cloned().collect();
+        for id in ids {
+            let issued = inner
+                .entries
+                .get(&id)
+                .is_some_and(|entry| entry.state == PermissionStateName::Issued);
+            if !issued {
+                continue;
             }
-        }
-        for frame in queued {
-            let _ = sink.write_json_value(&frame, counters);
+            if !inner.writable {
+                inner.release_by_id(&id);
+                continue;
+            }
+            if let Some(entry) = inner.entries.get_mut(&id) {
+                entry.state = PermissionStateName::Cancelling;
+            }
+            counters.cancel_notifications_queued += 1;
+            match sink.write_json_value(&cancel_request_notification(&id), counters) {
+                Ok(WriteOutcome::Complete) => inner.release_by_id(&id),
+                Ok(WriteOutcome::Partial { .. }) | Ok(WriteOutcome::Failed) | Err(_) => {
+                    inner.close_and_release_all();
+                    break;
+                }
+            }
         }
     }
 
@@ -473,24 +496,28 @@ impl OutboundPermissionRegistry {
         sink: &mut dyn FrameSink,
         counters: &mut AcpTransportCounters,
     ) {
-        let mut cancel = None;
-        {
-            let mut inner = self.inner.lock().expect("registry");
-            let issued = inner
-                .entries
-                .get(request_id)
-                .is_some_and(|entry| entry.state == PermissionStateName::Issued);
-            if !issued {
-                return;
-            }
-            if inner.writable {
-                cancel = Some(cancel_request_notification(request_id));
-                counters.cancel_notifications_queued += 1;
-            }
-            inner.release_by_id(request_id);
+        let _gate = self.gate.lock().expect("registry gate");
+        let mut inner = self.inner.lock().expect("registry");
+        let issued = inner
+            .entries
+            .get(request_id)
+            .is_some_and(|entry| entry.state == PermissionStateName::Issued);
+        if !issued {
+            return;
         }
-        if let Some(frame) = cancel {
-            let _ = sink.write_json_value(&frame, counters);
+        if !inner.writable {
+            inner.release_by_id(request_id);
+            return;
+        }
+        if let Some(entry) = inner.entries.get_mut(request_id) {
+            entry.state = PermissionStateName::Cancelling;
+        }
+        counters.cancel_notifications_queued += 1;
+        match sink.write_json_value(&cancel_request_notification(request_id), counters) {
+            Ok(WriteOutcome::Complete) => inner.release_by_id(request_id),
+            Ok(WriteOutcome::Partial { .. }) | Ok(WriteOutcome::Failed) | Err(_) => {
+                inner.close_and_release_all();
+            }
         }
     }
 
@@ -553,17 +580,68 @@ fn allocate_id(inner: &mut Inner) -> String {
     }
 }
 
+fn validated_issued_options(
+    params: &Value,
+    issued_options: &[String],
+) -> Result<HashSet<String>, RegistryError> {
+    let serialized = params
+        .get("options")
+        .and_then(Value::as_array)
+        .ok_or(RegistryError::InvalidIssuedOptions)?;
+    let mut option_ids = HashSet::with_capacity(serialized.len());
+    for option in serialized {
+        let id = option
+            .get("optionId")
+            .and_then(Value::as_str)
+            .ok_or(RegistryError::InvalidIssuedOptions)?;
+        if !option_ids.insert(id.to_string()) {
+            return Err(RegistryError::InvalidIssuedOptions);
+        }
+    }
+    let declared: HashSet<&str> = issued_options.iter().map(String::as_str).collect();
+    if declared.len() != issued_options.len()
+        || declared.len() != option_ids.len()
+        || !declared.iter().all(|id| option_ids.contains(*id))
+    {
+        return Err(RegistryError::InvalidIssuedOptions);
+    }
+    Ok(option_ids)
+}
+
 fn parse_permission_outcome(result: &RawNode, input: &str) -> Option<PermissionOutcome> {
     let _ = input;
+    if !has_only_members(result, &["outcome", "_meta"]) || !metadata_is_object(result) {
+        return None;
+    }
     let outcome = result.member("outcome")?;
     match outcome.member("outcome").and_then(RawNode::as_str) {
-        Some("cancelled") => Some(PermissionOutcome::Cancelled),
-        Some("selected") => outcome
-            .member("optionId")
-            .and_then(RawNode::as_str)
-            .map(|id| PermissionOutcome::Selected(id.to_string())),
+        Some("cancelled") if has_only_members(outcome, &["outcome"]) => {
+            Some(PermissionOutcome::Cancelled)
+        }
+        Some("selected")
+            if has_only_members(outcome, &["outcome", "optionId", "_meta"])
+                && metadata_is_object(outcome) =>
+        {
+            outcome
+                .member("optionId")
+                .and_then(RawNode::as_str)
+                .map(|id| PermissionOutcome::Selected(id.to_string()))
+        }
         _ => None,
     }
+}
+
+fn metadata_is_object(node: &RawNode) -> bool {
+    node.member("_meta")
+        .is_none_or(|metadata| metadata.as_object().is_some())
+}
+
+fn has_only_members(node: &RawNode, allowed: &[&str]) -> bool {
+    node.as_object().is_some_and(|members| {
+        members
+            .iter()
+            .all(|(name, _)| allowed.contains(&name.as_str()))
+    })
 }
 
 pub fn permission_params(session_id: &str, options: &[&str], tool_call_id: &str) -> Value {

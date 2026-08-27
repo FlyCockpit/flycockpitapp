@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use super::AcpTransportCounters;
-use super::adapter::AcpAdapter;
+use super::adapter::{AcpAdapter, run_stdio_peer};
 use super::classify::{InboundMessage, classify};
 use super::codec::{
     ACP_FORWARDED_MCP_VECTOR_MAX_BYTES_V1, ACP_JSON_FRAME_MAX_BYTES_V1, AcpFrameError,
@@ -12,10 +12,13 @@ use super::dto::{DtoError, decode_session_new};
 use super::raw_json::{JsonRpcId, RawJsonErrorKind, parse_frame};
 use super::registry::{
     ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1, ACP_OUTBOUND_PERMISSION_MAX_ENTRIES_V1,
-    EdgeReason, OutboundPermissionRegistry, PermissionStateName, RecordingAck, RecordingResolve,
-    RegistryError, permission_params,
+    ApprovalAck, EdgeReason, OutboundPermissionRegistry, PermissionStateName, RecordingAck,
+    RecordingResolve, RegistryError, ResolveCodeRootInterrupt, permission_params,
 };
 use cockpit_proto::ResolveCodeRootInterruptResultV1;
+use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 
 fn peer() -> AcpAdapter<MemoryFrameSink, RecordingResolve, RecordingAck> {
     AcpAdapter::new(
@@ -23,6 +26,30 @@ fn peer() -> AcpAdapter<MemoryFrameSink, RecordingResolve, RecordingAck> {
         RecordingResolve::default(),
         RecordingAck::default(),
     )
+}
+
+struct BlockingResolve {
+    started: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+impl ResolveCodeRootInterrupt for BlockingResolve {
+    fn resolve(
+        &mut self,
+        _request: cockpit_proto::ResolveCodeRootInterruptV1,
+    ) -> ResolveCodeRootInterruptResultV1 {
+        self.started.send(()).unwrap();
+        self.resume.recv().unwrap();
+        ResolveCodeRootInterruptResultV1::Accepted
+    }
+}
+
+struct AtomicAck(Arc<AtomicUsize>);
+
+impl ApprovalAck for AtomicAck {
+    fn ack_approval_delivery(&mut self, _delivery_id: &str) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn assert_jsonrpc_2_0(frame: &str) {
@@ -71,6 +98,31 @@ fn acp_transport_initialize_capability_serialization() {
             "session/prompt"
         ]
     );
+}
+
+#[test]
+fn acp_transport_stdio_transcript_keeps_diagnostics_off_stdout() {
+    let input = concat!(
+        "not-json\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n"
+    );
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    run_stdio_peer(
+        Cursor::new(input.as_bytes()),
+        &mut stdout,
+        &mut stderr,
+        RecordingResolve::default(),
+        RecordingAck::default(),
+    )
+    .unwrap();
+    let stdout = String::from_utf8(stdout).unwrap();
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    assert_jsonrpc_2_0(stdout.trim_end_matches('\n'));
+    assert!(stdout.ends_with('\n'));
+    assert!(!stdout.contains("acp:"));
+    assert!(stderr.contains("acp:"));
 }
 
 #[test]
@@ -153,6 +205,40 @@ fn acp_transport_rejects_wrong_or_duplicate_jsonrpc_before_routing() {
     );
     assert!(dup.unwrap().contains("-32600"));
     assert!(peer.counters.zero_side_effects() || peer.counters.bridge_conversions == 0);
+}
+
+#[test]
+fn acp_transport_rejects_response_with_result_and_error_before_resolve() {
+    let mut peer = peer();
+    peer.registry
+        .issue_and_write(
+            "att".into(),
+            "delivery".into(),
+            "attention".into(),
+            vec!["allow-once".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut peer.sink,
+            &mut peer.counters,
+        )
+        .unwrap();
+    send(
+        &mut peer,
+        r#"{"jsonrpc":"2.0","id":"1","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}},"error":{"code":-32603,"message":"no"}}"#,
+    );
+    assert!(peer.resolve.calls.is_empty());
+    assert!(peer.ack.ids.is_empty());
+}
+
+#[test]
+fn acp_transport_explicit_null_id_is_a_request_with_a_response() {
+    let mut peer = peer();
+    let response = send(
+        &mut peer,
+        r#"{"jsonrpc":"2.0","id":null,"method":"initialize","params":{"protocolVersion":1}}"#,
+    )
+    .unwrap();
+    assert!(response.contains("\"id\":null"));
+    assert!(response.contains("\"result\""));
 }
 
 fn duplicate_rejected(frame: &str, expected_name: &str) {
@@ -247,6 +333,22 @@ fn acp_transport_raw_mcp_servers_before_schema_and_no_partial_dto() {
 }
 
 #[test]
+fn acp_transport_rejects_mixed_transport_fields_losslessly() {
+    for frame in [
+        r#"{"cwd":"/tmp","mcpServers":[{"type":"http","name":"x","url":"https://x","command":"/bin/mcp","args":[],"env":[],"headers":[]}]}"#,
+        r#"{"cwd":"/tmp","mcpServers":[{"type":"stdio","name":"x","command":"/bin/mcp","args":[],"env":[],"url":"https://x","headers":[]}]}"#,
+        r#"{"cwd":"/tmp","mcpServers":[{"type":false,"name":"x","command":"/bin/mcp","args":[],"env":[]}]}"#,
+    ] {
+        let parsed = parse_frame(frame).unwrap();
+        let mut counters = AcpTransportCounters::default();
+        let err = decode_session_new(frame, &parsed.root, &mut counters).unwrap_err();
+        assert!(matches!(err, DtoError::MixedOrUnknownTransport));
+        assert_eq!(counters.dto_produced, 0);
+        assert_eq!(counters.schema_decode_attempts, 0);
+    }
+}
+
+#[test]
 fn acp_transport_session_new_bridge_only_converts_ingress() {
     let mut peer = peer();
     let response = send(&mut peer, &session_new_ok()).unwrap();
@@ -327,29 +429,32 @@ fn acp_transport_registry_entry_and_byte_caps() {
     assert!(sink.frames.len() == ACP_OUTBOUND_PERMISSION_MAX_ENTRIES_V1);
 
     let registry = OutboundPermissionRegistry::new();
-    let mut sink = MemoryFrameSink::default();
     let mut counters = AcpTransportCounters::default();
     let params = padded_permission_params(ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1);
-    let err = registry.reserve_permission(
-        "att".into(),
-        "d".into(),
-        "a".into(),
-        vec!["allow-once".into()],
-        params,
-        &mut counters,
+    let reserved = registry
+        .reserve_permission(
+            "att".into(),
+            "d".into(),
+            "a".into(),
+            vec!["allow-once".into()],
+            params,
+            &mut counters,
+        )
+        .unwrap();
+    assert_eq!(
+        reserved.frame.len(),
+        ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1
     );
-    match err {
-        Ok(reserved) => {
-            assert!(reserved.frame.len() <= ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1);
-        }
-        Err(RegistryError::OutboundRequestCapacityExhausted) => {}
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(
+        registry.charged_bytes(),
+        ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1
+    );
 
+    let registry = OutboundPermissionRegistry::new();
     let too_big = padded_permission_params(ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1 + 1);
     let err = registry
         .reserve_permission(
-            "att2".into(),
+            "att".into(),
             "d".into(),
             "a".into(),
             vec!["allow-once".into()],
@@ -359,9 +464,10 @@ fn acp_transport_registry_entry_and_byte_caps() {
         .unwrap_err();
     assert!(matches!(
         err,
-        RegistryError::OutboundRequestCapacityExhausted | RegistryError::WriterOverflow
+        RegistryError::OutboundRequestCapacityExhausted
     ));
-    assert_eq!(sink.frames.len(), 0);
+    assert_eq!(registry.charged_entries(), 0);
+    assert_eq!(registry.charged_bytes(), 0);
 }
 
 #[test]
@@ -388,7 +494,10 @@ fn acp_transport_registry_unique_ids_one_live_per_attachment_and_release() {
         &mut peer.sink,
         &mut peer.counters,
     );
-    assert!(matches!(second, Err(RegistryError::AttachmentAlreadyLive)));
+    assert!(matches!(
+        second,
+        Err(RegistryError::OutboundRequestCapacityExhausted)
+    ));
     peer.registry
         .on_local_cancel(&first, &mut peer.sink, &mut peer.counters);
     assert_eq!(
@@ -414,6 +523,47 @@ fn acp_transport_registry_unique_ids_one_live_per_attachment_and_release() {
         )
         .unwrap();
     assert_ne!(reused_attachment, first);
+}
+
+#[test]
+fn acp_transport_registry_rejects_option_set_not_present_on_wire() {
+    let registry = OutboundPermissionRegistry::new();
+    let mut counters = AcpTransportCounters::default();
+    let err = registry
+        .reserve_permission(
+            "att".into(),
+            "delivery".into(),
+            "attention".into(),
+            vec!["not-sent".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut counters,
+        )
+        .unwrap_err();
+    assert!(matches!(err, RegistryError::InvalidIssuedOptions));
+    assert_eq!(registry.charged_entries(), 0);
+}
+
+#[test]
+fn acp_transport_registry_cancel_output_failure_closes_and_releases() {
+    let registry = OutboundPermissionRegistry::new();
+    let mut sink = MemoryFrameSink::default();
+    let mut counters = AcpTransportCounters::default();
+    let id = registry
+        .issue_and_write(
+            "att".into(),
+            "delivery".into(),
+            "attention".into(),
+            vec!["allow-once".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut sink,
+            &mut counters,
+        )
+        .unwrap();
+    sink.partial_next = Some(4);
+    registry.on_local_cancel(&id, &mut sink, &mut counters);
+    assert!(registry.connection_closed());
+    assert_eq!(registry.state_of(&id), Some(PermissionStateName::Released));
+    assert_eq!(registry.charged_entries(), 0);
 }
 
 #[test]
@@ -512,6 +662,14 @@ fn acp_transport_registry_partial_write_late_wrong_and_races() {
         &mut peer,
         &format!(
             r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"selected","optionId":"nope"}}}}}}"#
+        ),
+    );
+    assert_eq!(peer.resolve.calls.len(), 0);
+
+    send(
+        &mut peer,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"selected","optionId":"allow-once","unexpected":true}}}}}}"#
         ),
     );
     assert_eq!(peer.resolve.calls.len(), 0);
@@ -636,6 +794,61 @@ fn acp_transport_registry_disconnect_during_resolve_and_typed_outcomes() {
 }
 
 #[test]
+fn acp_transport_registry_disconnect_while_resolve_blocks_suppresses_ack() {
+    let registry = Arc::new(OutboundPermissionRegistry::new());
+    let mut sink = MemoryFrameSink::default();
+    let mut counters = AcpTransportCounters::default();
+    let id = registry
+        .issue_and_write(
+            "att".into(),
+            "delivery".into(),
+            "attention".into(),
+            vec!["allow-once".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut sink,
+            &mut counters,
+        )
+        .unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let ack_count = Arc::new(AtomicUsize::new(0));
+    let worker_registry = Arc::clone(&registry);
+    let worker_ack_count = Arc::clone(&ack_count);
+    let worker_id = id.clone();
+    let worker = std::thread::spawn(move || {
+        let response = format!(
+            r#"{{"jsonrpc":"2.0","id":"{worker_id}","result":{{"outcome":{{"outcome":"selected","optionId":"allow-once"}}}}}}"#
+        );
+        let parsed = match classify(&response).unwrap() {
+            InboundMessage::Response(response) => response,
+            other => panic!("expected response, got {other:?}"),
+        };
+        let mut resolve = BlockingResolve {
+            started: started_tx,
+            resume: resume_rx,
+        };
+        let mut ack = AtomicAck(worker_ack_count);
+        let mut sink = MemoryFrameSink::default();
+        let mut counters = AcpTransportCounters::default();
+        worker_registry.on_inbound_response(
+            &parsed.id,
+            parsed.result.as_ref(),
+            &parsed.raw,
+            &mut resolve,
+            &mut ack,
+            &mut sink,
+            &mut counters,
+        )
+    });
+    started_rx.recv().unwrap();
+    registry.on_disconnect(&mut AcpTransportCounters::default());
+    resume_tx.send(()).unwrap();
+    assert!(!worker.join().unwrap());
+    assert_eq!(ack_count.load(Ordering::SeqCst), 0);
+    assert_eq!(registry.state_of(&id), Some(PermissionStateName::Released));
+}
+
+#[test]
 fn acp_transport_classify_request_notification_response() {
     assert!(matches!(
         classify(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).unwrap(),
@@ -686,12 +899,19 @@ fn wrap_session_new_with_pad(size: usize, mcp_servers: &str) -> String {
 }
 
 fn padded_permission_params(target_frame_bytes: usize) -> serde_json::Value {
-    let baseline = super::envelope::request(
-        "1",
-        "session/request_permission",
-        permission_params("s", &["allow-once"], "c"),
-    );
-    let extra = target_frame_bytes.saturating_sub(baseline.len());
+    let empty_title = json!({
+        "sessionId": "s",
+        "options": [{ "optionId": "allow-once", "name": "allow-once", "kind": "allow_once" }],
+        "toolCall": {
+            "toolCallId": "c",
+            "title": "",
+            "kind": "other",
+            "status": "pending"
+        }
+    });
+    let baseline = super::envelope::request("1", "session/request_permission", empty_title).len();
+    assert!(target_frame_bytes >= baseline);
+    let extra = target_frame_bytes - baseline;
     json!({
         "sessionId": "s",
         "options": [{ "optionId": "allow-once", "name": "allow-once", "kind": "allow_once" }],

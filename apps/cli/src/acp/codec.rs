@@ -8,6 +8,7 @@
 use std::io::{self, Write};
 
 use super::AcpTransportCounters;
+use super::classify::classify;
 
 /// Exact UTF-8 byte cap for one ACP JSON-RPC frame, LF excluded.
 pub const ACP_JSON_FRAME_MAX_BYTES_V1: usize = 2_097_152;
@@ -130,6 +131,10 @@ impl<R: io::Read> AcpLineReader<R> {
         };
         let mut line: Vec<u8> = self.pending.drain(..=newline_at).collect();
         line.pop();
+        if line.last() == Some(&b'\r') {
+            counters.frames_rejected += 1;
+            return Err(AcpFrameError::EmbeddedLineBreak);
+        }
         if line.contains(&b'\n') {
             counters.frames_rejected += 1;
             return Err(AcpFrameError::EmbeddedLineBreak);
@@ -250,9 +255,12 @@ pub fn prepare_outbound_json(json: &str) -> Result<(), AcpFrameError> {
     if json.contains('\n') {
         return Err(AcpFrameError::EmbeddedLineBreak);
     }
-    if !json.contains("\"jsonrpc\":\"2.0\"") {
+    if json.contains('\r') {
+        return Err(AcpFrameError::EmbeddedLineBreak);
+    }
+    if classify(json).is_err() {
         return Err(AcpFrameError::Io(
-            "outbound JSON-RPC value missing exact jsonrpc 2.0".into(),
+            "outbound value is not one valid JSON-RPC 2.0 message".into(),
         ));
     }
     Ok(())
@@ -389,6 +397,13 @@ mod tests {
     }
 
     #[test]
+    fn acp_transport_codec_rejects_crlf() {
+        let err =
+            read_one(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\r\n").unwrap_err();
+        assert!(matches!(err, AcpFrameError::EmbeddedLineBreak));
+    }
+
+    #[test]
     fn acp_transport_codec_exact_max_and_max_plus_one() {
         let max = make_object_of_size(ACP_JSON_FRAME_MAX_BYTES_V1);
         assert_eq!(max.len(), ACP_JSON_FRAME_MAX_BYTES_V1);
@@ -454,6 +469,25 @@ mod tests {
         let err = writer.write_json_value(&json, &mut counters).unwrap_err();
         assert!(matches!(err, AcpFrameError::OverLimit { .. }));
         assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn acp_transport_codec_rejects_structurally_invalid_outbound_jsonrpc() {
+        for invalid in [
+            r#"[{"jsonrpc":"2.0","id":1,"result":{}}]"#,
+            r#"{"jsonrpc":"1.0","note":"\"jsonrpc\":\"2.0\""}"#,
+            r#"{"note":"\"jsonrpc\":\"2.0\""}"#,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\r",
+        ] {
+            let mut sink = Vec::new();
+            let mut writer = AcpLineWriter::new(&mut sink);
+            assert!(
+                writer
+                    .write_json_value(invalid, &mut AcpTransportCounters::default())
+                    .is_err()
+            );
+            assert!(sink.is_empty());
+        }
     }
 
     pub(crate) fn make_object_of_size(size: usize) -> String {

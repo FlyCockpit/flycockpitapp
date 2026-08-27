@@ -21,7 +21,13 @@ pub fn success_response(id: &JsonRpcId, result: Value) -> String {
 }
 
 pub fn error_response(id: Option<&JsonRpcId>, code: i32, message: &str) -> Option<String> {
-    let id = id.filter(|id| !matches!(id, JsonRpcId::Null))?;
+    let id = id?;
+    if let JsonRpcId::Number(number) = id {
+        let error = json!({ "code": code, "message": message });
+        return Some(format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{number},\"error\":{error}}}"
+        ));
+    }
     Some(
         json!({
             "jsonrpc": JSON_RPC_VERSION,
@@ -80,11 +86,7 @@ fn id_value(id: &JsonRpcId) -> Value {
     match id {
         JsonRpcId::Null => Value::Null,
         JsonRpcId::Number(n) => {
-            if let Ok(as_u64) = n.parse::<u64>() {
-                Value::from(as_u64)
-            } else {
-                Value::from(n.clone())
-            }
+            serde_json::from_str(n).expect("raw parser admitted a valid JSON number")
         }
         JsonRpcId::String(s) => Value::from(s.clone()),
     }

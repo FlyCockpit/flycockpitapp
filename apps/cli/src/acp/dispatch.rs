@@ -1,20 +1,18 @@
 //! jsonrpsee inbound method dispatch for the ACP v1 peer.
 //!
-//! Raw `params` bytes are retained via `jsonrpsee_types::Params::as_str`.
-//! Unstable elicitation methods are not registered.
+//! Cockpit's parser gates each frame and retains raw `params`; the admitted
+//! request is then routed through jsonrpsee's raw-request dispatch API.
+
+use std::sync::{Arc, Mutex};
 
 use jsonrpsee::RpcModule;
-use jsonrpsee_types::Params;
+use jsonrpsee_types::{ErrorObjectOwned, Params};
 
 use super::AcpTransportCounters;
 use super::bridge::BridgeFacade;
 use super::classify::InboundRequest;
-use super::dto::{
-    SessionAdmissionDto, decode_session_load, decode_session_new, initialize_result,
-    raw_kind_is_object,
-};
-use super::envelope::{invalid_params, method_not_found, success_response};
-use super::raw_json::JsonRpcId;
+use super::dto::{SessionAdmissionDto, decode_session_load, decode_session_new, initialize_result};
+use super::raw_json::parse_frame;
 
 /// If this fails to type-check, return the transport-selection prompt.
 const JSONRPSEE_RAW_PARAMS_API: fn(&Params<'_>) -> Option<&str> = Params::as_str;
@@ -27,47 +25,92 @@ const INBOUND_METHODS: &[&str] = &[
     "session/prompt",
 ];
 
-pub fn build_rpc_module() -> RpcModule<()> {
-    let mut module = RpcModule::new(());
+#[derive(Debug, Default)]
+pub struct DispatchContext {
+    counters: Mutex<AcpTransportCounters>,
+    cancelled_sessions: Mutex<Vec<String>>,
+    raw_params: Option<String>,
+}
+
+pub fn build_rpc_module() -> RpcModule<DispatchContext> {
+    build_rpc_module_from_arc(Arc::new(DispatchContext::default()))
+}
+
+fn build_rpc_module_from_arc(context: Arc<DispatchContext>) -> RpcModule<DispatchContext> {
+    let mut module = RpcModule::from_arc(context);
     module
         .register_method("initialize", |params, _, _| {
             let _ = JSONRPSEE_RAW_PARAMS_API(&params);
-            initialize_result()
+            Ok::<_, ErrorObjectOwned>(initialize_result())
         })
         .expect("initialize is unique");
     module
-        .register_method("session/new", |params, _, _| {
-            let _ = JSONRPSEE_RAW_PARAMS_API(&params);
-            serde_json::json!({ "sessionId": "deferred" })
+        .register_method("session/new", |params, context, _| {
+            let raw = required_raw_params(&params, context)?;
+            let parsed = parse_frame(&raw).map_err(|err| invalid_params(err.to_string()))?;
+            let mut counters = context.counters.lock().expect("dispatch counters");
+            let dto = decode_session_new(&raw, &parsed.root, &mut counters)
+                .map_err(|err| invalid_params(err.to_string()))?;
+            let receipt = BridgeFacade.admit(&SessionAdmissionDto::New(dto), &mut counters);
+            Ok(serde_json::json!({
+                "sessionId": format!("acp-session-{}", receipt.server_count)
+            }))
         })
         .expect("session/new is unique");
     module
-        .register_method("session/load", |params, _, _| {
-            let _ = JSONRPSEE_RAW_PARAMS_API(&params);
-            serde_json::json!({})
+        .register_method("session/load", |params, context, _| {
+            let raw = required_raw_params(&params, context)?;
+            let parsed = parse_frame(&raw).map_err(|err| invalid_params(err.to_string()))?;
+            let mut counters = context.counters.lock().expect("dispatch counters");
+            let dto = decode_session_load(&raw, &parsed.root, &mut counters)
+                .map_err(|err| invalid_params(err.to_string()))?;
+            BridgeFacade.admit(&SessionAdmissionDto::Load(dto), &mut counters);
+            Ok(serde_json::json!({}))
         })
         .expect("session/load is unique");
     module
-        .register_method("session/cancel", |params, _, _| {
-            let _ = JSONRPSEE_RAW_PARAMS_API(&params);
-            serde_json::Value::Null
+        .register_method("session/cancel", |params, context, _| {
+            let raw = required_raw_params(&params, context)?;
+            let value: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|err| invalid_params(err.to_string()))?;
+            let session_id = value
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invalid_params("missing sessionId"))?;
+            context
+                .cancelled_sessions
+                .lock()
+                .expect("cancelled sessions")
+                .push(session_id.to_string());
+            Ok(serde_json::Value::Null)
         })
         .expect("session/cancel is unique");
     module
         .register_method("session/prompt", |params, _, _| {
             let _ = JSONRPSEE_RAW_PARAMS_API(&params);
-            serde_json::json!({ "stopReason": "end_turn" })
+            Ok::<_, ErrorObjectOwned>(serde_json::json!({ "stopReason": "end_turn" }))
         })
         .expect("session/prompt is unique");
     module
 }
 
-pub fn registered_method_names() -> Vec<&'static str> {
-    INBOUND_METHODS.to_vec()
+fn required_raw_params(
+    params: &Params<'_>,
+    context: &DispatchContext,
+) -> Result<String, ErrorObjectOwned> {
+    context
+        .raw_params
+        .clone()
+        .or_else(|| JSONRPSEE_RAW_PARAMS_API(params).map(str::to_string))
+        .ok_or_else(|| invalid_params("params required"))
 }
 
-pub fn method_is_registered(method: &str) -> bool {
-    INBOUND_METHODS.contains(&method)
+fn invalid_params(message: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32602, message.into(), None::<()>)
+}
+
+pub fn registered_method_names() -> Vec<&'static str> {
+    INBOUND_METHODS.to_vec()
 }
 
 pub fn elicitation_is_rejected(method: &str) -> bool {
@@ -85,113 +128,72 @@ pub enum DispatchResult {
 
 pub fn dispatch_request(
     request: &InboundRequest,
-    bridge: &BridgeFacade,
+    _bridge: &BridgeFacade,
     counters: &mut AcpTransportCounters,
     cancelled: &mut Vec<String>,
 ) -> DispatchResult {
-    let params = Params::new(request.raw_params.as_deref());
-    let raw = JSONRPSEE_RAW_PARAMS_API(&params);
-    if elicitation_is_rejected(&request.method) || !method_is_registered(&request.method) {
-        return DispatchResult::Response(method_not_found(&request.id));
-    }
-    match request.method.as_str() {
-        "initialize" => {
-            DispatchResult::Response(success_response(&request.id, initialize_result()))
-        }
-        "session/new" => dispatch_session_new(request, raw, bridge, counters),
-        "session/load" => dispatch_session_load(request, raw, bridge, counters),
-        "session/prompt" => DispatchResult::Response(success_response(
-            &request.id,
-            serde_json::json!({ "stopReason": "end_turn" }),
-        )),
-        "session/cancel" => {
-            if let Some(session_id) = request
-                .params
-                .as_ref()
-                .and_then(|node| node.member("sessionId"))
-                .and_then(|node| node.as_str())
-            {
-                cancelled.push(session_id.to_string());
-            }
-            DispatchResult::Response(success_response(&request.id, serde_json::Value::Null))
-        }
-        _ => DispatchResult::Response(method_not_found(&request.id)),
-    }
+    let context = Arc::new(DispatchContext {
+        raw_params: request.raw_params.clone(),
+        ..DispatchContext::default()
+    });
+    let module = build_rpc_module_from_arc(Arc::clone(&context));
+    let response = futures::executor::block_on(module.raw_json_request(&request.raw, 1));
+    let Ok((response, _notifications)) = response else {
+        return DispatchResult::NoResponse;
+    };
+    let dispatch_counters = context.counters.lock().expect("dispatch counters").clone();
+    counters.daemon_mutations += dispatch_counters.daemon_mutations;
+    counters.bridge_conversions += dispatch_counters.bridge_conversions;
+    counters.catalog_mutations += dispatch_counters.catalog_mutations;
+    counters.dto_produced += dispatch_counters.dto_produced;
+    counters.schema_decode_attempts += dispatch_counters.schema_decode_attempts;
+    cancelled.extend(
+        context
+            .cancelled_sessions
+            .lock()
+            .expect("cancelled sessions")
+            .drain(..),
+    );
+    DispatchResult::Response(response)
 }
 
 pub fn dispatch_notification(
     method: &str,
-    raw_params: Option<&str>,
-    params_node: Option<&super::raw_json::RawNode>,
+    raw: &str,
     cancelled: &mut Vec<String>,
 ) -> DispatchResult {
-    let params = Params::new(raw_params);
-    let _ = JSONRPSEE_RAW_PARAMS_API(&params);
-    match method {
-        "session/cancel" => {
-            if let Some(session_id) = params_node
-                .and_then(|node| node.member("sessionId"))
-                .and_then(|node| node.as_str())
-            {
-                cancelled.push(session_id.to_string());
-            }
-            DispatchResult::NotificationHandled
-        }
-        "$/cancel_request" => DispatchResult::NotificationHandled,
-        _ => DispatchResult::NoResponse,
+    if method == "$/cancel_request" {
+        return DispatchResult::NotificationHandled;
     }
-}
-
-fn dispatch_session_new(
-    request: &InboundRequest,
-    raw: Option<&str>,
-    bridge: &BridgeFacade,
-    counters: &mut AcpTransportCounters,
-) -> DispatchResult {
-    let Some(raw) = raw else {
-        return DispatchResult::Response(invalid_params(&request.id, "params required"));
+    let Ok(parsed) = parse_frame(raw) else {
+        return DispatchResult::NoResponse;
     };
-    let Some(node) = request.params.as_ref() else {
-        return DispatchResult::Response(invalid_params(&request.id, "params required"));
+    let raw_params = parsed.root.member("params").map(|node| node.raw(raw));
+    let routed = match raw_params {
+        Some(params) => format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":{},\"params\":{params}}}",
+            serde_json::to_string(method).expect("method is a JSON string")
+        ),
+        None => format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":{}}}",
+            serde_json::to_string(method).expect("method is a JSON string")
+        ),
     };
-    if !raw_kind_is_object(node) {
-        return DispatchResult::Response(invalid_params(&request.id, "params must be an object"));
+    let context = Arc::new(DispatchContext {
+        raw_params: raw_params.map(str::to_string),
+        ..DispatchContext::default()
+    });
+    let module = build_rpc_module_from_arc(Arc::clone(&context));
+    let response = futures::executor::block_on(module.raw_json_request(&routed, 1));
+    if response.is_err() {
+        return DispatchResult::NoResponse;
     }
-    match decode_session_new(raw, node, counters) {
-        Ok(dto) => {
-            let receipt = bridge.admit(&SessionAdmissionDto::New(dto), counters);
-            DispatchResult::Response(success_response(
-                &request.id,
-                serde_json::json!({
-                    "sessionId": format!("acp-session-{}", receipt.server_count)
-                }),
-            ))
-        }
-        Err(err) => DispatchResult::Response(invalid_params(&request.id, &err.to_string())),
-    }
-}
-
-fn dispatch_session_load(
-    request: &InboundRequest,
-    raw: Option<&str>,
-    bridge: &BridgeFacade,
-    counters: &mut AcpTransportCounters,
-) -> DispatchResult {
-    let Some(raw) = raw else {
-        return DispatchResult::Response(invalid_params(&request.id, "params required"));
-    };
-    let Some(node) = request.params.as_ref() else {
-        return DispatchResult::Response(invalid_params(&request.id, "params required"));
-    };
-    match decode_session_load(raw, node, counters) {
-        Ok(dto) => {
-            let _receipt = bridge.admit(&SessionAdmissionDto::Load(dto), counters);
-            DispatchResult::Response(success_response(&request.id, serde_json::json!({})))
-        }
-        Err(err) => DispatchResult::Response(invalid_params(&request.id, &err.to_string())),
-    }
-}
-
-pub fn request_id_json(id: &JsonRpcId) -> String {
-    id.to_json()
+    cancelled.extend(
+        context
+            .cancelled_sessions
+            .lock()
+            .expect("cancelled sessions")
+            .drain(..),
+    );
+    DispatchResult::NotificationHandled
 }

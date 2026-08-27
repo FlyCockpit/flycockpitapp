@@ -63,7 +63,7 @@ where
                 invalid_request(request_id.as_ref())
             }
             Ok(InboundMessage::Response(response)) => {
-                self.registry.on_inbound_response(
+                let closed_refusal = self.registry.on_inbound_response(
                     &response.id,
                     response.result.as_ref(),
                     &response.raw,
@@ -72,6 +72,10 @@ where
                     &mut self.sink,
                     &mut self.counters,
                 );
+                if closed_refusal {
+                    self.connection_closed = true;
+                    self.registry.on_disconnect(&mut self.counters);
+                }
                 None
             }
             Ok(InboundMessage::Request(request)) => {
@@ -91,8 +95,7 @@ where
             Ok(InboundMessage::Notification(notification)) => {
                 dispatch_notification(
                     &notification.method,
-                    notification.raw_params.as_deref(),
-                    notification.params.as_ref(),
+                    &notification.raw,
                     &mut self.cancelled_sessions,
                 );
                 None
@@ -166,7 +169,7 @@ where
                 }
             }
         }
-        if adapter.connection_closed {
+        if adapter.connection_closed || adapter.registry.connection_closed() {
             return Ok(());
         }
     }

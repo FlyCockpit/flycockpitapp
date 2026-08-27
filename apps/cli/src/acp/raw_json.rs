@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 
+const MAX_JSON_NESTING_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawJsonError {
     pub kind: RawJsonErrorKind,
@@ -128,7 +130,7 @@ pub fn parse_frame(input: &str) -> Result<ParsedFrame, RawJsonError> {
         root_id_ambiguous: false,
     };
     parser.skip_ws();
-    let root = parser.parse_value("")?;
+    let root = parser.parse_value("", 0)?;
     parser.skip_ws();
     if parser.pos != parser.input.len() {
         return Err(parser.fail(RawJsonErrorKind::TrailingJunk));
@@ -165,7 +167,10 @@ impl<'a> Parser<'a> {
         Some(ch)
     }
 
-    fn parse_value(&mut self, path: &str) -> Result<RawNode, RawJsonError> {
+    fn parse_value(&mut self, path: &str, depth: usize) -> Result<RawNode, RawJsonError> {
+        if depth > MAX_JSON_NESTING_DEPTH {
+            return Err(self.fail(RawJsonErrorKind::Syntax("JSON nesting limit exceeded")));
+        }
         self.skip_ws();
         let start = self.pos;
         match self.peek_char() {
@@ -201,8 +206,8 @@ impl<'a> Parser<'a> {
                     end: self.pos,
                 })
             }
-            Some('[') => self.parse_array(path, start),
-            Some('{') => self.parse_object(path, start),
+            Some('[') => self.parse_array(path, start, depth),
+            Some('{') => self.parse_object(path, start, depth),
             Some('-') | Some('0'..='9') => {
                 self.parse_number()?;
                 Ok(RawNode {
@@ -292,7 +297,7 @@ impl<'a> Parser<'a> {
                     Some('n') => out.push('\n'),
                     Some('r') => out.push('\r'),
                     Some('t') => out.push('\t'),
-                    Some('u') => out.push(self.parse_hex_escape()?),
+                    Some('u') => self.parse_unicode_escape(&mut out)?,
                     _ => return Err(self.fail(RawJsonErrorKind::Syntax("invalid string escape"))),
                 },
                 Some(ch) if ch.is_control() => {
@@ -303,7 +308,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_hex_escape(&mut self) -> Result<char, RawJsonError> {
+    fn parse_hex_code_unit(&mut self) -> Result<u16, RawJsonError> {
         let mut code = 0u32;
         for _ in 0..4 {
             let ch = self
@@ -314,11 +319,38 @@ impl<'a> Parser<'a> {
                 .to_digit(16)
                 .ok_or_else(|| self.fail(RawJsonErrorKind::Syntax("invalid unicode escape")))?;
         }
-        char::from_u32(code)
-            .ok_or_else(|| self.fail(RawJsonErrorKind::Syntax("invalid unicode scalar")))
+        Ok(code as u16)
     }
 
-    fn parse_array(&mut self, path: &str, start: usize) -> Result<RawNode, RawJsonError> {
+    fn parse_unicode_escape(&mut self, out: &mut String) -> Result<(), RawJsonError> {
+        let first = self.parse_hex_code_unit()?;
+        let scalar = if (0xD800..=0xDBFF).contains(&first) {
+            if self.bump() != Some('\\') || self.bump() != Some('u') {
+                return Err(self.fail(RawJsonErrorKind::Syntax("unpaired high surrogate")));
+            }
+            let second = self.parse_hex_code_unit()?;
+            if !(0xDC00..=0xDFFF).contains(&second) {
+                return Err(self.fail(RawJsonErrorKind::Syntax("invalid low surrogate")));
+            }
+            0x1_0000 + (((first as u32 - 0xD800) << 10) | (second as u32 - 0xDC00))
+        } else if (0xDC00..=0xDFFF).contains(&first) {
+            return Err(self.fail(RawJsonErrorKind::Syntax("unpaired low surrogate")));
+        } else {
+            first as u32
+        };
+        out.push(
+            char::from_u32(scalar)
+                .ok_or_else(|| self.fail(RawJsonErrorKind::Syntax("invalid unicode scalar")))?,
+        );
+        Ok(())
+    }
+
+    fn parse_array(
+        &mut self,
+        path: &str,
+        start: usize,
+        depth: usize,
+    ) -> Result<RawNode, RawJsonError> {
         self.bump();
         self.skip_ws();
         let mut items = Vec::new();
@@ -333,7 +365,7 @@ impl<'a> Parser<'a> {
         let mut index = 0usize;
         loop {
             let child_path = format!("{path}[{index}]");
-            items.push(self.parse_value(&child_path)?);
+            items.push(self.parse_value(&child_path, depth + 1)?);
             self.skip_ws();
             match self.peek_char() {
                 Some(',') => {
@@ -354,7 +386,12 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_object(&mut self, path: &str, start: usize) -> Result<RawNode, RawJsonError> {
+    fn parse_object(
+        &mut self,
+        path: &str,
+        start: usize,
+        depth: usize,
+    ) -> Result<RawNode, RawJsonError> {
         self.bump();
         self.skip_ws();
         let mut members = Vec::new();
@@ -396,7 +433,7 @@ impl<'a> Parser<'a> {
             } else {
                 format!("{path}.{name}")
             };
-            let value = self.parse_value(&child_path)?;
+            let value = self.parse_value(&child_path, depth + 1)?;
             if path.is_empty() && name == "id" {
                 if self.root_id.is_some() {
                     self.root_id_ambiguous = true;
@@ -496,5 +533,26 @@ mod tests {
             err.unambiguous_request_id,
             Some(JsonRpcId::Number("7".into()))
         );
+    }
+
+    #[test]
+    fn acp_transport_raw_accepts_surrogate_pair_and_rejects_unpaired_surrogate() {
+        let parsed = parse_frame(r#"{"value":"\uD83D\uDE00"}"#).unwrap();
+        assert_eq!(
+            parsed.root.member("value").and_then(RawNode::as_str),
+            Some("😀")
+        );
+        assert!(parse_frame(r#"{"value":"\uD83D"}"#).is_err());
+        assert!(parse_frame(r#"{"value":"\uDE00"}"#).is_err());
+    }
+
+    #[test]
+    fn acp_transport_raw_rejects_excessive_nesting() {
+        let nested = format!(
+            "{}null{}",
+            "[".repeat(MAX_JSON_NESTING_DEPTH + 1),
+            "]".repeat(MAX_JSON_NESTING_DEPTH + 1)
+        );
+        assert!(parse_frame(&nested).is_err());
     }
 }

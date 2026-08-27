@@ -143,11 +143,11 @@ fn decode_load_lossless(raw_params: &str, params: &RawNode) -> Result<SessionLoa
     })
 }
 
-fn decode_mcp_servers(raw_params: &str, params: &RawNode) -> Result<Vec<McpServerDto>, DtoError> {
+fn decode_mcp_servers(_raw_params: &str, params: &RawNode) -> Result<Vec<McpServerDto>, DtoError> {
     let node = params
         .member("mcpServers")
         .ok_or(DtoError::MissingField("mcpServers"))?;
-    let bytes = node.raw(raw_params).len();
+    let bytes = node.end - node.start;
     if bytes > ACP_FORWARDED_MCP_VECTOR_MAX_BYTES_V1 {
         return Err(DtoError::McpVectorOverLimit { bytes });
     }
@@ -164,26 +164,44 @@ fn decode_one_server(node: &RawNode) -> Result<McpServerDto, DtoError> {
         return Err(DtoError::FieldType("mcpServers[]"));
     }
     let name = required_string(node, "name")?;
-    let type_name = node.member("type").and_then(RawNode::as_str);
+    let type_name = match node.member("type") {
+        Some(discriminator) => Some(
+            discriminator
+                .as_str()
+                .ok_or(DtoError::MixedOrUnknownTransport)?,
+        ),
+        None => None,
+    };
     match type_name {
-        None | Some("stdio") => Ok(McpServerDto::Stdio {
-            name,
-            command: required_string(node, "command")?,
-            args: optional_string_array(node, "args")?,
-            env: optional_pairs(node, "env")?,
-        }),
-        Some("http") => Ok(McpServerDto::Http {
-            name,
-            url: required_string(node, "url")?,
-            headers: optional_pairs(node, "headers")?,
-        }),
-        Some("sse") => Ok(McpServerDto::Sse {
-            name,
-            url: required_string(node, "url")?,
-            headers: optional_pairs(node, "headers")?,
-        }),
+        None | Some("stdio") if !has_any_member(node, &["url", "headers"]) => {
+            Ok(McpServerDto::Stdio {
+                name,
+                command: required_string(node, "command")?,
+                args: optional_string_array(node, "args")?,
+                env: optional_pairs(node, "env")?,
+            })
+        }
+        Some("http") if !has_any_member(node, &["command", "args", "env"]) => {
+            Ok(McpServerDto::Http {
+                name,
+                url: required_string(node, "url")?,
+                headers: optional_pairs(node, "headers")?,
+            })
+        }
+        Some("sse") if !has_any_member(node, &["command", "args", "env"]) => {
+            Ok(McpServerDto::Sse {
+                name,
+                url: required_string(node, "url")?,
+                headers: optional_pairs(node, "headers")?,
+            })
+        }
         Some(_) => Err(DtoError::MixedOrUnknownTransport),
+        _ => Err(DtoError::MixedOrUnknownTransport),
     }
+}
+
+fn has_any_member(node: &RawNode, names: &[&str]) -> bool {
+    names.iter().any(|name| node.member(name).is_some())
 }
 
 fn required_string(node: &RawNode, name: &'static str) -> Result<String, DtoError> {
@@ -255,8 +273,8 @@ pub fn initialize_result() -> serde_json::Value {
                 "embeddedContext": false
             },
             "mcpCapabilities": {
-                "http": false,
-                "sse": false
+                "http": true,
+                "sse": true
             },
             "sessionCapabilities": {}
         },

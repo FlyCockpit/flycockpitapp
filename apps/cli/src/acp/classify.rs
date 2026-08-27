@@ -52,6 +52,7 @@ pub struct InboundRequest {
     pub method: String,
     pub raw_params: Option<String>,
     pub params: Option<RawNode>,
+    pub raw: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +60,7 @@ pub struct InboundNotification {
     pub method: String,
     pub raw_params: Option<String>,
     pub params: Option<RawNode>,
+    pub raw: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,27 +136,27 @@ fn classify_parsed(frame: &str, parsed: ParsedFrame) -> Result<InboundMessage, C
                 let id = parsed
                     .unambiguous_request_id
                     .ok_or(ClassifyError::InvalidJsonrpc { request_id: None })?;
-                if matches!(id, JsonRpcId::Null) {
-                    return Ok(InboundMessage::Notification(InboundNotification {
-                        method,
-                        raw_params,
-                        params,
-                    }));
+                if !jsonrpsee_supports_id(&id) {
+                    return Err(ClassifyError::InvalidJsonrpc {
+                        request_id: Some(id),
+                    });
                 }
                 Ok(InboundMessage::Request(InboundRequest {
                     id,
                     method,
                     raw_params,
                     params,
+                    raw: frame.to_string(),
                 }))
             }
             None => Ok(InboundMessage::Notification(InboundNotification {
                 method,
                 raw_params,
                 params,
+                raw: frame.to_string(),
             })),
         }
-    } else if has_result || has_error {
+    } else if has_result ^ has_error {
         let id = parsed
             .unambiguous_request_id
             .ok_or(ClassifyError::InvalidJsonrpc { request_id: None })?;
@@ -164,9 +166,20 @@ fn classify_parsed(frame: &str, parsed: ParsedFrame) -> Result<InboundMessage, C
             error: parsed.root.member("error").cloned(),
             raw: frame.to_string(),
         }))
+    } else if has_result && has_error {
+        Err(ClassifyError::BothRequestAndResponse {
+            request_id: parsed.unambiguous_request_id,
+        })
     } else {
         Err(ClassifyError::MissingMethod {
             request_id: parsed.unambiguous_request_id,
         })
+    }
+}
+
+fn jsonrpsee_supports_id(id: &JsonRpcId) -> bool {
+    match id {
+        JsonRpcId::Number(number) => number.parse::<u64>().is_ok(),
+        JsonRpcId::Null | JsonRpcId::String(_) => true,
     }
 }

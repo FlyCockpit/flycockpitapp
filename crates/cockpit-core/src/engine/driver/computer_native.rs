@@ -23,6 +23,157 @@
 use crate::computer::ComputerToolContract;
 use crate::computer::coordinator::{ComputerActionCoordinator, NativeComputerContinuation};
 use crate::computer::live_loop::NativeComputerLiveLoop;
+use crate::engine::agent::Agent;
+use crate::session::Session;
+use std::sync::Arc;
+
+/// Open a selected delegation's native-computer capability before its first
+/// advertised request. This is shared by foreground and noninteractive
+/// delegation loops so neither can advertise geometry before the coordinator
+/// owns the backend.
+pub(crate) async fn open_native_computer_for_delegation(
+    agent: &mut Agent,
+    session: &Arc<Session>,
+    approver: Option<Arc<crate::approval::Approver>>,
+    delegation_id: String,
+) -> Option<ComputerActionCoordinator> {
+    let candidate = agent.params.native_computer.clone()?;
+    if !agent
+        .model
+        .supports_native_computer_contract(candidate.contract)
+    {
+        return None;
+    }
+    let Some(approver) = approver else {
+        agent.params.native_computer = None;
+        return None;
+    };
+    let backend = match crate::computer::VirtualDisplayBackend::construct(
+        crate::computer::DisplayTarget::Virtual,
+        None,
+    ) {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!(error = %error, "native computer backend open failed");
+            agent.params.native_computer = None;
+            return None;
+        }
+    };
+    let handoff_journal = session.external_journal().map(|journal| {
+        Arc::new(crate::computer::coordinator::ExternalJournalHandoff::new(
+            journal,
+            crate::external_journal::projection::SafeToken::for_session(session.id),
+        )) as Arc<dyn crate::computer::coordinator::HandoffJournal>
+    });
+    let params = crate::computer::coordinator::CoordinatorParams {
+        session_id: session.id.hyphenated().to_string(),
+        delegation_id: crate::computer::coordinator::DelegationId(delegation_id),
+        tier: if candidate.approval_required {
+            crate::computer::coordinator::ComputerApprovalTier::Ask
+        } else {
+            crate::computer::coordinator::ComputerApprovalTier::Yolo
+        },
+        owner_instance: crate::computer::coordinator::OwnerInstance(1),
+        authorizer: Arc::new(
+            crate::computer::authorizer::ApproverComputerAuthorizer::new(approver),
+        ),
+        host_arbiter: None,
+        target_adapter: Some(Box::new(
+            crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(
+                *uuid::Uuid::new_v4().as_bytes(),
+            ),
+        )),
+        provider_id: crate::computer::coordinator::ProviderId(
+            agent.model.provider_id().to_string(),
+        ),
+        model_id: crate::computer::coordinator::ModelId(agent.model.model_id_ref().to_string()),
+        outcome_store: Some(Arc::new(
+            crate::computer::outcome_store::SqliteOutcomeStore::new(session.db.clone()),
+        )),
+        handoff_journal,
+    };
+    match ComputerActionCoordinator::open(Box::new(backend), params).await {
+        Ok(coordinator) => {
+            agent.params.native_computer = Some(crate::computer::NativeComputerToolConfig {
+                geometry: Some(coordinator.geometry().clone()),
+                ..candidate
+            });
+            Some(coordinator)
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "native computer coordinator open failed");
+            agent.params.native_computer = None;
+            None
+        }
+    }
+}
+
+/// Reconcile the live coordinator with the model's *current* wire support at
+/// every turn boundary. Endpoint fallback can change an OpenAI model from
+/// Responses to Chat Completions after a coordinator was opened; retaining
+/// Responses-only continuations across that change would make the next wire
+/// request invalid. Both foreground and noninteractive loops use this one
+/// lifecycle rule.
+pub(crate) async fn reconcile_native_computer_for_delegation(
+    agent: &mut Agent,
+    session: &Arc<Session>,
+    approver: Option<Arc<crate::approval::Approver>>,
+    delegation_id: String,
+    coordinator: &mut Option<ComputerActionCoordinator>,
+    contract: &mut Option<ComputerToolContract>,
+    pending_continuations: &mut Vec<serde_json::Value>,
+) {
+    let retained_is_compatible = coordinator.is_some()
+        && contract.is_some_and(|contract| agent.model.supports_native_computer_contract(contract));
+    if retained_is_compatible {
+        return;
+    }
+
+    if let Some(mut previous) = coordinator.take() {
+        *contract = None;
+        pending_continuations.clear();
+        if let Some(candidate) = agent.params.native_computer.as_mut() {
+            // Geometry describes a live, contract-specific coordinator. Keep
+            // only the capability metadata until a compatible backend reopens.
+            candidate.geometry = None;
+        }
+        if let Err(error) = previous.close().await {
+            // The incompatible coordinator is never retained after an endpoint
+            // fallback. Its backend has already been removed from scheduling;
+            // report a best-effort resource-release failure without reviving
+            // a capability whose wire contract no longer matches.
+            tracing::warn!(error = %error, "closing incompatible native computer coordinator failed");
+        }
+    } else if contract.take().is_some() {
+        // Preserve the same invariant even if a prior open failed halfway
+        // through a driver-frame update: no contract/geometry/continuation is
+        // retained without its matching coordinator.
+        pending_continuations.clear();
+        if let Some(candidate) = agent.params.native_computer.as_mut() {
+            candidate.geometry = None;
+        }
+    }
+
+    let Some(candidate) = agent.params.native_computer.as_ref() else {
+        return;
+    };
+    if !agent
+        .model
+        .supports_native_computer_contract(candidate.contract)
+    {
+        return;
+    }
+
+    let opened = open_native_computer_for_delegation(agent, session, approver, delegation_id).await;
+    if let Some(opened) = opened {
+        *contract = agent
+            .params
+            .native_computer
+            .as_ref()
+            .map(|config| config.contract);
+        *coordinator = Some(opened);
+    }
+}
 
 /// Handle native computer items from a provider completion.
 ///
@@ -51,6 +202,31 @@ pub async fn handle_native_computer_items(
     };
     let mut live_loop = NativeComputerLiveLoop::new(coordinator, contract);
     live_loop.handle_native_computer_items(raw_output).await
+}
+
+/// Build the short-lived provider wire items after executing retained raw
+/// provider actions. Both provider-native action and result are retained only
+/// for the one following request.
+pub(crate) async fn handle_retained_native_computer_items(
+    coordinator: &mut ComputerActionCoordinator,
+    contract: ComputerToolContract,
+    raw_items: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let continuations = handle_native_computer_items(Some(coordinator), contract, &raw_items).await;
+    if continuations.is_empty() {
+        return Vec::new();
+    }
+    let mut wire = raw_items
+        .into_iter()
+        .filter(|item| {
+            item.get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        })
+        .collect::<Vec<_>>();
+    wire.extend(into_wire_items(continuations));
+    wire
 }
 
 /// Consume transient continuations into the exact provider-native items that
@@ -211,9 +387,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0}
-            ]
+            "action": {"type": "move", "x": 4.0, "y": 5.0}
         })];
 
         let continuations = handle_native_computer_items(
@@ -235,9 +409,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0}
-            ]
+            "action": {"type": "move", "x": 4.0, "y": 5.0}
         })];
 
         let continuations =
@@ -280,9 +452,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0}
-            ]
+            "action": {"type": "move", "x": 4.0, "y": 5.0}
         })];
 
         // Execute through the driver seam.

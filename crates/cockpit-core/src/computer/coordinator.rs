@@ -358,6 +358,29 @@ fn target_evidence_binding_digest(
         .collect()
 }
 
+/// Deterministic, SafeToken-bounded idempotency key for one physical computer
+/// handoff. The prefix distinguishes this namespace while the remaining 55
+/// lowercase hex characters retain 220 bits of the SHA-256 digest.
+fn physical_handoff_idempotency_key(
+    session_id: &str,
+    delegation_id: &DelegationId,
+    call_id: &str,
+    actions: &[ComputerAction],
+) -> String {
+    let mut handoff_digest = Sha256::new();
+    handoff_digest.update(b"flycockpit.computer-handoff.v1\0");
+    handoff_digest.update(session_id.as_bytes());
+    handoff_digest.update(delegation_id.0.as_bytes());
+    handoff_digest.update(call_id.as_bytes());
+    handoff_digest.update(canonical_computer_action_payload_digest(actions).as_bytes());
+    let handoff_hex: String = handoff_digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("computer-{}", &handoff_hex[..55])
+}
+
 /// Trait for OS-level advisory lock operations. Tests inject an in-memory
 /// implementation; production uses file-based `flock`/`LockFileEx`.
 pub trait OsAdvisoryLock: Send {
@@ -2533,29 +2556,18 @@ impl ComputerActionCoordinator {
         let Some(store) = &self.outcome_store else {
             return None;
         };
-        for (identity, digest) in receipts {
-            match store.reserve(identity, digest, action_label).await {
-                Ok(super::outcome_store::OutcomeReservation::Acquired) => {}
-                Ok(super::outcome_store::OutcomeReservation::Existing(stored)) => {
-                    return Some(if stored.digest == *digest {
-                        CoordinatedOutcome::DuplicateReplay {
-                            prior_outcome: Box::new(stored.outcome),
-                        }
-                    } else {
-                        CoordinatedOutcome::IdentityConflict {
-                            identity: identity.clone(),
-                        }
-                    });
-                }
-                Err(error) => {
-                    tracing::error!(error = %error, "durable computer identity reservation failed");
-                    return Some(CoordinatedOutcome::DispatchUnknown {
-                        action_label: action_label.to_string(),
-                    });
-                }
+        match store.reserve_batch(receipts, action_label).await {
+            Ok(super::outcome_store::OutcomeReservation::Acquired) => None,
+            Ok(super::outcome_store::OutcomeReservation::Existing { identity, stored }) => {
+                Some(Self::stored_receipt_outcome(receipts, identity, stored))
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "durable computer identity batch reservation failed");
+                Some(CoordinatedOutcome::DispatchUnknown {
+                    action_label: action_label.to_string(),
+                })
             }
         }
-        None
     }
 
     fn record_action_receipts(&mut self, receipts: &[(ActionIdentity, ActionPayloadDigest)]) {
@@ -2563,6 +2575,82 @@ impl ComputerActionCoordinator {
             self.journal
                 .record_identity(identity.clone(), digest.clone());
         }
+    }
+
+    fn stored_receipt_outcome(
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        identity: ActionIdentity,
+        stored: super::outcome_store::StoredOutcome,
+    ) -> CoordinatedOutcome {
+        if receipts
+            .iter()
+            .find(|(candidate, _)| *candidate == identity)
+            .is_some_and(|(_, digest)| stored.digest == *digest)
+        {
+            CoordinatedOutcome::DuplicateReplay {
+                prior_outcome: Box::new(stored.outcome),
+            }
+        } else {
+            CoordinatedOutcome::IdentityConflict { identity }
+        }
+    }
+
+    /// Record a known zero-input terminal result directly. This operation is
+    /// atomic across the batch and does not create a claimed
+    /// `DispatchUnknown` placeholder before its terminal outcome is known.
+    async fn persist_pre_dispatch_terminal(
+        &mut self,
+        call_id: &str,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        outcome: CoordinatedOutcome,
+        action_label: &str,
+    ) -> CoordinatedOutcome {
+        if let Some(store) = &self.outcome_store {
+            match store.store_terminal_batch(receipts, &outcome).await {
+                Ok(super::outcome_store::OutcomeReservation::Acquired) => {}
+                Ok(super::outcome_store::OutcomeReservation::Existing { identity, stored }) => {
+                    return Self::stored_receipt_outcome(receipts, identity, stored);
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "durable pre-dispatch computer outcome commit failed");
+                    return CoordinatedOutcome::DispatchUnknown {
+                        action_label: action_label.to_string(),
+                    };
+                }
+            }
+        }
+        self.journal.record(call_id, outcome.clone());
+        self.record_action_receipts(receipts);
+        outcome
+    }
+
+    /// Complete the batch reserved immediately before a physical dispatch.
+    /// A commit failure here is genuinely ambiguous and therefore remains
+    /// `DispatchUnknown`; it is deliberately separate from zero-input paths.
+    async fn complete_reserved_receipts(
+        &mut self,
+        call_id: &str,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        outcome: CoordinatedOutcome,
+        action_label: &str,
+    ) -> CoordinatedOutcome {
+        if let Some(store) = &self.outcome_store {
+            match store.complete_reserved_batch(receipts, &outcome).await {
+                Ok(super::outcome_store::OutcomeReservation::Acquired) => {}
+                Ok(super::outcome_store::OutcomeReservation::Existing { identity, stored }) => {
+                    return Self::stored_receipt_outcome(receipts, identity, stored);
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "durable dispatched computer outcome commit failed");
+                    return CoordinatedOutcome::DispatchUnknown {
+                        action_label: action_label.to_string(),
+                    };
+                }
+            }
+        }
+        self.journal.record(call_id, outcome.clone());
+        self.record_action_receipts(receipts);
+        outcome
     }
 
     /// Open a coordinator with the given backend and parameters. Obtains
@@ -2910,18 +2998,12 @@ impl ComputerActionCoordinator {
                 self.host_lease.as_ref(),
                 self.virtual_display_uuid(),
             );
-            let mut handoff_digest = Sha256::new();
-            handoff_digest.update(b"flycockpit.computer-handoff.v1\0");
-            handoff_digest.update(self.session_id.as_bytes());
-            handoff_digest.update(self.delegation_id.0.as_bytes());
-            handoff_digest.update(call_id.as_bytes());
-            handoff_digest.update(canonical_computer_action_payload_digest(actions).as_bytes());
-            let handoff_hex: String = handoff_digest
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            let handoff_idempotency = format!("computer-{handoff_hex}");
+            let handoff_idempotency = physical_handoff_idempotency_key(
+                &self.session_id,
+                &self.delegation_id,
+                call_id,
+                actions,
+            );
             match journal
                 .prepare(&handoff_idempotency, &target_digest, actions.len() as u32)
                 .await
@@ -3341,14 +3423,13 @@ impl ComputerActionCoordinator {
         let Some(lease_key) = self.ask_lease_key(virtual_display_uuid) else {
             // Neither a host lease nor a known virtual display UUID — the lease
             // cannot be scoped to a real target. Fail closed: no human prompt,
-            // no backend input, a journaled security-relevant refusal (never a
-            // benign cancellation).
+            // no backend input, and let the execute chokepoint durably record
+            // the security-relevant refusal (never a benign cancellation).
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::VirtualIdentityUnavailable,
             };
-            self.journal.record(call_id, outcome.clone());
             return Err(outcome);
         };
 
@@ -3419,7 +3500,6 @@ impl ComputerActionCoordinator {
                                 let outcome = CoordinatedOutcome::Invalidated {
                                     reason: TargetUnavailableReason::StaleTarget,
                                 };
-                                self.journal.record(call_id, outcome.clone());
                                 Err(outcome)
                             }
                             AskAuthorizationOutcome::Denied { reason } => {
@@ -3429,7 +3509,6 @@ impl ComputerActionCoordinator {
                                     DispatchState::CancelledBeforeDispatch,
                                 );
                                 let outcome = CoordinatedOutcome::Denied { reason };
-                                self.journal.record(call_id, outcome.clone());
                                 Err(outcome)
                             }
                             AskAuthorizationOutcome::CancelledBeforeInstall
@@ -3439,7 +3518,6 @@ impl ComputerActionCoordinator {
                                     DispatchState::CancelledBeforeDispatch,
                                 );
                                 let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
-                                self.journal.record(call_id, outcome.clone());
                                 Err(outcome)
                             }
                         }
@@ -3465,7 +3543,6 @@ impl ComputerActionCoordinator {
                         let outcome = CoordinatedOutcome::Invalidated {
                             reason: TargetUnavailableReason::StaleTarget,
                         };
-                        self.journal.record(call_id, outcome.clone());
                         Err(outcome)
                     }
                     Err(LeaseDrift::Target) => {
@@ -3485,7 +3562,6 @@ impl ComputerActionCoordinator {
                 self.dispatch_states
                     .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                 let outcome = CoordinatedOutcome::Denied { reason };
-                self.journal.record(call_id, outcome.clone());
                 Err(outcome)
             }
             Ok(ComputerAuthorizationDecision::AskBlocked) => {
@@ -3495,7 +3571,6 @@ impl ComputerActionCoordinator {
                 self.dispatch_states
                     .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                 let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
-                self.journal.record(call_id, outcome.clone());
                 Err(outcome)
             }
             Err(err) => {
@@ -3506,7 +3581,6 @@ impl ComputerActionCoordinator {
                     },
                     screenshot: None,
                 };
-                self.journal.record(call_id, outcome.clone());
                 Err(outcome)
             }
         }
@@ -3514,8 +3588,8 @@ impl ComputerActionCoordinator {
 
     /// Discard the human's answer for this call without installing a lease,
     /// clearing the pending wait so the next action re-enters the Ask path and
-    /// re-prompts. Non-sticky: the coordinator stays live. Returns the
-    /// journaled fail-closed outcome.
+    /// re-prompts. Non-sticky: the coordinator stays live. The caller durably
+    /// records the returned fail-closed outcome at its identity boundary.
     fn discard_answer_nonsticky(
         &mut self,
         call_id: &str,
@@ -3527,7 +3601,6 @@ impl ComputerActionCoordinator {
         let outcome = CoordinatedOutcome::Invalidated {
             reason: TargetUnavailableReason::StaleTarget,
         };
-        self.journal.record(call_id, outcome.clone());
         outcome
     }
 
@@ -3701,6 +3774,27 @@ impl ComputerActionCoordinator {
         call_id: &str,
         actions: &[OpenAiComputerAction],
     ) -> CoordinatedOutcome {
+        let backend_actions = actions
+            .iter()
+            .flat_map(OpenAiComputerAction::to_backend_actions)
+            .collect();
+        self.execute_actions_unscoped(
+            call_id,
+            backend_actions,
+            format!("openai_call:{}", actions.len()),
+        )
+        .await
+    }
+
+    /// Shared provider-native execution path. Keeping all provider variants
+    /// here makes the durable identity and zero-input terminal semantics
+    /// identical for OpenAI and both Anthropic contracts.
+    async fn execute_actions_unscoped(
+        &mut self,
+        call_id: &str,
+        backend_actions: Vec<ComputerAction>,
+        action_label: String,
+    ) -> CoordinatedOutcome {
         // Clear any stale live frame from a previous dispatch.
         self.last_live_frame = None;
         // Build the backend action list + action identity BEFORE any dedup, so
@@ -3708,12 +3802,7 @@ impl ComputerActionCoordinator {
         // delegation, provider_call_id, batch_index) with a DIFFERENT payload is
         // an identity_conflict with zero dispatch — it must NOT be masked by the
         // call-id convenience dedup below as a stale DuplicateReplay (AC14).
-        let mut backend_actions = Vec::new();
-        for action in actions {
-            backend_actions.extend(action.to_backend_actions());
-        }
         self.batch_item_outcomes = vec![BatchItemOutcome::NotDispatched; backend_actions.len()];
-        let action_label = format!("openai_call:{}", actions.len());
         let receipts = match self.action_receipts(call_id, &backend_actions) {
             Ok(receipts) => receipts,
             Err(outcome) => return outcome,
@@ -3744,8 +3833,9 @@ impl ComputerActionCoordinator {
             let outcome = CoordinatedOutcome::Denied {
                 reason: reason.clone(),
             };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // If the coordinator is invalidated, return immediately.
@@ -3753,8 +3843,9 @@ impl ComputerActionCoordinator {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::StaleTarget,
             };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // If the backend is dead, return immediately with zero input.
@@ -3762,8 +3853,9 @@ impl ComputerActionCoordinator {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::SessionInactive,
             };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // Focus generation requirement: TypeText and KeyChord require a
@@ -3773,9 +3865,9 @@ impl ComputerActionCoordinator {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::StaleTarget,
             };
-            self.journal.record(call_id, outcome.clone());
-            self.record_action_receipts(&receipts);
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // Lease composition gate: Ask requires both a current Ask delegation
@@ -3791,8 +3883,9 @@ impl ComputerActionCoordinator {
             )
             .await
         {
-            self.record_action_receipts(&receipts);
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // Dispatch through the backend.
@@ -3804,20 +3897,8 @@ impl ComputerActionCoordinator {
             .await;
         let outcome = artifacts.outcome;
         self.last_live_frame = artifacts.live_frame;
-        self.journal.record(call_id, outcome.clone());
-        self.record_action_receipts(&receipts);
-        // Persist the terminal outcome to the durable store (AC13).
-        if let Some(store) = &self.outcome_store {
-            for (identity, payload_digest) in &receipts {
-                if let Err(error) = store.store(identity, &outcome, payload_digest).await {
-                    tracing::error!(error = %error, batch_index = identity.batch_index, "durable computer outcome commit failed");
-                    return CoordinatedOutcome::DispatchUnknown {
-                        action_label: action_label.clone(),
-                    };
-                }
-            }
-        }
-        outcome
+        self.complete_reserved_receipts(call_id, &receipts, outcome, &action_label)
+            .await
     }
 
     /// Execute a [`NativeComputerCall`] through the coordinator, returning
@@ -3898,107 +3979,12 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20251124ComputerAction,
     ) -> CoordinatedOutcome {
-        // Clear any stale live frame from a previous dispatch.
-        self.last_live_frame = None;
-        // Identity is the PRIMARY dedup key (built before any dedup), so a reused
-        // call id with a DIFFERENT payload is an identity_conflict with zero
-        // dispatch rather than a stale DuplicateReplay (AC14).
-        let backend_actions = action.to_backend_actions();
-        self.batch_item_outcomes = vec![BatchItemOutcome::NotDispatched; backend_actions.len()];
-        let action_label = "anthropic_20251124_call".to_string();
-        let receipts = match self.action_receipts(call_id, &backend_actions) {
-            Ok(receipts) => receipts,
-            Err(outcome) => return outcome,
-        };
-        if let Some(outcome) = self.check_action_receipts(call_id, &receipts) {
-            return outcome;
-        }
-
-        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
-        // call id but NOT by identity, so a replay of one returns here.
-        if let Some(prior) = self.journal.lookup(call_id) {
-            return CoordinatedOutcome::DuplicateReplay {
-                prior_outcome: Box::new(prior.clone()),
-            };
-        }
-
-        // Denial is terminal per delegation and outranks any later state
-        // transition: after one human Deny, every subsequent computer action on
-        // this delegation returns journaled `Denied` without prompting again
-        // (the authorizer is never consulted) — even if the coordinator was
-        // later invalidated or the backend died. Runs AFTER the dedup guards but
-        // BEFORE the invalidated/backend_dead checks. A new delegation gets a
-        // new coordinator, which starts clean.
-        if let Some(reason) = &self.denied {
-            let outcome = CoordinatedOutcome::Denied {
-                reason: reason.clone(),
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        if self.invalidated {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::StaleTarget,
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        if self.backend_dead {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::SessionInactive,
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        // Focus generation requirement for type/key actions.
-        if Self::requires_focus_generation(&backend_actions) && self.focus_generation.0 == 0 {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::StaleTarget,
-            };
-            self.journal.record(call_id, outcome.clone());
-            self.record_action_receipts(&receipts);
-            return outcome;
-        }
-
-        // Lease composition gate.
-        if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(
-                call_id,
-                &action_label,
-                &backend_actions,
-                self.virtual_display_uuid(),
-            )
-            .await
-        {
-            self.record_action_receipts(&receipts);
-            return outcome;
-        }
-
-        if let Some(outcome) = self.reserve_action_receipts(&receipts, &action_label).await {
-            return outcome;
-        }
-        let artifacts = self
-            .dispatch_backend_batch(call_id, &backend_actions, &action_label)
-            .await;
-        let outcome = artifacts.outcome;
-        self.last_live_frame = artifacts.live_frame;
-        self.journal.record(call_id, outcome.clone());
-        self.record_action_receipts(&receipts);
-        // Persist the terminal outcome to the durable store (AC13).
-        if let Some(store) = &self.outcome_store {
-            for (identity, payload_digest) in &receipts {
-                if let Err(error) = store.store(identity, &outcome, payload_digest).await {
-                    tracing::error!(error = %error, batch_index = identity.batch_index, "durable computer outcome commit failed");
-                    return CoordinatedOutcome::DispatchUnknown {
-                        action_label: action_label.clone(),
-                    };
-                }
-            }
-        }
-        outcome
+        self.execute_actions_unscoped(
+            call_id,
+            action.to_backend_actions(),
+            "anthropic_20251124_call".to_string(),
+        )
+        .await
     }
 
     /// Execute an Anthropic 2025-01-24 computer call through the coordinator.
@@ -4030,107 +4016,12 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20250124ComputerAction,
     ) -> CoordinatedOutcome {
-        // Clear any stale live frame from a previous dispatch.
-        self.last_live_frame = None;
-        // Identity is the PRIMARY dedup key (built before any dedup), so a reused
-        // call id with a DIFFERENT payload is an identity_conflict with zero
-        // dispatch rather than a stale DuplicateReplay (AC14).
-        let backend_actions = action.to_backend_actions();
-        self.batch_item_outcomes = vec![BatchItemOutcome::NotDispatched; backend_actions.len()];
-        let action_label = "anthropic_20250124_call".to_string();
-        let receipts = match self.action_receipts(call_id, &backend_actions) {
-            Ok(receipts) => receipts,
-            Err(outcome) => return outcome,
-        };
-        if let Some(outcome) = self.check_action_receipts(call_id, &receipts) {
-            return outcome;
-        }
-
-        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
-        // call id but NOT by identity, so a replay of one returns here.
-        if let Some(prior) = self.journal.lookup(call_id) {
-            return CoordinatedOutcome::DuplicateReplay {
-                prior_outcome: Box::new(prior.clone()),
-            };
-        }
-
-        // Denial is terminal per delegation and outranks any later state
-        // transition: after one human Deny, every subsequent computer action on
-        // this delegation returns journaled `Denied` without prompting again
-        // (the authorizer is never consulted) — even if the coordinator was
-        // later invalidated or the backend died. Runs AFTER the dedup guards but
-        // BEFORE the invalidated/backend_dead checks. A new delegation gets a
-        // new coordinator, which starts clean.
-        if let Some(reason) = &self.denied {
-            let outcome = CoordinatedOutcome::Denied {
-                reason: reason.clone(),
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        if self.invalidated {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::StaleTarget,
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        if self.backend_dead {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::SessionInactive,
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        // Focus generation requirement for type/key actions.
-        if Self::requires_focus_generation(&backend_actions) && self.focus_generation.0 == 0 {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::StaleTarget,
-            };
-            self.journal.record(call_id, outcome.clone());
-            self.record_action_receipts(&receipts);
-            return outcome;
-        }
-
-        // Lease composition gate.
-        if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(
-                call_id,
-                &action_label,
-                &backend_actions,
-                self.virtual_display_uuid(),
-            )
-            .await
-        {
-            self.record_action_receipts(&receipts);
-            return outcome;
-        }
-
-        if let Some(outcome) = self.reserve_action_receipts(&receipts, &action_label).await {
-            return outcome;
-        }
-        let artifacts = self
-            .dispatch_backend_batch(call_id, &backend_actions, &action_label)
-            .await;
-        let outcome = artifacts.outcome;
-        self.last_live_frame = artifacts.live_frame;
-        self.journal.record(call_id, outcome.clone());
-        self.record_action_receipts(&receipts);
-        // Persist the terminal outcome to the durable store (AC13).
-        if let Some(store) = &self.outcome_store {
-            for (identity, payload_digest) in &receipts {
-                if let Err(error) = store.store(identity, &outcome, payload_digest).await {
-                    tracing::error!(error = %error, batch_index = identity.batch_index, "durable computer outcome commit failed");
-                    return CoordinatedOutcome::DispatchUnknown {
-                        action_label: action_label.clone(),
-                    };
-                }
-            }
-        }
-        outcome
+        self.execute_actions_unscoped(
+            call_id,
+            action.to_backend_actions(),
+            "anthropic_20250124_call".to_string(),
+        )
+        .await
     }
 
     /// Cancel an action before dispatch. Cancellation before the dispatching
@@ -4808,6 +4699,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn computer_physical_handoff_idempotency_key_is_a_bounded_safe_token() {
+        let actions = [ComputerAction::Wait {
+            duration: Duration::from_millis(1),
+        }];
+        let key = physical_handoff_idempotency_key(
+            "session-1",
+            &DelegationId("delegation-1".to_string()),
+            "call-1",
+            &actions,
+        );
+        assert_eq!(key.len(), 64);
+        assert!(key.starts_with("computer-"));
+        assert!(crate::external_journal::projection::SafeToken::parse(&key).is_ok());
+        assert_eq!(
+            key,
+            physical_handoff_idempotency_key(
+                "session-1",
+                &DelegationId("delegation-1".to_string()),
+                "call-1",
+                &actions,
+            )
+        );
+    }
+
     fn physical_key() -> PhysicalTargetKey {
         PhysicalTargetKey::new(HostInstallationId([1u8; 32]), [2u8; 32], [3u8; 32])
     }
@@ -4941,10 +4857,9 @@ mod tests {
             true
         }
 
-        async fn reserve(
+        async fn reserve_batch(
             &self,
-            _identity: &ActionIdentity,
-            _digest: &ActionPayloadDigest,
+            _receipts: &[(ActionIdentity, ActionPayloadDigest)],
             _action_label: &str,
         ) -> Result<
             super::super::outcome_store::OutcomeReservation,
@@ -4955,12 +4870,27 @@ mod tests {
             ))
         }
 
-        async fn store(
+        async fn store_terminal_batch(
             &self,
-            _identity: &ActionIdentity,
+            _receipts: &[(ActionIdentity, ActionPayloadDigest)],
             _outcome: &CoordinatedOutcome,
-            _digest: &ActionPayloadDigest,
-        ) -> Result<(), super::super::outcome_store::OutcomeStoreError> {
+        ) -> Result<
+            super::super::outcome_store::OutcomeReservation,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture unavailable".to_string(),
+            ))
+        }
+
+        async fn complete_reserved_batch(
+            &self,
+            _receipts: &[(ActionIdentity, ActionPayloadDigest)],
+            _outcome: &CoordinatedOutcome,
+        ) -> Result<
+            super::super::outcome_store::OutcomeReservation,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
             Err(super::super::outcome_store::OutcomeStoreError::Database(
                 "fixture unavailable".to_string(),
             ))
@@ -5131,11 +5061,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0},
-                {"type": "click", "x": 100.0, "y": 200.0, "button": "left"},
-                {"type": "type", "text": "hello"}
-            ]
+            "action": {"type": "click", "x": 100.0, "y": 200.0, "button": "left"}
         })];
 
         // Extract through the native seam.
@@ -5146,7 +5072,7 @@ mod tests {
             panic!("expected OpenAi call");
         };
         assert_eq!(call_id, "call-1");
-        assert_eq!(actions.len(), 3);
+        assert_eq!(actions.len(), 1);
 
         // Execute through the coordinator.
         let outcome = coordinator.execute_openai_call(call_id, actions).await;
@@ -6411,7 +6337,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-transient",
-            "actions": [{"type": "screenshot"}]
+            "action": {"type": "screenshot"}
         })];
         let calls = NativeResponseExtractor::extract_openai(&output);
         let call = &calls[0];
@@ -6498,11 +6424,7 @@ mod tests {
         let call = serde_json::json!({
             "type": "computer_call",
             "call_id": "call-json",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0},
-                {"type": "click", "x": 100.0, "y": 200.0, "button": "left", "modifiers": {"shift": true}},
-                {"type": "type", "text": "hello"}
-            ],
+            "action": {"type": "click", "x": 100.0, "y": 200.0, "button": "left", "modifiers": {"shift": true}},
         });
         let (call_id, actions) = parse_openai_computer_call(&call).expect("parse");
 
@@ -7414,6 +7336,42 @@ mod tests {
         let fresh = coordinator2.execute_openai_call("call-1", &openai).await;
         assert!(matches!(fresh, CoordinatedOutcome::Completed { .. }));
         assert_eq!(authorizer2.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn computer_dedup_terminal_denial_replays_after_coordinator_restart() {
+        let store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
+            Arc::new(super::super::outcome_store::MemoryOutcomeStore::new());
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let denied_authorizer = Arc::new(FakeComputerAuthorizer::always_deny("policy blocks"));
+        let mut first_params =
+            make_ask_coordinator_params(denied_authorizer.clone(), "openai", "gpt-5");
+        first_params.outcome_store = Some(store.clone());
+        let mut first = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), first_params)
+            .await
+            .expect("open first coordinator");
+        let denied = first.execute_openai_call("durable-denial", &actions).await;
+        assert!(matches!(denied, CoordinatedOutcome::Denied { .. }));
+        drop(first);
+
+        let allow_authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut second_params =
+            make_ask_coordinator_params(allow_authorizer.clone(), "openai", "gpt-5");
+        second_params.outcome_store = Some(store);
+        let mut second =
+            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), second_params)
+                .await
+                .expect("rehydrate coordinator");
+        assert!(matches!(
+            second.execute_openai_call("durable-denial", &actions).await,
+            CoordinatedOutcome::DuplicateReplay { prior_outcome }
+                if matches!(*prior_outcome, CoordinatedOutcome::Denied { .. })
+        ));
+        assert_eq!(
+            allow_authorizer.call_count(),
+            0,
+            "replay sends zero input/prompt"
+        );
     }
 
     #[tokio::test]

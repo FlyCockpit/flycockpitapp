@@ -2340,10 +2340,8 @@ pub enum OpenAiComputerAction {
 pub enum OpenAiComputerWireError {
     #[error("computer_call is missing call_id")]
     MissingCallId,
-    #[error("computer_call.actions must be an array")]
-    MissingActions,
-    #[error("computer_call.actions must contain at least one action")]
-    EmptyActions,
+    #[error("computer_call.action must be an object")]
+    MissingAction,
     #[error("unsupported OpenAI computer action `{0}`")]
     UnsupportedAction(String),
     #[error("malformed OpenAI computer action: {0}")]
@@ -2580,28 +2578,23 @@ pub fn parse_openai_computer_call(
         .filter(|id| !id.is_empty())
         .ok_or(OpenAiComputerWireError::MissingCallId)?
         .to_string();
-    let raw_actions = value
-        .get("actions")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(OpenAiComputerWireError::MissingActions)?;
-    if raw_actions.is_empty() {
-        return Err(OpenAiComputerWireError::EmptyActions);
-    }
-    let mut actions = Vec::with_capacity(raw_actions.len());
-    for raw in raw_actions {
-        let action: OpenAiComputerWireAction =
-            serde_json::from_value(raw.clone()).map_err(|err| {
-                let action_type = raw.get("type").and_then(serde_json::Value::as_str);
-                match action_type {
-                    Some(action_type) => {
-                        OpenAiComputerWireError::UnsupportedAction(action_type.into())
-                    }
-                    None => OpenAiComputerWireError::MalformedAction(err.to_string()),
-                }
-            })?;
-        actions.push(action.into_provider_action());
-    }
-    Ok((call_id, actions))
+    // OpenAI Responses emits one `action` object per `computer_call`; it does
+    // not use the old plural `actions` envelope. One provider action can still
+    // expand into several canonical backend actions (for example, a click
+    // with coordinates first moves the cursor), which remains the
+    // coordinator's responsibility.
+    let raw_action = value
+        .get("action")
+        .ok_or(OpenAiComputerWireError::MissingAction)?;
+    let action: OpenAiComputerWireAction =
+        serde_json::from_value(raw_action.clone()).map_err(|err| {
+            let action_type = raw_action.get("type").and_then(serde_json::Value::as_str);
+            match action_type {
+                Some(action_type) => OpenAiComputerWireError::UnsupportedAction(action_type.into()),
+                None => OpenAiComputerWireError::MalformedAction(err.to_string()),
+            }
+        })?;
+    Ok((call_id, vec![action.into_provider_action()]))
 }
 
 fn maybe_point(x: Option<f64>, y: Option<f64>) -> Option<Point> {
@@ -3528,11 +3521,7 @@ mod tests {
         let call = serde_json::json!({
             "type": "computer_call",
             "call_id": "call-json",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0},
-                {"type": "click", "x": 100.0, "y": 200.0, "button": "left", "modifiers": {"shift": true}},
-                {"type": "type", "text": "hello"}
-            ],
+            "action": {"type": "click", "x": 100.0, "y": 200.0, "button": "left", "modifiers": {"shift": true}},
         });
         let mut backend = FakeBackend::new();
         let result = execute_openai_computer_call_json(&mut backend, &call)
@@ -3551,20 +3540,9 @@ mod tests {
             serde_json::to_string(result.output.sanitized_screenshot().unwrap()).unwrap();
         assert!(!proj_json.contains("base64"));
         assert!(!proj_json.contains("data:image"));
-        assert_eq!(backend.recorded.len(), 5);
+        assert_eq!(backend.recorded.len(), 3);
         assert!(matches!(
             backend.recorded[0],
-            ComputerAction::MoveCursor {
-                to: Point {
-                    x: 4.0,
-                    y: 5.0,
-                    space: CoordinateSpace::Physical,
-                },
-                ..
-            }
-        ));
-        assert!(matches!(
-            backend.recorded[1],
             ComputerAction::MoveCursor {
                 to: Point {
                     x: 100.0,
@@ -3575,12 +3553,33 @@ mod tests {
             }
         ));
         assert!(matches!(
-            backend.recorded[2],
+            backend.recorded[1],
             ComputerAction::Click {
                 button: MouseButton::Left,
                 modifiers: Modifiers { shift: true, .. },
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn openai_responses_computer_call_requires_singular_action() {
+        let singular = serde_json::json!({
+            "type": "computer_call",
+            "call_id": "call-singular",
+            "action": {"type": "move", "x": 4.0, "y": 5.0},
+        });
+        let (_, actions) = parse_openai_computer_call(&singular).expect("parse singular action");
+        assert_eq!(actions.len(), 1);
+
+        let legacy_plural = serde_json::json!({
+            "type": "computer_call",
+            "call_id": "call-legacy",
+            "actions": [{"type": "move", "x": 4.0, "y": 5.0}],
+        });
+        assert!(matches!(
+            parse_openai_computer_call(&legacy_plural),
+            Err(OpenAiComputerWireError::MissingAction)
         ));
     }
 

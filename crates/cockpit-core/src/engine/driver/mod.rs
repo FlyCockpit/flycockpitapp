@@ -1747,22 +1747,15 @@ impl Driver {
         else {
             return;
         };
-        let continuations =
-            computer_native::handle_native_computer_items(Some(coordinator), contract, &raw_items)
-                .await;
-        if continuations.is_empty() {
+        let wire = computer_native::handle_retained_native_computer_items(
+            coordinator,
+            contract,
+            raw_items,
+        )
+        .await;
+        if wire.is_empty() {
             return;
         }
-        let mut wire = Vec::new();
-        if contract == crate::computer::ComputerToolContract::OpenAiResponses {
-            wire.extend(raw_items.into_iter().filter(|item| {
-                item.get("call_id")
-                    .or_else(|| item.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|id| !id.is_empty())
-            }));
-        }
-        wire.extend(computer_native::into_wire_items(continuations));
         frame.pending_computer_continuations.extend(wire);
         frame.history.push(Message::User {
             content: vec![rig::message::UserContent::text(
@@ -1775,146 +1768,37 @@ impl Driver {
     /// native-computer request. Candidate scans leave geometry unset; this is
     /// the only path that turns that metadata into a live capability.
     async fn open_native_computer_for_active_frame(&mut self) {
-        // Endpoint recovery is live state. If an OpenAI-compatible model was
-        // confirmed onto Chat Completions after this frame opened, tear down
-        // the Responses-only coordinator and its unsendable continuations at
-        // the next turn boundary.
-        let retained_is_compatible = self.stack.last().is_some_and(|frame| {
-            frame.computer_coordinator.is_some()
-                && frame.computer_contract.is_some_and(|contract| {
-                    frame
-                        .agent
-                        .model
-                        .supports_native_computer_contract(contract)
-                })
-        });
-        if retained_is_compatible {
-            return;
-        }
-        if let Some(frame) = self.stack.last_mut()
-            && frame.computer_coordinator.is_some()
-        {
-            frame.computer_coordinator = None;
-            frame.computer_contract = None;
-            frame.pending_computer_continuations.clear();
-            if let Some(candidate) = Arc::make_mut(&mut frame.agent)
-                .params
-                .native_computer
-                .as_mut()
-            {
-                // Preserve capability metadata so a later config/probe change
-                // back to Responses can reopen. Geometry is live-open state
-                // and must be cleared while no coordinator exists.
-                candidate.geometry = None;
-            }
-            return;
-        }
-
-        let (candidate, provider_id, model_id, contract_supported) = {
-            let Some(frame) = self.stack.last() else {
-                return;
-            };
-            let Some(candidate) = frame.agent.params.native_computer.clone() else {
+        let (mut agent, delegation_id, mut coordinator, mut contract, mut pending) = {
+            let Some(frame) = self.stack.last_mut() else {
                 return;
             };
             (
-                candidate.clone(),
-                frame.agent.model.provider_id().to_string(),
-                frame.agent.model.model_id_ref().to_string(),
+                frame.agent.as_ref().clone(),
                 frame
-                    .agent
-                    .model
-                    .supports_native_computer_contract(candidate.contract),
+                    .agent_instance_id
+                    .unwrap_or(self.session.id)
+                    .hyphenated()
+                    .to_string(),
+                frame.computer_coordinator.take(),
+                frame.computer_contract.take(),
+                std::mem::take(&mut frame.pending_computer_continuations),
             )
         };
-        if !contract_supported {
-            // Keep the unopened capability candidate: an Auto endpoint can be
-            // corrected to Responses by an ordinary turn, after which this
-            // frame may open safely. Endpoint-scoped request params suppress
-            // the tool while the selected route is Completions.
-            return;
-        }
-        let Some(approver) = self.approver.clone() else {
-            Arc::make_mut(&mut self.stack.last_mut().expect("stack nonempty").agent)
-                .params
-                .native_computer = None;
-            return;
-        };
-        let backend = match crate::computer::VirtualDisplayBackend::construct(
-            crate::computer::DisplayTarget::Virtual,
-            None,
-        ) {
-            Ok(backend) => backend,
-            Err(error) => {
-                tracing::warn!(error = %error, "native computer backend open failed");
-                Arc::make_mut(&mut self.stack.last_mut().expect("stack nonempty").agent)
-                    .params
-                    .native_computer = None;
-                return;
-            }
-        };
-        let delegation_id = self
-            .stack
-            .last()
-            .and_then(|frame| frame.agent_instance_id)
-            .unwrap_or(self.session.id)
-            .hyphenated()
-            .to_string();
-        let handoff_journal = self.session.external_journal().map(|journal| {
-            Arc::new(crate::computer::coordinator::ExternalJournalHandoff::new(
-                journal,
-                crate::external_journal::projection::SafeToken::for_session(self.session.id),
-            )) as Arc<dyn crate::computer::coordinator::HandoffJournal>
-        });
-        let params = crate::computer::coordinator::CoordinatorParams {
-            session_id: self.session.id.hyphenated().to_string(),
-            delegation_id: crate::computer::coordinator::DelegationId(delegation_id),
-            tier: if candidate.approval_required {
-                crate::computer::coordinator::ComputerApprovalTier::Ask
-            } else {
-                crate::computer::coordinator::ComputerApprovalTier::Yolo
-            },
-            owner_instance: crate::computer::coordinator::OwnerInstance(1),
-            authorizer: Arc::new(
-                crate::computer::authorizer::ApproverComputerAuthorizer::new(approver),
-            ),
-            host_arbiter: None,
-            target_adapter: Some(Box::new(
-                crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(
-                    *uuid::Uuid::new_v4().as_bytes(),
-                ),
-            )),
-            provider_id: crate::computer::coordinator::ProviderId(provider_id),
-            model_id: crate::computer::coordinator::ModelId(model_id),
-            outcome_store: Some(Arc::new(
-                crate::computer::outcome_store::SqliteOutcomeStore::new(self.session.db.clone()),
-            )),
-            handoff_journal,
-        };
-        match crate::computer::coordinator::ComputerActionCoordinator::open(
-            Box::new(backend),
-            params,
+        computer_native::reconcile_native_computer_for_delegation(
+            &mut agent,
+            &self.session,
+            self.approver.clone(),
+            delegation_id,
+            &mut coordinator,
+            &mut contract,
+            &mut pending,
         )
-        .await
-        {
-            Ok(coordinator) => {
-                let geometry = coordinator.geometry().clone();
-                let frame = self.stack.last_mut().expect("stack nonempty");
-                Arc::make_mut(&mut frame.agent).params.native_computer =
-                    Some(crate::computer::NativeComputerToolConfig {
-                        geometry: Some(geometry),
-                        ..candidate
-                    });
-                frame.computer_contract = Some(candidate.contract);
-                frame.computer_coordinator = Some(coordinator);
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "native computer coordinator open failed");
-                Arc::make_mut(&mut self.stack.last_mut().expect("stack nonempty").agent)
-                    .params
-                    .native_computer = None;
-            }
-        }
+        .await;
+        let frame = self.stack.last_mut().expect("stack nonempty");
+        frame.agent = Arc::new(agent);
+        frame.computer_coordinator = coordinator;
+        frame.computer_contract = contract;
+        frame.pending_computer_continuations = pending;
     }
     async fn emit_subagent_routing_amend(
         &self,

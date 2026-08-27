@@ -255,19 +255,45 @@ pub(super) fn take_native_computer_continuations(
             let Ok(mut slot) = slot.lock() else {
                 return Vec::new();
             };
-            let compatible = slot.pending.as_ref().is_some_and(|items| {
-                !items.is_empty()
-                    && items.iter().all(|item| {
-                        let item_type = item.get("type").and_then(serde_json::Value::as_str);
-                        match wire {
-                            NativeComputerContinuationWire::OpenAiResponses => {
-                                matches!(item_type, Some("computer_call" | "computer_call_output"))
-                            }
-                            NativeComputerContinuationWire::AnthropicMessages => {
-                                item_type == Some("tool_result")
-                            }
-                        }
-                    })
+            let compatible = slot.pending.as_ref().is_some_and(|items| match wire {
+                NativeComputerContinuationWire::OpenAiResponses => {
+                    !items.is_empty()
+                        && items.iter().all(|item| {
+                            matches!(
+                                item.get("type").and_then(serde_json::Value::as_str),
+                                Some("computer_call" | "computer_call_output")
+                            )
+                        })
+                }
+                NativeComputerContinuationWire::AnthropicMessages => {
+                    let tool_use_ids = items
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                        })
+                        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>();
+                    let tool_results = items
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(serde_json::Value::as_str)
+                                == Some("tool_result")
+                        })
+                        .collect::<Vec<_>>();
+                    !tool_use_ids.is_empty()
+                        && !tool_results.is_empty()
+                        && items.iter().all(|item| {
+                            matches!(
+                                item.get("type").and_then(serde_json::Value::as_str),
+                                Some("tool_use" | "tool_result")
+                            )
+                        })
+                        && tool_results.iter().all(|item| {
+                            item.get("tool_use_id")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|id| tool_use_ids.contains(&id))
+                        })
+                }
             });
             if compatible {
                 let items = slot.pending.take().unwrap_or_default();

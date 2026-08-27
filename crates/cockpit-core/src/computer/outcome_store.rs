@@ -13,7 +13,10 @@ pub struct StoredOutcome {
 #[derive(Debug, Clone)]
 pub enum OutcomeReservation {
     Acquired,
-    Existing(StoredOutcome),
+    Existing {
+        identity: ActionIdentity,
+        stored: StoredOutcome,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -33,18 +36,29 @@ pub trait ComputerOutcomeStore: Send + Sync {
     fn is_durable(&self) -> bool {
         false
     }
-    async fn reserve(
+    /// Reserve every identity in one indivisible operation.  A competing
+    /// receipt leaves *none* of this batch claimed, so a retry cannot inherit
+    /// a synthetic `DispatchUnknown` from an earlier item in the batch.
+    async fn reserve_batch(
         &self,
-        identity: &ActionIdentity,
-        digest: &ActionPayloadDigest,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
         action_label: &str,
     ) -> Result<OutcomeReservation, OutcomeStoreError>;
-    async fn store(
+    /// Directly store a known zero-input terminal result for every identity.
+    /// Unlike completion, this never takes over a pre-existing claim.
+    async fn store_terminal_batch(
         &self,
-        identity: &ActionIdentity,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
         outcome: &CoordinatedOutcome,
-        digest: &ActionPayloadDigest,
-    ) -> Result<(), OutcomeStoreError>;
+    ) -> Result<OutcomeReservation, OutcomeStoreError>;
+    /// Complete the exact batch that this coordinator already reserved before
+    /// physical dispatch. This may transition matching `claimed` receipts,
+    /// but never overwrites an existing terminal outcome.
+    async fn complete_reserved_batch(
+        &self,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        outcome: &CoordinatedOutcome,
+    ) -> Result<OutcomeReservation, OutcomeStoreError>;
     async fn lookup(
         &self,
         identity: &ActionIdentity,
@@ -58,7 +72,13 @@ pub trait ComputerOutcomeStore: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct MemoryOutcomeStore {
-    entries: Mutex<HashMap<ActionIdentity, StoredOutcome>>,
+    entries: Mutex<HashMap<ActionIdentity, MemoryOutcomeEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryOutcomeEntry {
+    stored: StoredOutcome,
+    claimed: bool,
 }
 impl MemoryOutcomeStore {
     pub fn new() -> Self {
@@ -68,47 +88,107 @@ impl MemoryOutcomeStore {
 
 #[async_trait]
 impl ComputerOutcomeStore for MemoryOutcomeStore {
-    async fn reserve(
+    async fn reserve_batch(
         &self,
-        identity: &ActionIdentity,
-        digest: &ActionPayloadDigest,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
         action_label: &str,
     ) -> Result<OutcomeReservation, OutcomeStoreError> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| OutcomeStoreError::LockPoisoned)?;
-        if let Some(stored) = entries.get(identity) {
-            return Ok(OutcomeReservation::Existing(stored.clone()));
+        if let Some((identity, entry)) = receipts
+            .iter()
+            .find_map(|(identity, _)| entries.get(identity).map(|entry| (identity, entry)))
+        {
+            return Ok(OutcomeReservation::Existing {
+                identity: identity.clone(),
+                stored: entry.stored.clone(),
+            });
         }
-        entries.insert(
-            identity.clone(),
-            StoredOutcome {
-                digest: digest.clone(),
-                outcome: CoordinatedOutcome::DispatchUnknown {
-                    action_label: action_label.to_string(),
-                },
-            },
-        );
-        Ok(OutcomeReservation::Acquired)
-    }
-    async fn store(
-        &self,
-        identity: &ActionIdentity,
-        outcome: &CoordinatedOutcome,
-        digest: &ActionPayloadDigest,
-    ) -> Result<(), OutcomeStoreError> {
-        self.entries
-            .lock()
-            .map_err(|_| OutcomeStoreError::LockPoisoned)?
-            .insert(
+        for (identity, digest) in receipts {
+            entries.insert(
                 identity.clone(),
-                StoredOutcome {
-                    outcome: outcome.clone(),
-                    digest: digest.clone(),
+                MemoryOutcomeEntry {
+                    stored: StoredOutcome {
+                        digest: digest.clone(),
+                        outcome: CoordinatedOutcome::DispatchUnknown {
+                            action_label: action_label.to_string(),
+                        },
+                    },
+                    claimed: true,
                 },
             );
-        Ok(())
+        }
+        Ok(OutcomeReservation::Acquired)
+    }
+    async fn store_terminal_batch(
+        &self,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        outcome: &CoordinatedOutcome,
+    ) -> Result<OutcomeReservation, OutcomeStoreError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| OutcomeStoreError::LockPoisoned)?;
+        if let Some((identity, entry)) = receipts
+            .iter()
+            .find_map(|(identity, _)| entries.get(identity).map(|entry| (identity, entry)))
+        {
+            return Ok(OutcomeReservation::Existing {
+                identity: identity.clone(),
+                stored: entry.stored.clone(),
+            });
+        }
+        for (identity, digest) in receipts {
+            entries.insert(
+                identity.clone(),
+                MemoryOutcomeEntry {
+                    stored: StoredOutcome {
+                        outcome: outcome.clone(),
+                        digest: digest.clone(),
+                    },
+                    claimed: false,
+                },
+            );
+        }
+        Ok(OutcomeReservation::Acquired)
+    }
+    async fn complete_reserved_batch(
+        &self,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        outcome: &CoordinatedOutcome,
+    ) -> Result<OutcomeReservation, OutcomeStoreError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| OutcomeStoreError::LockPoisoned)?;
+        for (identity, digest) in receipts {
+            let Some(entry) = entries.get(identity) else {
+                return Err(OutcomeStoreError::Database(
+                    "computer outcome batch is missing its reservation".to_string(),
+                ));
+            };
+            if entry.stored.digest != *digest || !entry.claimed {
+                return Ok(OutcomeReservation::Existing {
+                    identity: identity.clone(),
+                    stored: entry.stored.clone(),
+                });
+            }
+        }
+        for (identity, digest) in receipts {
+            entries.insert(
+                identity.clone(),
+                MemoryOutcomeEntry {
+                    stored: StoredOutcome {
+                        outcome: outcome.clone(),
+                        digest: digest.clone(),
+                    },
+                    claimed: false,
+                },
+            );
+        }
+        Ok(OutcomeReservation::Acquired)
     }
     async fn lookup(
         &self,
@@ -119,7 +199,7 @@ impl ComputerOutcomeStore for MemoryOutcomeStore {
             .lock()
             .map_err(|_| OutcomeStoreError::LockPoisoned)?
             .get(identity)
-            .cloned())
+            .map(|entry| entry.stored.clone()))
     }
     async fn rehydrate(
         &self,
@@ -132,7 +212,7 @@ impl ComputerOutcomeStore for MemoryOutcomeStore {
             .map_err(|_| OutcomeStoreError::LockPoisoned)?
             .iter()
             .filter(|(id, _)| id.session_id == session_id && id.delegation_id == *delegation_id)
-            .map(|(id, stored)| (id.clone(), stored.clone()))
+            .map(|(id, entry)| (id.clone(), entry.stored.clone()))
             .collect())
     }
 }
@@ -168,52 +248,100 @@ impl ComputerOutcomeStore for SqliteOutcomeStore {
     fn is_durable(&self) -> bool {
         true
     }
-    async fn reserve(
+    async fn reserve_batch(
         &self,
-        identity: &ActionIdentity,
-        digest: &ActionPayloadDigest,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
         action_label: &str,
     ) -> Result<OutcomeReservation, OutcomeStoreError> {
         let unknown = serde_json::to_string(&CoordinatedOutcome::DispatchUnknown {
             action_label: action_label.to_string(),
         })
         .map_err(|error| OutcomeStoreError::Encoding(error.to_string()))?;
-        let row = self
+        let rows = receipts
+            .iter()
+            .map(
+                |(identity, digest)| crate::db::computer_outcomes::ComputerOutcomeRow {
+                    session_id: identity.session_id.clone(),
+                    delegation_id: identity.delegation_id.0.clone(),
+                    provider_call_id: identity.provider_call_id.clone(),
+                    batch_index: identity.batch_index,
+                    payload_digest: digest.to_hex(),
+                    outcome_json: unknown.clone(),
+                },
+            )
+            .collect();
+        let reservation = self
             .db
-            .reserve_computer_outcome(crate::db::computer_outcomes::ComputerOutcomeRow {
-                session_id: identity.session_id.clone(),
-                delegation_id: identity.delegation_id.0.clone(),
-                provider_call_id: identity.provider_call_id.clone(),
-                batch_index: identity.batch_index,
-                payload_digest: digest.to_hex(),
-                outcome_json: unknown,
-            })
+            .reserve_computer_outcomes(rows)
             .await
             .map_err(|error| OutcomeStoreError::Database(format!("{error:#}")))?;
-        match row {
+        match reservation {
             None => Ok(OutcomeReservation::Acquired),
-            Some(row) => Self::decode(row).map(|(_, stored)| OutcomeReservation::Existing(stored)),
+            Some(row) => Self::decode(row)
+                .map(|(identity, stored)| OutcomeReservation::Existing { identity, stored }),
         }
     }
-    async fn store(
+    async fn store_terminal_batch(
         &self,
-        identity: &ActionIdentity,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
         outcome: &CoordinatedOutcome,
-        digest: &ActionPayloadDigest,
-    ) -> Result<(), OutcomeStoreError> {
+    ) -> Result<OutcomeReservation, OutcomeStoreError> {
         let outcome_json = serde_json::to_string(outcome)
             .map_err(|error| OutcomeStoreError::Encoding(error.to_string()))?;
-        self.db
-            .put_computer_outcome(crate::db::computer_outcomes::ComputerOutcomeRow {
-                session_id: identity.session_id.clone(),
-                delegation_id: identity.delegation_id.0.clone(),
-                provider_call_id: identity.provider_call_id.clone(),
-                batch_index: identity.batch_index,
-                payload_digest: digest.to_hex(),
-                outcome_json,
-            })
+        let rows = receipts
+            .iter()
+            .map(
+                |(identity, digest)| crate::db::computer_outcomes::ComputerOutcomeRow {
+                    session_id: identity.session_id.clone(),
+                    delegation_id: identity.delegation_id.0.clone(),
+                    provider_call_id: identity.provider_call_id.clone(),
+                    batch_index: identity.batch_index,
+                    payload_digest: digest.to_hex(),
+                    outcome_json: outcome_json.clone(),
+                },
+            )
+            .collect();
+        match self
+            .db
+            .store_terminal_computer_outcomes(rows)
             .await
-            .map_err(|error| OutcomeStoreError::Database(format!("{error:#}")))
+            .map_err(|error| OutcomeStoreError::Database(format!("{error:#}")))?
+        {
+            None => Ok(OutcomeReservation::Acquired),
+            Some(row) => Self::decode(row)
+                .map(|(identity, stored)| OutcomeReservation::Existing { identity, stored }),
+        }
+    }
+    async fn complete_reserved_batch(
+        &self,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        outcome: &CoordinatedOutcome,
+    ) -> Result<OutcomeReservation, OutcomeStoreError> {
+        let outcome_json = serde_json::to_string(outcome)
+            .map_err(|error| OutcomeStoreError::Encoding(error.to_string()))?;
+        let rows = receipts
+            .iter()
+            .map(
+                |(identity, digest)| crate::db::computer_outcomes::ComputerOutcomeRow {
+                    session_id: identity.session_id.clone(),
+                    delegation_id: identity.delegation_id.0.clone(),
+                    provider_call_id: identity.provider_call_id.clone(),
+                    batch_index: identity.batch_index,
+                    payload_digest: digest.to_hex(),
+                    outcome_json: outcome_json.clone(),
+                },
+            )
+            .collect();
+        match self
+            .db
+            .commit_computer_outcomes(rows)
+            .await
+            .map_err(|error| OutcomeStoreError::Database(format!("{error:#}")))?
+        {
+            None => Ok(OutcomeReservation::Acquired),
+            Some(row) => Self::decode(row)
+                .map(|(identity, stored)| OutcomeReservation::Existing { identity, stored }),
+        }
     }
     async fn lookup(
         &self,
@@ -244,5 +372,67 @@ impl ComputerOutcomeStore for SqliteOutcomeStore {
             .into_iter()
             .map(Self::decode)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(batch_index: u32) -> ActionIdentity {
+        ActionIdentity {
+            session_id: "session".to_string(),
+            delegation_id: DelegationId("delegation".to_string()),
+            provider_call_id: "provider-call".to_string(),
+            batch_index,
+        }
+    }
+
+    fn digest() -> ActionPayloadDigest {
+        ActionPayloadDigest::from_actions(&[super::super::ComputerAction::CaptureFull])
+    }
+
+    #[tokio::test]
+    async fn computer_dedup_batch_reservation_is_atomic_in_memory() {
+        let store = MemoryOutcomeStore::new();
+        let receipt_one = (identity(1), digest());
+        assert!(matches!(
+            store
+                .reserve_batch(std::slice::from_ref(&receipt_one), "first")
+                .await,
+            Ok(OutcomeReservation::Acquired)
+        ));
+
+        let receipt_zero = (identity(0), digest());
+        let batch = vec![receipt_zero.clone(), receipt_one.clone()];
+        assert!(matches!(
+            store.reserve_batch(&batch, "batch").await,
+            Ok(OutcomeReservation::Existing { identity, .. }) if identity == receipt_one.0
+        ));
+        assert!(
+            store.lookup(&receipt_zero.0).await.unwrap().is_none(),
+            "a competing later identity must not strand an earlier claimed receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_dedup_terminal_zero_input_is_stored_without_claim_placeholder() {
+        let store = MemoryOutcomeStore::new();
+        let receipt = (identity(0), digest());
+        let terminal = CoordinatedOutcome::Denied {
+            reason: "approval denied".to_string(),
+        };
+        assert!(matches!(
+            store
+                .store_terminal_batch(std::slice::from_ref(&receipt), &terminal)
+                .await,
+            Ok(OutcomeReservation::Acquired)
+        ));
+        assert!(matches!(
+            store
+                .reserve_batch(std::slice::from_ref(&receipt), "must not replace terminal")
+                .await,
+            Ok(OutcomeReservation::Existing { stored, .. }) if stored.outcome == terminal
+        ));
     }
 }

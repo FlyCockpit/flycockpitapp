@@ -235,9 +235,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0}
-            ]
+            "action": {"type": "move", "x": 4.0, "y": 5.0}
         })];
         let calls = NativeComputerLiveLoop::extract_openai(&output);
         assert_eq!(calls.len(), 1);
@@ -277,9 +275,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0}
-            ]
+            "action": {"type": "move", "x": 4.0, "y": 5.0}
         })];
         let calls = NativeComputerLiveLoop::extract_openai(&output);
         let continuations = live_loop.handle_extracted(calls).await;
@@ -320,9 +316,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0}
-            ]
+            "action": {"type": "move", "x": 4.0, "y": 5.0}
         })];
         let continuations = live_loop.handle_native_computer_items(&output).await;
         assert_eq!(continuations.len(), 1);

@@ -254,14 +254,30 @@ fn inject_native_computer_continuations(bytes: bytes::Bytes) -> bytes::Bytes {
         .and_then(serde_json::Value::as_array_mut)
     {
         input.extend(continuations);
-    } else if let Some(content) = body
+    } else if let Some(messages) = body
         .get_mut("messages")
         .and_then(serde_json::Value::as_array_mut)
-        .and_then(|messages| messages.last_mut())
-        .and_then(|message| message.get_mut("content"))
-        .and_then(serde_json::Value::as_array_mut)
     {
-        content.extend(continuations);
+        // Anthropic requires every `tool_result` to follow the exact assistant
+        // `tool_use` that introduced its ID. Rig does not retain native
+        // computer tool blocks in normal assistant history, so keep that raw
+        // provider action only until this immediate follow-up request and
+        // reconstruct the provider-native assistant/user pair here.
+        let (assistant_actions, user_results): (Vec<_>, Vec<_>) =
+            continuations.into_iter().partition(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+            });
+        if assistant_actions.is_empty() || user_results.is_empty() {
+            return bytes;
+        }
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": assistant_actions,
+        }));
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": user_results,
+        }));
     } else {
         return bytes;
     }
@@ -462,6 +478,39 @@ data: {"type":"content_block_stop","index":2}
             let retry = inject_native_computer_continuations(openai.clone());
             assert_eq!(retry, openai);
         })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_native_continuation_keeps_matching_assistant_tool_use() {
+        let assistant_action = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu-computer-1",
+            "name": "computer",
+            "input": {"action": "screenshot"},
+        });
+        let tool_result = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu-computer-1",
+            "content": [{"type": "text", "text": "done"}],
+        });
+        crate::engine::model::with_native_computer_continuations(
+            vec![assistant_action, tool_result],
+            async {
+                let request = bytes::Bytes::from_static(
+                    br#"{"messages":[{"role":"user","content":[{"type":"text","text":"continue"}]}],"tools":[{"type":"computer_20251124","name":"computer"}]}"#,
+                );
+                let injected = inject_native_computer_continuations(request);
+                let body: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+                let messages = body["messages"].as_array().unwrap();
+                assert_eq!(messages.len(), 3);
+                assert_eq!(messages[1]["role"], "assistant");
+                assert_eq!(messages[1]["content"][0]["id"], "toolu-computer-1");
+                assert_eq!(messages[2]["role"], "user");
+                assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu-computer-1");
+                assert!(crate::engine::model::native_computer_continuation_was_dispatched());
+            },
+        )
         .await;
     }
 }

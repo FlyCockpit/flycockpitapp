@@ -50,20 +50,24 @@ impl WorkspaceDigest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceLeaseKind {
-    Worktree,
-    Repository,
+    SameRoot,
+    Subdirectory,
+    ManagedWorktree,
 }
+pub const WORKSPACE_LEASE_KINDS: &[&str] = &["same_root", "subdirectory", "managed_worktree"];
 impl WorkspaceLeaseKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Worktree => "worktree",
-            Self::Repository => "repository",
+            Self::SameRoot => "same_root",
+            Self::Subdirectory => "subdirectory",
+            Self::ManagedWorktree => "managed_worktree",
         }
     }
-    fn parse(value: &str) -> Result<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
         match value {
-            "worktree" => Ok(Self::Worktree),
-            "repository" => Ok(Self::Repository),
+            "same_root" => Ok(Self::SameRoot),
+            "subdirectory" => Ok(Self::Subdirectory),
+            "managed_worktree" => Ok(Self::ManagedWorktree),
             _ => bail!("unknown workspace lease kind"),
         }
     }
@@ -840,6 +844,25 @@ impl Db {
     ) -> Result<Vec<WorkspaceLeaseRow>> {
         self.read(move |c| { let mut stmt=c.prepare(&format!("SELECT {LEASE_COLS} FROM workspace_leases WHERE session_id=?1 AND agent_instance_id=?2 AND state IN ('active','grace','uncertain') ORDER BY created_at_unix_ms,workspace_lease_id"))?; stmt.query_map(params![session.to_string(),agent.to_string()],map_lease)?.collect::<std::result::Result<Vec<_>,_>>().context("loading workspace recovery leases") }).await
     }
+    /// Session-wide crash recovery: every nonterminal lease, regardless of owner.
+    /// Missing or identity-mismatched worktrees are marked uncertain by the
+    /// host; this listing never deletes a path.
+    pub async fn list_workspace_leases_for_session_recovery(
+        &self,
+        session: Uuid,
+    ) -> Result<Vec<WorkspaceLeaseRow>> {
+        self.read(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {LEASE_COLS} FROM workspace_leases
+                 WHERE session_id=?1 AND state IN ('active','grace','uncertain')
+                 ORDER BY created_at_unix_ms,workspace_lease_id"
+            ))?;
+            stmt.query_map(params![session.to_string()], map_lease)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("loading session workspace recovery leases")
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -912,7 +935,7 @@ mod tests {
             write_scope_lease_id: scope,
             canonical_repository_id: "repo-id".into(),
             canonical_root: "/repo/work".into(),
-            kind: WorkspaceLeaseKind::Worktree,
+            kind: WorkspaceLeaseKind::ManagedWorktree,
             base_sha_digest: d("head"),
             base_ref_digest: d("ref"),
             managed_path: "agents/one".into(),

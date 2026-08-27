@@ -5059,7 +5059,7 @@ CREATE TABLE workspace_leases (
     write_scope_lease_id      TEXT NOT NULL,
     canonical_repository_id   TEXT NOT NULL,
     canonical_root            TEXT NOT NULL,
-    kind                      TEXT NOT NULL CHECK (kind IN ('worktree', 'repository')),
+    kind                      TEXT NOT NULL CHECK (kind IN ('same_root', 'subdirectory', 'managed_worktree')),
     base_sha_digest           TEXT NOT NULL CHECK (length(base_sha_digest) = 64 AND base_sha_digest NOT GLOB '*[^0-9a-f]*'),
     base_ref_digest           TEXT NOT NULL CHECK (length(base_ref_digest) = 64 AND base_ref_digest NOT GLOB '*[^0-9a-f]*'),
     managed_path              TEXT NOT NULL,

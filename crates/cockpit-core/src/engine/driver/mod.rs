@@ -759,6 +759,16 @@ impl Drop for InvocationApprovalGuard {
     }
 }
 
+/// Per-node session-override axes consumed at a turn boundary that apply to the
+/// active frame (modes AC5). `None` fields keep the config-resolved values.
+#[derive(Default)]
+struct ConsumedNodeOverride {
+    /// Non-escalating LLM mode for this frame's next turn.
+    llm_mode: Option<crate::config::extended::LlmMode>,
+    /// Daemon-validated `(provider, model)` rebind for this frame's next turn.
+    model: Option<(String, String)>,
+}
+
 /// One agent's slice of state on the driver stack.
 pub struct AgentSession {
     pub agent: Arc<Agent>,
@@ -2339,10 +2349,11 @@ impl Driver {
         // applied through the session posture (see the method) — verification
         // and question axes are consumed into the node's effective override and
         // await their resolver-site application (documented follow-on).
-        let llm_override = self.consume_active_node_override_for_turn(active_idx).await;
-        self.refresh_active_model_for_turn(active_idx, llm_override, tx)
+        let consumed = self.consume_active_node_override_for_turn(active_idx).await;
+        let model_pin = self
+            .refresh_active_model_for_turn(active_idx, consumed, tx)
             .await;
-        self.refresh_active_tool_surface_for_turn(active_idx, tx)
+        self.refresh_active_tool_surface_for_turn(active_idx, model_pin, tx)
             .await;
         if self.prompt_cache_retention_override.is_some() {
             self.emit_longcache_state(tx).await;
@@ -2352,30 +2363,33 @@ impl Driver {
     /// Consume any pending per-node session override for the active node into
     /// its effective override at this turn boundary (modes AC5 "second
     /// transaction": pending is merged into effective and cleared; the revision
-    /// is unchanged). Returns the LLM-mode axis to apply to this frame's next
-    /// turn (or `None` to keep the config-resolved mode).
+    /// is unchanged). Returns the model/mode axes to apply to this frame's next
+    /// turn.
     ///
     /// Application status by axis:
-    ///  - `mode`: applied per-frame by the caller (returned here) — isolated, an
-    ///    ancestor/sibling frame is never affected.
+    ///  - `model` and `mode`: applied per-frame by the caller (returned here) —
+    ///    isolated to the active frame, so an ancestor or sibling frame is never
+    ///    affected. The daemon already re-validated the model choice as
+    ///    hard-compatible before it was stored.
     ///  - `sandbox`: applied to the session posture below. This is session-scoped
     ///    in the current architecture; true per-node sandbox isolation across
     ///    concurrent delegated turns needs a node-aware read seam at
     ///    `turn_toolbox` (documented follow-on). Only applied when the node
     ///    actually carries a sandbox override, so the no-override path leaves
     ///    existing sandbox behavior untouched.
-    ///  - `verification`/`question`: consumed into the node's effective override
-    ///    and surfaced in the effective-settings snapshot, but their execution
-    ///    application lives at the verification/question resolver sites and is
-    ///    not yet wired (follow-on).
+    ///  - `verification`: consumed into the node's effective override and
+    ///    surfaced in the snapshot; runtime enforcement (candidate execution) is
+    ///    out of scope for this prompt.
+    ///  - `question`: consumed here and applied at the decision resolver
+    ///    (`AgentTreeLifecycle::resolved_question_policy`).
     async fn consume_active_node_override_for_turn(
         &mut self,
         active_idx: usize,
-    ) -> Option<crate::config::extended::LlmMode> {
-        let node_id = self
-            .stack
-            .get(active_idx)
-            .and_then(|frame| frame.agent_instance_id)?;
+    ) -> ConsumedNodeOverride {
+        let Some(node_id) = self.stack.get(active_idx).and_then(|frame| frame.agent_instance_id)
+        else {
+            return ConsumedNodeOverride::default();
+        };
         let now = chrono::Utc::now().timestamp_millis();
         let effective = match self
             .session
@@ -2383,14 +2397,15 @@ impl Driver {
             .consume_pending_agent_override(self.session.id, node_id, now)
             .await
         {
-            Ok(effective) => effective?,
+            Ok(Some(effective)) => effective,
+            Ok(None) => return ConsumedNodeOverride::default(),
             Err(error) => {
                 tracing::warn!(
                     %node_id,
                     error = %error,
                     "consuming per-node session override failed; keeping current settings"
                 );
-                return None;
+                return ConsumedNodeOverride::default();
             }
         };
         if let Some(sandbox) = effective
@@ -2400,31 +2415,49 @@ impl Driver {
         {
             self.session.set_sandbox_mode(sandbox);
         }
-        effective
-            .llm_mode
-            .as_deref()
-            .and_then(crate::daemon::agent_session_override::mode_from_label)
+        ConsumedNodeOverride {
+            llm_mode: effective
+                .llm_mode
+                .as_deref()
+                .and_then(crate::daemon::agent_session_override::mode_from_label),
+            model: effective
+                .model
+                .map(|binding| (binding.provider, binding.model)),
+        }
     }
 
     async fn refresh_active_model_for_turn(
         &mut self,
         active_idx: usize,
-        // A per-node session override consumed at this turn boundary (modes AC5):
-        // when present it replaces the config-resolved mode for THIS frame only,
-        // so an ancestor or sibling frame is never affected. It has already been
-        // authorized non-escalating by the daemon.
-        llm_override: Option<crate::config::extended::LlmMode>,
+        // Per-node session override axes consumed at this turn boundary (modes
+        // AC5): when present they replace the config-resolved model/mode for THIS
+        // frame only, so an ancestor or sibling frame is never affected. The
+        // daemon already authorized them (non-escalating mode; hard-compatible
+        // model).
+        consumed: ConsumedNodeOverride,
         tx: &mpsc::Sender<TurnEvent>,
-    ) {
+    ) -> Option<Arc<crate::engine::model::Model>> {
         let running = self.stack[active_idx].agent.model.clone();
-        let provider = running.provider_id().to_string();
-        let model = running.model_id_ref().to_string();
+        // A model rebind overrides the frame's running provider/model; otherwise
+        // the running model is re-resolved from live config as before.
+        let (provider, model) = match &consumed.model {
+            Some((provider, model)) => (provider.clone(), model.clone()),
+            None => (
+                running.provider_id().to_string(),
+                running.model_id_ref().to_string(),
+            ),
+        };
         let old_llm_mode = self.stack[active_idx].agent.llm_mode;
         match self.build_live_model_for_running(&running, &provider, &model) {
             Ok(new_model) => {
-                let llm_mode =
-                    llm_override.unwrap_or_else(|| self.effective_llm_mode_for(&provider, &model));
+                let llm_mode = consumed
+                    .llm_mode
+                    .unwrap_or_else(|| self.effective_llm_mode_for(&provider, &model));
                 let new_model = Arc::new(new_model);
+                // Pin the rebound model so the subsequent tool-surface rebuild
+                // cannot let a frontmatter `model:` revert it (modes AC5). Only
+                // pinned when this frame actually carries a model override.
+                let model_pin = consumed.model.is_some().then(|| new_model.clone());
                 let selection = self.active_selection_for_model(&new_model);
                 let refreshed =
                     self.replace_frame_model(active_idx, new_model, llm_mode, &selection);
@@ -2435,6 +2468,7 @@ impl Driver {
                     let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
                 }
                 self.active_model_refresh_failure_notice = None;
+                model_pin
             }
             Err(e) => {
                 tracing::warn!(
@@ -2455,6 +2489,7 @@ impl Driver {
                         .await;
                     self.active_model_refresh_failure_notice = Some(notice);
                 }
+                None
             }
         }
     }
@@ -2462,12 +2497,22 @@ impl Driver {
     async fn refresh_active_tool_surface_for_turn(
         &mut self,
         active_idx: usize,
+        // The rebound model to pin as `model_override` across the rebuild so a
+        // frontmatter `model:` cannot revert a per-node model override (modes
+        // AC5). `None` outside a model override — normal rebuild precedence.
+        model_pin: Option<Arc<crate::engine::model::Model>>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
         let model = self.stack[active_idx].agent.model.clone();
         let llm_mode = self.stack[active_idx].agent.llm_mode;
         let selection = self.active_selection_for_model(&model);
-        match self.try_rebuild_frame_with_model(active_idx, model.clone(), llm_mode, &selection) {
+        match self.try_rebuild_frame_with_model(
+            active_idx,
+            model.clone(),
+            llm_mode,
+            &selection,
+            model_pin.clone(),
+        ) {
             Ok(rebuilt) => {
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
@@ -2477,7 +2522,7 @@ impl Driver {
             Err(e) if active_idx == 0 => {
                 tracing::warn!(error = %e, "refreshing root tool surface from config fell back to default Build");
                 let rebuilt =
-                    self.rebuild_frame_with_model(active_idx, model, llm_mode, &selection);
+                    self.rebuild_frame_with_model(active_idx, model, llm_mode, &selection, model_pin);
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
@@ -7658,6 +7703,10 @@ impl Driver {
         new_model: Arc<crate::engine::model::Model>,
         llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
+        // A per-node model override to pin as `model_override` so it wins over a
+        // frontmatter `model:` in `resolve_agent_model` (modes AC5). `None` for
+        // ordinary rebuilds, preserving the previous behaviour.
+        model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> (String, crate::engine::builtin::SpawnArgs) {
         let name = self.stack[frame_idx].agent.name.clone();
         let (additional_params, endpoint_recovery_additional_params) =
@@ -7671,7 +7720,7 @@ impl Driver {
         let mut args = self.spawn_args(true);
         args.llm_mode = llm_mode;
         args.model = new_model;
-        args.model_override = None;
+        args.model_override = model_pin;
         args.delegation_model = None;
         // Preserve the frame's already-resolved vNext grant across rebuilds so
         // portable child refs (including workspace-authored agents admitted at
@@ -7694,8 +7743,10 @@ impl Driver {
         new_model: Arc<crate::engine::model::Model>,
         llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
+        model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> Result<Agent> {
-        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection);
+        let (name, args) =
+            self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection, model_pin);
         crate::engine::builtin::load(&name, &args)
     }
 
@@ -7705,8 +7756,10 @@ impl Driver {
         new_model: Arc<crate::engine::model::Model>,
         llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
+        model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> Agent {
-        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection);
+        let (name, args) =
+            self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection, model_pin);
         // `builtin::load` honors a user override of a bundled primary; fall back
         // to the same agent name's default build on a load failure so the swap
         // never strands the session without a primary.

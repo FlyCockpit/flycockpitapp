@@ -524,12 +524,17 @@ impl Driver {
         };
         let llm_mode = self.effective_llm_mode_for(provider, model);
         let rebuilt =
-            match self.try_rebuild_frame_with_model(root_idx, new_model.clone(), llm_mode, &target)
-            {
+            match self.try_rebuild_frame_with_model(
+                root_idx,
+                new_model.clone(),
+                llm_mode,
+                &target,
+                None,
+            ) {
                 Ok(agent) => Arc::new(agent),
-                Err(_) if root_idx == 0 => {
-                    Arc::new(self.rebuild_frame_with_model(root_idx, new_model, llm_mode, &target))
-                }
+                Err(_) if root_idx == 0 => Arc::new(self.rebuild_frame_with_model(
+                    root_idx, new_model, llm_mode, &target, None,
+                )),
                 Err(e) => {
                     let error = format!("{e:#}");
                     self.record_model_switch_audit(crate::session::ModelSwitchAudit {
@@ -1122,11 +1127,12 @@ impl Driver {
             new_model.clone(),
             llm_mode,
             requested,
+            None,
         ) {
             Ok(agent) => Arc::new(agent),
-            Err(_) => {
-                Arc::new(self.rebuild_frame_with_model(root_idx, new_model, llm_mode, requested))
-            }
+            Err(_) => Arc::new(self.rebuild_frame_with_model(
+                root_idx, new_model, llm_mode, requested, None,
+            )),
         };
         self.stack[root_idx].agent = rebuilt;
         if self.active_frame_index() == Some(root_idx) {

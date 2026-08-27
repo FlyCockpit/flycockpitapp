@@ -22,6 +22,7 @@ use cockpit_config::config::sandbox_mode::SandboxMode;
 use cockpit_proto::{
     AgentDecisionAttention, AgentEffectiveSettingsV1, AgentQuestionOverrideV1,
     AgentSessionOverrideFieldV1, AgentTreeNode, AgentVerificationReductionV1,
+    SessionSetupModelSlotV1, SessionSetupSnapshotV1,
 };
 
 use crate::tui::agent_attention::order_attention;
@@ -75,16 +76,34 @@ pub(crate) struct AgentTreePane {
 }
 
 /// The per-node override controls: the daemon-owned effective settings for one
-/// node plus the actionable/read-only rows projected from them.
+/// node plus the actionable/read-only rows projected from them. The sandbox/
+/// mode/verification/question rows come from the effective-settings snapshot;
+/// the model rows come from the (separately fetched) session-setup snapshot, so
+/// each source is kept independently and the displayed `rows` is their
+/// concatenation, rebuilt whenever either arrives.
 struct OverrideView {
     agent_instance_id: Uuid,
     override_revision: u64,
     terminal: bool,
     title: String,
+    effective_rows: Vec<OverrideRow>,
+    model_rows: Vec<OverrideRow>,
     rows: Vec<OverrideRow>,
     list: ListState,
     /// Last daemon rejection or load error, shown at the top of the controls.
     error: Option<String>,
+}
+
+impl OverrideView {
+    /// Recombine the effective + model rows into the displayed list and reselect
+    /// the first actionable row.
+    fn recompute_rows(&mut self) {
+        let mut rows = self.effective_rows.clone();
+        rows.extend(self.model_rows.iter().cloned());
+        self.rows = rows;
+        let first = self.rows.iter().position(|row| row.field.is_some());
+        self.list.select(first);
+    }
 }
 
 /// One override-control row. Actionable rows carry the exact override field they
@@ -142,25 +161,51 @@ impl AgentTreePane {
     /// Populate the per-node override controls from a daemon effective-settings
     /// snapshot and switch the pane into override mode.
     pub(crate) fn apply_effective_settings(&mut self, snapshot: AgentEffectiveSettingsV1) {
-        let previous_error = self
+        // Preserve the current error and any already-fetched model rows when the
+        // snapshot is for the same node (a re-fetch), so a refresh of the
+        // effective settings does not blank the model section before its own
+        // (separately fired) fetch returns.
+        let (previous_error, previous_model_rows) = self
             .override_view
             .as_ref()
             .filter(|view| view.agent_instance_id.to_string() == snapshot.agent_instance_id)
-            .and_then(|view| view.error.clone());
+            .map(|view| (view.error.clone(), view.model_rows.clone()))
+            .unwrap_or_default();
         let agent_instance_id = Uuid::parse_str(&snapshot.agent_instance_id).unwrap_or_default();
-        let rows = build_override_rows(&snapshot);
-        let first = rows.iter().position(|row| row.field.is_some());
-        let mut list = ListState::default();
-        list.select(first);
-        self.override_view = Some(OverrideView {
+        let mut view = OverrideView {
             agent_instance_id,
             override_revision: snapshot.override_revision,
             terminal: snapshot.terminal,
             title: format!("Overrides — {}", short_id(agent_instance_id)),
-            rows,
-            list,
+            effective_rows: build_override_rows(&snapshot),
+            model_rows: previous_model_rows,
+            rows: Vec::new(),
+            list: ListState::default(),
             error: previous_error,
-        });
+        };
+        view.recompute_rows();
+        self.override_view = Some(view);
+    }
+
+    /// Populate the model-rebind controls from a session-setup snapshot. The
+    /// model choices are daemon-owned and hard-compatibility is re-validated on
+    /// apply, so the selected installation's slot choices are offered directly.
+    /// A no-op unless the per-node override controls are open (the two fetches
+    /// race; the effective-settings fetch creates the view).
+    pub(crate) fn apply_model_choices(&mut self, snapshot: SessionSetupSnapshotV1) {
+        let Some(view) = self.override_view.as_mut() else {
+            return;
+        };
+        // Prefer the selected candidate; fall back to the first.
+        let candidate = snapshot
+            .candidates
+            .iter()
+            .find(|candidate| candidate.selected)
+            .or_else(|| snapshot.candidates.first());
+        view.model_rows = candidate
+            .map(|candidate| build_model_rows(&candidate.slots, view.terminal))
+            .unwrap_or_default();
+        view.recompute_rows();
     }
 
     /// Record an override load/apply error in the open override controls (or as
@@ -694,6 +739,67 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
     rows
 }
 
+/// Project the selected installation's model slots into a "Model" section: each
+/// slot's hard-compatible choices become model-rebind action rows (the daemon
+/// re-validates compatibility on apply). A slot with a daemon-owned unavailable
+/// reason is shown read-only. The node's currently-effective choice is not
+/// carried in the effective-settings DTO, so choices are tagged by the daemon's
+/// author-suggested flag rather than a live "current" marker.
+fn build_model_rows(slots: &[SessionSetupModelSlotV1], terminal: bool) -> Vec<OverrideRow> {
+    let mut rows = Vec::new();
+    if slots.is_empty() {
+        return rows;
+    }
+    rows.push(blank());
+    rows.push(header("Model".to_string()));
+    for slot in slots {
+        rows.push(effective(format!("  slot {}", slot.slot_id)));
+        if let Some(reason) = &slot.unavailable_reason {
+            rows.push(locked(format!(
+                "    unavailable: {}",
+                unavailable_label(reason)
+            )));
+            continue;
+        }
+        for choice in &slot.choices {
+            let suggested = if choice.author_suggested {
+                " (suggested)"
+            } else {
+                ""
+            };
+            let label = choice
+                .author_label
+                .as_deref()
+                .map(|label| format!(" — {label}"))
+                .unwrap_or_default();
+            let text = format!(
+                "    → {}/{}{label}{suggested}",
+                choice.provider_id, choice.model_id
+            );
+            if terminal {
+                rows.push(effective(text));
+            } else {
+                rows.push(action(
+                    text,
+                    AgentSessionOverrideFieldV1::Model {
+                        slot_id: slot.slot_id.clone(),
+                        choice_id: choice.choice_id.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    rows
+}
+
+fn unavailable_label(reason: &cockpit_proto::SessionSetupUnavailableReasonV1) -> &'static str {
+    use cockpit_proto::SessionSetupUnavailableReasonV1 as Reason;
+    match reason {
+        Reason::NoHardCompatibleLocalModel => "no hard-compatible local model",
+        Reason::RebindRequired => "rebind required",
+    }
+}
+
 fn header(text: String) -> OverrideRow {
     OverrideRow {
         kind: OverrideRowKind::Header,
@@ -1000,5 +1106,139 @@ mod tests {
         let outcome = pane.handle_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(outcome, AgentTreeOutcome::Stay);
         assert!(pane.override_view.is_none());
+    }
+
+    fn model_choice(
+        id: &str,
+        provider: &str,
+        model: &str,
+        suggested: bool,
+    ) -> cockpit_proto::AgentInstallationChoiceV1 {
+        cockpit_proto::AgentInstallationChoiceV1 {
+            choice_id: id.to_string(),
+            // Deliberately distinct from any enclosing slot's id so tests pin
+            // that `build_model_rows` attributes the override to the enclosing
+            // slot's id, never the choice's own `slot_id` field.
+            slot_id: format!("choice-owned-slot-{id}"),
+            offering_id: format!("off-{id}"),
+            provider_id: provider.to_string(),
+            model_id: model.to_string(),
+            recommendation_id: None,
+            canonical_upstream_identity: None,
+            author_label: None,
+            rationale: None,
+            author_suggested: suggested,
+            exact_alias_match: false,
+        }
+    }
+
+    fn model_slot(
+        slot_id: &str,
+        choices: Vec<cockpit_proto::AgentInstallationChoiceV1>,
+        unavailable: Option<cockpit_proto::SessionSetupUnavailableReasonV1>,
+    ) -> SessionSetupModelSlotV1 {
+        SessionSetupModelSlotV1 {
+            slot_id: slot_id.to_string(),
+            choices,
+            unmatched_recommendations: Vec::new(),
+            unavailable_reason: unavailable,
+        }
+    }
+
+    fn setup_snapshot(slots: Vec<SessionSetupModelSlotV1>) -> SessionSetupSnapshotV1 {
+        SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: Uuid::from_u128(1).to_string(),
+            config_generation: 1,
+            revision: 0,
+            selected_installation_id: Some("inst-1".to_string()),
+            candidates: vec![cockpit_proto::SessionSetupAgentCandidateV1 {
+                installation: cockpit_proto::AgentInstallationRecordV1 {
+                    installation_id: "inst-1".to_string(),
+                    scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                    source_agent_id: "agent".to_string(),
+                    source_identity: "identity".to_string(),
+                    source_revision: None,
+                    source_digest: "digest".to_string(),
+                    installation_revision: 1,
+                    bindings: Vec::new(),
+                },
+                selected: true,
+                slots,
+                locked_reason: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn modes_session_setup_override_model_rows_list_slot_choices() {
+        let slots = vec![model_slot(
+            "primary",
+            vec![
+                model_choice("c1", "anthropic", "opus", true),
+                model_choice("c2", "openai", "gpt", false),
+            ],
+            None,
+        )];
+        let rows = build_model_rows(&slots, false);
+        let actions: Vec<&OverrideRow> = rows
+            .iter()
+            .filter(|r| matches!(&r.field, Some(AgentSessionOverrideFieldV1::Model { .. })))
+            .collect();
+        assert_eq!(actions.len(), 2, "each hard-compatible choice is a rebind action");
+        assert_eq!(
+            actions[0].field,
+            Some(AgentSessionOverrideFieldV1::Model {
+                slot_id: "primary".to_string(),
+                choice_id: "c1".to_string(),
+            })
+        );
+        assert!(actions[0].text.contains("anthropic/opus"));
+        assert!(actions[0].text.contains("(suggested)"));
+    }
+
+    #[test]
+    fn modes_session_setup_override_model_unavailable_slot_not_actionable() {
+        let slots = vec![model_slot(
+            "primary",
+            vec![model_choice("c1", "p", "m", false)],
+            Some(cockpit_proto::SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel),
+        )];
+        let rows = build_model_rows(&slots, false);
+        assert!(
+            rows.iter()
+                .all(|r| !matches!(&r.field, Some(AgentSessionOverrideFieldV1::Model { .. }))),
+            "an unavailable slot offers no model rebind actions"
+        );
+        assert!(rows.iter().any(|r| r.text.contains("unavailable")));
+    }
+
+    #[test]
+    fn modes_session_setup_override_model_enter_emits_apply_model() {
+        let mut pane = AgentTreePane::loading(false);
+        // Effective settings with NO actionable rows so the model rebind is the
+        // sole action: sandbox/mode pinned to their effective value, no
+        // verification regions, question off.
+        let mut snapshot =
+            effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.mode.allowed = vec![LlmMode::Normal];
+        pane.apply_effective_settings(snapshot);
+        pane.apply_model_choices(setup_snapshot(vec![model_slot(
+            "primary",
+            vec![model_choice("c1", "anthropic", "opus", true)],
+            None,
+        )]));
+        let outcome = pane.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            outcome,
+            AgentTreeOutcome::ApplyOverride {
+                agent_instance_id: Uuid::from_u128(7),
+                expected_override_revision: 9,
+                field: AgentSessionOverrideFieldV1::Model {
+                    slot_id: "primary".to_string(),
+                    choice_id: "c1".to_string(),
+                },
+            }
+        );
     }
 }

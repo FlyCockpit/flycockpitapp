@@ -1132,6 +1132,13 @@ impl App {
                 }
                 _ => {}
             },
+            AsyncActionKind::DaemonRpc("agent_tree.override_model_choices") => {
+                // Supplementary to the effective settings: on success populate the
+                // Model section; a failure leaves it empty (no error surfaced).
+                if let Ok(AsyncActionPayload::SessionSetupSnapshot(response)) = result.payload {
+                    self.apply_agent_override_model_choices(response);
+                }
+            }
             AsyncActionKind::DaemonRpc("guidance.estimate") => {
                 if let Ok(AsyncActionPayload::GuidanceEstimate(estimate)) = result.payload {
                     self.guidance_estimate = Some(estimate);

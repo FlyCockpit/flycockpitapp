@@ -149,6 +149,29 @@ impl App {
                 Ok(crate::tui::async_action::AsyncActionPayload::AgentEffectiveSettings(response))
             },
         );
+
+        // Fetch the model choices for the same node in parallel: they populate
+        // the override view's Model section (modes AC5/AC6). Sourced from the
+        // daemon-owned session-setup snapshot; the daemon re-validates
+        // hard-compatibility on apply.
+        let model_attached = runner.attached_request_binding();
+        let model_session_id = model_attached.session_id();
+        const MODEL_CHOICES_ACTION: &str = "agent_tree.override_model_choices";
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc(MODEL_CHOICES_ACTION),
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new(MODEL_CHOICES_ACTION),
+            ),
+            async move {
+                let response = model_attached
+                    .request(cockpit_proto::Request::GetSessionSetupSnapshot {
+                        session_id: model_session_id,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot(response))
+            },
+        );
     }
 
     pub(super) fn apply_agent_effective_settings(&mut self, response: cockpit_proto::Response) {
@@ -163,6 +186,18 @@ impl App {
     pub(super) fn apply_agent_effective_settings_error(&mut self, error: String) {
         if let Overlay::AgentTree(pane) = &mut self.overlay {
             pane.set_override_error(format!("Per-node settings could not be loaded: {error}"));
+        }
+    }
+
+    /// Apply fetched model choices into the open override view's Model section.
+    /// Supplementary to the effective settings, so a fetch failure is silently
+    /// tolerated (the Model section simply stays empty).
+    pub(super) fn apply_agent_override_model_choices(&mut self, response: cockpit_proto::Response) {
+        let cockpit_proto::Response::SessionSetupSnapshot { snapshot } = response else {
+            return;
+        };
+        if let Overlay::AgentTree(pane) = &mut self.overlay {
+            pane.apply_model_choices(snapshot);
         }
     }
 

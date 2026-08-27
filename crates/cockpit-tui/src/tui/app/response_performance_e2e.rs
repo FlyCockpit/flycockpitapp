@@ -1,6 +1,7 @@
 //! Response-performance e2e harness. Feature-gated; not a production API.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use cockpit_client::presentation::ResponsePerformance;
 use cockpit_core::test_support::{
@@ -19,11 +20,29 @@ use crate::tui::settings::Dialog;
 
 /// Fake provider/model stream plus injected tokenizer outcomes.
 pub struct ResponsePerformanceE2eInput {
-    pub agent: String,
-    pub provider: String,
-    pub model: String,
-    pub chunks: Vec<ResponsePerformanceE2eStreamChunk>,
-    pub tokenizer_outcomes: Vec<Result<usize, String>>,
+    agent: String,
+    provider: String,
+    model: String,
+    text_chunks: Vec<(Duration, String)>,
+    tokenizer_outcomes: Vec<Result<usize, String>>,
+}
+
+impl ResponsePerformanceE2eInput {
+    pub fn new(
+        agent: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        text_chunks: Vec<(Duration, String)>,
+        tokenizer_outcomes: Vec<Result<usize, String>>,
+    ) -> Self {
+        Self {
+            agent: agent.into(),
+            provider: provider.into(),
+            model: model.into(),
+            text_chunks,
+            tokenizer_outcomes,
+        }
+    }
 }
 
 /// Observations after driving the production pipeline through a click.
@@ -45,20 +64,32 @@ pub struct ResponsePerformanceE2eHarness;
 impl ResponsePerformanceE2eHarness {
     pub async fn run(input: ResponsePerformanceE2eInput) -> ResponsePerformanceE2eObservation {
         let session_id = Uuid::new_v4();
+        let chunks = input
+            .text_chunks
+            .into_iter()
+            .map(|(at, text)| ResponsePerformanceE2eStreamChunk::Text { at, text })
+            .collect();
         let turn_events = drive_response_performance_dispatcher_for_e2e(
             input.agent,
             input.provider,
             input.model,
-            input.chunks,
+            chunks,
             input.tokenizer_outcomes,
         )
         .await;
 
-        let mut published_events = Vec::new();
+        let (publication_tx, mut publication_rx) = tokio::sync::mpsc::unbounded_channel();
         for event in turn_events {
-            published_events.extend(turn_event_to_proto_for_response_performance_e2e(
-                event, session_id,
-            ));
+            for converted in turn_event_to_proto_for_response_performance_e2e(event, session_id) {
+                publication_tx
+                    .send(converted)
+                    .expect("in-memory publication sink remains attached");
+            }
+        }
+        drop(publication_tx);
+        let mut published_events = Vec::new();
+        while let Some(event) = publication_rx.recv().await {
+            published_events.push(event);
         }
 
         let metric = published_events

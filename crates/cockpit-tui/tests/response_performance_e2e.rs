@@ -1,26 +1,19 @@
 use std::time::Duration;
 
-use cockpit_core::test_support::ResponsePerformanceE2eStreamChunk;
 use cockpit_tui::test_support::{ResponsePerformanceE2eHarness, ResponsePerformanceE2eInput};
 
 #[tokio::test]
 async fn response_performance_e2e_stream_produces_clickable_chip() {
-    let observation = ResponsePerformanceE2eHarness::run(ResponsePerformanceE2eInput {
-        agent: "Build".to_string(),
-        provider: "local".to_string(),
-        model: "test-model".to_string(),
-        chunks: vec![
-            ResponsePerformanceE2eStreamChunk::Text {
-                at: Duration::from_millis(100),
-                text: "Hello ".to_string(),
-            },
-            ResponsePerformanceE2eStreamChunk::Text {
-                at: Duration::from_millis(200),
-                text: "world".to_string(),
-            },
+    let observation = ResponsePerformanceE2eHarness::run(ResponsePerformanceE2eInput::new(
+        "Build",
+        "local",
+        "test-model",
+        vec![
+            (Duration::from_millis(100), "Hello ".to_string()),
+            (Duration::from_millis(200), "world".to_string()),
         ],
-        tokenizer_outcomes: vec![Ok(2)],
-    })
+        vec![Ok(2)],
+    ))
     .await;
 
     assert!(

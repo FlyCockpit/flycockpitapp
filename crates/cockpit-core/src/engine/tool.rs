@@ -755,8 +755,19 @@ impl ContextUsageSnapshot {
             used_tokens: None,
             total_tokens: None,
             compact_nudge_pct: crate::config::providers::ContextConfig::default().compact_nudge_pct,
-            auto_compact_pct: 60,
+            auto_compact_pct: 80,
         }
+    }
+}
+
+#[cfg(test)]
+mod context_usage_snapshot_tests {
+    use super::ContextUsageSnapshot;
+
+    #[test]
+    fn unavailable_uses_definition_policy_default() {
+        let snapshot = ContextUsageSnapshot::unavailable();
+        assert_eq!(snapshot.auto_compact_pct, 80);
     }
 }
 
@@ -1894,11 +1905,11 @@ mod steering_tests {
             .collect()
     }
 
-    fn has_description_steering_shape(normal: &str, defensive: &str) -> bool {
-        let normal_words = words(normal);
-        let defensive_words = words(defensive);
-        let added_distinct_words = defensive_words.difference(&normal_words).count();
-        let defensive_lower = defensive.to_ascii_lowercase();
+    fn has_description_steering_shape(terse: &str, verbose: &str) -> bool {
+        let terse_words = words(terse);
+        let verbose_words = words(verbose);
+        let added_distinct_words = verbose_words.difference(&terse_words).count();
+        let verbose_lower = verbose.to_ascii_lowercase();
         let when_to_use_markers = [
             "use ",
             "call ",
@@ -1960,14 +1971,14 @@ mod steering_tests {
         added_distinct_words >= 8
             && when_to_use_markers
                 .iter()
-                .any(|marker| defensive_lower.contains(marker))
+                .any(|marker| verbose_lower.contains(marker))
             && when_not_to_use_markers
                 .iter()
-                .any(|marker| defensive_lower.contains(marker))
+                .any(|marker| verbose_lower.contains(marker))
     }
 
     /// CONFLICT-AVOIDANCE INVARIANT (implementation note):
-    /// for every built-in tool, in BOTH its terse and defensive schema, no
+    /// for every built-in tool, in BOTH its terse and verbose schema, no
     /// `x-cockpit-aliases` entry may (a) shadow a canonical property name or
     /// (b) be double-claimed by two properties — within that same schema.
     /// Cross-tool collisions are harmless (resolution is per-tool-schema).
@@ -1994,7 +2005,7 @@ mod steering_tests {
     }
 
     /// PRIMARY-FIELD INVARIANT (implementation note): for
-    /// every built-in tool, in BOTH its terse and defensive schema, an
+    /// every built-in tool, in BOTH its terse and verbose schema, an
     /// `x-cockpit-primary-field` annotation (when present) must name a real
     /// property of that same schema — otherwise the root-string wrap would
     /// produce an object that can never validate. Registry-driven, so a future
@@ -2029,7 +2040,7 @@ mod steering_tests {
     }
 
     /// FULL-SURFACE COVERAGE: every built-in tool must supply a non-empty
-    /// defensive description that is meaningfully more explicit than its
+    /// verbose description that is meaningfully more explicit than its
     /// terse one — no terse-fallback gaps, no TODO tools. Registry-driven,
     /// so a future built-in tool can't silently skip.
     #[test]
@@ -2043,30 +2054,30 @@ mod steering_tests {
                 continue;
             }
             let terse = tool.description().to_string();
-            let defensive = tool.verbose_description().unwrap_or_else(|| {
+            let verbose = tool.verbose_description().unwrap_or_else(|| {
                 panic!(
                     "built-in tool `{}` has no verbose_description — full-surface coverage requires one",
                     tool.name()
                 )
             });
             assert!(
-                !defensive.trim().is_empty(),
-                "tool `{}` has an empty defensive description",
+                !verbose.trim().is_empty(),
+                "tool `{}` has an empty verbose description",
                 tool.name()
             );
-            // Defensive is the *verbose* form: it must be longer than the
+            // Verbose steering must be longer than the
             // terse one, not byte-identical, and add real use/avoid steering
             // rather than padding.
             assert!(
-                defensive.len() > terse.len(),
-                "tool `{}` defensive description is not more explicit than terse ({} <= {})",
+                verbose.len() > terse.len(),
+                "tool `{}` verbose description is not more explicit than terse ({} <= {})",
                 tool.name(),
-                defensive.len(),
+                verbose.len(),
                 terse.len()
             );
             assert!(
-                has_description_steering_shape(&terse, &defensive),
-                "tool `{}` defensive description lacks structural use/avoid steering or meaningful new vocabulary: {defensive}",
+                has_description_steering_shape(&terse, &verbose),
+                "tool `{}` verbose description lacks structural use/avoid steering or meaningful new vocabulary: {verbose}",
                 tool.name()
             );
         }
@@ -2074,10 +2085,10 @@ mod steering_tests {
 
     #[test]
     fn padded_description_without_steering_fails_structural_check() {
-        let normal = "Read a file.";
+        let terse = "Read a file.";
         let padded = "Read a file. padding padding padding padding padding padding padding padding padding padding padding padding padding padding.";
         assert!(padded.len() >= 80);
-        assert!(!has_description_steering_shape(normal, padded));
+        assert!(!has_description_steering_shape(terse, padded));
     }
 
     #[test]
@@ -2117,14 +2128,14 @@ mod steering_tests {
         assert!(names.contains("webfetch"), "{names:?}");
         for name in ["websearch", "webfetch"] {
             let tool = tool_by_name(name);
-            let normal = tool.description().to_string();
-            let defensive = tool.verbose_description().unwrap();
-            assert!(has_description_steering_shape(&normal, &defensive));
+            let terse = tool.description().to_string();
+            let verbose = tool.verbose_description().unwrap();
+            assert!(has_description_steering_shape(&terse, &verbose));
         }
     }
 
     #[test]
-    fn sibling_disambiguation_normal_descriptions_name_siblings() {
+    fn sibling_disambiguation_terse_descriptions_name_siblings() {
         let cases: &[(&str, &[&str])] = &[
             ("search", &["grep", "code", "context_pack"]),
             ("grep", &["search", "code"]),
@@ -2162,7 +2173,7 @@ mod steering_tests {
             for sibling in *siblings {
                 assert!(
                     description.contains(sibling),
-                    "`{name}` normal description must name sibling `{sibling}`; got: {description}"
+                    "`{name}` terse description must name sibling `{sibling}`; got: {description}"
                 );
             }
         }
@@ -2301,21 +2312,21 @@ mod steering_tests {
         }
     }
 
-    /// Defensive parameters, when supplied, keep the SAME shape + required
-    /// set as the terse parameters — tool grants never vary by mode, only
+    /// Verbose parameters, when supplied, keep the SAME shape + required
+    /// set as the terse parameters — tool grants never vary by steering, only
     /// how descriptions render. We compare the structural skeleton
     /// (property names + `required` + `enum`s), ignoring `description`.
     #[test]
     fn verbose_parameters_preserve_shape() {
         for tool in all_builtin_tools() {
-            let Some(defensive) = tool.verbose_parameters() else {
+            let Some(verbose) = tool.verbose_parameters() else {
                 continue;
             };
             let terse = tool.parameters();
             assert_eq!(
                 skeleton(&terse),
-                skeleton(&defensive),
-                "tool `{}` defensive parameters changed the schema shape",
+                skeleton(&verbose),
+                "tool `{}` verbose parameters changed the schema shape",
                 tool.name()
             );
         }
@@ -2342,31 +2353,25 @@ mod steering_tests {
         }
     }
 
-    /// The centralized rendering seam: in `Normal` and `Frontier` the
-    /// definition carries the terse description; in `Defensive` it carries
-    /// the verbose one. The switch lives in `definition_of` and nowhere else.
+    /// The centralized rendering seam selects the terse or verbose description.
+    /// The switch lives in `definition_of` and nowhere else.
     #[test]
-    fn definition_of_switches_description_on_mode() {
+    fn definition_of_switches_description_on_steering() {
         let tool = tools::read::ReadTool;
-        let normal = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
-        let frontier = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
-        let defensive = definition_of(&tool, crate::agents::ToolSteering::Verbose, None);
-        assert_eq!(normal.description, tool.description());
-        assert_eq!(frontier.description, tool.description());
-        assert_eq!(defensive.description, tool.verbose_description().unwrap());
-        assert_ne!(normal.description, defensive.description);
-        assert_ne!(frontier.description, defensive.description);
+        let terse = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
+        let verbose = definition_of(&tool, crate::agents::ToolSteering::Verbose, None);
+        assert_eq!(terse.description, tool.description());
+        assert_eq!(verbose.description, tool.verbose_description().unwrap());
+        assert_ne!(terse.description, verbose.description);
     }
 
-    /// DEFENSIVE-ROUTING STEER (`defensive-tool-descriptions-weak-
-    /// model-routing.md`): the search/navigation intel tools each render a
-    /// verbose, bash-redirecting defensive description in `Defensive` (never
-    /// the terse fallback), and the terse `description()` in `Normal`. Anchored
-    /// on a distinctive phrase from each tool's spec'd prose so a regression
-    /// that drops back to the terse one-liner fails here.
+    /// The search/navigation intel tools each render a verbose,
+    /// bash-redirecting description under verbose steering (never the terse
+    /// fallback). Anchored on a distinctive phrase from each tool's prose so a
+    /// regression that drops back to the terse one-liner fails here.
     #[test]
-    fn definition_of_intel_tools_steer_in_defensive_mode() {
-        // (tool, distinctive defensive-only substring from its spec'd prose).
+    fn definition_of_intel_tools_steer_in_verbose_rendering() {
+        // (tool, distinctive verbose-only substring from its prose).
         let cases: Vec<(Arc<dyn Tool>, &str)> = vec![
             (Arc::new(tools::intel::CodeTool), "one closed `kind`"),
             (
@@ -2376,62 +2381,59 @@ mod steering_tests {
             (Arc::new(tools::intel::GraphTool), "indexed graph"),
         ];
         for (tool, needle) in cases {
-            let normal = definition_of(&*tool, crate::agents::ToolSteering::Terse, None);
-            let defensive = definition_of(&*tool, crate::agents::ToolSteering::Verbose, None);
-            // Normal renders the terse one-liner.
+            let terse = definition_of(&*tool, crate::agents::ToolSteering::Terse, None);
+            let verbose = definition_of(&*tool, crate::agents::ToolSteering::Verbose, None);
             assert_eq!(
-                normal.description,
+                terse.description,
                 tool.description(),
-                "tool `{}` normal-mode must be the terse description",
+                "tool `{}` terse steering must use the terse description",
                 tool.name()
             );
-            // Defensive renders the tool's own (verbose) defensive form, not
-            // the terse fallback, and carries the spec'd steering phrase.
             assert_eq!(
-                defensive.description,
+                verbose.description,
                 tool.verbose_description().unwrap(),
-                "tool `{}` defensive-mode must be the defensive description",
+                "tool `{}` verbose steering must use the verbose description",
                 tool.name()
             );
             assert_ne!(
-                defensive.description,
-                normal.description,
-                "tool `{}` defensive must differ from terse",
+                verbose.description,
+                terse.description,
+                "tool `{}` verbose must differ from terse",
                 tool.name()
             );
             assert!(
-                defensive.description.contains(needle),
-                "tool `{}` defensive text missing steer `{needle}`: {}",
+                verbose.description.contains(needle),
+                "tool `{}` verbose text missing steer `{needle}`: {}",
                 tool.name(),
-                defensive.description
+                verbose.description
             );
         }
     }
 
     /// The shared `bash` search-hint no longer implies searches should happen
     /// in bash: it is a pure `grep`/`find` → `rg`/`fd` substitution, with no
-    /// `for searches` tail, in BOTH the terse and defensive descriptions.
+    /// `for searches` tail, in BOTH the terse and verbose descriptions.
     #[test]
-    fn bash_search_hint_drops_for_searches_in_both_modes() {
+    fn bash_search_hint_drops_for_searches_in_both_steerings() {
         let tool = tools::bash::BashTool::new();
-        let normal = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
-        let defensive = definition_of(&tool, crate::agents::ToolSteering::Verbose, None);
+        let terse = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
+        let verbose = definition_of(&tool, crate::agents::ToolSteering::Verbose, None);
         assert!(
-            !normal.description.contains("for searches"),
+            !terse.description.contains("for searches"),
             "terse bash description still says `for searches`: {}",
-            normal.description
+            terse.description
         );
         assert!(
-            !defensive.description.contains("for searches"),
-            "defensive bash description still says `for searches`: {}",
-            defensive.description
+            !verbose.description.contains("for searches"),
+            "verbose bash description still says `for searches`: {}",
+            verbose.description
         );
     }
 
-    /// A tool with no defensive override falls back to the terse form in every
-    /// mode (the `None`-keeper path — custom-bash tools rely on this).
+    /// A tool with no verbose override falls back to the terse form under both
+    /// steerings (the `None`-keeper path — custom-bash tools rely on this).
     #[test]
-    fn definition_of_falls_back_when_no_defensive_variant() {
+    fn definition_of_falls_back_when_no_verbose_variant() {
         struct Terse;
         #[async_trait]
         impl Tool for Terse {
@@ -2452,21 +2454,15 @@ mod steering_tests {
         assert_eq!(
             definition_of(&t, crate::agents::ToolSteering::Terse, None).description,
             definition_of(&t, crate::agents::ToolSteering::Verbose, None).description,
-            "a tool with no defensive variant renders identically in defensive and normal"
-        );
-        assert_eq!(
-            definition_of(&t, crate::agents::ToolSteering::Terse, None).description,
-            definition_of(&t, crate::agents::ToolSteering::Terse, None).description,
-            "a tool with no defensive variant renders identically in normal and frontier"
+            "a tool with no verbose variant renders identically under both steerings"
         );
     }
 
-    /// TERSE-MODE BUDGET GUARD: rendered in `Normal` and `Frontier`, every
-    /// built-in tool's description stays terse (the token-economy budget the
-    /// CI check enforces). Defensive growth is the intended tradeoff and is
-    /// exempt. One sentence ≈ under ~200 chars is the terse bar; `bash` gets
-    /// a larger budget because it is high-frequency and must steer models
-    /// away from routing around the dedicated file/search tools.
+    /// TERSE-STEERING BUDGET GUARD: every built-in tool's terse description
+    /// stays within the token-economy budget. Verbose growth is the intended
+    /// tradeoff and is exempt. One sentence ≈ under ~200 chars is the terse
+    /// bar; `bash` gets a larger budget because it is high-frequency and must
+    /// steer models away from routing around the dedicated file/search tools.
     #[test]
     fn terse_mode_descriptions_stay_within_budget() {
         for tool in all_builtin_tools() {
@@ -2494,7 +2490,7 @@ mod steering_tests {
     /// with the terse/verbose axis. An absent steering override falls back to
     /// the tool's own rendering.
     #[test]
-    fn definition_of_applies_per_agent_override_and_composes_with_mode() {
+    fn definition_of_applies_per_agent_override_and_composes_with_steering() {
         let tool = tools::read::ReadTool;
         let ov = ToolDescOverride {
             text: Some("agent-specific terse intent".to_string()),
@@ -2525,17 +2521,17 @@ mod steering_tests {
     /// A partial override (text for only one steering) leaves the other on
     /// the tool's own base description — the fallback contract.
     #[test]
-    fn definition_of_partial_override_falls_back_per_mode() {
+    fn definition_of_partial_override_falls_back_per_steering() {
         let tool = tools::read::ReadTool;
         let ov = ToolDescOverride {
-            text: Some("only normal is overridden".to_string()),
+            text: Some("only terse is overridden".to_string()),
             verbose_text: None,
         };
         assert_eq!(
             definition_of(&tool, crate::agents::ToolSteering::Terse, Some(&ov)).description,
-            "only normal is overridden"
+            "only terse is overridden"
         );
-        // Defensive falls through to the tool's own defensive description.
+        // Verbose falls through to the tool's own verbose description.
         assert_eq!(
             definition_of(&tool, crate::agents::ToolSteering::Verbose, Some(&ov)).description,
             tool.verbose_description().unwrap()
@@ -2557,7 +2553,7 @@ mod steering_tests {
             }
 
             fn verbose_description(&self) -> Option<String> {
-                Some("fake defensive".to_string())
+                Some("fake verbose".to_string())
             }
 
             fn parameters(&self) -> Value {
@@ -2571,13 +2567,13 @@ mod steering_tests {
 
         let tool = FakeTool;
         let ov = ToolDescOverride {
-            text: Some("normal override only".to_string()),
+            text: Some("terse override only".to_string()),
             verbose_text: None,
         };
 
         assert_eq!(
             definition_of(&tool, crate::agents::ToolSteering::Terse, Some(&ov)).description,
-            "normal override only"
+            "terse override only"
         );
         // With no verbose_text, Verbose falls back to the tool's own verbose
         // description (the override only supplied terse text).

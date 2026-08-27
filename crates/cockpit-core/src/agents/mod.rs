@@ -880,9 +880,9 @@ pub fn next_primary_in_cycle(current: &str, order: &[String]) -> String {
 }
 
 impl AgentDef {
-    /// Non-fatal diagnostics produced when this definition is loaded. Keeping
-    /// these separate from invariant errors lets inventory/settings surfaces
-    /// warn without silently changing the definition's grants.
+    /// Non-fatal diagnostics emitted by the local definition loader. Keeping
+    /// these separate from invariant errors lets loading warn without silently
+    /// changing the definition's grants.
     pub fn load_warnings(&self) -> Vec<String> {
         invariants::small_model_capability_warning(self)
             .into_iter()

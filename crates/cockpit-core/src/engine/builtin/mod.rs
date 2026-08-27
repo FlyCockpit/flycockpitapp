@@ -1703,9 +1703,9 @@ pub fn load_with_tool_surface_override(
 /// through `args`, but edits to the definition itself affect only agents built
 /// after the edit (new children or a newly started root session).
 pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) -> Result<Agent> {
-    let Some(definition) = &agent.definition else {
-        return load(&agent.name, args);
-    };
+    let definition = agent.definition.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("running agent `{}` has no pinned definition", agent.name)
+    })?;
     let mut definition = (**definition).clone();
     let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
     // A foreground child may already carry the parent's no-widening

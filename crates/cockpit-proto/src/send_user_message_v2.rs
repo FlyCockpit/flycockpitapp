@@ -29,6 +29,7 @@ const ATTACHMENT_SET_DIGEST_DOMAIN: &[u8] = b"flycockpit-message-attachment-set-
 pub use cockpit_db::media_attachments::MediaKind as MessageAttachmentKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageAttachmentIdentity {
     pub attachment_id: Uuid,
     pub attachment_version: u64,
@@ -38,6 +39,7 @@ pub struct MessageAttachmentIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageTagExpansion {
     pub tool: String,
     pub path: String,
@@ -68,6 +70,7 @@ impl From<MessageTagExpansion> for crate::TagExpansionMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SendUserMessageV2 {
     pub client_submission_id: Uuid,
     pub text: String,

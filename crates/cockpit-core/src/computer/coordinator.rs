@@ -4582,15 +4582,27 @@ mod tests {
         // Execute through the coordinator.
         let outcome = coordinator.execute_openai_call(call_id, actions).await;
 
-        // Build the continuation through the native seam.
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
-        assert!(matches!(
-            continuation,
-            NativeComputerContinuation::TextOnly {
-                provider: NativeProvider::OpenAi,
-                ..
+        // Take the live frame from the coordinator (retained through the
+        // execute boundary for continuation assembly).
+        let live_frame = coordinator.take_last_live_frame();
+
+        // Build the continuation through the native seam with the live frame.
+        // With a successful capture (live frame present), the continuation
+        // carries a real `computer_call_output` transient — not TextOnly.
+        let continuation = NativeResponseExtractor::build_continuation(
+            call,
+            &outcome,
+            live_frame.as_ref(),
+        );
+        match &continuation {
+            NativeComputerContinuation::OpenAi { transient, .. } => {
+                assert!(
+                    transient.is_some(),
+                    "transient must be Some when live frame is present (AC1/AC6)"
+                );
             }
-        ));
+            other => panic!("expected OpenAi continuation with transient, got {other:?}"),
+        }
 
         // Verify the outcome is completed with a screenshot.
         match &outcome {
@@ -4725,11 +4737,23 @@ mod tests {
         let outcome = coordinator
             .execute_anthropic_20251124_call(tool_use_id, action)
             .await;
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
-        assert!(matches!(
-            continuation,
-            NativeComputerContinuation::Anthropic { .. }
-        ));
+        let live_frame = coordinator.take_last_live_frame();
+        let continuation = NativeResponseExtractor::build_continuation(
+            call,
+            &outcome,
+            live_frame.as_ref(),
+        );
+        // With a successful capture (live frame present), the Anthropic
+        // continuation carries a transient image block — not text-only.
+        match &continuation {
+            NativeComputerContinuation::Anthropic { transient, .. } => {
+                assert!(
+                    transient.is_some(),
+                    "transient must be Some when live frame is present (AC2)"
+                );
+            }
+            other => panic!("expected Anthropic continuation with transient, got {other:?}"),
+        }
         assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
     }
 
@@ -4771,11 +4795,23 @@ mod tests {
         let outcome = coordinator
             .execute_anthropic_20250124_call(tool_use_id, action)
             .await;
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
-        assert!(matches!(
-            continuation,
-            NativeComputerContinuation::Anthropic { .. }
-        ));
+        let live_frame = coordinator.take_last_live_frame();
+        let continuation = NativeResponseExtractor::build_continuation(
+            call,
+            &outcome,
+            live_frame.as_ref(),
+        );
+        // With a successful capture (live frame present), the Anthropic
+        // continuation carries a transient image block — not text-only.
+        match &continuation {
+            NativeComputerContinuation::Anthropic { transient, .. } => {
+                assert!(
+                    transient.is_some(),
+                    "transient must be Some when live frame is present (AC2)"
+                );
+            }
+            other => panic!("expected Anthropic continuation with transient, got {other:?}"),
+        }
         assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
     }
 

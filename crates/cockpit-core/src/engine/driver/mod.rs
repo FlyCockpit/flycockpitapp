@@ -1469,6 +1469,14 @@ impl Drop for Driver {
     }
 }
 
+/// Whether a subagent/child report is a HOST-generated failure sentinel. The
+/// harness formats every failed run as `format!("Error: {e}")`, so this is the
+/// single shared classifier for that sentinel — used by both the driver and the
+/// noninteractive delegation paths so a child's success/failure is judged by one
+/// consistent rule rather than several subtly different inline `starts_with`
+/// checks. It matches the exact host prefix (`"Error: "`, after any leading
+/// whitespace); a completed child whose report legitimately begins that way is a
+/// residual false positive that only true execution-provenance would remove.
 pub(crate) fn is_host_failure_sentinel(report: &str) -> bool {
     report.trim_start().starts_with("Error: ")
 }

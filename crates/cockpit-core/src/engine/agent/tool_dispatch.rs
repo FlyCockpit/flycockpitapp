@@ -696,6 +696,7 @@ async fn execute_ordinary_call_unscoped(
     // hook. Only the `dispatch_one_timed` path is a real execution.
     let mut tool_was_dispatched = false;
     let mut verification_disclosure: Option<String> = None;
+    let mut verification_blocked = false;
     let (result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
         // The model reads back a deterministic diagnostic; the native computer
@@ -789,7 +790,7 @@ async fn execute_ordinary_call_unscoped(
                 }
             }
         }
-        let payload = InterruptParkPayload {
+        let mut payload = InterruptParkPayload {
             tool: resolved_name.to_string(),
             args: args.clone(),
             call_id: tc.id.to_string(),
@@ -856,34 +857,87 @@ async fn execute_ordinary_call_unscoped(
         )
         .await;
         match verification {
-            crate::engine::verification::VerificationOutcome::Block { message, .. } => {
-                (Err(invalid_input(message)), 0)
+            crate::engine::verification::VerificationOutcome::Block {
+                message,
+                operation_id,
+            } => {
+                verification_blocked = true;
+                payload.verification =
+                    Some(crate::db::needs_attention::InterruptVerificationMemo {
+                        operation_id,
+                        outcome: crate::db::needs_attention::InterruptVerificationOutcome::Block {
+                            message: message.clone(),
+                        },
+                    });
+                (Ok(ToolOutput::text(message)), 0)
             }
             crate::engine::verification::VerificationOutcome::Revise {
                 args: revised_args,
                 disclosure,
-                ..
+                operation_id,
             } => {
-                super::rewrite_assistant_tool_call(history, tc.id.as_str(), &revised_args);
-                args = revised_args;
-                tool_was_dispatched = true;
-                let dispatched =
-                    crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                        dispatch_one_timed(
-                            env.active_tools,
-                            resolved_name,
-                            args.clone(),
-                            env.ctx,
-                            Some(&tc.id),
-                        )
-                        .await
-                    })
-                    .await;
-                verification_disclosure = Some(disclosure);
-                dispatched
+                payload.verification =
+                    Some(crate::db::needs_attention::InterruptVerificationMemo {
+                        operation_id,
+                        outcome: crate::db::needs_attention::InterruptVerificationOutcome::Revise {
+                            args: revised_args.clone(),
+                            disclosure: disclosure.clone(),
+                        },
+                    });
+                if !super::rewrite_assistant_tool_call(history, tc.id.as_str(), &revised_args) {
+                    verification_blocked = true;
+                    let message = "verification produced a revision, but this provider-signed assistant turn cannot be rewritten safely; revise and re-emit"
+                        .to_string();
+                    payload.verification =
+                        Some(crate::db::needs_attention::InterruptVerificationMemo {
+                            operation_id,
+                            outcome:
+                                crate::db::needs_attention::InterruptVerificationOutcome::Block {
+                                    message: message.clone(),
+                                },
+                        });
+                    (Ok(ToolOutput::text(message)), 0)
+                } else {
+                    args = revised_args;
+                    payload.args = args.clone();
+                    tool_was_dispatched = true;
+                    let dispatched =
+                        crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                            dispatch_one_timed(
+                                env.active_tools,
+                                resolved_name,
+                                args.clone(),
+                                env.ctx,
+                                Some(&tc.id),
+                            )
+                            .await
+                        })
+                        .await;
+                    verification_disclosure = Some(disclosure);
+                    dispatched
+                }
             }
-            crate::engine::verification::VerificationOutcome::Skip
-            | crate::engine::verification::VerificationOutcome::DispatchOriginal { .. } => {
+            crate::engine::verification::VerificationOutcome::Skip => {
+                tool_was_dispatched = true;
+                crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                    dispatch_one_timed(
+                        env.active_tools,
+                        resolved_name,
+                        args.clone(),
+                        env.ctx,
+                        Some(&tc.id),
+                    )
+                    .await
+                })
+                .await
+            }
+            crate::engine::verification::VerificationOutcome::DispatchOriginal { operation_id } => {
+                payload.verification = Some(
+                    crate::db::needs_attention::InterruptVerificationMemo {
+                        operation_id,
+                        outcome: crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal,
+                    },
+                );
                 tool_was_dispatched = true;
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {
                     dispatch_one_timed(
@@ -1562,6 +1616,8 @@ async fn execute_ordinary_call_unscoped(
             gate_block_status
         } else if placeholder_blocked {
             "blocked_redaction_placeholder"
+        } else if verification_blocked {
+            "blocked_verification"
         } else if hard_fail {
             "failed"
         } else {
@@ -1570,7 +1626,8 @@ async fn execute_ordinary_call_unscoped(
         let dispatched = !(repeated_recoverable_tool_call_reject
             || loop_guard_reject
             || gate_blocked
-            || placeholder_blocked);
+            || placeholder_blocked
+            || verification_blocked);
         let mut completed_data = serde_json::json!({
             "tool": resolved_name,
             "status": lifecycle_status,

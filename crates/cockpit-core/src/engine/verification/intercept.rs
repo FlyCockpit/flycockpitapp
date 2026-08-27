@@ -35,7 +35,7 @@ use super::budget::budget_to_ledger;
 use super::classify_tool;
 use super::estimate::{CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set};
 use super::generate::{CollectionInput, collect_candidates};
-use super::recipe::{proposed_diff, select_guidance_for_target};
+use super::recipe::select_guidance_for_target;
 
 /// Outcome of the verification intercept.
 #[derive(Debug, Clone, PartialEq)]
@@ -157,17 +157,7 @@ async fn shadow_record(
         max_candidates: requested.max_candidates,
         max_collection_millis: requested.max_collection_millis,
     });
-    let estimate = match pre.to_verification_estimate() {
-        VerificationEstimate::UnknownPrice if requested.max_estimated_cost_microusd == u64::MAX => {
-            VerificationEstimate::Known(crate::agents::VerificationBudget {
-                max_candidates: pre.candidates,
-                max_total_tokens: pre.tokens,
-                max_estimated_cost_microusd: 0,
-                max_collection_millis: pre.collection_millis,
-            })
-        }
-        other => other,
-    };
+    let estimate = pre.to_verification_estimate();
     let estimate_known = matches!(estimate, VerificationEstimate::Known(_));
     let dispatch = grant.resolve_verification(
         &subject,
@@ -181,15 +171,11 @@ async fn shadow_record(
         | VerificationDispatch::DispatchOriginal
         | VerificationDispatch::Verify { .. } => {}
     }
-    // No generators yet: never refuse the original (behavior delta: none).
-    // Record the pre-candidate action when the estimate exceeded, otherwise
-    // persist an available estimate and still dispatch the original.
     let generators = rule.generators.clone();
     let recorded_action = match dispatch {
         VerificationDispatch::Verify { .. } => None,
-        VerificationDispatch::Refuse | VerificationDispatch::DispatchOriginal => {
-            Some(VerificationBudgetAction::DispatchOriginal)
-        }
+        VerificationDispatch::Refuse => Some(VerificationBudgetAction::Refuse),
+        VerificationDispatch::DispatchOriginal => Some(VerificationBudgetAction::DispatchOriginal),
         VerificationDispatch::Off => return Ok(VerificationOutcome::Skip),
     };
     let now = chrono::Utc::now().timestamp_millis();
@@ -231,6 +217,13 @@ async fn shadow_record(
             now,
         )
         .await?;
+    if recorded_action == Some(VerificationBudgetAction::Refuse) {
+        return Ok(VerificationOutcome::Block {
+            message: "verification budget was exceeded; the configured policy refuses this edit"
+                .to_string(),
+            operation_id: created.operation_id,
+        });
+    }
     let mut collected = Vec::new();
     if recorded_action.is_none() && !generators.is_empty() {
         collected = collect_candidates(CollectionInput {
@@ -244,7 +237,7 @@ async fn shadow_record(
             generators: &generators,
             operation_id: created.operation_id,
             expected_revision: created.revision,
-            workspace_root: input.ctx.cwd.as_path(),
+            workspace_root: input.session.project_root.as_path(),
         })
         .await
         .unwrap_or_default();
@@ -255,10 +248,17 @@ async fn shadow_record(
             .args
             .get("path")
             .and_then(Value::as_str)
-            .map(std::path::PathBuf::from);
+            .map(std::path::PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    input.ctx.cwd.join(path)
+                }
+            });
         let instructions = select_guidance_for_target(
             input.session,
-            input.ctx.cwd.as_path(),
+            input.session.project_root.as_path(),
             input.ctx.cwd.as_path(),
             target.as_deref(),
             &names,
@@ -305,13 +305,11 @@ async fn shadow_record(
                 if let Some(answer) = selected_revision(&verdict, &collected)
                     && let Some(applied) = answer.args.clone()
                 {
-                    let original_diff =
-                        proposed_diff(input.resolved_name, input.args, input.ctx.cwd.as_path());
-                    let applied_diff =
-                        proposed_diff(input.resolved_name, &applied, input.ctx.cwd.as_path());
+                    let original_call = serde_json::to_string_pretty(input.args)?;
+                    let applied_call = serde_json::to_string_pretty(&applied)?;
                     let disclosure = format!(
                         "[cockpit] verification revised this change before applying:\n{}",
-                        crate::engine::guidance_diff::unified_diff(&original_diff, &applied_diff)
+                        crate::engine::guidance_diff::unified_diff(&original_call, &applied_call)
                     );
                     return Ok(VerificationOutcome::Revise {
                         args: applied,
@@ -319,6 +317,17 @@ async fn shadow_record(
                         operation_id: created.operation_id,
                     });
                 }
+                let feedback = if verdict.feedback.is_empty() {
+                    "verification rejected this change".to_string()
+                } else {
+                    verdict.feedback
+                };
+                return Ok(VerificationOutcome::Block {
+                    message: format!(
+                        "verification blocked this edit: {feedback}; revise and re-emit"
+                    ),
+                    operation_id: created.operation_id,
+                });
             }
             _ => {}
         }

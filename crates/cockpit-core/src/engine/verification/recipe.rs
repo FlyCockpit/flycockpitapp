@@ -166,18 +166,28 @@ pub async fn select_guidance_for_target(
     guidance_names: &[String],
 ) -> Option<(PathBuf, String)> {
     if let Some(target) = target_path {
-        let start = if target.is_dir() {
+        let requested_start = if target.is_dir() {
             target.to_path_buf()
         } else {
             target.parent().unwrap_or(target).to_path_buf()
         };
-        if let Some(found) = walk_guidance(&start, guidance_names)
+        let mut start = requested_start.as_path();
+        while !start.exists() {
+            let Some(parent) = start.parent() else {
+                break;
+            };
+            start = parent;
+        }
+        if let Some(found) = walk_guidance(start, guidance_names)
             && guidance_is_trusted(session, workspace_root, &found.0).await
         {
             return Some(found);
         }
     }
-    walk_guidance(cwd, guidance_names)
+    let fallback = walk_guidance(cwd, guidance_names)?;
+    guidance_is_trusted(session, workspace_root, &fallback.0)
+        .await
+        .then_some(fallback)
 }
 
 fn walk_guidance(start: &Path, names: &[String]) -> Option<(PathBuf, String)> {

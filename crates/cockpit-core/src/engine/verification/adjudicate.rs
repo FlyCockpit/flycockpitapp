@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use crate::agents::{OnAdjudicationFailure, VerificationMode};
 use crate::engine::model::Model;
+use crate::engine::model::UtilityCallSite;
+use crate::engine::tool::ToolDefinition;
 
 use super::generate::{CandidateKind, CollectedCandidate, GeneratorAnswer};
 
@@ -79,27 +81,62 @@ pub fn apply_mode(
 }
 
 pub async fn adjudicate(
-    _model: &Model,
-    _original: &Value,
-    _candidates: &[CollectedCandidate],
-    _instructions: &str,
-    on_failure: OnAdjudicationFailure,
+    model: &Model,
+    original: &Value,
+    candidates: &[CollectedCandidate],
+    instructions: &str,
+    _on_failure: OnAdjudicationFailure,
 ) -> Result<AdjudicatorVerdict> {
     if let Some(verdict) = take_override() {
         return Ok(verdict);
     }
-    match on_failure {
-        OnAdjudicationFailure::DispatchOriginal => Ok(AdjudicatorVerdict {
-            decision: AdjudicatorDecision::Approve,
-            selected: None,
-            feedback: "adjudicator unavailable; dispatching original".into(),
+    let tool = ToolDefinition {
+        name: "verification_verdict".to_string(),
+        description: "Adjudicate the original change and its verification candidates.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "decision": { "type": "string", "enum": ["approve", "block", "select"] },
+                "selected_candidate": { "type": ["string", "null"] },
+                "feedback": { "type": "string" }
+            },
+            "required": ["decision", "selected_candidate", "feedback"],
+            "additionalProperties": false
         }),
-        OnAdjudicationFailure::Refuse => Ok(AdjudicatorVerdict {
-            decision: AdjudicatorDecision::Block,
-            selected: None,
-            feedback: "adjudicator unavailable; verification refused".into(),
-        }),
-    }
+    };
+    let candidate_json = candidates
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "candidate_id": candidate.candidate_id,
+                "kind": match candidate.answer.kind {
+                    CandidateKind::Revision => "revision",
+                    CandidateKind::ApproveOriginal => "approve_original",
+                    CandidateKind::Flag => "flag",
+                },
+                "args": candidate.answer.args,
+                "critique": candidate.answer.critique,
+            })
+        })
+        .collect::<Vec<_>>();
+    let prompt = serde_json::to_string_pretty(&serde_json::json!({
+        "original_args": original,
+        "candidates": candidate_json,
+        "instructions_excerpt": instructions,
+    }))?;
+    let calls = model
+        .tool_completion_for(
+            UtilityCallSite::VerificationAdjudication,
+            "Judge a proposed file write or edit against the supplied instructions and candidates. Return exactly one structured verdict through the verification_verdict tool.",
+            &prompt,
+            &tool,
+        )
+        .await?;
+    let call = calls
+        .iter()
+        .find(|call| call.function.name == tool.name)
+        .ok_or_else(|| anyhow::anyhow!("verification adjudicator returned no verdict tool call"))?;
+    parse_verdict(&call.function.arguments)
 }
 
 pub fn parse_verdict(value: &Value) -> Result<AdjudicatorVerdict> {

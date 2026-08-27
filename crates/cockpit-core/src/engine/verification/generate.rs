@@ -14,7 +14,9 @@ use crate::db::verification_ledger::{
 use crate::engine::agent::Agent;
 use crate::engine::message::Message;
 use crate::engine::model::Model;
+use crate::engine::model::UtilityCallSite;
 use crate::engine::tool::ToolCtx;
+use crate::engine::tool::ToolDefinition;
 use crate::session::Session;
 
 use super::recipe::{RecipeAssemblyInput, assemble_recipe};
@@ -109,7 +111,14 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         .args
         .get("path")
         .and_then(Value::as_str)
-        .map(std::path::PathBuf::from);
+        .map(std::path::PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                input.ctx.cwd.join(path)
+            }
+        });
     let target_ref = target.as_deref();
     let placeholder = input.ctx.redact.placeholder().to_string();
     for spec in input.generators {
@@ -137,12 +146,17 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         })
         .await?;
         let answer = generate_with_turns(input.model, spec, &assembled.prompt).await;
+        let answer_json = serde_json::to_string(&serde_json::json!({
+            "args": &answer.args,
+            "critique": &answer.critique,
+        }))
+        .unwrap_or_default();
+        let invalid_placeholder = !placeholder.is_empty() && answer_json.contains(&placeholder);
         let args_json = answer
             .args
             .as_ref()
             .map(|value| value.to_string())
             .unwrap_or_default();
-        let invalid_placeholder = !placeholder.is_empty() && args_json.contains(&placeholder);
         let digest = VerificationDigest::of(args_json.as_bytes());
         let now = chrono::Utc::now().timestamp_millis();
         let reserved = match input
@@ -277,13 +291,34 @@ pub(crate) fn investigation_turns() -> u8 {
 }
 
 async fn generate_one_shot(model: &Model, prompt: &str) -> Result<GeneratorAnswer> {
-    let _ = (model, prompt);
-    // Production generators resolve utility models via the profile-snapshot
-    // binding in a follow-up wiring pass. Fail open to a flag so the original
-    // still dispatches when no test override and no bound utility model.
-    // TODO(verification): dispatch UtilityCallSite::VerificationVariant through
-    // WorkerAgentTreeResolverRegistry.utility_models.
-    anyhow::bail!("verification generator utility model is not bound")
+    let tool = ToolDefinition {
+        name: "verification_candidate".to_string(),
+        description: "Return one verification candidate for the proposed write or edit."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "enum": ["revision", "approve_original", "flag"] },
+                "args": { "type": ["object", "null"] },
+                "critique": { "type": "string" }
+            },
+            "required": ["kind", "args", "critique"],
+            "additionalProperties": false
+        }),
+    };
+    let calls = model
+        .tool_completion_for(
+            UtilityCallSite::VerificationVariant,
+            "Independently verify the proposed file change. Return exactly one structured candidate through the verification_candidate tool. Never execute tools.",
+            prompt,
+            &tool,
+        )
+        .await?;
+    let call = calls
+        .iter()
+        .find(|call| call.function.name == tool.name)
+        .ok_or_else(|| anyhow::anyhow!("verification generator returned no candidate tool call"))?;
+    parse_candidate_payload(&call.function.arguments)
 }
 
 pub fn parse_candidate_payload(value: &Value) -> Result<GeneratorAnswer> {

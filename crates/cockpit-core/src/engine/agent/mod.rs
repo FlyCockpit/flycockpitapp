@@ -1679,24 +1679,25 @@ pub(crate) fn rewrite_assistant_tool_call(
     history: &mut [Message],
     call_id: &str,
     canonical_args: &Value,
-) {
+) -> bool {
     use rig::message::AssistantContent;
     for msg in history.iter_mut().rev() {
         if let Message::Assistant { content, .. } = msg {
             if assistant_content_has_signed_reasoning(content) {
-                return;
+                return false;
             }
             for c in content.iter_mut() {
                 if let AssistantContent::ToolCall(tc) = c
                     && tc.id == call_id
                 {
                     tc.function.arguments = canonical_args.clone();
-                    return;
+                    return true;
                 }
             }
-            return;
+            return false;
         }
     }
+    false
 }
 
 /// Mutate the most recent assistant message in `history` so the tool call

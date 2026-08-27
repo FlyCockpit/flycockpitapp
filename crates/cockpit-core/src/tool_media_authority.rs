@@ -17,30 +17,14 @@
 //!   authority for attachment/local/HTTPS admission.
 //! - [`availability`] — `MediaToolAvailability` data-free tool-presence
 //!   snapshot created before `ToolCtx`.
+//! - [`recovery`] — queue recovery/materialization, folded-root subject
+//!   derivation, spawn-context enforcement, and epoch increment on
+//!   control-state changes.
 //!
-//! # Remaining wiring (TODO for follow-up)
-//!
-//! The following pieces are scaffolded but not yet wired into the full
-//! daemon flow in this rough draft:
-//!
-//! - **Queue recovery/materialization** loads the binding for every accepted
-//!   `UserSubmission` via `Db::load_tool_media_subject_bindings_for_session`.
-//! - **Folded root** gets a subject only if all contributors have
-//!   byte-identical canonical receipts and each live revalidation succeeds;
-//!   otherwise it remains folded with no authority.
-//! - **Scheduled/background/headless roots** and children without inherited
-//!   valid root authority get none.
-//! - **Secure-key ref lifecycle** in `accept_message_with_attachments`:
-//!   reserve → activate after reachable binding insert in the same
-//!   transaction (the binding insert is wired; the ref lifecycle needs the
-//!   secure-key actor integration).
-//! - **Epoch increment** on control-state changes (device revocation,
-//!   authority status transition, local membership/read-path change) in the
-//!   authoritative write transaction.
-
 pub mod availability;
 pub mod locator;
 pub mod receipt;
+pub mod recovery;
 pub mod revalidator;
 pub mod seal;
 pub mod session_authority;
@@ -48,6 +32,12 @@ pub mod session_authority;
 // Re-export the primary public types for ergonomic access from within core.
 pub use availability::MediaToolAvailability;
 pub use receipt::ToolMediaSubjectReceiptV1;
+pub use recovery::{
+    ControlStateChange, RecoveredBinding, RecoveryError, SpawnContext,
+    apply_control_state_change_conn, context_eligible_for_authority, derive_folded_root_subject,
+    media_availability_for_context, receipt_from_binding_row, recover_session_bindings,
+    recover_session_bindings_with_failures,
+};
 pub use revalidator::{RevalidatorError, ToolMediaSubjectRevalidator};
 pub use seal::{SealError, SealedLocator, UnsealedLocator};
 pub use session_authority::{AdmissionDenial, AdmittedHandle, SessionMediaAuthority};

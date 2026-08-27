@@ -737,3 +737,439 @@ fn media_tool_availability_materialization() {
         0
     );
 }
+
+// ---------------------------------------------------------------------------
+// Extended suites: five acceptance-criteria pieces (issue #70)
+// ---------------------------------------------------------------------------
+
+// --- Piece 1: Queue recovery / materialization -----------------------------
+
+#[tokio::test]
+async fn tool_media_subject_binding_replay_and_propagation_recovery() {
+    use super::recovery::{recover_session_bindings, recover_session_bindings_with_failures};
+
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = db
+        .create_session("project", "/workspace", "Build")
+        .await
+        .unwrap();
+
+    // Create the FK parent (message submission receipt).
+    let input = crate::db::message_attachments::AcceptMessageInput {
+        session_id: session.session_id,
+        operation_id: [1; 16],
+        actor: crate::db::message_attachments::MessageActor::LocalOwner,
+        request_hash: [2; 32],
+        message_request_digest: [3; 32],
+        attachment_set_digest: [4; 32],
+        client_submission_id: [5; 16],
+        queue_item_id: [6; 16],
+        canonical_message: b"FCM2\x02".to_vec(),
+        attachments: vec![],
+        outbox_sequence: 1,
+        now_ms: 10,
+        tool_media_subject_binding: None,
+    };
+    use crate::db::message_attachments::MessageAcceptanceJoin;
+    struct Allow;
+    impl MessageAcceptanceJoin for Allow {
+        fn validate_and_join(
+            &self,
+            _: &rusqlite::Connection,
+            _: &crate::db::message_attachments::AcceptMessageInput,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    db.accept_message_with_attachments(input, Arc::new(Allow))
+        .await
+        .unwrap();
+
+    // Build and insert a real sealed binding.
+    let key = [0x42; 32];
+    let session_bytes = *session.session_id.as_bytes();
+    let submission = [5; 16];
+    let locator = LocatorV1::local_owner();
+    let project_uuid = [0xAB; 16];
+    let project_digest = LocatorV1::project_digest(&project_uuid);
+    let receipt = ToolMediaSubjectReceiptV1::new(
+        IssuerKind::LocalOwner,
+        &locator,
+        project_digest,
+        session_bytes,
+        0,
+    );
+    let receipt_bytes = receipt.canonical_bytes();
+    let sealed =
+        seal::seal_locator(&key, &session_bytes, &submission, &receipt_bytes, &locator).unwrap();
+
+    let session_str = session.session_id.to_string();
+    let submission_hex: String = submission.iter().map(|b| format!("{b:02x}")).collect();
+    let ref_id = super::binding_key_reference_id(&session_str, &submission_hex, 1);
+
+    let insert = crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
+        session_id: session.session_id,
+        client_submission_id: submission,
+        receipt_version: 1,
+        issuer_kind: 1,
+        principal_digest: receipt.principal_digest,
+        project_digest: receipt.project_digest,
+        authorization_epoch: 0,
+        subject_digest: receipt.subject_digest,
+        seal_version: 1,
+        key_namespace: "tool_media_subject_binding".to_string(),
+        key_version: 1,
+        nonce: sealed.nonce,
+        ciphertext: sealed.ciphertext,
+        secure_key_reference_id: ref_id,
+        receipt_bytes: receipt_bytes.clone(),
+        now_ms: 20,
+    };
+
+    db.transaction(move |conn| {
+        crate::db::Db::insert_tool_media_subject_binding_conn(conn, &insert)
+    })
+    .await
+    .unwrap();
+
+    // Simulate restart/recovery: load all bindings and revalidate.
+    let revalidator = ToolMediaSubjectRevalidator::new(
+        Arc::new(LocalOnlyProjection),
+        Arc::new(FakeKeyResolver {
+            key,
+            available: true,
+        }),
+    );
+
+    let recovered = recover_session_bindings(&db, session.session_id, &revalidator)
+        .await
+        .unwrap();
+
+    // The binding revalidated successfully → authority granted.
+    assert_eq!(recovered.len(), 1);
+    let subject = recovered.get(&submission).unwrap();
+    assert_eq!(subject.receipt, receipt);
+    assert_eq!(subject.issuer_kind, IssuerKind::LocalOwner);
+
+    // Verify the with-failures variant returns a matching outcome.
+    let recoveries = recover_session_bindings_with_failures(&db, session.session_id, &revalidator)
+        .await
+        .unwrap();
+    assert_eq!(recoveries.len(), 1);
+    assert!(recoveries[0].result.is_ok());
+}
+
+// --- Piece 2: Folded root subject derivation -------------------------------
+
+#[test]
+fn tool_media_mixed_principal_fold_derivation() {
+    use super::recovery::{RecoveredBinding, derive_folded_root_subject};
+
+    let key = [0x42; 32];
+    let session_id = [0xCD; 16];
+
+    // Case 1: all identical → Some.
+    {
+        let sub_a = [0x01; 16];
+        let sub_b = [0x02; 16];
+        let (_, bytes_a, nonce_a, ct_a) = make_sealed_local_binding(&key, 0, session_id, sub_a);
+        let (_, bytes_b, nonce_b, ct_b) = make_sealed_local_binding(&key, 0, session_id, sub_b);
+        assert_eq!(bytes_a, bytes_b);
+
+        let revalidator = make_revalidator(
+            &key,
+            FakeProjection {
+                device_active: true,
+                authority_active: true,
+                epoch: 0,
+            },
+        );
+
+        let recoveries = vec![
+            RecoveredBinding {
+                client_submission_id: sub_a,
+                result: revalidator.revalidate(
+                    &bytes_a,
+                    &nonce_a,
+                    &ct_a,
+                    "tool_media_subject_binding",
+                    1,
+                    &sub_a,
+                ),
+            },
+            RecoveredBinding {
+                client_submission_id: sub_b,
+                result: revalidator.revalidate(
+                    &bytes_b,
+                    &nonce_b,
+                    &ct_b,
+                    "tool_media_subject_binding",
+                    1,
+                    &sub_b,
+                ),
+            },
+        ];
+
+        assert!(derive_folded_root_subject(&recoveries).is_some());
+    }
+
+    // Case 2: mixed issuer → None.
+    {
+        let sub_a = [0x01; 16];
+        let sub_c = [0x03; 16];
+        let (_, bytes_a, nonce_a, ct_a) = make_sealed_local_binding(&key, 0, session_id, sub_a);
+        let (_, bytes_c, nonce_c, ct_c) =
+            make_sealed_remote_binding(&key, 0, [0xFF; 16], 1, session_id, sub_c);
+
+        let revalidator = make_revalidator(
+            &key,
+            FakeProjection {
+                device_active: true,
+                authority_active: true,
+                epoch: 0,
+            },
+        );
+
+        let recoveries = vec![
+            RecoveredBinding {
+                client_submission_id: sub_a,
+                result: revalidator.revalidate(
+                    &bytes_a,
+                    &nonce_a,
+                    &ct_a,
+                    "tool_media_subject_binding",
+                    1,
+                    &sub_a,
+                ),
+            },
+            RecoveredBinding {
+                client_submission_id: sub_c,
+                result: revalidator.revalidate(
+                    &bytes_c,
+                    &nonce_c,
+                    &ct_c,
+                    "tool_media_subject_binding",
+                    1,
+                    &sub_c,
+                ),
+            },
+        ];
+
+        assert!(derive_folded_root_subject(&recoveries).is_none());
+    }
+
+    // Case 3: any failed revalidation → None.
+    {
+        let sub_a = [0x01; 16];
+        let sub_b = [0x02; 16];
+        let (_, bytes_a, nonce_a, ct_a) = make_sealed_local_binding(&key, 0, session_id, sub_a);
+        let (_, bytes_b, nonce_b, ct_b) = make_sealed_local_binding(&key, 0, session_id, sub_b);
+        assert_eq!(bytes_a, bytes_b);
+
+        let ok_rev = make_revalidator(
+            &key,
+            FakeProjection {
+                device_active: true,
+                authority_active: true,
+                epoch: 0,
+            },
+        );
+        let stale_rev = make_revalidator(
+            &key,
+            FakeProjection {
+                device_active: true,
+                authority_active: true,
+                epoch: 99,
+            },
+        );
+
+        let recoveries = vec![
+            RecoveredBinding {
+                client_submission_id: sub_a,
+                result: ok_rev.revalidate(
+                    &bytes_a,
+                    &nonce_a,
+                    &ct_a,
+                    "tool_media_subject_binding",
+                    1,
+                    &sub_a,
+                ),
+            },
+            RecoveredBinding {
+                client_submission_id: sub_b,
+                result: stale_rev.revalidate(
+                    &bytes_b,
+                    &nonce_b,
+                    &ct_b,
+                    "tool_media_subject_binding",
+                    1,
+                    &sub_b,
+                ),
+            },
+        ];
+
+        assert!(derive_folded_root_subject(&recoveries).is_none());
+    }
+
+    // Case 4: empty → None.
+    assert!(derive_folded_root_subject(&[]).is_none());
+}
+
+// --- Piece 3: Scheduled / background / headless enforcement ----------------
+
+#[test]
+fn media_tool_availability_materialization_spawn_context() {
+    use super::recovery::{
+        SpawnContext, context_eligible_for_authority, media_availability_for_context,
+    };
+
+    // UserRoot with valid binding → available.
+    assert!(media_availability_for_context(&SpawnContext::UserRoot, true).is_available());
+    assert!(context_eligible_for_authority(&SpawnContext::UserRoot));
+
+    // UserRoot without binding → unavailable.
+    assert!(!media_availability_for_context(&SpawnContext::UserRoot, false).is_available());
+
+    // ScheduledRoot → never available, never eligible (even with binding).
+    assert!(!media_availability_for_context(&SpawnContext::ScheduledRoot, true).is_available());
+    assert!(!context_eligible_for_authority(
+        &SpawnContext::ScheduledRoot
+    ));
+
+    // BackgroundRoot → never available, never eligible.
+    assert!(!media_availability_for_context(&SpawnContext::BackgroundRoot, true).is_available());
+    assert!(!context_eligible_for_authority(
+        &SpawnContext::BackgroundRoot
+    ));
+
+    // HeadlessRoot → never available, never eligible.
+    assert!(!media_availability_for_context(&SpawnContext::HeadlessRoot, true).is_available());
+    assert!(!context_eligible_for_authority(&SpawnContext::HeadlessRoot));
+
+    // DelegatedChild with inherited authority + binding → available.
+    let child_with = SpawnContext::DelegatedChild {
+        inherited_valid_root_authority: true,
+    };
+    assert!(media_availability_for_context(&child_with, true).is_available());
+    assert!(context_eligible_for_authority(&child_with));
+
+    // DelegatedChild without inherited authority → unavailable.
+    let child_without = SpawnContext::DelegatedChild {
+        inherited_valid_root_authority: false,
+    };
+    assert!(!media_availability_for_context(&child_without, true).is_available());
+    assert!(!context_eligible_for_authority(&child_without));
+
+    // DelegatedChild with inherited authority but no binding → unavailable.
+    assert!(!media_availability_for_context(&child_with, false).is_available());
+}
+
+// --- Piece 4: Secure-key ref lifecycle (core-level smoke) ------------------
+//
+// The DB-level reserve/activate/release lifecycle is tested in
+// cockpit-db's `message_attachments` tests. Here we verify the composite
+// reconciler routing and the ref-id/consumer-id formatting that the
+// lifecycle depends on.
+
+#[test]
+fn tool_media_secure_key_lifecycle_ref_ids() {
+    // The ref-id format must match what the DB layer writes in accept_conn.
+    let ref_id =
+        super::binding_key_reference_id("session-abc", "0102030405060708090a0b0c0d0e0f10", 2);
+    assert_eq!(
+        ref_id,
+        "tool-media-subject-binding/session-abc/0102030405060708090a0b0c0d0e0f10/2"
+    );
+
+    let consumer_id = super::binding_consumer_id("session-abc", "0102030405060708090a0b0c0d0e0f10");
+    assert_eq!(consumer_id, "session-abc/0102030405060708090a0b0c0d0e0f10");
+
+    // The consumer kind constant must be "tool_media_subject_binding".
+    assert_eq!(
+        super::TOOL_MEDIA_SUBJECT_BINDING_CONSUMER_KIND,
+        "tool_media_subject_binding"
+    );
+    assert_eq!(
+        super::TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE,
+        "tool_media_subject_binding"
+    );
+}
+
+// --- Piece 5: Epoch increment on control-state changes ---------------------
+
+#[tokio::test]
+async fn tool_media_epoch_increment_on_control_state_changes() {
+    use super::recovery::{ControlStateChange, apply_control_state_change_conn};
+
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = uuid::Uuid::from_bytes([0xCD; 16]);
+    let principal = [0x11; 32];
+    let project = [0x22; 32];
+
+    // 1. Authority status transition (local owner, issuer_kind=1).
+    let auth_change = ControlStateChange::AuthorityStatusTransition {
+        issuer_kind: IssuerKind::LocalOwner,
+        principal_digest: principal,
+        session_id: session,
+        project_digest: project,
+    };
+    let e1 = db
+        .transaction(move |conn| apply_control_state_change_conn(conn, auth_change, 100))
+        .await
+        .unwrap();
+    assert_eq!(e1, 1);
+
+    // The epoch is now 1 — a binding at epoch 0 would fail revalidation.
+    let current = db
+        .tool_media_authorization_epoch(1, principal, session, project)
+        .await
+        .unwrap();
+    assert_eq!(current, Some(1));
+
+    // 2. Local membership/read-path change (local owner, issuer_kind=1).
+    let membership_change = ControlStateChange::LocalMembershipReadPathChange {
+        principal_digest: principal,
+        session_id: session,
+        project_digest: project,
+    };
+    let e2 = db
+        .transaction(move |conn| apply_control_state_change_conn(conn, membership_change, 200))
+        .await
+        .unwrap();
+    assert_eq!(e2, 2);
+
+    // 3. Device revocation (remote device, issuer_kind=2) — different tuple.
+    let device_change = ControlStateChange::DeviceRevocation {
+        device_uuid: [0xFF; 16],
+        principal_digest: [0x33; 32], // different principal for the remote device
+        session_id: session,
+        project_digest: project,
+    };
+    let e3 = db
+        .transaction(move |conn| apply_control_state_change_conn(conn, device_change, 300))
+        .await
+        .unwrap();
+    assert_eq!(e3, 1); // new tuple → starts at 1
+
+    // The remote device epoch is independent from the local owner epoch.
+    let remote_epoch = db
+        .tool_media_authorization_epoch(2, [0x33; 32], session, project)
+        .await
+        .unwrap();
+    assert_eq!(remote_epoch, Some(1));
+
+    // The local owner epoch is still 2 (unaffected by the device revocation
+    // for a different principal).
+    let local_epoch = db
+        .tool_media_authorization_epoch(1, principal, session, project)
+        .await
+        .unwrap();
+    assert_eq!(local_epoch, Some(2));
+
+    // 4. A second authority status transition increments to 3.
+    let e4 = db
+        .transaction(move |conn| apply_control_state_change_conn(conn, auth_change, 400))
+        .await
+        .unwrap();
+    assert_eq!(e4, 3);
+}

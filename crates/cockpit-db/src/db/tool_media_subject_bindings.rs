@@ -530,10 +530,9 @@ mod tests {
                 "tool-media-subject-binding/test/05050505050505050505050505050505/1".to_string(),
             receipt_bytes: vec![0xFF; 122],
             now_ms: 20,
-            tool_media_subject_binding: None,
         };
 
-        db.transaction(|conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
+        db.transaction(move |conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
             .await
             .unwrap();
 
@@ -607,10 +606,9 @@ mod tests {
                 "tool-media-subject-binding/test/07070707070707070707070707070707/1".to_string(),
             receipt_bytes: vec![0xFF; 122],
             now_ms: 20,
-            tool_media_subject_binding: None,
         };
 
-        db.transaction(|conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
+        db.transaction(move |conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
             .await
             .unwrap();
 
@@ -623,7 +621,7 @@ mod tests {
 
         // Delete the submission with binding.
         let session_str = session.session_id.to_string();
-        db.transaction(|conn| {
+        db.transaction(move |conn| {
             Db::delete_message_submission_with_media_subject_binding_conn(
                 conn,
                 &session_str,
@@ -699,11 +697,13 @@ mod tests {
             secure_key_reference_id: "test-ref-2".to_string(),
             receipt_bytes: vec![0xFF; 122],
             now_ms: 20,
-            tool_media_subject_binding: None,
         };
 
         let result = db
-            .transaction(|conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
+            .transaction({
+                let insert = insert.clone();
+                move |conn| Db::insert_tool_media_subject_binding_conn(conn, &insert)
+            })
             .await;
         assert!(result.is_err());
 
@@ -711,7 +711,7 @@ mod tests {
         insert.receipt_version = 1;
         insert.issuer_kind = 3; // invalid
         let result = db
-            .transaction(|conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
+            .transaction(move |conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
             .await;
         assert!(result.is_err());
     }

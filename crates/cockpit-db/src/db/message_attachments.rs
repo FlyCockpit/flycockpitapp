@@ -455,10 +455,75 @@ pub(crate) fn accept_conn(
         conn.execute("INSERT INTO message_attachment_references (session_id,client_submission_id,ordinal,attachment_id,attachment_version,checksum,kind,acquired_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![session,input.client_submission_id.as_slice(),ordinal as i64,attachment.attachment_id.as_slice(),attachment.attachment_version.to_be_bytes().as_slice(),attachment.checksum.as_slice(),attachment.kind,input.now_ms])?;
     }
     // Atomically insert the tool-media-subject binding if present.
+    //
+    // Secure-key ref lifecycle (issue #70 piece 4): reserve the consumer ref
+    // BEFORE the binding insert, then activate it AFTER the binding row is
+    // reachable — all in the same transaction. A failed reservation
+    // (NotFound/NotReservable/Conflict) fails the entire acceptance
+    // transaction so no durable binding can outlive its key reference.
     if let Some(binding) = &input.tool_media_subject_binding {
+        let submission_hex: String = binding
+            .client_submission_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let consumer_id = format!("{session}/{submission_hex}");
+
+        // 1. Reserve the consumer ref (Reserved → Active is the next step).
+        use crate::db::secure_key::{ReserveResult, reserve_consumer_ref_conn};
+        let reserve_result = reserve_consumer_ref_conn(
+            conn,
+            &binding.secure_key_reference_id,
+            &binding.key_namespace,
+            binding.key_version,
+            // The consumer kind matches the constant in cockpit-core's
+            // tool_media_authority module: "tool_media_subject_binding".
+            "tool_media_subject_binding",
+            &consumer_id,
+        )
+        .context("reserving tool-media-subject-binding secure-key ref")?;
+        match reserve_result {
+            ReserveResult::Reserved(_) | ReserveResult::Idempotent(_) => {}
+            ReserveResult::NotFound => {
+                anyhow::bail!(
+                    "secure-key version not found for tool-media-subject-binding ref: \
+                     namespace={}, version={}",
+                    binding.key_namespace,
+                    binding.key_version
+                );
+            }
+            ReserveResult::Retiring => {
+                anyhow::bail!(
+                    "secure-key version is retiring; cannot reserve tool-media-subject-binding ref"
+                );
+            }
+            ReserveResult::NotReservable { state } => {
+                anyhow::bail!(
+                    "secure-key version not reservable (state={:?}); \
+                     cannot reserve tool-media-subject-binding ref",
+                    state
+                );
+            }
+            ReserveResult::Conflict => {
+                anyhow::bail!("secure-key consumer ref conflict for tool-media-subject-binding");
+            }
+        }
+
+        // 2. Insert the binding row — this makes the consumer data reachable.
         crate::db::tool_media_subject_bindings::Db::insert_tool_media_subject_binding_conn(
             conn, binding,
         )?;
+
+        // 3. Activate the consumer ref now that the binding is reachable.
+        use crate::db::secure_key::activate_consumer_ref_conn;
+        let activated = activate_consumer_ref_conn(conn, &binding.secure_key_reference_id)
+            .context("activating tool-media-subject-binding secure-key ref")?;
+        if !activated {
+            anyhow::bail!(
+                "failed to activate tool-media-subject-binding secure-key ref \
+                 (not in Reserved state after insert)"
+            );
+        }
     }
     Ok(AcceptMessageResult::Accepted)
 }
@@ -783,6 +848,222 @@ mod tests {
                 .await
                 .unwrap(),
             AcceptMessageResult::Conflict
+        );
+    }
+
+    // ---- Secure-key ref lifecycle (issue #70 piece 4) -----------------------
+
+    use crate::db::secure_key::{
+        SecureKeyRefState, SecureKeyVersionState, ensure_namespace_conn, get_ref_by_id_conn,
+    };
+
+    /// Hex-encode a 16-byte submission id.
+    fn submission_hex(id: &[u8; 16]) -> String {
+        id.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Set up a secure-key namespace with an Active version 1 so that a
+    /// consumer ref can be reserved against it.
+    fn setup_active_key_version(conn: &Connection) -> Result<()> {
+        ensure_namespace_conn(conn, "tool_media_subject_binding")?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO secure_key_versions
+                (namespace, version, state, key_digest, created_at, updated_at)
+             VALUES (?1, 1, ?2, 'test-digest', ?3, ?3)",
+            params![
+                "tool_media_subject_binding",
+                SecureKeyVersionState::Active.as_str(),
+                now
+            ],
+        )?;
+        conn.execute(
+            "UPDATE secure_key_namespaces SET active_version = 1, updated_at = ?1
+             WHERE namespace = ?2",
+            params![now, "tool_media_subject_binding"],
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accept_with_binding_reserves_and_activates_secure_key_ref() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+
+        // Provision the secure-key namespace + active version 1.
+        db.write(setup_active_key_version).await.unwrap();
+
+        let mut input = input(session.session_id);
+        input.tool_media_subject_binding = Some(
+            crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
+                session_id: session.session_id,
+                client_submission_id: input.client_submission_id,
+                receipt_version: 1,
+                issuer_kind: 1,
+                principal_digest: [0xAA; 32],
+                project_digest: [0xBB; 32],
+                authorization_epoch: 0,
+                subject_digest: [0xCC; 32],
+                seal_version: 1,
+                key_namespace: "tool_media_subject_binding".to_string(),
+                key_version: 1,
+                nonce: [0xDD; 24],
+                ciphertext: vec![0xEE; 48],
+                secure_key_reference_id: format!(
+                    "tool-media-subject-binding/{}/{}/1",
+                    session.session_id,
+                    submission_hex(&input.client_submission_id)
+                ),
+                receipt_bytes: vec![0xFF; 122],
+                now_ms: 20,
+            },
+        );
+
+        let result = db
+            .accept_message_with_attachments(input.clone(), Arc::new(Allow))
+            .await
+            .unwrap();
+        assert_eq!(result, AcceptMessageResult::Accepted);
+
+        // The secure-key consumer ref should be Active.
+        let ref_id = input
+            .tool_media_subject_binding
+            .as_ref()
+            .unwrap()
+            .secure_key_reference_id
+            .clone();
+        let ref_state = db
+            .read(move |conn| {
+                let r = get_ref_by_id_conn(conn, &ref_id)?.unwrap();
+                Ok(r.state)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ref_state, SecureKeyRefState::Active);
+
+        // The binding row should exist.
+        let row = db
+            .load_tool_media_subject_binding(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(row.is_some());
+    }
+
+    #[tokio::test]
+    async fn accept_with_binding_fails_when_key_version_missing() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+
+        // Do NOT provision the secure-key namespace — reserve must fail.
+        let mut input = input(session.session_id);
+        input.tool_media_subject_binding = Some(
+            crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
+                session_id: session.session_id,
+                client_submission_id: input.client_submission_id,
+                receipt_version: 1,
+                issuer_kind: 1,
+                principal_digest: [0xAA; 32],
+                project_digest: [0xBB; 32],
+                authorization_epoch: 0,
+                subject_digest: [0xCC; 32],
+                seal_version: 1,
+                key_namespace: "tool_media_subject_binding".to_string(),
+                key_version: 1,
+                nonce: [0xDD; 24],
+                ciphertext: vec![0xEE; 48],
+                secure_key_reference_id: "tool-media-subject-binding/missing/1".to_string(),
+                receipt_bytes: vec![0xFF; 122],
+                now_ms: 20,
+            },
+        );
+
+        let result = db
+            .accept_message_with_attachments(input.clone(), Arc::new(Allow))
+            .await;
+        assert!(
+            result.is_err(),
+            "acceptance must fail when the secure-key version is missing — no partial binding"
+        );
+
+        // No binding row should exist (transaction rolled back).
+        let row = db
+            .load_tool_media_subject_binding(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(row.is_none());
+
+        // No submission receipt either — the whole transaction rolled back.
+        let receipts = db
+            .message_attachment_receipts(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(receipts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accept_with_binding_rollback_on_join_failure_releases_ref() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+
+        db.write(setup_active_key_version).await.unwrap();
+
+        let mut input = input(session.session_id);
+        let ref_id = format!(
+            "tool-media-subject-binding/{}/{}/1",
+            session.session_id,
+            submission_hex(&input.client_submission_id)
+        );
+        input.tool_media_subject_binding = Some(
+            crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
+                session_id: session.session_id,
+                client_submission_id: input.client_submission_id,
+                receipt_version: 1,
+                issuer_kind: 1,
+                principal_digest: [0xAA; 32],
+                project_digest: [0xBB; 32],
+                authorization_epoch: 0,
+                subject_digest: [0xCC; 32],
+                seal_version: 1,
+                key_namespace: "tool_media_subject_binding".to_string(),
+                key_version: 1,
+                nonce: [0xDD; 24],
+                ciphertext: vec![0xEE; 48],
+                secure_key_reference_id: ref_id.clone(),
+                receipt_bytes: vec![0xFF; 122],
+                now_ms: 20,
+            },
+        );
+
+        // The Deny join fails after the ref is reserved — the entire
+        // transaction (including the ref) must roll back.
+        let result = db
+            .accept_message_with_attachments(input.clone(), Arc::new(Deny))
+            .await;
+        assert!(result.is_err());
+
+        // No binding, no ref, no receipt.
+        let row = db
+            .load_tool_media_subject_binding(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(row.is_none());
+
+        let ref_exists = db
+            .read(move |conn| Ok(get_ref_by_id_conn(conn, &ref_id)?.is_some()))
+            .await
+            .unwrap();
+        assert!(
+            !ref_exists,
+            "rolled-back acceptance must not leave a dangling secure-key ref"
         );
     }
 }

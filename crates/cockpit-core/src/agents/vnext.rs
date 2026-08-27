@@ -15,6 +15,9 @@ use uuid::Uuid;
 pub const SCHEMA_VERSION: u8 = 2;
 pub const DEFAULT_MAX_CANDIDATES: u16 = 5;
 pub const MAX_VERIFICATION_CANDIDATES: u16 = 64;
+/// Explicit self-invocation token in `delegation.allowedChildren`. Counted
+/// against `maxDescendantDepth` / `maxConcurrentChildren` like any other child.
+pub const SELF_CHILD_REF: &str = "self";
 
 /// Provenance assigned by the trusted definition loader, never read from an
 /// authored frontmatter key.  The `local` publisher is a daemon-local
@@ -517,6 +520,8 @@ impl VnextAgentDef {
                 max_descendant_depth: depth,
                 max_concurrent_children: concurrent,
                 targets,
+                default_child: self.delegation.default_child.clone(),
+                package_children: BTreeMap::new(),
             })
         };
         let questions =
@@ -721,7 +726,14 @@ impl EffectiveVnextGrant {
 
     pub fn permits_child(&self, child_ref: &AllowedChild, child_kind: ExecutionKind) -> bool {
         self.delegation.as_ref().is_some_and(|delegation| {
-            delegation.allowed_children.contains(child_ref)
+            let allowed = delegation.allowed_children.contains(child_ref)
+                || (child_ref.is_self()
+                    && delegation
+                        .allowed_children
+                        .iter()
+                        .any(AllowedChild::is_self))
+                || delegation.permits_package_child(child_ref);
+            allowed
                 && delegation_kind_permitted(
                     self.execution_kind,
                     child_kind,
@@ -790,6 +802,23 @@ pub struct EffectiveDelegationGrant {
     pub max_descendant_depth: u16,
     pub max_concurrent_children: u16,
     pub targets: BTreeSet<DelegationTarget>,
+    pub default_child: Option<String>,
+    /// Package-private child name → portable agent_id. Private defs win over
+    /// a same-named global agent for this parent only.
+    pub package_children: BTreeMap<String, String>,
+}
+
+impl EffectiveDelegationGrant {
+    fn permits_package_child(&self, child_ref: &AllowedChild) -> bool {
+        let AllowedChild::PortableRef { portable_agent_ref } = child_ref else {
+            return false;
+        };
+        self.package_children.contains_key(portable_agent_ref)
+            || self
+                .package_children
+                .values()
+                .any(|agent_id| agent_id == portable_agent_ref)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1057,6 +1086,14 @@ pub struct DelegationPolicy {
     pub max_concurrent_children: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<DelegationTarget>,
+    /// Used when a parent delegates without naming an agent. Must name one of
+    /// `allowedChildren` (including `"self"`).
+    #[serde(
+        rename = "defaultChild",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_child: Option<String>,
 }
 
 impl DelegationPolicy {
@@ -1065,6 +1102,7 @@ impl DelegationPolicy {
             && self.max_descendant_depth.is_none()
             && self.max_concurrent_children.is_none()
             && self.targets.is_empty()
+            && self.default_child.is_none()
     }
 
     pub fn validate(&self, agent_id: &str, kind: ExecutionKind) -> Result<()> {
@@ -1094,6 +1132,8 @@ impl DelegationPolicy {
             }
             match (local, child) {
                 (true, AllowedChild::LocalInstallation { .. }) => {}
+                (_, AllowedChild::PortableRef { portable_agent_ref })
+                    if portable_agent_ref == SELF_CHILD_REF => {}
                 (false, AllowedChild::PortableRef { portable_agent_ref }) => {
                     validate_agent_id(portable_agent_ref)?;
                     if portable_agent_ref.starts_with("local/") {
@@ -1106,6 +1146,19 @@ impl DelegationPolicy {
                 (false, AllowedChild::LocalInstallation { .. }) => bail!(
                     "workspace-shared definitions may only use portableAgentRef child references"
                 ),
+            }
+        }
+        if let Some(default_child) = &self.default_child {
+            let named = self.allowed_children.iter().any(|child| match child {
+                AllowedChild::PortableRef { portable_agent_ref } => {
+                    portable_agent_ref == default_child
+                }
+                AllowedChild::LocalInstallation { .. } => false,
+            });
+            if !named {
+                bail!(
+                    "delegation.defaultChild `{default_child}` must name an allowedChildren entry"
+                );
             }
         }
         let target_set: BTreeSet<DelegationTarget> = self.targets.iter().copied().collect();
@@ -1134,6 +1187,21 @@ pub enum AllowedChild {
         #[serde(rename = "ref")]
         portable_agent_ref: String,
     },
+}
+
+impl AllowedChild {
+    pub fn is_self(&self) -> bool {
+        matches!(
+            self,
+            Self::PortableRef { portable_agent_ref } if portable_agent_ref == SELF_CHILD_REF
+        )
+    }
+
+    pub fn portable_ref(name: &str) -> Self {
+        Self::PortableRef {
+            portable_agent_ref: name.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2087,6 +2155,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         assert!(definition.validate().is_err());
     }
@@ -2101,6 +2170,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut child = valid();
         child.agent_id = "acme/child".into();
@@ -2111,6 +2181,7 @@ mod tests {
             max_descendant_depth: Some(2),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let parent_grant = parent.resolve_grant(&host()).unwrap();
         let child_grant = child
@@ -2141,6 +2212,7 @@ mod tests {
             max_descendant_depth: Some(2),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut child = valid();
         child.agent_id = "acme/child".into();
@@ -2151,6 +2223,7 @@ mod tests {
             max_descendant_depth: Some(2),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut grandchild = valid();
         grandchild.agent_id = "acme/grandchild".into();
@@ -2161,6 +2234,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let root_grant = root.resolve_grant(&host).unwrap();
         let child_ref = root_grant.delegation.as_ref().unwrap().allowed_children[0].clone();
@@ -2283,6 +2357,7 @@ mod tests {
             max_descendant_depth: Some(2),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut child = valid();
         child.agent_id = "acme/child".into();
@@ -2293,6 +2368,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(2),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut host = host();
         host.max_concurrent_children = 2;
@@ -2330,6 +2406,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::Subdirectory],
+            default_child: None,
         };
         let mut policy = host();
         policy
@@ -2338,6 +2415,40 @@ mod tests {
         let grant = definition.resolve_grant(&policy).unwrap();
         assert!(grant.permits_target(root, &child));
         assert!(!grant.permits_target(root, root));
+    }
+
+    #[test]
+    fn agent_vnext_self_child_is_an_allowed_portable_ref() {
+        let mut definition = valid();
+        definition.delegation = DelegationPolicy {
+            allowed_children: vec![AllowedChild::portable_ref(SELF_CHILD_REF)],
+            max_descendant_depth: Some(2),
+            max_concurrent_children: Some(1),
+            targets: vec![DelegationTarget::SameRoot],
+            default_child: Some(SELF_CHILD_REF.to_string()),
+        };
+        let grant = definition.resolve_grant(&host()).unwrap();
+        assert!(grant.permits_child(
+            &AllowedChild::portable_ref(SELF_CHILD_REF),
+            definition.execution_kind
+        ));
+        assert_eq!(
+            grant.delegation.as_ref().unwrap().default_child.as_deref(),
+            Some(SELF_CHILD_REF)
+        );
+    }
+
+    #[test]
+    fn agent_vnext_default_child_must_be_an_allowed_child() {
+        let mut definition = valid();
+        definition.delegation = DelegationPolicy {
+            allowed_children: vec![AllowedChild::portable_ref("acme/child")],
+            max_descendant_depth: Some(1),
+            max_concurrent_children: Some(1),
+            targets: vec![DelegationTarget::SameRoot],
+            default_child: Some("acme/other".into()),
+        };
+        assert!(definition.validate().is_err());
     }
 
     fn host() -> VnextHostPolicy {

@@ -688,6 +688,7 @@ mod grant_tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let error = validate_invariants(&def).unwrap_err().to_string();
         assert!(error.contains("computer"), "{error}");

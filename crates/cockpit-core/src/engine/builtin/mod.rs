@@ -2388,8 +2388,12 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         if grant.agent_id != vnext.agent_id || grant.execution_kind != vnext.execution_kind {
             bail!("vNext effective grant does not match selected definition");
         }
-        let targets =
-            vnext_reachable_subagents(grant, &args.cwd, &args.vnext_local_installation_resolver)?;
+        let targets = vnext_reachable_subagents(
+            grant,
+            def,
+            &args.cwd,
+            &args.vnext_local_installation_resolver,
+        )?;
         let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
         tb = with_task_for_targets(tb, args, &target_refs);
     }
@@ -2513,7 +2517,7 @@ fn effective_vnext_grant_for(
             // permissive compatibility projection.
             return Ok(None);
         };
-        return definition.resolve_grant(host).map(Some);
+        return def.resolve_vnext_grant(host).map(Some);
     };
     let Some(parent_delegation) = &parent.delegation else {
         bail!("vNext parent has no live delegation grant");
@@ -2522,9 +2526,17 @@ fn effective_vnext_grant_for(
         .allowed_children
         .iter()
         .filter(|reference| {
-            matches!(reference,
+            reference.is_self() && parent.agent_id == definition.agent_id
+                || matches!(reference,
             crate::agents::AllowedChild::PortableRef { portable_agent_ref }
-                if portable_agent_ref == &definition.agent_id)
+                if portable_agent_ref == &definition.agent_id
+                    || portable_agent_ref == &def.name
+                    || parent_delegation.package_children.get(portable_agent_ref.as_str())
+                        == Some(&definition.agent_id)
+                    || parent_delegation
+                        .package_children
+                        .values()
+                        .any(|id| id == &definition.agent_id))
                 || matches!(reference,
                     crate::agents::AllowedChild::LocalInstallation { installation_id }
                         if definition.is_local()
@@ -2747,6 +2759,7 @@ fn append_custom_subagents(out: &mut Vec<String>, cwd: &Path) {
 /// never guessed from a display name or silently omitted.
 fn vnext_reachable_subagents(
     grant: &crate::agents::EffectiveVnextGrant,
+    parent: &crate::agents::AgentDef,
     cwd: &Path,
     local_installations: &crate::agents::LocalInstallationResolver,
 ) -> Result<Vec<String>> {
@@ -2766,7 +2779,38 @@ fn vnext_reachable_subagents(
                 // selected vNext definition/kind again at the factory seam.
                 resolved.push(binding.launch_target.clone());
             }
+            AllowedChild::PortableRef { portable_agent_ref }
+                if portable_agent_ref == crate::agents::SELF_CHILD_REF =>
+            {
+                resolved.push(parent.name.clone());
+            }
             AllowedChild::PortableRef { portable_agent_ref } => {
+                if let Some(private) = parent.private_subagents.get(portable_agent_ref).or_else(
+                    || {
+                        parent.private_subagents.values().find(|child| {
+                            child
+                                .vnext
+                                .as_ref()
+                                .is_some_and(|vnext| vnext.agent_id == *portable_agent_ref)
+                        })
+                    },
+                ) {
+                    if listings.iter().any(|listing| {
+                        listing.name == private.name
+                            || listing.def.as_ref().ok().and_then(|def| def.vnext.as_ref()).is_some_and(
+                                |vnext| vnext.agent_id == *portable_agent_ref,
+                            )
+                    }) {
+                        tracing::warn!(
+                            parent = %parent.name,
+                            child = %private.name,
+                            portable = %portable_agent_ref,
+                            "package-private subagent shadows a global agent of the same identity"
+                        );
+                    }
+                    resolved.push(private.name.clone());
+                    continue;
+                }
                 let matches: Vec<_> = listings
                     .iter()
                     .filter_map(|listing| {
@@ -5922,6 +5966,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut args = test_spawn_args(tmp.path());
         args.delegated = true;

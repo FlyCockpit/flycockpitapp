@@ -2139,3 +2139,68 @@ fn configured_agent_dirs_extend_across_config_layers() {
         "later layer agent_dirs must extend rather than replace: {dirs:?}"
     );
 }
+
+#[test]
+fn private_subagents_are_absent_from_inventory_listings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    let pkg = agents.join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    fs::write(
+        pkg.join("agent.md"),
+        vnext_agent_document("Package root", "ROOT"),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        vnext_agent_document("Helper", "HELPER"),
+    )
+    .unwrap();
+    let listings = trusted_list_all(tmp.path());
+    assert!(
+        listings.iter().any(|listing| listing.name == "pack"),
+        "package root is listed"
+    );
+    assert!(
+        listings.iter().all(|listing| listing.name != "helper"),
+        "private subagent must not appear in GetAgentInventory/list_all"
+    );
+}
+
+#[test]
+fn package_grant_prefers_private_child_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    let pkg = agents.join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    let mut root = vnext_agent_document("Package root", "ROOT");
+    root = root.replace(
+        "allowDefaultFallback: false\n---",
+        "allowDefaultFallback: false\ndelegation:\n  allowedChildren: [{kind: portable_ref, ref: helper}]\n  maxDescendantDepth: 1\n  maxConcurrentChildren: 1\n  targets: [same_root]\n  defaultChild: helper\n---",
+    );
+    fs::write(pkg.join("agent.md"), root).unwrap();
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        vnext_agent_document("Helper", "HELPER"),
+    )
+    .unwrap();
+    let def = trusted_resolve(tmp.path(), "pack")
+        .unwrap()
+        .expect("package resolves");
+    let host = crate::agents::VnextHostPolicy::for_session_config(
+        &crate::config::extended::ExtendedConfig::default(),
+    );
+    let grant = def.resolve_vnext_grant(&host).expect("grant resolves");
+    assert!(
+        grant
+            .delegation
+            .as_ref()
+            .unwrap()
+            .package_children
+            .contains_key("helper")
+    );
+    assert_eq!(
+        grant.delegation.as_ref().unwrap().default_child.as_deref(),
+        Some("helper")
+    );
+}

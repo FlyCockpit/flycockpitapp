@@ -67,7 +67,8 @@ pub use vnext::{
     LocalInstallationResolver, MAX_GENERATOR_TURNS, MAX_VERIFICATION_CANDIDATES, ModelCapability,
     ModelLocality, ModelRecommendation, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded,
     PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, ProhibitedQuestionClass, ProviderAlias,
-    QuestionOverride, QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SelectorPredicate, ToolClass,
+    QuestionOverride, QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SELF_CHILD_REF,
+    SelectorPredicate, ToolClass,
     VerificationAction, VerificationBudget, VerificationDispatch, VerificationEstimate,
     VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
     VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
@@ -1071,6 +1072,45 @@ impl AgentDef {
         self.package_files.is_some()
     }
 
+    /// Resolve this definition's vNext grant, attaching package-private child
+    /// identities so `permits_child` / reachable-subagent lookup prefer them
+    /// over a same-named global agent.
+    pub fn resolve_vnext_grant(
+        &self,
+        host: &VnextHostPolicy,
+    ) -> Result<EffectiveVnextGrant> {
+        let vnext = self
+            .vnext
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vNext grant requires a schemaVersion 2 definition"))?;
+        let mut grant = vnext.resolve_grant(host)?;
+        if let Some(delegation) = &mut grant.delegation {
+            for (name, child) in &self.private_subagents {
+                if let Some(child_vnext) = &child.vnext {
+                    if delegation
+                        .package_children
+                        .insert(name.clone(), child_vnext.agent_id.clone())
+                        .is_some()
+                    {
+                        bail!("package-private subagent `{name}` is not unique");
+                    }
+                    if child_vnext.agent_id != *name {
+                        delegation
+                            .package_children
+                            .entry(child_vnext.agent_id.clone())
+                            .or_insert_with(|| child_vnext.agent_id.clone());
+                    }
+                }
+            }
+        }
+        Ok(grant)
+    }
+
+    /// Source-agent identity for a package-private child bound with its parent.
+    pub fn package_child_source_agent_id(parent_source_agent_id: &str, child_name: &str) -> String {
+        format!("{parent_source_agent_id}/{child_name}")
+    }
+
     fn vnext_canonical_frontmatter(&self) -> Result<String> {
         let vnext = self
             .vnext
@@ -1526,7 +1566,29 @@ pub fn load_profile_definition_from_owned_path(
         observation.installation_id == installation.installation_id,
         "profile observation belongs to a different installation"
     );
-    let definition = match source {
+    let definition = if owned_path.is_dir() {
+        let parent = owned_path
+            .parent()
+            .context("owned package path missing parent")?;
+        let dir_name = owned_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("owned package path has no directory name")?;
+        load_from_dir(parent, dir_name)?
+    } else if owned_path.file_name().and_then(|name| name.to_str()) == Some(PACKAGE_ROOT_FILE) {
+        let dir = owned_path
+            .parent()
+            .context("owned package agent.md missing parent")?;
+        let parent = dir
+            .parent()
+            .context("owned package missing agents directory")?;
+        let dir_name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("owned package has no directory name")?;
+        load_from_dir(parent, dir_name)?
+    } else {
+        match source {
         AgentProfileInstallationSource::Builtin => {
             let name = installation
                 .source_agent_id
@@ -1553,13 +1615,22 @@ pub fn load_profile_definition_from_owned_path(
             // the authority boundary.
             load_workspace_named_from_file(owned_path, &installation.source_agent_id)?
         }
+        }
     };
     let vnext = definition
         .vnext
         .as_ref()
         .context("profile installation did not load a vNext AgentDef")?;
     ensure!(
-        vnext.agent_id == installation.source_agent_id,
+        vnext.agent_id == installation.source_agent_id
+            || installation.source_agent_id
+                == AgentDef::package_child_source_agent_id(
+                    installation.source_agent_id.rsplit_once('/').map(|(parent, _)| parent).unwrap_or(""),
+                    &definition.name,
+                )
+            || installation
+                .source_agent_id
+                .ends_with(&format!("/{}", definition.name)),
         "owned profile path identity does not match its selected installation"
     );
     Ok(AgentProfileDefinition {
@@ -2089,6 +2160,9 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
             let Some(name) = agent_file_candidate_name(&path) else {
                 continue;
             };
+            if name == PACKAGE_SUBAGENTS_DIR {
+                continue;
+            }
             if seen.contains(&name) {
                 continue;
             }

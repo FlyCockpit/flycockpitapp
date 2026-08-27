@@ -55,6 +55,20 @@ pub struct SendUserMessageV2 {
     pub attachments: Vec<MessageAttachmentIdentity>,
 }
 
+impl SendUserMessageV2 {
+    /// Ergonomic text-only constructor for CLI/TUI and tests.
+    pub fn text_only(client_submission_id: Uuid, text: impl Into<String>) -> Self {
+        Self {
+            client_submission_id,
+            text: text.into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            attachments: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalSendUserMessageV2 {
     pub session_id: Uuid,
@@ -64,27 +78,138 @@ pub struct CanonicalSendUserMessageV2 {
     pub request: SendUserMessageV2,
 }
 
+/// Local-owner direct ingress adapter. Only an authenticated daemon-local
+/// Owner surface may submit this branch. `operation_id` is the durable outer
+/// ledger identity (distinct from `request.client_submission_id`); the
+/// transport attempt id is `Body::Request.id`, which is not carried here.
+///
+/// The paired optional CAS fence (`expected_model_state_generation` +
+/// `expected_model`) is checked after exact session resolution and before
+/// acceptance; it is replay-neutral and stays outside FCM2. `run_invocation_options`
+/// is local/CLI-oriented only and is never carried by the remote envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalOwnerDirectSendUserMessageV2 {
-    pub request_id: Uuid,
     pub operation_id: Uuid,
     pub session_locator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model_state_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_invocation_options: Option<crate::RunInvocationOptions>,
     pub request: SendUserMessageV2,
 }
 
+/// Authenticated remote ingress adapter. A bound authenticated remote
+/// principal (web / native / relay / remote device) may submit only this
+/// branch. The durable operation id lives in `Body.operation` (a
+/// `RemoteOperationIdentityV1`), not here; this envelope carries no
+/// `operation_id` and no `run_invocation_options`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedRemoteOperationEnvelopeV2 {
-    pub request_id: Uuid,
-    pub operation_id: Uuid,
     pub session_locator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model_state_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     pub request: SendUserMessageV2,
+}
+
+/// Internally-tagged V2 ingress envelope. `Request::SendUserMessageV2` carries
+/// exactly this as `ingress`. The `ingress` discriminator selects
+/// `local_owner_direct` or `authenticated_remote_operation`; the two branches
+/// are non-substitutable (Owner/direct vs. bound authenticated remote).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "ingress", rename_all = "snake_case")]
+pub enum MessageIngressV2 {
+    LocalOwnerDirect(LocalOwnerDirectSendUserMessageV2),
+    AuthenticatedRemoteOperation(AuthenticatedRemoteOperationEnvelopeV2),
+}
+
+impl MessageIngressV2 {
+    /// Ergonomic local-direct constructor for CLI/TUI and tests.
+    pub fn local_direct(
+        operation_id: Uuid,
+        session_locator: impl Into<String>,
+        expected_model_state_generation: Option<u64>,
+        expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+        run_invocation_options: Option<crate::RunInvocationOptions>,
+        request: SendUserMessageV2,
+    ) -> Self {
+        Self::LocalOwnerDirect(LocalOwnerDirectSendUserMessageV2 {
+            operation_id,
+            session_locator: session_locator.into(),
+            expected_model_state_generation,
+            expected_model,
+            run_invocation_options,
+            request,
+        })
+    }
+
+    pub fn as_local_direct(&self) -> Option<&LocalOwnerDirectSendUserMessageV2> {
+        match self {
+            Self::LocalOwnerDirect(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    pub fn as_authenticated_remote(&self) -> Option<&AuthenticatedRemoteOperationEnvelopeV2> {
+        match self {
+            Self::AuthenticatedRemoteOperation(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    pub fn session_locator(&self) -> &str {
+        match self {
+            Self::LocalOwnerDirect(inner) => &inner.session_locator,
+            Self::AuthenticatedRemoteOperation(inner) => &inner.session_locator,
+        }
+    }
+
+    pub fn request(&self) -> &SendUserMessageV2 {
+        match self {
+            Self::LocalOwnerDirect(inner) => &inner.request,
+            Self::AuthenticatedRemoteOperation(inner) => &inner.request,
+        }
+    }
+
+    /// Paired optional CAS fence; both present or both absent.
+    pub fn expected_model_cas(
+        &self,
+    ) -> (
+        Option<u64>,
+        Option<&cockpit_config::config::providers::ActiveModelRef>,
+    ) {
+        match self {
+            Self::LocalOwnerDirect(inner) => (
+                inner.expected_model_state_generation,
+                inner.expected_model.as_ref(),
+            ),
+            Self::AuthenticatedRemoteOperation(inner) => (
+                inner.expected_model_state_generation,
+                inner.expected_model.as_ref(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedMessageIngress {
+    /// `Body::Request.id` — the sole transport-attempt request id. May vary
+    /// across ambiguous retries; excluded from FCM2, the message receipt
+    /// digest, FCOR opaque params, and durable identities.
     pub request_id: Uuid,
+    /// Durable outer ledger identity. For local-direct it is the adapter's
+    /// `operation_id`; for remote it comes from `Body.operation`.
     pub operation_id: Uuid,
     pub session_locator: String,
+    pub expected_model_state_generation: Option<u64>,
+    pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+    /// Local-direct only; always `None` for authenticated remote ingress.
+    pub run_invocation_options: Option<crate::RunInvocationOptions>,
     pub command: SendUserMessageV2,
     pub provenance: MessageIngressProvenance,
 }
@@ -98,10 +223,14 @@ pub enum MessageIngressProvenance {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_ingress(
     request_id: Uuid,
     operation_id: Uuid,
     session_locator: String,
+    expected_model_state_generation: Option<u64>,
+    expected_model: Option<&cockpit_config::config::providers::ActiveModelRef>,
+    run_invocation_options: Option<&crate::RunInvocationOptions>,
     command: SendUserMessageV2,
     provenance: MessageIngressProvenance,
 ) -> Result<ValidatedMessageIngress> {
@@ -120,6 +249,21 @@ fn validate_ingress(
             && operation_id != command.client_submission_id,
         "request, operation, and submission identities must be pairwise distinct"
     );
+    // Paired CAS fence: both present or both absent.
+    ensure!(
+        expected_model_state_generation.is_some() == expected_model.is_some(),
+        "expected_model_state_generation and expected_model must be supplied together"
+    );
+    if let Some(options) = run_invocation_options {
+        ensure!(
+            options.max_turns != Some(0),
+            "run_invocation_options.max_turns must not be zero"
+        );
+        ensure!(
+            options.timeout_ms != Some(0),
+            "run_invocation_options.timeout_ms must not be zero"
+        );
+    }
     if let MessageIngressProvenance::AuthenticatedRemote {
         actor_id,
         actor_generation,
@@ -129,22 +273,35 @@ fn validate_ingress(
             actor_id != [0; 16] && actor_generation > 0,
             "invalid remote actor binding"
         );
+        // Remote sharees cannot carry run-invocation bounds.
+        ensure!(
+            run_invocation_options.is_none(),
+            "run_invocation_options is not permitted on authenticated remote ingress"
+        );
     }
     Ok(ValidatedMessageIngress {
         request_id,
         operation_id,
         session_locator,
+        expected_model_state_generation,
+        expected_model: expected_model.cloned(),
+        run_invocation_options: run_invocation_options.cloned(),
         command,
         provenance,
     })
 }
 
 impl LocalOwnerDirectSendUserMessageV2 {
-    pub fn into_validated(self) -> Result<ValidatedMessageIngress> {
+    /// Validate with the transport `Body::Request.id` (not carried in the
+    /// adapter struct). The durable `operation_id` is the adapter field.
+    pub fn into_validated(self, request_id: Uuid) -> Result<ValidatedMessageIngress> {
         validate_ingress(
-            self.request_id,
+            request_id,
             self.operation_id,
             self.session_locator,
+            self.expected_model_state_generation,
+            self.expected_model.as_ref(),
+            self.run_invocation_options.as_ref(),
             self.request,
             MessageIngressProvenance::LocalOwner,
         )
@@ -152,15 +309,23 @@ impl LocalOwnerDirectSendUserMessageV2 {
 }
 
 impl AuthenticatedRemoteOperationEnvelopeV2 {
+    /// Validate with the transport `Body::Request.id` and the durable
+    /// `operation_id` from `Body.operation` (neither is carried in the
+    /// adapter struct), plus the verified remote actor binding.
     pub fn into_validated(
         self,
+        request_id: Uuid,
+        operation_id: Uuid,
         actor_id: [u8; 16],
         actor_generation: u64,
     ) -> Result<ValidatedMessageIngress> {
         validate_ingress(
-            self.request_id,
-            self.operation_id,
+            request_id,
+            operation_id,
             self.session_locator,
+            self.expected_model_state_generation,
+            self.expected_model.as_ref(),
+            None,
             self.request,
             MessageIngressProvenance::AuthenticatedRemote {
                 actor_id,

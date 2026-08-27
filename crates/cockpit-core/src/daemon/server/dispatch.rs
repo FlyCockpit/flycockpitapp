@@ -8840,6 +8840,26 @@ async fn handle_serialized_request_impl(
         Request::GetSessionSetupSnapshot { session_id } => {
             get_session_setup_snapshot(ctx, state, session_id).await
         }
+        Request::GetAgentEffectiveSettings {
+            session_id,
+            agent_instance_id,
+        } => get_agent_effective_settings(ctx, state, session_id, agent_instance_id).await,
+        Request::ApplyAgentSessionOverride {
+            session_id,
+            agent_instance_id,
+            expected_override_revision,
+            field,
+        } => {
+            apply_agent_session_override(
+                ctx,
+                state,
+                session_id,
+                agent_instance_id,
+                expected_override_revision,
+                field,
+            )
+            .await
+        }
         Request::ResourceSnapshot => Ok(Response::ResourceSnapshot {
             snapshot: resource_scheduler_snapshot(ctx),
         }),
@@ -15447,6 +15467,12 @@ async fn handle_concurrent_request_impl(
         }
         Request::GetSessionSetupSnapshot { session_id } => {
             get_session_setup_snapshot_shared(&ctx, &shared, session_id).await
+        }
+        Request::GetAgentEffectiveSettings {
+            session_id,
+            agent_instance_id,
+        } => {
+            get_agent_effective_settings_shared(&ctx, &shared, session_id, agent_instance_id).await
         }
         Request::ResourceSnapshot => Ok(Response::ResourceSnapshot {
             snapshot: resource_scheduler_snapshot(&ctx),
@@ -22573,6 +22599,264 @@ pub(super) async fn get_session_setup_snapshot(
     Err(ErrorPayload {
         code: ErrorCode::Conflict,
         message: "session setup authority changed; retry request".into(),
+    })
+}
+
+// --- Per-node session overrides (modes AC5/6/7) ---------------------------
+
+/// Load every daemon-owned fact needed to project or authorize a per-node
+/// override: the node's override state (lifecycle + revision + pending/effective
+/// override), its resolved profile snapshot (verification/question envelope),
+/// and the session config sandbox/mode defaults. Returns `None` when the node
+/// does not exist in the session.
+async fn build_node_override_context(
+    ctx: &DaemonContext,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+    session_sandbox_default: cockpit_config::config::sandbox_mode::SandboxMode,
+    session_llm_mode_default: cockpit_config::config::extended::LlmMode,
+) -> std::result::Result<
+    Option<crate::daemon::agent_session_override::NodeOverrideContext>,
+    ErrorPayload,
+> {
+    let Some(state) = ctx
+        .db
+        .read_agent_override_state(session_id, agent_instance_id)
+        .await
+        .map_err(internal)?
+    else {
+        return Ok(None);
+    };
+    let profile = match state.resolved_profile_snapshot_id {
+        Some(snapshot_id) => ctx
+            .db
+            .agent_profile_snapshot_by_id(session_id, snapshot_id)
+            .await
+            .map_err(internal)?
+            .map(|row| row.reconstruct())
+            .transpose()
+            .map_err(internal)?,
+        None => None,
+    };
+    Ok(Some(
+        crate::daemon::agent_session_override::NodeOverrideContext {
+            session_id,
+            agent_instance_id,
+            state: state.state,
+            override_revision: state.override_revision,
+            pending: state.pending,
+            effective: state.effective,
+            session_sandbox_default,
+            session_llm_mode_default,
+            profile,
+        },
+    ))
+}
+
+fn agent_node_not_found(agent_instance_id: Uuid) -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::UnknownSession,
+        message: format!("agent node `{agent_instance_id}` is not in this session"),
+    }
+}
+
+pub(super) async fn get_agent_effective_settings(
+    ctx: &DaemonContext,
+    state: &MutableClientState,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    let att = require_attached(state)?;
+    ensure_agent_tree_attached_session(session_id, att.handle.session_id)?;
+    let config = att.handle.config_snapshot();
+    let Some(node_ctx) = build_node_override_context(
+        ctx,
+        session_id,
+        agent_instance_id,
+        config.extended.sandbox.default_mode,
+        config.extended.llm_mode,
+    )
+    .await?
+    else {
+        return Err(agent_node_not_found(agent_instance_id));
+    };
+    Ok(Response::AgentEffectiveSettings {
+        snapshot: crate::daemon::agent_session_override::build_effective_settings(&node_ctx),
+    })
+}
+
+async fn get_agent_effective_settings_shared(
+    ctx: &DaemonContext,
+    shared: &SharedClientState,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    let att = require_shared_attached(shared)?;
+    if att.session_id != session_id {
+        return Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("session `{session_id}` is not the attached session"),
+        });
+    }
+    let config = att.handle.config_snapshot();
+    let Some(node_ctx) = build_node_override_context(
+        ctx,
+        session_id,
+        agent_instance_id,
+        config.extended.sandbox.default_mode,
+        config.extended.llm_mode,
+    )
+    .await?
+    else {
+        return Err(agent_node_not_found(agent_instance_id));
+    };
+    Ok(Response::AgentEffectiveSettings {
+        snapshot: crate::daemon::agent_session_override::build_effective_settings(&node_ctx),
+    })
+}
+
+/// Resolve a model-slot override against the daemon-owned setup snapshot. The
+/// client names a `(slot_id, choice_id)`; the daemon re-validates the choice is
+/// present and hard-compatible (no `unavailable_reason`) and derives the
+/// provider/model itself — the client never sends a provider handle.
+async fn resolve_model_override_field(
+    ctx: &DaemonContext,
+    state: &MutableClientState,
+    session_id: Uuid,
+    slot_id: &str,
+    choice_id: &str,
+) -> std::result::Result<
+    Result<
+        crate::db::agent_tree_decisions::StoredOverrideField,
+        cockpit_proto::AgentSessionOverrideStatusV1,
+    >,
+    ErrorPayload,
+> {
+    let Response::SessionSetupSnapshot { snapshot } =
+        get_session_setup_snapshot(ctx, state, session_id).await?
+    else {
+        return Ok(Err(
+            cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
+        ));
+    };
+    for candidate in &snapshot.candidates {
+        for slot in &candidate.slots {
+            if slot.slot_id != slot_id {
+                continue;
+            }
+            if slot.unavailable_reason.is_some() {
+                return Ok(Err(
+                    cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
+                ));
+            }
+            if let Some(choice) = slot.choices.iter().find(|c| c.choice_id == choice_id) {
+                return Ok(Ok(
+                    crate::db::agent_tree_decisions::StoredOverrideField::Model(
+                        crate::db::agent_tree_decisions::StoredModelBinding {
+                            slot_id: slot_id.to_string(),
+                            provider: choice.provider_id.clone(),
+                            model: choice.model_id.clone(),
+                        },
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(Err(
+        cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
+    ))
+}
+
+pub(super) async fn apply_agent_session_override(
+    ctx: &DaemonContext,
+    state: &MutableClientState,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+    expected_override_revision: u64,
+    field: cockpit_proto::AgentSessionOverrideFieldV1,
+) -> std::result::Result<Response, ErrorPayload> {
+    use cockpit_proto::AgentSessionOverrideStatusV1 as Status;
+
+    let att = require_attached(state)?;
+    ensure_agent_tree_attached_session(session_id, att.handle.session_id)?;
+    let config = att.handle.config_snapshot();
+    let Some(node_ctx) = build_node_override_context(
+        ctx,
+        session_id,
+        agent_instance_id,
+        config.extended.sandbox.default_mode,
+        config.extended.llm_mode,
+    )
+    .await?
+    else {
+        return Ok(Response::AgentSessionOverrideOutcome {
+            session_id,
+            agent_instance_id,
+            status: Status::RejectedNotFound,
+            override_revision: 0,
+        });
+    };
+
+    let current_revision = node_ctx.override_revision.max(0) as u64;
+
+    // Terminal nodes reject without a state change (the DB CAS agrees, but this
+    // avoids loading the setup snapshot for a dead node).
+    if node_ctx.state.is_terminal() {
+        return Ok(Response::AgentSessionOverrideOutcome {
+            session_id,
+            agent_instance_id,
+            status: Status::RejectedTerminal,
+            override_revision: current_revision,
+        });
+    }
+
+    // Authorize the typed field into its storable form.
+    let authorized = match &field {
+        cockpit_proto::AgentSessionOverrideFieldV1::Model { slot_id, choice_id } => {
+            resolve_model_override_field(ctx, state, session_id, slot_id, choice_id).await?
+        }
+        other => crate::daemon::agent_session_override::authorize_non_model_field(other, &node_ctx),
+    };
+    let stored_field = match authorized {
+        Ok(field) => field,
+        Err(status) => {
+            return Ok(Response::AgentSessionOverrideOutcome {
+                session_id,
+                agent_instance_id,
+                status,
+                override_revision: current_revision,
+            });
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let outcome = ctx
+        .db
+        .apply_agent_session_override(
+            session_id,
+            agent_instance_id,
+            expected_override_revision as i64,
+            stored_field,
+            now,
+        )
+        .await
+        .map_err(internal)?;
+    use crate::db::agent_tree_decisions::AgentOverrideApplyOutcome as Db;
+    let (status, override_revision) = match outcome {
+        Db::Applied { override_revision } => (Status::Applied, override_revision.max(0) as u64),
+        Db::StaleRevision { override_revision } => {
+            (Status::StaleRevision, override_revision.max(0) as u64)
+        }
+        Db::Terminal { override_revision } => {
+            (Status::RejectedTerminal, override_revision.max(0) as u64)
+        }
+        Db::NotFound => (Status::RejectedNotFound, 0),
+    };
+    Ok(Response::AgentSessionOverrideOutcome {
+        session_id,
+        agent_instance_id,
+        status,
+        override_revision,
     })
 }
 

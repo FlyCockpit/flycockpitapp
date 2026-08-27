@@ -1224,6 +1224,21 @@ CREATE TABLE agent_instances (
         'completed', 'failed', 'cancelled'
     )),
     revision INTEGER NOT NULL CHECK (revision >= 0),
+    -- Effective-settings revision for the per-node session-override CAS. It is
+    -- deliberately independent of the lifecycle `revision` above so a state
+    -- transition and an override edit never contend for the same token. Each
+    -- accepted `ApplyAgentSessionOverride` compares and increments it.
+    override_revision INTEGER NOT NULL DEFAULT 0 CHECK (override_revision >= 0),
+    -- The not-yet-consumed, daemon-authorized session override accumulated
+    -- across accepted apply requests (NULL = none). It can only preserve or
+    -- reduce the immutable profile/host envelope; the daemon validates
+    -- non-escalation before it is ever written here. Consumed into
+    -- `effective_override_json` at the node's next model-turn boundary.
+    pending_override_json TEXT CHECK (pending_override_json IS NULL OR json_valid(pending_override_json)),
+    -- The override consumed into effect at the last turn boundary (NULL until
+    -- the first consumption). The engine reads this as the node's effective
+    -- session override for the turn.
+    effective_override_json TEXT CHECK (effective_override_json IS NULL OR json_valid(effective_override_json)),
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (agent_instance_id, session_id),

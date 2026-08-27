@@ -11,6 +11,7 @@
 //! fallback in the composer.
 
 mod agent_inventory;
+mod agent_tree;
 mod async_actions;
 mod attach_lifecycle;
 mod attention;
@@ -29,6 +30,7 @@ mod inventory;
 #[cfg(test)]
 mod inventory_tests;
 mod response_metrics_tokenizer;
+mod session_setup;
 pub(crate) use response_metrics_tokenizer::{TokenizerConfirmOutcome, TokenizerConfirmPending};
 #[cfg(test)]
 pub(crate) use response_metrics_tokenizer::{
@@ -1347,6 +1349,8 @@ pub(super) enum Overlay {
     Leaks(crate::tui::leaks_pane::LeaksPane),
     Sealed(crate::tui::sealed_overlay::SealedOverlay),
     Diff(crate::tui::diff_pane::DiffPane),
+    SessionSetup(crate::tui::session_setup::SessionSetupPane),
+    AgentTree(crate::tui::agent_tree_pane::AgentTreePane),
     Help(help_overlay::HelpOverlay),
 }
 
@@ -1394,6 +1398,8 @@ impl Overlay {
             | Self::Context(_)
             | Self::Leaks(_)
             | Self::Sealed(_)
+            | Self::SessionSetup(_)
+            | Self::AgentTree(_)
             | Self::Help(_) => None,
         }
     }

@@ -401,6 +401,13 @@ pub const SUBAGENT_PREVIEW_LINES: usize = 3;
 /// bold red when the model built the call badly (unrecoverable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCallState {
+    /// The call is being verified before any dispatch — a distinct semantic
+    /// verification treatment with an accessible `Verifying` label. A
+    /// no-dispatch outcome moves straight from here to [`Self::Success`]
+    /// (`done`); an approved candidate moves to [`Self::Processing`]
+    /// (`running`) only once final dispatch starts. The stable row never shows
+    /// hidden original or candidate content.
+    Verifying,
     /// The model is waiting on the tool — yellow.
     Processing,
     /// Completed successfully — white.
@@ -3139,8 +3146,14 @@ fn format_tool_glyph_label(presentation: &ToolPresentation, emojis: bool) -> (St
     (glyph, label.to_string())
 }
 
+/// Distinct semantic colour for the pre-dispatch verification state. Kept
+/// separate from the `running` yellow, terminal-white, and error-red so a
+/// `verifying` row is never confused with any of them.
+const VERIFYING_TEXT: Color = Color::Magenta;
+
 fn tool_state_style(state: ToolCallState) -> Style {
     match state {
+        ToolCallState::Verifying => Style::default().fg(VERIFYING_TEXT),
         ToolCallState::Processing => Style::default().fg(WARNING_TEXT),
         ToolCallState::Success => Style::default().fg(Color::White),
         ToolCallState::Failed => Style::default().fg(ERROR_TEXT),
@@ -3191,6 +3204,11 @@ fn tool_call_spans(
     if let Some(suffix) = progress_width.and_then(|width| tool_progress_suffix(call, width)) {
         spans.push(Span::styled(suffix, style));
     }
+    // Accessible label so the pre-dispatch verification state reads in the
+    // no-colour projection too (colour is supplementary).
+    if call.state == ToolCallState::Verifying {
+        spans.push(Span::styled(" Verifying".to_string(), style));
+    }
     spans
 }
 
@@ -3213,6 +3231,9 @@ fn tool_line_spans(
     if !text.is_empty() {
         spans.push(Span::raw(" ".to_string()));
         spans.push(Span::styled(text.to_string(), style));
+    }
+    if state == ToolCallState::Verifying {
+        spans.push(Span::styled(" Verifying".to_string(), style));
     }
     spans
 }

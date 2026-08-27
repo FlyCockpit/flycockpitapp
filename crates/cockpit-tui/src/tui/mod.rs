@@ -12,7 +12,9 @@
 //! battle-tested vim state machine — port the structure rather than
 //! reinventing it.
 
+pub mod agent_attention;
 pub mod agent_runner;
+pub mod agent_tree_pane;
 pub mod app;
 pub mod async_action;
 pub mod attention;
@@ -55,6 +57,7 @@ pub mod quick_dialog;
 pub(crate) mod read_highlight;
 pub mod resources_pane;
 pub mod sealed_overlay;
+pub mod session_setup;
 pub mod sessions_pane;
 pub mod settings;
 pub mod skills_pane;

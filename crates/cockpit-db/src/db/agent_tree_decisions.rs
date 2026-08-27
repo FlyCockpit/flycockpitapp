@@ -8826,6 +8826,320 @@ fn validate_resolver_route(value: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Per-node session-override storage (modes AC5/AC6/AC7).
+//
+// The DB is the lowest layer and knows nothing of override *semantics*: the
+// daemon authorizes non-escalation before any field reaches these methods.
+// Storage keeps enum axes as their canonical serde string labels so this crate
+// stays free of a cockpit-config dependency; the daemon parses them back into
+// `SandboxMode`/`LlmMode`. The effective-settings revision is a token
+// independent of the lifecycle `revision`, so a state transition and an
+// override edit never contend.
+// ---------------------------------------------------------------------------
+
+/// The accumulated, daemon-authorized pending or effective session override for
+/// one agent node. Absent axes inherit the immutable profile/host envelope.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredSessionOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<StoredModelBinding>,
+    /// `SandboxMode` serde label (e.g. `off`, `sandbox`, `container`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    /// `LlmMode` serde label (e.g. `normal`, `frontier`, `defensive`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_mode: Option<String>,
+    /// Per-region verification reductions, kept sorted by `region_id` so the
+    /// stored form is deterministic regardless of apply order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification: Vec<StoredVerificationReduction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<StoredQuestionOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredModelBinding {
+    pub slot_id: String,
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredVerificationReduction {
+    pub region_id: String,
+    /// True writes an explicit whole-region off mask; false is a narrowing.
+    pub off: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selector_intersection: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_candidates: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_estimated_cost_microusd: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_collection_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StoredQuestionOverride {
+    Disable,
+    Reduce {
+        required_decision_timeout_seconds: u32,
+    },
+}
+
+/// One typed, already-authorized field to merge into a node's pending override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredOverrideField {
+    Model(StoredModelBinding),
+    Sandbox(String),
+    LlmMode(String),
+    Verification(StoredVerificationReduction),
+    Question(StoredQuestionOverride),
+}
+
+impl StoredSessionOverride {
+    /// Deterministically merge one typed field. Scalar axes overwrite; a
+    /// verification reduction is upserted by `region_id` and the list is kept
+    /// sorted so the persisted JSON is independent of apply order.
+    fn merge_field(&mut self, field: StoredOverrideField) {
+        match field {
+            StoredOverrideField::Model(binding) => self.model = Some(binding),
+            StoredOverrideField::Sandbox(label) => self.sandbox = Some(label),
+            StoredOverrideField::LlmMode(label) => self.llm_mode = Some(label),
+            StoredOverrideField::Question(question) => self.question = Some(question),
+            StoredOverrideField::Verification(reduction) => {
+                match self
+                    .verification
+                    .iter_mut()
+                    .find(|existing| existing.region_id == reduction.region_id)
+                {
+                    Some(existing) => *existing = reduction,
+                    None => self.verification.push(reduction),
+                }
+                self.verification
+                    .sort_by(|a, b| a.region_id.cmp(&b.region_id));
+            }
+        }
+    }
+}
+
+/// Current override state of one node, for building the effective-settings
+/// snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentOverrideState {
+    pub state: AgentInstanceState,
+    pub override_revision: i64,
+    pub pending: Option<StoredSessionOverride>,
+    pub effective: Option<StoredSessionOverride>,
+    pub resolved_profile_snapshot_id: Option<Uuid>,
+}
+
+/// Outcome of an override-apply CAS. A stale or rejected apply never mutates a
+/// row and reports the current authoritative revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentOverrideApplyOutcome {
+    Applied { override_revision: i64 },
+    StaleRevision { override_revision: i64 },
+    Terminal { override_revision: i64 },
+    NotFound,
+}
+
+fn parse_stored_override(raw: Option<String>) -> Result<Option<StoredSessionOverride>> {
+    raw.map(|json| serde_json::from_str(&json).context("decoding stored session override"))
+        .transpose()
+}
+
+impl Db {
+    /// Read the focused node's override state for the effective-settings
+    /// snapshot. Concurrent read; no mutation.
+    pub async fn read_agent_override_state(
+        &self,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+    ) -> Result<Option<AgentOverrideState>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT state, override_revision, pending_override_json,
+                        effective_override_json, resolved_profile_snapshot_id
+                 FROM agent_instances
+                 WHERE agent_instance_id = ?1 AND session_id = ?2",
+                params![agent_instance_id.to_string(), session_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("loading agent override state")?
+            .map(|(state, override_revision, pending, effective, snapshot)| {
+                Ok(AgentOverrideState {
+                    state: AgentInstanceState::parse(&state)?,
+                    override_revision,
+                    pending: parse_stored_override(pending)?,
+                    effective: parse_stored_override(effective)?,
+                    resolved_profile_snapshot_id: snapshot.map(parse_uuid).transpose()?,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    /// Apply one authorized override field to a node under an effective-settings
+    /// revision CAS. Merges into the pending override, increments and returns
+    /// the revision, and makes every competing old-revision request stale.
+    /// Missing, terminal, or stale targets are rejected without a row change.
+    pub async fn apply_agent_session_override(
+        &self,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        expected_override_revision: i64,
+        field: StoredOverrideField,
+        now_unix_ms: i64,
+    ) -> Result<AgentOverrideApplyOutcome> {
+        self.transaction(move |conn| {
+            let Some((state, current_revision, pending_json)) = conn
+                .query_row(
+                    "SELECT state, override_revision, pending_override_json
+                     FROM agent_instances
+                     WHERE agent_instance_id = ?1 AND session_id = ?2",
+                    params![agent_instance_id.to_string(), session_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .context("loading node for override apply")?
+            else {
+                return Ok(AgentOverrideApplyOutcome::NotFound);
+            };
+            let state = AgentInstanceState::parse(&state)?;
+            if state.is_terminal() {
+                return Ok(AgentOverrideApplyOutcome::Terminal {
+                    override_revision: current_revision,
+                });
+            }
+            if current_revision != expected_override_revision {
+                return Ok(AgentOverrideApplyOutcome::StaleRevision {
+                    override_revision: current_revision,
+                });
+            }
+            let mut pending = parse_stored_override(pending_json)?.unwrap_or_default();
+            pending.merge_field(field);
+            let pending_json =
+                serde_json::to_string(&pending).context("encoding merged pending override")?;
+            let next_revision = current_revision + 1;
+            let changed = conn.execute(
+                "UPDATE agent_instances
+                 SET pending_override_json = ?1, override_revision = ?2, updated_at_unix_ms = ?3
+                 WHERE agent_instance_id = ?4 AND session_id = ?5 AND override_revision = ?6",
+                params![
+                    pending_json,
+                    next_revision,
+                    now_unix_ms,
+                    agent_instance_id.to_string(),
+                    session_id.to_string(),
+                    expected_override_revision,
+                ],
+            )?;
+            if changed != 1 {
+                // Lost the CAS race to a concurrent same-revision apply.
+                return Ok(AgentOverrideApplyOutcome::StaleRevision {
+                    override_revision: current_revision,
+                });
+            }
+            Ok(AgentOverrideApplyOutcome::Applied {
+                override_revision: next_revision,
+            })
+        })
+        .await
+    }
+
+    /// Consume any pending override into the node's effective override at a
+    /// turn boundary: the pending fields overwrite the effective ones and the
+    /// pending slot is cleared. Returns the resulting effective override (or the
+    /// unchanged effective when nothing was pending). The revision is not bumped
+    /// — consumption is not an edit.
+    pub async fn consume_pending_agent_override(
+        &self,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<Option<StoredSessionOverride>> {
+        self.transaction(move |conn| {
+            let Some((pending_json, effective_json)) = conn
+                .query_row(
+                    "SELECT pending_override_json, effective_override_json
+                     FROM agent_instances
+                     WHERE agent_instance_id = ?1 AND session_id = ?2",
+                    params![agent_instance_id.to_string(), session_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .context("loading node for override consume")?
+            else {
+                return Ok(None);
+            };
+            let pending = parse_stored_override(pending_json)?;
+            let mut effective = parse_stored_override(effective_json)?;
+            let Some(pending) = pending else {
+                // Nothing pending: effective is unchanged.
+                return Ok(effective);
+            };
+            let merged = effective.get_or_insert_with(StoredSessionOverride::default);
+            if let Some(model) = pending.model {
+                merged.merge_field(StoredOverrideField::Model(model));
+            }
+            if let Some(sandbox) = pending.sandbox {
+                merged.merge_field(StoredOverrideField::Sandbox(sandbox));
+            }
+            if let Some(llm_mode) = pending.llm_mode {
+                merged.merge_field(StoredOverrideField::LlmMode(llm_mode));
+            }
+            for reduction in pending.verification {
+                merged.merge_field(StoredOverrideField::Verification(reduction));
+            }
+            if let Some(question) = pending.question {
+                merged.merge_field(StoredOverrideField::Question(question));
+            }
+            let effective_json =
+                serde_json::to_string(merged).context("encoding consumed effective override")?;
+            conn.execute(
+                "UPDATE agent_instances
+                 SET effective_override_json = ?1, pending_override_json = NULL,
+                     updated_at_unix_ms = ?2
+                 WHERE agent_instance_id = ?3 AND session_id = ?4",
+                params![
+                    effective_json,
+                    now_unix_ms,
+                    agent_instance_id.to_string(),
+                    session_id.to_string(),
+                ],
+            )?;
+            Ok(effective)
+        })
+        .await
+    }
+}
+
 /// Receipts may carry a user answer or a resolver's raw context, so the DB
 /// stores only a non-reversible marker. Decision *contracts* use the typed
 /// allowlisted projections below instead: they retain only what a restart may
@@ -10262,6 +10576,285 @@ mod tests {
                 .to_string()
                 .contains("inherit its exact parent workspace reference")
         );
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_override_apply_bumps_revision_and_merges_fields() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let root = db
+            .ensure_session_root_agent(session.session_id, None, host_workspace_ref(), 1)
+            .await
+            .unwrap();
+
+        // Effective-settings revision starts at 0, independent of lifecycle.
+        let first = db
+            .apply_agent_session_override(
+                session.session_id,
+                root.agent_instance_id,
+                0,
+                StoredOverrideField::Sandbox("container".to_string()),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            AgentOverrideApplyOutcome::Applied {
+                override_revision: 1
+            }
+        );
+
+        // A second, different axis merges into the same pending override and
+        // bumps the revision again.
+        let second = db
+            .apply_agent_session_override(
+                session.session_id,
+                root.agent_instance_id,
+                1,
+                StoredOverrideField::LlmMode("frontier".to_string()),
+                11,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            AgentOverrideApplyOutcome::Applied {
+                override_revision: 2
+            }
+        );
+
+        let state = db
+            .read_agent_override_state(session.session_id, root.agent_instance_id)
+            .await
+            .unwrap()
+            .expect("override state present");
+        assert_eq!(state.override_revision, 2);
+        let pending = state.pending.expect("pending present");
+        assert_eq!(pending.sandbox.as_deref(), Some("container"));
+        assert_eq!(pending.llm_mode.as_deref(), Some("frontier"));
+        assert!(state.effective.is_none(), "nothing consumed yet");
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_override_apply_stale_revision_is_rejected_without_change() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let root = db
+            .ensure_session_root_agent(session.session_id, None, host_workspace_ref(), 1)
+            .await
+            .unwrap();
+        db.apply_agent_session_override(
+            session.session_id,
+            root.agent_instance_id,
+            0,
+            StoredOverrideField::Sandbox("off".to_string()),
+            10,
+        )
+        .await
+        .unwrap();
+
+        // A second request holding the pre-apply revision (0) is stale.
+        let stale = db
+            .apply_agent_session_override(
+                session.session_id,
+                root.agent_instance_id,
+                0,
+                StoredOverrideField::LlmMode("normal".to_string()),
+                11,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stale,
+            AgentOverrideApplyOutcome::StaleRevision {
+                override_revision: 1
+            }
+        );
+
+        // The losing request left no field behind: only the first apply stands.
+        let state = db
+            .read_agent_override_state(session.session_id, root.agent_instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.override_revision, 1);
+        let pending = state.pending.unwrap();
+        assert_eq!(pending.sandbox.as_deref(), Some("off"));
+        assert!(pending.llm_mode.is_none(), "stale field must not persist");
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_override_apply_on_terminal_node_is_rejected() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let agent = running_agent(&db, session.session_id, 10).await;
+        match db
+            .transition_agent_instance(
+                session.session_id,
+                agent.agent_instance_id,
+                agent.revision,
+                AgentInstanceState::Cancelled,
+                "{}",
+                11,
+            )
+            .await
+            .unwrap()
+        {
+            AgentTransitionOutcome::Transitioned(_) => {}
+            other => panic!("expected cancel, got {other:?}"),
+        }
+
+        let outcome = db
+            .apply_agent_session_override(
+                session.session_id,
+                agent.agent_instance_id,
+                0,
+                StoredOverrideField::Sandbox("off".to_string()),
+                12,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            AgentOverrideApplyOutcome::Terminal {
+                override_revision: 0
+            }
+        );
+        // Rejected without a write.
+        let state = db
+            .read_agent_override_state(session.session_id, agent.agent_instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_override_apply_missing_node_is_not_found() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let outcome = db
+            .apply_agent_session_override(
+                session.session_id,
+                Uuid::new_v4(),
+                0,
+                StoredOverrideField::Sandbox("off".to_string()),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, AgentOverrideApplyOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_override_snapshot_reload_preserves_narrowed_region() {
+        // AC6: a disabled/narrowed earlier region survives consume + a fresh
+        // read (snapshot reload), and later axes are not revealed as a fallback.
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let root = db
+            .ensure_session_root_agent(session.session_id, None, host_workspace_ref(), 1)
+            .await
+            .unwrap();
+        db.apply_agent_session_override(
+            session.session_id,
+            root.agent_instance_id,
+            0,
+            StoredOverrideField::Verification(StoredVerificationReduction {
+                region_id: "rule-1".to_string(),
+                off: true,
+                selector_intersection: Vec::new(),
+                max_candidates: None,
+                max_total_tokens: None,
+                max_estimated_cost_microusd: None,
+                max_collection_millis: None,
+            }),
+            10,
+        )
+        .await
+        .unwrap();
+        db.apply_agent_session_override(
+            session.session_id,
+            root.agent_instance_id,
+            1,
+            StoredOverrideField::Question(StoredQuestionOverride::Disable),
+            11,
+        )
+        .await
+        .unwrap();
+        db.consume_pending_agent_override(session.session_id, root.agent_instance_id, 12)
+            .await
+            .unwrap();
+
+        // Fresh read simulates a reload: both reductions persist in effective.
+        let reloaded = db
+            .read_agent_override_state(session.session_id, root.agent_instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let effective = reloaded.effective.expect("effective preserved on reload");
+        let region = effective
+            .verification
+            .iter()
+            .find(|r| r.region_id == "rule-1")
+            .expect("narrowed region preserved");
+        assert!(
+            region.off,
+            "the off mask is preserved, not a later fallback"
+        );
+        assert_eq!(effective.question, Some(StoredQuestionOverride::Disable));
+        assert!(
+            reloaded.pending.is_none(),
+            "nothing left pending after consume"
+        );
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_override_consume_moves_pending_into_effective() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let root = db
+            .ensure_session_root_agent(session.session_id, None, host_workspace_ref(), 1)
+            .await
+            .unwrap();
+        db.apply_agent_session_override(
+            session.session_id,
+            root.agent_instance_id,
+            0,
+            StoredOverrideField::Sandbox("container".to_string()),
+            10,
+        )
+        .await
+        .unwrap();
+
+        let effective = db
+            .consume_pending_agent_override(session.session_id, root.agent_instance_id, 11)
+            .await
+            .unwrap()
+            .expect("effective override after consume");
+        assert_eq!(effective.sandbox.as_deref(), Some("container"));
+
+        let state = db
+            .read_agent_override_state(session.session_id, root.agent_instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.pending.is_none(), "pending cleared after consume");
+        assert_eq!(
+            state.effective.and_then(|e| e.sandbox).as_deref(),
+            Some("container")
+        );
+        // Consumption is not an edit: the revision is unchanged.
+        assert_eq!(state.override_revision, 1);
+
+        // A no-op consume with nothing pending leaves effective intact.
+        let again = db
+            .consume_pending_agent_override(session.session_id, root.agent_instance_id, 12)
+            .await
+            .unwrap()
+            .expect("effective override still present");
+        assert_eq!(again.sandbox.as_deref(), Some("container"));
     }
 
     #[test]

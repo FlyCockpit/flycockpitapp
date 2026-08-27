@@ -1090,6 +1090,55 @@ impl App {
                 }
                 _ => {}
             },
+            AsyncActionKind::DaemonRpc("session_setup.snapshot") => match result.payload {
+                Ok(AsyncActionPayload::SessionSetupSnapshot(response)) => {
+                    self.apply_session_setup_snapshot_response(response);
+                }
+                Err(error) => {
+                    self.apply_session_setup_snapshot_error(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc("agent_tree.snapshot") => match result.payload {
+                Ok(AsyncActionPayload::AgentTreeSnapshot { tree, attention }) => {
+                    self.apply_agent_tree_snapshot(*tree, *attention);
+                }
+                Err(error) => {
+                    self.apply_agent_tree_error(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc("agent_tree.resolve") => match result.payload {
+                Ok(AsyncActionPayload::AgentTreeResolved) => {
+                    self.request_agent_tree_refresh();
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc("agent_tree.effective_settings") => match result.payload {
+                Ok(AsyncActionPayload::AgentEffectiveSettings(response)) => {
+                    self.apply_agent_effective_settings(response);
+                }
+                Err(error) => {
+                    self.apply_agent_effective_settings_error(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc("agent_tree.apply_override") => match result.payload {
+                Ok(AsyncActionPayload::AgentSessionOverrideOutcome(response)) => {
+                    self.apply_agent_session_override_outcome(response);
+                }
+                Err(error) => {
+                    self.set_agent_override_error(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc("agent_tree.override_model_choices") => {
+                // Supplementary to the effective settings: on success populate the
+                // Model section; a failure leaves it empty (no error surfaced).
+                if let Ok(AsyncActionPayload::SessionSetupSnapshot(response)) = result.payload {
+                    self.apply_agent_override_model_choices(response);
+                }
+            }
             AsyncActionKind::DaemonRpc("guidance.estimate") => {
                 if let Ok(AsyncActionPayload::GuidanceEstimate(estimate)) = result.payload {
                     self.guidance_estimate = Some(estimate);

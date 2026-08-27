@@ -76,6 +76,13 @@ pub use session_setup::{
     SESSION_SETUP_DTO_VERSION, SessionSetupAgentCandidateV1, SessionSetupLockedReasonV1,
     SessionSetupModelSlotV1, SessionSetupSnapshotV1, SessionSetupUnavailableReasonV1,
 };
+pub mod session_override;
+pub use session_override::{
+    AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
+    AgentModeControlV1, AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
+    AgentSandboxControlV1, AgentSessionOverrideFieldV1, AgentSessionOverrideStatusV1,
+    AgentVerificationControlV1, AgentVerificationReductionV1, AgentVerificationRegionV1,
+};
 #[cfg(feature = "remote")]
 pub mod remote_connection_metadata;
 #[cfg(feature = "remote")]

@@ -2969,3 +2969,106 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
         assert!(narrow.pin_region.is_none());
     }
 }
+
+// --- modes-session-setup Increment 3: tool-row Verifying/Running/Done renderer (AC8) ---
+
+fn modes_session_setup_tool_call(state: ToolCallState) -> ToolCall {
+    ToolCall {
+        call_id: "call-1".to_string(),
+        tool: "bash".to_string(),
+        summary: "echo hello".to_string(),
+        full_input: "echo hello".to_string(),
+        output: String::new(),
+        expanded: false,
+        result_offset: 0,
+        state,
+        hint: None,
+        progress: None,
+        mcp_child: None,
+    }
+}
+
+fn modes_session_setup_row_text(state: ToolCallState) -> String {
+    let call = modes_session_setup_tool_call(state);
+    tool_call_spans(&call, &call.summary, false, None)
+        .iter()
+        .map(|span| span.content.to_string())
+        .collect::<String>()
+}
+
+fn modes_session_setup_label_fg(state: ToolCallState) -> Option<Color> {
+    let call = modes_session_setup_tool_call(state);
+    // The bold `label:` span carries the semantic state colour.
+    tool_call_spans(&call, &call.summary, false, None)
+        .into_iter()
+        .find(|span| span.content.contains(':'))
+        .and_then(|span| span.style.fg)
+}
+
+#[test]
+fn modes_session_setup_tool_row_verifying_uses_distinct_color_and_accessible_label() {
+    // Verifying carries an accessible "Verifying" label (readable with no
+    // colour) and a distinct colour, separate from running/done/error.
+    assert!(modes_session_setup_row_text(ToolCallState::Verifying).contains("Verifying"));
+    assert_eq!(
+        modes_session_setup_label_fg(ToolCallState::Verifying),
+        Some(VERIFYING_TEXT)
+    );
+    assert_ne!(
+        VERIFYING_TEXT, WARNING_TEXT,
+        "verifying must differ from running"
+    );
+    assert_ne!(
+        VERIFYING_TEXT,
+        Color::White,
+        "verifying must differ from done"
+    );
+    assert_ne!(
+        VERIFYING_TEXT, ERROR_TEXT,
+        "verifying must differ from error"
+    );
+}
+
+#[test]
+fn modes_session_setup_tool_row_verifying_to_running_to_done_transition() {
+    // running uses the existing Processing (yellow) treatment; done is white.
+    // Only the pre-dispatch verifying state shows the accessible label.
+    assert_eq!(
+        modes_session_setup_label_fg(ToolCallState::Processing),
+        Some(WARNING_TEXT)
+    );
+    assert_eq!(
+        modes_session_setup_label_fg(ToolCallState::Success),
+        Some(Color::White)
+    );
+    assert!(!modes_session_setup_row_text(ToolCallState::Processing).contains("Verifying"));
+    assert!(!modes_session_setup_row_text(ToolCallState::Success).contains("Verifying"));
+    // The three states are visually distinct.
+    let verifying = modes_session_setup_label_fg(ToolCallState::Verifying);
+    let running = modes_session_setup_label_fg(ToolCallState::Processing);
+    let done = modes_session_setup_label_fg(ToolCallState::Success);
+    assert_ne!(verifying, running);
+    assert_ne!(running, done);
+    assert_ne!(verifying, done);
+}
+
+#[test]
+fn modes_session_setup_tool_row_verifying_to_done_directly_for_no_dispatch() {
+    // A no-dispatch outcome moves verifying -> done without a running phase.
+    assert!(modes_session_setup_row_text(ToolCallState::Verifying).contains("Verifying"));
+    let done = modes_session_setup_row_text(ToolCallState::Success);
+    assert!(!done.contains("Verifying"));
+    assert_eq!(
+        modes_session_setup_label_fg(ToolCallState::Success),
+        Some(Color::White)
+    );
+}
+
+#[test]
+fn modes_session_setup_tool_row_verifying_shows_no_duplicate_or_hidden_content() {
+    // The stable row shows its own summary exactly once and one Verifying
+    // label — never a hidden original/candidate copy.
+    let text = modes_session_setup_row_text(ToolCallState::Verifying);
+    assert_eq!(text.matches("echo hello").count(), 1);
+    assert_eq!(text.matches("Verifying").count(), 1);
+}

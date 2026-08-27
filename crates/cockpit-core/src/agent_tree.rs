@@ -3933,7 +3933,7 @@ use crate::db::agent_tree_decisions::{
     AgentInstanceRow, AgentInstanceState, AgentTransitionOutcome, AgentTreePage,
     AgentTreePageCursor, DecisionAttentionRow, DecisionRequestRow, DecisionState,
     DecisionTransitionOutcome, HostCapabilityRefreshAuthority as DbHostCapabilityRefreshAuthority,
-    NewDecisionRequest,
+    NewDecisionRequest, StoredQuestionOverride,
 };
 use crate::db::wire::{InterruptQuestion, InterruptQuestionSet, ResolveResponse};
 
@@ -5842,19 +5842,78 @@ impl AgentTreeLifecycle {
                 auto_answer_disabled,
                 prohibited_classes,
                 required_decision_timeout_ms,
+                host_resource_ceiling_ms,
                 resolver_slot,
                 ..
-            } => Ok(Some(ResolvedDecisionPolicy {
-                // The immutable profile determines whether automation is
-                // permitted at all; this durable per-agent reduction decides
-                // whether this concrete executor opted into it.
-                auto_answer_enabled: agent.auto_answer_enabled,
-                auto_answer_disabled,
-                prohibited_classes,
-                required_decision_timeout_ms,
-                resolver_slot,
-            })),
+            } => {
+                let mut policy = ResolvedDecisionPolicy {
+                    // The immutable profile determines whether automation is
+                    // permitted at all; this durable per-agent reduction decides
+                    // whether this concrete executor opted into it.
+                    auto_answer_enabled: agent.auto_answer_enabled,
+                    auto_answer_disabled,
+                    prohibited_classes,
+                    required_decision_timeout_ms,
+                    resolver_slot,
+                };
+                // Apply the node's effective (consumed) session question
+                // override on top of the immutable base (modes AC7). The
+                // override was authorized reduce-only by
+                // `agent_session_override::authorize_question`, but we re-clamp
+                // defensively so a stale/replayed value can only ever tighten:
+                // `Disable` forces auto-answer off, and `Reduce` may only
+                // lengthen the wait, never below the base and never above the
+                // host ceiling.
+                self.apply_effective_question_override(
+                    session_id,
+                    agent.agent_instance_id,
+                    host_resource_ceiling_ms,
+                    &mut policy,
+                )
+                .await?;
+                Ok(Some(policy))
+            }
         }
+    }
+
+    /// Fold the node's effective session question override into `policy`. A
+    /// no-op when the node carries no question override. Reduce-only by
+    /// construction and re-clamped here for defence in depth.
+    async fn apply_effective_question_override(
+        &self,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        host_resource_ceiling_ms: u64,
+        policy: &mut ResolvedDecisionPolicy,
+    ) -> Result<()> {
+        let Some(state) = self
+            .db
+            .read_agent_override_state(session_id, agent_instance_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some(question) = state.effective.and_then(|effective| effective.question) else {
+            return Ok(());
+        };
+        match question {
+            StoredQuestionOverride::Disable => {
+                policy.auto_answer_disabled = true;
+            }
+            StoredQuestionOverride::Reduce {
+                required_decision_timeout_seconds,
+            } => {
+                let requested_ms = u64::from(required_decision_timeout_seconds) * 1000;
+                // Cap at the host ceiling, then floor at the immutable base LAST
+                // so the base always wins: even a corrupt snapshot with
+                // `base > ceiling` can only ever lengthen the wait (tighten),
+                // never shorten it below the base (which would widen authority).
+                policy.required_decision_timeout_ms = requested_ms
+                    .min(host_resource_ceiling_ms)
+                    .max(policy.required_decision_timeout_ms);
+            }
+        }
+        Ok(())
     }
 
     async fn decision_deadline_from_resolved_profile(

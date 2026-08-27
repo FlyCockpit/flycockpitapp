@@ -4000,8 +4000,12 @@ impl Driver {
             events: Some(tx.clone()),
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
-            media_authority: None,
-            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+            media_authority: self.session.tool_media_authority(),
+            media_availability: if self.session.tool_media_authority().is_some() {
+                crate::tool_media_authority::MediaToolAvailability::available()
+            } else {
+                crate::tool_media_authority::MediaToolAvailability::unavailable()
+            },
             env_overlay: agent.env_overlay.clone(),
             config: self.config.clone(),
         };
@@ -7681,6 +7685,7 @@ impl Driver {
             .expect("non-empty batch has a final turn");
         let mut leading_history = Vec::with_capacity(pending.len());
         let mut leading_queue_item_ids = Vec::new();
+        let mut leading_media_submission_ids = Vec::new();
         while let Some(submission) = pending.pop_front() {
             if self.record_queued_user_fold(&submission, tx).await.is_err() {
                 if let Some(top) = self.stack.last_mut() {
@@ -7701,6 +7706,12 @@ impl Driver {
                 return Ok(());
             }
             leading_queue_item_ids.extend(submission.queue_item_ids.iter().copied());
+            leading_media_submission_ids.extend(
+                submission
+                    .client_submissions
+                    .iter()
+                    .map(|receipt| receipt.id),
+            );
             leading_history.push(crate::engine::message::build_user_message(UserSubmission {
                 expected_model_state_generation: None,
                 expected_model: None,
@@ -7723,7 +7734,14 @@ impl Driver {
             }));
         }
         let result = self
-            .run_user_input_with_leading_history(last, leading_history, true, input_rx, tx)
+            .run_user_input_with_leading_history(
+                last,
+                leading_history,
+                leading_media_submission_ids,
+                true,
+                input_rx,
+                tx,
+            )
             .await;
         input_rx.finish(&leading_queue_item_ids).await;
         result
@@ -9450,14 +9468,22 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        self.run_user_input_with_leading_history(submission, Vec::new(), false, input_rx, tx)
-            .await
+        self.run_user_input_with_leading_history(
+            submission,
+            Vec::new(),
+            Vec::new(),
+            false,
+            input_rx,
+            tx,
+        )
+        .await
     }
 
     async fn run_user_input_with_leading_history(
         &mut self,
         submission: UserSubmission,
         leading_history: Vec<Message>,
+        mut leading_media_submission_ids: Vec<uuid::Uuid>,
         time_prelude_as_system: bool,
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
@@ -9497,6 +9523,29 @@ impl Driver {
             .iter()
             .map(|receipt| receipt.id.to_string())
             .collect();
+        // Materialize only for this accepted interactive user-root fold. The
+        // factory requires a binding for every folded contributor and live
+        // revalidation of each; any missing, remote-unprojected, stale, or
+        // mixed-principal receipt leaves the session authority unset.
+        leading_media_submission_ids.extend(
+            submission
+                .client_submissions
+                .iter()
+                .map(|receipt| receipt.id),
+        );
+        let authority = if self.stack.len() == 1 {
+            match self.session.tool_media_runtime() {
+                Some(runtime) => {
+                    runtime
+                        .authority_for_fold(&self.session, &leading_media_submission_ids)
+                        .await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        self.session.set_tool_media_authority(authority);
         let result = self
             .run_user_input_with_leading_history_inner(
                 submission,
@@ -9506,6 +9555,32 @@ impl Driver {
                 tx,
             )
             .await;
+        // Never let authority outlive the exact user-root turn that produced
+        // it. This also clears it before durable terminal/retry handling.
+        self.session.set_tool_media_authority(None);
+        // The durable receipt remains for exact replay, but a completed turn
+        // has no remaining right to use its private media subject. Releasing
+        // every folded contributor here keeps the secure-key ref alive for
+        // the entire in-flight turn and no longer.
+        for client_submission_id in &leading_media_submission_ids {
+            let session_id = self.session.id.to_string();
+            let client_submission_id = *client_submission_id.as_bytes();
+            if let Err(error) = self
+                .session
+                .db
+                .transaction(move |conn| {
+                    crate::db::tool_media_subject_bindings::release_tool_media_subject_binding_conn(
+                        conn,
+                        &session_id,
+                        &client_submission_id,
+                    )
+                    .map(|_| ())
+                })
+                .await
+            {
+                tracing::warn!(%error, session = %self.session.id, "tool-media subject release remains retryable after turn completion");
+            }
+        }
         input_rx.finish(&queue_item_ids).await;
         struct CompletionClock;
         impl crate::media_reservation::MonotonicClock for CompletionClock {
@@ -12292,7 +12367,11 @@ impl Driver {
                 .session
                 .provider_credential_store(&self.config.providers())
                 .ok(),
-            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+            media_availability: if self.session.tool_media_authority().is_some() {
+                crate::tool_media_authority::MediaToolAvailability::available()
+            } else {
+                crate::tool_media_authority::MediaToolAvailability::unavailable()
+            },
         }
     }
 

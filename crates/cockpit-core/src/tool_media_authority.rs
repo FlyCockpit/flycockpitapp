@@ -21,11 +21,20 @@
 //!   derivation, spawn-context enforcement, and epoch increment on
 //!   control-state changes.
 //!
+//! ```compile_fail
+//! use cockpit_core::tool_media_authority::SessionMediaAuthority;
+//!
+//! // `new` is crate-private: an external crate cannot mint a source-admitting
+//! // authority from a fabricated subject or policy objects.
+//! let _ = SessionMediaAuthority::new;
+//! ```
+//!
 pub mod availability;
 pub mod locator;
 pub mod receipt;
 pub mod recovery;
 pub mod revalidator;
+pub(crate) mod runtime;
 pub mod seal;
 pub mod session_authority;
 
@@ -47,6 +56,14 @@ pub const TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE: &str = "tool_media_subject_bindi
 
 /// Consumer kind for secure-key refs owned by tool-media-subject bindings.
 pub const TOOL_MEDIA_SUBJECT_BINDING_CONSUMER_KIND: &str = "tool_media_subject_binding";
+
+/// Derive the opaque project digest bound into every receipt from the durable
+/// session project identifier. The UUID namespace avoids treating an arbitrary
+/// project string as a UUID while keeping the receipt fixed-width.
+pub(crate) fn project_digest_for_project_id(project_id: &str) -> [u8; 32] {
+    let project_uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, project_id.as_bytes());
+    locator::LocatorV1::project_digest(project_uuid.as_bytes())
+}
 
 /// Build the secure-key reference id for a binding.
 ///

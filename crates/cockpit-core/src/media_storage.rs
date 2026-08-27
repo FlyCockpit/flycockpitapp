@@ -255,6 +255,54 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Fetch an HTTPS source into daemon-private held storage for a
+    /// direct-native tool authority. The returned bytes have been checked
+    /// against the network proof while the no-follow file handle remained
+    /// live; the temporary private object is removed before return.
+    pub(crate) async fn retain_https_source_for_tool(&self, url: &str) -> Result<Vec<u8>> {
+        let storage_name = format!("tool-retained-https-{}", Uuid::now_v7());
+        let mut held = self
+            .owned_root
+            .create_file_exclusive(&storage_name)
+            .map_err(anyhow::Error::new)?;
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let mut async_file = tokio::fs::File::from_std(held.try_clone()?);
+        let fetched = self
+            .https_fetcher
+            .fetch(
+                url,
+                &mut async_file,
+                &crate::media_https::HttpsFetchLimits::default(),
+            )
+            .await;
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                let _ = self.owned_root.remove_file(&storage_name);
+                return Err(error);
+            }
+        };
+        async_file.sync_all().await?;
+        drop(async_file);
+        held.seek(SeekFrom::Start(0))?;
+        let identity = stable_identity_digest(&held)?;
+        let (length, checksum) = read_full_digest(&mut held)?;
+        anyhow::ensure!(
+            stable_identity_digest(&held)? == identity
+                && length == fetched.byte_length
+                && checksum == fetched.sha256,
+            "storage_security_violation"
+        );
+        held.seek(SeekFrom::Start(0))?;
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(length).context("retained HTTPS object too large")?);
+        held.read_to_end(&mut bytes)?;
+        self.owned_root
+            .remove_file(&storage_name)
+            .map_err(anyhow::Error::new)?;
+        Ok(bytes)
+    }
+
     /// Resolve a durable tool-result media reference through the real storage
     /// lease path. Every identity/availability/capability check and the
     /// no-follow file proof completes before a provider mapping can be built.

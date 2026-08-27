@@ -2432,12 +2432,17 @@ impl Db {
 
     pub async fn end_session(&self, session_id: Uuid) -> Result<()> {
         let now_unix_ms = Utc::now().timestamp_millis();
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2",
                 params![now_unix_ms, session_id.to_string()],
             )
             .context("ending session")?;
+            crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_session_conn(
+                conn,
+                session_id,
+                now_unix_ms,
+            )?;
             Ok(())
         })
         .await

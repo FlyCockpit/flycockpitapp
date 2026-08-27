@@ -2756,6 +2756,14 @@ impl DaemonContext {
                 handle.clone(),
             ));
         self.registry.set_redaction_key_resolver(resolver.clone());
+        if let Some(storage) = self.media_storage_recovery.clone() {
+            self.registry.set_tool_media_runtime(Arc::new(
+                crate::tool_media_authority::runtime::ToolMediaRuntime::new(
+                    handle.clone(),
+                    storage,
+                ),
+            ));
+        }
         self.redaction_key_resolver = Some(resolver);
         self.secure_key = Some(handle);
         self._secure_key_actor = Some(actor);

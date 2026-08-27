@@ -244,6 +244,15 @@ pub(crate) async fn turn_toolbox(
 ) -> ToolBox {
     let mut toolbox =
         toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode).await;
+    // Media tools are present in a root/eligible-child definition only while
+    // this exact user-root fold has a live daemon-owned authority.  The
+    // session clears it at the turn boundary, so a previously built toolbox
+    // cannot retain availability into a scheduled/background/later root.
+    if session.tool_media_authority().is_none() {
+        for &name in crate::tool_media_authority::availability::MEDIA_TOOL_NAMES {
+            toolbox = toolbox.without(name);
+        }
+    }
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }

@@ -190,6 +190,8 @@ struct Inner {
             )>,
         >,
     >,
+    tool_media_runtime:
+        Arc<Mutex<Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>>>>,
     /// Daemon descendant process-containment handle. Late-installed like
     /// `external_journal` (the daemon builds the actor after this registry
     /// exists), then copied onto every worker `Session` so lifecycle hooks run
@@ -629,6 +631,7 @@ impl SessionRegistry {
                 write_scope: Arc::new(Mutex::new(None)),
                 external_journal: Arc::new(Mutex::new(None)),
                 message_media_authority: Arc::new(Mutex::new(None)),
+                tool_media_runtime: Arc::new(Mutex::new(None)),
                 process_containment: Arc::new(Mutex::new(None)),
                 redaction_key_resolver: Arc::new(Mutex::new(None)),
                 secret_vault: Arc::new(Mutex::new(None)),
@@ -751,6 +754,19 @@ impl SessionRegistry {
         crate::media_reservation::MediaReservationLedger,
     )> {
         crate::sync::lock_or_recover(&self.inner.message_media_authority).clone()
+    }
+
+    pub(crate) fn set_tool_media_runtime(
+        &self,
+        runtime: Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = Some(runtime);
+    }
+
+    fn tool_media_runtime(
+        &self,
+    ) -> Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>> {
+        crate::sync::lock_or_recover(&self.inner.tool_media_runtime).clone()
     }
 
     /// Install the daemon's descendant process-containment handle. Called once
@@ -1839,6 +1855,7 @@ impl SessionRegistry {
 
         session.set_external_journal(self.external_journal());
         session.set_message_media_authority(self.message_media_authority());
+        session.set_tool_media_runtime(self.tool_media_runtime());
         // Copy the daemon containment handle onto the worker session so every
         // lifecycle hook (driver, noninteractive, swarm — all share this
         // `Session`) spawns its child under a proven containment lease.

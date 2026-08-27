@@ -472,9 +472,11 @@ mod tests {
             &self,
             _namespace: &str,
             _version: i64,
-        ) -> Result<Option<[u8; 32]>, RevalidatorError> {
+        ) -> Result<Option<crate::secure_key::SecureKeyBytes>, RevalidatorError> {
             if self.available {
-                Ok(Some(self.key))
+                Ok(Some(crate::secure_key::SecureKeyBytes::from_array(
+                    self.key,
+                )))
             } else {
                 Ok(None)
             }

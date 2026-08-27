@@ -197,6 +197,13 @@ pub struct Session {
             crate::media_reservation::MediaReservationLedger,
         )>,
     >,
+    /// Daemon-installed factory for live tool-media subjects. It is absent in
+    /// isolated/headless sessions; those paths never inherit media authority.
+    tool_media_runtime: Mutex<Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>>>,
+    /// Authority materialized for the currently executing interactive user
+    /// root fold. Cleared at the turn boundary so later roots, background
+    /// work, MCP/Monty, and untrusted children cannot inherit it.
+    tool_media_authority: Mutex<Option<Arc<crate::tool_media_authority::SessionMediaAuthority>>>,
     /// Daemon-process command-backed secret cache. Late-installed by the
     /// registry / daemon before the worker (or DocsAsk session) builds any
     /// store, so every `credential_store` / `provider_credential_store` this
@@ -495,6 +502,32 @@ impl Session {
         crate::media_reservation::MediaReservationLedger,
     )> {
         self.message_media_authority.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_tool_media_runtime(
+        &self,
+        runtime: Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>>,
+    ) {
+        *self.tool_media_runtime.lock().unwrap() = runtime;
+    }
+
+    pub(crate) fn tool_media_runtime(
+        &self,
+    ) -> Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>> {
+        self.tool_media_runtime.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_tool_media_authority(
+        &self,
+        authority: Option<Arc<crate::tool_media_authority::SessionMediaAuthority>>,
+    ) {
+        *self.tool_media_authority.lock().unwrap() = authority;
+    }
+
+    pub(crate) fn tool_media_authority(
+        &self,
+    ) -> Option<Arc<crate::tool_media_authority::SessionMediaAuthority>> {
+        self.tool_media_authority.lock().unwrap().clone()
     }
 
     /// Install (or inherit) the daemon-process command-secret cache.

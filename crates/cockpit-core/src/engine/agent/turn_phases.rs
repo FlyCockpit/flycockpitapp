@@ -2279,8 +2279,12 @@ pub(crate) async fn run_turn(
         events: Some(tx.clone()),
         lsp,
         resource_scheduler,
-        media_authority: None,
-        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+        media_authority: session.tool_media_authority(),
+        media_availability: if session.tool_media_authority().is_some() {
+            crate::tool_media_authority::MediaToolAvailability::available()
+        } else {
+            crate::tool_media_authority::MediaToolAvailability::unavailable()
+        },
         config: config.clone(),
     };
 

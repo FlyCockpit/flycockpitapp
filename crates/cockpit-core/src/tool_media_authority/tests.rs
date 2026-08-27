@@ -40,9 +40,11 @@ impl SecureKeyResolver for FakeKeyResolver {
         &self,
         _namespace: &str,
         _version: i64,
-    ) -> Result<Option<[u8; 32]>, RevalidatorError> {
+    ) -> Result<Option<crate::secure_key::SecureKeyBytes>, RevalidatorError> {
         if self.available {
-            Ok(Some(self.key))
+            Ok(Some(crate::secure_key::SecureKeyBytes::from_array(
+                self.key,
+            )))
         } else {
             Ok(None)
         }
@@ -651,12 +653,9 @@ fn tool_media_context_stripping() {
     // catalog contexts, and external MCP cannot construct/recover a subject
     // or register/call source-admitting tools.
     //
-    // The issue allows "trybuild (or equivalent external-crate)" — we use
-    // runtime assertions here because trybuild is not a dev-dependency.
-    // TODO: add a trybuild compile-fail fixture when trybuild is added.
-
-    use crate::engine::tool::ToolCtx;
-    use crate::mcp::builtin::HostContext;
+    // The external-crate construction boundary is covered by the
+    // `compile_fail` doctest on `tool_media_authority`; these runtime
+    // inventories cover the independently observable registry surface.
 
     // 1. MediaToolAvailability is Copy + 1 byte — no authority data.
     let avail = MediaToolAvailability::available();
@@ -671,11 +670,16 @@ fn tool_media_context_stripping() {
     // 3. MediaToolAvailability::unavailable().omitted_tool_names() contains
     // all direct-native media tools.
     let omitted = MediaToolAvailability::unavailable().omitted_tool_names();
-    assert!(omitted.contains(&"read_image"));
-    assert!(omitted.contains(&"inspect_audio"));
-    assert!(omitted.contains(&"inspect_video"));
-    assert!(omitted.contains(&"extract_audio_clip"));
-    assert!(omitted.contains(&"transcribe_audio"));
+    for name in super::availability::MEDIA_TOOL_NAMES {
+        assert!(
+            omitted.contains(name),
+            "{name} must be omitted without authority"
+        );
+        assert!(
+            !crate::engine::tool::is_monty_builtin_adaptable(name),
+            "{name} must never enter the Monty/MCP builtin registry"
+        );
+    }
 
     // 4. When available, no tools are omitted.
     assert!(
@@ -718,7 +722,7 @@ fn media_tool_availability_materialization() {
     assert!(!false_avail.is_available());
     let omitted = false_avail.omitted_tool_names();
     assert!(!omitted.is_empty());
-    assert!(omitted.contains(&"read_image"));
+    assert!(omitted.contains(&"extract_video_clip"));
     assert!(omitted.contains(&"transcribe_audio"));
 
     // True availability carries no authority data.
@@ -743,10 +747,10 @@ fn media_tool_availability_materialization() {
     // Default is unavailable.
     assert!(!MediaToolAvailability::default().is_available());
 
-    // LocalOnlyProjection is the local-only launch scope default.
+    // LocalOnlyProjection is the deterministic test projection.
     let projection = LocalOnlyProjection;
     // Remote devices are not active in local-only scope.
-    assert!(!projection.device_active(&[0xFF; 16]).unwrap());
+    assert!(!projection.device_active(&[0xFF; 16], 0).unwrap());
     // Local owner authority is active.
     assert!(projection.authority_active(&[0x11; 32]).unwrap());
     // Epoch is 0 for local owners.

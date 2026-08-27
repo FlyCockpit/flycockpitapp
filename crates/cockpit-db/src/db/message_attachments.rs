@@ -149,6 +149,55 @@ pub trait MessageAcceptanceJoin: Send + Sync {
 }
 
 impl Db {
+    /// Return a previously committed local-owner acceptance before any caller
+    /// allocates fresh authority material.  The durable operation receipt is
+    /// the replay authority; in particular a new key version or randomized
+    /// locator seal must not be required to replay it.
+    pub async fn exact_local_message_replay_outcome(
+        &self,
+        session_id: Uuid,
+        operation_id: [u8; 16],
+        client_submission_id: [u8; 16],
+        request_hash: [u8; 32],
+        message_request_digest: [u8; 32],
+        attachment_set_digest: [u8; 32],
+    ) -> Result<Option<MessageSafeOutcome>> {
+        self.read(move |conn| {
+            let outcome = conn
+                .query_row(
+                    "SELECT o.safe_outcome
+                       FROM message_operation_receipts o
+                       JOIN message_submission_receipts s
+                         ON s.session_id = o.session_id
+                        AND s.operation_id = o.operation_id
+                      WHERE o.session_id = ?1
+                        AND o.operation_id = ?2
+                        AND o.actor_kind = 'local_owner'
+                        AND o.actor_id IS NULL
+                        AND o.actor_generation = ?3
+                        AND o.client_submission_id = ?4
+                        AND o.request_hash = ?5
+                        AND o.message_request_digest = ?6
+                        AND s.attachment_set_digest = ?7",
+                    params![
+                        session_id.to_string(),
+                        operation_id.as_slice(),
+                        0_u64.to_be_bytes().as_slice(),
+                        client_submission_id.as_slice(),
+                        request_hash.as_slice(),
+                        message_request_digest.as_slice(),
+                        attachment_set_digest.as_slice(),
+                    ],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            outcome
+                .map(|bytes| MessageSafeOutcome::decode(&bytes))
+                .transpose()
+        })
+        .await
+    }
+
     pub async fn accept_message_with_attachments(
         &self,
         input: AcceptMessageInput,
@@ -229,6 +278,14 @@ impl Db {
             conn.execute("UPDATE message_operation_receipts SET state=?3,safe_outcome=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),state,safe_outcome,now_ms])?;
             conn.execute("UPDATE message_queue_items SET state=?3,updated_at=?4 WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding')", params![session_id.to_string(),submission.as_slice(),state,now_ms])?;
             release_message_attachment_references_conn(conn, session_id, &submission, now_ms)?;
+            // A terminal submission has no in-flight turn left to consume its
+            // media authority. Remove the binding in the same authoritative
+            // transition and begin secure-key release immediately.
+            crate::db::tool_media_subject_bindings::release_tool_media_subject_binding_conn(
+                conn,
+                &session_id.to_string(),
+                &submission,
+            )?;
             Ok(true)
         }).await
     }
@@ -539,13 +596,15 @@ fn tool_media_binding_replay_matches_conn(
     session_id: &str,
     input: &AcceptMessageInput,
 ) -> Result<bool> {
-    let stored =
+    // The receipt/seal are daemon-private acceptance artifacts, not client
+    // request identity.  Once the durable operation, canonical message, and
+    // attachment set above match exactly, replay must succeed even after the
+    // binding has been released or a current key would produce a randomized
+    // new seal. Keep this helper as an explicit read of the row so corruption
+    // surfaces as a DB error rather than silently widening the replay query.
+    let _ =
         Db::load_tool_media_subject_binding_conn(conn, session_id, &input.client_submission_id)?;
-    match (&input.tool_media_subject_binding, stored) {
-        (None, None) => Ok(true),
-        (Some(expected), Some(actual)) => Ok(expected.receipt_bytes == actual.receipt_bytes),
-        _ => Ok(false),
-    }
+    Ok(true)
 }
 
 fn actor_parts(actor: MessageActor) -> (&'static str, Option<Vec<u8>>, Vec<u8>) {
@@ -957,6 +1016,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, AcceptMessageResult::Accepted);
+
+        // An exact durable acceptance is discoverable before a caller mints
+        // another seal/key binding. This remains the replay path after key
+        // rotation or normal post-turn binding release.
+        let replay = db
+            .exact_local_message_replay_outcome(
+                session.session_id,
+                input.operation_id,
+                input.client_submission_id,
+                input.request_hash,
+                input.message_request_digest,
+                input.attachment_set_digest,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replay,
+            Some(MessageSafeOutcome::Accepted {
+                queue_item_id: input.queue_item_id,
+            })
+        );
 
         // The secure-key consumer ref should be Active.
         let ref_id = input

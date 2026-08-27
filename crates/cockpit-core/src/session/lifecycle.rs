@@ -490,6 +490,8 @@ impl Session {
             secret_vault: vault,
             external_journal: Mutex::new(None),
             message_media_authority: Mutex::new(None),
+            tool_media_runtime: Mutex::new(None),
+            tool_media_authority: Mutex::new(None),
             command_secret_cache: Mutex::new(None),
             process_containment: Mutex::new(None),
             redaction_key_resolver: resolver,
@@ -727,11 +729,17 @@ impl Session {
         let session_id = self.id;
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
+                let now_ms = Utc::now().timestamp_millis();
                 conn.execute(
                     "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2",
-                    params![Utc::now().timestamp_millis(), session_id.to_string()],
+                    params![now_ms, session_id.to_string()],
                 )
                 .context("ending session")?;
+                crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_session_conn(
+                    conn,
+                    session_id,
+                    now_ms,
+                )?;
                 Ok(())
             })
             .context("ending session")

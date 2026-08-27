@@ -5006,7 +5006,10 @@ pub(super) async fn run_worker(
         credential_store: session
             .provider_credential_store(&start_config.providers)
             .ok(),
-        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+        // The root definition contains the direct-native media tools, but
+        // `turn_toolbox` removes them unless a specific accepted user fold
+        // has a live revalidated authority. This is not a blanket grant.
+        media_availability: crate::tool_media_authority::MediaToolAvailability::available(),
     };
     let tool_surface_override = stored_tool_surface_override(&session);
     let _goal_settings_override = stored_goal_settings_override(&session);

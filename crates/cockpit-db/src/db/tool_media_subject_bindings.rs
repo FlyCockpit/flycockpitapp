@@ -87,6 +87,40 @@ impl Db {
     ) -> Result<()> {
         validate_insert(insert)?;
         let session = insert.session_id.to_string();
+        // Materialize the initial epoch in the same transaction as the
+        // binding.  A concurrent authoritative invalidation either commits
+        // before us (and makes this stale receipt reject here) or after us
+        // (and invalidates the just-accepted receipt); it can never leave an
+        // accepted binding attached to an implicit missing epoch.
+        conn.execute(
+            "INSERT INTO tool_media_authorization_epochs
+             (issuer_kind, principal_digest, session_id, project_digest, epoch, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)
+             ON CONFLICT(issuer_kind, principal_digest, session_id, project_digest) DO NOTHING",
+            params![
+                insert.issuer_kind,
+                insert.principal_digest.as_slice(),
+                &session,
+                insert.project_digest.as_slice(),
+                insert.now_ms,
+            ],
+        )?;
+        let current_epoch: i64 = conn.query_row(
+            "SELECT epoch FROM tool_media_authorization_epochs
+             WHERE issuer_kind = ?1 AND principal_digest = ?2
+               AND session_id = ?3 AND project_digest = ?4",
+            params![
+                insert.issuer_kind,
+                insert.principal_digest.as_slice(),
+                &session,
+                insert.project_digest.as_slice(),
+            ],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            current_epoch == insert.authorization_epoch,
+            "tool-media-subject binding authorization epoch changed before acceptance"
+        );
         conn.execute(
             "INSERT INTO message_tool_media_subject_bindings
              (session_id, client_submission_id, receipt_version, issuer_kind,
@@ -126,7 +160,7 @@ impl Db {
             .await
     }
 
-    pub(crate) fn load_tool_media_subject_binding_conn(
+    pub fn load_tool_media_subject_binding_conn(
         conn: &Connection,
         session_id: &str,
         client_submission_id: &[u8; 16],
@@ -306,6 +340,60 @@ impl Db {
     }
 }
 
+/// Invalidate every media binding attached to a session inside the caller's
+/// authoritative session-state transaction. Session termination has no
+/// surviving valid subject, so the update is deliberately broad over the
+/// session rather than relying on a caller to reconstruct principal tuples.
+pub fn invalidate_tool_media_authorization_epochs_for_session_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    now_ms: i64,
+) -> Result<u64> {
+    let changed = conn.execute(
+        "UPDATE tool_media_authorization_epochs
+         SET epoch = epoch + 1, updated_at = ?1
+         WHERE session_id = ?2",
+        params![now_ms, session_id.to_string()],
+    )?;
+    Ok(changed as u64)
+}
+
+/// Remove a binding after its owning turn has completed and start release of
+/// its retained secure-key version.  The message receipt deliberately remains
+/// durable for exact replay; only the private, live authority is discarded.
+pub fn release_tool_media_subject_binding_conn(
+    conn: &Connection,
+    session_id: &str,
+    client_submission_id: &[u8; 16],
+) -> Result<bool> {
+    let reference_id: Option<String> = conn
+        .query_row(
+            "SELECT secure_key_reference_id
+             FROM message_tool_media_subject_bindings
+             WHERE session_id = ?1 AND client_submission_id = ?2",
+            params![session_id, client_submission_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(reference_id) = reference_id else {
+        return Ok(false);
+    };
+    let changed = conn.execute(
+        "DELETE FROM message_tool_media_subject_bindings
+         WHERE session_id = ?1 AND client_submission_id = ?2",
+        params![session_id, client_submission_id.as_slice()],
+    )?;
+    ensure!(
+        changed == 1,
+        "tool-media-subject binding release lost its row"
+    );
+    ensure!(
+        crate::db::secure_key::begin_release_consumer_ref_conn(conn, &reference_id)?,
+        "tool-media-subject binding has no active secure-key reference"
+    );
+    Ok(true)
+}
+
 fn validate_insert(insert: &ToolMediaSubjectBindingInsertV1) -> Result<()> {
     ensure!(insert.receipt_version == 1, "receipt_version must be 1");
     ensure!(
@@ -430,6 +518,28 @@ fn map_binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolMediaSubject
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setup_active_tool_media_key(conn: &Connection) -> Result<()> {
+        use crate::db::secure_key::{SecureKeyVersionState, ensure_namespace_conn};
+
+        ensure_namespace_conn(conn, "tool_media_subject_binding")?;
+        conn.execute(
+            "INSERT INTO secure_key_versions
+             (namespace, version, state, key_digest, created_at, updated_at)
+             VALUES (?1, 1, ?2, 'tool-media-test-key', ?3, ?3)",
+            params![
+                "tool_media_subject_binding",
+                SecureKeyVersionState::Active.as_str(),
+                10_i64,
+            ],
+        )?;
+        conn.execute(
+            "UPDATE secure_key_namespaces SET active_version = 1, updated_at = 10
+             WHERE namespace = 'tool_media_subject_binding'",
+            [],
+        )?;
+        Ok(())
+    }
 
     fn test_binding_receipt(session_id: Uuid) -> Vec<u8> {
         let mut bytes = vec![1, 1];
@@ -612,6 +722,11 @@ mod tests {
             .await
             .unwrap();
 
+        // The private deletion path must release an active ref before it
+        // removes the binding.  Model the production reserve → reachable row
+        // → activate order in this integration test.
+        db.write(setup_active_tool_media_key).await.unwrap();
+
         // Insert a binding.
         let insert = ToolMediaSubjectBindingInsertV1 {
             session_id: session.session_id,
@@ -633,9 +748,26 @@ mod tests {
             now_ms: 20,
         };
 
-        db.transaction(move |conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
-            .await
-            .unwrap();
+        db.transaction(move |conn| {
+            use crate::db::secure_key::{
+                ReserveResult, activate_consumer_ref_conn, reserve_consumer_ref_conn,
+            };
+            let reference_id = insert.secure_key_reference_id.clone();
+            let reservation = reserve_consumer_ref_conn(
+                conn,
+                &reference_id,
+                "tool_media_subject_binding",
+                1,
+                "tool_media_subject_binding",
+                "session/07070707070707070707070707070707",
+            )?;
+            assert!(matches!(reservation, ReserveResult::Reserved(_)));
+            Db::insert_tool_media_subject_binding_conn(conn, &insert)?;
+            assert!(activate_consumer_ref_conn(conn, &reference_id)?);
+            Ok(())
+        })
+        .await
+        .unwrap();
 
         // Verify binding exists.
         let row = db
@@ -663,6 +795,20 @@ mod tests {
             .await
             .unwrap();
         assert!(row.is_none());
+
+        let reference_id =
+            "tool-media-subject-binding/test/07070707070707070707070707070707/1".to_string();
+        let state = db
+            .read(move |conn| {
+                Ok(
+                    crate::db::secure_key::get_ref_by_id_conn(conn, &reference_id)?
+                        .expect("released ref is retained for reconciliation")
+                        .state,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, crate::db::secure_key::SecureKeyRefState::Releasing);
     }
 
     #[tokio::test]

@@ -650,41 +650,15 @@ impl Tool for ReadImageTool {
             return Err(invalid_input("exactly one of `path` or `url` is required"));
         }
 
-        // Fail closed when no server-private media authority is present.
-        // MCP/Monty/catalog/external-MCP stripped contexts have `None`;
-        // only the direct-native dispatch path carries a live authority.
-        if ctx.media_authority().is_none() {
-            bail!(
-                "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"
-            );
-        }
-
-        let authority = ctx.media_authority().unwrap();
-        let session_id = uuid::Uuid::from_bytes(authority.subject().session_id).to_string();
-
-        if let Some(path) = parsed.path.as_ref() {
-            let _handle = authority
-                .admit_local_path(&session_id, path)
-                .map_err(|e| invalid_input(format!("local path denied: {e}")))?;
-            // TODO: image processing and consumer behavior landed in
-            // `typed-media-attachment-authority-wiring` — not in this prompt.
-            bail!(
-                "media_attachment_authority_unavailable: image processing not yet wired in this build"
-            );
-        }
-
-        if let Some(url) = parsed.url.as_ref() {
-            let _source = authority
-                .admit_retained_https(&session_id, url)
-                .map_err(|e| invalid_input(format!("HTTPS source denied: {e}")))?;
-            // TODO: image processing and consumer behavior landed in
-            // `typed-media-attachment-authority-wiring` — not in this prompt.
-            bail!(
-                "media_attachment_authority_unavailable: image processing not yet wired in this build"
-            );
-        }
-
-        unreachable!("source_count check guarantees exactly one source");
+        // Consumer behavior is intentionally out of scope for this change.
+        // Do not ask the authority to admit a path/URL until a consumer can
+        // use its held handle or immutable retained object: admission itself
+        // may open or fetch a source.  Returning here preserves the no-I/O
+        // denial contract for both stripped and direct-native contexts.
+        let _ = (ctx, parsed);
+        bail!(
+            "media_attachment_authority_unavailable: image processing is not wired in this build"
+        );
     }
 }
 

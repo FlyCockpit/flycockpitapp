@@ -1861,7 +1861,6 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AgentTreeChanged { session_id, .. }
         | GoalSupervisionProgress { session_id, .. }
         | PrimarySwapped { session_id, .. }
-        | LlmModeChanged { session_id, .. }
         | SessionEnded { session_id, .. }
         | ScheduleStarted { session_id, .. }
         | ScheduleProgress { session_id, .. }

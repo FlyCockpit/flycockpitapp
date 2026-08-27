@@ -38,7 +38,7 @@ use crate::tui::textfield::TextField;
 use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
 use cockpit_config::extended::{
     ApprovalMode, Concurrency, DefaultPrimaryAgent, DiffStyle, InjectionResultAction,
-    InjectionThreshold, LlmMode, PredictNextMessage, ShellCompression, TextEmbeddedRecovery,
+    InjectionThreshold, PredictNextMessage, ShellCompression, TextEmbeddedRecovery,
     ThinkingDisplay, TuiConfig, VimModeSetting,
 };
 use cockpit_core::tools::command_resource_profiles::{
@@ -204,22 +204,6 @@ fn text_embedded_recovery_label(m: TextEmbeddedRecovery) -> &'static str {
     }
 }
 
-/// Harness-steering labels only. Mode is orthogonal to model trust: no label
-/// here implies data custody, and none of them changes redaction.
-fn llm_mode_label(m: LlmMode) -> &'static str {
-    match m {
-        LlmMode::Defensive => {
-            "defensive (default — explicit tool steering, more decomposition; weaker models; steering only)"
-        }
-        LlmMode::Normal => {
-            "normal (terse tool descriptions, episode sequencing; strong models; steering only)"
-        }
-        LlmMode::Frontier => {
-            "frontier (lean steering, high-autonomy; top-tier models; steering only)"
-        }
-    }
-}
-
 /// Which top-level category a [`CategoryPage`] renders. Drives the page
 /// title, the section intro, the row descriptor list, the reset scope, and
 /// the back-target cursor.
@@ -354,7 +338,6 @@ pub(super) enum SettingId {
 
     // ── Behavior ─────────────────────────────────────────────────────
     DefaultPrimaryAgent,
-    LlmMode,
     ApprovalMode,
     SandboxEscalationEnabled,
     PredictNextMessage,
@@ -453,7 +436,6 @@ pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::AttentionDesktop,
     SettingId::ExitTailLines,
     SettingId::DefaultPrimaryAgent,
-    SettingId::LlmMode,
     SettingId::ApprovalMode,
     SettingId::SandboxEscalationEnabled,
     SettingId::PredictNextMessage,
@@ -554,7 +536,6 @@ impl SettingId {
             SettingId::AttentionDesktop => "attention desktop",
             SettingId::ExitTailLines => "exit tail lines",
             SettingId::DefaultPrimaryAgent => "default agent",
-            SettingId::LlmMode => "llm mode",
             SettingId::ApprovalMode => "approval mode",
             SettingId::SandboxEscalationEnabled => "sandbox escalation",
             SettingId::PredictNextMessage => "predict next message",
@@ -735,20 +716,6 @@ impl SettingId {
                 "Which agent a brand-new session starts on. `build` starts on the \
                  coding agent; `plan` starts on the planning agent. You can still \
                  switch any time with /build or /plan."
-            }
-            SettingId::LlmMode => {
-                "How hard tools and prompts steer the model. `defensive` (default) \
-                 uses explicit, spelled-out tool descriptions and more task \
-                 decomposition — tuned for weaker ~120k-context models; `normal` \
-                 uses terse descriptions and episode-sequencing delegation for \
-                 strong models; `frontier` uses the leanest steering and \
-                 high-autonomy prompts for top-tier models. This global default is \
-                 not auto-detected — a provider or model Mode override wins over \
-                 it (known frontier models on standard providers are pinned to \
-                 `frontier` at discovery). Steering only: mode never changes \
-                 provider eligibility, data custody, or redaction. Model trust \
-                 alone decides whether inference requests are sent raw, and no \
-                 mode or locality implies trust."
             }
             SettingId::ApprovalMode => {
                 "When a command needs approval to leave the sandbox. `manual` \
@@ -1827,7 +1794,6 @@ fn category_rows(category: Category) -> Vec<Row> {
         ],
         Category::Behavior => vec![
             Setting(S::DefaultPrimaryAgent),
-            Setting(S::LlmMode),
             Setting(S::ApprovalMode),
             Setting(S::SandboxEscalationEnabled),
             Setting(S::PredictNextMessage),
@@ -2059,7 +2025,6 @@ impl SettingsCx {
             S::DefaultPrimaryAgent => {
                 default_primary_agent_label(e.default_primary_agent).to_string()
             }
-            S::LlmMode => llm_mode_label(e.llm_mode).to_string(),
             S::ApprovalMode => approval_mode_label(e.default_approval_mode).to_string(),
             S::SandboxEscalationEnabled => on_off(
                 e.sandbox_escalation_enabled,
@@ -2985,7 +2950,6 @@ impl SettingsCx {
             S::DefaultPrimaryAgent => {
                 e.default_primary_agent = e.default_primary_agent.cycled();
             }
-            S::LlmMode => e.llm_mode = e.llm_mode.cycled(),
             S::ApprovalMode => e.default_approval_mode = e.default_approval_mode.cycled(),
             S::SandboxEscalationEnabled => {
                 e.sandbox_escalation_enabled = !e.sandbox_escalation_enabled
@@ -3516,7 +3480,6 @@ impl SettingsCx {
                 let d = cockpit_config::extended::ExtendedConfig::default();
                 let e = &mut self.extended;
                 e.default_primary_agent = d.default_primary_agent;
-                e.llm_mode = d.llm_mode;
                 e.default_approval_mode = d.default_approval_mode;
                 e.sandbox_escalation_enabled = d.sandbox_escalation_enabled;
                 e.predict_next_message = d.predict_next_message;
@@ -3758,7 +3721,6 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::AttentionTitle => &["tui", "attention", "title"],
         S::AttentionBell => &["tui", "attention", "bell"],
         S::AttentionDesktop => &["tui", "attention", "desktop"],
-        S::LlmMode => &["llm_mode"],
         S::ApprovalMode => &["defaultApprovalMode"],
         S::SandboxEscalationEnabled => &["sandbox_escalation_enabled"],
         S::SandboxDefaultMode => &["sandbox", "defaultMode"],
@@ -4770,35 +4732,6 @@ mod descriptor_tests {
             SettingId::ApprovalMode.descriptor().help,
             "When a command needs approval to leave the sandbox. `manual` (default) asks you — you are the gate; `auto` lets the utility-model safety gate approve when possible and asks when unsafe or unavailable; `yolo` runs without approval prompts. Distinct from the `auto` *agent*."
         );
-    }
-
-    /// AC6 (picker/settings half). Mode copy must stay harness-steering only:
-    /// it may not claim, or let a reader infer, any custody or redaction
-    /// effect, and it must say model trust owns that decision.
-    #[test]
-    fn llm_mode_copy_never_implies_trust() {
-        let help = SettingId::LlmMode.descriptor().help;
-        assert!(
-            help.contains("mode never changes provider eligibility, data custody, or redaction"),
-            "llm mode help: {help}"
-        );
-        assert!(
-            help.contains("no mode or locality implies trust"),
-            "llm mode help: {help}"
-        );
-
-        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            let label = llm_mode_label(mode);
-            assert!(
-                label.contains("steering only"),
-                "{mode:?} label must stay steering-only: {label}"
-            );
-            let lowered = label.to_ascii_lowercase();
-            assert!(
-                !lowered.contains("trust") && !lowered.contains("redact"),
-                "{mode:?} label must not mention custody: {label}"
-            );
-        }
     }
 }
 

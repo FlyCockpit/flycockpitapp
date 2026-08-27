@@ -86,7 +86,7 @@ impl HostContext {
             context_usage: ctx.context_usage,
             child_events,
             builtin_registry: ctx.mcp_builtin_registry.clone(),
-            native_tool_ctx: Some(ctx.clone()),
+            native_tool_ctx: Some(ctx.clone_stripped()),
             scan_tool_results: true,
             #[cfg(test)]
             test_builtin_gate: None,

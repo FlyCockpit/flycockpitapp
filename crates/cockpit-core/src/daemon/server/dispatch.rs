@@ -25531,6 +25531,7 @@ async fn run_docs_ask_pipeline(
         lock_identity: None,
         write_scope: None,
         credential_store: Some(store),
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     };
     let locks = Arc::new(
         crate::locks::LockManager::from_db(db)

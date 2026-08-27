@@ -7433,6 +7433,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             lock_identity: None,
             write_scope,
             credential_store: session.provider_credential_store(&config.providers()).ok(),
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         },
     )
     .context("loading recovered recursive noninteractive child")?;
@@ -8034,6 +8035,8 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         events: Some(tx.clone()),
         lsp: None,
         resource_scheduler: resource_scheduler.clone(),
+        media_authority: None,
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         env_overlay: agent.env_overlay.clone(),
         config: config.clone(),
     };
@@ -9464,6 +9467,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     lock_identity: None,
                     write_scope: resolved_write_scope,
                     credential_store: session.provider_credential_store(&config.providers()).ok(),
+                    media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
                 };
                 let nested_steer_target = match (agent_instance_id, steer_target.as_ref()) {
                     (Some(parent_agent_instance_id), Some(parent_target)) => {
@@ -9819,6 +9823,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         lock_identity: None,
                         write_scope: resolved_write_scope,
                         credential_store: session
+                        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
                             .provider_credential_store(&config.providers())
                             .ok(),
                     };

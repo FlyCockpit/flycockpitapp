@@ -589,6 +589,8 @@ mod safety_gate_tests {
             events: None,
             lsp: None,
             resource_scheduler: None,
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }

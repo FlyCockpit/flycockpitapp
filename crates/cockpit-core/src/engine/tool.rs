@@ -1150,6 +1150,48 @@ pub struct ToolCtx {
     /// machine/user queue.
     #[allow(dead_code)]
     pub resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    /// Server-private media authority for direct-native media tools.
+    /// `None` in stripped/MCP/Monty/catalog contexts and tests; set only by
+    /// the daemon/session-worker production composition on the direct-native
+    /// dispatch path. `HostContext::from_tool_ctx` creates a structurally
+    /// stripped clone with this field set to `None`, so MCP/Monty/external-MCP
+    /// paths never inherit media authority. Media tools fail closed when this
+    /// is `None`.
+    pub(crate) media_authority: Option<Arc<crate::tool_media_authority::SessionMediaAuthority>>,
+    /// Data-free media tool availability snapshot, created from the live
+    /// authority before `ToolCtx` via `SpawnArgs`. Carries no principal,
+    /// source, attachment, grant, or bypass data. Controls whether
+    /// direct-native media tools are registered on the toolbox at all.
+    pub media_availability: crate::tool_media_authority::MediaToolAvailability,
+}
+
+impl ToolCtx {
+    /// Access the server-private media authority. Returns `None` in
+    /// stripped/MCP/Monty contexts — media tools fail closed.
+    pub fn media_authority(&self) -> Option<&crate::tool_media_authority::SessionMediaAuthority> {
+        self.media_authority.as_deref()
+    }
+
+    /// Attach a media authority to this context. Production-only; the
+    /// daemon/session-worker composition calls this on the direct-native
+    /// dispatch path. Test-only constructors may use fakes.
+    pub(crate) fn with_media_authority(
+        mut self,
+        authority: Arc<crate::tool_media_authority::SessionMediaAuthority>,
+    ) -> Self {
+        self.media_authority = Some(authority);
+        self
+    }
+
+    /// Create a structurally stripped clone — media authority removed.
+    /// This is what `HostContext::from_tool_ctx` uses so MCP/Monty/catalog
+    /// paths never inherit media authority.
+    pub(crate) fn clone_stripped(&self) -> Self {
+        Self {
+            media_authority: None,
+            ..self.clone()
+        }
+    }
 }
 
 /// A per-agent description override for a single tool, carried on the

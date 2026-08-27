@@ -639,7 +639,7 @@ impl Tool for ReadImageTool {
         Some(self.parameters())
     }
 
-    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let parsed = ReadImageArgs::from_value(&args)?;
 
         let source_count = [parsed.path.is_some(), parsed.url.is_some()]
@@ -650,9 +650,43 @@ impl Tool for ReadImageTool {
             return Err(invalid_input("exactly one of `path` or `url` is required"));
         }
 
-        bail!(
-            "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"
+        // Fail closed when no server-private media authority is present.
+        // MCP/Monty/catalog/external-MCP stripped contexts have `None`;
+        // only the direct-native dispatch path carries a live authority.
+        if ctx.media_authority().is_none() {
+            bail!(
+                "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"
+            );
+        }
+
+        let authority = ctx.media_authority().unwrap();
+        let session_hex = crate::tool_media_authority::revalidator::hex::encode(
+            &authority.subject().session_id,
         );
+
+        if let Some(path) = parsed.path.as_ref() {
+            let _handle = authority
+                .admit_local_path(&session_hex, path)
+                .map_err(|e| invalid_input(format!("local path denied: {e}")))?;
+            // TODO: image processing and consumer behavior landed in
+            // `typed-media-attachment-authority-wiring` — not in this prompt.
+            bail!(
+                "media_attachment_authority_unavailable: image processing not yet wired in this build"
+            );
+        }
+
+        if let Some(url) = parsed.url.as_ref() {
+            let _source = authority
+                .admit_retained_https(&session_hex, url)
+                .map_err(|e| invalid_input(format!("HTTPS source denied: {e}")))?;
+            // TODO: image processing and consumer behavior landed in
+            // `typed-media-attachment-authority-wiring` — not in this prompt.
+            bail!(
+                "media_attachment_authority_unavailable: image processing not yet wired in this build"
+            );
+        }
+
+        unreachable!("source_count check guarantees exactly one source");
     }
 }
 

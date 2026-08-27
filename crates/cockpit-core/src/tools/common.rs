@@ -418,6 +418,8 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             events: None,
             lsp: None,
             resource_scheduler: None,
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         },

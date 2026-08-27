@@ -2978,6 +2978,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         lock_identity: None,
         write_scope: None,
         credential_store: None,
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     }
 }
 

@@ -240,6 +240,11 @@ pub struct SpawnArgs {
     /// Vault-backed credential store for delegated model construction.
     /// Production session/driver spawns pass `Some`; tests may leave `None`.
     pub credential_store: Option<crate::credentials::CredentialStore>,
+    /// Data-free media tool availability snapshot, created from the live
+    /// authority before `ToolCtx`. Controls whether direct-native media
+    /// tools are registered on the toolbox. Carries no principal, source,
+    /// attachment, grant, or bypass data.
+    pub media_availability: crate::tool_media_authority::MediaToolAvailability,
 }
 
 impl SpawnArgs {
@@ -3676,6 +3681,7 @@ mod tests {
             lock_identity: None,
             write_scope: None,
             credential_store: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         }
     }
 

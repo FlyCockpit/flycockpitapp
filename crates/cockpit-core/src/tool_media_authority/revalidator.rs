@@ -267,7 +267,7 @@ impl ToolMediaSubjectRevalidator {
 
 /// Minimal hex encoding (avoids pulling in a hex crate dependency just for
 /// the session-id string used in epoch lookups).
-mod hex {
+pub(crate) mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }

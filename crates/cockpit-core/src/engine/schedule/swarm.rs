@@ -737,6 +737,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         lock_identity: None,
         write_scope: None,
         credential_store: scoped_store,
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     };
     // The recursive worker unit is `bee` (GOALS §24/§26): a noninteractive,
     // write-capable, parallel worker that may itself fan out deeper `bee`

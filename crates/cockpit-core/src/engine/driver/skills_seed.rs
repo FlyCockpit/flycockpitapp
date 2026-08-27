@@ -339,6 +339,8 @@ impl Driver {
             events: None,
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config: self.config.clone(),
             env_overlay: agent.env_overlay.clone(),
         };

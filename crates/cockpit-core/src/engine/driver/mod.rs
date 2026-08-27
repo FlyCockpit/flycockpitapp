@@ -4000,6 +4000,8 @@ impl Driver {
             events: Some(tx.clone()),
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             env_overlay: agent.env_overlay.clone(),
             config: self.config.clone(),
         };
@@ -12287,6 +12289,7 @@ impl Driver {
             // resolve a `$secret:` owned by (provider, this workspace). See
             // `named-secret-ownership-boundary`.
             credential_store: self
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
                 .session
                 .provider_credential_store(&self.config.providers())
                 .ok(),

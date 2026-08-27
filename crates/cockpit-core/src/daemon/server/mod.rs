@@ -3775,6 +3775,12 @@ pub(crate) async fn boot_with_db(
             .await
             .context("media retention recovery")?;
     }
+    run_retention_pass(
+        db.clone(),
+        retention_config(),
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
     timer.phase("media_upload_reconcile");
     // Shared host-capability probes run once here. The TUI in-process doctor
     // snapshot is not the daemon's capability authority.
@@ -4143,12 +4149,6 @@ async fn run_boot_housekeeping(db: &Db) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "sweeping empty display sessions on boot failed"),
     }
-    run_retention_pass(
-        db.clone(),
-        retention_config(),
-        chrono::Utc::now().timestamp(),
-    )
-    .await;
     // Durable task executors are recovered by the owning session worker. A
     // daemon restart is not evidence that a running child was lost; marking
     // every live row failed here would discard its exact lifecycle claim,

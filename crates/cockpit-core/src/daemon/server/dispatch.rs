@@ -5615,7 +5615,7 @@ async fn handle_serialized_request_impl(
             // closed rather than grow it without bound: the just-minted
             // capability is dropped (never stored), so it can never be applied.
             let minting_session = state.terminal_context.client_instance_id;
-            let stored = ctx.sealed_owner_capabilities.lock().unwrap().insert(
+            let stored = crate::sync::lock_or_recover(&ctx.sealed_owner_capabilities).insert(
                 result.capability,
                 minting_session,
                 now_ms,

@@ -14728,7 +14728,7 @@ async fn retention_tick_runs_one_pass_without_sleep() {
 
 #[test]
 fn media_preview_encode_fails_closed_before_write_when_oversize() {
-    let oversize = vec![0_u8; proto::MAX_NDJSON_FRAME_BYTES];
+    let oversize = vec![0_u8; proto::MAX_SERIALIZED_RESPONSE_BYTES];
     let error = encode_media_attachment_preview(oversize).expect_err("oversize preview");
     assert_eq!(error.code, ErrorCode::BadRequest);
     assert_eq!(

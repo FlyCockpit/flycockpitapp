@@ -1015,7 +1015,7 @@ impl GrantStore {
                     rusqlite::params![
                         &grant_id,
                         &scope_str,
-                        session_param.as_ref(),
+                        session_param.as_deref(),
                         &project_id,
                         &plan_digest,
                         &output_path_authority,
@@ -1059,7 +1059,7 @@ impl GrantStore {
                         rusqlite::params![
                             now,
                             &scope_str,
-                            session_param.as_ref(),
+                            session_param.as_deref(),
                             &project_id,
                             &plan_digest,
                         ],

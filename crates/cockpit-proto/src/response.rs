@@ -445,6 +445,13 @@ pub enum Response {
         request_hash: String,
         flow_id: String,
         authorize_url: String,
+        /// RFC 8628 device-flow user code. Present only for device grants.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification_uri: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification_uri_complete: Option<String>,
     },
     /// Completion result for a daemon-owned MCP OAuth flow.
     #[serde(rename = "mcp_oauth_completed")]
@@ -1598,6 +1605,9 @@ mod tests {
             request_hash: "00".repeat(32),
             flow_id: "flow-opaque".into(),
             authorize_url: "https://auth.example.test/authorize?state=daemon-state".into(),
+            user_code: None,
+            verification_uri: None,
+            verification_uri_complete: None,
         })
         .unwrap();
         assert!(started.contains("flow-opaque"));

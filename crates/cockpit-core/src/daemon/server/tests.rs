@@ -11893,6 +11893,9 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
             request_hash: "00".repeat(32),
             flow_id: Uuid::new_v4().to_string(),
             authorize_url: "https://mcp.example/authorize?state=def&code_challenge=PUB-CHALLENGE".into(),
+            user_code: None,
+            verification_uri: None,
+            verification_uri_complete: None,
         },
     ];
     for response in &started {

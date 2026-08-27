@@ -1777,6 +1777,9 @@ enum PendingMcpOAuth {
         begin_client_operation_id: String,
         flow_id: String,
         authorize_url: String,
+        user_code: Option<String>,
+        verification_uri: Option<String>,
+        verification_uri_complete: Option<String>,
     },
     Completed {
         server: String,
@@ -4074,18 +4077,29 @@ impl SettingsCx {
                             request_hash,
                             flow_id,
                             authorize_url,
+                            user_code,
+                            verification_uri,
+                            verification_uri_complete,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
                         && request_hash == expected_request_hash =>
                     {
+                        let message = if user_code.is_some() {
+                            "MCP device flow started; confirm the code in a browser".to_string()
+                        } else {
+                            "MCP OAuth started; open the authorization URL".to_string()
+                        };
                         self.pending_mcp_oauth = Some(PendingMcpOAuth::Started {
                             server,
                             begin_client_operation_id: client_operation_id,
                             flow_id,
                             authorize_url,
+                            user_code,
+                            verification_uri,
+                            verification_uri_complete,
                         });
-                        Ok("MCP OAuth started; open the authorization URL".to_string())
+                        Ok(message)
                     }
                     (
                         SettingsMutationAction::McpOAuthComplete {

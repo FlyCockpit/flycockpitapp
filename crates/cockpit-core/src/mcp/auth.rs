@@ -567,7 +567,7 @@ pub fn build_authorize_url(
 /// Encode an `application/x-www-form-urlencoded` body (reqwest is built
 /// without the `urlencoded` feature, so we encode manually like the rest
 /// of `auth/`).
-fn form_body(pairs: &[(&str, &str)]) -> String {
+pub(crate) fn form_body(pairs: &[(&str, &str)]) -> String {
     pairs
         .iter()
         .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
@@ -666,7 +666,7 @@ async fn refresh_token(oauth: &OauthAuth, refresh: &str) -> Result<StoredTokens>
     Ok(tokens)
 }
 
-fn oauth_http_client() -> Result<reqwest::Client> {
+pub(crate) fn oauth_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(OAUTH_CONNECT_TIMEOUT)
         .timeout(OAUTH_TOTAL_TIMEOUT)
@@ -894,6 +894,8 @@ mod tests {
             token_url: Some("https://provider.example/token".into()),
             client_id: Some("client".into()),
             scopes: vec!["read".into()],
+            device_authorization_endpoint: None,
+            issuer: None,
         });
         let (flow, url) = begin_oauth_flow("srv", &cfg, false)
             .await
@@ -959,6 +961,8 @@ mod tests {
             token_url: Some("https://auth.example.com/token".into()),
             client_id: Some("cid".into()),
             scopes: vec!["read".into(), "write".into()],
+            device_authorization_endpoint: None,
+            issuer: None,
         };
         let url =
             build_authorize_url(&oauth, "http://127.0.0.1:1234/callback", "chal", "st").unwrap();

@@ -569,8 +569,8 @@ describe("cockpit-proto daemon wire schemas", () => {
     );
   });
 
-  it("config_refreshed_typescript_mirror_is_v22", () => {
-    expect(PROTOCOL_VERSION).toBe(22);
+  it("config_refreshed_typescript_mirror_is_v23", () => {
+    expect(PROTOCOL_VERSION).toBe(23);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );

@@ -6392,6 +6392,9 @@ fn mcp_oauth_ui_retains_public_url_and_accepts_manual_callback() {
         begin_client_operation_id: "begin".into(),
         flow_id: "flow-id".into(),
         authorize_url: "https://auth.example.test/authorize".into(),
+        user_code: None,
+        verification_uri: None,
+        verification_uri_complete: None,
         callback,
         status: None,
     };

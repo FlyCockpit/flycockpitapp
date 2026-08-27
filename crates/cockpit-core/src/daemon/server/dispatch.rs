@@ -1759,6 +1759,9 @@ struct StoredMcpOAuthFlow {
     owner: String,
     begin_client_operation_id: String,
     authorize_url: String,
+    user_code: Option<String>,
+    verification_uri: Option<String>,
+    verification_uri_complete: Option<String>,
     created_at: Instant,
     flow: McpOAuthFlow,
 }
@@ -1993,6 +1996,9 @@ impl OAuthFlowStore {
                 owner,
                 begin_client_operation_id,
                 authorize_url,
+                user_code: None,
+                verification_uri: None,
+                verification_uri_complete: None,
                 created_at: Instant::now(),
                 flow: McpOAuthFlow::Ready(flow),
             },
@@ -12813,6 +12819,9 @@ async fn handle_serialized_request_impl(
                         request_hash,
                         flow_id,
                         authorize_url: authorize_url.expose().to_owned(),
+                        user_code: None,
+                        verification_uri: None,
+                        verification_uri_complete: None,
                     });
                 }
                 LocalOperationStart::Replay(response) => return Ok(response),
@@ -12869,6 +12878,9 @@ async fn handle_serialized_request_impl(
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id,
                     authorize_url,
+                    user_code: None,
+                    verification_uri: None,
+                    verification_uri_complete: None,
                 };
                 let receipt = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
@@ -12878,6 +12890,9 @@ async fn handle_serialized_request_impl(
                         _ => unreachable!(),
                     },
                     authorize_url: String::new(),
+                    user_code: None,
+                    verification_uri: None,
+                    verification_uri_complete: None,
                 };
                 finish_local_operation(
                     ctx,
@@ -12928,12 +12943,18 @@ async fn handle_serialized_request_impl(
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: flow_id.clone(),
                     authorize_url: authorize_url.expose().to_owned(),
+                    user_code: None,
+                    verification_uri: None,
+                    verification_uri_complete: None,
                 };
                 let receipt = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id,
                     authorize_url: String::new(),
+                    user_code: None,
+                    verification_uri: None,
+                    verification_uri_complete: None,
                 };
                 finish_local_operation(
                     ctx,
@@ -12957,6 +12978,70 @@ async fn handle_serialized_request_impl(
                 #[cfg(feature = "remote")]
                 remote_operation,
             );
+            let device_oauth = match &server_config.auth {
+                crate::mcp::config::Auth::Oauth(oauth)
+                    if oauth.device_authorization_endpoint.is_some() =>
+                {
+                    Some(oauth.clone())
+                }
+                _ => None,
+            };
+            if let Some(oauth) = device_oauth {
+                // TODO: remote-owner MCP device flow should present the user
+                // code on the remote client rather than opening a host browser.
+                let device = match crate::mcp::device::request_device_authorization(&oauth).await {
+                    Ok(device) => device,
+                    Err(cause) => {
+                        let error = internal(cause);
+                        let terminal_error = settle_failed_oauth_begin(
+                            ctx,
+                            owner,
+                            client_operation_id,
+                            request_hash,
+                            fencing_generation,
+                            &error,
+                        )
+                        .await?;
+                        return Err(terminal_error);
+                    }
+                };
+                let flow_id = uuid::Uuid::new_v4().to_string();
+                let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let response = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    authorize_url: device.verification_uri_complete.clone(),
+                    user_code: Some(device.user_code.clone()),
+                    verification_uri: Some(device.verification_uri.clone()),
+                    verification_uri_complete: Some(device.verification_uri_complete.clone()),
+                };
+                // Poll in the daemon; CancelMcpOAuth flips the Completing fence.
+                let poll_oauth = oauth.clone();
+                let poll_code = device.device_code.clone();
+                let poll_cancel = cancelled.clone();
+                tokio::spawn(async move {
+                    let interval = device.interval_secs;
+                    let _ = crate::mcp::device::run_device_poll_loop(
+                        interval,
+                        poll_cancel,
+                        || crate::mcp::device::poll_device_token(&poll_oauth, &poll_code),
+                    )
+                    .await;
+                });
+                let _ = cancelled;
+                let _ = flow_id;
+                finish_local_operation(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &response,
+                )
+                .await?;
+                return Ok(response);
+            }
             let (flow, authorize_url) =
                 match crate::mcp::auth::begin_oauth_flow(&server, &server_config, local_display)
                     .await
@@ -12988,12 +13073,18 @@ async fn handle_serialized_request_impl(
                 request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id: flow_id.clone(),
                 authorize_url: authorize_url.clone(),
+                user_code: None,
+                verification_uri: None,
+                verification_uri_complete: None,
             };
             let receipt = Response::McpOAuthStarted {
                 client_operation_id: client_operation_id.clone(),
                 request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id: flow_id.clone(),
                 authorize_url: String::new(),
+                user_code: None,
+                verification_uri: None,
+                verification_uri_complete: None,
             };
             let durable_flow_copy_result = match serde_json::to_vec(&pending.flow).map_err(internal)
             {

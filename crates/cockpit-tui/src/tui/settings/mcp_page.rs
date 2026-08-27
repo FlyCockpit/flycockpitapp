@@ -54,6 +54,9 @@ pub(super) struct McpOAuthState {
     pub(super) begin_client_operation_id: String,
     pub(super) flow_id: String,
     pub(super) authorize_url: String,
+    pub(super) user_code: Option<String>,
+    pub(super) verification_uri: Option<String>,
+    pub(super) verification_uri_complete: Option<String>,
     pub(super) callback: TextField,
     pub(super) status: Option<String>,
 }
@@ -471,18 +474,31 @@ impl SettingsCx {
                     begin_client_operation_id,
                     flow_id,
                     authorize_url,
+                    user_code,
+                    verification_uri,
+                    verification_uri_complete,
                 } => {
+                    let status = if let Some(code) = user_code.as_ref() {
+                        let complete = verification_uri_complete
+                            .as_deref()
+                            .or(verification_uri.as_deref())
+                            .unwrap_or(authorize_url.as_str());
+                        format!("Open {complete} and confirm this code: {code}")
+                    } else {
+                        "open the authorize URL, then paste the callback or code below".into()
+                    };
                     s.oauth = Some(McpOAuthState {
                         server,
                         begin_client_operation_id,
                         flow_id,
                         authorize_url,
+                        user_code,
+                        verification_uri,
+                        verification_uri_complete,
                         callback: TextField::default(),
                         status: None,
                     });
-                    s.status = Some(
-                        "open the authorize URL, then paste the callback or code below".into(),
-                    );
+                    s.status = Some(status);
                 }
                 super::PendingMcpOAuth::Completed { server, flow_id } => {
                     if s.oauth
@@ -1427,6 +1443,8 @@ fn build_server_from_editor(name: &str, s: &AddState) -> Result<BuiltServerFromE
             token_url: nonempty_option(s.oauth_token_url.text()),
             client_id: nonempty_option(s.oauth_client_id.text()),
             scopes: split_words(s.oauth_scopes.text()),
+            device_authorization_endpoint: None,
+            issuer: None,
         }),
     };
     let enabled = if matches!(&auth, Auth::Oauth(o) if o.authorize_url.is_none() || o.token_url.is_none())
@@ -1448,6 +1466,7 @@ fn build_server_from_editor(name: &str, s: &AddState) -> Result<BuiltServerFromE
         cache_ttl_secs,
         connect_timeout_secs,
         timeout_secs,
+        profiles: BTreeMap::new(),
     };
     match s.transport {
         Transport::Stdio => {
@@ -1945,6 +1964,8 @@ mod tests {
                     token_url: Some("https://auth.example/token".into()),
                     client_id: None,
                     scopes: vec![],
+                    device_authorization_endpoint: None,
+                    issuer: None,
                 }),
                 true,
             ),

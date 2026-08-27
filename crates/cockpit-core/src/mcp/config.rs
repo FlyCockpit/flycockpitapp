@@ -106,6 +106,14 @@ pub struct OauthAuth {
     /// Requested scopes, space-joined into the auth request.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
+    /// RFC 8628 device-authorization endpoint. When set, MCP OAuth uses
+    /// device flow instead of a loopback redirect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_authorization_endpoint: Option<String>,
+    /// Optional RFC 8414 issuer used to discover the device endpoint when
+    /// only the issuer is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
 }
 
 /// Static-header config: a header name + value. The value may carry
@@ -764,6 +772,8 @@ mod tests {
                     token_url: Some("https://idp.example.test/token".into()),
                     client_id: Some("client".into()),
                     scopes: vec![],
+                    device_authorization_endpoint: None,
+                    issuer: None,
                 }),
                 ..server(Auth::None)
             },

@@ -2333,7 +2333,15 @@ impl Driver {
         };
         self.schedule
             .set_agent(self.stack[active_idx].agent.clone());
-        self.refresh_active_model_for_turn(active_idx, tx).await;
+        // Modes AC5 turn-consumption: consume any pending per-node session
+        // override for the active node into effect at this turn boundary. The
+        // llm-mode axis is applied per-frame (below); the sandbox axis is
+        // applied through the session posture (see the method) — verification
+        // and question axes are consumed into the node's effective override and
+        // await their resolver-site application (documented follow-on).
+        let llm_override = self.consume_active_node_override_for_turn(active_idx).await;
+        self.refresh_active_model_for_turn(active_idx, llm_override, tx)
+            .await;
         self.refresh_active_tool_surface_for_turn(active_idx, tx)
             .await;
         if self.prompt_cache_retention_override.is_some() {
@@ -2341,9 +2349,71 @@ impl Driver {
         }
     }
 
+    /// Consume any pending per-node session override for the active node into
+    /// its effective override at this turn boundary (modes AC5 "second
+    /// transaction": pending is merged into effective and cleared; the revision
+    /// is unchanged). Returns the LLM-mode axis to apply to this frame's next
+    /// turn (or `None` to keep the config-resolved mode).
+    ///
+    /// Application status by axis:
+    ///  - `mode`: applied per-frame by the caller (returned here) — isolated, an
+    ///    ancestor/sibling frame is never affected.
+    ///  - `sandbox`: applied to the session posture below. This is session-scoped
+    ///    in the current architecture; true per-node sandbox isolation across
+    ///    concurrent delegated turns needs a node-aware read seam at
+    ///    `turn_toolbox` (documented follow-on). Only applied when the node
+    ///    actually carries a sandbox override, so the no-override path leaves
+    ///    existing sandbox behavior untouched.
+    ///  - `verification`/`question`: consumed into the node's effective override
+    ///    and surfaced in the effective-settings snapshot, but their execution
+    ///    application lives at the verification/question resolver sites and is
+    ///    not yet wired (follow-on).
+    async fn consume_active_node_override_for_turn(
+        &mut self,
+        active_idx: usize,
+    ) -> Option<crate::config::extended::LlmMode> {
+        let node_id = self
+            .stack
+            .get(active_idx)
+            .and_then(|frame| frame.agent_instance_id)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let effective = match self
+            .session
+            .db
+            .consume_pending_agent_override(self.session.id, node_id, now)
+            .await
+        {
+            Ok(effective) => effective?,
+            Err(error) => {
+                tracing::warn!(
+                    %node_id,
+                    error = %error,
+                    "consuming per-node session override failed; keeping current settings"
+                );
+                return None;
+            }
+        };
+        if let Some(sandbox) = effective
+            .sandbox
+            .as_deref()
+            .and_then(crate::daemon::agent_session_override::sandbox_from_label)
+        {
+            self.session.set_sandbox_mode(sandbox);
+        }
+        effective
+            .llm_mode
+            .as_deref()
+            .and_then(crate::daemon::agent_session_override::mode_from_label)
+    }
+
     async fn refresh_active_model_for_turn(
         &mut self,
         active_idx: usize,
+        // A per-node session override consumed at this turn boundary (modes AC5):
+        // when present it replaces the config-resolved mode for THIS frame only,
+        // so an ancestor or sibling frame is never affected. It has already been
+        // authorized non-escalating by the daemon.
+        llm_override: Option<crate::config::extended::LlmMode>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
         let running = self.stack[active_idx].agent.model.clone();
@@ -2352,7 +2422,8 @@ impl Driver {
         let old_llm_mode = self.stack[active_idx].agent.llm_mode;
         match self.build_live_model_for_running(&running, &provider, &model) {
             Ok(new_model) => {
-                let llm_mode = self.effective_llm_mode_for(&provider, &model);
+                let llm_mode =
+                    llm_override.unwrap_or_else(|| self.effective_llm_mode_for(&provider, &model));
                 let new_model = Arc::new(new_model);
                 let selection = self.active_selection_for_model(&new_model);
                 let refreshed =
@@ -3910,14 +3981,12 @@ impl Driver {
         };
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
-        // TODO(modes AC5 turn-consumption): consume any pending per-node session
-        // override for the active node here (this is the AC5 "second transaction"
-        // boundary). DB side is ready + tested: `Db::consume_pending_agent_override(
-        // session_id, agent_instance_id, now)` merges pending into effective and
-        // clears pending; active node id is
-        // `self.stack.last().and_then(|f| f.agent_instance_id)`. Applying the
-        // effective sandbox/mode requires node-aware reads (or root->session
-        // mapping) and MUST be compiled + turn-loop-tested — not spliced in blind.
+        // Modes AC5 turn-consumption is wired in `refresh_active_frame_for_turn`
+        // (below): `consume_active_node_override_for_turn` runs the AC5 "second
+        // transaction" for the active node (mode applied per-frame, sandbox to the
+        // session posture). Follow-on: per-node sandbox isolation across concurrent
+        // delegated turns, and verification/question application at their resolver
+        // sites.
         // Pin the session config snapshot for this turn's duration: a
         // re-resolution that lands mid-turn is observed only at the next turn
         // boundary (`engine-config-snapshot-adoption`).
@@ -9238,14 +9307,12 @@ impl Driver {
         self.preempt_self_improvement_review_for_foreground();
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
-        // TODO(modes AC5 turn-consumption): consume any pending per-node session
-        // override for the active node here (this is the AC5 "second transaction"
-        // boundary). DB side is ready + tested: `Db::consume_pending_agent_override(
-        // session_id, agent_instance_id, now)` merges pending into effective and
-        // clears pending; active node id is
-        // `self.stack.last().and_then(|f| f.agent_instance_id)`. Applying the
-        // effective sandbox/mode requires node-aware reads (or root->session
-        // mapping) and MUST be compiled + turn-loop-tested — not spliced in blind.
+        // Modes AC5 turn-consumption is wired in `refresh_active_frame_for_turn`
+        // (below): `consume_active_node_override_for_turn` runs the AC5 "second
+        // transaction" for the active node (mode applied per-frame, sandbox to the
+        // session posture). Follow-on: per-node sandbox isolation across concurrent
+        // delegated turns, and verification/question application at their resolver
+        // sites.
         // Pin the session config snapshot for this turn's duration: a
         // re-resolution that lands mid-turn is observed only at the next turn
         // boundary (`engine-config-snapshot-adoption`).

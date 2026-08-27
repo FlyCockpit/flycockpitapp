@@ -100,7 +100,7 @@ fn sandbox_label(mode: SandboxMode) -> &'static str {
     }
 }
 
-fn sandbox_from_label(label: &str) -> Option<SandboxMode> {
+pub(crate) fn sandbox_from_label(label: &str) -> Option<SandboxMode> {
     match label {
         "off" => Some(SandboxMode::Off),
         "sandbox" => Some(SandboxMode::Sandbox),
@@ -118,7 +118,7 @@ fn mode_label(mode: LlmMode) -> &'static str {
     }
 }
 
-fn mode_from_label(label: &str) -> Option<LlmMode> {
+pub(crate) fn mode_from_label(label: &str) -> Option<LlmMode> {
     match label {
         "defensive" => Some(LlmMode::Defensive),
         "normal" => Some(LlmMode::Normal),

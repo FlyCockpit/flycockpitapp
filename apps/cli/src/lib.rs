@@ -294,26 +294,33 @@ pub mod integration {
         ) -> Result<()> {
             match self
                 .inner
-                .request_ok(crate::daemon::proto::Request::SendUserMessage {
-                    expected_model_state_generation: None,
-                    expected_model: None,
-                    client_submission_id: Uuid::new_v4(),
-                    text: text.into(),
-                    display_text,
-                    tag_expansions: tag_expansions
-                        .into_iter()
-                        .map(
-                            |(tool, path, detail, ok)| crate::daemon::proto::TagExpansionMeta {
-                                tool,
-                                path,
-                                detail,
-                                ok,
+                .request_ok(crate::daemon::proto::Request::SendUserMessageV2 {
+                    ingress:
+                        crate::daemon::proto::send_user_message_v2::MessageIngressV2::local_direct(
+                            Uuid::now_v7(),
+                            "local-owner",
+                            None,
+                            None,
+                            None,
+                            crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
+                                client_submission_id: Uuid::new_v4(),
+                                text: text.into(),
+                                display_text,
+                                tag_expansions: tag_expansions
+                                    .into_iter()
+                                    .map(
+                                        |(tool, path, detail, ok)| crate::daemon::proto::TagExpansionMeta {
+                                            tool,
+                                            path,
+                                            detail,
+                                            ok,
+                                        },
+                                    )
+                                    .collect(),
+                                forced_skill: None,
+                                attachments: Vec::new(),
                             },
-                        )
-                        .collect(),
-                    image_refs: Vec::new(),
-                    forced_skill: None,
-                    run_invocation_options: None,
+                        ),
                 })
                 .await?
             {

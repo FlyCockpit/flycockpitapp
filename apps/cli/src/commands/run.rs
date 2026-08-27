@@ -35,7 +35,10 @@ use uuid::Uuid;
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
 use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient};
-use crate::daemon::proto::{self, Request, Response};
+use crate::daemon::proto::{
+    self, Request, Response,
+    send_user_message_v2::MessageIngressV2,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -616,17 +619,26 @@ pub(crate) async fn attach_send_pump(
                 .await
         } else {
             let image_refs = load_and_upload_images(client, options.image_data).await?;
+            // TODO(#69): convert `image_refs` into typed `MessageAttachmentIdentity`
+            // records via the typed-upload pipeline and send as V2 attachments.
+            let _ = image_refs;
             client
-                .request(Request::SendUserMessage {
-                    expected_model_state_generation: None,
-                    expected_model: None,
-                    client_submission_id,
-                    text: prompt,
-                    display_text: None,
-                    tag_expansions: Vec::new(),
-                    image_refs,
-                    forced_skill: None,
-                    run_invocation_options: options.run_invocation_options.clone(),
+                .request(Request::SendUserMessageV2 {
+                    ingress: MessageIngressV2::local_direct(
+                    Uuid::now_v7(),
+                    "session",
+                    None,
+                    None,
+                    options.run_invocation_options.clone(),
+                    crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
+                        client_submission_id,
+                        text: prompt,
+                        display_text: None,
+                        tag_expansions: Vec::new(),
+                        forced_skill: None,
+                        attachments: Vec::new(),
+                    },
+                ),
                 })
                 .await
         }
@@ -2124,6 +2136,7 @@ mod tests {
 
     #[test]
     fn run_permission_mode_uses_submission_id_and_immutable_options() {
+        use crate::daemon::proto::send_user_message_v2::MessageIngressV2;
         use crate::daemon::proto::{ApprovalMode, Request, RunInvocationOptions};
         use uuid::Uuid;
 
@@ -2135,16 +2148,22 @@ mod tests {
             timeout_ms: None,
             approval_mode: Some(ApprovalMode::Yolo),
         };
-        let send = Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id: id,
-            text: "go".into(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: None,
-            run_invocation_options: Some(options.clone()),
+        let send = Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            Some(options.clone()),
+            crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: id,
+                text: "go".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        ),
         };
         let json = serde_json::to_value(&send).unwrap();
         assert_eq!(json["request"], "send_user_message");
@@ -2167,17 +2186,18 @@ mod tests {
         };
         assert_eq!(set.wire_tag(), "set_approval_mode");
         assert_ne!(set.wire_tag(), send.wire_tag());
-        // Shared envelope requires SendUserMessage with options marker.
+        // Shared envelope requires SendUserMessageV2 with options marker.
         match send {
-            Request::SendUserMessage {
-                client_submission_id,
-                run_invocation_options: Some(opts),
-                ..
+            Request::SendUserMessageV2 {
+                ingress: cockpit_proto::send_user_message_v2::MessageIngressV2::LocalOwnerDirect(local),
             } => {
-                assert_eq!(client_submission_id, id);
-                assert_eq!(opts.approval_mode, Some(ApprovalMode::Yolo));
+                assert_eq!(local.request.client_submission_id, id);
+                assert_eq!(
+                    local.run_invocation_options.as_ref().unwrap().approval_mode,
+                    Some(ApprovalMode::Yolo)
+                );
             }
-            other => panic!("run path must send SendUserMessage, got {other:?}"),
+            other => panic!("run path must send SendUserMessageV2, got {other:?}"),
         }
     }
 

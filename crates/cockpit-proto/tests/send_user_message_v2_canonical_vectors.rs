@@ -58,12 +58,14 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
     let request_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000001").unwrap();
     let operation_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000002").unwrap();
     let validated = LocalOwnerDirectSendUserMessageV2 {
-        request_id,
         operation_id,
         session_locator: "opaque-session".into(),
+        expected_model_state_generation: None,
+        expected_model: None,
+        run_invocation_options: None,
         request: command,
     }
-    .into_validated()
+    .into_validated(request_id)
     .unwrap();
     assert_eq!(validated.request_id, request_id);
     assert_eq!(validated.operation_id, operation_id);
@@ -72,12 +74,14 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
         validated.command.client_submission_id
     );
     let error = LocalOwnerDirectSendUserMessageV2 {
-        request_id,
         operation_id: request_id,
         session_locator: "opaque-session".into(),
+        expected_model_state_generation: None,
+        expected_model: None,
+        run_invocation_options: None,
         request: validated.command.clone(),
     }
-    .into_validated()
+    .into_validated(request_id)
     .unwrap_err();
     assert_eq!(
         error.to_string(),
@@ -87,46 +91,52 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
     request_collision.client_submission_id = request_id;
     assert!(
         LocalOwnerDirectSendUserMessageV2 {
-            request_id,
             operation_id,
             session_locator: "opaque".into(),
+            expected_model_state_generation: None,
+            expected_model: None,
+            run_invocation_options: None,
             request: request_collision
         }
-        .into_validated()
+        .into_validated(request_id)
         .is_err()
     );
     let mut operation_collision = validated.command.clone();
     operation_collision.client_submission_id = operation_id;
     assert!(
         LocalOwnerDirectSendUserMessageV2 {
-            request_id,
             operation_id,
             session_locator: "opaque".into(),
+            expected_model_state_generation: None,
+            expected_model: None,
+            run_invocation_options: None,
             request: operation_collision
         }
-        .into_validated()
+        .into_validated(request_id)
         .is_err()
     );
     let non_rfc_v7 = Uuid::parse_str("018f47a2-7b3c-7def-0123-000000000003").unwrap();
     assert_eq!(
         LocalOwnerDirectSendUserMessageV2 {
-            request_id: non_rfc_v7,
             operation_id,
             session_locator: "opaque".into(),
+            expected_model_state_generation: None,
+            expected_model: None,
+            run_invocation_options: None,
             request: validated.command.clone()
         }
-        .into_validated()
+        .into_validated(non_rfc_v7)
         .unwrap_err()
         .to_string(),
         "request_id must be RFC UUIDv7"
     );
     let remote = AuthenticatedRemoteOperationEnvelopeV2 {
-        request_id,
-        operation_id,
         session_locator: "opaque".into(),
+        expected_model_state_generation: None,
+        expected_model: None,
         request: validated.command,
     }
-    .into_validated([42; 16], 9)
+    .into_validated(request_id, operation_id, [42; 16], 9)
     .unwrap();
     assert_eq!(
         remote.provenance,

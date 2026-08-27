@@ -2572,17 +2572,30 @@ async fn try_spawn_inner(
                         let refs = upload_submission_images(&client, &sub.images)
                             .await
                             .map_err(classify_image_upload_error)?;
+                        // TODO(#69): convert uploaded `refs` (`ImageAttachmentRef`)
+                        // into typed `MessageAttachmentIdentity` records via the
+                        // typed-upload pipeline (Begin/FinalizeMediaUpload) and
+                        // send them as `ingress.request.attachments`. Until that
+                        // reshape lands, attachments are not yet carried over V2.
+                        let _ = refs;
                         client
-                            .request(Request::SendUserMessage {
-                                expected_model_state_generation: sub.expected_model_state_generation,
-                                expected_model: sub.expected_model,
-                                client_submission_id,
-                                text: sub.text,
-                                display_text: sub.display_text,
-                                tag_expansions: sub.tag_expansions,
-                                image_refs: refs,
-                                forced_skill: sub.forced_skill,
-                                run_invocation_options: None,
+                            .request(Request::SendUserMessageV2 {
+                                ingress:
+                                    cockpit_proto::send_user_message_v2::MessageIngressV2::local_direct(
+                                        uuid::Uuid::now_v7(),
+                                        "local-owner",
+                                        sub.expected_model_state_generation,
+                                        sub.expected_model,
+                                        None,
+                                        cockpit_proto::send_user_message_v2::SendUserMessageV2 {
+                                            client_submission_id,
+                                            text: sub.text,
+                                            display_text: sub.display_text,
+                                            tag_expansions: sub.tag_expansions,
+                                            forced_skill: sub.forced_skill,
+                                            attachments: Vec::new(),
+                                        },
+                                    ),
                             })
                             .await
                     };

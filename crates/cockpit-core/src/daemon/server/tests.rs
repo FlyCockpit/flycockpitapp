@@ -7,6 +7,7 @@ use super::sessions::*;
 use super::*;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
+use crate::proto_crate::send_user_message_v2::MessageIngressV2;
 use crate::session::Session;
 #[cfg(feature = "remote")]
 use std::collections::HashSet;
@@ -4783,16 +4784,22 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let first = tokio::spawn(async move {
         let mut state = state;
         let result = handle_request(
-            Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                text: "first turn".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: Vec::new(),
-                forced_skill: None,
-                run_invocation_options: None,
+            Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: "first turn".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
             },
             &mut state,
             &first_ctx,
@@ -4862,16 +4869,22 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let second = tokio::spawn(async move {
         let mut state = state;
         handle_request(
-            Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                text: "second turn".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: Vec::new(),
-                forced_skill: None,
-                run_invocation_options: None,
+            Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: "second turn".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
             },
             &mut state,
             &second_ctx,
@@ -10948,16 +10961,22 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
         let task = tokio::spawn(async move {
             let mut state = state;
             let mut effects = ClientRequestEffects::default();
-            let request = Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id,
-                text: "same content".to_string(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: Vec::new(),
-                forced_skill: None,
-                run_invocation_options: None,
+            let request = Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: client_submission_id,
+                    text: "same content".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
             };
             let result = Box::pin(handle_serialized_request_with_remote_operation(
                 request,
@@ -11088,16 +11107,22 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
     let shared = state.shared_snapshot();
     let operation = remote_owner_operation().await;
     let client_submission_id = Uuid::new_v4();
-    let request = Request::SendUserMessage {
-        expected_model_state_generation: None,
-        expected_model: None,
-        client_submission_id,
-        text: "image duplicate".to_string(),
-        display_text: None,
-        tag_expansions: Vec::new(),
-        image_refs: vec![image_ref.clone()],
-        forced_skill: None,
-        run_invocation_options: None,
+    let request = Request::SendUserMessageV2 {
+        ingress: MessageIngressV2::local_direct(
+        Uuid::now_v7(),
+        "session",
+        None,
+        None,
+        None,
+        crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            client_submission_id: client_submission_id,
+            text: "image duplicate".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            attachments: Vec::new(),
+        },
+    ),
     };
     let task_ctx = ctx.clone();
     let task = tokio::spawn(async move {
@@ -14913,16 +14938,22 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let error = handle_request(
-        Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id: Uuid::new_v4(),
-            text: "x".repeat(crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES + 1),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: None,
-            run_invocation_options: None,
+        Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: Uuid::new_v4(),
+                text: "x".repeat(crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES + 1),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        ),
         },
         &mut state,
         &ctx,
@@ -14952,16 +14983,22 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let image_ref = proto::ImageAttachmentRef { id: Uuid::new_v4() };
     let error = handle_request(
-        Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id: Uuid::new_v4(),
-            text: "x".repeat(64 * 1024 + 1),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: vec![image_ref.clone()],
-            forced_skill: None,
-            run_invocation_options: None,
+        Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: Uuid::new_v4(),
+                text: "x".repeat(64 * 1024 + 1),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        ),
         },
         &mut state,
         &ctx,
@@ -14984,16 +15021,22 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
     let boundary_ctx = ctx.clone();
     let boundary = tokio::spawn(async move {
         let result = handle_request(
-            Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                text: "x".repeat(64 * 1024),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: vec![image_ref],
-                forced_skill: None,
-                run_invocation_options: None,
+            Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: "x".repeat(64 * 1024),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
             },
             &mut state,
             &boundary_ctx,
@@ -15212,7 +15255,7 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
         canonical_project_digest: [41; 32],
         model_config_generation: 0,
         canonical_model_digest: [42; 32],
-        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+        request: crate::proto_crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
             text: source.clone(),
             display_text: Some(display.clone()),
@@ -15397,7 +15440,7 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
         canonical_project_digest: [51; 32],
         model_config_generation: 0,
         canonical_model_digest: [52; 32],
-        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+        request: crate::proto_crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
             text: source.clone(),
             display_text: None,
@@ -18288,16 +18331,22 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             task_call_id: "task-1".into(),
             label: "child".into(),
         },
-        "send_user_message" => Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id: Uuid::new_v4(),
-            text: "authz".into(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: None,
-            run_invocation_options: None,
+        "send_user_message" => Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: Uuid::new_v4(),
+                text: "authz".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        ),
         },
         "send_user_message_bulk" => Request::SendUserMessageBulk {
             expected_model_state_generation: None,
@@ -20967,16 +21016,22 @@ async fn assert_worker_delivery_happy(kind: &str) {
         stage_opaque_user_transfer(bulk_text.as_bytes(), &owner)
     });
     let request = match kind {
-        "send_user_message" => Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id: Uuid::new_v4(),
-            text: "hello worker".into(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: None,
-            run_invocation_options: None,
+        "send_user_message" => Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: Uuid::new_v4(),
+                text: "hello worker".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        ),
         },
         "send_user_message_bulk" => Request::SendUserMessageBulk {
             expected_model_state_generation: None,
@@ -21399,16 +21454,22 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
         tmp.path(),
         session_id,
         work_rx,
-        Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id,
-            text: "must remain retryable".to_string(),
-            display_text: Some("visible draft".to_string()),
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: Some("review".to_string()),
-            run_invocation_options: None,
+        Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: client_submission_id,
+                text: "must remain retryable".to_string(),
+                display_text: Some("visible draft".to_string()),
+                tag_expansions: Vec::new(),
+                forced_skill: Some("review".to_string()),
+                attachments: Vec::new(),
+            },
+        ),
         },
         |work| {
             let SessionWork::UserMessage {
@@ -21498,16 +21559,22 @@ async fn set_longcache_returns_longcache_state() {
 async fn assert_attached_required_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
-        "send_user_message" => Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id: Uuid::new_v4(),
-            text: "detached".into(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: None,
-            run_invocation_options: None,
+        "send_user_message" => Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: Uuid::new_v4(),
+                text: "detached".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        ),
         },
         "send_user_message_bulk" => Request::SendUserMessageBulk {
             expected_model_state_generation: None,
@@ -24729,16 +24796,22 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
-            request: Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                text: "hello".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: Vec::new(),
-                forced_skill: None,
-                run_invocation_options: None,
+            request: Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: "hello".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
             },
             kind: "send_user_message",
             session_id: Some(attached_session_id),
@@ -26558,7 +26631,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ReadRedactedExportChunk,
         Attach,
         SubagentTranscript,
-        SendUserMessage,
+        SendUserMessageV2,
         SendUserMessageBulk,
         GetRunInvocationStatus,
         CancelRunInvocation,
@@ -27055,16 +27128,22 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         .unwrap();
 
     let exact = handle_request(
-        Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id,
-            text: text.to_string(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: None,
-            run_invocation_options: None,
+        Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: client_submission_id,
+                text: text.to_string(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        ),
         },
         &mut state,
         &ctx,
@@ -27079,16 +27158,22 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
     );
 
     let conflict = handle_request(
-        Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id,
-            text: "different payload".to_string(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: None,
-            run_invocation_options: None,
+        Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: client_submission_id,
+                text: "different payload".to_string(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        ),
         },
         &mut state,
         &ctx,
@@ -27178,21 +27263,27 @@ async fn image_submission_exact_retry_case() {
     };
     let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let client_submission_id = Uuid::new_v4();
-    let request = |id, text: &str| Request::SendUserMessage {
-        expected_model_state_generation: None,
-        expected_model: None,
-        client_submission_id: id,
-        text: text.to_string(),
-        display_text: Some("message with image".to_string()),
-        tag_expansions: vec![proto::TagExpansionMeta {
+    let request = |id, text: &str| Request::SendUserMessageV2 {
+        ingress: MessageIngressV2::local_direct(
+        Uuid::now_v7(),
+        "session",
+        None,
+        None,
+        None,
+        crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            client_submission_id: id,
+            text: text.to_string(),
+            display_text: Some("message with image".to_string()),
+            tag_expansions: vec![proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "image-test.png".to_string(),
             detail: "expanded image context".to_string(),
             ok: true,
         }],
-        image_refs: vec![image_ref.clone()],
-        forced_skill: Some("image-skill".to_string()),
-        run_invocation_options: None,
+            forced_skill: Some("image-skill".to_string()),
+            attachments: Vec::new(),
+        },
+    ),
     };
 
     // Treat the first successful response as lost by intentionally discarding
@@ -27279,21 +27370,27 @@ async fn image_submission_exact_retry_case() {
     // still dedupe when the complete consumed payload is identical.
     let reuploaded_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let reuploaded = handle_request(
-        Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id,
-            text: "inspect this image".to_string(),
-            display_text: Some("message with image".to_string()),
-            tag_expansions: vec![proto::TagExpansionMeta {
+        Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: client_submission_id,
+                text: "inspect this image".to_string(),
+                display_text: Some("message with image".to_string()),
+                tag_expansions: vec![proto::TagExpansionMeta {
                 tool: "read".to_string(),
                 path: "image-test.png".to_string(),
                 detail: "expanded image context".to_string(),
                 ok: true,
             }],
-            image_refs: vec![reuploaded_ref.clone()],
-            forced_skill: Some("image-skill".to_string()),
-            run_invocation_options: None,
+                forced_skill: Some("image-skill".to_string()),
+                attachments: Vec::new(),
+            },
+        ),
         },
         &mut state,
         &ctx,
@@ -27373,16 +27470,22 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let first_id = Uuid::new_v4();
-    let request = |id| Request::SendUserMessage {
-        expected_model_state_generation: None,
-        expected_model: None,
-        client_submission_id: id,
-        text: "ambiguous image delivery".to_string(),
-        display_text: None,
-        tag_expansions: Vec::new(),
-        image_refs: vec![image_ref.clone()],
-        forced_skill: None,
-        run_invocation_options: None,
+    let request = |id| Request::SendUserMessageV2 {
+        ingress: MessageIngressV2::local_direct(
+        Uuid::now_v7(),
+        "session",
+        None,
+        None,
+        None,
+        crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            client_submission_id: id,
+            text: "ambiguous image delivery".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            attachments: Vec::new(),
+        },
+    ),
     };
 
     let first_ctx = ctx.clone();
@@ -30989,16 +31092,22 @@ async fn serialized_requests_apply_in_receipt_order() {
         .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
             Envelope::request(
                 message_id,
-                Request::SendUserMessage {
-                    expected_model_state_generation: None,
-                    expected_model: None,
-                    client_submission_id: Uuid::new_v4(),
-                    text: "after model switch".to_string(),
-                    display_text: None,
-                    tag_expansions: Vec::new(),
-                    image_refs: Vec::new(),
-                    forced_skill: None,
-                    run_invocation_options: None,
+                Request::SendUserMessageV2 {
+                    ingress: MessageIngressV2::local_direct(
+                    Uuid::now_v7(),
+                    "session",
+                    None,
+                    None,
+                    None,
+                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                        client_submission_id: Uuid::new_v4(),
+                        text: "after model switch".to_string(),
+                        display_text: None,
+                        tag_expansions: Vec::new(),
+                        forced_skill: None,
+                        attachments: Vec::new(),
+                    },
+                ),
                 },
             ),
         ))))
@@ -32419,16 +32528,22 @@ async fn btw_concurrent_with_parent_turn() {
     let ctx_for_parent = ctx.clone();
     let parent_request = tokio::spawn(async move {
         handle_request(
-            Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                text: "parent work".to_string(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: Vec::new(),
-                forced_skill: None,
-                run_invocation_options: None,
+            Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: "parent work".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
             },
             &mut parent_state,
             &ctx_for_parent,
@@ -32485,16 +32600,22 @@ async fn btw_concurrent_with_parent_turn() {
     let ctx_for_btw = ctx.clone();
     let btw_request = tokio::spawn(async move {
         handle_request(
-            Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                text: "btw work".to_string(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: Vec::new(),
-                forced_skill: None,
-                run_invocation_options: None,
+            Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: "btw work".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
             },
             &mut btw_state,
             &ctx_for_btw,
@@ -32888,16 +33009,22 @@ async fn send_user_message_refused_while_draining() {
     ctx.shutdown.begin_drain();
 
     let err = handle_request(
-        Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id: Uuid::new_v4(),
-            text: "hi".into(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: vec![],
-            forced_skill: None,
-            run_invocation_options: None,
+        Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            "session",
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id: Uuid::new_v4(),
+                text: "hi".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        ),
         },
         &mut state,
         &ctx,

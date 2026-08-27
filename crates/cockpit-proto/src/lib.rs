@@ -5809,26 +5809,35 @@ mod tests {
     fn request_round_trip() {
         let env = Envelope::request(
             Uuid::new_v4(),
-            Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                text: "hello".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: Vec::new(),
-                forced_skill: None,
-                run_invocation_options: None,
+            Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: "hello".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
             },
         );
         let s = serde_json::to_string(&env).unwrap();
         let back: Envelope = serde_json::from_str(&s).unwrap();
         match back.body {
             Body::Request {
-                request: Request::SendUserMessage { text, .. },
+                request:
+                    Request::SendUserMessageV2 {
+                        ingress,
+                    },
                 ..
-            } => assert_eq!(text, "hello"),
-            other => panic!("expected SendUserMessage, got {other:?}"),
+            } => assert_eq!(ingress.request().text, "hello"),
+            other => panic!("expected SendUserMessageV2, got {other:?}"),
         }
     }
 
@@ -5872,16 +5881,22 @@ mod tests {
         let image_ref = ImageAttachmentRef { id: Uuid::new_v4() };
         let env = Envelope::request(
             Uuid::new_v4(),
-            Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                text: IMAGE_PART_SENTINEL.to_string(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: vec![image_ref],
-                forced_skill: None,
-                run_invocation_options: None,
+            Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: IMAGE_PART_SENTINEL.to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
             },
         );
         let json = serde_json::to_value(&env).unwrap();

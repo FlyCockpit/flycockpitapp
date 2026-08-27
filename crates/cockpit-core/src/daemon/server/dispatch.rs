@@ -2664,6 +2664,57 @@ pub(super) async fn handle_request(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn handle_send_user_message_v2(
+    state: &mut MutableClientState,
+    ctx: &Arc<DaemonContext>,
+    ingress: crate::proto_crate::send_user_message_v2::MessageIngressV2,
+    #[cfg(feature = "remote")]
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    // TODO(#69, remote): the `authenticated_remote_operation` branch must be
+    // decoded only through the registered opaque FCM2 FCOR path with a bound
+    // verified remote principal and the transactional remote-operation ledger.
+    // That is out of the local CLI/TUI launch scope and stubbed fail-closed.
+    let local = match ingress {
+        crate::proto_crate::send_user_message_v2::MessageIngressV2::LocalOwnerDirect(inner) => {
+            inner
+        }
+        _ => {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "authenticated_remote_operation ingress is not supported on the local path"
+                    .into(),
+            });
+        }
+    };
+    // TODO(#69): (a) reject non-Owner principals for local-direct ingress;
+    // (b) wire `Db::accept_message_with_attachments` via the transactional
+    // acceptance seam (`MessageAcceptanceJoin` acquiring
+    // `MediaReferenceConsumerKind::Message` references) instead of the
+    // ephemeral in-memory claim path; (c) resolve the typed
+    // `MessageAttachmentIdentity` attachments to leased media bytes through
+    // the typed-upload pipeline. Until (c) lands, attachments are not yet
+    // carried into the engine; the durable FCM2 attachment identities live in
+    // `local.request.attachments`.
+    let request = local.request;
+    handle_send_user_message(
+        state,
+        ctx,
+        request.client_submission_id,
+        local.expected_model_state_generation,
+        local.expected_model,
+        request.text,
+        request.display_text,
+        request.tag_expansions,
+        Vec::new(),
+        request.forced_skill,
+        local.run_invocation_options,
+        #[cfg(feature = "remote")]
+        remote_operation,
+    )
+    .await
+}
+
 async fn handle_send_user_message(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
@@ -4598,29 +4649,11 @@ async fn handle_serialized_request_impl(
             })
         }
 
-        Request::SendUserMessage {
-            expected_model_state_generation,
-            expected_model,
-            client_submission_id,
-            text,
-            display_text,
-            tag_expansions,
-            image_refs,
-            forced_skill,
-            run_invocation_options,
-        } => {
-            Box::pin(handle_send_user_message(
+        Request::SendUserMessageV2 { ingress } => {
+            Box::pin(handle_send_user_message_v2(
                 state,
                 ctx,
-                client_submission_id,
-                expected_model_state_generation,
-                expected_model,
-                text,
-                display_text,
-                tag_expansions,
-                image_refs,
-                forced_skill,
-                run_invocation_options,
+                ingress,
                 #[cfg(feature = "remote")]
                 remote_operation,
             ))

@@ -2232,6 +2232,84 @@ where
     S: futures::Stream<Item = Result<StreamedAssistantContent, rig::completion::CompletionError>>
         + Unpin,
 {
+    drain_items_with_first_token_clock(
+        stream,
+        timeout,
+        hard_timeout_on_stall,
+        phase,
+        first_token_ms,
+        agent_name,
+        provider_id,
+        model_id,
+        event_tx,
+        cancel,
+        output_sent,
+        display,
+        || dispatched_at.elapsed().as_millis() as u64,
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drain_items_for_response_performance_e2e<S, F>(
+    stream: &mut S,
+    timeout: &crate::config::providers::TimeoutConfig,
+    phase: &std::sync::atomic::AtomicU8,
+    first_token_ms: &std::sync::atomic::AtomicU64,
+    agent_name: &str,
+    provider_id: &str,
+    model_id: &str,
+    event_tx: Option<&mpsc::Sender<TurnEvent>>,
+    cancel: &CancellationToken,
+    output_sent: &std::sync::atomic::AtomicBool,
+    display: Option<&crate::engine::model::DisplayAttemptSlot>,
+    first_token_elapsed_ms: F,
+) -> Result<(), rig::completion::CompletionError>
+where
+    S: futures::Stream<Item = Result<StreamedAssistantContent, rig::completion::CompletionError>>
+        + Unpin,
+    F: Fn() -> u64,
+{
+    drain_items_with_first_token_clock(
+        stream,
+        timeout,
+        false,
+        phase,
+        first_token_ms,
+        agent_name,
+        provider_id,
+        model_id,
+        event_tx,
+        cancel,
+        output_sent,
+        display,
+        first_token_elapsed_ms,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_items_with_first_token_clock<S, F>(
+    stream: &mut S,
+    timeout: &crate::config::providers::TimeoutConfig,
+    hard_timeout_on_stall: bool,
+    phase: &std::sync::atomic::AtomicU8,
+    first_token_ms: &std::sync::atomic::AtomicU64,
+    agent_name: &str,
+    provider_id: &str,
+    model_id: &str,
+    event_tx: Option<&mpsc::Sender<TurnEvent>>,
+    cancel: &CancellationToken,
+    output_sent: &std::sync::atomic::AtomicBool,
+    display: Option<&crate::engine::model::DisplayAttemptSlot>,
+    first_token_elapsed_ms: F,
+) -> Result<(), rig::completion::CompletionError>
+where
+    S: futures::Stream<Item = Result<StreamedAssistantContent, rig::completion::CompletionError>>
+        + Unpin,
+    F: Fn() -> u64,
+{
     // The first chunk is watched by TTFT; every later chunk by the idle
     // threshold. `first_token` flips after the first chunk so the warning phase
     // switches from TTFT to idle.
@@ -2295,7 +2373,7 @@ where
             // attempt that ultimately succeeds (the last write wins, and only
             // the Ok attempt's value is read back).
             first_token_ms.store(
-                dispatched_at.elapsed().as_millis() as u64,
+                first_token_elapsed_ms(),
                 std::sync::atomic::Ordering::SeqCst,
             );
         } else {

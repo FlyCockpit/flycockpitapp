@@ -98,35 +98,53 @@ impl DisplayStreamClassifier {
 /// production uses the real one. The classifier never reads a second real
 /// clock at finish — every timestamp comes from the injected clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Instant(std::time::Instant);
+pub struct Instant(InstantKind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstantKind {
+    Real(std::time::Instant),
+    Manual(Duration),
+}
 
 impl Default for Instant {
     fn default() -> Self {
-        Self(std::time::Instant::now())
+        Self(InstantKind::Real(std::time::Instant::now()))
     }
 }
 
 impl Instant {
     /// The current real-time instant (production clock).
     pub fn now() -> Self {
-        Self(std::time::Instant::now())
+        Self(InstantKind::Real(std::time::Instant::now()))
     }
 
     /// Wrap a specific `std::time::Instant` (test/injected clock).
     pub const fn from_std(instant: std::time::Instant) -> Self {
-        Self(instant)
+        Self(InstantKind::Real(instant))
+    }
+
+    /// Construct a deterministic instant on the manual test timeline.
+    pub(crate) const fn manual(offset: Duration) -> Self {
+        Self(InstantKind::Manual(offset))
     }
 
     /// The underlying `std::time::Instant`.
     pub const fn as_std(self) -> std::time::Instant {
-        self.0
+        match self.0 {
+            InstantKind::Real(instant) => instant,
+            InstantKind::Manual(_) => panic!("manual display instant has no std::time::Instant"),
+        }
     }
 
     /// Duration since an earlier instant. Returns zero if `self` is
     /// somehow before `earlier` (defensive; should not happen with a
     /// monotonic injected clock).
     pub fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
-        self.0.checked_duration_since(earlier.0)
+        match (self.0, earlier.0) {
+            (InstantKind::Real(now), InstantKind::Real(then)) => now.checked_duration_since(then),
+            (InstantKind::Manual(now), InstantKind::Manual(then)) => now.checked_sub(then),
+            _ => None,
+        }
     }
 }
 
@@ -601,18 +619,16 @@ impl DisplayStreamClassifier {
         let performance = if display_text.trim().is_empty() {
             None
         } else {
+            let finish_at = self.clock.now();
             match self.tokenizer.count(&display_text) {
-                Ok(displayed_tokens) => {
-                    let finish_at = self.clock.now();
-                    Self::response_performance_from_measurements(
-                        self.attempt_dispatched_at,
-                        self.first_non_whitespace_presentation_at,
-                        finish_at,
-                        &display_text,
-                        displayed_tokens as u64,
-                        self.config.encoding,
-                    )
-                }
+                Ok(displayed_tokens) => Self::response_performance_from_measurements(
+                    self.attempt_dispatched_at,
+                    self.first_non_whitespace_presentation_at,
+                    finish_at,
+                    &display_text,
+                    displayed_tokens as u64,
+                    self.config.encoding,
+                ),
                 Err(_) => None,
             }
         };

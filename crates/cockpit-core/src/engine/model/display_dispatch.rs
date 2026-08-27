@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::engine::agent::TurnEvent;
-#[cfg(feature = "test-support")]
 use crate::engine::response_performance::DisplayComplete;
 use crate::engine::response_performance::{
     AssistantAttemptId, DisplayClassifierConfig, DisplayClock, DisplayEvent,
@@ -79,6 +78,16 @@ impl DisplayAttemptSlot {
         event_tx: Option<&mpsc::Sender<TurnEvent>>,
         dispatched_at: std::time::Instant,
     ) {
+        self.begin_successful_attempt_at(agent_name, event_tx, Instant::from_std(dispatched_at))
+            .await;
+    }
+
+    pub(crate) async fn begin_successful_attempt_at(
+        &self,
+        agent_name: &str,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+        dispatched_at: Instant,
+    ) {
         let reset = {
             let mut inner = self.0.lock().expect("display attempt slot");
             let replacement =
@@ -100,7 +109,7 @@ impl DisplayAttemptSlot {
             let clock = (inner.clock_factory)();
             inner.classifier = Some(DisplayStreamClassifier::new_with_tokenizer(
                 replacement,
-                Instant::from_std(dispatched_at),
+                dispatched_at,
                 clock,
                 inner.config.clone(),
                 Arc::clone(&inner.tokenizer),
@@ -177,31 +186,6 @@ impl DisplayAttemptSlot {
             .take()
     }
 
-    /// Production finish path: take the open classifier, run
-    /// [`DisplayStreamClassifier::finish`], and emit the typed Complete.
-    #[cfg(feature = "test-support")]
-    pub(crate) async fn finish_successful_attempt(
-        &self,
-        agent_name: &str,
-        choice_text: &str,
-        channel_reasoning: &str,
-        translated_presentation: Option<String>,
-        event_tx: Option<&mpsc::Sender<TurnEvent>>,
-    ) -> Option<DisplayComplete> {
-        let complete = {
-            let mut inner = self.0.lock().expect("display attempt slot");
-            let mut classifier = inner.classifier.take()?;
-            classifier.finish(choice_text, channel_reasoning, translated_presentation)?
-        };
-        emit_display_events(
-            agent_name,
-            vec![DisplayEvent::Complete(complete.clone())],
-            event_tx,
-        )
-        .await;
-        Some(complete)
-    }
-
     /// Terminal failure/cancel after visible provisional output: emit one
     /// `AssistantDisplayError` row (no performance chip). Attempts with no
     /// visible body emit nothing. Does not arm Reset for a replacement.
@@ -242,6 +226,26 @@ impl DisplayAttemptSlot {
     }
 }
 
+pub(crate) fn finish_open_display_classifier(
+    classifier: &mut DisplayStreamClassifier,
+    choice_text: &str,
+    channel_reasoning: &str,
+    translated_presentation: Option<String>,
+) -> Option<DisplayComplete> {
+    classifier.finish(choice_text, channel_reasoning, translated_presentation)
+}
+
+pub(crate) fn assistant_display_complete_turn_event(
+    agent_name: &str,
+    complete: DisplayComplete,
+) -> TurnEvent {
+    TurnEvent::AssistantDisplayComplete {
+        agent: agent_name.to_string(),
+        attempt_id: complete.attempt_id,
+        assistant: complete.assistant,
+    }
+}
+
 async fn emit_display_events(
     agent_name: &str,
     events: Vec<DisplayEvent>,
@@ -262,11 +266,9 @@ async fn emit_display_events(
                 attempt_id: delta.attempt_id,
                 delta: delta.delta,
             },
-            DisplayEvent::Complete(complete) => TurnEvent::AssistantDisplayComplete {
-                agent: agent_name.to_string(),
-                attempt_id: complete.attempt_id,
-                assistant: complete.assistant,
-            },
+            DisplayEvent::Complete(complete) => {
+                assistant_display_complete_turn_event(agent_name, complete)
+            }
             DisplayEvent::AttemptReset(reset) => TurnEvent::AssistantDisplayAttemptReset {
                 agent: agent_name.to_string(),
                 failed_attempt_id: reset.failed_attempt_id,

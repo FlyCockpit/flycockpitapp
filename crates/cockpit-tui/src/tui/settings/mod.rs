@@ -7086,7 +7086,20 @@ impl SettingsDialog {
                 false
             }
             Nav::Back => {
-                self.page = self.stack.pop().unwrap_or_else(|| root_page(0));
+                let current = std::mem::replace(&mut self.page, root_page(0));
+                let mut parent = self.stack.pop().unwrap_or_else(|| root_page(0));
+                // Sidecar pages are intentionally split into navigable
+                // surfaces. Their reducer session is authoritative state, not
+                // page-local presentation: return the child session to its
+                // sidecar parent before restoring it so edits and daemon
+                // projections cannot disappear on Back.
+                if let (Some(child), Some(parent_sidecar)) = (
+                    current.downcast_ref::<image_sidecar::SidecarPage>(),
+                    parent.downcast_mut::<image_sidecar::SidecarPage>(),
+                ) {
+                    parent_sidecar.session = child.session.clone();
+                }
+                self.page = parent;
                 false
             }
             Nav::Close => true,

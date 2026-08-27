@@ -135,20 +135,30 @@ fn page_with(kind: SidecarPageKind) -> SidecarPage {
         SidecarModelOption {
             provider: "openai".into(),
             model: "gpt-4o".into(),
+            configured: true,
             image_capable: true,
             fresh: true,
         },
         SidecarModelOption {
             provider: "openai".into(),
             model: "gpt-text".into(),
+            configured: true,
             image_capable: false,
             fresh: true,
         },
         SidecarModelOption {
             provider: "openai".into(),
             model: "stale-vision".into(),
+            configured: true,
             image_capable: true,
             fresh: false,
+        },
+        SidecarModelOption {
+            provider: "discovered-only".into(),
+            model: "fresh-vision".into(),
+            configured: false,
+            image_capable: true,
+            fresh: true,
         },
     ];
     session.reducer.resolution = Some(sample_trace(SidecarModeChoice::Automatic));
@@ -168,18 +178,21 @@ fn image_sidecar_settings_resolver_form_matrix() {
         SidecarModelOption {
             provider: "openai".into(),
             model: "gpt-4o".into(),
+            configured: true,
             image_capable: true,
             fresh: true,
         },
         SidecarModelOption {
             provider: "openai".into(),
             model: "gpt-text".into(),
+            configured: true,
             image_capable: false,
             fresh: true,
         },
         SidecarModelOption {
             provider: "openai".into(),
             model: "stale-vision".into(),
+            configured: true,
             image_capable: true,
             fresh: false,
         },
@@ -187,6 +200,17 @@ fn image_sidecar_settings_resolver_form_matrix() {
     let selectable = form.selectable_models();
     assert_eq!(selectable.len(), 1);
     assert_eq!(selectable[0].model, "gpt-4o");
+    assert!(selectable.iter().all(|model| model.configured));
+
+    form.trusted_default = Some(SidecarModelRef {
+        provider: "discovered-only".into(),
+        model: "fresh-vision".into(),
+    });
+    assert!(
+        form.to_selection_config().trusted_primary_default.is_none(),
+        "a discovered but unconfigured model must not enter a mutation request"
+    );
+    form.trusted_default = None;
 
     for mode in [
         SidecarModeChoice::Automatic,
@@ -426,6 +450,33 @@ fn image_sidecar_settings_invocation_accounting_redaction() {
 }
 
 #[test]
+fn image_sidecar_settings_stale_invocation_action_is_inert() {
+    let mut page = page_with(SidecarPageKind::InvocationList);
+    page.session.reducer.invocations = vec![sample_invocation()];
+    let nav = page.handle_pointer_control(
+        &mut test_dialog(),
+        SettingsPointerAction::Sidecar(SidecarAction::OpenInvocationDetail(SidecarInvocationId(
+            "deleted-invocation".into(),
+        ))),
+    );
+    assert!(matches!(nav, Nav::Stay));
+    assert!(page.session.selected_invocation.is_none());
+    assert_eq!(
+        page.session.error.as_deref(),
+        Some(REASON_INVOCATION_NOT_FOUND)
+    );
+
+    page.kind = SidecarPageKind::InvocationDetail;
+    let rendered = build_rows(&page)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Invocation not found."));
+    assert!(!rendered.contains("inv-1 |"));
+}
+
+#[test]
 fn image_sidecar_settings_reducer_rejects_stale_events() {
     let mut reducer = SidecarReducer::new("d1".into(), "p1".into(), "s1".into(), "sel1".into(), 1);
     let inv = sample_invocation();
@@ -528,6 +579,8 @@ fn image_sidecar_settings_a11y_and_layout_snapshots() {
     page.session.reducer.grants = vec![project_grant];
     page.session.error = Some("cap_exhausted".into());
     page.session.busy = true;
+    page.session.save_pending = true;
+    page.session.health_refresh_pending = true;
     page.session.conflict = Some("config generation moved".into());
     page.session.remediation = Some(SidecarRemediation::CapExhausted);
 
@@ -542,9 +595,9 @@ fn image_sidecar_settings_a11y_and_layout_snapshots() {
         a11y.project_grant_warning.as_deref(),
         Some(PROJECT_GRANT_WARNING)
     );
-    let focused = rows.get(page.session.cursor).unwrap();
-    assert!(a11y.focused_label.contains(&focused.label));
-    assert_eq!(a11y.focused_value, a11y.focused_label);
+    let focused = rows.get(page.session.cursor.get()).unwrap();
+    assert_eq!(a11y.focused_label, focused.label);
+    assert_eq!(a11y.focused_value, focused.value);
     assert_eq!(a11y.non_color_state, focused.state);
     assert_eq!(
         a11y.destination,
@@ -571,6 +624,31 @@ fn image_sidecar_settings_a11y_and_layout_snapshots() {
     assert!(page.session.reducer.grants.is_empty());
     assert!(page.session.confirm_revoke.is_none());
     assert!(page.session.error.is_none());
+    assert!(!page.session.authoritative_snapshot);
+    assert!(!page.session.authoritative_mutations);
+    assert!(!page.session.principal.can_mutate());
+    assert!(page.session.form.models.is_empty());
+    assert_eq!(page.session.form.override_pair, None);
+    assert!(!page.session.save_pending);
+    assert!(!page.session.health_refresh_pending);
+    assert_eq!(
+        page.session.reducer.apply(SidecarEvent {
+            daemon_instance: "local".into(),
+            project_id: "project".into(),
+            session_id: "session".into(),
+            selection_id: "selection".into(),
+            config_generation: 1,
+            entity_version: 1,
+            payload: SidecarEventPayload::Health(HealthView {
+                available: true,
+                capability_source: "configured".into(),
+                freshness: "fresh".into(),
+                reason: "late completion".into(),
+            }),
+        }),
+        SidecarEventOutcome::Discarded,
+        "a completion for the previous identity must remain inert after rebind"
+    );
 
     let empty = page_with(SidecarPageKind::GrantList);
     let joined = render_page_lines(&empty, &dialog, 80, 24).join("\n");
@@ -583,9 +661,96 @@ fn image_sidecar_settings_a11y_and_layout_snapshots() {
 
     let mut page = page_with(SidecarPageKind::Overview);
     page.handle_key(&mut test_dialog(), press(KeyCode::Down));
-    assert_eq!(page.session.cursor, 1);
+    assert_eq!(page.session.cursor.get(), 1);
     page.handle_key(&mut test_dialog(), press(KeyCode::Up));
-    assert_eq!(page.session.cursor, 0);
+    assert_eq!(page.session.cursor.get(), 0);
+}
+
+#[test]
+fn image_sidecar_settings_cursor_and_a11y_follow_rendered_rows() {
+    let mut page = page_with(SidecarPageKind::GrantList);
+    page.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
+    page.session.cursor.set(99);
+
+    // A dynamic reducer change can shrink the list after the cursor was set.
+    // A11y, rendering, and keyboard dispatch must use the same clamped row.
+    page.session.reducer.grants.clear();
+    let a11y = page.a11y();
+    assert_eq!(
+        a11y.focused_label,
+        "Effective: 32 source=configured hard_ceiling=128"
+    );
+    assert!(a11y.project_grant_warning.is_none());
+    page.handle_key(&mut test_dialog(), press(KeyCode::Down));
+    assert_eq!(page.session.cursor.get(), page.max_cursor());
+
+    // Off-page grants and resolver traces are not a11y fallbacks. Only the
+    // viewport-clipped focused typed row may supply these sensitive facts.
+    page.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
+    page.session.cursor.set(3);
+    page.session.a11y_viewport.set((2, 2));
+    let a11y = page.a11y();
+    assert!(a11y.destination.is_empty());
+    assert!(a11y.project_grant_warning.is_none());
+
+    let mut resolver = page_with(SidecarPageKind::ResolverDetail);
+    resolver.session.a11y_viewport.set((0, 1));
+    let a11y = resolver.a11y();
+    assert!(a11y.destination.is_empty());
+}
+
+#[test]
+fn image_sidecar_settings_create_grant_requires_current_destination_and_once_binding() {
+    let mut page = page_with(SidecarPageKind::GrantEditor);
+    let create = page
+        .named_actions()
+        .into_iter()
+        .find(|(action, _, _)| matches!(action, SidecarAction::CreateGrant))
+        .unwrap();
+    assert!(!create.1);
+    assert_eq!(create.2, Some(REASON_INVOCATION_NOT_FOUND));
+    page.handle_pointer_control(
+        &mut test_dialog(),
+        SettingsPointerAction::Sidecar(SidecarAction::CreateGrant),
+    );
+    assert!(page.session.reducer.grants.is_empty());
+
+    page.session.form.draft_scope = GrantScope::Session;
+    page.session.reducer.resolution.as_mut().unwrap().available = false;
+    let create = page
+        .named_actions()
+        .into_iter()
+        .find(|(action, _, _)| matches!(action, SidecarAction::CreateGrant))
+        .unwrap();
+    assert!(!create.1);
+    assert_eq!(create.2, Some(REASON_DESTINATION_DENIED));
+    page.handle_pointer_control(
+        &mut test_dialog(),
+        SettingsPointerAction::Sidecar(SidecarAction::CreateGrant),
+    );
+    assert!(page.session.reducer.grants.is_empty());
+
+    page.session.reducer.resolution.as_mut().unwrap().available = true;
+    page.session.form.draft_scope = GrantScope::Once;
+    page.session.reducer.invocations = vec![sample_invocation()];
+    page.session.selected_invocation = Some("inv-1".into());
+    let create = page
+        .named_actions()
+        .into_iter()
+        .find(|(action, _, _)| matches!(action, SidecarAction::CreateGrant))
+        .unwrap();
+    assert!(create.1);
+    assert_eq!(create.2, None);
+    page.handle_pointer_control(
+        &mut test_dialog(),
+        SettingsPointerAction::Sidecar(SidecarAction::CreateGrant),
+    );
+    assert_eq!(page.session.reducer.grants.len(), 1);
+    assert_eq!(
+        page.session.reducer.grants[0].invocation_binding.as_deref(),
+        Some("inv-1")
+    );
+    assert!(!page.session.reducer.grants[0].destination.is_empty());
 }
 
 #[test]
@@ -624,7 +789,7 @@ fn image_sidecar_settings_pointer_surface_contract() {
         1,
     );
     assert_eq!(overview.session.form.mode, before);
-    assert_eq!(overview.session.cursor, 1);
+    assert_eq!(overview.session.cursor.get(), 1);
 
     let mut grants = page_with(SidecarPageKind::GrantList);
     grants.session.reducer.grants = vec![sample_grant(GrantScope::Once)];
@@ -676,6 +841,7 @@ fn image_sidecar_settings_state_action_registry() {
             page.session.form.models = vec![SidecarModelOption {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
+                configured: true,
                 image_capable: true,
                 fresh: true,
             }];

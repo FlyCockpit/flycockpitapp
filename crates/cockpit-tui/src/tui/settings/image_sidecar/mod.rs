@@ -46,6 +46,7 @@ const REASON_YOLO_NO_GRANT: &str = "yolo_no_standing_grant";
 const REASON_SAVE_PENDING: &str = "save_pending";
 const REASON_FORBIDDEN_SIDECAR_ADMIN: &str = "forbidden_requires_sidecar_admin";
 const REASON_AUTHORITATIVE_UNAVAILABLE: &str = "authoritative_sidecar_operation_unavailable";
+const REASON_INVOCATION_NOT_FOUND: &str = "invocation_not_found";
 
 const SIDECAR_NODE_TITLES: &[&str] = &[
     "Mode",
@@ -141,13 +142,16 @@ impl SidecarPrincipal {
 pub(crate) struct SidecarModelOption {
     pub provider: String,
     pub model: String,
+    /// Only the daemon's explicit configured-model projection may be offered
+    /// as a sidecar destination. Catalog discovery is not authorization.
+    pub configured: bool,
     pub image_capable: bool,
     pub fresh: bool,
 }
 
 impl SidecarModelOption {
     pub(crate) fn is_selectable(&self) -> bool {
-        self.image_capable && self.fresh
+        self.configured && self.image_capable && self.fresh
     }
 }
 
@@ -420,6 +424,17 @@ pub(crate) struct SidecarA11yProjection {
     pub project_grant_warning: Option<String>,
 }
 
+/// One source of truth for a rendered line, its control contract, and the
+/// accessibility facts exposed for that exact line.  Keeping these together
+/// prevents keyboard focus, pointer targets, and the bounded linearized
+/// projection from drifting apart as a page gains headings or status rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidecarRenderedRow {
+    text: String,
+    binding: SidecarBinding,
+    view: SidecarRowView,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidecarRemediation {
     MissingSelection,
@@ -536,11 +551,18 @@ impl SidecarFormState {
             provider: r.provider.clone(),
             model: r.model.clone(),
         };
+        let selected = |candidate: &Option<SidecarModelRef>| {
+            candidate.as_ref().filter(|candidate| {
+                self.selectable_models().iter().any(|model| {
+                    model.provider == candidate.provider && model.model == candidate.model
+                })
+            })
+        };
         SidecarSelectionConfig {
             mode: self.mode.to_core(),
-            trusted_primary_default: self.trusted_default.as_ref().map(to_pair),
-            untrusted_primary_default: self.untrusted_default.as_ref().map(to_pair),
-            per_primary_override: self.override_pair.as_ref().map(to_pair),
+            trusted_primary_default: selected(&self.trusted_default).map(to_pair),
+            untrusted_primary_default: selected(&self.untrusted_default).map(to_pair),
+            per_primary_override: selected(&self.override_pair).map(to_pair),
         }
     }
 
@@ -854,7 +876,11 @@ pub(super) struct SidecarSession {
     pub policy: CentralPolicyView,
     pub confirm_revoke: Option<PendingRevoke>,
     pub selected_invocation: Option<String>,
-    pub cursor: usize,
+    pub cursor: Cell<usize>,
+    /// The line range actually rendered in the last frame. The accessibility
+    /// projection is bounded to this same viewport rather than a parallel,
+    /// un-clipped interpretation of page data.
+    pub a11y_viewport: Cell<(usize, usize)>,
     pub busy: bool,
     pub error: Option<String>,
     pub conflict: Option<String>,
@@ -888,7 +914,8 @@ impl SidecarSession {
             },
             confirm_revoke: None,
             selected_invocation: None,
-            cursor: 0,
+            cursor: Cell::new(0),
+            a11y_viewport: Cell::new((0, usize::MAX)),
             busy: false,
             error: None,
             conflict: None,
@@ -925,12 +952,65 @@ impl SidecarSession {
     ) {
         self.reducer
             .rebind(daemon_instance, project_id, session_id, selection_id);
+        // An identity transition invalidates every daemon-owned projection and
+        // mutation authority. Do not carry policy, principal, or model/form
+        // state into the new identity: a fresh authoritative snapshot must
+        // rehydrate them before this screen can act again.
+        self.principal = SidecarPrincipal::default();
+        self.form = SidecarFormState::default();
+        self.approval_mode = ApprovalMode::Ask;
+        self.policy = CentralPolicyView {
+            value: MediaResourceLimits::defaults().sidecar_invocations_per_session,
+            source: SidecarInvocationCapProvenance::Configured,
+            hard_ceiling: MediaResourceLimits::hard_ceilings().sidecar_invocations_per_session,
+        };
+        self.authoritative_mutations = false;
+        self.authoritative_snapshot = false;
         self.confirm_revoke = None;
         self.selected_invocation = None;
+        self.cursor.set(0);
+        self.a11y_viewport.set((0, usize::MAX));
         self.error = None;
         self.conflict = None;
         self.busy = false;
+        self.save_pending = false;
+        self.health_refresh_pending = false;
         self.remediation = None;
+    }
+
+    /// Returns the exact destination that a local grant construction may use.
+    /// Keeping this check in the session makes the state registry and the
+    /// action handler fail closed on the same prerequisites.
+    fn grant_creation_destination(&self) -> Result<String, &'static str> {
+        if self.approval_mode == ApprovalMode::Yolo {
+            return Err(REASON_YOLO_NO_GRANT);
+        }
+        if !self.authoritative_mutations {
+            return Err(REASON_AUTHORITATIVE_UNAVAILABLE);
+        }
+        if let Some(reason) = self.principal.config_reason() {
+            return Err(reason);
+        }
+        let Some(resolution) = self.reducer.resolution.as_ref() else {
+            return Err(REASON_MISSING_SELECTION);
+        };
+        let destination = sanitized_display_origin(&resolution.origin);
+        if !resolution.available || destination.trim().is_empty() {
+            return Err(REASON_DESTINATION_DENIED);
+        }
+        if self.form.draft_scope == GrantScope::Once
+            && !self.selected_invocation.as_deref().is_some_and(|selected| {
+                !selected.is_empty()
+                    && self
+                        .reducer
+                        .invocations
+                        .iter()
+                        .any(|invocation| invocation.invocation_id == selected)
+            })
+        {
+            return Err(REASON_INVOCATION_NOT_FOUND);
+        }
+        Ok(destination)
     }
 }
 
@@ -1026,7 +1106,7 @@ fn render_sidecar_page(
     area: Rect,
     key: &'static str,
     title: &str,
-    rows: Vec<(String, SidecarBinding)>,
+    rows: &[SidecarRenderedRow],
     selected: Option<usize>,
 ) {
     let mode = sidecar_viewport_mode(area.width, area.height);
@@ -1042,9 +1122,9 @@ fn render_sidecar_page(
     frame.render_widget(block, content);
     let mut lines = Vec::with_capacity(rows.len());
     let mut controls = Vec::with_capacity(rows.len());
-    for (text, binding) in rows {
-        lines.push(Line::from(text));
-        controls.push(binding.map(|(action, enabled, reason)| {
+    for row in rows {
+        lines.push(Line::from(row.text.clone()));
+        controls.push(row.binding.clone().map(|(action, enabled, reason)| {
             (SettingsPointerAction::Sidecar(action), enabled, reason)
         }));
     }
@@ -1073,130 +1153,56 @@ fn accept_or_back(action: &SettingsPointerAction, accepted: bool) -> Nav {
 
 impl SidecarPage {
     fn max_cursor(&self) -> usize {
-        match self.kind {
-            SidecarPageKind::Overview => SIDECAR_NODE_TITLES.len().saturating_sub(1),
-            SidecarPageKind::InvocationList => {
-                self.session.reducer.invocations.len().saturating_sub(1)
-            }
-            SidecarPageKind::GrantList => self.session.reducer.grants.len().saturating_sub(1),
-            _ => self.named_actions().len().saturating_sub(1),
-        }
+        self.rendered_rows().len().saturating_sub(1)
+    }
+
+    fn normalized_cursor_for_rows(&self, rows: &[SidecarRenderedRow]) -> usize {
+        self.session.cursor.get().min(rows.len().saturating_sub(1))
+    }
+
+    fn normalized_cursor(&self) -> usize {
+        self.normalized_cursor_for_rows(&self.rendered_rows())
+    }
+
+    /// A reducer or session transition can remove rows (for example after a
+    /// rehydrate). Clamp before further input so a stale index cannot select a
+    /// different control than the one rendered.
+    fn normalize_cursor(&self) {
+        self.session.cursor.set(self.normalized_cursor());
     }
 
     fn focused_keyboard_action(&self) -> Option<SidecarAction> {
-        match self.kind {
-            SidecarPageKind::InvocationList => self
-                .session
-                .reducer
-                .invocations
-                .get(self.session.cursor)
-                .map(|inv| {
-                    SidecarAction::OpenInvocationDetail(SidecarInvocationId(
-                        inv.invocation_id.clone(),
-                    ))
-                }),
-            SidecarPageKind::GrantList => None,
-            SidecarPageKind::Overview => None,
-            _ => self
-                .named_actions()
-                .get(self.session.cursor)
-                .and_then(|(action, enabled, _)| enabled.then(|| action.clone())),
-        }
+        self.normalize_cursor();
+        self.rendered_rows()
+            .get(self.normalized_cursor())
+            .and_then(|row| row.binding.as_ref())
+            .and_then(|(action, enabled, _)| enabled.then(|| action.clone()))
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<SidecarRowView> {
-        let mut rows = Vec::new();
-        match self.kind {
-            SidecarPageKind::Overview => {
-                for title in SIDECAR_NODE_TITLES {
-                    rows.push(SidecarRowView {
-                        label: (*title).into(),
-                        value: String::new(),
-                        state: "nav".into(),
-                        destination: None,
-                        scope: None,
-                        error: None,
-                        busy: false,
-                    });
-                }
-            }
-            SidecarPageKind::ModeEditor => {
-                rows.push(SidecarRowView {
-                    label: "mode".into(),
-                    value: self.session.form.mode.as_str().into(),
-                    state: "edit".into(),
-                    destination: None,
-                    scope: None,
-                    error: None,
-                    busy: false,
-                });
-            }
-            SidecarPageKind::GrantList | SidecarPageKind::GrantEditor => {
-                for grant in &self.session.reducer.grants {
-                    rows.push(SidecarRowView {
-                        label: grant.grant_id.clone(),
-                        value: grant.row_text(),
-                        state: if grant.revoked {
-                            "revoked".into()
-                        } else {
-                            "active".into()
-                        },
-                        destination: Some(sanitized_display_origin(&grant.destination)),
-                        scope: Some(grant.scope.as_str().into()),
-                        error: None,
-                        busy: false,
-                    });
-                }
-            }
-            SidecarPageKind::InvocationList | SidecarPageKind::InvocationDetail => {
-                for inv in &self.session.reducer.invocations {
-                    rows.push(SidecarRowView {
-                        label: inv.invocation_id.clone(),
-                        value: inv.row_text(),
-                        state: inv.state.as_str().into(),
-                        destination: Some(format!("{}:{}", inv.provider, inv.model)),
-                        scope: inv.grant_id.clone(),
-                        error: inv.safe_error.clone(),
-                        busy: false,
-                    });
-                }
-            }
-            _ => {}
-        }
-        if let Some(r) = self.session.remediation {
-            rows.push(SidecarRowView {
-                label: "remediation".into(),
-                value: r.label().into(),
-                state: r.code().into(),
-                destination: None,
-                scope: None,
-                error: Some(r.code().into()),
-                busy: false,
-            });
-        }
-        rows
+        self.viewport_rows()
+            .into_iter()
+            .map(|row| row.view)
+            .collect()
     }
 
     pub(crate) fn a11y(&self) -> SidecarA11yProjection {
-        let rendered_rows = build_rows(self);
-        let focused_text = rendered_rows
-            .get(self.session.cursor)
-            .or_else(|| rendered_rows.first())
-            .map(|(text, _)| text.clone())
-            .unwrap_or_default();
-        let typed_rows = self.visible_rows();
-        let focused = typed_rows
-            .get(self.session.cursor)
-            .or_else(|| typed_rows.first());
-        let grant_warning = self
-            .session
-            .reducer
-            .grants
-            .iter()
-            .find_map(|g| g.project_warning().map(str::to_string));
+        self.normalize_cursor();
+        let rows = self.viewport_rows();
+        let viewport_start = self.session.a11y_viewport.get().0;
+        let focused_index = self.normalized_cursor().saturating_sub(viewport_start);
+        let focused = rows.get(focused_index).or_else(|| rows.first());
+        let grant_warning = focused.and_then(|row| {
+            (row.view.scope.as_deref() == Some(GrantScope::Project.as_str()))
+                .then(|| PROJECT_GRANT_WARNING.to_string())
+        });
         SidecarA11yProjection {
-            focused_label: focused_text.clone(),
-            focused_value: focused_text,
+            focused_label: focused
+                .map(|row| row.view.label.clone())
+                .unwrap_or_default(),
+            focused_value: focused
+                .map(|row| row.view.value.clone())
+                .unwrap_or_default(),
             effective_policy: "sidecar_invocations_per_session".into(),
             effective_value: if self.session.authoritative_snapshot {
                 self.session.policy.value.to_string()
@@ -1209,18 +1215,13 @@ impl SidecarPage {
                 REASON_AUTHORITATIVE_UNAVAILABLE.into()
             },
             destination: focused
-                .and_then(|r| r.destination.clone())
-                .or_else(|| {
-                    self.session
-                        .reducer
-                        .resolution
-                        .as_ref()
-                        .map(|t| sanitized_display_origin(&t.origin))
-                })
+                .and_then(|row| row.view.destination.clone())
                 .unwrap_or_default(),
-            scope: focused.and_then(|r| r.scope.clone()).unwrap_or_default(),
+            scope: focused
+                .and_then(|row| row.view.scope.clone())
+                .unwrap_or_default(),
             non_color_state: focused
-                .map(|r| r.state.clone())
+                .map(|row| row.view.state.clone())
                 .unwrap_or_else(|| "idle".into()),
             busy: self.session.busy,
             error: self.session.error.clone(),
@@ -1229,10 +1230,98 @@ impl SidecarPage {
     }
 
     pub(crate) fn named_actions(&self) -> Vec<(SidecarAction, bool, Option<&'static str>)> {
+        self.rendered_rows()
+            .into_iter()
+            .filter_map(|row| row.binding)
+            .collect()
+    }
+
+    fn rendered_rows(&self) -> Vec<SidecarRenderedRow> {
         build_rows(self)
             .into_iter()
-            .filter_map(|(_, binding)| binding)
+            .map(|(text, binding)| SidecarRenderedRow {
+                view: self.row_view(&text, binding.as_ref()),
+                text,
+                binding,
+            })
             .collect()
+    }
+
+    fn viewport_rows(&self) -> Vec<SidecarRenderedRow> {
+        let (start, count) = self.session.a11y_viewport.get();
+        self.rendered_rows()
+            .into_iter()
+            .skip(start)
+            .take(count)
+            .collect()
+    }
+
+    fn row_view(
+        &self,
+        text: &str,
+        binding: Option<&(SidecarAction, bool, Option<&'static str>)>,
+    ) -> SidecarRowView {
+        let text_without_marker = text.trim_start_matches(['▸', ' ']);
+        if let Some(grant) = self
+            .session
+            .reducer
+            .grants
+            .iter()
+            .find(|grant| grant.row_text() == text_without_marker)
+        {
+            return SidecarRowView {
+                label: grant.grant_id.clone(),
+                value: grant.row_text(),
+                state: if grant.revoked { "revoked" } else { "active" }.into(),
+                destination: Some(sanitized_display_origin(&grant.destination)),
+                scope: Some(grant.scope.as_str().into()),
+                error: None,
+                busy: self.session.busy,
+            };
+        }
+        if let Some(invocation) = self
+            .session
+            .reducer
+            .invocations
+            .iter()
+            .find(|invocation| invocation.row_text() == text_without_marker)
+        {
+            return SidecarRowView {
+                label: invocation.invocation_id.clone(),
+                value: invocation.row_text(),
+                state: invocation.state.as_str().into(),
+                destination: Some(format!("{}:{}", invocation.provider, invocation.model)),
+                scope: invocation.grant_id.clone(),
+                error: invocation.safe_error.clone(),
+                busy: self.session.busy,
+            };
+        }
+        let (label, state, error) = if let Some(remediation) = self.session.remediation
+            && text.contains(remediation.code())
+        {
+            (
+                "remediation".into(),
+                remediation.code().into(),
+                Some(remediation.code().into()),
+            )
+        } else if let Some((_, enabled, reason)) = binding {
+            (
+                text.into(),
+                if *enabled { "action" } else { "disabled" }.into(),
+                reason.map(str::to_string),
+            )
+        } else {
+            (text.into(), "information".into(), None)
+        };
+        SidecarRowView {
+            label,
+            value: text.into(),
+            state,
+            destination: None,
+            scope: None,
+            error,
+            busy: self.session.busy,
+        }
     }
 
     fn push_kind(&self, kind: SidecarPageKind) -> Nav {
@@ -1259,7 +1348,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
     match page.kind {
         SidecarPageKind::Overview => {
             for (i, title) in SIDECAR_NODE_TITLES.iter().enumerate() {
-                let marker = if i == page.session.cursor {
+                let marker = if i == page.session.cursor.get() {
                     "▸ "
                 } else {
                     "  "
@@ -1554,15 +1643,10 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     }
                 }
             }
-            let create_enabled = can_mutate && page.session.approval_mode == ApprovalMode::Ask;
-            let create_reason = if page.session.approval_mode == ApprovalMode::Yolo {
-                Some(REASON_YOLO_NO_GRANT)
-            } else {
-                mutate_reason
-            };
+            let create = page.session.grant_creation_destination();
             rows.push((
                 "[create grant]".into(),
-                Some((SidecarAction::CreateGrant, create_enabled, create_reason)),
+                Some((SidecarAction::CreateGrant, create.is_ok(), create.err())),
             ));
             rows.push((
                 "[open grant editor]".into(),
@@ -1634,17 +1718,10 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                 ));
                 rows.push(("No approval prompt. No standing grant.".into(), None));
             }
+            let create = page.session.grant_creation_destination();
             rows.push((
                 "[create grant]".into(),
-                Some((
-                    SidecarAction::CreateGrant,
-                    can_mutate && first_use.prompt,
-                    if first_use.prompt {
-                        mutate_reason
-                    } else {
-                        Some(REASON_YOLO_NO_GRANT)
-                    },
-                )),
+                Some((SidecarAction::CreateGrant, create.is_ok(), create.err())),
             ));
             rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
         }
@@ -1652,17 +1729,10 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
             if page.session.reducer.invocations.is_empty() {
                 rows.push(("No invocations.".into(), None));
             } else {
-                for (i, inv) in page.session.reducer.invocations.iter().enumerate() {
-                    let marker = if i == page.session.cursor {
-                        "▸ "
-                    } else {
-                        "  "
-                    };
-                    rows.push((format!("{marker}{}", inv.row_text()), None));
-                }
-                if let Some(inv) = page.session.reducer.invocations.get(page.session.cursor) {
+                for inv in &page.session.reducer.invocations {
+                    rows.push((inv.row_text(), None));
                     rows.push((
-                        "[open invocation detail]".into(),
+                        format!("[open invocation detail {}]", inv.invocation_id),
                         Some((
                             SidecarAction::OpenInvocationDetail(SidecarInvocationId(
                                 inv.invocation_id.clone(),
@@ -1676,19 +1746,13 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
             rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
         }
         SidecarPageKind::InvocationDetail => {
-            if let Some(inv) = page
-                .session
-                .selected_invocation
-                .as_ref()
-                .and_then(|id| {
-                    page.session
-                        .reducer
-                        .invocations
-                        .iter()
-                        .find(|i| i.invocation_id == *id)
-                })
-                .or_else(|| page.session.reducer.invocations.first())
-            {
+            if let Some(inv) = page.session.selected_invocation.as_ref().and_then(|id| {
+                page.session
+                    .reducer
+                    .invocations
+                    .iter()
+                    .find(|i| i.invocation_id == *id)
+            }) {
                 rows.push((inv.row_text(), None));
                 rows.push((
                     format!(
@@ -1762,10 +1826,12 @@ impl SettingsPage for SidecarPage {
                 _ => Nav::Stay,
             };
         }
+        self.normalize_cursor();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {
                 if self.session.confirm_revoke.is_some() {
                     self.session.cancel_confirm();
+                    self.normalize_cursor();
                     Nav::Stay
                 } else {
                     Nav::Back
@@ -1774,47 +1840,33 @@ impl SettingsPage for SidecarPage {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.session.confirm_revoke.is_some() {
                     self.session.cancel_confirm();
+                    self.normalize_cursor();
                     return Nav::Stay;
                 }
-                self.session.cursor = self.session.cursor.saturating_sub(1);
+                self.session
+                    .cursor
+                    .set(self.session.cursor.get().saturating_sub(1));
                 Nav::Stay
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.session.confirm_revoke.is_some() {
                     self.session.cancel_confirm();
+                    self.normalize_cursor();
                     return Nav::Stay;
                 }
-                self.session.cursor = self.session.cursor.saturating_add(1).min(self.max_cursor());
+                self.session.cursor.set(
+                    self.session
+                        .cursor
+                        .get()
+                        .saturating_add(1)
+                        .min(self.max_cursor()),
+                );
                 Nav::Stay
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.kind == SidecarPageKind::Overview {
-                    let node = match self.session.cursor {
-                        0 => SidecarNodeId::Mode,
-                        1 => SidecarNodeId::Defaults,
-                        2 => SidecarNodeId::Override,
-                        3 => SidecarNodeId::CentralPolicy,
-                        4 => SidecarNodeId::Resolver,
-                        5 => SidecarNodeId::Health,
-                        6 => SidecarNodeId::Grants,
-                        _ => SidecarNodeId::Invocations,
-                    };
-                    return Nav::Push(open_node(node, self.session.clone()));
-                }
                 if let Some(action) = self.focused_keyboard_action() {
                     return self
                         .handle_pointer_control(_cx, SettingsPointerAction::Sidecar(action));
-                }
-                Nav::Stay
-            }
-            KeyCode::Char('r') if self.kind == SidecarPageKind::GrantList => {
-                if let Some(grant) = self.session.reducer.grants.get(self.session.cursor) {
-                    return self.handle_pointer_control(
-                        _cx,
-                        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
-                            grant.grant_id.clone(),
-                        ))),
-                    );
                 }
                 Nav::Stay
             }
@@ -1830,14 +1882,28 @@ impl SettingsPage for SidecarPage {
         let SettingsPointerAction::Sidecar(action) = action else {
             return Nav::Stay;
         };
+        self.normalize_cursor();
         match action {
             SidecarAction::OpenNode(node) => Nav::Push(open_node(node, self.session.clone())),
             SidecarAction::OpenResolverDetail => self.push_kind(SidecarPageKind::ResolverDetail),
             SidecarAction::OpenHealthDetail => self.push_kind(SidecarPageKind::HealthDetail),
             SidecarAction::OpenGrantEditor => self.push_kind(SidecarPageKind::GrantEditor),
             SidecarAction::OpenInvocationDetail(id) => {
-                self.session.selected_invocation = Some(id.0);
-                self.push_kind(SidecarPageKind::InvocationDetail)
+                if self.session.authoritative_snapshot
+                    && self
+                        .session
+                        .reducer
+                        .invocations
+                        .iter()
+                        .any(|invocation| invocation.invocation_id == id.0)
+                {
+                    self.session.selected_invocation = Some(id.0);
+                    self.push_kind(SidecarPageKind::InvocationDetail)
+                } else {
+                    self.session.selected_invocation = None;
+                    self.session.error = Some(REASON_INVOCATION_NOT_FOUND.into());
+                    Nav::Stay
+                }
             }
             SidecarAction::SetMode(mode) => {
                 if !self.session.authoritative_mutations {
@@ -1935,33 +2001,25 @@ impl SettingsPage for SidecarPage {
                 Nav::Stay
             }
             SidecarAction::CreateGrant => {
-                if self.kind == SidecarPageKind::GrantList {
-                    if self.session.approval_mode == ApprovalMode::Yolo {
+                let destination = match self.session.grant_creation_destination() {
+                    Ok(destination) => destination,
+                    Err(REASON_DESTINATION_DENIED) => {
+                        self.session.remediation = Some(SidecarRemediation::DestinationDenied);
                         return Nav::Stay;
                     }
+                    Err(_) => {
+                        self.session.remediation = Some(SidecarRemediation::MissingSelection);
+                        return Nav::Stay;
+                    }
+                };
+                if self.kind == SidecarPageKind::GrantList {
                     return self.push_kind(SidecarPageKind::GrantEditor);
-                }
-                if self.session.approval_mode == ApprovalMode::Yolo
-                    || !self.session.principal.can_mutate()
-                    || !self.session.authoritative_mutations
-                    || self.session.reducer.resolution.is_none()
-                    || (self.session.form.draft_scope == GrantScope::Once
-                        && self.session.selected_invocation.is_none())
-                {
-                    self.session.remediation = Some(SidecarRemediation::MissingSelection);
-                    return Nav::Stay;
                 }
                 let grant = GrantView {
                     grant_id: format!("grant-{}", self.session.reducer.grants.len() + 1),
                     version: 1,
                     project: self.session.reducer.project_id.clone(),
-                    destination: self
-                        .session
-                        .reducer
-                        .resolution
-                        .as_ref()
-                        .map(|t| sanitized_display_origin(&t.origin))
-                        .unwrap_or_default(),
+                    destination,
                     media_class: MediaClass::Image.as_str().into(),
                     purpose: Purpose::AskImage.as_str().into(),
                     scope: self.session.form.draft_scope,
@@ -2000,22 +2058,26 @@ impl SettingsPage for SidecarPage {
                 if !self.session.authoritative_mutations {
                     self.session.cancel_confirm();
                     self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                    self.normalize_cursor();
                     return Nav::Stay;
                 }
                 let Some(pending) = self.session.confirm_revoke.take() else {
                     return Nav::Stay;
                 };
                 if pending.grant_id != id.0 {
+                    self.normalize_cursor();
                     return Nav::Stay;
                 }
                 let _ = self
                     .session
                     .reducer
                     .revoke_grant(&pending.grant_id, pending.version);
+                self.normalize_cursor();
                 Nav::Stay
             }
             SidecarAction::ConfirmRevokeGrant(_, ConfirmationChoice::Cancel) => {
                 self.session.cancel_confirm();
+                self.normalize_cursor();
                 Nav::Stay
             }
             SidecarAction::Cancel => Nav::Back,
@@ -2030,6 +2092,7 @@ impl SettingsPage for SidecarPage {
     ) -> Nav {
         if self.session.confirm_revoke.is_some() {
             self.session.cancel_confirm();
+            self.normalize_cursor();
             return Nav::Stay;
         }
         let key = if delta < 0 {
@@ -2048,22 +2111,44 @@ impl SettingsPage for SidecarPage {
 
     fn cancel_pointer_transients(&mut self) {
         self.session.cancel_confirm();
+        self.normalize_cursor();
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        self.session
-            .viewport
-            .set(sidecar_viewport_mode(area.width, area.height));
-        let rows = build_rows(self);
+        self.normalize_cursor();
+        let mode = sidecar_viewport_mode(area.width, area.height);
+        self.session.viewport.set(mode);
+        if mode == SidecarViewportMode::Blocked {
+            self.session.a11y_viewport.set((0, 0));
+        } else {
+            let content_height = if mode == SidecarViewportMode::Compact {
+                area.height.saturating_sub(1)
+            } else {
+                area.height
+            };
+            let inner_height = content_height.saturating_sub(2);
+            self.session.a11y_viewport.set((
+                cx.scroll_states.offset_for("sidecar"),
+                usize::from(inner_height),
+            ));
+        }
+        let rows = self.rendered_rows();
+        let selected = self.normalized_cursor_for_rows(&rows);
         render_sidecar_page(
             cx,
             frame,
             area,
             "sidecar",
             self.kind.title(),
-            rows,
-            Some(self.session.cursor),
+            &rows,
+            Some(selected),
         );
+        if mode != SidecarViewportMode::Blocked {
+            let (_, count) = self.session.a11y_viewport.get();
+            self.session
+                .a11y_viewport
+                .set((cx.scroll_states.offset_for("sidecar"), count));
+        }
     }
 
     fn title(&self, _cx: &SettingsCx) -> String {

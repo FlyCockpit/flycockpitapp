@@ -1487,6 +1487,7 @@ fn sidecar_pointer_session() -> image_sidecar::SidecarSession {
     session.form.models = vec![image_sidecar::SidecarModelOption {
         provider: "openai".into(),
         model: "gpt-4o".into(),
+        configured: true,
         image_capable: true,
         fresh: true,
     }];
@@ -1532,6 +1533,39 @@ fn sidecar_pointer_session() -> image_sidecar::SidecarSession {
             owner_detail: None,
         });
     session
+}
+
+#[test]
+fn sidecar_child_page_mutations_propagate_back_to_the_parent_session() {
+    use pointer_actions::{SettingsPointerAction, SidecarAction, SidecarModeChoice};
+
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = dialog_with_sidecar_page(
+        &tmp,
+        image_sidecar::sidecar_page(
+            image_sidecar::SidecarPageKind::Overview,
+            sidecar_pointer_session(),
+        ),
+    );
+    dialog.apply_nav(Nav::Push(image_sidecar::sidecar_page(
+        image_sidecar::SidecarPageKind::ModeEditor,
+        sidecar_pointer_session(),
+    )));
+    let child = dialog
+        .page
+        .downcast_mut::<image_sidecar::SidecarPage>()
+        .expect("sidecar child page");
+    child.handle_pointer_control(
+        &mut dialog.cx,
+        SettingsPointerAction::Sidecar(SidecarAction::SetMode(SidecarModeChoice::Always)),
+    );
+
+    dialog.apply_nav(Nav::Back);
+    let parent = dialog
+        .page
+        .downcast_ref::<image_sidecar::SidecarPage>()
+        .expect("sidecar parent page");
+    assert_eq!(parent.session.form.mode, SidecarModeChoice::Always);
 }
 
 fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {

@@ -147,6 +147,26 @@ describe("send_user_message_v2_canonical_vectors", () => {
       generation: 9n,
     });
   });
+
+  it("rejects daemon-owned provenance at both ingress boundaries", () => {
+    const request = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex)).request;
+    request.origin = "auto_continue";
+    const envelope = {
+      request_id: "018f47a2-7b3c-7def-8123-000000000001",
+      operation_id: "018f47a2-7b3c-7def-8123-000000000002",
+      session_locator: "opaque-session",
+      request,
+    };
+    expect(() =>
+      validateLocalOwnerDirectMessageV2({ ...envelope, ingress: "local_owner_direct" }),
+    ).toThrow("user-message ingress origin must be external_root");
+    expect(() =>
+      validateAuthenticatedRemoteMessageV2(
+        { ...envelope, ingress: "authenticated_remote" },
+        { id: new Uint8Array(16).fill(42), generation: 9n },
+      ),
+    ).toThrow("user-message ingress origin must be external_root");
+  });
   it("round trips the shared bytes and digests", async () => {
     for (const vector of [...fixture.vectors, ...fixture.compact_positive_vectors]) {
       const bytes = vector.fcm2_hex ? fromHex(vector.fcm2_hex) : compactBytes(vector);
@@ -162,15 +182,18 @@ describe("send_user_message_v2_canonical_vectors", () => {
     }
   });
 
-  it("binds origin into the canonical replay identity", async () => {
+  it("rejects daemon-owned provenance from canonical encode and decode", () => {
     const external = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[1].fcm2_hex));
     const internal = structuredClone(external);
     internal.request.origin = "auto_continue";
-    expect(toHex(encodeCanonicalSendUserMessageV2(internal))).not.toBe(
-      toHex(encodeCanonicalSendUserMessageV2(external)),
+    expect(() => encodeCanonicalSendUserMessageV2(internal)).toThrow(
+      "FCM2 user-message origin must be external_root",
     );
-    expect(toHex(await messageRequestDigest(internal))).not.toBe(
-      toHex(await messageRequestDigest(external)),
+
+    const internalBytes = fromHex(fixture.vectors[1].fcm2_hex);
+    internalBytes[21] = 4;
+    expect(() => decodeCanonicalSendUserMessageV2(internalBytes)).toThrow(
+      "FCM2 user-message origin must be external_root",
     );
   });
 

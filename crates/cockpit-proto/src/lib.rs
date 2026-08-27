@@ -5813,7 +5813,7 @@ mod tests {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
-                origin: UserMessageOrigin::AutoContinue,
+                origin: UserMessageOrigin::ExternalRoot,
                 text: "hello".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -5829,7 +5829,7 @@ mod tests {
                 request:
                     Request::SendUserMessage {
                         text,
-                        origin: UserMessageOrigin::AutoContinue,
+                        origin: UserMessageOrigin::ExternalRoot,
                         ..
                     },
                 ..

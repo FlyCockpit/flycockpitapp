@@ -2666,35 +2666,6 @@ pub(super) async fn handle_request(
     result
 }
 
-fn submission_origin_from_wire(
-    origin: proto::UserMessageOrigin,
-) -> crate::engine::message::SubmissionOrigin {
-    match origin {
-        proto::UserMessageOrigin::ExternalRoot => {
-            crate::engine::message::SubmissionOrigin::ExternalRoot
-        }
-        proto::UserMessageOrigin::GoalContinuation => {
-            crate::engine::message::SubmissionOrigin::GoalContinuation
-        }
-        proto::UserMessageOrigin::ScheduledJob => {
-            crate::engine::message::SubmissionOrigin::ScheduledJob
-        }
-        proto::UserMessageOrigin::AutoContinue => {
-            crate::engine::message::SubmissionOrigin::AutoContinue
-        }
-        proto::UserMessageOrigin::RetryRecovery => {
-            crate::engine::message::SubmissionOrigin::RetryRecovery
-        }
-        proto::UserMessageOrigin::ToolResult => {
-            crate::engine::message::SubmissionOrigin::ToolResult
-        }
-        proto::UserMessageOrigin::CompactNotice => {
-            crate::engine::message::SubmissionOrigin::CompactNotice
-        }
-        proto::UserMessageOrigin::Internal => crate::engine::message::SubmissionOrigin::Internal,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn handle_send_user_message(
     state: &mut MutableClientState,
@@ -2711,6 +2682,12 @@ async fn handle_send_user_message(
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     if ctx.shutdown.is_draining() {
         return Err(ErrorPayload {
             code: ErrorCode::Shutdown,
@@ -2938,7 +2915,9 @@ async fn handle_send_user_message(
     };
     let (respond_to, response_rx) = tokio::sync::oneshot::channel();
     let mut submission = crate::engine::message::UserSubmission {
-        origin: submission_origin_from_wire(origin),
+        // Client ingress is external by contract. Daemon-owned continuations
+        // use dedicated internal construction paths and never cross this API.
+        origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
         expected_model_state_generation,
         expected_model,
         kind: crate::engine::message::UserSubmissionKind::User,

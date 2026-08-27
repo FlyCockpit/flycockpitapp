@@ -3890,6 +3890,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         if canonical.session_id != session.id
             || !canonical.request.attachments.is_empty()
             || canonical.request.text.len() <= 64 * 1024
+            || canonical.request.origin != proto::UserMessageOrigin::ExternalRoot
         {
             continue;
         }
@@ -3965,7 +3966,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 .map(|(generation, _)| *generation),
             expected_model: durable_model_fence.map(|(_, model)| model),
             kind: crate::engine::message::UserSubmissionKind::User,
-            origin: canonical.request.origin.into(),
+            origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
             text: canonical.request.text,
             display_text: canonical.request.display_text,
             tag_expansions: canonical

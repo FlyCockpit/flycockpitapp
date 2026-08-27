@@ -1088,6 +1088,18 @@ mod tests {
         let flattened = plan.chunks.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(flattened, history);
 
+        let exact_cap = (0..32)
+            .flat_map(|index| {
+                [
+                    Message::user(format!("request-{index} {}", "x".repeat(200))),
+                    Message::assistant(format!("response-{index} {}", "y".repeat(200))),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let exact_cap_plan = plan_chunked_synthesis(&exact_cap, one_exchange).unwrap();
+        assert_eq!(exact_cap_plan.chunks.len(), 32);
+        assert_eq!(exact_cap_plan.draft_nodes, MAX_DRAFT_NODES);
+
         let oversized = (0..33)
             .flat_map(|index| {
                 [

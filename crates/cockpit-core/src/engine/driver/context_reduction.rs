@@ -1744,17 +1744,6 @@ impl Driver {
                 crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { diagnostic },
             )
         })?;
-        if plan.draft_nodes.saturating_add(1) > crate::engine::compact_draft::MAX_DRAFT_NODES {
-            return Err(PrepareCompactionError::Draft(
-                crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
-                    diagnostic: format!(
-                        "chunked synthesis exhausted {} draft nodes / {} wire samples",
-                        crate::engine::compact_draft::MAX_DRAFT_NODES,
-                        crate::engine::compact_draft::MAX_COMPACTION_WIRE_SAMPLES
-                    ),
-                },
-            ));
-        }
         let cancel = tokio_util::sync::CancellationToken::new();
         let chunk_instruction = "Summarize this chronological source chunk faithfully. Preserve decisions, constraints, tool findings, failures, and the next action. A deterministic appendix will be appended by the host after final synthesis; do not invent or reproduce it.";
         let mut summaries = Vec::with_capacity(plan.chunks.len());

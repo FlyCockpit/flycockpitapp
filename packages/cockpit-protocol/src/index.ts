@@ -761,16 +761,9 @@ const requestParamSchemas = {
   send_user_message: z
     .object({
       client_submission_id: clientSubmissionIdSchema,
-      origin: z.enum([
-        "external_root",
-        "goal_continuation",
-        "scheduled_job",
-        "auto_continue",
-        "retry_recovery",
-        "tool_result",
-        "compact_notice",
-        "internal",
-      ]),
+      // Authenticated clients can author only root user activity. Internal
+      // provenance is assigned by the daemon at the owning dispatch site.
+      origin: z.literal("external_root"),
       expected_model_state_generation: safeU64NumberSchema.optional(),
       expected_model: activeModelRefSchema.optional(),
       text: z.string(),
@@ -805,16 +798,7 @@ const requestParamSchemas = {
   send_user_message_bulk: z
     .object({
       client_submission_id: clientSubmissionIdSchema,
-      origin: z.enum([
-        "external_root",
-        "goal_continuation",
-        "scheduled_job",
-        "auto_continue",
-        "retry_recovery",
-        "tool_result",
-        "compact_notice",
-        "internal",
-      ]),
+      origin: z.literal("external_root"),
       expected_model_state_generation: safeU64NumberSchema.optional(),
       expected_model: activeModelRefSchema.optional(),
       transfer: bulkTransferRefSchema,

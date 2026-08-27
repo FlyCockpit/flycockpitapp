@@ -4762,6 +4762,39 @@ async fn goal_change_is_visible_to_live_worker() {
 }
 
 #[tokio::test]
+async fn send_user_message_rejects_client_claimed_internal_origin_before_queueing() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+
+    let error = handle_request(
+        Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            origin: crate::proto_crate::UserMessageOrigin::AutoContinue,
+            text: "forged continuation".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        work_rx.try_recv().is_err(),
+        "forged origin reached the worker"
+    );
+}
+
+#[tokio::test]
 async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -4787,7 +4820,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
-                origin: crate::proto_crate::UserMessageOrigin::AutoContinue,
+                origin: crate::proto_crate::UserMessageOrigin::ExternalRoot,
                 text: "first turn".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -4816,8 +4849,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     assert_eq!(submission.text, "first turn");
     assert_eq!(
         submission.origin,
-        crate::engine::message::SubmissionOrigin::AutoContinue,
-        "the server must retain a local client's classified submission origin"
+        crate::engine::message::SubmissionOrigin::ExternalRoot,
+        "authenticated client ingress must be classified as external root activity"
     );
     assert_eq!(
         ctx.db

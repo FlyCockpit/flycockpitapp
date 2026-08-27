@@ -2760,11 +2760,18 @@ impl Request {
             }
             Self::SendUserMessage {
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 run_invocation_options,
                 ..
             } => {
+                if *origin != UserMessageOrigin::ExternalRoot {
+                    return Err(
+                        "send_user_message origin must be external_root; internal provenance is daemon-owned"
+                            .to_string(),
+                    );
+                }
                 if client_submission_id.is_nil() {
                     return Err("client_submission_id must not be nil".to_string());
                 }
@@ -2787,6 +2794,7 @@ impl Request {
             }
             Self::SendUserMessageBulk {
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 transfer,
@@ -2795,6 +2803,12 @@ impl Request {
                 run_invocation_options,
                 ..
             } => {
+                if *origin != UserMessageOrigin::ExternalRoot {
+                    return Err(
+                        "send_user_message_bulk origin must be external_root; internal provenance is daemon-owned"
+                            .to_string(),
+                    );
+                }
                 if client_submission_id.is_nil() {
                     return Err("client_submission_id must not be nil".to_string());
                 }

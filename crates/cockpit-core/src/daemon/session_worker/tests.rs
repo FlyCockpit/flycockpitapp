@@ -540,7 +540,7 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         72,
         Some((9, expected.clone())),
         false,
-        proto::UserMessageOrigin::AutoContinue,
+        proto::UserMessageOrigin::ExternalRoot,
     )
     .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
@@ -563,8 +563,8 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         .unwrap()
         .request
         .origin,
-        proto::UserMessageOrigin::AutoContinue,
-        "the persisted FCM2 form must retain the original origin"
+        proto::UserMessageOrigin::ExternalRoot,
+        "the persisted FCM2 form must retain authenticated external provenance"
     );
     let (matching_updates, _matching_rx) = watch::channel(Vec::new());
     let matching_queue = crate::engine::message::UserSubmissionQueue::new(matching_updates);

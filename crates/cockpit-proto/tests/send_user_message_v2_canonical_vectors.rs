@@ -331,7 +331,7 @@ fn send_user_message_v2_shared_bytes_and_digests() {
 }
 
 #[test]
-fn send_user_message_v2_origin_is_bound_into_replay_identity() {
+fn send_user_message_v2_rejects_client_claimed_internal_origin() {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
     ))
@@ -342,12 +342,8 @@ fn send_user_message_v2_origin_is_bound_into_replay_identity() {
     .unwrap();
     let mut internal = external.clone();
     internal.request.origin = cockpit_proto::UserMessageOrigin::AutoContinue;
-    assert_ne!(external.encode().unwrap(), internal.encode().unwrap());
-    assert_ne!(
-        external.message_request_digest().unwrap(),
-        internal.message_request_digest().unwrap(),
-        "semantic replay must not reuse an identity with a changed origin"
-    );
+    let error = internal.encode().unwrap_err().to_string();
+    assert!(error.contains("origin must be external_root"), "{error}");
 }
 
 #[test]

@@ -71,6 +71,10 @@ function validateEnvelopeIdentities(envelope: MessageIngressEnvelopeV2) {
   if (!UUID_V7.test(envelope.operation_id)) throw new Error("operation_id must be UUIDv7");
   if (!envelope.session_locator) throw new Error("empty session locator");
   uuid(envelope.request.client_submission_id);
+  if (envelope.request.origin !== "external_root")
+    throw new Error(
+      "user-message ingress origin must be external_root; internal provenance is daemon-owned",
+    );
   if (
     new Set([envelope.request_id, envelope.operation_id, envelope.request.client_submission_id])
       .size !== 3
@@ -201,7 +205,10 @@ const originFromCode = (code: number): UserMessageOrigin => {
 function validate(v: CanonicalSendUserMessageV2) {
   uuid(v.session_id);
   uuid(v.request.client_submission_id);
-  originCode(v.request.origin);
+  if (v.request.origin !== "external_root")
+    throw new Error(
+      "FCM2 user-message origin must be external_root; internal provenance is daemon-owned",
+    );
   if (v.model_config_generation < 0n || v.model_config_generation > 0xffffffffffffffffn)
     throw new Error("model config generation exceeds u64");
   if (v.canonical_project_digest.length !== 32) throw new Error("invalid project digest");

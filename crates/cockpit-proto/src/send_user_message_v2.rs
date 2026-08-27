@@ -127,6 +127,10 @@ fn validate_ingress(
     provenance: MessageIngressProvenance,
 ) -> Result<ValidatedMessageIngress> {
     ensure!(
+        command.origin == crate::UserMessageOrigin::ExternalRoot,
+        "user-message ingress origin must be external_root; internal provenance is daemon-owned"
+    );
+    ensure!(
         request_id.get_version_num() == 7 && request_id.get_variant() == uuid::Variant::RFC4122,
         "request_id must be RFC UUIDv7"
     );
@@ -223,6 +227,10 @@ fn validate_text(value: &str, name: &str) -> Result<()> {
 
 impl CanonicalSendUserMessageV2 {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.request.origin == crate::UserMessageOrigin::ExternalRoot,
+            "FCM2 user-message origin must be external_root; internal provenance is daemon-owned"
+        );
         ensure!(
             !self.request.client_submission_id.is_nil(),
             "invalid nonnil UUID"

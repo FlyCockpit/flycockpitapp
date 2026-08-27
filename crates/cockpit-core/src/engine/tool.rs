@@ -1113,10 +1113,19 @@ pub enum Capability {
 }
 
 impl Capability {
-    /// Whether this capability is available under `mode`. Disabled
-    /// capabilities are gated at the engine's point of action, not merely
-    /// hidden in description text.
-    pub fn enabled(self, mode: crate::config::extended::LlmMode) -> bool {
+    /// Whether this capability is available under `posture` (issue #75).
+    /// When the posture carries a declared grant set, membership decides;
+    /// otherwise the legacy [`LlmMode`] gate applies (Stage 2 fallback).
+    /// Disabled capabilities are gated at the engine's point of action, not
+    /// merely hidden in description text.
+    pub fn enabled(self, posture: &crate::agents::PostureResolution) -> bool {
+        posture.capability_enabled(self)
+    }
+
+    /// The legacy mode gate, retained as the not-yet-declared fallback. Once
+    /// Stage 5 closes the ratchet this is reachable only through
+    /// [`PostureResolution::legacy`].
+    pub fn enabled_for_mode(self, mode: crate::config::extended::LlmMode) -> bool {
         use crate::config::extended::LlmMode;
         match self {
             // Follow-up/seed is a stronger-model affordance: the weak-model
@@ -1127,6 +1136,17 @@ impl Capability {
             Capability::ForkContext | Capability::ScopedParallelWrite => {
                 matches!(mode, LlmMode::Frontier)
             }
+        }
+    }
+}
+
+impl From<Capability> for crate::agents::AgentCapability {
+    fn from(cap: Capability) -> Self {
+        match cap {
+            Capability::FollowupSeed => Self::FollowupSeed,
+            Capability::SandboxEscalate => Self::SandboxEscalate,
+            Capability::ForkContext => Self::ForkContext,
+            Capability::ScopedParallelWrite => Self::ScopedParallelWrite,
         }
     }
 }
@@ -1410,6 +1430,7 @@ impl ToolBox {
 #[cfg(test)]
 mod capability_tests {
     use super::*;
+    use crate::agents::PostureResolution;
     use crate::config::extended::LlmMode;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -1419,23 +1440,97 @@ mod capability_tests {
     /// The follow-up/seed capability is disabled only for defensive mode.
     #[test]
     fn followup_seed_is_enabled_outside_defensive_mode() {
-        assert!(Capability::FollowupSeed.enabled(LlmMode::Normal));
-        assert!(Capability::FollowupSeed.enabled(LlmMode::Frontier));
-        assert!(!Capability::FollowupSeed.enabled(LlmMode::Defensive));
+        assert!(Capability::FollowupSeed.enabled(&PostureResolution::legacy(
+            LlmMode::Normal
+        )));
+        assert!(Capability::FollowupSeed.enabled(&PostureResolution::legacy(
+            LlmMode::Frontier
+        )));
+        assert!(!Capability::FollowupSeed.enabled(&PostureResolution::legacy(
+            LlmMode::Defensive
+        )));
     }
 
     #[test]
     fn fork_context_capability_is_frontier_only() {
-        assert!(!Capability::ForkContext.enabled(LlmMode::Normal));
-        assert!(Capability::ForkContext.enabled(LlmMode::Frontier));
-        assert!(!Capability::ForkContext.enabled(LlmMode::Defensive));
+        assert!(!Capability::ForkContext.enabled(&PostureResolution::legacy(
+            LlmMode::Normal
+        )));
+        assert!(Capability::ForkContext.enabled(&PostureResolution::legacy(
+            LlmMode::Frontier
+        )));
+        assert!(!Capability::ForkContext.enabled(&PostureResolution::legacy(
+            LlmMode::Defensive
+        )));
     }
 
     #[test]
     fn scoped_parallel_write_capability_is_frontier_only() {
-        assert!(!Capability::ScopedParallelWrite.enabled(LlmMode::Normal));
-        assert!(Capability::ScopedParallelWrite.enabled(LlmMode::Frontier));
-        assert!(!Capability::ScopedParallelWrite.enabled(LlmMode::Defensive));
+        assert!(!Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(
+            LlmMode::Normal
+        )));
+        assert!(Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(
+            LlmMode::Frontier
+        )));
+        assert!(!Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(
+            LlmMode::Defensive
+        )));
+    }
+
+    /// Issue #75 Stage 2: a declared grant set overrides the legacy mode
+    /// gate in both directions.
+    #[test]
+    fn declared_grants_override_mode_fallback() {
+        use crate::agents::{AgentCapability, AgentDef};
+        let mut grants = BTreeSet::new();
+        grants.insert(AgentCapability::ForkContext);
+        // A def that declares forkContext but is in defensive mode: the grant
+        // wins (legacy would disable it).
+        let mut def = AgentDef {
+            name: "test".into(),
+            description: "d".into(),
+            mode: crate::agents::AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: None,
+            tool_tiers: std::collections::BTreeMap::new(),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: None,
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
+            permission: None,
+            fork_eligible: false,
+            capabilities: Some(grants.clone()),
+            tool_steering: None,
+            context_policy: None,
+            vnext: None,
+            prompt: String::new(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: std::path::PathBuf::new(),
+        };
+        let posture = PostureResolution::from_def(&def, LlmMode::Defensive);
+        assert!(
+            Capability::ForkContext.enabled(&posture),
+            "declared grant overrides defensive mode"
+        );
+        assert!(
+            !Capability::FollowupSeed.enabled(&posture),
+            "an undeclared capability is off even in a mode that would enable it"
+        );
+
+        // Empty grant set disables everything regardless of mode.
+        def.capabilities = Some(BTreeSet::new());
+        let posture_empty = PostureResolution::from_def(&def, LlmMode::Frontier);
+        assert!(!Capability::ForkContext.enabled(&posture_empty));
+        assert!(!Capability::FollowupSeed.enabled(&posture_empty));
+
+        // SandboxEscalate: a declared grant enables it even in defensive mode
+        // (the tool-registration seam consults the same posture).
+        let mut escalate_grants = BTreeSet::new();
+        escalate_grants.insert(AgentCapability::SandboxEscalate);
+        def.capabilities = Some(escalate_grants);
+        let posture_escalate = PostureResolution::from_def(&def, LlmMode::Defensive);
+        assert!(Capability::SandboxEscalate.enabled(&posture_escalate));
+        assert!(!Capability::FollowupSeed.enabled(&posture_escalate));
     }
 
     struct RequirementTool {

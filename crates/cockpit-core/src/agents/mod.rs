@@ -156,6 +156,68 @@ impl ContextPolicy {
     pub const DEFAULT_AUTO_COMPACT_PCT: u8 = 80;
 }
 
+/// The resolved posture of one agent node (issue #75): the single value the
+/// engine consults in place of the session-global [`LlmMode`]. It carries
+/// either an explicit capability-grant set (when the [`AgentDef`] declares
+/// `capabilities`) or a legacy [`LlmMode`] for the not-yet-declared fallback.
+///
+/// The only constructor that injects a declared grant set is
+/// [`PostureResolution::from_def`]; the legacy seam is
+/// [`PostureResolution::legacy`]. This keeps the closure ratchet (Stage 5)
+/// enforceable: no engine site can synthesize a grant set.
+#[derive(Debug, Clone)]
+pub struct PostureResolution {
+    declared: Option<BTreeSet<AgentCapability>>,
+    legacy_mode: crate::config::extended::LlmMode,
+}
+
+impl PostureResolution {
+    /// Resolve posture from an agent definition plus the legacy mode the
+    /// session would have used. When `def.capabilities` is `Some`, the
+    /// declared set is authoritative; when `None`, the legacy mode gate
+    /// applies (Stage 2 fallback).
+    pub fn from_def(
+        def: &AgentDef,
+        legacy_mode: crate::config::extended::LlmMode,
+    ) -> Self {
+        Self {
+            declared: def.capabilities.clone(),
+            legacy_mode,
+        }
+    }
+
+    /// The legacy-only posture (no declared grants): the mode gate applies.
+    /// Used at seams that have not yet been threaded through a def.
+    pub fn legacy(legacy_mode: crate::config::extended::LlmMode) -> Self {
+        Self {
+            declared: None,
+            legacy_mode,
+        }
+    }
+
+    /// The declared grant set, or `None` when the def has not declared
+    /// capabilities (legacy mode-gate fallback).
+    pub fn declared_grants(&self) -> Option<&BTreeSet<AgentCapability>> {
+        self.declared.as_ref()
+    }
+
+    /// The legacy [`LlmMode`], consulted only when [`Self::declared_grants`]
+    /// is `None`.
+    pub fn legacy_mode(&self) -> crate::config::extended::LlmMode {
+        self.legacy_mode
+    }
+
+    /// Whether a given [`crate::engine::tool::Capability`] is enabled under
+    /// this posture. When grants are declared, membership decides; otherwise
+    /// the legacy mode gate applies.
+    pub fn capability_enabled(&self, cap: crate::engine::tool::Capability) -> bool {
+        if let Some(grants) = &self.declared {
+            return grants.contains(&cap.into());
+        }
+        cap.enabled_for_mode(self.legacy_mode)
+    }
+}
+
 /// A fully-resolved agent definition: the embedded default for a
 /// built-in, or a user-authored file on disk. The `model`/`temperature`/
 /// `tools` here are what the engine builds the agent from — an edited

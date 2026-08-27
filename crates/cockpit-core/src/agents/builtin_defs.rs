@@ -134,7 +134,9 @@ fn standard_def() -> AgentDef {
         "standard",
         "Universal fallback agent — conservative grants, terse steering.",
         super::AgentMode::All,
-        &["read", "code", "search", "graph", "bash", "task", "question"],
+        &[
+            "read", "code", "search", "graph", "bash", "task", "question",
+        ],
         "You are a general-purpose coding agent. Read and investigate before acting; delegate substantive work via `task`; report concise progress.",
         None,
     )
@@ -226,8 +228,7 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
             caps.insert(AgentCapability::ForkContext);
             caps.insert(AgentCapability::ScopedParallelWrite);
         }
-        "bee" | "Plan" | "explore" | "scout" | "history" | "Multireview"
-        | "deepthink" => {
+        "bee" | "Plan" | "explore" | "scout" | "history" | "Multireview" | "deepthink" => {
             def.tool_steering = Some(ToolSteering::Terse);
             caps.insert(AgentCapability::FollowupSeed);
             caps.insert(AgentCapability::SandboxEscalate);

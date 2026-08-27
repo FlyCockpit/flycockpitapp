@@ -3304,8 +3304,9 @@ impl Driver {
             .await;
             self.session.set_active_tool_names(
                 tools.names(),
-                crate::engine::tool::Capability::SandboxEscalate
-                    .enabled(&crate::agents::PostureResolution::legacy(frame.agent.llm_mode)),
+                crate::engine::tool::Capability::SandboxEscalate.enabled(
+                    &crate::agents::PostureResolution::legacy(frame.agent.llm_mode),
+                ),
             );
         }
     }
@@ -8966,8 +8967,9 @@ impl Driver {
         // Seeding a re-query handle for the finished child is a child-execution
         // capability, so it is gated on the CHILD's own resolved posture — the
         // child was built with its selected model's mode — not the root frame's.
-        let followup_enabled = crate::engine::tool::Capability::FollowupSeed
-            .enabled(&crate::agents::PostureResolution::legacy(child.agent.llm_mode));
+        let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(
+            &crate::agents::PostureResolution::legacy(child.agent.llm_mode),
+        );
         let followup_handle = if followup_enabled
             && crate::engine::builtin::is_followup_eligible(&child.agent.name)
         {

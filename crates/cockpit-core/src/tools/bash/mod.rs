@@ -540,7 +540,8 @@ async fn call_bash_inner(
             resource_profiles: command_resource_plan.metas.clone(),
         };
         if !options.escalated
-            && crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode) == crate::agents::ToolSteering::Verbose
+            && crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode)
+                == crate::agents::ToolSteering::Verbose
             && ctx.session.sandbox_escalation_enabled()
             && let Some(output) = defensive_human_escalation_offer(
                 args.clone(),
@@ -827,7 +828,8 @@ async fn call_bash_inner(
         && !options.escalated
         && ctx.write_scope.is_none()
         && !final_outcome.success
-        && crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode) == crate::agents::ToolSteering::Verbose
+        && crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode)
+            == crate::agents::ToolSteering::Verbose
         && ctx.session.sandbox_escalation_enabled()
         && let Some(output) = defensive_human_escalation_offer(
             args.clone(),
@@ -878,7 +880,9 @@ async fn call_bash_inner(
     // line to the model-facing body, after the `exit:` line and outside
     // compression. `Normal` mode appends nothing (token economy §10), and a
     // command with no file/search replacement classifies to `None`.
-    let tip = if crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode) == crate::agents::ToolSteering::Verbose {
+    let tip = if crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode)
+        == crate::agents::ToolSteering::Verbose
+    {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {
@@ -2441,7 +2445,9 @@ fn render_bash_outcome(
     timeout_note: Option<&str>,
 ) -> ToolOutput {
     let compress = ctx.session.shell_compression_enabled();
-    let tip = if crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode) == crate::agents::ToolSteering::Verbose {
+    let tip = if crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode)
+        == crate::agents::ToolSteering::Verbose
+    {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {

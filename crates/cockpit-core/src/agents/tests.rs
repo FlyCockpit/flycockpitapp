@@ -1266,7 +1266,10 @@ fn dir_form_selects_per_model_override() {
     let def = trusted_resolve(tmp.path(), "rev")
         .unwrap()
         .expect("agent resolves");
-    assert_eq!(def.resolved_prompt(Some("anthropic/claude-opus")), "OPUS BODY");
+    assert_eq!(
+        def.resolved_prompt(Some("anthropic/claude-opus")),
+        "OPUS BODY"
+    );
     assert_eq!(def.resolved_prompt(Some("openai/gpt-5")), "GPT BODY");
     // No hint → the canonical flat body.
     assert_eq!(def.resolved_prompt(None), "FLAT BODY");
@@ -1302,7 +1305,10 @@ fn dir_form_override_only_no_flat_uses_first_override_as_canonical() {
         .unwrap()
         .expect("agent resolves");
     // The override is present and selectable.
-    assert_eq!(def.resolved_prompt(Some("anthropic/claude-opus")), "OPUS BODY");
+    assert_eq!(
+        def.resolved_prompt(Some("anthropic/claude-opus")),
+        "OPUS BODY"
+    );
     // No hint and no flat → the first override body is the canonical body.
     assert!(def.resolved_prompt(None).len() > 0);
 }
@@ -1696,24 +1702,44 @@ fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
     let grep_docs_text = "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches.";
     // Terse steering renders the override's canonical (normal) text.
     assert_eq!(
-        definition_of(&grep, crate::agents::ToolSteering::Terse, Some(&grep_override)).description,
+        definition_of(
+            &grep,
+            crate::agents::ToolSteering::Terse,
+            Some(&grep_override)
+        )
+        .description,
         grep_docs_text
     );
     // Verbose steering: no verbose_text in the override, so it falls back to
     // the tool's own verbose description.
     assert_eq!(
-        definition_of(&grep, crate::agents::ToolSteering::Verbose, Some(&grep_override)).description,
+        definition_of(
+            &grep,
+            crate::agents::ToolSteering::Verbose,
+            Some(&grep_override)
+        )
+        .description,
         grep.verbose_description().unwrap()
     );
 
     let glob_override = def.tool_descriptions.get("glob").unwrap().to_override();
     let glob = GlobTool;
     assert_eq!(
-        definition_of(&glob, crate::agents::ToolSteering::Terse, Some(&glob_override)).description,
+        definition_of(
+            &glob,
+            crate::agents::ToolSteering::Terse,
+            Some(&glob_override)
+        )
+        .description,
         "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
     );
     assert_eq!(
-        definition_of(&glob, crate::agents::ToolSteering::Verbose, Some(&glob_override)).description,
+        definition_of(
+            &glob,
+            crate::agents::ToolSteering::Verbose,
+            Some(&glob_override)
+        )
+        .description,
         glob.verbose_description().unwrap()
     );
 }
@@ -1722,8 +1748,8 @@ fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
 
 #[test]
 fn agent_def_capabilities_parse_and_validate() {
-    use std::collections::BTreeSet;
     use super::AgentCapability;
+    use std::collections::BTreeSet;
 
     let def = def_with_tools("custom", &["read", "bash"]);
     // An empty set = explicitly none.

@@ -1044,7 +1044,11 @@ impl ToolOutputBuiltinAdapter {
         }
 
         let normal = definition_of(self.tool.as_ref(), crate::agents::ToolSteering::Terse, None);
-        let defensive = definition_of(self.tool.as_ref(), crate::agents::ToolSteering::Verbose, None);
+        let defensive = definition_of(
+            self.tool.as_ref(),
+            crate::agents::ToolSteering::Verbose,
+            None,
+        );
 
         let name = normal.name.clone();
         let mut description = normal.description;

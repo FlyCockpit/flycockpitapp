@@ -394,10 +394,9 @@ mod tests {
             // cache-safe acceptance half of enabling a branch.
             assert!(parse_action(action).is_ok());
             // The tool definition is unchanged after "enabling" it.
-            let after = serde_json::to_string(
-                &toolbox.definitions(crate::agents::ToolSteering::Terse),
-            )
-            .unwrap();
+            let after =
+                serde_json::to_string(&toolbox.definitions(crate::agents::ToolSteering::Terse))
+                    .unwrap();
             assert_eq!(
                 before, after,
                 "tools array changed after enabling `{action}`"

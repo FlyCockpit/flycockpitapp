@@ -504,10 +504,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(
-            text,
-            "[Build › explore] · [openai/gpt-test] · sandbox"
-        );
+        assert_eq!(text, "[Build › explore] · [openai/gpt-test] · sandbox");
         assert_eq!(
             status
                 .hits

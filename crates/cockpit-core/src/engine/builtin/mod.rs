@@ -5359,8 +5359,7 @@ mod tests {
     fn builtin_prompts_have_no_mode_suffixed_files() {
         // Issue #75 ratchet: the per-mode `.normal.md`/`.frontier.md` prompt
         // bodies are gone; each bundled agent has a single canonical body.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/engine/builtin");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/builtin");
         let entries = std::fs::read_dir(&dir).unwrap();
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -5790,7 +5789,9 @@ mod tests {
             let mut builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
             builder_args.llm_mode = mode;
             for build_agent in [load("Build", &build_args).unwrap(), builder(&builder_args)] {
-                let defs = build_agent.tools.definitions(crate::agents::ToolSteering::from_llm_mode(mode));
+                let defs = build_agent
+                    .tools
+                    .definitions(crate::agents::ToolSteering::from_llm_mode(mode));
                 let task = defs
                     .iter()
                     .find(|d| d.name == "task")
@@ -5842,10 +5843,7 @@ mod tests {
     /// told "draft, don't implement" must follow the brief, not implement).
     #[test]
     fn explore_prompts_advertise_native_intel_tools() {
-        for (name, prompt) in [
-            ("explore", EXPLORE_PROMPT),
-            ("explore", EXPLORE_PROMPT),
-        ] {
+        for (name, prompt) in [("explore", EXPLORE_PROMPT), ("explore", EXPLORE_PROMPT)] {
             for tool in ["context_pack", "code", "search", "graph", "bash"] {
                 assert!(
                     prompt.contains(tool),
@@ -6072,16 +6070,10 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>(),
         );
-        let base_def = crate::engine::tool::definition_of(
-            &base,
-            crate::agents::ToolSteering::Terse,
-            None,
-        );
-        let base_frontier = crate::engine::tool::definition_of(
-            &base,
-            crate::agents::ToolSteering::Terse,
-            None,
-        );
+        let base_def =
+            crate::engine::tool::definition_of(&base, crate::agents::ToolSteering::Terse, None);
+        let base_frontier =
+            crate::engine::tool::definition_of(&base, crate::agents::ToolSteering::Terse, None);
         assert_eq!(task_normal.name, base_def.name);
         assert_eq!(task_normal.parameters, base_def.parameters);
         // …and the description genuinely differs from the un-overridden one.

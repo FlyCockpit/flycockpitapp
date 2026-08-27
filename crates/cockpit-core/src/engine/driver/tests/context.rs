@@ -1990,7 +1990,10 @@ async fn effective_auto_compact_pct_stays_60_without_mcp() {
     let cfg = ContextConfig::default();
 
     for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, None, false), 60);
+        assert_eq!(
+            driver.effective_auto_compact_pct(&cfg, mode, None, false),
+            60
+        );
     }
 }
 
@@ -2005,8 +2008,14 @@ async fn effective_auto_compact_pct_explicit_override_wins() {
     };
 
     for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, None, false), 50);
-        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, None, true), 50);
+        assert_eq!(
+            driver.effective_auto_compact_pct(&cfg, mode, None, false),
+            50
+        );
+        assert_eq!(
+            driver.effective_auto_compact_pct(&cfg, mode, None, true),
+            50
+        );
     }
 }
 

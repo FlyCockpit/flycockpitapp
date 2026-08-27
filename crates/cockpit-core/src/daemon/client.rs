@@ -505,9 +505,7 @@ fn after_restart_wait(mode: LifecycleMode, error: SharedWaitError) -> RestartWai
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
-    use crate::daemon::{
-        DaemonPaths, DaemonStatus, discover, spawn_detached, spawn_detached_ephemeral,
-    };
+    use crate::daemon::{DaemonPaths, discover, spawn_detached, spawn_detached_ephemeral};
 
     match mode {
         LifecycleMode::AttachOrAutoPromote

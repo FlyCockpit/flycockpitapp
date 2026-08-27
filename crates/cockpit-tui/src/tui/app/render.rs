@@ -981,15 +981,59 @@ impl App {
     }
 
     /// Height of the queued-messages strip above the input box. Zero
-    /// when nothing's queued; otherwise top border (1) + N messages +
-    /// bottom border (1). Geometry overlaps that bottom border with
-    /// the input's top border.
+    /// when nothing's queued; otherwise top border (1) + group headers
+    /// and messages + bottom border (1). Geometry overlaps that bottom
+    /// border with the input's top border.
     pub(super) fn queue_lines(&self) -> u16 {
         if self.queue.is_empty() {
             0
         } else {
-            2 + self.queue.len() as u16
+            2 + self.queue_content_lines() as u16
         }
+    }
+
+    fn queue_content_lines(&self) -> usize {
+        let (steering, held) = self.queue_grouped();
+        let mut lines = 0;
+        if !steering.is_empty() {
+            lines += 1 + steering.len();
+        }
+        if !held.is_empty() {
+            lines += 1 + held.len();
+        }
+        lines
+    }
+
+    fn queue_grouped(&self) -> (Vec<&cockpit_proto::QueueItem>, Vec<&cockpit_proto::QueueItem>) {
+        let mut steering = Vec::new();
+        let mut held = Vec::new();
+        for item in &self.queue {
+            if item.delivery_class.is_steering() {
+                steering.push(item);
+            } else {
+                held.push(item);
+            }
+        }
+        (steering, held)
+    }
+
+    fn queue_box_title(&self) -> Line<'static> {
+        let agent = self
+            .foreground_input_target
+            .as_ref()
+            .map(|target| target.agent.as_str())
+            .filter(|agent| !agent.is_empty())
+            .or_else(|| {
+                self.queue
+                    .first()
+                    .map(|item| item.target.agent.as_str())
+                    .filter(|agent| !agent.is_empty())
+            })
+            .unwrap_or("agent");
+        Line::from(vec![Span::styled(
+            format!(" {agent} "),
+            Style::default().fg(MUTED_TEXT),
+        )])
     }
 
     pub(super) fn input_height(&self) -> u16 {
@@ -1738,6 +1782,7 @@ impl App {
         frame: &mut ratatui::Frame,
         area: Rect,
         border_color: Color,
+        title: Option<Line<'static>>,
     ) -> Option<Rect> {
         if area.height < 2 || area.width < 5 {
             return None;
@@ -1749,11 +1794,14 @@ impl App {
             strip.width.saturating_sub(2),
             strip.height.saturating_sub(2),
         );
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_set(Self::CONNECTED_INPUT_STRIP_BORDER_SET)
             .border_style(Style::default().fg(border_color))
             .merge_borders(MergeStrategy::Exact);
+        if let Some(title) = title {
+            block = block.title(title);
+        }
         frame.render_widget(block, strip);
         Some(content)
     }
@@ -1761,7 +1809,8 @@ impl App {
     /// Queued-messages box. Inset one column from each side of the
     /// input box, with a bottom border that overlaps the input's top
     /// border and relies on ratatui border merging for the junctions.
-    pub(super) fn render_queue(&self, frame: &mut ratatui::Frame, area: Rect) {
+    /// `&mut self` so later control buttons can register hits.
+    pub(super) fn render_queue(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         if self.queue.is_empty() {
             return;
         }
@@ -1771,16 +1820,32 @@ impl App {
         // the queue strip, so it reuses the same helper with
         // `shell_mode = false`.
         let border_color = Self::input_border_color(self.busy, false);
-        let Some(content_area) = Self::render_connected_input_top_strip(frame, area, border_color)
-        else {
+        let Some(content_area) = Self::render_connected_input_top_strip(
+            frame,
+            area,
+            border_color,
+            Some(self.queue_box_title()),
+        ) else {
             return;
         };
         let queue_text_style = Style::default().fg(MUTED_TEXT);
+        let header_style = queue_text_style.add_modifier(Modifier::ITALIC);
         let non_foreground_style = queue_text_style.add_modifier(Modifier::DIM);
         let inner_w = content_area.width.saturating_sub(2).max(1) as usize;
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.queue.len());
+        let (steering, held) = self.queue_grouped();
+        let mut lines: Vec<Line<'static>> = Vec::new();
 
-        for msg in &self.queue {
+        let mut push_header = |label: &str| {
+            let text = first_line_truncated(label, inner_w);
+            let pad = inner_w.saturating_sub(display_width(&text));
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(text, header_style),
+                Span::raw(" ".repeat(pad)),
+                Span::raw(" "),
+            ]));
+        };
+        let mut push_item = |msg: &cockpit_proto::QueueItem| {
             let non_foreground = self
                 .foreground_input_target
                 .as_ref()
@@ -1816,6 +1881,19 @@ impl App {
             }
             spans.extend([Span::raw(" ".repeat(trailing)), Span::raw(" ")]);
             lines.push(Line::from(spans));
+        };
+
+        if !steering.is_empty() {
+            push_header("steering · next turn");
+            for msg in steering {
+                push_item(msg);
+            }
+        }
+        if !held.is_empty() {
+            push_header("after completion");
+            for msg in held {
+                push_item(msg);
+            }
         }
 
         frame.render_widget(Paragraph::new(lines), content_area);
@@ -3696,7 +3774,8 @@ impl App {
             return;
         }
         let border_color = Self::input_border_color(self.busy, false);
-        let Some(content_area) = Self::render_connected_input_top_strip(frame, area, border_color)
+        let Some(content_area) =
+            Self::render_connected_input_top_strip(frame, area, border_color, None)
         else {
             return;
         };
@@ -10118,7 +10197,9 @@ mod prediction_ghost_context_indicator_tests {
     };
     use crate::tui::composer::{PredictionGhost, VimMode, display_width, input_prefix_width};
     use crate::tui::theme::MUTED_TEXT;
-    use cockpit_core::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
+    use cockpit_core::engine::message::{
+        QueueDeliveryClass, QueueItemStatus, QueueTarget, QueuedUserMessage,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
@@ -10195,11 +10276,13 @@ mod prediction_ghost_context_indicator_tests {
             .push(queued_item("queued text", QueueTarget::root("Build")));
 
         let width = 32;
-        let buf = render_queue_buffer(&mut app, width, 3);
+        let height = app.queue_lines();
+        let buf = render_queue_buffer(&mut app, width, height);
         let top = row_text(&buf, 0, width);
-        let bottom = row_text(&buf, 2, width);
+        let bottom = row_text(&buf, height - 1, width);
 
-        assert_eq!(top, format!(" ╭{}╮ ", "─".repeat(width as usize - 4)));
+        assert!(top.contains('╭') && top.contains('╮'), "{top:?}");
+        assert!(top.contains("Build"), "box labels the target agent: {top:?}");
         assert_eq!(bottom, format!("╭┴{}┴╮", "─".repeat(width as usize - 4)));
     }
 
@@ -10214,7 +10297,9 @@ mod prediction_ghost_context_indicator_tests {
         item.display_text = Some("check @src/lib.rs".to_string());
         app.queue.push(item);
 
-        let row = row_text(&render_queue_buffer(&mut app, 50, 3), 1, 50);
+        let height = app.queue_lines();
+        let buf = render_queue_buffer(&mut app, 50, height);
+        let row = row_text(&buf, 2, 50);
         assert!(row.contains("check @src/lib.rs"), "{row:?}");
         assert!(!row.contains("<file"), "{row:?}");
     }
@@ -10243,15 +10328,16 @@ mod prediction_ghost_context_indicator_tests {
         app.queue
             .push(queued_item("root message", QueueTarget::root("Build")));
 
-        let buf = render_queue_buffer(&mut app, 50, 3);
-        let row = row_text(&buf, 1, 50);
+        let height = app.queue_lines();
+        let buf = render_queue_buffer(&mut app, 50, height);
+        let row = row_text(&buf, 2, 50);
         assert!(row.contains("root message"), "{row:?}");
         assert!(
             !row.contains(" · Build"),
             "foreground item is not annotated"
         );
         let x = row.find("root message").unwrap() as u16;
-        let style = buf[(x, 1)].style();
+        let style = buf[(x, 2)].style();
         assert_eq!(style.fg, Some(MUTED_TEXT));
         assert!(!style.add_modifier.contains(Modifier::DIM));
     }
@@ -10266,8 +10352,9 @@ mod prediction_ghost_context_indicator_tests {
             QueueTarget::child("explore", 1, "call-1", "default"),
         ));
 
-        let buf = render_queue_buffer(&mut app, 56, 3);
-        let row = row_text(&buf, 1, 56);
+        let height = app.queue_lines();
+        let buf = render_queue_buffer(&mut app, 56, height);
+        let row = row_text(&buf, 2, 56);
         assert!(row.contains("child message"), "{row:?}");
         assert!(row.contains(" · explore"), "{row:?}");
         assert!(
@@ -10277,7 +10364,7 @@ mod prediction_ghost_context_indicator_tests {
 
         for needle in ["child message", "explore"] {
             let x = row.find(needle).unwrap() as u16;
-            let style = buf[(x, 1)].style();
+            let style = buf[(x, 2)].style();
             assert_eq!(style.fg, Some(MUTED_TEXT));
             assert!(style.add_modifier.contains(Modifier::DIM));
         }
@@ -10293,8 +10380,9 @@ mod prediction_ghost_context_indicator_tests {
             QueueTarget::child("explore", 1, "call-1", "default"),
         ));
 
-        let buf = render_queue_buffer(&mut app, 56, 3);
-        let row = row_text(&buf, 1, 56);
+        let height = app.queue_lines();
+        let buf = render_queue_buffer(&mut app, 56, height);
+        let row = row_text(&buf, 2, 56);
         assert!(row.contains("child message"), "{row:?}");
         assert!(
             !row.contains("explore"),
@@ -10306,7 +10394,7 @@ mod prediction_ghost_context_indicator_tests {
         );
         for x in 0..56 {
             assert!(
-                !buf[(x, 1)].style().add_modifier.contains(Modifier::DIM),
+                !buf[(x, 2)].style().add_modifier.contains(Modifier::DIM),
                 "no queue cell should be dimmed when foreground target is unknown"
             );
         }
@@ -10322,10 +10410,11 @@ mod prediction_ghost_context_indicator_tests {
             QueueTarget::child("verylongagent", 1, "call-1", "default"),
         ));
 
-        let buf = render_queue_buffer(&mut app, 30, 3);
+        let height = app.queue_lines();
+        let buf = render_queue_buffer(&mut app, 30, height);
         let top = row_text(&buf, 0, 30);
-        let row = row_text(&buf, 1, 30);
-        let bottom = row_text(&buf, 2, 30);
+        let row = row_text(&buf, 2, 30);
+        let bottom = row_text(&buf, height - 1, 30);
         assert!(row.contains("queued text"), "{row:?}");
         assert!(
             !row.contains("task:"),
@@ -10336,6 +10425,82 @@ mod prediction_ghost_context_indicator_tests {
             bottom.starts_with('╭') && bottom.ends_with('╮'),
             "{bottom:?}"
         );
+    }
+
+    #[test]
+    fn queue_renders_steering_and_held_groups_in_delivery_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.foreground_input_target = Some(QueueTarget::root("Build"));
+        let mut first = queued_item("steer first", QueueTarget::root("Build"));
+        first.delivery_class = QueueDeliveryClass::Steering;
+        let mut held = queued_item("hold me", QueueTarget::root("Build"));
+        held.delivery_class = QueueDeliveryClass::Held;
+        let mut second = queued_item("steer second", QueueTarget::root("Build"));
+        second.delivery_class = QueueDeliveryClass::Steering;
+        app.queue.extend([first, held, second]);
+
+        let height = app.queue_lines();
+        let buf = render_queue_buffer(&mut app, 48, height);
+        let rows: Vec<String> = (0..height).map(|y| row_text(&buf, y, 48)).collect();
+        let joined = rows.join("\n");
+        assert!(joined.contains("steering · next turn"), "{joined}");
+        assert!(joined.contains("after completion"), "{joined}");
+        let steer_header = rows
+            .iter()
+            .position(|row| row.contains("steering · next turn"))
+            .expect("steering header");
+        let first_idx = rows
+            .iter()
+            .position(|row| row.contains("steer first"))
+            .expect("first steering message");
+        let second_idx = rows
+            .iter()
+            .position(|row| row.contains("steer second"))
+            .expect("second steering message");
+        let held_header = rows
+            .iter()
+            .position(|row| row.contains("after completion"))
+            .expect("held header");
+        let held_idx = rows
+            .iter()
+            .position(|row| row.contains("hold me"))
+            .expect("held message");
+        assert!(steer_header < first_idx && first_idx < second_idx);
+        assert!(second_idx < held_header && held_header < held_idx);
+    }
+
+    #[test]
+    fn queue_group_move_rerenders_toggled_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut item = queued_item("toggle me", QueueTarget::root("Build"));
+        item.delivery_class = QueueDeliveryClass::Steering;
+        app.queue.push(item);
+
+        let before = {
+            let height = app.queue_lines();
+            let buf = render_queue_buffer(&mut app, 40, height);
+            (0..height)
+                .map(|y| row_text(&buf, y, 40))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(before.contains("steering · next turn"));
+        assert!(!before.contains("after completion"));
+
+        app.queue[0].delivery_class = QueueDeliveryClass::Held;
+        let after = {
+            let height = app.queue_lines();
+            let buf = render_queue_buffer(&mut app, 40, height);
+            (0..height)
+                .map(|y| row_text(&buf, y, 40))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(after.contains("after completion"));
+        assert!(!after.contains("steering · next turn"));
+        assert!(after.contains("toggle me"));
     }
 
     #[test]

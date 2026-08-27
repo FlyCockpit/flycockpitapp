@@ -1016,6 +1016,94 @@ async fn compact_preparation_quota_is_shared_across_draft_calls() {
 }
 
 #[tokio::test]
+async fn full_shadow_delta_overflow_fallback_covers_complete_current_history() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    let full_history = (0..8)
+        .flat_map(|turn| {
+            [
+                Message::user(format!("full-source-user-{turn}-{}", "u".repeat(5_000))),
+                Message::assistant(format!(
+                    "full-source-assistant-{turn}-{}",
+                    "a".repeat(5_000)
+                )),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let revision_history = full_history[full_history.len() - 2..].to_vec();
+    let script = driver.test_compact_brief_script.as_ref().unwrap();
+    crate::sync::lock_or_recover(script).extend(
+        std::iter::once(TestCompactSample::Error {
+            message: "maximum context length".to_string(),
+            status: Some(400),
+            typed_timeout: false,
+        })
+        .chain(
+            std::iter::repeat_with(|| {
+                TestCompactSample::Success("complete trustworthy synthesis ".repeat(40))
+            })
+            .take(40),
+        ),
+    );
+
+    let result = driver
+        .draft_brief_delta(
+            &tx,
+            &[],
+            &"existing full shadow brief ".repeat(40),
+            revision_history.clone(),
+            full_history.clone(),
+            Arc::new(std::sync::Mutex::new(CompactPreparationQuota::default())),
+        )
+        .await;
+    assert!(result.is_ok(), "full-coverage fallback should synthesize");
+
+    let calls = crate::sync::lock_or_recover(driver.test_compact_brief_calls.as_ref().unwrap());
+    let delta = calls
+        .iter()
+        .find(|call| call.purpose == "compact_brief_delta")
+        .expect("delta attempt is captured");
+    assert_eq!(
+        delta.history, revision_history,
+        "delta keeps the reduced revision"
+    );
+    let chunk_source = calls
+        .iter()
+        .filter(|call| call.purpose == "compact_chunk_brief")
+        .flat_map(|call| call.history.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chunk_source, full_history,
+        "overflow fallback chunks must cover the snapshot prefix as well as the revision tail"
+    );
+}
+
+#[test]
+fn compact_synthesis_quota_accounts_for_the_direct_node_before_execution() {
+    let mut quota = CompactPreparationQuota::default();
+    quota.claim_node().expect("direct node fits");
+    assert!(
+        quota
+            .ensure_nodes_available(crate::engine::compact_draft::MAX_DRAFT_NODES - 1)
+            .is_ok()
+    );
+    assert!(
+        quota
+            .ensure_nodes_available(crate::engine::compact_draft::MAX_DRAFT_NODES)
+            .is_err()
+    );
+    assert_eq!(quota.draft_nodes, 1, "preflight does not consume nodes");
+}
+
+#[tokio::test]
 async fn compact_unknown_window_overflow_never_advances_to_smaller_rung() {
     use crate::config::providers::{CacheMode, ContextConfig};
     let (mut driver, _tmp) = test_driver_without_network(8);
@@ -1228,6 +1316,59 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
         !degen_gate.suppresses(&changed),
         "degenerate failure does not suppress a different coverage"
     );
+}
+
+#[test]
+fn production_host_ingress_constructors_preserve_until_activity() {
+    use crate::engine::message::SubmissionOrigin;
+
+    let routed = [
+        retry_recovery_submission("retry".to_string()),
+        auto_continue_submission("auto".to_string(), Vec::new()),
+        goal_continuation_submission("goal".to_string(), Vec::new(), None),
+        crate::engine::driver::schedule_dispatch::scheduled_job_submission(
+            "scheduled root delivery".to_string(),
+            None,
+        ),
+        crate::engine::driver::schedule_dispatch::scheduled_job_submission(
+            "scheduled subagent result delivery".to_string(),
+            Some("job-child".to_string()),
+        ),
+    ];
+    assert_eq!(routed[0].origin, SubmissionOrigin::RetryRecovery);
+    assert_eq!(routed[1].origin, SubmissionOrigin::AutoContinue);
+    assert_eq!(routed[2].origin, SubmissionOrigin::GoalContinuation);
+    assert_eq!(routed[3].origin, SubmissionOrigin::ScheduledJob);
+    assert_eq!(routed[4].origin, SubmissionOrigin::ScheduledJob);
+
+    for submission in routed {
+        let mut gate = AutoCompactGate::UntilActivity {
+            activity_epoch: 7,
+            reason: "deterministic compaction failure".to_string(),
+        };
+        gate.observe_submission(submission.origin, false);
+        assert!(
+            matches!(
+                gate,
+                AutoCompactGate::UntilActivity {
+                    activity_epoch: 7,
+                    ..
+                }
+            ),
+            "production {origin:?} ingress must preserve UntilActivity",
+            origin = submission.origin
+        );
+    }
+
+    let mut gate = AutoCompactGate::UntilActivity {
+        activity_epoch: 7,
+        reason: "deterministic compaction failure".to_string(),
+    };
+    gate.observe_submission(SubmissionOrigin::ExternalRoot, false);
+    assert!(matches!(
+        gate,
+        AutoCompactGate::Eligible { activity_epoch: 8 }
+    ));
 }
 
 #[tokio::test]
@@ -1618,6 +1759,10 @@ async fn apply_runs_no_inference() {
         .expect("apply succeeds");
 
     assert_eq!(compact_inference_purposes(&driver).await, before);
+    assert!(matches!(
+        driver.auto_compact_gate,
+        AutoCompactGate::Committed { activity_epoch: 0 }
+    ));
     drop(tx);
     while rx.recv().await.is_some() {}
 }

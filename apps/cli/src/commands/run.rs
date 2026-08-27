@@ -2174,11 +2174,12 @@ mod tests {
         match send {
             Request::SendUserMessage {
                 client_submission_id,
-                origin: Default::default(),
+                origin,
                 run_invocation_options: Some(opts),
                 ..
             } => {
                 assert_eq!(client_submission_id, id);
+                assert_eq!(origin, cockpit_proto::UserMessageOrigin::ExternalRoot);
                 assert_eq!(opts.approval_mode, Some(ApprovalMode::Yolo));
             }
             other => panic!("run path must send SendUserMessage, got {other:?}"),

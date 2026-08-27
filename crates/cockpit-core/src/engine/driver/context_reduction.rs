@@ -59,6 +59,16 @@ impl AutoCompactGate {
         };
     }
 
+    pub(in crate::engine::driver) fn observe_submission(
+        &mut self,
+        origin: crate::engine::message::SubmissionOrigin,
+        has_oversized_artifact_lease: bool,
+    ) {
+        if origin.advances_activity_epoch() && !has_oversized_artifact_lease {
+            self.external_activity();
+        }
+    }
+
     pub(in crate::engine::driver) fn record_failure(
         &mut self,
         outcome: &PrepareCompactionError,
@@ -221,13 +231,21 @@ pub(in crate::engine::driver) struct CompactPreparationQuota {
 }
 
 impl CompactPreparationQuota {
-    fn claim_node(&mut self) -> Result<(), String> {
-        if self.draft_nodes >= crate::engine::compact_draft::MAX_DRAFT_NODES {
+    fn ensure_nodes_available(&self, additional: usize) -> Result<(), String> {
+        if self.draft_nodes.saturating_add(additional)
+            > crate::engine::compact_draft::MAX_DRAFT_NODES
+        {
             return Err(format!(
-                "compaction preparation exhausted {} draft nodes / {} wire samples",
-                self.draft_nodes, self.wire_samples
+                "compaction preparation requires {additional} additional draft nodes after {} already claimed; limit is {}",
+                self.draft_nodes,
+                crate::engine::compact_draft::MAX_DRAFT_NODES
             ));
         }
+        Ok(())
+    }
+
+    fn claim_node(&mut self) -> Result<(), String> {
+        self.ensure_nodes_available(1)?;
         self.draft_nodes += 1;
         Ok(())
     }
@@ -1430,6 +1448,7 @@ impl Driver {
                     &tail_message_seqs,
                     &ready.brief,
                     revision_history,
+                    filtered_history.clone(),
                     draft_quota.clone(),
                 )
                 .await?
@@ -1744,6 +1763,14 @@ impl Driver {
                 crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { diagnostic },
             )
         })?;
+        let synthesis_nodes = plan.draft_nodes.saturating_sub(1);
+        let quota_check =
+            crate::sync::lock_or_recover(&draft.quota).ensure_nodes_available(synthesis_nodes);
+        if let Err(diagnostic) = quota_check {
+            return Err(PrepareCompactionError::Draft(
+                crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { diagnostic },
+            ));
+        }
         let cancel = tokio_util::sync::CancellationToken::new();
         let chunk_instruction = "Summarize this chronological source chunk faithfully. Preserve decisions, constraints, tool findings, failures, and the next action. A deterministic appendix will be appended by the host after final synthesis; do not invent or reproduce it.";
         let mut summaries = Vec::with_capacity(plan.chunks.len());
@@ -1857,6 +1884,7 @@ impl Driver {
         tail_message_seqs: &[i64],
         shadow_brief: &str,
         revision_history: Vec<Message>,
+        full_history: Vec<Message>,
         quota: Arc<std::sync::Mutex<CompactPreparationQuota>>,
     ) -> Result<(String, CompactAuthoringModel), PrepareCompactionError> {
         let draft = self
@@ -1888,10 +1916,13 @@ impl Driver {
             crate::engine::compact_draft::CompactDraftOutcome::Success(_)
             | crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { .. } => {
                 // A fitted delta is only a partial precursor. Re-run from the
-                // complete assembled revision history so the foreground path
+                // complete current source history so the foreground path
                 // enters the same full-coverage chunk synthesis as a non-shadow
-                // compact instead of promoting the partial shadow.
-                self.draft_brief(tx, tail_message_seqs, revision_history, quota)
+                // compact instead of promoting the partial shadow. A full
+                // shadow's revision history intentionally contains only its
+                // prior tail plus newer turns, so it is not a full-coverage
+                // fallback source by itself.
+                self.draft_brief(tx, tail_message_seqs, full_history, quota)
                     .await
             }
             failure => Err(PrepareCompactionError::Draft(failure)),
@@ -2179,7 +2210,11 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                         "compact: brief generation failed"
                     );
                 } else {
-                    tracing::warn!(error = %e, purpose, "compact: brief generation failed");
+                    tracing::warn!(
+                        purpose,
+                        provider_detail = "unavailable",
+                        "compact: brief generation failed"
+                    );
                 }
                 let diagnostic_input = safe.map_or(raw_error.as_str(), |safe| safe.marker);
                 let diagnostic = compact_diagnostic(&draft, diagnostic_input);

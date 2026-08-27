@@ -1408,6 +1408,34 @@ struct DelegationRecursionOverride {
     default_depth: u32,
 }
 
+fn retry_recovery_submission(text: String) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::RetryRecovery;
+    submission
+}
+
+fn auto_continue_submission(
+    text: String,
+    images: Vec<crate::engine::message::SubmissionImage>,
+) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::AutoContinue;
+    submission.images = images;
+    submission
+}
+
+fn goal_continuation_submission(
+    text: String,
+    images: Vec<crate::engine::message::SubmissionImage>,
+    run_invocation_id: Option<uuid::Uuid>,
+) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::GoalContinuation;
+    submission.images = images;
+    submission.run_invocation_id = run_invocation_id;
+    submission
+}
+
 /// An in-flight compact-after-delegation: the decision tracker plus the
 /// background shrink task's join handle (`None` once joined, or when the
 /// shrink was synchronous). Held per delegation so the parent can resolve
@@ -5822,7 +5850,7 @@ impl Driver {
         self.goal_root_turn = Some((goal.id, goal.attempt_generation, turn_id));
         let result = self
             .run_user_input(
-                UserSubmission::text(self.goal_host_directive(goal)),
+                goal_continuation_submission(self.goal_host_directive(goal), Vec::new(), None),
                 input_rx,
                 tx,
             )
@@ -9492,9 +9520,8 @@ impl Driver {
         // starts. A receipt-keyed oversized turn has not reached phase two
         // yet, so advancing it here would make a rejected/expired source an
         // accepted-turn side effect.
-        if submission.origin.advances_activity_epoch() && !submission_has_oversized_artifact_lease {
-            self.auto_compact_gate.external_activity();
-        }
+        self.auto_compact_gate
+            .observe_submission(submission.origin, submission_has_oversized_artifact_lease);
         // Shadow drafting is utility work: a foreground user turn always wins.
         // Preserve a task that already completed, but cancel an unfinished one
         // before assembling or dispatching the user's inference.
@@ -10295,25 +10322,9 @@ impl Driver {
             recovered_next_prompt
         } else if let Some((recovery_id, recovered_text)) = &retry_recovery {
             self.record_failed_turn_retry_started(recovery_id, tx).await;
-            crate::engine::message::build_user_message(UserSubmission {
-                expected_model_state_generation: None,
-                expected_model: None,
-                kind: UserSubmissionKind::User,
-                origin: crate::engine::message::SubmissionOrigin::RetryRecovery,
-                text: recovered_text.clone(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                images: Vec::new(),
-                forced_skill: None,
-                origin_principal: None,
-                job_id: None,
-                preflight_cleaned: None,
-                queue_item_ids: Vec::new(),
-                client_submissions: Vec::new(),
-                queue_target: None,
-                pending_terminal_disposition: None,
-                run_invocation_id: None,
-            })
+            crate::engine::message::build_user_message(retry_recovery_submission(
+                recovered_text.clone(),
+            ))
         } else if let Some(composition) = rendered_oversized_composition {
             if !composition.leading.is_empty() {
                 self.stack
@@ -10850,27 +10861,12 @@ impl Driver {
                                 }
                                 input_rx.finish(&queue_item_ids).await;
                                 self.reset_delegation_retry_budget();
-                                next_prompt =
-                                    crate::engine::message::build_user_message(UserSubmission {
-                                        expected_model_state_generation: None,
-                                        expected_model: None,
-                                        kind: UserSubmissionKind::User,
-                                        origin:
-                                            crate::engine::message::SubmissionOrigin::AutoContinue,
-                                        text: self.with_time_prelude(prepared.text),
-                                        display_text: None,
-                                        tag_expansions: Vec::new(),
-                                        images: prepared.images,
-                                        forced_skill: None,
-                                        origin_principal: None,
-                                        job_id: None,
-                                        preflight_cleaned: None,
-                                        queue_item_ids: Vec::new(),
-                                        client_submissions: Vec::new(),
-                                        queue_target: None,
-                                        pending_terminal_disposition: None,
-                                        run_invocation_id: None,
-                                    });
+                                next_prompt = crate::engine::message::build_user_message(
+                                    auto_continue_submission(
+                                        self.with_time_prelude(prepared.text),
+                                        prepared.images,
+                                    ),
+                                );
                             }
                         }
                     } else {
@@ -11007,26 +11003,13 @@ impl Driver {
                                     }
                                     input_rx.finish(&queue_item_ids).await;
                                     self.reset_delegation_retry_budget();
-                                    next_prompt =
-                                    crate::engine::message::build_user_message(UserSubmission {
-                                        expected_model_state_generation: None,
-                                        expected_model: None,
-                                        kind: UserSubmissionKind::User,
-                                        origin: crate::engine::message::SubmissionOrigin::GoalContinuation,
-                                        text: prepared.text,
-                                        display_text: None,
-                                        tag_expansions: Vec::new(),
-                                        images: prepared.images,
-                                        forced_skill: None,
-                                        origin_principal: None,
-                                        job_id: None,
-                                        preflight_cleaned: None,
-                                        queue_item_ids: Vec::new(),
-                                        client_submissions: Vec::new(),
-                                        queue_target: None,
-                                        pending_terminal_disposition: None,
-                                        run_invocation_id: prepared.run_invocation_id,
-                                    });
+                                    next_prompt = crate::engine::message::build_user_message(
+                                        goal_continuation_submission(
+                                            prepared.text,
+                                            prepared.images,
+                                            prepared.run_invocation_id,
+                                        ),
+                                    );
                                     // Continue under the next invocation's identity when present.
                                     // (Outer `run_invocation_id` still binds the original run.)
                                     continue;

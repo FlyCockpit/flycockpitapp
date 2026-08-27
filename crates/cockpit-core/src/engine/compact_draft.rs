@@ -446,7 +446,7 @@ pub(crate) struct ChunkedSynthesisPlan {
     pub chunks: Vec<Vec<Message>>,
     /// Number of recursive adjacent-merge layers after leaf drafting.
     pub merge_depth: usize,
-    /// Leaves, recursive merges, and the final synthesis node.
+    /// The initial direct attempt, leaves, recursive merges, and final node.
     pub draft_nodes: usize,
     pub max_wire_samples: usize,
 }
@@ -486,7 +486,13 @@ pub(crate) fn plan_chunked_synthesis(
     }
     let leaves = chunks.len();
     let recursive_merges = leaves.saturating_sub(1);
-    let draft_nodes = leaves.saturating_add(recursive_merges).saturating_add(1);
+    // Chunked synthesis is reached only after the direct full-history node has
+    // already been sampled. Account for it here so an accepted plan always
+    // fits the preparation-wide 64-node quota through its final execution.
+    let draft_nodes = 1usize
+        .saturating_add(leaves)
+        .saturating_add(recursive_merges)
+        .saturating_add(1);
     if draft_nodes > MAX_DRAFT_NODES {
         return Err(format!(
             "chunked synthesis requires {draft_nodes} draft nodes; limit is {MAX_DRAFT_NODES}"
@@ -1080,7 +1086,7 @@ mod tests {
         let one_exchange = wire_token_total(&history[..2]);
         let plan = plan_chunked_synthesis(&history, one_exchange).unwrap();
         assert_eq!(plan.chunks.len(), 4);
-        assert_eq!(plan.draft_nodes, 8);
+        assert_eq!(plan.draft_nodes, 9);
         assert_eq!(
             plan.max_wire_samples,
             plan.draft_nodes * MAX_WIRE_SAMPLES_PER_NODE as usize
@@ -1088,7 +1094,7 @@ mod tests {
         let flattened = plan.chunks.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(flattened, history);
 
-        let exact_cap = (0..32)
+        let largest_accepted = (0..31)
             .flat_map(|index| {
                 [
                     Message::user(format!("request-{index} {}", "x".repeat(200))),
@@ -1096,11 +1102,13 @@ mod tests {
                 ]
             })
             .collect::<Vec<_>>();
-        let exact_cap_plan = plan_chunked_synthesis(&exact_cap, one_exchange).unwrap();
-        assert_eq!(exact_cap_plan.chunks.len(), 32);
-        assert_eq!(exact_cap_plan.draft_nodes, MAX_DRAFT_NODES);
+        let largest_plan = plan_chunked_synthesis(&largest_accepted, one_exchange).unwrap();
+        assert_eq!(largest_plan.chunks.len(), 31);
+        assert_eq!(largest_plan.draft_nodes, MAX_DRAFT_NODES - 1);
 
-        let oversized = (0..33)
+        // The next balanced tree would need 65 total nodes once the direct
+        // attempt is counted, so it is rejected before consuming a leaf.
+        let oversized = (0..32)
             .flat_map(|index| {
                 [
                     Message::user(format!("request-{index} {}", "x".repeat(200))),

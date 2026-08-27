@@ -3287,6 +3287,15 @@ async fn handle_send_user_message_bulk(
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    // Validate provenance before resolving the opaque references. Resolution
+    // consumes their owner-bound staged bytes, while this public ingress only
+    // accepts user-authored root turns.
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     let session_id = require_attached(state)?.handle.session_id;
     #[cfg(feature = "remote")]
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, remote_operation)?;

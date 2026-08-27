@@ -15326,6 +15326,44 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
 }
 
 #[tokio::test]
+async fn bulk_user_message_rejects_internal_origin_without_consuming_staging() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let source = "origin-bound bulk source\n".repeat(4_000);
+    let owner = bulk_user_message_transfer_owner_local(&state.principal, session_id).unwrap();
+    let transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
+
+    let error = handle_send_user_message_bulk(
+        &mut state,
+        &ctx,
+        Uuid::new_v4(),
+        proto::UserMessageOrigin::Internal,
+        None,
+        None,
+        transfer.clone(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        None,
+        #[cfg(feature = "remote")]
+        None,
+    )
+    .await
+    .expect_err("public bulk ingress must reject an internal origin");
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert_eq!(error.message, "user-message origin must be external_root");
+    assert_eq!(
+        crate::daemon::bulk_staging::take_owned(&transfer, &owner).unwrap(),
+        source.as_bytes(),
+        "origin validation must happen before staged payload resolution"
+    );
+}
+
+#[tokio::test]
 async fn bulk_user_message_owner_mismatch_is_non_oracular_and_multi_ref_atomic() {
     let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();

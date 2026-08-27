@@ -233,6 +233,11 @@ const COMPOSER: KeyGroup = KeyGroup {
             desc: "jump to the newest messages",
         },
         KeyBinding {
+            key: "Home",
+            action: "sticky header",
+            desc: "jump to the pinned previous user message (empty composer)",
+        },
+        KeyBinding {
             key: "Ctrl+N",
             action: "scratchpad",
             desc: "open the project scratchpad",
@@ -928,6 +933,8 @@ mod tests {
         assert!(text.contains("scroll"));
         assert!(text.contains("End"));
         assert!(text.contains("live tail"));
+        assert!(text.contains("Home"));
+        assert!(text.contains("sticky header"));
     }
 
     #[test]

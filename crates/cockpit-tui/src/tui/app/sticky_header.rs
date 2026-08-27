@@ -172,6 +172,22 @@ impl App {
         };
         frame.render_widget(Paragraph::new(lines).style(bg), area);
     }
+
+    pub(super) fn jump_to_sticky_user_header(&mut self) {
+        let Some(idx) = self.sticky_header_history_index else {
+            return;
+        };
+        let Some(&rel) = self.msg_abs_line.get(&idx) else {
+            return;
+        };
+        let abs = self.chat_banner_lines + rel;
+        self.scroll_abs_line_into_view(abs);
+    }
+
+    pub(super) fn mouse_in_sticky_header(&self, col: u16, row: u16) -> bool {
+        self.sticky_header_area
+            .is_some_and(|area| super::mouse::point_in(area, col, row))
+    }
 }
 
 fn user_raw_text(entry: &HistoryEntry) -> Option<&str> {

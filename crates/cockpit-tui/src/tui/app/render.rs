@@ -2440,6 +2440,8 @@ impl App {
         tail_find_lines: &[String],
     ) {
         record_find_lines_rebuild();
+        // Sticky header is carved outside this buffer; find indices stay
+        // aligned with `chat_total_lines` and never include the header.
         let mut lines = box_lines
             .iter()
             .map(|line| rendered_line_text(line).to_lowercase())

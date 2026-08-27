@@ -24,6 +24,7 @@ Open the in-TUI keybinding overlay with `Ctrl+K` or `/keys`. `Esc`, `q`, or `Ctr
 | `↑/↓` | history | recall previously sent messages |
 | `PgUp/PgDn` | scroll | scroll the chat transcript; Shift+↑/↓ scrolls by line |
 | `End` | live tail | jump to the newest messages |
+| `Home` | sticky header | jump to the pinned previous user message when the composer is empty |
 | `Ctrl+N` | scratchpad | open the project scratchpad |
 | `Ctrl+G` | $EDITOR | edit the composer text in $EDITOR |
 | `Esc` | normal/cancel | vim Normal mode, or cancel a slash query |

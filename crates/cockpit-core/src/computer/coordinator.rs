@@ -2087,7 +2087,7 @@ impl OutcomeJournal {
 #[async_trait]
 pub trait HandoffJournal: Send + Sync {
     fn is_durable(&self) -> bool {
-        true
+        false
     }
     /// Prepare the handoff record (before `backend.execute`). Returns a
     /// ticket on success; an error means fail-closed (zero input).
@@ -2103,7 +2103,7 @@ pub trait HandoffJournal: Send + Sync {
     async fn begin_dispatch(&self, ticket: &HandoffTicket) -> Result<(), ComputerError>;
 
     /// Record the outcome after `backend.execute` returns.
-    async fn complete(&self, ticket: &HandoffTicket, succeeded: bool);
+    async fn complete(&self, ticket: &HandoffTicket, succeeded: bool) -> Result<(), ComputerError>;
 }
 
 /// A handoff journal ticket (opaque to the coordinator).
@@ -2142,7 +2142,13 @@ impl HandoffJournal for NoopHandoffJournal {
         Ok(())
     }
 
-    async fn complete(&self, _ticket: &HandoffTicket, _succeeded: bool) {}
+    async fn complete(
+        &self,
+        _ticket: &HandoffTicket,
+        _succeeded: bool,
+    ) -> Result<(), ComputerError> {
+        Ok(())
+    }
 }
 
 /// Production adapter over the generic durable external-side-effect journal.
@@ -2162,6 +2168,9 @@ impl ExternalJournalHandoff {
 
 #[async_trait]
 impl HandoffJournal for ExternalJournalHandoff {
+    fn is_durable(&self) -> bool {
+        true
+    }
     async fn prepare(
         &self,
         idempotency_key: &str,
@@ -2222,38 +2231,35 @@ impl HandoffJournal for ExternalJournalHandoff {
         Ok(())
     }
 
-    async fn complete(&self, ticket: &HandoffTicket, succeeded: bool) {
+    async fn complete(&self, ticket: &HandoffTicket, succeeded: bool) -> Result<(), ComputerError> {
         let dispatch = ticket
             .dispatch
             .lock()
-            .ok()
-            .and_then(|mut dispatch| dispatch.take());
-        let Some(mut dispatch) = dispatch else { return };
+            .map_err(|_| ComputerError::Refused("handoff ticket lock poisoned".to_string()))?
+            .take();
+        let Some(mut dispatch) = dispatch else {
+            return Err(ComputerError::Refused(
+                "missing handoff dispatch ticket".to_string(),
+            ));
+        };
         let now = chrono::Utc::now().timestamp_millis();
-        if let Err(error) = self
-            .journal
+        self.journal
             .record_outcome(
                 &mut dispatch,
                 crate::db::external_journal::ExternalJournalState::Accepted,
                 now,
             )
             .await
-        {
-            tracing::error!(error = %error, "computer handoff outcome journal failed");
-            return;
-        }
+            .map_err(|error| ComputerError::Refused(error.to_string()))?;
         let terminal = if succeeded {
             crate::db::external_journal::ExternalJournalState::Succeeded
         } else {
             crate::db::external_journal::ExternalJournalState::Failed
         };
-        if let Err(error) = self
-            .journal
+        self.journal
             .record_outcome(&mut dispatch, terminal, now)
             .await
-        {
-            tracing::error!(error = %error, "computer handoff terminal journal failed");
-        }
+            .map_err(|error| ComputerError::Refused(error.to_string()))
     }
 }
 
@@ -2447,6 +2453,7 @@ impl ComputerActionCoordinator {
         call_id: &str,
         actions: &[ComputerAction],
     ) -> Result<Vec<(ActionIdentity, ActionPayloadDigest)>, CoordinatedOutcome> {
+        let batch_digest = ActionPayloadDigest::from_actions(actions);
         actions
             .iter()
             .enumerate()
@@ -2462,7 +2469,11 @@ impl ComputerActionCoordinator {
                         provider_call_id: call_id.to_string(),
                         batch_index,
                     },
-                    ActionPayloadDigest::from_actions(std::slice::from_ref(action)),
+                    if batch_index == 0 {
+                        batch_digest.clone()
+                    } else {
+                        ActionPayloadDigest::from_actions(std::slice::from_ref(action))
+                    },
                 ))
             })
             .collect()
@@ -2474,7 +2485,11 @@ impl ComputerActionCoordinator {
         receipts: &[(ActionIdentity, ActionPayloadDigest)],
     ) -> Option<CoordinatedOutcome> {
         let mut replayed = 0_usize;
-        for (identity, digest) in receipts {
+        // Batch index zero carries the digest of the entire canonical batch,
+        // making this single atomic insert the ownership claim for every item.
+        // This avoids cross-process partial-claim deadlocks while later rows
+        // retain per-item replay detail.
+        for (identity, digest) in receipts.iter().take(1) {
             match self.journal.check_identity(identity, digest) {
                 Ok(true) => {}
                 Ok(false) => replayed += 1,
@@ -2498,6 +2513,39 @@ impl ComputerActionCoordinator {
         if replayed != 0 {
             let identity = receipts[replayed].0.clone();
             return Some(CoordinatedOutcome::IdentityConflict { identity });
+        }
+        None
+    }
+
+    async fn reserve_action_receipts(
+        &self,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        action_label: &str,
+    ) -> Option<CoordinatedOutcome> {
+        let Some(store) = &self.outcome_store else {
+            return None;
+        };
+        for (identity, digest) in receipts {
+            match store.reserve(identity, digest, action_label).await {
+                Ok(super::outcome_store::OutcomeReservation::Acquired) => {}
+                Ok(super::outcome_store::OutcomeReservation::Existing(stored)) => {
+                    return Some(if stored.digest == *digest {
+                        CoordinatedOutcome::DuplicateReplay {
+                            prior_outcome: Box::new(stored.outcome),
+                        }
+                    } else {
+                        CoordinatedOutcome::IdentityConflict {
+                            identity: identity.clone(),
+                        }
+                    });
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "durable computer identity reservation failed");
+                    return Some(CoordinatedOutcome::DispatchUnknown {
+                        action_label: action_label.to_string(),
+                    });
+                }
+            }
         }
         None
     }
@@ -2802,10 +2850,10 @@ impl ComputerActionCoordinator {
         // every one of those facts immediately before the concrete backend
         // call. A stale/cancelled/different capability is terminalized by the
         // coordinator-owned scope and must never reach `backend.execute`.
-        let concrete_effect = self.concrete_host_approval_effect(call_id, _action_label, actions);
+        let concrete_effects = self.concrete_host_approval_effects(call_id, _action_label, actions);
         if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
             "computer_coordinator_backend_execute",
-            std::slice::from_ref(&concrete_effect),
+            &concrete_effects,
         )
         .await
         .is_err()
@@ -2816,7 +2864,7 @@ impl ComputerActionCoordinator {
             || crate::engine::interrupt::recheck_host_approval_effect_boundary(
                 "computer_coordinator_backend_execute",
                 &self.host_effect_cancel,
-                std::slice::from_ref(&concrete_effect),
+                &concrete_effects,
             )
             .await
             .is_err()
@@ -2962,7 +3010,17 @@ impl ComputerActionCoordinator {
             && let Some(journal) = &self.handoff_journal
         {
             let succeeded = report.failure.is_none();
-            journal.complete(ticket, succeeded).await;
+            if let Err(error) = journal.complete(ticket, succeeded).await {
+                tracing::error!(error = %error, "computer handoff settlement failed");
+                self.dispatch_states
+                    .insert(call_id.to_string(), DispatchState::DispatchUnknown);
+                return ExecuteArtifacts {
+                    outcome: CoordinatedOutcome::DispatchUnknown {
+                        action_label: _action_label.to_string(),
+                    },
+                    live_frame: None,
+                };
+            }
         }
 
         // Record the final dispatch state.
@@ -3100,27 +3158,23 @@ impl ComputerActionCoordinator {
     /// action identity, tier, current host lease, target evidence, generation,
     /// and the digest of the full canonical action list are all read from the
     /// coordinator immediately before `backend.execute`.
-    fn concrete_host_approval_effect(
+    fn concrete_host_approval_effects(
         &self,
         call_id: &str,
         action_label: &str,
         actions: &[ComputerAction],
-    ) -> serde_json::Value {
-        let action_class = actions
-            .first()
-            .map(ActionRiskClass::classify)
-            .unwrap_or(ActionRiskClass::Unknown);
+    ) -> Vec<serde_json::Value> {
         let lease_binding_digest = self.host_lease.as_ref().map(host_lease_binding_digest);
         let target_evidence_binding_digest = target_evidence_binding_digest(
             self.backend_kind,
             self.host_lease.as_ref(),
             self.virtual_display_uuid(),
         );
-        serde_json::json!({
+        actions.iter().enumerate().map(|(batch_index, action)| serde_json::json!({
             "execute": {
                 "session_id": &self.session_id,
                 "delegation_id": &self.delegation_id.0,
-                "action_id": call_id,
+                "action_id": format!("{call_id}:{batch_index}"),
                 "tier": match self.tier {
                     ComputerApprovalTier::Ask => "ask",
                     ComputerApprovalTier::Yolo => "yolo",
@@ -3131,14 +3185,14 @@ impl ComputerActionCoordinator {
                 "observation_generation": self.observation_generation.0,
                 "geometry_generation": self.observation_generation.0,
                 "provider_call_id": call_id,
-                "batch_index": 0_u32,
-                "action_class": action_class.label(),
+                "batch_index": batch_index,
+                "action_class": ActionRiskClass::classify(action).label(),
                 "has_host_lease": self.host_lease.is_some(),
-                "payload_digest": canonical_computer_action_payload_digest(actions),
+                "payload_digest": canonical_computer_action_payload_digest(std::slice::from_ref(action)),
                 "lease_binding_digest": lease_binding_digest,
                 "target_evidence_binding_digest": target_evidence_binding_digest,
             }
-        })
+        })).collect()
     }
 
     /// Build the Ask lease key for the current coordinator state. The key is
@@ -3661,6 +3715,9 @@ impl ComputerActionCoordinator {
         }
 
         // Dispatch through the backend.
+        if let Some(outcome) = self.reserve_action_receipts(&receipts, &action_label).await {
+            return outcome;
+        }
         let artifacts = self
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;
@@ -3839,6 +3896,9 @@ impl ComputerActionCoordinator {
             return outcome;
         }
 
+        if let Some(outcome) = self.reserve_action_receipts(&receipts, &action_label).await {
+            return outcome;
+        }
         let artifacts = self
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;
@@ -3968,6 +4028,9 @@ impl ComputerActionCoordinator {
             return outcome;
         }
 
+        if let Some(outcome) = self.reserve_action_receipts(&receipts, &action_label).await {
+            return outcome;
+        }
         let artifacts = self
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;

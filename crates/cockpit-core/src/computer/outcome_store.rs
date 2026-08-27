@@ -10,6 +10,12 @@ pub struct StoredOutcome {
     pub digest: ActionPayloadDigest,
 }
 
+#[derive(Debug, Clone)]
+pub enum OutcomeReservation {
+    Acquired,
+    Existing(StoredOutcome),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OutcomeStoreError {
     #[error("computer outcome store lock is poisoned")]
@@ -27,6 +33,12 @@ pub trait ComputerOutcomeStore: Send + Sync {
     fn is_durable(&self) -> bool {
         false
     }
+    async fn reserve(
+        &self,
+        identity: &ActionIdentity,
+        digest: &ActionPayloadDigest,
+        action_label: &str,
+    ) -> Result<OutcomeReservation, OutcomeStoreError>;
     async fn store(
         &self,
         identity: &ActionIdentity,
@@ -56,6 +68,30 @@ impl MemoryOutcomeStore {
 
 #[async_trait]
 impl ComputerOutcomeStore for MemoryOutcomeStore {
+    async fn reserve(
+        &self,
+        identity: &ActionIdentity,
+        digest: &ActionPayloadDigest,
+        action_label: &str,
+    ) -> Result<OutcomeReservation, OutcomeStoreError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| OutcomeStoreError::LockPoisoned)?;
+        if let Some(stored) = entries.get(identity) {
+            return Ok(OutcomeReservation::Existing(stored.clone()));
+        }
+        entries.insert(
+            identity.clone(),
+            StoredOutcome {
+                digest: digest.clone(),
+                outcome: CoordinatedOutcome::DispatchUnknown {
+                    action_label: action_label.to_string(),
+                },
+            },
+        );
+        Ok(OutcomeReservation::Acquired)
+    }
     async fn store(
         &self,
         identity: &ActionIdentity,
@@ -131,6 +167,33 @@ impl SqliteOutcomeStore {
 impl ComputerOutcomeStore for SqliteOutcomeStore {
     fn is_durable(&self) -> bool {
         true
+    }
+    async fn reserve(
+        &self,
+        identity: &ActionIdentity,
+        digest: &ActionPayloadDigest,
+        action_label: &str,
+    ) -> Result<OutcomeReservation, OutcomeStoreError> {
+        let unknown = serde_json::to_string(&CoordinatedOutcome::DispatchUnknown {
+            action_label: action_label.to_string(),
+        })
+        .map_err(|error| OutcomeStoreError::Encoding(error.to_string()))?;
+        let row = self
+            .db
+            .reserve_computer_outcome(crate::db::computer_outcomes::ComputerOutcomeRow {
+                session_id: identity.session_id.clone(),
+                delegation_id: identity.delegation_id.0.clone(),
+                provider_call_id: identity.provider_call_id.clone(),
+                batch_index: identity.batch_index,
+                payload_digest: digest.to_hex(),
+                outcome_json: unknown,
+            })
+            .await
+            .map_err(|error| OutcomeStoreError::Database(format!("{error:#}")))?;
+        match row {
+            None => Ok(OutcomeReservation::Acquired),
+            Some(row) => Self::decode(row).map(|(_, stored)| OutcomeReservation::Existing(stored)),
+        }
     }
     async fn store(
         &self,

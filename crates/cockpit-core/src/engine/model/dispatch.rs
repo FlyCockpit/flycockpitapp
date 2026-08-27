@@ -2350,7 +2350,17 @@ where
                 }
             }
             StreamedAssistantContent::Unknown(item) => {
-                crate::engine::model::retain_native_computer_item(item.value().clone());
+                let value = item.value();
+                let native_shape = match value.get("type").and_then(serde_json::Value::as_str) {
+                    Some("computer_call") => true,
+                    Some("tool_use") => {
+                        value.get("name").and_then(serde_json::Value::as_str) == Some("computer")
+                    }
+                    _ => false,
+                };
+                if native_shape {
+                    crate::engine::model::retain_native_computer_item(value.clone());
+                }
             }
             StreamedAssistantContent::ToolCall {
                 tool_call: call, ..

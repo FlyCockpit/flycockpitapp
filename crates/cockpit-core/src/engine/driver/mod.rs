@@ -1750,6 +1750,9 @@ impl Driver {
         let continuations =
             computer_native::handle_native_computer_items(Some(coordinator), contract, &raw_items)
                 .await;
+        if continuations.is_empty() {
+            return;
+        }
         let mut wire = Vec::new();
         if contract == crate::computer::ComputerToolContract::OpenAiResponses {
             wire.extend(raw_items);

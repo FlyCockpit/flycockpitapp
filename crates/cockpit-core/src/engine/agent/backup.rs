@@ -244,7 +244,13 @@ pub async fn turn_with_backup(
             )
             .await
             {
-                Ok(reposed) => reposed,
+                Ok(reposed) => reposed.map(|mut candidate| {
+                    // A coordinator opened for the primary model is not rebound
+                    // during an in-flight fallback. Do not advertise the
+                    // primary's native-computer contract under another model.
+                    candidate.params.native_computer = None;
+                    candidate
+                }),
                 // Fail CLOSED: the candidate's own posture cannot be rendered, so
                 // this failover candidate is NEVER dispatched under the primary's
                 // posture. The def is the same for every candidate, so no later

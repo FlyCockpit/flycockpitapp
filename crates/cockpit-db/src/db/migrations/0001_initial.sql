@@ -6905,6 +6905,7 @@ CREATE TABLE computer_outcome_store (
         json_valid(outcome_json)
         AND length(CAST(outcome_json AS BLOB)) <= 1048576
     ),
+    state             TEXT    NOT NULL CHECK (state IN ('claimed', 'completed')),
     committed_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY (session_id, delegation_id, provider_call_id, batch_index)
 );

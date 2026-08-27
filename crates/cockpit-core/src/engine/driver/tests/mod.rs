@@ -6,7 +6,6 @@ mod delegation;
 mod goals;
 mod inbound;
 mod learn;
-mod llm_mode;
 mod misc;
 mod model_switch;
 mod noninteractive;
@@ -463,7 +462,8 @@ fn test_driver_with_url_and_grant(
         model,
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: true,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
@@ -644,7 +644,8 @@ fn learn_driver(
         model,
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: false,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
         context_policy: None,
         lock_identity: "LearnBuild".to_string(),
         write_scope: None,
@@ -990,7 +991,6 @@ async fn record_skill_tool_row(driver: &Driver, call_id: &str, agent: &str, outp
             output: output.to_string(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::Normal,
             shape_fingerprint: None,
             hint: None,
         })
@@ -1666,7 +1666,8 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         model: old.model.clone(),
         params: old.params.clone(),
         scan_tool_results: old.scan_tool_results,
-        llm_mode: crate::config::extended::LlmMode::Normal,
+        tool_steering: old.tool_steering,
+        posture: old.posture.clone(),
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,

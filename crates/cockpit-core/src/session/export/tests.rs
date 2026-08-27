@@ -291,7 +291,6 @@ async fn record_transcript_tool(session: &Session, row: TranscriptTool<'_>) {
             output: row.output.into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -1063,7 +1062,6 @@ async fn export_tool_call_event_includes_provider_identity_provenance() {
         truncated: false,
         duration_ms: 3,
         cockpit_version: Some(env!("CARGO_PKG_VERSION").into()),
-        llm_mode: Some("defensive".into()),
         shape_fingerprint: None,
         hint: None,
     })
@@ -1166,7 +1164,6 @@ async fn export_completions_wire_tool_call_event_includes_provider_identity() {
         truncated: false,
         duration_ms: 3,
         cockpit_version: Some(env!("CARGO_PKG_VERSION").into()),
-        llm_mode: Some("normal".into()),
         shape_fingerprint: None,
         hint: None,
     })
@@ -1377,7 +1374,6 @@ async fn export_rejects_invalid_responses_provider_identity() {
             output: "body".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -4619,42 +4615,30 @@ async fn config_entries_missing_config_writes_marker() {
     assert!(entries[0].1.contains("No cockpit config"));
 }
 
-/// AC5, the dependent portable-export matrix. All six trust/mode combinations
-/// must export **redacted** artifacts.
-///
 /// Trust decides raw-vs-redacted for *inference* only. Export is a different
 /// sink with a different rule: it is redacted unconditionally, regardless of
-/// which custody class the session's model runs under and regardless of the
-/// harness posture. That is the boundary `redaction-scrub-sites.md` calls the
-/// all-export boundary.
+/// which custody class the session's model runs under. That is the boundary
+/// `redaction-scrub-sites.md` calls the all-export boundary.
 ///
 /// The failure this prevents is an export-path change that keys redaction on
-/// trust or mode — most plausibly "the model is trusted, so the operator is
-/// self-hosting and the bundle can keep raw values". Every combination is
+/// trust — most plausibly "the model is trusted, so the operator is
+/// self-hosting and the bundle can keep raw values". Every trust class is
 /// asserted independently so such a change cannot regress quietly under one
-/// pair while the others stay green. The positive control (a placeholder must
+/// class while the other stays green. The positive control (a placeholder must
 /// appear somewhere) keeps the matrix from passing vacuously if the
 /// secret-bearing material stopped reaching the bundle at all.
 #[tokio::test]
-async fn portable_export_stays_redacted_across_every_trust_mode_combination() {
-    use crate::config::extended::LlmMode;
+async fn portable_export_stays_redacted_across_every_trust_class() {
     use crate::config::providers::{
         ActiveModelRef, ConfigDoc, ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig,
     };
 
     const SECRET: &str = "SECRET_EXPORT_MATRIX_TOKEN_ABCDEF";
 
-    let combos = [
-        (ModelTrust::Trusted, LlmMode::Defensive),
-        (ModelTrust::Trusted, LlmMode::Normal),
-        (ModelTrust::Trusted, LlmMode::Frontier),
-        (ModelTrust::Untrusted, LlmMode::Defensive),
-        (ModelTrust::Untrusted, LlmMode::Normal),
-        (ModelTrust::Untrusted, LlmMode::Frontier),
-    ];
-    assert_eq!(combos.len(), 6, "the product must stay complete");
+    let trusts = [ModelTrust::Trusted, ModelTrust::Untrusted];
+    assert_eq!(trusts.len(), 2, "both custody classes must stay covered");
 
-    for (trust, mode) in combos {
+    for trust in trusts {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().to_string_lossy().to_string();
         std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
@@ -4662,21 +4646,19 @@ async fn portable_export_stays_redacted_across_every_trust_mode_combination() {
         std::fs::write(
             &config_path,
             format!(
-                r#"{{"llm_mode":"{}","redact":{{"scan_environment":false,"scan_dotenv":false,"denylist":["{SECRET}"]}}}}"#,
-                mode.as_str()
+                r#"{{"redact":{{"scan_environment":false,"scan_dotenv":false,"denylist":["{SECRET}"]}}}}"#
             ),
         )
         .unwrap();
 
-        // The session's model carries this trust/mode pair explicitly, so a
-        // trust- or mode-keyed export change would have something to read.
+        // The session's model carries this trust class explicitly, so a
+        // trust-keyed export change would have something to read.
         let mut providers = ProvidersConfig::default();
         providers.providers.insert(
             "p".into(),
             ProviderEntry {
                 url: "http://127.0.0.1:1/v1".into(),
                 trust: Some(trust),
-                mode: Some(mode),
                 models: vec![ModelEntry {
                     id: "m".into(),
                     ..ModelEntry::default()
@@ -4742,14 +4724,14 @@ async fn portable_export_stays_redacted_across_every_trust_mode_combination() {
             };
             assert!(
                 !body.contains(SECRET),
-                "{trust:?}/{mode:?}: exported artifact `{name}` leaked the secret; \
-                 exports stay redacted regardless of trust and mode"
+                "{trust:?}: exported artifact `{name}` leaked the secret; \
+                 exports stay redacted regardless of trust"
             );
             saw_placeholder |= body.contains("REDACTED");
         }
         assert!(
             saw_placeholder,
-            "{trust:?}/{mode:?}: no redaction placeholder anywhere in the bundle — the \
+            "{trust:?}: no redaction placeholder anywhere in the bundle — the \
              secret-bearing material never reached the export, so the matrix proved nothing"
         );
     }

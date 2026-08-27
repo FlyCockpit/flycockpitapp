@@ -1692,7 +1692,8 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
         model: old.model.clone(),
         params: old.params.clone(),
         scan_tool_results: old.scan_tool_results,
-        llm_mode: crate::config::extended::LlmMode::Normal,
+        tool_steering: old.tool_steering,
+        posture: old.posture.clone(),
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
@@ -1733,7 +1734,6 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
             output: "seed body".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -2303,7 +2303,6 @@ async fn auto_compact_fires_at_threshold_once() {
             output: "seed body".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -2372,66 +2371,55 @@ async fn auto_compact_fires_at_threshold_once() {
 }
 
 #[tokio::test]
-async fn effective_auto_compact_pct_mode_defaults_when_unset() {
-    use crate::config::extended::LlmMode;
+async fn effective_auto_compact_pct_defaults_when_unset() {
     use crate::config::providers::ContextConfig;
     let (driver, _tmp) = test_driver_without_network(8);
     let cfg = ContextConfig::default();
 
+    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, true), 80);
+    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, false), 60);
+    let conservative = crate::agents::ContextPolicy {
+        auto_compact_pct: Some(60),
+        inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+    };
     assert_eq!(
-        driver.effective_auto_compact_pct(&cfg, LlmMode::Defensive, None, true),
+        driver.effective_auto_compact_pct(&cfg, Some(&conservative), true),
         60
-    );
-    assert_eq!(
-        driver.effective_auto_compact_pct(&cfg, LlmMode::Normal, None, true),
-        80
-    );
-    assert_eq!(
-        driver.effective_auto_compact_pct(&cfg, LlmMode::Frontier, None, true),
-        80
     );
 }
 
 #[tokio::test]
 async fn effective_auto_compact_pct_stays_60_without_mcp() {
-    use crate::config::extended::LlmMode;
     use crate::config::providers::ContextConfig;
     let (driver, _tmp) = test_driver_without_network(8);
     let cfg = ContextConfig::default();
 
-    for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        assert_eq!(
-            driver.effective_auto_compact_pct(&cfg, mode, None, false),
-            60
-        );
-    }
+    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, false), 60);
 }
 
 #[tokio::test]
 async fn effective_auto_compact_pct_explicit_override_wins() {
-    use crate::config::extended::LlmMode;
     use crate::config::providers::ContextConfig;
     let (driver, _tmp) = test_driver_without_network(8);
     let cfg = ContextConfig {
         auto_compact_pct: Some(50),
         ..ContextConfig::default()
     };
+    let policy = crate::agents::ContextPolicy {
+        auto_compact_pct: Some(60),
+        inline_caps: None,
+    };
 
-    for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        assert_eq!(
-            driver.effective_auto_compact_pct(&cfg, mode, None, false),
-            50
-        );
-        assert_eq!(
-            driver.effective_auto_compact_pct(&cfg, mode, None, true),
-            50
-        );
-    }
+    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, false), 50);
+    assert_eq!(driver.effective_auto_compact_pct(&cfg, None, true), 50);
+    assert_eq!(
+        driver.effective_auto_compact_pct(&cfg, Some(&policy), true),
+        50
+    );
 }
 
 #[tokio::test]
-async fn auto_compact_fires_at_mode_resolved_line() {
-    use crate::config::extended::LlmMode;
+async fn auto_compact_fires_at_resolved_line() {
     use crate::config::providers::{CacheMode, ContextConfig};
 
     let (mut capable, _tmp) = test_driver_without_network(8);
@@ -2442,20 +2430,17 @@ async fn auto_compact_fires_at_mode_resolved_line() {
         ContextConfig::default(),
         100_000,
     );
-    let mut agent = (*capable.stack[0].agent).clone();
-    agent.llm_mode = LlmMode::Normal;
-    capable.stack[0].agent = Arc::new(agent);
     capable.session.set_active_tool_names(["mcp"], false);
 
     record_test_context_tokens(&capable, 70_000).await;
     assert!(
         !capable.maybe_auto_compact(&tx).await,
-        "normal+mcp stays below the resolved 80% line at 70%"
+        "mcp-capable stays below the resolved 80% line at 70%"
     );
     record_test_context_tokens(&capable, 82_000).await;
     assert!(
         capable.maybe_auto_compact(&tx).await,
-        "normal+mcp compacts at the resolved 80% line"
+        "mcp-capable compacts at the resolved 80% line"
     );
     drop(tx);
     while rx.recv().await.is_some() {}
@@ -2468,14 +2453,11 @@ async fn auto_compact_fires_at_mode_resolved_line() {
         ContextConfig::default(),
         100_000,
     );
-    let mut agent = (*no_mcp.stack[0].agent).clone();
-    agent.llm_mode = LlmMode::Normal;
-    no_mcp.stack[0].agent = Arc::new(agent);
     no_mcp.session.set_active_tool_names([], false);
     record_test_context_tokens(&no_mcp, 65_000).await;
     assert!(
         no_mcp.maybe_auto_compact(&tx).await,
-        "normal without mcp keeps the 60% forced line"
+        "without mcp keeps the 60% forced line"
     );
     drop(tx);
     while rx.recv().await.is_some() {}
@@ -2483,7 +2465,6 @@ async fn auto_compact_fires_at_mode_resolved_line() {
 
 #[tokio::test]
 async fn auto_compact_defers_equal_line_until_compact_nudge_fires() {
-    use crate::config::extended::LlmMode;
     use crate::config::providers::{CacheMode, ContextConfig};
 
     let (mut driver, _tmp) = test_driver_without_network(8);
@@ -2495,14 +2476,17 @@ async fn auto_compact_defers_equal_line_until_compact_nudge_fires() {
         100_000,
     );
     let mut agent = (*driver.stack[0].agent).clone();
-    agent.llm_mode = LlmMode::Defensive;
+    agent.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(60),
+        inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+    });
     driver.stack[0].agent = Arc::new(agent);
     driver.session.set_active_tool_names(["mcp"], false);
     record_test_context_tokens(&driver, 65_000).await;
 
     assert!(
         !driver.maybe_auto_compact(&tx).await,
-        "defensive+mcp gives the equal-line compact nudge one turn to reach the model"
+        "a 60% context policy gives the equal-line compact nudge one turn to reach the model"
     );
     assert!(
         driver
@@ -2521,7 +2505,6 @@ async fn auto_compact_defers_equal_line_until_compact_nudge_fires() {
 
 #[tokio::test]
 async fn context_usage_reports_nudge_and_resolved_forced_pct() {
-    use crate::config::extended::LlmMode;
     use crate::config::providers::{CacheMode, ContextConfig};
 
     let (mut driver, _tmp) = test_driver_without_network(8);
@@ -2531,9 +2514,6 @@ async fn context_usage_reports_nudge_and_resolved_forced_pct() {
         ContextConfig::default(),
         100_000,
     );
-    let mut agent = (*driver.stack[0].agent).clone();
-    agent.llm_mode = LlmMode::Normal;
-    driver.stack[0].agent = Arc::new(agent);
     driver.session.set_active_tool_names(["mcp"], false);
     record_test_context_tokens(&driver, 62_000).await;
 

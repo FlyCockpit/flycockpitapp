@@ -732,62 +732,6 @@ async fn model_switch_carries_prompt_cache_retention() {
     );
 }
 
-#[tokio::test]
-async fn llm_mode_reresolved_on_model_switch() {
-    use crate::config::extended::LlmMode;
-    use crate::config::providers::ModelEntry;
-
-    let (mut driver, _tmp) = model_switch_driver();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    assert_eq!(driver.stack[0].agent.llm_mode, LlmMode::Defensive);
-    driver
-        .test_providers_override
-        .as_mut()
-        .unwrap()
-        .0
-        .providers
-        .get_mut("provider-b")
-        .unwrap()
-        .models
-        .push(ModelEntry {
-            id: "model-b".into(),
-            mode: Some(LlmMode::Normal),
-            ..ModelEntry::default()
-        });
-
-    driver
-        .run_control(
-            DriverControl::SetActiveModel {
-                selection_id: uuid::Uuid::nil(),
-                provider: "provider-b".into(),
-                model: "model-b".into(),
-                persist_as_default: true,
-                trigger: crate::session::ModelSwitchTrigger::Daemon,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            &tx,
-        )
-        .await;
-
-    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
-    assert_eq!(driver.stack[0].agent.llm_mode, LlmMode::Normal);
-    let mut events = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        events.push(event);
-    }
-    assert!(events.iter().any(
-        |event| matches!(event, TurnEvent::LlmModeChanged { mode } if *mode == LlmMode::Normal)
-    ));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, TurnEvent::Pruned { .. })),
-        "model-pin re-resolution is prune-free; only explicit /llm-mode warns and prunes"
-    );
-}
-
 /// A successful switch commits both durable authorities and routes the next
 /// inference through the newly selected root model.
 #[tokio::test]
@@ -2115,18 +2059,13 @@ fn remove_agent_override(root: &std::path::Path, name: &str) {
 }
 
 fn tool_definitions_value(agent: &crate::engine::agent::Agent) -> serde_json::Value {
-    serde_json::to_value(
-        agent
-            .tools
-            .definitions(crate::agents::ToolSteering::from_llm_mode(agent.llm_mode)),
-    )
-    .unwrap()
+    serde_json::to_value(agent.tools.definitions(agent.tool_steering)).unwrap()
 }
 
 fn task_definition_mentions_agent(agent: &crate::engine::agent::Agent, name: &str) -> bool {
     agent
         .tools
-        .definitions(crate::agents::ToolSteering::from_llm_mode(agent.llm_mode))
+        .definitions(agent.tool_steering)
         .into_iter()
         .find(|definition| definition.name == "task")
         .map(|definition| serde_json::to_string(&definition).unwrap().contains(name))

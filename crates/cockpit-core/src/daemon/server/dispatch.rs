@@ -23763,6 +23763,28 @@ async fn get_session_setup_snapshot_under_publication(
                 .flatten();
             let foreground = att.handle.foreground_snapshot();
             let root_foreground = foreground.active_subagent.is_none();
+            let root_agent_instance_id = ctx
+                .db
+                .agent_lineage_page(session_id, None, None, 16)
+                .await
+                .ok()
+                .and_then(|page| {
+                    page.entries
+                        .into_iter()
+                        .find(|row| row.parent_agent_instance_id.is_none())
+                        .map(|row| row.agent_instance_id)
+                });
+            let override_revision = match root_agent_instance_id {
+                Some(id) => ctx
+                    .db
+                    .read_agent_override_state(session_id, id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|state| state.override_revision.max(0) as u64)
+                    .unwrap_or(0),
+                None => 0,
+            };
             let snapshot = crate::daemon::session_setup_projection::enrich_session_setup_snapshot(
                 snapshot,
                 &att.handle.project_root,
@@ -23770,8 +23792,8 @@ async fn get_session_setup_snapshot_under_publication(
                 last_used,
                 att.handle.tool_surface_override_json().as_deref(),
                 root_foreground,
-                None,
-                0,
+                root_agent_instance_id.map(|id| id.to_string()),
+                override_revision,
             );
             return Ok(Response::SessionSetupSnapshot { snapshot });
         }

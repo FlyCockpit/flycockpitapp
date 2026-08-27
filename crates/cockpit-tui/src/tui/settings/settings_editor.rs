@@ -187,7 +187,7 @@ pub(super) const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::XaiMultiAgentToolsBeta,
 ];
 
-const AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT: u8 = 80;
+const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
 
 impl ProviderSettingId {
     pub(super) fn descriptor(self) -> SettingDescriptor {
@@ -1597,7 +1597,7 @@ impl SettingsEditor {
     }
 
     fn auto_compact_auto_value(&self) -> u8 {
-        AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT
+        AUTO_COMPACT_DEFAULT_PCT
     }
 
     pub(super) fn commit_text(

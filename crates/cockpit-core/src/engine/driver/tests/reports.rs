@@ -151,6 +151,7 @@ fn docs_style_agent_without_return_tool_reports_plain_answer() {
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: driver.stack[0].agent.env_overlay.clone(),
+        definition: None,
         assistant_identity_prefix: None,
     };
     let history = vec![Message::assistant("The answer is to call foo() with bar.")];

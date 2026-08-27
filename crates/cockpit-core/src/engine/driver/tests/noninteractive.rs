@@ -3649,7 +3649,7 @@ async fn delegated_failover_reposture_fires_on_model_change() {
     // An assistant-owned session: the identity/SOUL/USER prefix is prepended to
     // every child's composed system at build time.
     driver.set_assistant_identity_prefix(Some("SOUL-IDENTITY-MARKER".to_string()));
-    let agent_a = dmh_build_child(
+    let mut agent_a = dmh_build_child(
         &driver,
         "explore",
         false,
@@ -3665,14 +3665,22 @@ async fn delegated_failover_reposture_fires_on_model_change() {
     );
     assert_eq!(agent_a.model.model_id_ref(), "model-a");
     assert_eq!(agent_b.model.model_id_ref(), "model-b");
+    Arc::make_mut(
+        agent_a
+            .definition
+            .as_mut()
+            .expect("loaded agent pins its definition"),
+    )
+    .prompt_overrides
+    .insert("model-b".to_string(), "MODEL-B-SPECIFIC-ROLE".to_string());
     // The build applied the identity prefix to the composed system.
     assert!(agent_a.system.contains("SOUL-IDENTITY-MARKER"));
     assert_eq!(
         agent_a.assistant_identity_prefix.as_deref(),
         Some("SOUL-IDENTITY-MARKER")
     );
-    // DIFFERENT model → re-render (Some), carrying model-b. Re-render reuses
-    // the agent's own role (no def re-resolution / no workspace-trust needed).
+    // DIFFERENT model → re-render (Some), carrying model-b and selecting the
+    // candidate's prompt override from the pinned governing definition.
     let reposed = crate::engine::builtin::reposture_agent_for_candidate(
         &agent_a,
         &agent_b.model,
@@ -3689,16 +3697,13 @@ async fn delegated_failover_reposture_fires_on_model_change() {
         "the re-rendered agent carries the CANDIDATE model, not the primary's"
     );
     // The repostured system KEEPS the assistant identity prefix, and is
-    // byte-identical to a fresh build for the candidate model (identity prefix +
-    // role body) — fails if the reposture drops the prefix.
+    // composed with the candidate-specific role body.
     assert!(
         reposed.system.contains("SOUL-IDENTITY-MARKER"),
         "the repostured system keeps the assistant identity prefix"
     );
-    assert_eq!(
-        reposed.system, agent_b.system,
-        "the repostured system == a fresh build for the candidate model"
-    );
+    assert_eq!(reposed.role_prompt, "MODEL-B-SPECIFIC-ROLE");
+    assert!(reposed.system.contains("MODEL-B-SPECIFIC-ROLE"));
     assert_eq!(
         reposed.assistant_identity_prefix.as_deref(),
         Some("SOUL-IDENTITY-MARKER")

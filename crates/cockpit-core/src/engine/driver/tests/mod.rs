@@ -471,6 +471,7 @@ fn test_driver_with_url_and_grant(
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: with_vnext_grant.then(|| test_vnext_build_grant(&root)),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
     });
     let driver = Driver::with_max_schedules(session, locks, redact, root, agent, max_schedules);
@@ -653,6 +654,7 @@ fn learn_driver(
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
     });
     let db = crate::db::Db::open_in_memory().unwrap();
@@ -1675,6 +1677,7 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: old.env_overlay.clone(),
+        definition: old.definition.clone(),
         assistant_identity_prefix: None,
     });
     (driver, tmp)

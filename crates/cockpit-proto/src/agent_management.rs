@@ -57,6 +57,10 @@ pub struct AgentInventoryEntry {
     pub model: Option<String>,
     pub valid: bool,
     pub diagnostic: Option<String>,
+    /// Non-fatal definition load warnings. These never imply invalidity and
+    /// never alter the definition's effective grants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Exact effective-source ownership used to bind later actions.
     pub source_layer: AgentSourceLayer,
     /// Opaque daemon-minted source occurrence identity. It contains no path
@@ -591,6 +595,10 @@ pub fn agent_inventory_entry_projection_material(entry: &AgentInventoryEntry) ->
             None => digest.update([0]),
         }
     }
+    digest.update((entry.warnings.len() as u64).to_be_bytes());
+    for warning in &entry.warnings {
+        digest_field(&mut digest, warning.as_bytes());
+    }
     digest.update([
         entry.kind as u8,
         u8::from(entry.overridden),
@@ -642,6 +650,35 @@ pub fn validate_agent_source_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_inventory_warnings_round_trip_and_bind_projection() {
+        let entry = AgentInventoryEntry {
+            name: "helper".into(),
+            kind: AgentEntryKind::Custom,
+            overridden: false,
+            description: Some("helper".into()),
+            model: None,
+            valid: true,
+            diagnostic: None,
+            warnings: vec!["advisory warning".into()],
+            source_layer: AgentSourceLayer::Workspace,
+            source_identity: "11".repeat(32),
+            revision: "22".repeat(32),
+            editable: true,
+            projection_digest: String::new(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let round_trip: AgentInventoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip.warnings, entry.warnings);
+
+        let mut without_warning = entry.clone();
+        without_warning.warnings.clear();
+        assert_ne!(
+            agent_inventory_entry_projection_material(&entry),
+            agent_inventory_entry_projection_material(&without_warning)
+        );
+    }
 
     #[test]
     fn mutation_intent_hash_is_body_free_but_binds_public_shape() {

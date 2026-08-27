@@ -295,13 +295,13 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     }
 }
 
-/// `Careful` — a Defensive-mode-targeted write-capable primary. It keeps only
+/// `Careful` — the verbose/conservative write-capable primary. It keeps only
 /// the minimum direct Build tools needed for ordinary edits; broader code intel,
 /// skill, harness, and recall capabilities stay reachable through `mcp`.
 fn careful_def() -> AgentDef {
     def(
         "Careful",
-        "Defensive-mode coding primary; small direct tool surface, uses `mcp` for broader Build capabilities.",
+        "Conservative coding primary; small direct tool surface, uses `mcp` for broader Build capabilities.",
         AgentMode::Primary,
         &[
             "read",
@@ -370,16 +370,11 @@ fn build_def() -> AgentDef {
     );
     def.tool_descriptions.insert(
         "task".to_string(),
-        ToolDescriptionSpec::PerMode {
-            normal: Some(
+        ToolDescriptionSpec::WithVerbose {
+            text:
                 "Delegate substantive feature work to a subagent (builder writes, explore investigates); handoff prompts may use @file, @file:XX-YY, @dir/, and /skill tags; if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
-            ),
-            frontier: Some(
-                "Write small local edits directly; delegate larger, multi-file, risky, or isolated work to builder/explore; handoff prompts may use @file, @file:XX-YY, @dir/, and /skill tags; backgrounded JSON means the task call closed but the child is detached/result-pending; use docs when APIs are unfamiliar or version-sensitive"
-                    .to_string(),
-            ),
-            defensive: Some(
+            verbose_text: Some(
                 "Delegate substantive implementation instead of doing it inline: hand each \
                  well-scoped piece to `builder` to write/edit files, or to `explore` for \
                  read-only investigation, with a complete standalone brief (goal, constraints, \
@@ -439,16 +434,11 @@ fn builder_def() -> AgentDef {
     );
     def.tool_descriptions.insert(
         "task".to_string(),
-        ToolDescriptionSpec::PerMode {
-            normal: Some(
+        ToolDescriptionSpec::WithVerbose {
+            text:
                 "Use `task` only for docs by default for unfamiliar APIs; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
                     .to_string(),
-            ),
-            frontier: Some(
-                "Use `task` only for docs when APIs are unfamiliar; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
-                    .to_string(),
-            ),
-            defensive: Some(
+            verbose_text: Some(
                 "Do the assigned code work yourself — read, lock, edit, and verify in this context. \
                  Use `task` only to ask the `docs` pipeline how a third-party dependency's API \
                  works — and when you need that API, asking `docs` is your first move, not a guess \
@@ -673,25 +663,17 @@ fn docs_answerer_def() -> AgentDef {
     );
     def.tool_descriptions.insert(
         "grep".to_string(),
-        ToolDescriptionSpec::PerMode {
-            normal: Some(
-                "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches."
-                    .to_string(),
-            ),
-            frontier: None,
-            defensive: None,
-        },
+        ToolDescriptionSpec::Text(
+            "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches."
+                .to_string(),
+        ),
     );
     def.tool_descriptions.insert(
         "glob".to_string(),
-        ToolDescriptionSpec::PerMode {
-            normal: Some(
-                "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
-                    .to_string(),
-            ),
-            frontier: None,
-            defensive: None,
-        },
+        ToolDescriptionSpec::Text(
+            "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
+                .to_string(),
+        ),
     );
     def
 }

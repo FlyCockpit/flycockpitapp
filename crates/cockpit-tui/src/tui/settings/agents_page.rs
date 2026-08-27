@@ -2534,7 +2534,12 @@ fn inventory_rows_from_response(
                 cockpit_proto::AgentEntryKind::Custom => AgentKind::Custom,
             },
             detail: if entry.valid {
-                Ok(entry.description.unwrap_or_default())
+                let mut detail = entry.description.unwrap_or_default();
+                for warning in entry.warnings {
+                    detail.push_str("\nWarning: ");
+                    detail.push_str(&warning);
+                }
+                Ok(detail)
             } else {
                 Err(entry.diagnostic.unwrap_or_else(|| "invalid agent".into()))
             },
@@ -2567,7 +2572,9 @@ fn valid_agent_inventory(
                 ]
                 .into_iter()
                 .flatten()
+                .chain(entry.warnings.iter().map(String::as_str))
                 .all(|value| value.len() <= cockpit_proto::MAX_AGENT_METADATA_BYTES)
+                && entry.warnings.len() <= 16
                 && (entry.kind == cockpit_proto::AgentEntryKind::Builtin) == builtin
                 && (!entry.overridden || builtin)
                 && cockpit_proto::is_opaque_authority_token(&entry.source_identity)
@@ -2576,7 +2583,8 @@ fn valid_agent_inventory(
                 && if entry.valid {
                     entry.diagnostic.is_none() && entry.description.is_some()
                 } else {
-                    entry.description.is_none()
+                    entry.warnings.is_empty()
+                        && entry.description.is_none()
                         && entry.model.is_none()
                         && entry
                             .diagnostic

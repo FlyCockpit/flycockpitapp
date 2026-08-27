@@ -1348,6 +1348,7 @@ mod backup_fallback_tests {
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
         }
     }

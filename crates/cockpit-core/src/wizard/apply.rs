@@ -230,7 +230,7 @@ impl ModelAnswersOutcome {
 }
 
 /// Persist the model wizard's answers for the selected `provider:model`:
-/// LLM mode, trust, capability overrides, context/output token ceilings,
+/// trust, capability overrides, context/output token ceilings,
 /// default thinking mode, `subagent_invokable`/`can_delegate`, the system
 /// prompt, and optionally the active model. Model fields go to the most
 /// specific writable layer for that provider; the "make default" choice

@@ -36,9 +36,8 @@ impl TaskTool {
     /// `mode` is an optional override of the per-agent default
     /// interactivity. Omitted, the engine routes by the agent's own default
     /// (`builder` is the interactive handoff; everything else runs
-    /// noninteractively). The explicit value is the seam the future
-    /// LLM-strategy axis switches on (`open design questions`):
-    /// the interactive-subagent path is the one wired today.
+    /// noninteractively). An explicit value selects the interactive or
+    /// noninteractive subagent path for this call.
     pub fn with_subagents(agents: &[&str]) -> Self {
         Self::with_subagents_inner(agents, None, false)
     }

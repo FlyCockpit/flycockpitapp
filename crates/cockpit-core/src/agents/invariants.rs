@@ -237,18 +237,23 @@ pub(crate) fn small_model_capability_warning(def: &AgentDef) -> Option<String> {
     {
         return None;
     }
-    // Heuristic: a def with no model slots or only local/small-model slots
-    // (no suggested cloud models) is unlikely to benefit from fork/parallel
-    // grants. This is advisory only.
+    // Heuristic: only warn when the author actually suggested at least one
+    // model and every suggestion is explicitly local/small. An empty
+    // suggestion list leaves model choice to host policy and is not evidence
+    // of a small-model-only definition.
     let vnext = def.vnext.as_ref()?;
-    let has_cloud_model = vnext.model_slots.values().any(|slot| {
-        !slot.suggested_models.is_empty()
-            && slot
-                .suggested_models
-                .iter()
-                .any(|m| !m.contains("/local/") && !m.contains("small"))
+    let mut saw_suggestion = false;
+    let only_local_or_small = vnext.model_slots.values().all(|slot| {
+        slot.suggested_models.iter().all(|recommendation| {
+            saw_suggestion = true;
+            let identity = recommendation.upstream_identity.to_ascii_lowercase();
+            slot.locality == super::ModelLocality::Local
+                || identity.contains("/local/")
+                || identity.starts_with("local/")
+                || identity.contains("small")
+        })
     });
-    if has_cloud_model {
+    if !saw_suggestion || !only_local_or_small {
         return None;
     }
     Some(format!(

@@ -240,6 +240,9 @@ pub enum HistoryEntry {
         call_id: String,
         tool: String,
         summary: String,
+        /// Path used for file-icon selection when the visible summary is not
+        /// a path (for example, a standalone edit error).
+        icon_path: Option<String>,
         state: ToolCallState,
     },
     /// A locally-run command and its captured (display-capped) output,
@@ -1045,12 +1048,14 @@ pub fn render_entry(
         HistoryEntry::ToolLine {
             tool,
             summary,
+            icon_path,
             state,
             ..
         } => {
+            let icon_path = icon_path.as_deref().unwrap_or(summary);
             // Standalone styled one-liner, indented to align with box
             // content (the box's sidebar+space is 2 cells wide).
-            let avail = tool_summary_budget(tool, width as usize, 2, emojis, file_icons, summary);
+            let avail = tool_summary_budget(tool, width as usize, 2, emojis, file_icons, icon_path);
             let mut spans = vec![Span::raw("  ".to_string())];
             spans.extend(tool_line_spans(
                 tool,
@@ -1058,7 +1063,7 @@ pub fn render_entry(
                 *state,
                 emojis,
                 file_icons,
-                summary,
+                icon_path,
             ));
             Rendered {
                 lines: vec![Line::from(spans)],

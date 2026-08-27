@@ -521,11 +521,13 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             call_id,
             tool,
             summary,
+            icon_path,
             state,
         } => {
             hash_len(&mut hasher, call_id);
             hash_len(&mut hasher, tool);
             hash_len(&mut hasher, summary);
+            icon_path.as_ref().map(|path| path.len()).hash(&mut hasher);
             tool_call_state_id(*state).hash(&mut hasher);
         }
         HistoryEntry::LocalCommand {

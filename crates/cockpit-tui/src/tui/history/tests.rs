@@ -1817,6 +1817,7 @@ fn historical_lock_verb_tool_calls_still_render() {
         call_id: "w".to_string(),
         tool: "writeunlock".to_string(),
         summary: "src/lib.rs".to_string(),
+        icon_path: None,
         state: ToolCallState::Success,
     };
     let rendered_write = render_entry(
@@ -2310,6 +2311,7 @@ fn tool_line_and_diff_honor_file_icons() {
         call_id: "w".to_string(),
         tool: "write".to_string(),
         summary: "src/lib.rs".to_string(),
+        icon_path: None,
         state: ToolCallState::Success,
     };
     let on = render_entry(
@@ -2342,6 +2344,32 @@ fn tool_line_and_diff_honor_file_icons() {
     );
     let off_text = line_text(&off.lines[0]);
     assert!(!off_text.contains(rust_icon), "{off_text}");
+
+    let failed_edit = HistoryEntry::ToolLine {
+        call_id: "e".to_string(),
+        tool: "edit".to_string(),
+        summary: "replacement did not match".to_string(),
+        icon_path: Some("src/lib.rs".to_string()),
+        state: ToolCallState::Failed,
+    };
+    let failed = render_entry(
+        &failed_edit,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        true,
+        &no_elided(),
+        0,
+        None,
+    );
+    let failed_text = line_text(&failed.lines[0]);
+    assert!(failed_text.contains(rust_icon), "{failed_text}");
+    assert!(
+        failed_text.contains("edit: replacement did not match"),
+        "{failed_text}"
+    );
 
     let diff = HistoryEntry::Diff {
         tool: "edit".to_string(),

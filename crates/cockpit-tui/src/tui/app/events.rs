@@ -1488,6 +1488,7 @@ impl App {
                         call_id,
                         tool,
                         summary,
+                        icon_path: None,
                         state: ToolCallState::Processing,
                     });
                     return;
@@ -1559,6 +1560,7 @@ impl App {
                         call_id,
                         tool,
                         summary: cockpit_host::text::first_line(&output, 200),
+                        icon_path: None,
                         state: ToolCallState::Success,
                     });
                 }
@@ -1617,7 +1619,7 @@ impl App {
                 // Drop any cached args from a paired ToolStart that never
                 // produced a ToolEnd — the diff would be misleading on a
                 // hard failure.
-                self.pending_edit_args.remove(&call_id);
+                let pending_edit = self.pending_edit_args.remove(&call_id);
                 // Bold red when the model built the call badly; plain red
                 // when the tool failed for another reason.
                 let state = match kind {
@@ -1632,6 +1634,7 @@ impl App {
                         call_id,
                         tool,
                         summary: cockpit_host::text::first_line(&error, 200),
+                        icon_path: pending_edit.map(|args| args.path),
                         state,
                     });
                 }
@@ -3049,6 +3052,7 @@ pub(super) fn wire_history_to_entries(wire: Vec<cockpit_proto::HistoryEntry>) ->
                         call_id,
                         tool,
                         summary,
+                        icon_path: None,
                         state,
                     });
                     continue;

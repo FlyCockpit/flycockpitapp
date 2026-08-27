@@ -73,16 +73,9 @@ pub fn configured_recursion_context(
 /// authored opencode-style for forward-compat with [`crate::agents`]
 /// — we still pull the prompt out by hand here because the agent loop
 /// already knows the tool surface.
-// The flat `<name>.md` body is the `defensive` variant **and** the
-// mode-agnostic flat fallback (implementation note):
-// defensive is the default and the more explicit, scaffolded body
-// (weak-model-first, priority #1). `<name>.normal.md` is the terser
-// strong-model body. Optional frontier bodies are the most autonomous
-// variant.
-// Issue #75: each bundled agent has a single canonical prompt body (the
-// former `.normal.md` body, adopted as the flat `<name>.md`). The per-mode
-// defensive/frontier body trios are gone; per-model overrides live on the
-// AgentDef as `prompt_overrides`.
+// Issue #75: each bundled agent has a single canonical prompt body in the
+// flat `<name>.md` file. Per-model-slot overrides live on the AgentDef as
+// `prompt_overrides` (`<name>/<key>.md`).
 pub(crate) const BUILD_PROMPT: &str = include_str!("build.md");
 pub(crate) const CAREFUL_PROMPT: &str = include_str!("careful.md");
 pub(crate) const BUILDER_PROMPT: &str = include_str!("builder.md");
@@ -3378,7 +3371,6 @@ mod tests {
     /// that cannot satisfy the typed request is not offered as a candidate.
     #[test]
     fn computer_use_route_is_custody_typed() {
-        use crate::config::extended::LlmMode;
         use crate::config::providers::{
             CapabilityStatus, ComputerUseCapability, ComputerUseContract, ModelCapabilities,
             ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig,
@@ -3420,7 +3412,7 @@ mod tests {
         // The trusted (self-hosted) model is eligible under trusted custody.
         // The eligibility API mints no grant and takes no payload, so this
         // decision can never release or render anything.
-        let trusted = computer_use_custody_route(&cfg, "selfhosted", "vision", LlmMode::Normal)
+        let trusted = computer_use_custody_route(&cfg, "selfhosted", "vision")
             .expect("a trusted computer-use model routes");
         assert_eq!(trusted.trust, ModelTrust::Trusted);
         assert_eq!(
@@ -3428,17 +3420,8 @@ mod tests {
             Some(crate::config::providers::ModelCustody::Trusted)
         );
 
-        // The session's actual harness posture is reported, not a hardcoded
-        // default: mode and custody stay independent.
-        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            let route = computer_use_custody_route(&cfg, "selfhosted", "vision", mode)
-                .expect("mode never changes eligibility");
-            assert_eq!(route.routing_diagnostics().mode, mode.as_str());
-            assert_eq!(route.trust, ModelTrust::Trusted);
-        }
-
         // The untrusted (cloud) model is eligible under untrusted custody.
-        let untrusted = computer_use_custody_route(&cfg, "cloud", "vision", LlmMode::Normal)
+        let untrusted = computer_use_custody_route(&cfg, "cloud", "vision")
             .expect("an untrusted computer-use model routes");
         assert_eq!(untrusted.trust, ModelTrust::Untrusted);
         assert_eq!(
@@ -3457,7 +3440,7 @@ mod tests {
             },
         );
         assert!(
-            computer_use_custody_route(&cfg, "hidden", "vision", LlmMode::Normal).is_err(),
+            computer_use_custody_route(&cfg, "hidden", "vision").is_err(),
             "a non-subagent-invokable model must not be routable for computer use"
         );
 
@@ -3474,7 +3457,7 @@ mod tests {
                 ..ProviderEntry::default()
             },
         );
-        assert!(computer_use_custody_route(&cfg, "blind", "text", LlmMode::Normal).is_err());
+        assert!(computer_use_custody_route(&cfg, "blind", "text").is_err());
     }
 
     /// A keyless localhost model + [`SpawnArgs`] for exercising the agent
@@ -3577,7 +3560,6 @@ mod tests {
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
-            llm_mode: crate::config::extended::LlmMode::default(),
             model_override: None,
             delegation_model: None,
             delegated: false,
@@ -3608,25 +3590,11 @@ mod tests {
     }
 
     #[test]
-    fn build_skill_manage_tool_set_is_mode_invariant() {
+    fn build_skill_manage_tool_set_includes_skill_manage() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
-        let mut expected = None;
-
-        for mode in [
-            crate::config::extended::LlmMode::Normal,
-            crate::config::extended::LlmMode::Frontier,
-            crate::config::extended::LlmMode::Defensive,
-        ] {
-            args.llm_mode = mode;
-            let names = sorted_tool_names(&build(&args));
-            assert!(names.iter().any(|name| name == "skill_manage"));
-            if let Some(expected) = &expected {
-                assert_eq!(&names, expected, "Build tool set changed in {mode:?}");
-            } else {
-                expected = Some(names);
-            }
-        }
+        let args = test_spawn_args(tmp.path());
+        let names = sorted_tool_names(&build(&args));
+        assert!(names.iter().any(|name| name == "skill_manage"));
     }
 
     fn host_for_agent(agent: &Agent, cwd: &Path) -> crate::mcp::builtin::HostContext {
@@ -4494,12 +4462,10 @@ mod tests {
     #[test]
     fn defensive_wire_surface_is_smaller_than_normal() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut normal_args = test_spawn_args(tmp.path());
-        normal_args.llm_mode = crate::config::extended::LlmMode::Normal;
+        let normal_args = test_spawn_args(tmp.path());
         let normal = load("Build", &normal_args).unwrap();
 
-        let mut defensive_args = test_spawn_args(tmp.path());
-        defensive_args.llm_mode = crate::config::extended::LlmMode::Defensive;
+        let defensive_args = test_spawn_args(tmp.path());
         let defensive = load("Careful", &defensive_args).unwrap();
 
         let normal_names = normal.tools.names();
@@ -4815,7 +4781,7 @@ mod tests {
     }
 
     fn task_target_names(agent: &Agent) -> Vec<String> {
-        task_definition(agent, crate::config::extended::LlmMode::Normal).parameters["properties"]
+        task_definition(agent, crate::agents::ToolSteering::Terse).parameters["properties"]
             ["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .unwrap()
@@ -5020,7 +4986,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_project_config(tmp.path(), r#"{"deepthink":{"enabled":false}}"#);
         let args = test_spawn_args(tmp.path());
-        let task = task_definition(&build(&args), crate::config::extended::LlmMode::Normal);
+        let task = task_definition(&build(&args), crate::agents::ToolSteering::Terse);
         let targets = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .unwrap()
@@ -5031,7 +4997,7 @@ mod tests {
         // Config is snapshotted onto `SpawnArgs` when built, so re-read it after
         // changing the config on disk (`engine-config-snapshot-adoption`).
         let args = test_spawn_args(tmp.path());
-        let task = task_definition(&build(&args), crate::config::extended::LlmMode::Normal);
+        let task = task_definition(&build(&args), crate::agents::ToolSteering::Terse);
         let targets = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .unwrap()
@@ -5735,20 +5701,18 @@ mod tests {
     }
 
     /// The per-agent `task` description override (`Build`/`builder`) follows
-    /// the same defensive/normal/frontier docs strength as the prompts.
+    /// terse vs verbose steering.
     #[test]
-    fn task_override_uses_tiered_docs_policy_by_mode() {
-        use crate::config::extended::LlmMode;
+    fn task_override_uses_tiered_docs_policy_by_steering() {
         let tmp = tempfile::tempdir().unwrap();
-        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            let mut build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
-            build_args.llm_mode = mode;
-            let mut builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
-            builder_args.llm_mode = mode;
+        let build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
+        let builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
+        for (steering, expect_first_move) in [
+            (crate::agents::ToolSteering::Terse, false),
+            (crate::agents::ToolSteering::Verbose, true),
+        ] {
             for build_agent in [load("Build", &build_args).unwrap(), builder(&builder_args)] {
-                let defs = build_agent
-                    .tools
-                    .definitions(crate::agents::ToolSteering::from_llm_mode(mode));
+                let defs = build_agent.tools.definitions(steering);
                 let task = defs
                     .iter()
                     .find(|d| d.name == "task")
@@ -5756,37 +5720,24 @@ mod tests {
                 let low = task.description.to_lowercase();
                 assert!(
                     low.contains("docs"),
-                    "`{}` ({mode:?}) `task` desc must name `docs`: {}",
+                    "`{}` ({steering:?}) `task` desc must name `docs`: {}",
                     build_agent.name,
                     task.description
                 );
-                match mode {
-                    LlmMode::Defensive => assert!(
+                if expect_first_move {
+                    assert!(
                         low.contains("first move"),
-                        "`{}` defensive `task` desc must make docs the first move: {}",
+                        "`{}` verbose `task` desc must make docs the first move: {}",
                         build_agent.name,
                         task.description
-                    ),
-                    LlmMode::Normal => assert!(
+                    );
+                } else {
+                    assert!(
                         low.contains("by default") && low.contains("unfamiliar"),
-                        "`{}` normal `task` desc must make docs the default for uncertainty: {}",
+                        "`{}` terse `task` desc must make docs the default for uncertainty: {}",
                         build_agent.name,
                         task.description
-                    ),
-                    LlmMode::Frontier => {
-                        assert!(
-                            low.contains("when") && low.contains("unfamiliar"),
-                            "`{}` frontier `task` desc must expose discretionary docs: {}",
-                            build_agent.name,
-                            task.description
-                        );
-                        assert!(
-                            !low.contains("first move"),
-                            "`{}` frontier `task` desc must not force docs first: {}",
-                            build_agent.name,
-                            task.description
-                        );
-                    }
+                    );
                 }
             }
         }
@@ -5817,10 +5768,7 @@ mod tests {
     #[test]
     fn explore_never_gets_removed_seed_tool() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
-        args.llm_mode = crate::config::extended::LlmMode::Defensive;
-        assert!(!explore(&args).tools.names().contains(&"seed"));
-        args.llm_mode = crate::config::extended::LlmMode::Normal;
+        let args = test_spawn_args(tmp.path());
         assert!(!explore(&args).tools.names().contains(&"seed"));
     }
 
@@ -5919,7 +5867,7 @@ mod tests {
         args.delegated = true;
 
         let agent = builder(&args);
-        let task = task_definition(&agent, crate::config::extended::LlmMode::Normal);
+        let task = task_definition(&agent, crate::agents::ToolSteering::Terse);
         let agent_enum = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .expect("agent enum");
@@ -5940,7 +5888,7 @@ mod tests {
         };
 
         let agent = builder(&args);
-        let task = task_definition(&agent, crate::config::extended::LlmMode::Normal);
+        let task = task_definition(&agent, crate::agents::ToolSteering::Terse);
         let agent_enum = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .expect("agent enum");
@@ -5965,40 +5913,25 @@ mod tests {
     }
 
     #[test]
-    fn build_task_description_is_per_agent_overridden_and_composes_with_mode() {
+    fn build_task_description_is_per_agent_overridden_and_composes_with_steering() {
         // `Build` registers a per-agent override on `task` (delegate-eager
         // intent, prompt `per-agent-tool-definitions.md`). The override wins
-        // over the tool's own description in normal/defensive modes, composes
-        // with the per-mode axis, and leaves the SCHEMA untouched — same tool
-        // ID + parameters as the base `task` tool. Frontier has no authored
-        // override here, so it falls back to the base terse description.
+        // over the tool's own description under both terse and verbose
+        // steering, and leaves the SCHEMA untouched — same tool ID +
+        // parameters as the base `task` tool.
         let tmp = tempfile::tempdir().unwrap();
-        let mut normal_args = test_spawn_args(tmp.path());
-        normal_args.llm_mode = crate::config::extended::LlmMode::Normal;
-        let mut defensive_args = test_spawn_args(tmp.path());
-        defensive_args.llm_mode = crate::config::extended::LlmMode::Defensive;
-        let mut frontier_args = test_spawn_args(tmp.path());
-        frontier_args.llm_mode = crate::config::extended::LlmMode::Frontier;
+        let args = test_spawn_args(tmp.path());
+        let build_agent = build(&args);
 
-        let build_normal = build(&normal_args);
-        let build_defensive = build(&defensive_args);
-        let build_frontier = build(&frontier_args);
-
-        let task_normal = build_normal
+        let task_terse = build_agent
             .tools
             .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("Build holds task");
-        let task_defensive = build_defensive
+        let task_verbose = build_agent
             .tools
             .definitions(crate::agents::ToolSteering::Verbose)
-            .into_iter()
-            .find(|d| d.name == "task")
-            .expect("Build holds task");
-        let task_frontier = build_frontier
-            .tools
-            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("Build holds task");
@@ -6006,13 +5939,13 @@ mod tests {
         // The override text is present (delegate-eager intent), not the tool's
         // own base description.
         assert!(
-            task_normal.description.contains("substantive feature work"),
-            "Build normal `task` must carry the per-agent intent: {}",
-            task_normal.description
+            task_terse.description.contains("substantive feature work"),
+            "Build terse `task` must carry the per-agent intent: {}",
+            task_terse.description
         );
-        // Normal and defensive select different text — per-mode axis preserved
+        // Terse and verbose select different text — steering axis preserved
         // on top of the per-agent override.
-        assert_ne!(task_normal.description, task_defensive.description);
+        assert_ne!(task_terse.description, task_verbose.description);
 
         // SCHEMA is identical to the un-overridden `task` tool: same ID + same
         // parameters. The override never touched the schema.
@@ -6029,63 +5962,31 @@ mod tests {
         );
         let base_def =
             crate::engine::tool::definition_of(&base, crate::agents::ToolSteering::Terse, None);
-        let base_frontier =
-            crate::engine::tool::definition_of(&base, crate::agents::ToolSteering::Terse, None);
-        assert_eq!(task_normal.name, base_def.name);
-        assert_eq!(task_normal.parameters, base_def.parameters);
+        assert_eq!(task_terse.name, base_def.name);
+        assert_eq!(task_terse.parameters, base_def.parameters);
         // …and the description genuinely differs from the un-overridden one.
-        assert_ne!(task_normal.description, base_def.description);
-        // Frontier collapsed to Terse (issue #75): the frontier-specific text
-        // is gone, so the frontier render is identical to the terse one.
-        assert_eq!(task_frontier.name, base_frontier.name);
-        assert_eq!(task_frontier.parameters, base_frontier.parameters);
-        assert_ne!(task_frontier.description, base_frontier.description);
-        assert!(
-            task_frontier
-                .description
-                .contains("substantive feature work"),
-            "{}",
-            task_frontier.description
-        );
+        assert_ne!(task_terse.description, base_def.description);
     }
 
     fn task_definition(
         agent: &Agent,
-        mode: crate::config::extended::LlmMode,
+        steering: crate::agents::ToolSteering,
     ) -> crate::engine::message::ToolDefinition {
         agent
             .tools
-            .definitions(crate::agents::ToolSteering::from_llm_mode(mode))
+            .definitions(steering)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("agent holds task")
     }
 
     #[test]
-    fn defensive_build_prompt_and_task_description_preserve_delegation_steer() {
+    fn verbose_build_task_description_preserve_delegation_steer() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
-        args.llm_mode = crate::config::extended::LlmMode::Defensive;
+        let args = test_spawn_args(tmp.path());
 
         let agent = build(&args);
-        let task = task_definition(&agent, crate::config::extended::LlmMode::Defensive);
-
-        for needle in [
-            "Substantive implementation goes to `{\"intent\":\"delegate\",\"payload\":{\"agent\":\"builder\",\"prompt\":\"...\"}}`",
-            "FIRST move is `{\"intent\":\"delegate\",\"payload\":{\"agent\":\"docs\"",
-            "dependency API questions discovered while preparing a `builder` brief",
-            "one `builder` task is one implementation slice",
-            "delegate again to a fresh `builder` brief seeded with the prior result summary",
-            "Task background contract:",
-            "Do not treat that as the report and do not redelegate the same work solely because it backgrounded",
-            "Read each child `status` (`completed`, `failed`, `cancelled`, `lost`) and optional `error`",
-        ] {
-            assert!(
-                agent.role_prompt.contains(needle),
-                "Build defensive prompt missing `{needle}`:\n{}",
-                agent.role_prompt
-            );
-        }
+        let task = task_definition(&agent, crate::agents::ToolSteering::Verbose);
 
         for needle in [
             "Delegate substantive implementation instead of doing it inline",
@@ -6101,36 +6002,19 @@ mod tests {
         ] {
             assert!(
                 task.description.contains(needle),
-                "Build defensive task description missing `{needle}`:\n{}",
+                "Build verbose task description missing `{needle}`:\n{}",
                 task.description
             );
         }
     }
 
     #[test]
-    fn defensive_builder_prompt_and_task_description_preserve_scope_steer() {
+    fn verbose_builder_task_description_preserve_scope_steer() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
-        args.llm_mode = crate::config::extended::LlmMode::Defensive;
+        let args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
 
         let agent = builder(&args);
-        let task = task_definition(&agent, crate::config::extended::LlmMode::Defensive);
-
-        for needle in [
-            "Do exactly one assigned implementation slice yourself",
-            "return that out-of-scope ask to your caller through the structured `return` report",
-            "FIRST move is to delegate to the `docs` subagent",
-            "If the `docs` task backgrounds",
-            "read per-child `status`/`error` because docs can fail",
-            "exact usage pattern is clearly established in already-read local code",
-            "Do not use `task` to delegate the feature itself",
-        ] {
-            assert!(
-                agent.role_prompt.contains(needle),
-                "builder defensive prompt missing `{needle}`:\n{}",
-                agent.role_prompt
-            );
-        }
+        let task = task_definition(&agent, crate::agents::ToolSteering::Verbose);
 
         for needle in [
             "Use `task` only to ask the `docs` pipeline",
@@ -6144,7 +6028,7 @@ mod tests {
         ] {
             assert!(
                 task.description.contains(needle),
-                "builder defensive task description missing `{needle}`:\n{}",
+                "builder verbose task description missing `{needle}`:\n{}",
                 task.description
             );
         }
@@ -6160,77 +6044,18 @@ mod tests {
     }
 
     #[test]
-    fn frontier_build_prompt_permits_direct_small_edits_with_lock_tools() {
+    fn terse_build_and_builder_task_descriptions_stay_terse() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut frontier = test_spawn_args(tmp.path());
-        frontier.llm_mode = crate::config::extended::LlmMode::Frontier;
-        let mut defensive = test_spawn_args(tmp.path());
-        defensive.llm_mode = crate::config::extended::LlmMode::Defensive;
-
-        let frontier_agent = build(&frontier);
-        let defensive_agent = build(&defensive);
-        let frontier_task =
-            task_definition(&frontier_agent, crate::config::extended::LlmMode::Frontier);
-
-        for needle in [
-            "may directly make small local edits",
-            "`read(path, offset?, limit?)`",
-            "`write(path, content)`",
-            "`edit(path, old_string, new_string, replace_all?)`",
-            "`unlock(path)`",
-            "Delegate when the change needs broad search",
-            "run the relevant build/test/check command",
-        ] {
-            assert!(
-                frontier_agent.role_prompt.contains(needle),
-                "frontier Build prompt missing `{needle}`:\n{}",
-                frontier_agent.role_prompt
-            );
-        }
-        assert!(
-            frontier_task
-                .description
-                .contains("Write small local edits directly"),
-            "{}",
-            frontier_task.description
-        );
-        assert!(
-            frontier_task
-                .description
-                .contains("delegate larger, multi-file, risky, or isolated work"),
-            "{}",
-            frontier_task.description
-        );
-
-        assert!(
-            defensive_agent.role_prompt.contains("You are not a writer"),
-            "{}",
-            defensive_agent.role_prompt
-        );
-        assert!(
-            !defensive_agent
-                .role_prompt
-                .contains("may directly make small local edits"),
-            "{}",
-            defensive_agent.role_prompt
-        );
-    }
-
-    #[test]
-    fn normal_build_and_builder_task_descriptions_stay_terse() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
-        build_args.llm_mode = crate::config::extended::LlmMode::Normal;
-        let mut builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
-        builder_args.llm_mode = crate::config::extended::LlmMode::Normal;
+        let build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
+        let builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
 
         let build_task = task_definition(
             &load("Build", &build_args).unwrap(),
-            crate::config::extended::LlmMode::Normal,
+            crate::agents::ToolSteering::Terse,
         );
         let builder_task = task_definition(
             &load("builder", &builder_args).unwrap(),
-            crate::config::extended::LlmMode::Normal,
+            crate::agents::ToolSteering::Terse,
         );
 
         assert!(build_task.description.contains("substantive feature work"));
@@ -6265,12 +6090,12 @@ mod tests {
         );
         assert!(
             build_task.description.len() < 520,
-            "normal Build task description grew too verbose: {}",
+            "terse Build task description grew too verbose: {}",
             build_task.description
         );
         assert!(
             builder_task.description.len() < 320,
-            "normal builder task description grew too verbose: {}",
+            "terse builder task description grew too verbose: {}",
             builder_task.description
         );
     }
@@ -6534,7 +6359,7 @@ mod tests {
         let agent = bee(&args);
         let def = agent
             .tools
-            .definitions(crate::agents::ToolSteering::from_llm_mode(args.llm_mode))
+            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "spawn")
             .expect("spawn tool present");

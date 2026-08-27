@@ -241,7 +241,7 @@ pub(super) fn persist_sandbox_intent(
     // first existing file — could equal the requested mode while an outer layer
     // still overrode it, silently dropping a toggle-to-default. Writing the
     // intent to the nearest layer every time is idempotent and matches
-    // `persist_llm_mode`.
+    // the other session-preference persist helpers.
     cfg.sandbox.default_mode = mode;
     doc.write(&cfg)?;
     Ok(())

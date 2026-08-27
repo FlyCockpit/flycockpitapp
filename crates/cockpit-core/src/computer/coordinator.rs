@@ -50,6 +50,9 @@ use super::frame::{
     ScreenshotMediaType, TransientProviderRequest, anthropic_transient_image_block,
     openai_transient_computer_output,
 };
+use super::observation::{
+    GeometryGeneration, ObservationEpoch, TargetGeneration, VerificationStateMachine,
+};
 use super::target::{
     BackendKind, PhysicalTargetKey, TargetEvidenceAdapter, TargetUnavailableReason,
 };
@@ -1187,9 +1190,9 @@ pub struct ComputerActionAuthorization {
     /// have no host lease.
     pub host_lease: Option<HostLeaseToken>,
     /// Focus generation from the planning evidence capture.
-    pub focus_generation: u64,
+    pub focus_generation: TargetGeneration,
     /// Observation generation (display generation) from the opened backend.
-    pub observation_generation: u64,
+    pub observation_generation: ObservationEpoch,
     /// Safe action metadata: a short label describing the action type.
     pub action_label: String,
     /// Safe target metadata: backend kind (diagnostic only).
@@ -1200,7 +1203,7 @@ pub struct ComputerActionAuthorization {
     /// Ordered batch index within the provider call.
     pub batch_index: u32,
     /// Geometry generation from the opened backend.
-    pub geometry_generation: u64,
+    pub geometry_generation: GeometryGeneration,
     /// Advisory action risk class (audit/guidance only — never affects
     /// dispatch).
     pub action_class: ActionRiskClass,
@@ -2114,9 +2117,9 @@ pub struct ComputerActionCoordinator {
     /// Whether the coordinator has been invalidated (e.g. display hotplug).
     invalidated: bool,
     /// The observation generation (display generation) from the opened backend.
-    observation_generation: u64,
+    observation_generation: ObservationEpoch,
     /// The focus generation from the planning evidence capture.
-    focus_generation: u64,
+    focus_generation: TargetGeneration,
     /// The backend kind.
     backend_kind: BackendKind,
     /// Tracks dispatch state per call ID.
@@ -2145,6 +2148,12 @@ pub struct ComputerActionCoordinator {
     /// fences the one currently approved host operation at its final backend
     /// boundary.
     host_effect_cancel: tokio_util::sync::CancellationToken,
+    /// The observation verification state machine. Starts at
+    /// [`VerificationLevel::Strict`]. Full post-action `evaluate_qualification`
+    /// on the live dispatch path is deferred until backend pointer evidence
+    /// exists (separate prompt); do not fabricate pointer coordinates or
+    /// claim Guarded/Stable promotions here (AC22).
+    verification: VerificationStateMachine,
 }
 
 impl std::fmt::Debug for ComputerActionCoordinator {
@@ -2197,8 +2206,8 @@ impl ComputerActionCoordinator {
             return Err(CoordinatorOpenError::ZeroGeometry);
         }
 
-        let observation_generation: u64 = 1;
-        let mut focus_generation: u64 = 0;
+        let observation_generation = ObservationEpoch(1);
+        let mut focus_generation = TargetGeneration(0);
         let mut backend_kind = BackendKind::VirtualDisplay;
         let mut host_lease: Option<HostLeaseToken> = None;
         let mut virtual_display_uuid: Option<[u8; 16]> = None;
@@ -2211,7 +2220,7 @@ impl ComputerActionCoordinator {
             backend_kind = adapter.backend_kind();
             match adapter.capture_snapshot() {
                 Ok(evidence) => {
-                    focus_generation = evidence.focus_generation;
+                    focus_generation = TargetGeneration(evidence.focus_generation);
                     // Pin the virtual display identity for lease scoping. For
                     // physical targets this stays `None` (they scope by host
                     // lease).
@@ -2291,6 +2300,7 @@ impl ComputerActionCoordinator {
             virtual_display_uuid,
             denied: None,
             host_effect_cancel: tokio_util::sync::CancellationToken::new(),
+            verification: VerificationStateMachine::new(),
         })
     }
 
@@ -2370,7 +2380,7 @@ impl ComputerActionCoordinator {
         // If we have a target adapter, re-capture evidence and check for drift.
         if let Some(adapter) = &mut self.target_adapter {
             let evidence = adapter.capture_snapshot()?;
-            if evidence.focus_generation != self.focus_generation && self.focus_generation > 0 {
+            if evidence.focus_generation != self.focus_generation.0 && self.focus_generation.0 > 0 {
                 // Focus generation changed — invalidate.
                 self.invalidate(TargetUnavailableReason::StaleTarget);
                 return Err(TargetUnavailableReason::StaleTarget);
@@ -2497,7 +2507,7 @@ impl ComputerActionCoordinator {
             dims,
             ObservationId(call_id.to_string()),
             ActionId(call_id.to_string()),
-            CaptureEpoch(self.observation_generation),
+            CaptureEpoch(self.observation_generation.0),
             reservation,
             None,
         )
@@ -2539,7 +2549,7 @@ impl ComputerActionCoordinator {
             backend_kind: self.backend_kind,
             provider_call_id: call_id.to_string(),
             batch_index: 0,
-            geometry_generation: self.observation_generation,
+            geometry_generation: GeometryGeneration(self.observation_generation.0),
             action_class,
             action_payload_digest,
             lease_binding_digest,
@@ -2580,9 +2590,9 @@ impl ComputerActionCoordinator {
                 },
                 "action_label": action_label,
                 "backend_kind": self.backend_kind.diagnostic_label(),
-                "focus_generation": self.focus_generation,
-                "observation_generation": self.observation_generation,
-                "geometry_generation": self.observation_generation,
+                "focus_generation": self.focus_generation.0,
+                "observation_generation": self.observation_generation.0,
+                "geometry_generation": self.observation_generation.0,
                 "provider_call_id": call_id,
                 "batch_index": 0_u32,
                 "action_class": action_class.label(),
@@ -2627,7 +2637,7 @@ impl ComputerActionCoordinator {
             model_id: self.model_id.clone(),
             target_key,
             host_lease_generation,
-            display_generation: self.observation_generation,
+            display_generation: self.observation_generation.0,
         })
     }
 
@@ -2702,7 +2712,7 @@ impl ComputerActionCoordinator {
             Some(Err(())) => {
                 return Err(self.discard_answer_nonsticky(call_id, &lease_key));
             }
-            None => (self.focus_generation, virtual_display_uuid),
+            None => (self.focus_generation.0, virtual_display_uuid),
         };
         let host_present_pre_await = self.host_lease.is_some();
 
@@ -3110,7 +3120,7 @@ impl ComputerActionCoordinator {
         // Focus generation requirement: TypeText and KeyChord require a
         // current focus generation (focus_generation > 0). A zero focus
         // generation means no planning evidence capture was done.
-        if Self::requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
+        if Self::requires_focus_generation(&backend_actions) && self.focus_generation.0 == 0 {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::StaleTarget,
             };
@@ -3251,7 +3261,7 @@ impl ComputerActionCoordinator {
         }
 
         // Focus generation requirement for type/key actions.
-        if Self::requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
+        if Self::requires_focus_generation(&backend_actions) && self.focus_generation.0 == 0 {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::StaleTarget,
             };
@@ -3388,7 +3398,7 @@ impl ComputerActionCoordinator {
         }
 
         // Focus generation requirement for type/key actions.
-        if Self::requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
+        if Self::requires_focus_generation(&backend_actions) && self.focus_generation.0 == 0 {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::StaleTarget,
             };
@@ -3509,13 +3519,19 @@ impl ComputerActionCoordinator {
     }
 
     /// The observation generation (display generation) from the opened backend.
-    pub fn observation_generation(&self) -> u64 {
+    pub fn observation_generation(&self) -> ObservationEpoch {
         self.observation_generation
     }
 
     /// The focus generation from the planning evidence capture.
-    pub fn focus_generation(&self) -> u64 {
+    pub fn focus_generation(&self) -> TargetGeneration {
         self.focus_generation
+    }
+
+    /// The observation verification state machine (starts at Strict; live
+    /// qualification deferred until backend pointer evidence exists).
+    pub fn verification(&self) -> &VerificationStateMachine {
+        &self.verification
     }
 
     /// The session ID this coordinator serves.
@@ -6947,7 +6963,7 @@ mod tests {
         assert_eq!(coordinator.session_id(), "session-1");
         assert_eq!(coordinator.delegation_id().0, "delegation-1");
         // The observation and focus generations are carried.
-        assert!(coordinator.observation_generation() > 0);
+        assert!(coordinator.observation_generation().0 > 0);
     }
 
     #[tokio::test]
@@ -7420,7 +7436,7 @@ mod tests {
             .expect("coordinator open");
 
         // Without a target adapter, focus_generation is 0.
-        assert_eq!(coordinator.focus_generation(), 0);
+        assert_eq!(coordinator.focus_generation(), TargetGeneration(0));
 
         // TypeText is rejected — requires current focus generation.
         let actions = vec![OpenAiComputerAction::TypeText("hello".to_string())];
@@ -7458,7 +7474,7 @@ mod tests {
             .expect("coordinator open");
 
         // focus_generation > 0 from the evidence.
-        assert!(coordinator.focus_generation() > 0);
+        assert!(coordinator.focus_generation().0 > 0);
 
         let actions = vec![OpenAiComputerAction::TypeText("hello".to_string())];
         let outcome = coordinator

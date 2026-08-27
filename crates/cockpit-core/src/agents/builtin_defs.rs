@@ -81,17 +81,15 @@ pub const FALLBACK_PRIMARY: &str = "Build";
 /// mode.
 pub const DEFENSIVE_PRIMARY: &str = "Careful";
 
-pub fn resolve_primary_for_llm_mode(
-    requested_or_stored: Option<&str>,
-    configured_default: &str,
-    llm_mode: crate::config::extended::LlmMode,
-) -> String {
+/// Resolve the primary agent for a session (issue #75): the mode axis no
+/// longer selects `Careful` automatically — `defaultPrimaryAgent` (the
+/// configured default) governs. A stored/requested name wins (with
+/// removed-primary fallback to `Build`); otherwise the configured default
+/// applies (with the same removed-primary fallback).
+pub fn resolve_primary(requested_or_stored: Option<&str>, configured_default: &str) -> String {
     match requested_or_stored.filter(|name| !name.is_empty()) {
         Some(name) if is_removed_primary(name) => FALLBACK_PRIMARY.to_string(),
         Some(name) => name.to_string(),
-        None if llm_mode == crate::config::extended::LlmMode::Defensive => {
-            DEFENSIVE_PRIMARY.to_string()
-        }
         None if is_removed_primary(configured_default) => FALLBACK_PRIMARY.to_string(),
         None => configured_default.to_string(),
     }
@@ -121,8 +119,25 @@ pub(crate) fn embedded_internal_default(name: &str) -> Option<AgentDef> {
         "computer" => Some(computer_def()),
         "docs-resolver" => Some(docs_resolver_def()),
         "docs-answerer" => Some(docs_answerer_def()),
+        "standard" => Some(standard_def()),
         _ => None,
     }
+}
+
+/// The universal fallback agent def (issue #75, decision 6): conservative
+/// grants — none of the four capabilities, terse steering, default context
+/// policy (80% auto-compact, standard inline caps). Used for cold start and
+/// delegation to an undescribed model, always subject to no-widening
+/// intersection against the parent's grants.
+fn standard_def() -> AgentDef {
+    def_with_normal(
+        "standard",
+        "Universal fallback agent — conservative grants, terse steering.",
+        super::AgentMode::All,
+        &["read", "code", "search", "graph", "bash", "task", "question"],
+        "You are a general-purpose coding agent. Read and investigate before acting; delegate substantive work via `task`; report concise progress.",
+        None,
+    )
 }
 
 fn def(name: &str, description: &str, mode: AgentMode, tools: &[&str], prompt: &str) -> AgentDef {
@@ -175,7 +190,54 @@ fn def_with_normal(
         prompt_overrides: std::collections::BTreeMap::new(),
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),
+    };
+    stamp_builtin_posture(&mut def, name);
+    def
+}
+
+/// Stamp an embedded built-in def with its explicit issue-#75 posture:
+/// capabilities, tool steering, and context policy. This makes agent
+/// definitions the sole policy artifact — no code path resolves posture from
+/// the session-global `LlmMode` for shipped defs.
+///
+/// - `Careful` (the shipped single-model-defensive preset): verbose steering,
+///   60% auto-compact floor, conservative inline caps, no extra capabilities.
+/// - `Build`/`builder`: terse, defaults, `{followupSeed, sandboxEscalate,
+///   forkContext, scopedParallelWrite}`.
+/// - `bee`/`plan`/`explore`/`scout`/`history`/`multireview`/`deepthink`:
+///   terse, defaults, `{followupSeed, sandboxEscalate}`.
+/// - `computer`/docs agents: terse, defaults, no extra capabilities (`{}`).
+fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
+    use super::{AgentCapability, ContextPolicy, InlineCapsProfile, ToolSteering};
+    let mut caps = std::collections::BTreeSet::new();
+    match name {
+        "Careful" => {
+            def.tool_steering = Some(ToolSteering::Verbose);
+            def.context_policy = Some(ContextPolicy {
+                auto_compact_pct: Some(60),
+                inline_caps: Some(InlineCapsProfile::Conservative),
+            });
+            // No extra capabilities — the conservative preset.
+        }
+        "Build" | "builder" => {
+            def.tool_steering = Some(ToolSteering::Terse);
+            caps.insert(AgentCapability::FollowupSeed);
+            caps.insert(AgentCapability::SandboxEscalate);
+            caps.insert(AgentCapability::ForkContext);
+            caps.insert(AgentCapability::ScopedParallelWrite);
+        }
+        "bee" | "Plan" | "explore" | "scout" | "history" | "Multireview"
+        | "deepthink" => {
+            def.tool_steering = Some(ToolSteering::Terse);
+            caps.insert(AgentCapability::FollowupSeed);
+            caps.insert(AgentCapability::SandboxEscalate);
+        }
+        // computer / docs-resolver / docs-answerer / custom: no extra caps.
+        _ => {
+            def.tool_steering = Some(ToolSteering::Terse);
+        }
     }
+    def.capabilities = Some(caps);
 }
 
 /// Bundled definitions are authored by the binary, not by an editable
@@ -675,15 +737,10 @@ mod tests {
     }
 
     #[test]
-    fn defensive_primary_selected_for_defensive_llm_mode() {
-        assert_eq!(
-            resolve_primary_for_llm_mode(
-                None,
-                FALLBACK_PRIMARY,
-                crate::config::extended::LlmMode::Defensive,
-            ),
-            DEFENSIVE_PRIMARY
-        );
+    fn configured_default_governs_primary_selection() {
+        // Issue #75: the mode axis no longer selects Careful; the configured
+        // default (`FALLBACK_PRIMARY` here) governs for brand-new sessions.
+        assert_eq!(resolve_primary(None, FALLBACK_PRIMARY), FALLBACK_PRIMARY);
         assert_eq!(
             embedded_default(DEFENSIVE_PRIMARY)
                 .expect("defensive primary embedded default")
@@ -701,59 +758,36 @@ mod tests {
     }
 
     #[test]
-    fn defensive_primary_not_selected_for_normal_or_frontier() {
-        use crate::config::extended::LlmMode;
-
+    fn configured_default_resolves_to_build_when_default_is_build() {
         let build = embedded_default(FALLBACK_PRIMARY).expect("Build embedded default");
-        for mode in [LlmMode::Normal, LlmMode::Frontier] {
-            let resolved = resolve_primary_for_llm_mode(None, FALLBACK_PRIMARY, mode);
-            let resolved_def = embedded_default(&resolved).expect("resolved embedded default");
+        let resolved = resolve_primary(None, FALLBACK_PRIMARY);
+        let resolved_def = embedded_default(&resolved).expect("resolved embedded default");
 
-            assert_eq!(resolved, FALLBACK_PRIMARY);
-            assert_eq!(resolved_def.tools, build.tools);
-        }
+        assert_eq!(resolved, FALLBACK_PRIMARY);
+        assert_eq!(resolved_def.tools, build.tools);
     }
 
     #[test]
-    fn defensive_primary_never_overrides_explicit_agent_choice() {
-        use crate::config::extended::LlmMode;
-
+    fn explicit_agent_choice_wins_over_default() {
+        assert_eq!(resolve_primary(Some("Plan"), FALLBACK_PRIMARY), "Plan");
+        assert_eq!(resolve_primary(Some("Build"), FALLBACK_PRIMARY), "Build");
         assert_eq!(
-            resolve_primary_for_llm_mode(Some("Plan"), FALLBACK_PRIMARY, LlmMode::Defensive),
-            "Plan"
-        );
-        assert_eq!(
-            resolve_primary_for_llm_mode(Some("Build"), FALLBACK_PRIMARY, LlmMode::Defensive),
-            "Build"
-        );
-        assert_eq!(
-            resolve_primary_for_llm_mode(
-                Some("custom-primary"),
-                FALLBACK_PRIMARY,
-                LlmMode::Defensive,
-            ),
+            resolve_primary(Some("custom-primary"), FALLBACK_PRIMARY),
             "custom-primary"
         );
     }
 
     #[test]
-    fn defensive_primary_composes_with_experimental_fallback() {
-        use crate::config::extended::LlmMode;
-
+    fn removed_primary_falls_back_to_build() {
         assert_eq!(
-            resolve_primary_for_llm_mode(Some("Swarm"), FALLBACK_PRIMARY, LlmMode::Defensive),
+            resolve_primary(Some("Swarm"), FALLBACK_PRIMARY),
             FALLBACK_PRIMARY,
             "removed stored primaries keep the existing Build fallback"
         );
         assert_eq!(
-            resolve_primary_for_llm_mode(None, "Swarm", LlmMode::Normal),
+            resolve_primary(None, "Swarm"),
             FALLBACK_PRIMARY,
             "removed configured defaults keep the existing Build fallback"
-        );
-        assert_eq!(
-            resolve_primary_for_llm_mode(None, "Swarm", LlmMode::Defensive),
-            DEFENSIVE_PRIMARY,
-            "brand-new Defensive sessions still select the Defensive primary"
         );
     }
 

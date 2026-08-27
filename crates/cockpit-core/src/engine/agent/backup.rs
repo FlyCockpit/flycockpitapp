@@ -1347,6 +1347,7 @@ mod backup_fallback_tests {
             params: ModelParams::default(),
             scan_tool_results: true,
             llm_mode: crate::config::extended::LlmMode::Normal,
+            context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
             delegated: false,

@@ -1693,6 +1693,7 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
         params: old.params.clone(),
         scan_tool_results: old.scan_tool_results,
         llm_mode: crate::config::extended::LlmMode::Normal,
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
         delegated: false,
@@ -2378,15 +2379,15 @@ async fn effective_auto_compact_pct_mode_defaults_when_unset() {
     let cfg = ContextConfig::default();
 
     assert_eq!(
-        driver.effective_auto_compact_pct(&cfg, LlmMode::Defensive, true),
+        driver.effective_auto_compact_pct(&cfg, LlmMode::Defensive, None, true),
         60
     );
     assert_eq!(
-        driver.effective_auto_compact_pct(&cfg, LlmMode::Normal, true),
+        driver.effective_auto_compact_pct(&cfg, LlmMode::Normal, None, true),
         80
     );
     assert_eq!(
-        driver.effective_auto_compact_pct(&cfg, LlmMode::Frontier, true),
+        driver.effective_auto_compact_pct(&cfg, LlmMode::Frontier, None, true),
         80
     );
 }
@@ -2399,7 +2400,7 @@ async fn effective_auto_compact_pct_stays_60_without_mcp() {
     let cfg = ContextConfig::default();
 
     for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, false), 60);
+        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, None, false), 60);
     }
 }
 
@@ -2414,8 +2415,8 @@ async fn effective_auto_compact_pct_explicit_override_wins() {
     };
 
     for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, false), 50);
-        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, true), 50);
+        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, None, false), 50);
+        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, None, true), 50);
     }
 }
 

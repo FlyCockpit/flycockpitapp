@@ -163,11 +163,7 @@ pub(crate) fn resolve_root_agent_conn(
     }
     let active = row.active_agent;
     if crate::agents::is_builtin_primary(&active) || crate::agents::is_removed_primary(&active) {
-        return crate::agents::resolve_primary_for_llm_mode(
-            Some(&active),
-            initial_active_agent(cfg),
-            llm_mode,
-        );
+        return crate::agents::resolve_primary(Some(&active), initial_active_agent(cfg));
     }
     default_primary()
 }

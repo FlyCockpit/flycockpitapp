@@ -8436,10 +8436,18 @@ impl Driver {
         &self,
         ctx_cfg: &crate::config::providers::ContextConfig,
         mode: LlmMode,
+        context_policy: Option<&crate::agents::ContextPolicy>,
         can_self_compact: bool,
     ) -> u8 {
         if let Some(explicit) = ctx_cfg.auto_compact_pct {
             return explicit;
+        }
+        // Issue #75: the def's contextPolicy.autoCompactPct overrides the
+        // mode-derived floor; the default is 80 (CAPABLE_MODE_DEFAULT_PCT).
+        if let Some(policy) = context_policy
+            && let Some(pct) = policy.auto_compact_pct
+        {
+            return pct;
         }
         if !can_self_compact {
             return AUTO_COMPACT_FLOOR_PCT;
@@ -8454,12 +8462,10 @@ impl Driver {
         &self,
         ctx_cfg: &crate::config::providers::ContextConfig,
     ) -> u8 {
-        let mode = self
-            .stack
-            .first()
-            .map(|frame| frame.agent.llm_mode)
-            .unwrap_or_default();
-        self.effective_auto_compact_pct(ctx_cfg, mode, self.root_can_self_compact())
+        let frame = self.stack.first();
+        let mode = frame.map(|f| f.agent.llm_mode).unwrap_or_default();
+        let policy = frame.and_then(|f| f.agent.context_policy.as_ref());
+        self.effective_auto_compact_pct(ctx_cfg, mode, policy, self.root_can_self_compact())
     }
 
     /// Last provider-reported input usage, with a debug-build-only threshold

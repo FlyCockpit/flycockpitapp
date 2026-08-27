@@ -61,6 +61,7 @@ fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempD
         params: old.params.clone(),
         scan_tool_results: old.scan_tool_results,
         llm_mode: old.llm_mode,
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
         delegated: old.delegated,

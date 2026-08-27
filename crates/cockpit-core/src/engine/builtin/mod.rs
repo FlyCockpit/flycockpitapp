@@ -2341,6 +2341,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             params,
             scan_tool_results: false,
             llm_mode,
+            context_policy: def.context_policy.clone(),
             lock_identity: args
                 .lock_identity
                 .clone()
@@ -2482,6 +2483,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             .scan_tool_results
             .unwrap_or_else(|| crate::agents::default_scan_tool_results(&def.name)),
         llm_mode,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -2915,6 +2917,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         params,
         scan_tool_results: true,
         llm_mode,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3101,6 +3104,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         params: args.params.clone(),
         scan_tool_results: false,
         llm_mode,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3215,6 +3219,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         params: args.params.clone(),
         scan_tool_results: true,
         llm_mode,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3267,6 +3272,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         params: args.params.clone(),
         scan_tool_results: true,
         llm_mode,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3336,6 +3342,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         params: args.params.clone(),
         scan_tool_results: true,
         llm_mode,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()

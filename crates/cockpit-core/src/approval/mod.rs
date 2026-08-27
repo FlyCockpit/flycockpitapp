@@ -142,15 +142,19 @@ pub(crate) fn host_approval_response_allows(
 
 /// Validate the only response shapes that may terminally decline a real host
 /// approval.  Cancellation is explicit; a deny must be the exact `Single`
-/// option offered by that same persisted approval question.  In particular,
-/// a batch, multi-select, free-text value, foreign option ID, or an allow-like
-/// option cannot be laundered into the cancellation path.
+/// option offered by that same persisted approval question.  The structured
+/// `cockpit run` auto-deny sentinel is the one non-UI free-text envelope that
+/// may decline: it is the same protocol constant already decoded as
+/// [`Decision::NoninteractiveDeny`]. Arbitrary free-text, a batch,
+/// multi-select, foreign option ID, or an allow-like option cannot be
+/// laundered into the cancellation path.
 pub(crate) fn host_approval_response_declines(
     response: &ResolveResponse,
     offered: &InterruptQuestionSet,
 ) -> bool {
     match response {
         ResolveResponse::Cancel => true,
+        ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL => true,
         ResolveResponse::Single { selected_id } => {
             let [InterruptQuestion::Single { options, .. }] = offered.questions.as_slice() else {
                 return false;
@@ -4561,6 +4565,15 @@ mod tests {
             },
             &offered,
         ));
+        assert!(
+            host_approval_response_declines(
+                &ResolveResponse::Freetext {
+                    text: NONINTERACTIVE_RUN_DENIAL.into(),
+                },
+                &offered,
+            ),
+            "the structured cockpit-run auto-deny sentinel must settle a parked host approval"
+        );
         for invalid in [
             ResolveResponse::Single {
                 selected_id: ApprovalOptionId::ApproveOnce.as_str().into(),
@@ -4580,7 +4593,7 @@ mod tests {
         ] {
             assert!(
                 !host_approval_response_declines(&invalid, &offered),
-                "only the exact Cancel or exact offered deny response may terminalize host approval"
+                "only Cancel, the offered deny, or the structured noninteractive sentinel may terminalize host approval"
             );
         }
     }

@@ -23096,8 +23096,8 @@ pub(super) async fn attach(
     let model_override = model_override.filter(|_| session_id.is_none());
     let project_root = project_root.map(PathBuf::from);
 
-    // Claim an in-memory lazy session before consulting SQLite. Until its
-    // first user message it intentionally has no durable row; only the
+    // Claim an in-memory lazy session before consulting SQLite. The worker
+    // persists the row before durable lifecycle setup; until then only the
     // registry owns its identity, project root, and immutable setup mode.
     // Authorization has already limited this path to the local owner.
     let live_claim = match session_id {
@@ -24160,7 +24160,7 @@ async fn run_docs_ask_pipeline(
         env_overlay: Arc::new(std::sync::RwLock::new(Default::default())),
         cwd: cwd.clone(),
         config: config.clone(),
-        session_short_id: session.short_id.clone(),
+        session_short_id: session.short_id(),
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,

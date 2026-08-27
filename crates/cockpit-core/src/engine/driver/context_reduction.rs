@@ -1541,7 +1541,7 @@ impl Driver {
                 &prepared.agent_name,
                 crate::session::SessionCompactionRecord {
                     successor_session_id: self.session.id,
-                    successor_short_id: &self.session.short_id,
+                    successor_short_id: &self.session.short_id(),
                     seed_tool_count: prepared.seed_tags.len(),
                     brief_text: &prepared.brief,
                     handoff_text: &prepared.handoff,

@@ -647,11 +647,51 @@ impl Db {
     /// a live daemon must be queried over RPC rather than inspected beside it.
     pub fn open_default_read_only_diagnostic() -> Result<Self> {
         let path = Self::default_path()?;
-        if !path.is_file() {
-            anyhow::bail!("database does not exist at {}", path.display());
+        match path.metadata() {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => anyhow::bail!(
+                "database path is not openable because {} is not a file",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Self::explain_missing_database(&path));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                anyhow::bail!(
+                    "database path is not readable at {}: permission denied",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "database path cannot be inspected at {}: {error}",
+                    path.display()
+                );
+            }
         }
         let diagnostic_lock = Arc::new(files::DatabaseDiagnosticLock::try_acquire(&path)?);
         Self::open_read_only_diagnostic_impl(path, Some(diagnostic_lock))
+    }
+
+    fn explain_missing_database(path: &Path) -> anyhow::Error {
+        for ancestor in path.ancestors().skip(1) {
+            match ancestor.metadata() {
+                Ok(meta) if !meta.is_dir() => {
+                    return anyhow::anyhow!(
+                        "database path is not openable because {} is not a directory",
+                        ancestor.display()
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return anyhow::anyhow!(
+                        "database path is not readable because {} cannot be inspected: permission denied",
+                        ancestor.display()
+                    );
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        anyhow::anyhow!("database does not exist at {}", path.display())
     }
 
     /// Inspect an explicitly supplied offline copy/snapshot. Unlike the
@@ -1158,6 +1198,51 @@ pub const SCHEMA_PROFILE_MISMATCH_CODE: &str = "FCDB_SCHEMA_PROFILE_MISMATCH";
 /// whose pre-migration backup could not be promoted to a trusted restorable
 /// artifact because the schema/ledger was not an exact compiled state.
 pub const SCHEMA_REJECTION_AFTER_OPEN_CODE: &str = "FCDB_SCHEMA_REJECTED_AFTER_OPEN";
+/// Shared `prerelease_backup_reason` token for a ledger that is newer than
+/// this binary. Only this exact schema-shape failure may be swallowed after
+/// quarantine so `verify_ledger` can still surface the future-schema refusal.
+/// Physical backup failures (`quick_check`, foreign keys) must not use it.
+pub const FUTURE_PRERELEASE_SCHEMA_REASON: &str = "rejecting a future prerelease schema";
+pub const AMENDED_PRERELEASE_V1_REASON: &str = "rejecting an amended prerelease v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrereleaseBackupReason {
+    Unledgered,
+    LegacyLedger,
+    FutureSchema,
+    PendingMigration,
+    ProfileMismatch,
+    AmendedV1,
+    FingerprintDrift,
+    UserVersionDrift,
+    Unproven,
+}
+
+impl PrereleaseBackupReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unledgered => "rejecting an unledgered prerelease database",
+            Self::LegacyLedger => "rejecting a legacy prerelease schema ledger",
+            Self::FutureSchema => FUTURE_PRERELEASE_SCHEMA_REASON,
+            Self::PendingMigration => "applying a pending migration",
+            Self::ProfileMismatch => "rejecting a different database schema profile",
+            Self::AmendedV1 => AMENDED_PRERELEASE_V1_REASON,
+            Self::FingerprintDrift => "rejecting schema fingerprint drift",
+            Self::UserVersionDrift => "rejecting SQLite user_version drift",
+            Self::Unproven => "rejecting an unproven or malformed prerelease schema ledger",
+        }
+    }
+
+    fn continue_open_after_untrusted_backup(self) -> bool {
+        matches!(self, Self::FutureSchema | Self::AmendedV1)
+    }
+}
+
+impl std::fmt::Display for PrereleaseBackupReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 fn schema_profile_mismatch(database_profile: &str) -> anyhow::Error {
     anyhow::anyhow!(
@@ -1194,12 +1279,7 @@ fn backup_before_pending_migration(
     let backup_reason = match prerelease_backup_reason(conn, migration_count) {
         Ok(reason) => reason,
         Err(assessment_error) => {
-            create_migration_backup(
-                conn,
-                path,
-                0,
-                "rejecting an unproven or malformed prerelease schema ledger",
-            )?;
+            create_migration_backup(conn, path, 0, PrereleaseBackupReason::Unproven)?;
             return Err(assessment_error).context(
                 "database schema could not be proven compatible; a durable backup artifact was preserved before rejection",
             );
@@ -1215,7 +1295,7 @@ fn create_migration_backup(
     conn: &Connection,
     path: &Path,
     schema_version: i64,
-    reason: &str,
+    reason: PrereleaseBackupReason,
 ) -> Result<()> {
     create_migration_backup_with_limit(
         conn,
@@ -1230,7 +1310,7 @@ fn create_migration_backup_with_limit(
     conn: &Connection,
     path: &Path,
     schema_version: i64,
-    reason: &str,
+    reason: PrereleaseBackupReason,
     quarantine_byte_limit: u64,
 ) -> Result<()> {
     // Serialize the complete artifact lifecycle across processes, including
@@ -1337,6 +1417,15 @@ fn create_migration_backup_with_limit(
             remove_backup_candidate(&displaced)?;
         }
         prune_untrusted_migration_backups(path)?;
+        // A future ledger cannot be a trusted compiled-schema backup. The
+        // quarantine is the recovery artifact; the open path still has to
+        // prove incompatibility through `verify_ledger` so the user sees
+        // the schema refusal, not only the backup-trust failure.
+        if reason.continue_open_after_untrusted_backup()
+            && !migration_backup_error_is_physical_corruption(&error)
+        {
+            return Ok(());
+        }
         return Err(error);
     }
     let displaced = handle_invalid_quarantine_occupant(path, &untrusted)?;
@@ -2593,24 +2682,21 @@ impl Drop for BackupCandidateGuard {
 fn prerelease_backup_reason(
     conn: &Connection,
     migration_count: usize,
-) -> Result<Option<(i64, &'static str)>> {
+) -> Result<Option<(i64, PrereleaseBackupReason)>> {
     if !table_exists(conn, "schema_version")? {
-        return Ok(Some((0, "rejecting an unledgered prerelease database")));
+        return Ok(Some((0, PrereleaseBackupReason::Unledgered)));
     }
     let columns = table_columns(conn, "schema_version")?;
     if !columns.iter().any(|column| column == "schema_fingerprint") {
         let version = legacy_schema_version(conn)?;
-        return Ok(Some((
-            version,
-            "rejecting a legacy prerelease schema ledger",
-        )));
+        return Ok(Some((version, PrereleaseBackupReason::LegacyLedger)));
     }
     let version = current_schema_version(conn)?;
     if version > migration_count as i64 {
-        return Ok(Some((version, "rejecting a future prerelease schema")));
+        return Ok(Some((version, PrereleaseBackupReason::FutureSchema)));
     }
     if version < migration_count as i64 {
-        return Ok(Some((version, "applying a pending migration")));
+        return Ok(Some((version, PrereleaseBackupReason::PendingMigration)));
     }
     let profile: String = conn
         .query_row(
@@ -2620,10 +2706,7 @@ fn prerelease_backup_reason(
         )
         .context("reading prerelease schema profile")?;
     if profile != SCHEMA_PROFILE {
-        return Ok(Some((
-            version,
-            "rejecting a different database schema profile",
-        )));
+        return Ok(Some((version, PrereleaseBackupReason::ProfileMismatch)));
     }
     if version == 1 {
         let recorded: String = conn
@@ -2634,7 +2717,7 @@ fn prerelease_backup_reason(
             )
             .context("reading prerelease v1 migration checksum")?;
         if recorded != migration_definition_hash(&MIGRATIONS[0]) {
-            return Ok(Some((version, "rejecting an amended prerelease v1")));
+            return Ok(Some((version, PrereleaseBackupReason::AmendedV1)));
         }
     }
     let recorded_fingerprint: String = conn
@@ -2645,12 +2728,17 @@ fn prerelease_backup_reason(
         )
         .context("reading prerelease schema fingerprint")?;
     if recorded_fingerprint != exact_ddl_fingerprint(conn)? {
-        return Ok(Some((version, "rejecting schema fingerprint drift")));
+        return Ok(Some((version, PrereleaseBackupReason::FingerprintDrift)));
     }
     if sqlite_schema_version(conn)? != version {
-        return Ok(Some((version, "rejecting SQLite user_version drift")));
+        return Ok(Some((version, PrereleaseBackupReason::UserVersionDrift)));
     }
     Ok(None)
+}
+
+fn migration_backup_error_is_physical_corruption(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("failed SQLite quick_check") || text.contains("foreign keys")
 }
 
 fn validate_migration_backup(path: &Path, expected_schema_version: i64) -> Result<()> {
@@ -3652,7 +3740,13 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         migrate_with(&conn, MIGRATIONS).unwrap();
 
-        create_migration_backup(&conn, &path, EXPECTED_SCHEMA_VERSION, "test promotion").unwrap();
+        create_migration_backup(
+            &conn,
+            &path,
+            EXPECTED_SCHEMA_VERSION,
+            PrereleaseBackupReason::PendingMigration,
+        )
+        .unwrap();
 
         let names = std::fs::read_dir(temp.path())
             .unwrap()
@@ -4267,8 +4361,14 @@ mod tests {
         )
         .unwrap();
 
-        let error =
-            create_migration_backup_with_limit(&conn, &path, 1, "test limit", 1).unwrap_err();
+        let error = create_migration_backup_with_limit(
+            &conn,
+            &path,
+            1,
+            PrereleaseBackupReason::Unproven,
+            1,
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("no recovery artifact was created"));
         assert!(
             !std::fs::read_dir(temp.path())

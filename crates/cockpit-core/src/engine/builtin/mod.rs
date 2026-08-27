@@ -2118,7 +2118,8 @@ fn compose_reposture_system(
 ) -> String {
     let snapshot = session.model_system_prompt_snapshot();
     let role = assistant_role_prompt(role, assistant_identity_prefix);
-    let role_system = compose_system_prompt(&role, &session.short_id, cwd);
+    let short_id = session.short_id();
+    let role_system = compose_system_prompt(&role, &short_id, cwd);
     match snapshot.get(model.provider_id(), model.model_id_ref()) {
         Some(model_prompt) => {
             let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());

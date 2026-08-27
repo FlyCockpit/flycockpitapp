@@ -2043,7 +2043,7 @@ impl Session {
         let data = serde_json::json!({
             "kind": "compaction",
             "predecessor_session_id": self.id.to_string(),
-            "predecessor_short_id": self.short_id,
+            "predecessor_short_id": self.short_id(),
             "successor_session_id": record.successor_session_id.to_string(),
             "successor_short_id": record.successor_short_id,
             "seed_tool_count": record.seed_tool_count,
@@ -2068,7 +2068,7 @@ impl Session {
             let trimmed = serde_json::json!({
                 "kind": "compaction",
                 "predecessor_session_id": self.id.to_string(),
-                "predecessor_short_id": self.short_id,
+                "predecessor_short_id": self.short_id(),
                 "successor_session_id": record.successor_session_id.to_string(),
                 "successor_short_id": record.successor_short_id,
                 "seed_tool_count": record.seed_tool_count,

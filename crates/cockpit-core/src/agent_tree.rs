@@ -6531,7 +6531,7 @@ impl AgentTreeLifecycle {
         let offered = offered.context("host approval cancellation has no offered question set")?;
         ensure!(
             crate::approval::host_approval_response_declines(&response, &offered),
-            "host approval cancellation response is not cancel or an exact offered deny option"
+            "host approval cancellation response is not cancel, an exact offered deny option, or the structured noninteractive denial"
         );
         // Parsing then re-serializing the typed response normalizes the
         // durable continuation payload. The response shape is still the exact

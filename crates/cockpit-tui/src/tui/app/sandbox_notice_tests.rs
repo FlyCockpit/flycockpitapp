@@ -282,3 +282,75 @@ fn sandbox_down_notice_survives_off_transition_when_platform_has_no_backend() {
     );
     assert!(app.sandbox_down_notice.is_none());
 }
+
+#[test]
+fn sandbox_escalation_state_toasts_only_on_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    let initial = app.sandbox_escalation_enabled;
+
+    app.apply_event(TurnEvent::SandboxEscalationState { enabled: initial });
+    assert!(
+        app.toast.is_none(),
+        "attach replay of the current escalation policy must not toast"
+    );
+
+    app.apply_event(TurnEvent::SandboxEscalationState { enabled: !initial });
+    assert_eq!(app.sandbox_escalation_enabled, !initial);
+    let toast = app.toast.as_ref().expect("a real policy change must toast");
+    assert!(
+        toast.text.contains("sandbox escalation"),
+        "unexpected toast text: {}",
+        toast.text
+    );
+
+    app.toast = None;
+    app.apply_event(TurnEvent::SandboxEscalationState { enabled: !initial });
+    assert!(
+        app.toast.is_none(),
+        "repeating the already-applied policy must stay silent"
+    );
+}
+
+#[test]
+fn sandbox_state_attach_hydration_does_not_toast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    assert!(
+        app.sandbox_mode.enabled(),
+        "constructor --sandbox default is on"
+    );
+
+    app.apply_event(TurnEvent::SandboxState {
+        mode: cockpit_proto::SandboxMode::Off,
+        container_network_enabled: false,
+        container_availability: cockpit_core::container::availability_snapshot(),
+        persisted_intent: Some(cockpit_proto::SandboxMode::Off),
+    });
+    assert_eq!(app.sandbox_mode, cockpit_proto::SandboxMode::Off);
+    assert!(
+        app.toast.is_none(),
+        "first SandboxState is attach hydration and must not toast"
+    );
+
+    app.apply_event(TurnEvent::SandboxState {
+        mode: cockpit_proto::SandboxMode::Sandbox,
+        container_network_enabled: false,
+        container_availability: cockpit_core::container::availability_snapshot(),
+        persisted_intent: Some(cockpit_proto::SandboxMode::Sandbox),
+    });
+    let toast = app.toast.as_ref().expect("a later mode change must toast");
+    assert_eq!(toast.text, "sandbox on");
+
+    app.toast = None;
+    app.apply_event(TurnEvent::SandboxState {
+        mode: cockpit_proto::SandboxMode::Sandbox,
+        container_network_enabled: false,
+        container_availability: cockpit_core::container::availability_snapshot(),
+        persisted_intent: Some(cockpit_proto::SandboxMode::Sandbox),
+    });
+    assert!(
+        app.toast.is_none(),
+        "repeating the already-applied sandbox mode must stay silent"
+    );
+}

@@ -477,11 +477,36 @@ pub async fn collect_shared_host_probes(
 ) -> SharedHostProbes {
     let keyring = match &inputs.keyring {
         KeyringProbeSource::Production => {
-            if refresh_keyring {
-                probe_platform_keyring_refresh()
-            } else {
-                probe_platform_keyring()
-            }
+            // zbus Store::new builds a nested Tokio runtime. Never probe on a
+            // worker that is already inside `block_on` (daemon boot / refresh).
+            let refresh = refresh_keyring;
+            std::thread::Builder::new()
+                .name("cockpit-keyring-probe".into())
+                .spawn(move || {
+                    if refresh {
+                        probe_platform_keyring_refresh()
+                    } else {
+                        probe_platform_keyring()
+                    }
+                })
+                .and_then(|handle| {
+                    handle.join().map_err(|_| {
+                        std::io::Error::other("platform keyring probe thread panicked")
+                    })
+                })
+                .unwrap_or_else(|error| {
+                    let panicked = error.to_string().contains("panicked");
+                    KeyringProbeResult {
+                        state: FeatureCapabilityState::Failed,
+                        reason: format!("platform keyring probe failed: {error}"),
+                        fix_command: None,
+                        remedy_text: Some(if panicked {
+                            "The OS keyring probe panicked while a Tokio runtime was active.".into()
+                        } else {
+                            format!("The OS keyring probe could not be started: {error}")
+                        }),
+                    }
+                })
         }
         KeyringProbeSource::Injected { result, calls } => {
             calls.fetch_add(1, Ordering::SeqCst);

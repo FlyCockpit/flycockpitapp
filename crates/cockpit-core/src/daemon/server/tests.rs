@@ -6231,8 +6231,8 @@ async fn assistant_rpc_creates_session_via_registry() {
             .get_session(session.session_id)
             .await
             .unwrap()
-            .is_none(),
-        "created assistant session is deferred until first user message"
+            .is_some(),
+        "created assistant session is durable once the worker starts"
     );
 }
 
@@ -22690,8 +22690,8 @@ async fn assert_create_assistant_session_happy() {
             .get_session(session.session_id)
             .await
             .unwrap()
-            .is_none(),
-        "assistant session remains deferred until first user message"
+            .is_some(),
+        "assistant session is durable once the worker starts"
     );
 }
 

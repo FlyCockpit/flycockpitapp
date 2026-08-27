@@ -6,8 +6,10 @@
 //! - **Default:** attach to a long-running daemon if one is up;
 //!   otherwise spawn an ephemeral daemon that exits when the run
 //!   completes.
-//! - **`--ephemeral`:** always spawn a fresh daemon for this run. The
-//!   daemon ends when the run does.
+//! - **`--ephemeral`:** spawn a private daemon that exits when the run
+//!   completes, unless a persistent daemon already holds the exclusive
+//!   ledger lock — then this run attaches to that owner and leaves it
+//!   running.
 //!
 //! Behavior:
 //!
@@ -90,7 +92,9 @@ async fn enforce_noninteractive_workspace_trust_via_daemon(
     let trust_root = crate::config::trust::resolve_trust_root(cwd)?;
     let project_root = trust_root.root.display().to_string();
     let response = client
-        .request(crate::daemon::proto::Request::GetWorkspaceTrust { project_root })
+        .request(crate::daemon::proto::Request::GetWorkspaceTrust {
+            project_root: project_root.clone(),
+        })
         .await
         .context("requesting workspace trust from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected workspace trust request: {error}"))?;
@@ -98,11 +102,32 @@ async fn enforce_noninteractive_workspace_trust_via_daemon(
         crate::daemon::proto::Response::WorkspaceTrust {
             mode: Some(mode), ..
         } => mode,
-        crate::daemon::proto::Response::WorkspaceTrust { mode: None, .. } => {
-            bail!(
-                "workspace trust is not set for {}; run `cockpit trust set` first",
-                trust_root.root.display()
-            )
+        crate::daemon::proto::Response::WorkspaceTrust {
+            mode: None,
+            config_generation,
+        } => {
+            let set = client
+                .request(crate::daemon::proto::Request::SetWorkspaceTrust {
+                    project_root,
+                    mode: crate::daemon::proto::WorkspaceTrustMode::IgnoreConfig,
+                    expected_config_generation: config_generation,
+                })
+                .await
+                .context("seeding default workspace trust on the owned daemon")?
+                .map_err(|error| {
+                    anyhow::anyhow!("daemon rejected workspace trust persist: {error}")
+                })?;
+            if !matches!(
+                set,
+                crate::daemon::proto::Response::WorkspaceTrustSet { .. }
+            ) {
+                bail!("daemon returned unexpected workspace trust persist response: {set:?}");
+            }
+            crate::config::trust::set_runtime_policy(
+                trust_root,
+                crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            );
+            return Ok(());
         }
         other => bail!("daemon returned unexpected response to workspace trust: {other:?}"),
     };
@@ -417,6 +442,7 @@ pub(crate) async fn attach_send_pump(
         Some(root) => root.to_path_buf(),
         None => std::env::current_dir().context("resolving cwd")?,
     };
+    enforce_noninteractive_workspace_trust_via_daemon(client, &cwd).await?;
     let project_root = cwd.to_string_lossy().into_owned();
     let requested_session = options.session;
     let model_override = parse_model_override(options.model_override, requested_session.is_some())?;

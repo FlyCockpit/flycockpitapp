@@ -888,7 +888,7 @@ pub(super) fn build_resume_repair_state(
     let (provider, model, wire_api) = active_wire_api_for_session(session, providers);
     proto::ResumeRepairState {
         session_id: session.id,
-        short_id: session.short_id.clone(),
+        short_id: session.short_id(),
         provider,
         model,
         wire_api: wire_api_label(wire_api).to_string(),
@@ -1533,7 +1533,7 @@ impl SessionWorkerHandle {
     /// The session's 6-char display id — read from the in-memory session so
     /// it is available before the `sessions` row is persisted.
     pub fn short_id(&self) -> String {
-        self.session.short_id.clone()
+        self.session.short_id()
     }
 
     /// The session's complete active selection. This is the daemon-owned

@@ -6686,7 +6686,7 @@ mod tests {
             "Build",
             crate::session::SessionCompactionRecord {
                 successor_session_id: s.id,
-                successor_short_id: &s.short_id,
+                successor_short_id: &s.short_id(),
                 seed_tool_count: 2,
                 brief_text: &handoff,
                 handoff_text: &handoff,
@@ -6793,7 +6793,7 @@ mod tests {
                 "Build",
                 crate::session::SessionCompactionRecord {
                     successor_session_id: s.id,
-                    successor_short_id: &s.short_id,
+                    successor_short_id: &s.short_id(),
                     seed_tool_count: 0,
                     brief_text: "brief",
                     handoff_text: "full handoff",
@@ -6844,7 +6844,7 @@ mod tests {
             "Build",
             crate::session::SessionCompactionRecord {
                 successor_session_id: s.id,
-                successor_short_id: &s.short_id,
+                successor_short_id: &s.short_id(),
                 seed_tool_count: 0,
                 brief_text: "brief",
                 handoff_text: "exact handoff",

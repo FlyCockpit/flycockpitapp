@@ -430,7 +430,7 @@ impl DecisionState {
         }
     }
 
-    fn is_terminal(self) -> bool {
+    pub fn is_terminal(self) -> bool {
         matches!(
             self,
             Self::Answered | Self::AutoResolved | Self::TimedOut | Self::Cancelled

@@ -107,7 +107,7 @@ fn assert_launch_graph(launcher: &HermeticCockpit, profile: HermeticProfile) {
         assert_eq!(path.cwd, spec.project());
         match (profile, path.kind) {
             (HermeticProfile::RemoteOsc52, HermeticLaunchKind::PtyChild) => {
-                assert_eq!(path.env.len(), 10, "{path:?}");
+                assert_eq!(path.env.len(), 11, "{path:?}");
                 assert_eq!(
                     path.env_value("SSH_CONNECTION"),
                     Some(REMOTE_OSC52_SSH_CONNECTION)
@@ -116,7 +116,7 @@ fn assert_launch_graph(launcher: &HermeticCockpit, profile: HermeticProfile) {
             (_, HermeticLaunchKind::DaemonStart) => {
                 // The detached daemon has an explicit startup-log policy;
                 // this is fixture-owned input, not inherited environment.
-                assert_eq!(path.env.len(), 10, "{path:?}");
+                assert_eq!(path.env.len(), 11, "{path:?}");
                 assert_eq!(
                     path.env_value("COCKPIT_LOG"),
                     Some("warn,cockpit::startup=info"),
@@ -124,7 +124,7 @@ fn assert_launch_graph(launcher: &HermeticCockpit, profile: HermeticProfile) {
                 );
             }
             _ => {
-                assert_eq!(path.env.len(), 9, "{path:?}");
+                assert_eq!(path.env.len(), 10, "{path:?}");
                 assert!(
                     path.env_value("SSH_CONNECTION").is_none(),
                     "SSH_CONNECTION must stay off non-PTY and default-PTY paths: {path:?}"
@@ -184,6 +184,10 @@ fn assert_allowlisted_env(
     assert_eq!(map.get("TERM").copied(), Some(HERMETIC_TERM));
     assert_eq!(map.get("LANG").copied(), Some(HERMETIC_LOCALE));
     assert_eq!(map.get("LC_ALL").copied(), Some(HERMETIC_LOCALE));
+    assert_eq!(
+        map.get("PATH").copied(),
+        Some(crate::support::HERMETIC_PATH)
+    );
 }
 
 fn sorted_pairs(env: &[(String, String)]) -> Vec<(String, String)> {

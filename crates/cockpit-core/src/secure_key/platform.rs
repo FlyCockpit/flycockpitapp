@@ -226,24 +226,21 @@ fn run_keyring_construct(
     // Refresh can run after the secure-key actor has registered the live
     // process-global store. Capture it first, then restore so a dry probe
     // never leaves the actor pointing at an unset or probe-owned default.
+    // Linux `Store::new` runs on `cockpit-keyring-construct` and registers an
+    // Arc-backed process-global store, then that helper thread exits. That is
+    // fine: keyring-core owns the Store, and later I/O uses `cockpit-keyring-io`
+    // via `Entry` against this default. Unsetting after a successful first-run
+    // probe leaves `KeyringKekStore` with no default and hard-fails boot.
+    //
+    // Refresh can run after the actor already registered a live store. Capture
+    // it first so a dry probe never steals that default. A failed construct
+    // with no prior store must not leave a half-registered default.
     let previous = keyring_core::get_default_store();
     let outcome = construct();
-    match &outcome {
-        Ok(()) => {
-            // Keep a successful first construct registered so later KEK use
-            // does not construct the platform store a second time. Restore a
-            // previously registered actor store if one existed.
-            if let Some(previous) = previous {
-                keyring_core::set_default_store(previous);
-            }
-        }
-        Err(_) => {
-            if let Some(previous) = previous {
-                keyring_core::set_default_store(previous);
-            } else {
-                unset_default_platform_store();
-            }
-        }
+    if let Some(previous) = previous {
+        keyring_core::set_default_store(previous);
+    } else if outcome.is_err() {
+        unset_default_platform_store();
     }
     match outcome {
         Ok(()) => KeyringProbeResult {
@@ -277,6 +274,15 @@ fn classify_keyring_error(error: &SecureKeyError) -> KeyringProbeResult {
                     .into(),
             ),
         ),
+        SecureKeyError::Unavailable(message)
+            if message.contains("keyring construct thread") =>
+        {
+            (
+                FeatureCapabilityState::Failed,
+                None,
+                Some(keyring_missing_remedy_text()),
+            )
+        }
         SecureKeyError::Unavailable(_) | SecureKeyError::NotFound(_) => (
             FeatureCapabilityState::Missing,
             None,

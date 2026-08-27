@@ -16,7 +16,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use cockpit_config::config::media_budget::MediaResourceLimits;
 use cockpit_core::image_sidecar::{
-    ApprovalMode, GrantScope, InvocationDisposition, InvocationState, MediaClass, Purpose,
+    ApprovalMode, GrantScope, InvocationDisposition, InvocationState,
     SidecarInvocationCapProvenance, SidecarProviderModel, SidecarSelectionConfig,
 };
 
@@ -548,6 +548,30 @@ impl Default for SidecarFormState {
 }
 
 impl SidecarFormState {
+    pub(crate) fn from_authoritative_config(config: &SidecarSelectionConfig) -> Self {
+        let as_ref = |candidate: &SidecarProviderModel| SidecarModelRef {
+            provider: candidate.provider.clone(),
+            model: candidate.model.clone(),
+        };
+        Self {
+            mode: match config.mode {
+                cockpit_config::config::image_sidecar::SidecarMode::Automatic => {
+                    SidecarModeChoice::Automatic
+                }
+                cockpit_config::config::image_sidecar::SidecarMode::Always => {
+                    SidecarModeChoice::Always
+                }
+                cockpit_config::config::image_sidecar::SidecarMode::Never => {
+                    SidecarModeChoice::Never
+                }
+            },
+            trusted_default: config.trusted_primary_default.as_ref().map(as_ref),
+            untrusted_default: config.untrusted_primary_default.as_ref().map(as_ref),
+            override_pair: config.per_primary_override.as_ref().map(as_ref),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn to_selection_config(&self) -> SidecarSelectionConfig {
         let to_pair = |r: &SidecarModelRef| SidecarProviderModel {
             provider: r.provider.clone(),
@@ -758,18 +782,6 @@ impl SidecarReducer {
     ) {
         *self = Self::new(daemon_instance, project_id, session_id, selection_id, 0);
     }
-
-    pub(crate) fn revoke_grant(&mut self, grant_id: &str, expected_version: u64) -> bool {
-        if let Some(grant) = self.grants.iter_mut().find(|g| g.grant_id == grant_id)
-            && grant.version == expected_version
-            && !grant.revoked
-        {
-            grant.revoked = true;
-            grant.version = grant.version.saturating_add(1);
-            return true;
-        }
-        false
-    }
 }
 
 fn is_terminal(state: InvocationState) -> bool {
@@ -917,10 +929,15 @@ pub(super) struct SidecarSession {
     pub error: Option<String>,
     pub conflict: Option<String>,
     pub save_pending: bool,
+    /// Opaque revision consumed by the queued config mutation. Completion
+    /// accepts only a different daemon-issued revision; a stale or failed
+    /// request never clears the local authority fence.
+    pub save_base_revision: Option<String>,
     pub health_refresh_pending: bool,
     pub remediation: Option<SidecarRemediation>,
-    /// Test seams can exercise reducer transitions, but production remains
-    /// fail-closed until the daemon exposes authoritative sidecar mutations.
+    /// The daemon-issued settings snapshot enables only the config CAS path.
+    /// Runtime health, grants, and accounting remain fail-closed until their
+    /// own daemon-owned projections exist.
     pub authoritative_mutations: bool,
     pub authoritative_snapshot: bool,
 }
@@ -953,11 +970,30 @@ impl SidecarSession {
             error: None,
             conflict: None,
             save_pending: false,
+            save_base_revision: None,
             health_refresh_pending: false,
             remediation: None,
             authoritative_mutations: false,
             authoritative_snapshot: false,
         }
+    }
+
+    fn with_authoritative_config(
+        principal: SidecarPrincipal,
+        config: &SidecarSelectionConfig,
+        central_cap: u64,
+        snapshot_available: bool,
+    ) -> Self {
+        let mut session = Self::new(principal);
+        session.form = SidecarFormState::from_authoritative_config(config);
+        session.form.central_cap = central_cap;
+        session.policy.value = central_cap;
+        // The settings snapshot is an opaque daemon-issued capability.  A
+        // local owner cannot mutate until it exists; no client-side config
+        // read is used as a fallback.
+        session.authoritative_snapshot = snapshot_available;
+        session.authoritative_mutations = snapshot_available && session.principal.can_mutate();
+        session
     }
 
     pub(crate) fn first_use(&self) -> FirstUseView {
@@ -1043,8 +1079,26 @@ impl SidecarSession {
         self.conflict = None;
         self.busy = false;
         self.save_pending = false;
+        self.save_base_revision = None;
         self.health_refresh_pending = false;
         self.remediation = None;
+    }
+
+    fn complete_config_save(&mut self, revision: Option<&str>) {
+        let Some(expected) = self.save_base_revision.as_deref() else {
+            return;
+        };
+        let Some(revision) = revision else {
+            return;
+        };
+        if revision == expected {
+            return;
+        }
+        self.save_pending = false;
+        self.save_base_revision = None;
+        self.busy = false;
+        self.policy.value = self.form.central_cap;
+        self.policy.source = SidecarInvocationCapProvenance::Configured;
     }
 
     /// Returns the exact destination that a local grant construction may use.
@@ -1093,10 +1147,28 @@ fn boxed(page: SidecarPage) -> PageBox {
     Box::new(page)
 }
 
+#[cfg(test)]
 pub(super) fn sidecar_overview_page(principal: SidecarPrincipal) -> PageBox {
     boxed(SidecarPage {
         kind: SidecarPageKind::Overview,
         session: SidecarSession::new(principal),
+    })
+}
+
+pub(super) fn sidecar_overview_page_from_snapshot(
+    principal: SidecarPrincipal,
+    config: &SidecarSelectionConfig,
+    central_cap: u64,
+    snapshot_available: bool,
+) -> PageBox {
+    boxed(SidecarPage {
+        kind: SidecarPageKind::Overview,
+        session: SidecarSession::with_authoritative_config(
+            principal,
+            config,
+            central_cap,
+            snapshot_available,
+        ),
     })
 }
 
@@ -1940,7 +2012,7 @@ impl SettingsPage for SidecarPage {
 
     fn handle_pointer_control(
         &mut self,
-        _cx: &mut SettingsCx,
+        cx: &mut SettingsCx,
         action: SettingsPointerAction,
     ) -> Nav {
         let SettingsPointerAction::Sidecar(action) = action else {
@@ -2044,20 +2116,42 @@ impl SettingsPage for SidecarPage {
                     && self.session.principal.can_mutate()
                     && !self.session.save_pending
                 {
-                    self.session.policy.value = self.session.form.central_cap;
-                    self.session.policy.source = SidecarInvocationCapProvenance::Configured;
-                    self.session.save_pending = false;
+                    let selection = self.session.form.to_selection_config();
+                    let mut limits = cx.extended.media_resources.limits().clone();
+                    limits.sidecar_invocations_per_session = self.session.form.central_cap;
+                    let policy =
+                        match cockpit_config::config::media_budget::MediaResourcePolicy::new(
+                            cx.extended.media_resources.version(),
+                            limits,
+                            cx.extended.media_resources.profiles().clone(),
+                        ) {
+                            Ok(policy) => policy,
+                            Err(_) => {
+                                self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                                return Nav::Stay;
+                            }
+                        };
+                    cx.extended.image_sidecar = selection;
+                    cx.extended.media_resources = Box::new(policy);
+                    match cx.save_extended() {
+                        Ok(_) => {
+                            self.session.save_pending = true;
+                            self.session.save_base_revision = cx.extended_revision.clone();
+                            self.session.busy = true;
+                            self.session.error = None;
+                        }
+                        Err(error) => self.session.error = Some(error),
+                    }
                 } else {
                     self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
                 }
                 Nav::Stay
             }
             SidecarAction::RefreshHealth => {
-                if self.session.authoritative_mutations {
-                    self.session.health_refresh_pending = true;
-                } else {
-                    self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
-                }
+                // Capability freshness is daemon/provider evidence, not a
+                // local reducer transition. Until the daemon exposes that
+                // projection, do not acknowledge a refresh that never ran.
+                self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
                 Nav::Stay
             }
             SidecarAction::SelectGrantScope(scope) => {
@@ -2065,39 +2159,13 @@ impl SettingsPage for SidecarPage {
                 Nav::Stay
             }
             SidecarAction::CreateGrant => {
-                let destination = match self.session.grant_creation_destination() {
-                    Ok(destination) => destination,
-                    Err(REASON_DESTINATION_DENIED) => {
-                        self.session.remediation = Some(SidecarRemediation::DestinationDenied);
-                        return Nav::Stay;
-                    }
-                    Err(_) => {
-                        self.session.remediation = Some(SidecarRemediation::MissingSelection);
-                        return Nav::Stay;
-                    }
-                };
+                // The policy module currently has no daemon-owned grant
+                // ledger.  Do not manufacture a process-local grant that the
+                // sidecar pipeline cannot consult.
                 if self.kind == SidecarPageKind::GrantList {
                     return self.push_kind(SidecarPageKind::GrantEditor);
                 }
-                let grant = GrantView {
-                    grant_id: format!("grant-{}", self.session.reducer.grants.len() + 1),
-                    version: 1,
-                    project: self.session.reducer.project_id.clone(),
-                    destination,
-                    media_class: MediaClass::Image.as_str().into(),
-                    purpose: Purpose::AskImage.as_str().into(),
-                    scope: self.session.form.draft_scope,
-                    session_binding: (self.session.form.draft_scope == GrantScope::Session)
-                        .then(|| self.session.reducer.session_id.clone()),
-                    invocation_binding: (self.session.form.draft_scope == GrantScope::Once)
-                        .then(|| self.session.selected_invocation.clone())
-                        .flatten(),
-                    created_at: "0".into(),
-                    last_used_at: None,
-                    revoked: false,
-                    consumed: false,
-                };
-                self.session.reducer.grants.push(grant);
+                self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
                 Nav::Stay
             }
             SidecarAction::RevokeGrant(id) => {
@@ -2147,13 +2215,7 @@ impl SettingsPage for SidecarPage {
                     self.normalize_cursor();
                     return Nav::Stay;
                 }
-                if !self
-                    .session
-                    .reducer
-                    .revoke_grant(&pending.grant_id, pending.version)
-                {
-                    self.session.error = Some(REASON_REVOKE_CONFIRMATION_STALE.into());
-                }
+                self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
                 self.normalize_cursor();
                 Nav::Stay
             }
@@ -2254,5 +2316,12 @@ impl SettingsPage for SidecarPage {
     #[cfg(test)]
     fn test_name(&self) -> &'static str {
         self.kind.title()
+    }
+}
+
+impl SidecarPage {
+    pub(super) fn apply_authoritative_settings_completion(&mut self, cx: &SettingsCx) {
+        self.session
+            .complete_config_save(cx.extended_revision.as_deref());
     }
 }

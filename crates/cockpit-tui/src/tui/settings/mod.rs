@@ -6023,6 +6023,9 @@ impl SettingsDialog {
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
             Ok(()) => {
+                if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
+                    page.apply_authoritative_settings_completion(&self.cx);
+                }
                 if let Some((navigation, config)) = self.cx.completed_provider_navigation.take() {
                     let requested_provider_id = match &navigation {
                         ProviderNavigation::Edit { provider_id, .. }
@@ -7581,10 +7584,16 @@ impl SettingsPage for RootPage {
                             &cx.image_generation_session_snapshot(),
                         ),
                     )),
-                    "Image Sidecar" => Some(image_sidecar::sidecar_overview_page(
+                    "Image Sidecar" => Some(image_sidecar::sidecar_overview_page_from_snapshot(
                         image_sidecar::SidecarPrincipal::from_session(
                             &cx.image_generation_session_snapshot(),
                         ),
+                        &cx.extended.image_sidecar,
+                        cx.extended
+                            .media_resources
+                            .limits()
+                            .sidecar_invocations_per_session,
+                        cx.extended_revision.is_some(),
                     )),
                     "Privacy & Safety" => {
                         cx.reload_extended();

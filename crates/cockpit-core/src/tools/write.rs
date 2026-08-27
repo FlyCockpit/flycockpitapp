@@ -197,8 +197,11 @@ impl Tool for WriteTool {
             &concrete_effects,
         )
         .await?;
-        let outcome = if exists {
-            write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?
+        let (outcome, created_directories) = if exists {
+            (
+                write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?,
+                None,
+            )
         } else {
             create_new_and_release(&path, normalized.as_bytes(), write_guard, create_new_file)
                 .await?
@@ -214,6 +217,10 @@ impl Tool for WriteTool {
             normalized.len(),
             if want_crlf { "CRLF" } else { "LF" }
         );
+        if let Some(created) = created_directories {
+            message.push('\n');
+            message.push_str(&created);
+        }
         if let Some(lsp) = &ctx.lsp {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
@@ -295,8 +302,11 @@ async fn create_new_and_release(
     bytes: &[u8],
     guard: crate::locks::WriteGuard<'_>,
     create_file: impl FnOnce(&std::path::Path, &[u8]) -> std::io::Result<()>,
-) -> Result<crate::tools::common::WriteReleaseOutcome> {
-    ensure_parent_dirs(path)?;
+) -> Result<(
+    crate::tools::common::WriteReleaseOutcome,
+    Option<String>,
+)> {
+    let created_directories = ensure_parent_dirs(path)?;
     create_file(path, bytes).map_err(|err| {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
             anyhow::anyhow!(
@@ -308,13 +318,41 @@ async fn create_new_and_release(
         }
     })?;
     let persist_ok = guard.release_after_write().await;
-    Ok(crate::tools::common::WriteReleaseOutcome { persist_ok })
+    Ok((
+        crate::tools::common::WriteReleaseOutcome { persist_ok },
+        created_directories,
+    ))
 }
 
-fn ensure_parent_dirs(path: &std::path::Path) -> Result<()> {
+/// Name the created portion below the nearest pre-existing ancestor as
+/// `created directories: <first-created>/…/<parent>`. A single created
+/// component omits the ellipsis.
+fn format_created_directories_line(created_relative: &std::path::Path) -> String {
+    let parts: Vec<&std::ffi::OsStr> = created_relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    match parts.as_slice() {
+        [] => "created directories: .".to_string(),
+        [one] => format!("created directories: {}", one.to_string_lossy()),
+        [first, .., last] => format!(
+            "created directories: {}/…/{}",
+            first.to_string_lossy(),
+            last.to_string_lossy()
+        ),
+    }
+}
+
+fn ensure_parent_dirs(path: &std::path::Path) -> Result<Option<String>> {
     let Some(parent) = path.parent() else {
-        return Ok(());
+        return Ok(None);
     };
+    if parent.as_os_str().is_empty() {
+        return Ok(None);
+    }
     if parent.exists() && !parent.is_dir() {
         bail!(
             "cannot create `{}` — parent `{}` is not a directory",
@@ -322,6 +360,23 @@ fn ensure_parent_dirs(path: &std::path::Path) -> Result<()> {
             parent.display()
         );
     }
+    if parent.is_dir() {
+        return Ok(None);
+    }
+    let (ancestor, _) = cockpit_host::path_containment::nearest_existing_ancestor(parent)
+        .with_context(|| {
+            format!(
+                "locate existing ancestor of parent `{}` for `{}`",
+                parent.display(),
+                path.display()
+            )
+        })?;
+    let created_relative = parent.strip_prefix(&ancestor).unwrap_or(parent);
+    let disclosure = if created_relative.as_os_str().is_empty() {
+        None
+    } else {
+        Some(format_created_directories_line(created_relative))
+    };
     std::fs::create_dir_all(parent).with_context(|| {
         format!(
             "create parent directories for `{}` under `{}`",
@@ -329,7 +384,7 @@ fn ensure_parent_dirs(path: &std::path::Path) -> Result<()> {
             parent.display()
         )
     })?;
-    Ok(())
+    Ok(disclosure)
 }
 
 fn create_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1017,6 +1072,128 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("nested/deep/file.txt")).unwrap(),
             "body"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_write_discloses_created_parent_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "nested/deep/file.txt", "content": "body"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("nested/deep/file.txt")).unwrap(),
+            "body"
+        );
+        assert!(
+            out.content.contains("created directories: nested/…/deep"),
+            "{}",
+            out.content
+        );
+        let wrote_idx = out.content.find("wrote `").expect("wrote line");
+        let created_idx = out
+            .content
+            .find("created directories:")
+            .expect("created-directories line");
+        assert!(wrote_idx < created_idx, "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn write_into_existing_directory_does_not_disclose_created_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("existing")).unwrap();
+
+        let existing_dir_out = WriteTool
+            .call(
+                serde_json::json!({"path": "existing/file.txt", "content": "body"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let cwd_out = WriteTool
+            .call(
+                serde_json::json!({"path": "plain.txt", "content": "body"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("existing/file.txt")).unwrap(),
+            "body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("plain.txt")).unwrap(),
+            "body"
+        );
+        assert!(
+            !existing_dir_out.content.contains("created directories:"),
+            "{}",
+            existing_dir_out.content
+        );
+        assert!(
+            !cwd_out.content.contains("created directories:"),
+            "{}",
+            cwd_out.content
+        );
+        assert!(
+            existing_dir_out.content.starts_with("wrote `"),
+            "{}",
+            existing_dir_out.content
+        );
+        assert!(
+            cwd_out.content.starts_with("wrote `"),
+            "{}",
+            cwd_out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn single_created_parent_directory_discloses_without_ellipsis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "nested/file.txt", "content": "body"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.content.contains("created directories: nested"),
+            "{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("/…/"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn created_directories_line_names_first_and_parent_components() {
+        assert_eq!(
+            format_created_directories_line(Path::new("nested")),
+            "created directories: nested"
+        );
+        assert_eq!(
+            format_created_directories_line(Path::new("nested/deep")),
+            "created directories: nested/…/deep"
+        );
+        assert_eq!(
+            format_created_directories_line(Path::new("a/b/c")),
+            "created directories: a/…/c"
         );
     }
 

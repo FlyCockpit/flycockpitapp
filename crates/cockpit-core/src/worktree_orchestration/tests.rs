@@ -188,6 +188,30 @@ async fn three_orthogonal_child_artifacts_apply_uncommitted() {
         )
         .await
         .unwrap();
+    for child in &children {
+        assert_eq!(
+            h.orch
+                .store()
+                .fanout_receipt(child.lease.workspace_lease_id)
+                .unwrap(),
+            child.base_receipt,
+            "artifact production must load the durable pre-fan-out receipt, not rebuild one after edits"
+        );
+        let branch =
+            git::run_git_checked(&child.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let expected = format!("cockpit-lease/{}", child.lease.workspace_lease_id);
+        assert_eq!(branch.trim(), expected);
+        assert_eq!(
+            child.lease.private_ref_digest,
+            WorkspaceDigest::of(expected),
+            "fan-out lease and on-disk worktree must share one private identity"
+        );
+        assert!(
+            WorkspaceLease::from_row(&child.lease)
+                .unwrap()
+                .identity_matches_disk()
+        );
+    }
     write_uncommitted(&children[0].path, "a.txt", "a1\n");
     write_uncommitted(&children[1].path, "b.txt", "b1\n");
     write_uncommitted(&children[2].path, "c.txt", "c1\n");
@@ -658,8 +682,7 @@ async fn conflict_specialist_cannot_read_primary_or_sibling() {
         )
         .await
         .unwrap();
-    let lease =
-        WorkspaceLease::from_row(&children[0].lease, WorktreeOrchestrator::coding_ops()).unwrap();
+    let lease = WorkspaceLease::from_row(&children[0].lease).unwrap();
     let specialist = h.orch.conflict_specialist_for(lease);
     let err = specialist
         .read_path(&h.repo.join("a.txt"))
@@ -793,7 +816,6 @@ fn managed_worktree_kind_is_required_for_fan_out_paths() {
     let id = Uuid::new_v4();
     let path = workspace_lease::managed_worktree_path(tmp.path(), id);
     std::fs::create_dir_all(&path).unwrap();
-    assert!(workspace_lease::is_managed_worktree_path(&path));
     let lease = WorkspaceLease::ephemeral(
         WorkspaceLeaseKind::ManagedWorktree,
         path.clone(),
@@ -802,4 +824,21 @@ fn managed_worktree_kind_is_required_for_fan_out_paths() {
     );
     assert!(lease.covers_path(&path.join("x")));
     assert!(!lease.covers_path(tmp.path().join("repo/x")));
+}
+
+#[test]
+fn newline_paths_use_nul_framed_artifact_manifests() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+    let unusual = "line\nbreak.rs";
+    std::fs::write(repo.join(unusual), "fn changed() {}\n").unwrap();
+
+    let patch = git::capture_uncommitted_patch(&repo).unwrap();
+    assert_eq!(patch.untracked_paths, vec![unusual.to_owned()]);
+    assert!(patch.touched_paths.contains(&unusual.to_owned()));
+
+    let digest =
+        crate::worktree_orchestration::receipt::live_manifest(&repo, &patch.touched_paths).unwrap();
+    assert_ne!(digest, WorkspaceDigest::of(b""));
 }

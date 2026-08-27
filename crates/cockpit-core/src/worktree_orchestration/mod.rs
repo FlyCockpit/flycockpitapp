@@ -18,12 +18,15 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-pub use artifact::{ArtifactStore, ParentVisibleArtifact, ProducedArtifact, produce_artifact};
+pub use artifact::{
+    ArtifactStore, ParentVisibleArtifact, ProducedArtifact, produce_artifact,
+    produce_artifact_from_patch,
+};
 pub use capability::{
     DirectEditSession, FanOutSpec, ManagedChildWorktree, OrchestrationAction,
     OrchestrationCapability, OrchestratorInit, WorktreeOrchestrator,
 };
-pub use conflict::{ConflictSpecialist, ConflictSpecialistVerdict};
+pub use conflict::{ConflictResolution, ConflictSpecialist, ConflictSpecialistVerdict};
 pub use integration::{
     IntegrationMode, IntegrationRequest, IntegrationResult, StaleReason, integrate_artifacts,
 };
@@ -33,5 +36,6 @@ pub use lifecycle::{
 pub use receipt::repository_id as receipt_repository_id;
 pub use receipt::{ArtifactPreconditions, WorkspaceReceipt, capture_workspace_receipt};
 pub use validation::{
-    CandidateValidation, ValidationEvidence, worker_must_not_invoke_cargo, wt_test_wrapper_path,
+    CandidateValidation, ValidationEvidence, evidence_digest, worker_must_not_invoke_cargo,
+    wt_test_wrapper_path,
 };

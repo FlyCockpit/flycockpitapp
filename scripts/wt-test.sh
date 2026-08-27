@@ -61,8 +61,32 @@ if [[ "${WT_TEST_LOCK_HELD:-}" == "1" ]]; then
 fi
 
 lockdir=$lock_root/wt-test.lock.dir
+deadline=$((SECONDS + ${WT_TEST_LOCK_TIMEOUT_SECONDS:-120}))
+nonce="$$-${RANDOM}-${RANDOM}"
 while ! mkdir "$lockdir" 2>/dev/null; do
+  owner=""
+  if [[ -r "$lockdir/owner" ]]; then
+    read -r owner _ < "$lockdir/owner" || true
+  fi
+  stale=0
+  if [[ -z "$owner" ]] || ! kill -0 "$owner" 2>/dev/null; then
+    stale=1
+  fi
+  if (( stale )); then
+    # Move the inspected name aside atomically before deletion. A competing
+    # waiter can create a successor only at $lockdir, never in this tombstone.
+    tombstone="${lockdir}.stale-$$-${RANDOM}"
+    if mv -- "$lockdir" "$tombstone" 2>/dev/null; then
+      rm -rf -- "$tombstone"
+    fi
+    continue
+  fi
+  if (( SECONDS >= deadline )); then
+    echo "wt-test.sh: timed out waiting for candidate-validation lock" >&2
+    exit 75
+  fi
   sleep 0.05
 done
-trap 'rmdir "$lockdir"' EXIT
+printf '%s %s\n' "$$" "$nonce" > "$lockdir/owner"
+trap 'if [[ -r "$lockdir/owner" ]] && read -r pid held_nonce < "$lockdir/owner" && [[ "$pid" == "$$" && "$held_nonce" == "$nonce" ]]; then rm -rf -- "$lockdir"; fi' EXIT
 "$cargo_bin" "$@"

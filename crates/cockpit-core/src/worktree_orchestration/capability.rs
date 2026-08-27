@@ -223,21 +223,58 @@ impl WorktreeOrchestrator {
                         canonical_repository_id: repo_id.clone(),
                         canonical_root: root,
                         kind: WorkspaceLeaseKind::ManagedWorktree,
+                        allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
                         base_sha_digest: base_receipt.head_digest.clone(),
                         base_ref_digest: base_receipt.ref_digest.clone(),
                         managed_path: path.to_string_lossy().into_owned(),
-                        private_ref_digest: WorkspaceDigest::of(lease_id.as_bytes()),
+                        private_ref_digest: WorkspaceDigest::of(format!(
+                            "cockpit-lease/{lease_id}"
+                        )),
                         expires_at_unix_ms: now_ms.saturating_add(24 * 60 * 60 * 1000),
                     },
                     now_ms,
                 )
                 .await
                 .context("creating managed worktree lease")?;
+            if let Err(error) = self
+                .store
+                .write_fanout_receipt(row.workspace_lease_id, &base_receipt)
+            {
+                let _ = self
+                    .db
+                    .mark_workspace_lease_uncertain(
+                        self.session_id,
+                        self.agent_instance_id,
+                        row.workspace_lease_id,
+                        row.revision,
+                        crate::db::workspace_lease_artifacts::WorkspaceLeaseTerminalReason::RestartUncertain,
+                        now_ms,
+                    )
+                    .await;
+                return Err(error).context("persisting managed-child pre-fan-out receipt");
+            }
             // Publish authority before the filesystem object. If checkout
             // fails or the host crashes, recovery sees a durable lease and
             // marks the missing path uncertain instead of stranding an
             // unowned linked worktree.
-            git::worktree_add_detached(&self.primary_repo, &path, &base)?;
+            // A managed tree has a private branch as part of its durable
+            // identity. Detached worktrees cannot satisfy recovery's
+            // identity proof and must never be issued here.
+            let branch = format!("cockpit-lease/{lease_id}");
+            if let Err(error) = git::worktree_add(&self.primary_repo, &path, &branch, &base) {
+                let _ = self
+                    .db
+                    .mark_workspace_lease_uncertain(
+                        self.session_id,
+                        self.agent_instance_id,
+                        row.workspace_lease_id,
+                        row.revision,
+                        crate::db::workspace_lease_artifacts::WorkspaceLeaseTerminalReason::RestartUncertain,
+                        now_ms,
+                    )
+                    .await;
+                return Err(error).context("creating managed child worktree");
+            }
             created.push(ManagedChildWorktree {
                 label: spec.label,
                 lease: row,
@@ -255,6 +292,7 @@ impl WorktreeOrchestrator {
         now_ms: i64,
         validation: WorkspaceDigest,
     ) -> Result<ProducedArtifact> {
+        let receipt = self.store.fanout_receipt(child.lease.workspace_lease_id)?;
         artifact::produce_artifact(
             &self.db,
             &self.store,
@@ -264,7 +302,7 @@ impl WorktreeOrchestrator {
             self.agent_instance_id,
             now_ms,
             validation,
-            Some(&child.base_receipt),
+            Some(&receipt),
         )
         .await
     }
@@ -356,11 +394,74 @@ impl WorktreeOrchestrator {
     }
 
     pub async fn recover(&self, now_ms: i64) -> Result<Vec<WorkspaceLeaseRow>> {
+        self.store
+            .reconcile_integration_journals(&self.db, self.session_id, now_ms)
+            .await?;
         lifecycle::recover_managed_worktrees(&self.db, self.session_id, now_ms).await
     }
 
     pub fn conflict_specialist_for(&self, lease: WorkspaceLease) -> ConflictSpecialist {
         ConflictSpecialist::bounded_by(lease)
+    }
+
+    /// Issue a short-lived, read-only integration lease for a conflict
+    /// specialist.  It is distinct from the parent's primary lease: the
+    /// specialist is handed only left/right patches and may return only its
+    /// verdict (and a replacement patch), never target-write authority.
+    pub async fn issue_conflict_specialist(&self, now_ms: i64) -> Result<ConflictSpecialist> {
+        let root = receipt::canonical_root(&self.primary_repo)?;
+        let scope_id = Uuid::new_v4();
+        self.db
+            .insert_write_scope_lease(WriteScopeLeaseRow {
+                lease_id: scope_id,
+                parent_lease_id: Some(self.write_scope_lease_id),
+                session_id: self.session_id,
+                task_id: None,
+                scope_path: root.clone(),
+                generation: 1,
+                state: "active".into(),
+                owner_id: self.agent_instance_id.to_string(),
+                version: 0,
+                created_at_wall_ms: now_ms,
+                updated_at_wall_ms: now_ms,
+                released_at_wall_ms: None,
+            })
+            .await
+            .context("creating conflict-specialist integration scope")?;
+        let receipt = receipt::capture_workspace_receipt(&self.primary_repo)?;
+        let row = self
+            .db
+            .create_workspace_lease(
+                NewWorkspaceLease {
+                    session_id: self.session_id,
+                    agent_instance_id: self.agent_instance_id,
+                    write_scope_lease_id: scope_id,
+                    canonical_repository_id: receipt::repository_id(&self.primary_repo)?,
+                    canonical_root: root,
+                    kind: WorkspaceLeaseKind::SameRoot,
+                    allowed_ops: WorkspaceLeaseOps {
+                        read: true,
+                        write: false,
+                        execute: false,
+                        computer: false,
+                    }
+                    .to_bits(),
+                    base_sha_digest: receipt.head_digest,
+                    base_ref_digest: receipt.ref_digest,
+                    managed_path: String::new(),
+                    private_ref_digest: WorkspaceDigest::of(format!(
+                        "cockpit-conflict-specialist-{}",
+                        Uuid::new_v4()
+                    )),
+                    expires_at_unix_ms: now_ms.saturating_add(5 * 60 * 1000),
+                },
+                now_ms,
+            )
+            .await
+            .context("creating bounded conflict-specialist integration lease")?;
+        Ok(ConflictSpecialist::bounded_by(WorkspaceLease::from_row(
+            &row,
+        )?))
     }
 
     pub fn coding_ops() -> WorkspaceLeaseOps {

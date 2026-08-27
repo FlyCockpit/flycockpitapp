@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::db::Db;
 use crate::db::workspace_lease_artifacts::{
-    ArtifactResultClass, NewTaskArtifact, RedactedArtifactResult, TaskArtifactIntegrationReceipt,
-    TaskArtifactRow, WorkspaceDigest,
+    ArtifactCasOutcome, ArtifactResultClass, NewTaskArtifact, RedactedArtifactResult,
+    TaskArtifactIntegrationReceipt, TaskArtifactRow, TaskArtifactState, WorkspaceDigest,
 };
 use crate::git::{self, UncommittedPatch};
 
@@ -17,6 +17,15 @@ use super::receipt::{self, ArtifactPreconditions};
 #[derive(Debug, Clone)]
 pub struct ArtifactStore {
     root: PathBuf,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct IntegrationJournalArtifact {
+    artifact_id: Uuid,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+    integrating_revision: i64,
+    expected_state: String,
 }
 
 impl ArtifactStore {
@@ -28,6 +37,207 @@ impl ArtifactStore {
 
     pub fn artifact_dir(&self, id: Uuid) -> PathBuf {
         self.root.join(id.to_string())
+    }
+
+    fn fanout_receipt_path(&self, lease_id: Uuid) -> PathBuf {
+        self.root
+            .join("fanout-receipts")
+            .join(format!("{lease_id}.json"))
+    }
+
+    /// The fan-out receipt is durable before a child can make edits.  It is
+    /// deliberately separate from the artifact payload: artifact production
+    /// must not reconstruct a base from a child that has already changed.
+    pub(crate) fn write_fanout_receipt(
+        &self,
+        lease_id: Uuid,
+        receipt: &receipt::WorkspaceReceipt,
+    ) -> Result<()> {
+        let path = self.fanout_receipt_path(lease_id);
+        let parent = path.parent().expect("fanout receipt has parent");
+        std::fs::create_dir_all(parent)?;
+        let pending = parent.join(format!(".{lease_id}.pending"));
+        std::fs::write(&pending, serde_json::to_vec(receipt)?)?;
+        std::fs::File::open(&pending)?.sync_all()?;
+        std::fs::rename(&pending, &path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn fanout_receipt(&self, lease_id: Uuid) -> Result<receipt::WorkspaceReceipt> {
+        let path = self.fanout_receipt_path(lease_id);
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("loading fan-out receipt `{}`", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("decoding fan-out receipt `{}`", path.display()))
+    }
+
+    fn integration_journal_dir(&self) -> PathBuf {
+        self.root.join("integration-journal")
+    }
+
+    /// Publish an fsync-visible intent before mutating an integration target.
+    /// Recovery never guesses: any intent whose target no longer has its exact
+    /// pre-apply receipt is surfaced as an operator-visible reconciliation
+    /// failure instead of silently deleting edits.
+    pub(crate) fn begin_integration_journal(
+        &self,
+        target: &Path,
+        patch: &UncommittedPatch,
+        before: &crate::git::ByteIdenticalReceipt,
+        artifacts: &[(TaskArtifactRow, UncommittedPatch)],
+    ) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        let dir = self.integration_journal_dir();
+        std::fs::create_dir_all(&dir)?;
+        let pending = dir.join(format!(".{id}.pending"));
+        let journal = dir.join(format!("{id}.json"));
+        let patch_file = dir.join(format!("{id}.patch"));
+        std::fs::write(
+            &pending,
+            serde_json::json!({
+                "attempt_id": id,
+                "target": target.to_string_lossy(),
+                "head": before.head,
+                "ref": before.git_ref,
+                "index": before.index,
+                "worktree": before.worktree,
+                "patch": patch_file.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
+                "artifacts": artifacts.iter().map(|(row, _)| IntegrationJournalArtifact {
+                    artifact_id: row.artifact_id,
+                    session_id: row.session_id,
+                    agent_instance_id: row.agent_instance_id,
+                    integrating_revision: row.revision,
+                    expected_state: TaskArtifactState::Integrating.as_str().to_owned(),
+                }).collect::<Vec<_>>(),
+            })
+            .to_string(),
+        )?;
+        std::fs::write(&patch_file, &patch.diff)?;
+        std::fs::File::open(&pending)?.sync_all()?;
+        std::fs::File::open(&patch_file)?.sync_all()?;
+        std::fs::rename(&pending, &journal)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(id)
+    }
+
+    pub(crate) fn finish_integration_journal(&self, id: Uuid) -> Result<()> {
+        let dir = self.integration_journal_dir();
+        let journal = dir.join(format!("{id}.json"));
+        let patch = dir.join(format!("{id}.patch"));
+        if journal.exists() {
+            std::fs::remove_file(journal)?;
+        }
+        if patch.exists() {
+            std::fs::remove_file(patch)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn reconcile_integration_journals(
+        &self,
+        db: &Db,
+        session_id: Uuid,
+        now_ms: i64,
+    ) -> Result<()> {
+        let dir = self.integration_journal_dir();
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let artifacts: Vec<IntegrationJournalArtifact> =
+                serde_json::from_value(value.get("artifacts").cloned().ok_or_else(|| {
+                    anyhow::anyhow!("integration journal has no artifact attempt records")
+                })?)?;
+            if artifacts
+                .iter()
+                .all(|artifact| artifact.session_id != session_id)
+            {
+                continue;
+            }
+            if artifacts
+                .iter()
+                .any(|artifact| artifact.session_id != session_id)
+            {
+                bail!("integration journal mixes session identities; retaining it for inspection");
+            }
+            let target = value
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("integration journal has no target"))?;
+            let live = crate::git::byte_identical_receipt(Path::new(target))?;
+            let unchanged = value.get("head").and_then(serde_json::Value::as_str)
+                == Some(live.head.as_str())
+                && value.get("ref").and_then(serde_json::Value::as_str)
+                    == Some(live.git_ref.as_str())
+                && value.get("index").and_then(serde_json::Value::as_str)
+                    == Some(live.index.as_str())
+                && value.get("worktree").and_then(serde_json::Value::as_str)
+                    == Some(live.worktree.as_str());
+            if unchanged {
+                for artifact in &artifacts {
+                    if artifact.expected_state != TaskArtifactState::Integrating.as_str() {
+                        bail!("integration journal has an invalid expected artifact state");
+                    }
+                    match db
+                        .retry_task_artifact_integration(
+                            artifact.session_id,
+                            artifact.agent_instance_id,
+                            artifact.artifact_id,
+                            artifact.integrating_revision,
+                            now_ms,
+                        )
+                        .await
+                        .context("releasing stranded integrating artifact after unchanged target")?
+                    {
+                        ArtifactCasOutcome::Transitioned(_)
+                        | ArtifactCasOutcome::AlreadyTerminal(_) => {}
+                        ArtifactCasOutcome::RevisionConflict => bail!(
+                            "integration journal artifact `{}` no longer matches its integrating attempt",
+                            artifact.artifact_id
+                        ),
+                    }
+                }
+                let id = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid integration journal name"))?;
+                self.finish_integration_journal(Uuid::parse_str(id)?)?;
+            } else {
+                // If the database receipt was committed before the process
+                // crashed, this is a successful integration whose cleanup was
+                // interrupted. Do not report it as a stranded filesystem edit.
+                let mut completed = true;
+                for artifact in &artifacts {
+                    let row = db
+                        .task_artifact(
+                            artifact.session_id,
+                            artifact.agent_instance_id,
+                            artifact.artifact_id,
+                        )
+                        .await?;
+                    completed &= row.is_some_and(|row| row.state == TaskArtifactState::Integrated);
+                }
+                if completed {
+                    let id = path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| anyhow::anyhow!("invalid integration journal name"))?;
+                    self.finish_integration_journal(Uuid::parse_str(id)?)?;
+                    continue;
+                }
+                bail!(
+                    "unreconciled integration intent `{}`: target changed after an interrupted filesystem apply; refusing automatic rollback",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn write_payload(
@@ -47,13 +257,13 @@ impl ArtifactStore {
         std::fs::write(pending.join("patch.diff"), patch.diff.as_bytes())
             .context("writing artifact patch")?;
         std::fs::write(
-            pending.join("touched.txt"),
-            preconditions.touched_paths.join("\n"),
+            pending.join("touched.json"),
+            serde_json::to_vec(&preconditions.touched_paths)?,
         )
         .context("writing touched manifest")?;
         std::fs::write(
-            pending.join("untracked.txt"),
-            preconditions.untracked_paths.join("\n"),
+            pending.join("untracked.json"),
+            serde_json::to_vec(&preconditions.untracked_paths)?,
         )
         .context("writing untracked manifest")?;
         std::fs::rename(&pending, &dir).context("publishing artifact payload atomically")?;
@@ -65,8 +275,8 @@ impl ArtifactStore {
         let dir = self.artifact_dir(id);
         let diff = std::fs::read_to_string(dir.join("patch.diff"))
             .with_context(|| format!("loading patch for artifact `{id}`"))?;
-        let touched = read_path_list(&dir.join("touched.txt"))?;
-        let untracked = read_path_list(&dir.join("untracked.txt"))?;
+        let touched = read_path_list(&dir.join("touched.json"))?;
+        let untracked = read_path_list(&dir.join("untracked.json"))?;
         let patch = UncommittedPatch {
             diff,
             touched_paths: touched,
@@ -108,14 +318,60 @@ pub async fn produce_artifact(
 ) -> Result<ProducedArtifact> {
     let patch = git::capture_uncommitted_patch(source_worktree)
         .context("capturing uncommitted artifact patch")?;
+    produce_artifact_from_patch(
+        db,
+        store,
+        source_worktree,
+        source_workspace_lease_id,
+        session_id,
+        agent_instance_id,
+        now_ms,
+        validation_receipt_digest,
+        base_receipt,
+        patch,
+    )
+    .await
+}
+
+/// Persist the immutable patch that was validated by the caller.  Do not
+/// recapture here: re-reading a changed worker tree would make validation
+/// evidence describe different bytes than the artifact we publish.
+#[allow(clippy::too_many_arguments)]
+pub async fn produce_artifact_from_patch(
+    db: &Db,
+    store: &ArtifactStore,
+    source_worktree: &Path,
+    source_workspace_lease_id: Uuid,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+    now_ms: i64,
+    validation_receipt_digest: WorkspaceDigest,
+    base_receipt: Option<&receipt::WorkspaceReceipt>,
+    patch: UncommittedPatch,
+) -> Result<ProducedArtifact> {
+    let base_receipt = base_receipt
+        .context("artifact production requires the complete fan-out pre-edit receipt")?;
+    let live = receipt::capture_workspace_receipt(source_worktree)?;
+    // Managed children are deliberately checked out on private refs, so the
+    // source ref is expected to differ from the integration target's original
+    // ref.  HEAD and index must still be the recorded pre-fan-out base.
+    if live.head_digest != base_receipt.head_digest
+        || live.index_digest != base_receipt.index_digest
+    {
+        bail!(
+            "refusing artifact production after HEAD, ref, or index changed from the pre-fan-out receipt"
+        );
+    }
+    patch.validate_paths()?;
     let mut preconditions = receipt::preconditions_for_paths(
         source_worktree,
         &patch.touched_paths,
         &patch.untracked_paths,
     )?;
-    if let Some(base) = base_receipt {
-        preconditions.receipt = base.clone();
-    }
+    // The manifests are captured from the source tree's base HEAD; the
+    // complete, pre-edit fan-out receipt supplies the durable identity (in
+    // particular the index), never the post-edit child receipt.
+    preconditions.receipt = base_receipt.clone();
     let parent_result = RedactedArtifactResult::new(
         ArtifactResultClass::Produced,
         WorkspaceDigest::of(patch.diff.as_bytes()),
@@ -191,15 +447,6 @@ pub fn assert_no_transcripts(visible: &[ParentVisibleArtifact]) -> Result<()> {
 }
 
 fn read_path_list(path: &Path) -> Result<Vec<String>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("reading `{}`", path.display()))?;
-    Ok(raw
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    let raw = std::fs::read(path).with_context(|| format!("reading `{}`", path.display()))?;
+    serde_json::from_slice(&raw).with_context(|| format!("decoding `{}`", path.display()))
 }

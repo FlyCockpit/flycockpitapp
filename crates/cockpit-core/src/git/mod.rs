@@ -236,6 +236,20 @@ pub(crate) fn run_git_checked_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>
     Ok(output.stdout)
 }
 
+fn run_git_bytes(dir: &Path, args: &[&str]) -> Result<(bool, Vec<u8>, Vec<u8>)> {
+    crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GIT,
+        dir,
+    )
+    .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("launching `git {}`", args.join(" ")))?;
+    Ok((output.status.success(), output.stdout, output.stderr))
+}
+
 /// Resolve a git path through symlink-aware containment. A dangling symlink
 /// or `..` escape fails closed.
 pub fn resolve_git_path(path: &Path) -> Result<PathBuf> {
@@ -532,7 +546,9 @@ pub fn head_ref_name(dir: &Path) -> Result<String> {
 /// Exact index stage listing (`git ls-files --stage`). Byte-identical across
 /// a no-op so integration can refuse rather than overwrite on drift.
 pub fn index_stage_text(dir: &Path) -> Result<String> {
-    Ok(run_git_checked(dir, &["ls-files", "--stage"])?)
+    let output = run_git_checked_bytes(dir, &["ls-files", "--stage", "-z"])?;
+    String::from_utf8(output)
+        .context("git index contains a non-UTF-8 path unsupported by artifact receipts")
 }
 
 /// Number of commits reachable from `HEAD`. Used to prove orchestration never
@@ -546,17 +562,21 @@ pub fn commit_count(dir: &Path) -> Result<u64> {
 
 /// Relative paths of tracked files that differ from `HEAD` (staged or not).
 pub fn touched_paths_versus_head(dir: &Path) -> Result<Vec<String>> {
-    let out = git_allow_diff_exit(run_git(
-        dir,
-        &["diff", "--name-only", "--no-renames", "HEAD"],
-    )?)?;
-    Ok(split_path_lines(&out))
+    let (success, output, stderr) =
+        run_git_bytes(dir, &["diff", "--name-only", "-z", "--no-renames", "HEAD"])?;
+    if !success && output.is_empty() {
+        anyhow::bail!(
+            "git diff --name-only failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    split_nul_paths(output)
 }
 
 /// Untracked, non-ignored paths relative to `dir`.
 pub fn untracked_paths(dir: &Path) -> Result<Vec<String>> {
-    let out = run_git_checked(dir, &["ls-files", "--others", "--exclude-standard"])?;
-    Ok(split_path_lines(&out))
+    let output = run_git_checked_bytes(dir, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    split_nul_paths(output)
 }
 
 /// SHA-256 of a worktree-relative path's current bytes, or the fixed
@@ -600,9 +620,13 @@ pub(crate) fn manifest_digest<'a>(
 /// Unified diff of every uncommitted change (tracked vs HEAD plus untracked
 /// files as `/dev/null` diffs). Never stages. `git add -A` is forbidden here.
 pub(crate) fn capture_uncommitted_patch(dir: &Path) -> Result<UncommittedPatch> {
+    // Enumerate with NUL framing before asking Git for textual diff output.
+    // Unsupported non-UTF-8 paths are therefore rejected before any receipt,
+    // snapshot, lock, or patch capture can observe a lossy representation.
+    let untracked = untracked_paths(dir)?;
+    let mut touched = touched_paths_versus_head(dir)?;
     let tracked =
         git_allow_diff_exit(run_git(dir, &["diff", "--binary", "--no-renames", "HEAD"])?)?;
-    let untracked = untracked_paths(dir)?;
     let mut diff = tracked;
     for file in &untracked {
         reject_relative_escape(file)?;
@@ -615,7 +639,6 @@ pub(crate) fn capture_uncommitted_patch(dir: &Path) -> Result<UncommittedPatch> 
         }
         diff.push_str(&piece);
     }
-    let mut touched = touched_paths_versus_head(dir)?;
     for file in &untracked {
         if !touched.iter().any(|p| p == file) {
             touched.push(file.clone());
@@ -683,6 +706,47 @@ pub(crate) fn apply_uncommitted_patch_check(dir: &Path, diff: &str) -> Result<bo
     Ok(out.success)
 }
 
+/// Apply a proposed patch to a disposable clone of `base` and capture the
+/// resulting manifest from Git itself.  Conflict resolutions must not be able
+/// to smuggle a handwritten manifest past locks and receipt checks.
+pub(crate) fn derive_patch_manifest_on_isolated_base(
+    base: &Path,
+    diff: &str,
+) -> Result<UncommittedPatch> {
+    let base = resolve_git_path(base)?;
+    crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GIT,
+        &base,
+    )
+    .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
+    let scratch = tempfile::tempdir().context("creating isolated conflict-validation clone")?;
+    let base_arg = base.to_string_lossy().into_owned();
+    let scratch_arg = scratch.path().to_string_lossy().into_owned();
+    let clone = Command::new("git")
+        .args([
+            "clone",
+            "--shared",
+            "--no-checkout",
+            "--",
+            base_arg.as_str(),
+            scratch_arg.as_str(),
+        ])
+        .output()
+        .context("cloning isolated conflict-validation base")?;
+    if !clone.status.success() {
+        anyhow::bail!(
+            "creating isolated conflict-validation base failed: {}",
+            String::from_utf8_lossy(&clone.stderr).trim()
+        );
+    }
+    run_git_checked(scratch.path(), &["checkout", "--detach", "HEAD"])?;
+    if !apply_uncommitted_patch_check(scratch.path(), diff)? {
+        anyhow::bail!("resolved conflict patch cannot be applied to the isolated base");
+    }
+    apply_uncommitted_patch(scratch.path(), diff)?;
+    capture_uncommitted_patch(scratch.path())
+}
+
 /// Store `bytes` as a git blob and point `ref_name` at it. The ref must live
 /// under `refs/cockpit/` so it is not a user-visible branch.
 pub(crate) fn store_private_blob_ref(dir: &Path, ref_name: &str, bytes: &[u8]) -> Result<String> {
@@ -708,11 +772,13 @@ pub(crate) fn byte_identical_receipt(dir: &Path) -> Result<ByteIdenticalReceipt>
     let head = head_sha(dir)?;
     let git_ref = head_ref_name(dir)?;
     let index = index_stage_text(dir)?;
-    let mut paths = run_git_checked(dir, &["ls-files", "-c", "-o", "--exclude-standard"])?;
-    let mut listed = split_path_lines(&paths);
+    let mut listed = split_nul_paths(run_git_checked_bytes(
+        dir,
+        &["ls-files", "-c", "-o", "--exclude-standard", "-z"],
+    )?)?;
     listed.sort_unstable();
     listed.dedup();
-    paths.clear();
+    let mut paths = String::new();
     for rel in &listed {
         let digest = path_content_digest(dir, rel)?;
         paths.push_str(rel);
@@ -762,16 +828,22 @@ impl UncommittedPatch {
     }
 }
 
-fn split_path_lines(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
+fn split_nul_paths(bytes: Vec<u8>) -> Result<Vec<String>> {
+    bytes
+        .split(|byte| *byte == b'\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let path = std::str::from_utf8(path)
+                .context("non-UTF-8 Git path is unsupported by artifact receipts")?;
+            reject_relative_escape(path)?;
+            Ok(path.to_owned())
+        })
         .collect()
 }
 
 fn reject_relative_escape(relative: &str) -> Result<()> {
     if relative.is_empty()
+        || relative.contains('\0')
         || relative.starts_with('/')
         || relative.starts_with('\\')
         || relative.split(['/', '\\']).any(|part| part == "..")

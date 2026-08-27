@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::db::Db;
 use crate::db::workspace_lease_artifacts::{
-    LeaseCasOutcome, WorkspaceLeaseRow, WorkspaceLeaseState,
+    LeaseCasOutcome, WorkspaceLeaseRow, WorkspaceLeaseState, WorkspaceLeaseTerminalReason,
 };
 use crate::git;
 use crate::workspace_lease;
@@ -111,6 +111,34 @@ pub async fn cleanup_managed_worktree(
     }
     let managed = Path::new(&row.managed_path);
     if managed.exists() {
+        // Rebuild from the row we are about to clean, rather than trusting a
+        // check performed during startup or an earlier lifecycle transition.
+        // A clean linked worktree can be replaced between those points.
+        let lease = workspace_lease::WorkspaceLease::from_row(&row)?;
+        if !lease.identity_matches_disk() {
+            let retained = match db
+                .mark_workspace_lease_uncertain(
+                    session,
+                    agent,
+                    lease_id,
+                    revision,
+                    WorkspaceLeaseTerminalReason::RestartUncertain,
+                    now_ms,
+                )
+                .await
+                .context("retaining identity-mismatched managed worktree")?
+            {
+                LeaseCasOutcome::Transitioned(updated)
+                | LeaseCasOutcome::AlreadyTerminal(updated) => updated,
+                // A concurrent lifecycle owner may have changed the row, but
+                // cleanup still must retain the on-disk path.
+                LeaseCasOutcome::RevisionConflict => row,
+            };
+            return Ok(CleanupOutcome::Denied {
+                reason: CleanupDenial::Uncertain,
+                row: retained,
+            });
+        }
         match git::worktree_remove_clean(primary_repo, managed) {
             Ok(()) => {}
             Err(error) => {

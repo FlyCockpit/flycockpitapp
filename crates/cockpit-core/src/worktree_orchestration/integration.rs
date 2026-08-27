@@ -88,9 +88,51 @@ pub async fn integrate_artifacts(
         .acquire(&target, lock_identity, session_id)
         .await
         .context("acquiring target workspace lock")?;
+    // The repository-root lock is a coarse integration claim, but ordinary
+    // write tools lock individual files. Hold the complete affected path set
+    // too, before reading any receipt, and retain it through rollback and DB
+    // finalization. This is the bridge between the two lock granularities.
+    let mut path_locks = BTreeSet::new();
+    for id in &request.artifact_ids {
+        let row = match db.task_artifact(session_id, agent_instance_id, *id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                let _ = locks.release(&target, lock_identity, session_id).await;
+                bail!("artifact `{id}` is not owned");
+            }
+            Err(error) => {
+                let _ = locks.release(&target, lock_identity, session_id).await;
+                return Err(error).context("loading artifact before integration lock");
+            }
+        };
+        let patch = match store.load_patch(&row) {
+            Ok(patch) => patch,
+            Err(error) => {
+                let _ = locks.release(&target, lock_identity, session_id).await;
+                return Err(error).context("loading artifact patch before integration lock");
+            }
+        };
+        for rel in patch.touched_paths.iter().chain(&patch.untracked_paths) {
+            path_locks.insert(target.join(rel));
+        }
+    }
+    let mut acquired_paths = Vec::new();
+    for path in path_locks {
+        if let Err(error) = locks.acquire(&path, lock_identity, session_id).await {
+            for held in acquired_paths.into_iter().rev() {
+                let _ = locks.release(&held, lock_identity, session_id).await;
+            }
+            let _ = locks.release(&target, lock_identity, session_id).await;
+            return Err(error).context("acquiring integration affected-path lock");
+        }
+        acquired_paths.push(path);
+    }
     let before = match git::byte_identical_receipt(&target) {
         Ok(receipt) => receipt,
         Err(error) => {
+            for path in acquired_paths.into_iter().rev() {
+                let _ = locks.release(&path, lock_identity, session_id).await;
+            }
             let _ = locks.release(&target, lock_identity, session_id).await;
             return Err(error);
         }
@@ -108,6 +150,9 @@ pub async fn integrate_artifacts(
         cancel,
     )
     .await;
+    for path in acquired_paths.into_iter().rev() {
+        let _ = locks.release(&path, lock_identity, session_id).await;
+    }
     let _ = locks.release(&target, lock_identity, session_id).await;
     result
 }
@@ -227,7 +272,7 @@ async fn integrate_locked(
         });
     }
 
-    let (composed, contributors) = match compose_patches(&begun, specialist) {
+    let (composed, contributors) = match compose_patches(&begun, specialist, target) {
         Ok(patch) => patch,
         Err(verdict) => {
             let mut finished = Vec::new();
@@ -313,8 +358,10 @@ async fn integrate_locked(
     }
 
     let touched_snapshot = snapshot_paths(target, &composed.touched_paths)?;
+    let journal = store.begin_integration_journal(target, &composed, before, &selected)?;
     if let Err(error) = git::apply_uncommitted_patch(target, &composed.diff) {
         restore_paths(target, &touched_snapshot)?;
+        store.finish_integration_journal(journal)?;
         return finish_failed(
             db,
             session_id,
@@ -329,7 +376,17 @@ async fn integrate_locked(
         .await;
     }
     if cancel.is_cancelled() {
-        git::reverse_uncommitted_patch(target, &composed.diff)?;
+        reverse_or_record_terminal_failure(
+            db,
+            session_id,
+            agent_instance_id,
+            now_ms,
+            &begun,
+            target,
+            &composed.diff,
+        )
+        .await?;
+        store.finish_integration_journal(journal)?;
         return abort_cancel(
             db,
             session_id,
@@ -353,7 +410,17 @@ async fn integrate_locked(
                 .unwrap_or_else(Uuid::nil)
         );
         if let Err(error) = git::store_private_blob_ref(target, &name, composed.diff.as_bytes()) {
-            git::reverse_uncommitted_patch(target, &composed.diff)?;
+            reverse_or_record_terminal_failure(
+                db,
+                session_id,
+                agent_instance_id,
+                now_ms,
+                &begun,
+                target,
+                &composed.diff,
+            )
+            .await?;
+            store.finish_integration_journal(journal)?;
             return finish_failed(
                 db,
                 session_id,
@@ -392,7 +459,17 @@ async fn integrate_locked(
     let target_spec = match prepared {
         Ok(spec) => spec,
         Err(error) => {
-            git::reverse_uncommitted_patch(target, &composed.diff)?;
+            reverse_or_record_terminal_failure(
+                db,
+                session_id,
+                agent_instance_id,
+                now_ms,
+                &begun,
+                target,
+                &composed.diff,
+            )
+            .await?;
+            store.finish_integration_journal(journal)?;
             if let Some(name) = &private_ref {
                 let _ = git::delete_private_ref(target, name);
             }
@@ -420,7 +497,17 @@ async fn integrate_locked(
     {
         Ok(Some(rows)) => rows,
         Ok(None) => {
-            git::reverse_uncommitted_patch(target, &composed.diff)?;
+            reverse_or_record_terminal_failure(
+                db,
+                session_id,
+                agent_instance_id,
+                now_ms,
+                &begun,
+                target,
+                &composed.diff,
+            )
+            .await?;
+            store.finish_integration_journal(journal)?;
             if let Some(name) = &private_ref {
                 let _ = git::delete_private_ref(target, name);
             }
@@ -438,7 +525,17 @@ async fn integrate_locked(
             .await;
         }
         Err(error) => {
-            git::reverse_uncommitted_patch(target, &composed.diff)?;
+            reverse_or_record_terminal_failure(
+                db,
+                session_id,
+                agent_instance_id,
+                now_ms,
+                &begun,
+                target,
+                &composed.diff,
+            )
+            .await?;
+            store.finish_integration_journal(journal)?;
             if let Some(name) = &private_ref {
                 let _ = git::delete_private_ref(target, name);
             }
@@ -457,6 +554,7 @@ async fn integrate_locked(
         }
     };
 
+    store.finish_integration_journal(journal)?;
     Ok(IntegrationResult::Integrated {
         artifacts: integrated,
         private_ref,
@@ -493,6 +591,7 @@ fn stale_reason(
 fn compose_patches(
     begun: &[(TaskArtifactRow, UncommittedPatch)],
     specialist: Option<&ConflictSpecialist>,
+    isolated_base: &Path,
 ) -> Result<(UncommittedPatch, BTreeSet<Uuid>), ConflictSpecialistVerdict> {
     if begun.is_empty() {
         return Ok((
@@ -513,7 +612,7 @@ fn compose_patches(
             };
             let verdict = specialist.resolve(&acc, next);
             acc = specialist
-                .compose(&acc, next, verdict)
+                .compose(&acc, next, verdict, isolated_base)
                 .map_err(|_| verdict)?;
             match verdict {
                 ConflictSpecialistVerdict::Combined => {
@@ -581,6 +680,46 @@ async fn finish_state(
         ArtifactCasOutcome::Transitioned(row) | ArtifactCasOutcome::AlreadyTerminal(row) => Ok(row),
         ArtifactCasOutcome::RevisionConflict => bail!("artifact `{id}` revision conflict"),
     }
+}
+
+/// A failed reverse is an operator-visible target uncertainty, but it must
+/// never strand the database attempt in `integrating`. The journal remains in
+/// place for startup reconciliation while every selected artifact reaches an
+/// explicit terminal state.
+async fn reverse_or_record_terminal_failure(
+    db: &Db,
+    session: Uuid,
+    agent: Uuid,
+    now_ms: i64,
+    begun: &[(TaskArtifactRow, UncommittedPatch)],
+    target: &Path,
+    diff: &str,
+) -> Result<()> {
+    if let Err(rollback) = git::reverse_uncommitted_patch(target, diff) {
+        for (row, _) in begun {
+            match db
+                .finish_task_artifact(
+                    session,
+                    agent,
+                    row.artifact_id,
+                    row.revision,
+                    TaskArtifactState::Failed,
+                    now_ms,
+                )
+                .await?
+            {
+                ArtifactCasOutcome::Transitioned(_) | ArtifactCasOutcome::AlreadyTerminal(_) => {}
+                ArtifactCasOutcome::RevisionConflict => bail!(
+                    "artifact `{}` revision changed while recording rollback failure",
+                    row.artifact_id
+                ),
+            }
+        }
+        return Err(rollback).context(
+            "integration rollback failed; artifacts were marked failed and the journal was retained",
+        );
+    }
+    Ok(())
 }
 
 async fn abort_cancel(

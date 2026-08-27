@@ -3,11 +3,12 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::db::workspace_lease_artifacts::WorkspaceDigest;
 use crate::git;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceReceipt {
     pub head: String,
     pub head_digest: WorkspaceDigest,

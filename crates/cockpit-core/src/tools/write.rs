@@ -8,7 +8,9 @@
 #[cfg(unix)]
 use std::io::Write as _;
 
-use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -2881,6 +2883,7 @@ mod write_approval_regressions {
     use crate::engine::tool::Tool;
     use crate::tools::common::test_ctx;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn creating_new_file_is_not_gated() {
         let tmp = tempfile::tempdir().unwrap();

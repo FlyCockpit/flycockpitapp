@@ -70,29 +70,6 @@ fn append_unresolved_tail(
     Ok(base)
 }
 
-/// Walk up until `lstat` succeeds. Unlike [`nearest_existing_ancestor`], this
-/// does not follow a resolving symlink: the returned prefix may itself be a
-/// symlink, which a later `O_NOFOLLOW` open must refuse rather than creating
-/// beneath the link target.
-pub fn nearest_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
-    let mut current = path;
-    loop {
-        match std::fs::symlink_metadata(current) {
-            Ok(_) => return Ok(current.to_path_buf()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let Some(parent) = current.parent() else {
-                    return Err(err);
-                };
-                if parent == current {
-                    return Err(err);
-                }
-                current = parent;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
 /// True when `candidate` is equal to or under `root` after symlink-aware
 /// normalization. Nonexistent leaves are allowed when their existing parent is
 /// contained.
@@ -128,11 +105,6 @@ mod tests {
             canonical,
             std::fs::canonicalize(root.join("scope")).unwrap()
         );
-        assert_eq!(
-            nearest_existing_prefix(&missing).unwrap(),
-            root.join("scope")
-        );
-
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&sibling, root.join("scope/link")).unwrap();
@@ -141,8 +113,6 @@ mod tests {
                 &root.join("scope/link/escaped.txt")
             ));
             assert!(nearest_existing_ancestor(&root.join("scope/link/escaped.txt")).is_err());
-            let prefix = nearest_existing_prefix(&root.join("scope/link/escaped.txt")).unwrap();
-            assert_eq!(prefix, root.join("scope/link"));
         }
     }
 }

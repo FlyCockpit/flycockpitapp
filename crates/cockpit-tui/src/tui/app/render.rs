@@ -4232,7 +4232,6 @@ impl App {
         right.extend(chrome::status_line_spans(&self.launch));
         let status = chrome::left_status(
             &self.launch,
-            self.llm_mode,
             &self.agent_path,
             self.hovered_footer_control.or(self.footer_selection),
             self.sandbox_mode,
@@ -4341,11 +4340,6 @@ impl App {
                         format!("{provider}/{model}"),
                     )
                 }
-                crate::tui::chrome::FooterControl::Mode => (
-                    ButtonId::Footer(crate::tui::chrome::FooterControl::Mode),
-                    ButtonDispatch::Footer(crate::tui::chrome::FooterControl::Mode),
-                    self.llm_mode.as_str().to_string(),
-                ),
             };
             let spec = ButtonSpec::new(id, label, dispatch).focused(focused == Some(hit.control));
             let _ = self

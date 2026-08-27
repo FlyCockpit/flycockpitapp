@@ -107,11 +107,6 @@ fn footer_enter_opens_selector_for_each_axis() {
     app.footer_selection = Some(crate::tui::chrome::FooterControl::Model);
     app.handle_key(press(KeyCode::Enter));
     assert!(matches!(app.overlay, Overlay::ModelPicker(_)));
-
-    app.overlay = Overlay::None;
-    app.footer_selection = Some(crate::tui::chrome::FooterControl::Mode);
-    app.handle_key(press(KeyCode::Enter));
-    assert!(app.footer_mode_picker.is_some());
 }
 
 #[test]

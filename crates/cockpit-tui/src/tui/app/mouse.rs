@@ -433,7 +433,6 @@ impl App {
                 match hit.control {
                     crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
                     crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                    crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
                 }
             }
             return;
@@ -680,7 +679,6 @@ impl App {
                     match control {
                         crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
                         crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                        crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
                     }
                 }
             }

@@ -3980,6 +3980,7 @@ impl Driver {
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
             image_generation_dispatch: None,
+            transcription_dispatch: None,
             deferred_log: self
                 .stack
                 .last()

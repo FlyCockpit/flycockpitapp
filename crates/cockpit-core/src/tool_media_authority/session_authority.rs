@@ -143,6 +143,17 @@ pub trait AttachmentResolver: Send + Sync {
         session_id: &str,
         attachment_id: &[u8; 16],
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial>;
+
+    /// Read the normalized derivative bytes for an already-admitted attachment.
+    ///
+    /// Default fails closed: a resolver that only knows metadata cannot mint
+    /// content. Production and test resolvers that hold bytes override this.
+    fn read_bytes(&self, attachment: &AdmittedAttachment) -> Result<Vec<u8>, AdmissionDenial> {
+        let _ = attachment;
+        Err(AdmissionDenial::Internal(
+            "attachment content is not available from this resolver".to_string(),
+        ))
+    }
 }
 
 /// The local-path admission policy trait.
@@ -289,6 +300,37 @@ impl SessionMediaAuthority {
 
         self.retained_https_policy.admit(session_id, url)
     }
+    /// Read admitted source bytes. The tool never opens a model-supplied path
+    /// or URL itself: local files are read from the authority-held descriptor,
+    /// HTTPS uses the retained immutable
+    /// buffer, and attachments go through the resolver's content seam.
+    pub fn read_bytes(&self, handle: &AdmittedHandle) -> Result<Vec<u8>, AdmissionDenial> {
+        match handle {
+            AdmittedHandle::Attachment(attachment) => {
+                self.attachment_resolver.read_bytes(attachment)
+            }
+            AdmittedHandle::Local(local) => read_held_local(local),
+            AdmittedHandle::RetainedHttps(source) => Ok(source.content().to_vec()),
+        }
+    }
+
+}
+
+fn read_held_local(local: &AdmittedLocalHandle) -> Result<Vec<u8>, AdmissionDenial> {
+    use std::io::{Read as _, Seek as _};
+
+    let mut file = local.held_file().try_clone().map_err(|error| {
+        AdmissionDenial::Internal(format!("admitted local handle could not be cloned: {error}"))
+    })?;
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+        AdmissionDenial::Internal(format!("admitted local handle could not be rewound: {error}"))
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        AdmissionDenial::Internal(format!("admitted local handle could not be read: {error}"))
+    })?;
+    let _ = local.evidence();
+    Ok(bytes)
 }
 
 #[cfg(test)]

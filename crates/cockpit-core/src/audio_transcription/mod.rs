@@ -39,9 +39,11 @@
 pub mod authorization;
 pub mod catalogs;
 pub mod dispatch;
+pub mod journal;
 pub mod request;
 pub mod response;
 pub mod result;
+pub mod transport;
 pub mod whisper_preflight;
 
 #[cfg(test)]

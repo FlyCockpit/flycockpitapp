@@ -11,22 +11,12 @@
 //! after which dispatch fails `transcription_unavailable` with **zero** send.
 //!
 //! No real network, sleeps, or global environment mutation occurs here. The
-//! concrete production transport (binding the vetted egress client, credential
-//! headers, and endpoint identity) is owned by the external-runtime layer and
-//! implements [`TranscriptionEgressTransport`]; tests inject a fake.
-//!
-//! TODO(audio-transcription-journal): the external-side-effect journal is the
-//! sole handoff authority for the prepared -> dispatching -> terminal
-//! (completed / cancelled / completed_after_cancel / failed) state machine and
-//! the cancel-vs-prepare-vs-dispatch race matrix (complete-prompt AC6/AC9). It
-//! is NOT integrated in this increment. Until it is, no production caller may
-//! invoke [`dispatch_multipart`]: the only entry point (the `transcribe_audio`
-//! tool) fails closed at the attachment-authority boundary before any
-//! reservation, journal record, authorization, or send — so this send path is
-//! reachable only from injected-transport unit tests, never live egress. The
-//! follow-up must record `prepared` before dispatch, treat the journal terminal
-//! as authoritative (a `completed_after_cancel` discards content), and make the
-//! whole path exactly-once and fail-closed on any journal error.
+//! production transport is [`super::transport::TranscriptionHttpTransport`],
+//! which binds the shared vetted provider HTTP client, credential headers,
+//! and endpoint identity. Tests inject a fake. Live send is gated by the
+//! external-side-effect journal in [`super::journal`]: `prepared` commits
+//! before any provider byte, and a `completed_after_cancel` terminal discards
+//! content.
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;

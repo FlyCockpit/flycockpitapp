@@ -3,32 +3,46 @@
 //! Transcribes one authorized audio source through the external
 //! audio-transcription contract ([`crate::audio_transcription`]): pure caller
 //! validation, feature-driven model selection, Whisper prompt preflight, the
-//! secret-free `MediaEgress` authorization chokepoint, and multipart egress.
-//!
-//! Like every other media tool in this repository, source bytes come *only*
-//! from typed session normalized derivatives via the attachment authority. That
-//! authority is not yet exposed here (see [`crate::tools::audio_video`]), so the
-//! tool validates its closed arguments, selects the model, and runs the Whisper
-//! preflight gate, then **fails closed** at the attachment-authority boundary
-//! with `media_attachment_authority_unavailable` — never opening a
-//! model-supplied path itself and never contacting a provider. When the
-//! attachment authority lands, the resolved normalized bytes + checksum feed a
-//! [`crate::audio_transcription::authorization::MediaEgressTranscriptionRequest`],
-//! which routes through [`crate::approval::Approver`] before any egress.
+//! secret-free `MediaEgress` authorization chokepoint, journaled multipart
+//! egress, and a normalized result. Source bytes come only from typed session
+//! normalized derivatives via [`crate::tool_media_authority::SessionMediaAuthority`].
+//! Stripped MCP/Monty/catalog contexts have no authority and fail closed
+//! before reservation, journal, authorization, or send.
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use sha2::{Digest as Sha256Digest, Sha256};
+use uuid::Uuid;
 
-use crate::audio_transcription::request::{
-    CallerTimestamps, TranscriptionModel, validate_diarize_languages, validate_gpt_languages,
-    validate_keywords, validate_prompt, validate_whisper_languages,
+use crate::audio_transcription::authorization::{
+    MediaEgressTranscriptionRequest, TranscriptionPurpose,
 };
-use crate::audio_transcription::result::TimestampsKind;
+use crate::audio_transcription::journal::TranscriptionHandoff;
+use crate::audio_transcription::request::{
+    CallerTimestamps, MAX_FILE_BYTES, MIN_FILE_BYTES, TranscriptionModel,
+    plan_gpt_4o_transcribe_diarize, plan_gpt_transcribe, plan_whisper_1,
+    validate_diarize_languages, validate_gpt_languages, validate_keywords, validate_prompt,
+    validate_whisper_languages,
+};
+use crate::audio_transcription::response::{
+    decode_diarized, decode_gpt_transcribe, decode_whisper_segments, decode_whisper_words,
+};
+use crate::audio_transcription::result::{
+    DiarizationV1, DiarizedSegmentV1, NormalizedTranscriptionResultV1, TimestampsKind,
+    TimestampsV1, TranscriptSegmentV1, TranscriptWordV1, TranscriptionContentV1,
+    TranscriptionProvenanceV1, decimal_seconds_to_microseconds, map_provider_speakers,
+    project_text, requested_to_applied, validate_content_timestamps,
+};
 use crate::audio_transcription::whisper_preflight::{
     WhisperPreflightOutcome, verify_whisper_tokenizer_digest, whisper_prompt_preflight,
 };
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
+use crate::external_journal::projection::{Digest, SafeToken};
+use crate::tool_media_authority::AdmittedHandle;
+use crate::tool_media_authority::session_authority::AdmissionDenial;
+
+const RESULT_SCHEMA_VERSION: u8 = 1;
 
 /// The nested `source` union shared with the other media tools: exactly one of
 /// `{attachment_id} | {path} | {url}` on the first call; later calls reuse
@@ -129,6 +143,260 @@ fn caller_timestamps_to_kind(ts: CallerTimestamps) -> TimestampsKind {
     }
 }
 
+enum SourceArg {
+    AttachmentId(String),
+    Path(String),
+    Url(String),
+}
+
+fn parse_source(args: &Value) -> Result<SourceArg> {
+    let source = args
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_input("source is required"))?;
+    let attachment_id = source.get("attachment_id").and_then(Value::as_str);
+    let path = source.get("path").and_then(Value::as_str);
+    let url = source.get("url").and_then(Value::as_str);
+    match (attachment_id, path, url) {
+        (Some(id), None, None) => Ok(SourceArg::AttachmentId(id.to_string())),
+        (None, Some(path), None) => Ok(SourceArg::Path(path.to_string())),
+        (None, None, Some(url)) => Ok(SourceArg::Url(url.to_string())),
+        _ => Err(invalid_input(
+            "source must be exactly one of attachment_id, path, or url",
+        )),
+    }
+}
+
+fn parse_interval_us(args: &Value) -> Result<(u64, u64)> {
+    let start = args.get("start").and_then(Value::as_f64);
+    let end = args.get("end").and_then(Value::as_f64);
+    match (start, end) {
+        (None, None) => Ok((0, 0)),
+        (Some(start), Some(end)) => {
+            let start_us = decimal_seconds_to_microseconds(start)
+                .ok_or_else(|| invalid_input("start is not a valid media timestamp"))?;
+            let end_us = decimal_seconds_to_microseconds(end)
+                .ok_or_else(|| invalid_input("end is not a valid media timestamp"))?;
+            if end_us <= start_us {
+                return Err(invalid_input("end must be greater than start"));
+            }
+            Ok((start_us, end_us))
+        }
+        _ => Err(invalid_input(
+            "start and end must both be supplied or both omitted",
+        )),
+    }
+}
+
+fn parse_attachment_id_bytes(raw: &str) -> Result<[u8; 16]> {
+    if let Ok(uuid) = Uuid::parse_str(raw) {
+        return Ok(*uuid.as_bytes());
+    }
+    let mut out = [0u8; 16];
+    if raw.len() != 32 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid_input(
+            "attachment_id must be a UUID or 32 lowercase hex characters",
+        ));
+    }
+    for (i, chunk) in raw.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).unwrap_or("00");
+        out[i] = u8::from_str_radix(s, 16)
+            .map_err(|_| invalid_input("attachment_id is not valid hex"))?;
+    }
+    Ok(out)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
+}
+
+fn admit_source(
+    authority: &crate::tool_media_authority::SessionMediaAuthority,
+    session_hex: &str,
+    source: &SourceArg,
+) -> Result<AdmittedHandle> {
+    let result = match source {
+        SourceArg::AttachmentId(id) => {
+            let bytes = parse_attachment_id_bytes(id)?;
+            authority
+                .resolve_attachment(session_hex, &bytes)
+                .map(AdmittedHandle::Attachment)
+        }
+        SourceArg::Path(path) => authority
+            .admit_local_path(session_hex, path)
+            .map(AdmittedHandle::Local),
+        SourceArg::Url(url) => authority
+            .admit_retained_https(session_hex, url)
+            .map(AdmittedHandle::RetainedHttps),
+    };
+    result.map_err(|denial| match denial {
+        AdmissionDenial::NoAuthority | AdmissionDenial::SubjectMismatch => {
+            anyhow::anyhow!(
+                "media_attachment_authority_unavailable: the session media authority rejected this source"
+            )
+        }
+        AdmissionDenial::AttachmentNotFound => {
+            invalid_input("attachment not found")
+        }
+        AdmissionDenial::LocalPathDenied => invalid_input("local path denied"),
+        AdmissionDenial::HttpsDenied => invalid_input("HTTPS source denied"),
+        other => anyhow::anyhow!("media_attachment_authority_unavailable: {other}"),
+    })
+}
+
+fn handle_identity(handle: &AdmittedHandle, audio: &[u8]) -> (String, String, u64) {
+    match handle {
+        AdmittedHandle::Attachment(att) => (
+            Uuid::from_bytes(att.attachment_id())
+                .hyphenated()
+                .to_string(),
+            hex_encode(&att.checksum()),
+            att.attachment_version(),
+        ),
+        AdmittedHandle::Local(_) | AdmittedHandle::RetainedHttps(_) => (
+            hex_encode(&Sha256::digest(audio))[..32].to_string(),
+            sha256_hex(audio),
+            1,
+        ),
+    }
+}
+
+fn normalize_body(
+    model: TranscriptionModel,
+    timestamps: CallerTimestamps,
+    diarization: bool,
+    languages: &[crate::audio_transcription::result::RequestedLanguageV1],
+    body: &[u8],
+    provenance: TranscriptionProvenanceV1,
+) -> Result<NormalizedTranscriptionResultV1> {
+    let requested_kind = caller_timestamps_to_kind(timestamps);
+    let applied_languages: Vec<_> = languages.iter().map(requested_to_applied).collect();
+    let (text, content, detected, usage) = match model {
+        TranscriptionModel::GptTranscribe => {
+            let decoded = decode_gpt_transcribe(body)?;
+            (
+                decoded.text.clone(),
+                TranscriptionContentV1::Plain {
+                    text: decoded.text.clone(),
+                },
+                decoded.detected_languages,
+                decoded.usage,
+            )
+        }
+        TranscriptionModel::Whisper1 => match timestamps {
+            CallerTimestamps::Segment => {
+                let decoded = decode_whisper_segments(body)?;
+                let items = decoded
+                    .segments
+                    .iter()
+                    .map(|seg| TranscriptSegmentV1 {
+                        id: seg.id,
+                        start_us: seg.start_us,
+                        end_us: seg.end_us,
+                        text: seg.text.clone(),
+                    })
+                    .collect();
+                (
+                    decoded.text.clone(),
+                    TranscriptionContentV1::Segments { items },
+                    Vec::new(),
+                    decoded.usage,
+                )
+            }
+            CallerTimestamps::Word => {
+                let decoded = decode_whisper_words(body)?;
+                let items = decoded
+                    .words
+                    .iter()
+                    .map(|word| TranscriptWordV1 {
+                        word: word.word.clone(),
+                        start_us: word.start_us,
+                        end_us: word.end_us,
+                    })
+                    .collect();
+                (
+                    decoded.text.clone(),
+                    TranscriptionContentV1::Words { items },
+                    Vec::new(),
+                    decoded.usage,
+                )
+            }
+            CallerTimestamps::Off => {
+                bail!("whisper-1 requires segment or word timestamps")
+            }
+        },
+        TranscriptionModel::Gpt4oTranscribeDiarize => {
+            let decoded = decode_diarized(body)?;
+            let speaker_codes: Vec<Option<String>> = decoded
+                .segments
+                .iter()
+                .map(|seg| Some(seg.speaker.clone()))
+                .collect();
+            let mapped = map_provider_speakers(&speaker_codes);
+            let items = decoded
+                .segments
+                .iter()
+                .zip(mapped)
+                .enumerate()
+                .map(|(index, (seg, speaker))| {
+                    DiarizedSegmentV1::new(
+                        index as u32,
+                        seg.start_us,
+                        seg.end_us,
+                        seg.text.clone(),
+                        speaker.unwrap_or_else(|| "speaker_1".to_string()),
+                    )
+                })
+                .collect();
+            (
+                decoded.text.clone(),
+                TranscriptionContentV1::Diarized {
+                    duration_us: decoded.duration_us,
+                    items,
+                },
+                Vec::new(),
+                decoded.usage,
+            )
+        }
+    };
+    let projected = project_text(&text);
+    let timestamps_pair = TimestampsV1 {
+        requested: requested_kind,
+        applied: requested_kind,
+    };
+    let diarization_pair = DiarizationV1 {
+        requested: diarization,
+        applied: diarization,
+    };
+    validate_content_timestamps(&content, &timestamps_pair, &diarization_pair)
+        .map_err(|error| anyhow::anyhow!("invalid_output: {error}"))?;
+    Ok(NormalizedTranscriptionResultV1 {
+        schema_version: RESULT_SCHEMA_VERSION,
+        text: projected.text,
+        content,
+        requested_languages: languages.to_vec(),
+        applied_languages,
+        detected_languages: detected,
+        timestamps: timestamps_pair,
+        diarization: diarization_pair,
+        usage,
+        provenance,
+        complete: projected.complete,
+        omitted_text_scalars: projected.omitted_text_scalars,
+        omitted_text_utf8_bytes: projected.omitted_text_utf8_bytes,
+        omitted_segments: projected.omitted_segments,
+        omitted_words: projected.omitted_words,
+    })
+}
+
 pub struct TranscribeAudioTool;
 
 #[async_trait]
@@ -160,9 +428,6 @@ impl Tool for TranscribeAudioTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         validate_args(&args)?;
 
-        // Feature-driven model selection. This surfaces the unsupported
-        // timestamps+diarization combination as a precise error before any
-        // reservation or provider contact.
         let timestamps = parse_timestamps(&args)?;
         let diarization = args
             .get("diarization")
@@ -171,25 +436,22 @@ impl Tool for TranscribeAudioTool {
         let model = TranscriptionModel::select(caller_timestamps_to_kind(timestamps), diarization)
             .map_err(|error| invalid_input(error.to_string()))?;
 
-        // Collect the raw caller inputs from the (shape-validated) args.
         let prompt_raw = args.get("prompt").and_then(|v| v.as_str());
         let keywords_raw = collect_string_array(&args, "keywords");
         let languages_raw = collect_string_array(&args, "languages");
 
-        // Run the module's real caller-context validators per selected model,
-        // BEFORE any authorization or egress. These reject oversized prompts,
-        // forbidden keyword bytes, duplicate/unlisted languages, and
-        // model-specific language-count and unsupported-field violations. Every
-        // validator message is caller-derived and secret-free.
-        match model {
+        let (prompt, keywords, languages) = match model {
             TranscriptionModel::GptTranscribe => {
-                if let Some(prompt) = prompt_raw {
-                    validate_prompt(prompt).map_err(|error| invalid_input(error.to_string()))?;
-                }
-                validate_keywords(&keywords_raw)
+                let prompt = if let Some(prompt) = prompt_raw {
+                    validate_prompt(prompt).map_err(|error| invalid_input(error.to_string()))?
+                } else {
+                    None
+                };
+                let keywords = validate_keywords(&keywords_raw)
                     .map_err(|error| invalid_input(error.to_string()))?;
-                validate_gpt_languages(&languages_raw)
+                let languages = validate_gpt_languages(&languages_raw)
                     .map_err(|error| invalid_input(error.to_string()))?;
+                (prompt, keywords, languages)
             }
             TranscriptionModel::Whisper1 => {
                 if !keywords_raw.is_empty() {
@@ -197,11 +459,14 @@ impl Tool for TranscribeAudioTool {
                         "whisper-1 does not accept keywords".to_string(),
                     ));
                 }
-                validate_whisper_languages(&languages_raw)
+                let languages = validate_whisper_languages(&languages_raw)
                     .map_err(|error| invalid_input(error.to_string()))?;
-                if let Some(prompt) = prompt_raw {
-                    validate_prompt(prompt).map_err(|error| invalid_input(error.to_string()))?;
-                }
+                let prompt = if let Some(prompt) = prompt_raw {
+                    validate_prompt(prompt).map_err(|error| invalid_input(error.to_string()))?
+                } else {
+                    None
+                };
+                (prompt, Vec::new(), languages)
             }
             TranscriptionModel::Gpt4oTranscribeDiarize => {
                 if prompt_raw.is_some() {
@@ -214,22 +479,19 @@ impl Tool for TranscribeAudioTool {
                         "diarization does not accept keywords".to_string(),
                     ));
                 }
-                validate_diarize_languages(&languages_raw)
+                let languages = validate_diarize_languages(&languages_raw)
                     .map_err(|error| invalid_input(error.to_string()))?;
+                (None, Vec::new(), languages)
             }
-        }
+        };
 
-        // Whisper preflight gate. The tokenizer-DATA digest pin ALWAYS runs for
-        // a Whisper-model request (gating egress) regardless of whether a prompt
-        // is supplied; the 224-token prompt count is only meaningful when a
-        // prompt is present. Both fail closed with zero provider contact.
         if model == TranscriptionModel::Whisper1 {
             if verify_whisper_tokenizer_digest().is_err() {
                 bail!(
                     "transcription_unavailable: the pinned Whisper tokenizer data did not verify"
                 );
             }
-            if let Some(prompt) = prompt_raw {
+            if let Some(prompt) = prompt.as_deref() {
                 match whisper_prompt_preflight(prompt) {
                     WhisperPreflightOutcome::Ok { .. } => {}
                     WhisperPreflightOutcome::TooLong { token_count } => {
@@ -246,22 +508,407 @@ impl Tool for TranscribeAudioTool {
             }
         }
 
-        // Source bytes come only from typed session normalized derivatives via
-        // the attachment authority. Fail closed when no server-private media
-        // authority is present (MCP/Monty/catalog/external-MCP stripped
-        // contexts have `None`). When the authority is present, the resolved
-        // normalized bytes + checksum feed a
-        // [`crate::audio_transcription::authorization::MediaEgressTranscriptionRequest`],
-        // which routes through [`crate::approval::Approver`] before any egress.
-        if ctx.media_authority().is_none() {
+        let Some(authority) = ctx.media_authority() else {
             bail!(
-                "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe audio-transcription egress"
+                "media_attachment_authority_unavailable: stripped MCP/Monty/catalog contexts cannot transcribe audio"
             );
+        };
+
+        let session_hex =
+            crate::tool_media_authority::revalidator::hex::encode(ctx.session.id.as_bytes());
+        let source = parse_source(&args)?;
+        let (interval_start_us, interval_end_us) = parse_interval_us(&args)?;
+        let handle = admit_source(authority, &session_hex, &source)?;
+        let audio = authority
+            .read_bytes(&handle)
+            .map_err(|error| anyhow::anyhow!("media_attachment_authority_unavailable: {error}"))?;
+        let file_bytes = audio.len() as u64;
+        if file_bytes < MIN_FILE_BYTES {
+            return Err(invalid_input("audio source is empty"));
         }
-        // TODO: wire the attachment-authority-resolved bytes through the
-        // MediaEgress authorization chokepoint in the transcription batch.
-        bail!(
-            "media_attachment_authority_unavailable: audio-transcription egress not yet wired in this build"
+        if file_bytes > MAX_FILE_BYTES {
+            return Err(invalid_input("audio source exceeds the 25 MiB file cap"));
+        }
+
+        let (attachment_id, attachment_checksum, attachment_version) =
+            handle_identity(&handle, &audio);
+
+        let Some(dispatch) = ctx.transcription_dispatch.as_ref() else {
+            bail!(
+                "transcription_egress_unavailable: no journaled transcription transport is wired for this session"
+            );
+        };
+        let Some(approver) = ctx.approver.as_ref() else {
+            bail!("transcription_unavailable: authorization is unavailable in this session");
+        };
+
+        let identity = dispatch.identity();
+        let provider_id = identity.provider_id.clone();
+        let origin = identity.origin.clone();
+        let resolved_location = identity.resolved_location.clone();
+        let credential_fingerprint = identity.credential_fingerprint.clone();
+        let request = MediaEgressTranscriptionRequest {
+            provider_id: provider_id.clone(),
+            model_id: model.as_str().to_string(),
+            credential_fingerprint_digest: credential_fingerprint.clone(),
+            origin: origin.clone(),
+            resolved_location,
+            project_digest: sha256_hex(ctx.session.project_id.as_bytes()),
+            session_id: ctx.session.id.hyphenated().to_string(),
+            attachment_id: attachment_id.clone(),
+            attachment_checksum: attachment_checksum.clone(),
+            interval_start_us,
+            interval_end_us,
+            prompt_bytes: prompt.as_deref().unwrap_or("").as_bytes().to_vec(),
+            keywords: keywords.clone(),
+            languages: languages.clone(),
+            timestamps: caller_timestamps_to_kind(timestamps),
+            diarization,
+            purpose: TranscriptionPurpose::Transcription,
+        };
+        let request_digest = request.digest();
+        match request.authorize(approver).await? {
+            crate::approval::Decision::Allow { .. } => {}
+            crate::approval::Decision::Deny
+            | crate::approval::Decision::StandingReject { .. }
+            | crate::approval::Decision::NoninteractiveDeny => {
+                bail!("transcription_denied: media egress was not authorized");
+            }
+        }
+
+        let duration_ms = interval_end_us.saturating_sub(interval_start_us) / 1_000;
+        let owner = SafeToken::for_session(ctx.session.id);
+        let idempotency_key = SafeToken::parse(request_digest.as_str()).map_err(|error| {
+            anyhow::anyhow!("transcription_unavailable: idempotency key: {error}")
+        })?;
+        let source_digest = Digest::of(&audio);
+        let prompt_ref = prompt.clone();
+        let keywords_ref = keywords.clone();
+        let languages_ref = languages.clone();
+        let build = move |boundary: &str| match model {
+            TranscriptionModel::GptTranscribe => plan_gpt_transcribe(
+                file_bytes,
+                prompt_ref.as_deref(),
+                &keywords_ref,
+                &languages_ref,
+                boundary,
+            ),
+            TranscriptionModel::Whisper1 => plan_whisper_1(
+                file_bytes,
+                timestamps,
+                languages_ref.first(),
+                prompt_ref.as_deref(),
+                boundary,
+            ),
+            TranscriptionModel::Gpt4oTranscribeDiarize => plan_gpt_4o_transcribe_diarize(
+                file_bytes,
+                Some(duration_ms),
+                languages_ref.first(),
+                boundary,
+            ),
+        };
+        let mut boundaries = std::iter::from_fn(|| Some(Uuid::new_v4().as_u128()));
+        let now_wall_ms = chrono::Utc::now().timestamp_millis();
+        let handoff = dispatch
+            .dispatch(
+                &owner,
+                &idempotency_key,
+                source_digest,
+                duration_ms,
+                now_wall_ms,
+                &audio,
+                &mut boundaries,
+                build,
+                ctx.cancel.is_cancelled(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("transcription_unavailable: {error}"))?;
+
+        match handoff {
+            TranscriptionHandoff::Succeeded { operation_id, body } => {
+                let provenance = TranscriptionProvenanceV1 {
+                    attachment_id,
+                    attachment_version,
+                    attachment_checksum,
+                    interval_start_us,
+                    interval_end_us,
+                    session_id: ctx.session.id.hyphenated().to_string(),
+                    canonical_project_digest: sha256_hex(ctx.session.project_id.as_bytes()),
+                    provider_id,
+                    endpoint_identity_digest: sha256_hex(origin.as_bytes()),
+                    endpoint_config_generation: 1,
+                    model_id: model.as_str().to_string(),
+                    credential_fingerprint_digest: credential_fingerprint.as_str().to_string(),
+                    transcription_request_digest: request_digest.as_str().to_string(),
+                    external_operation_id: operation_id.hyphenated().to_string(),
+                    external_attempt_number: 1,
+                };
+                let result = normalize_body(
+                    model,
+                    timestamps,
+                    diarization,
+                    &languages,
+                    &body,
+                    provenance,
+                )?;
+                let json = serde_json::to_string(&result)?;
+                Ok(ToolOutput::text(json))
+            }
+            TranscriptionHandoff::Cancelled { .. } => {
+                bail!("transcription_cancelled: the operation was cancelled before dispatch")
+            }
+            TranscriptionHandoff::CompletedAfterCancel { .. } => {
+                bail!(
+                    "transcription_cancelled: the provider completed after cancel; content was discarded"
+                )
+            }
+            TranscriptionHandoff::Failed { reason, .. } => {
+                bail!("{reason}")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_transcription::authorization::CredentialFingerprintDigest;
+    use crate::audio_transcription::dispatch::{
+        TranscriptionEgressError, TranscriptionEgressTransport, TranscriptionHttpResponse,
+    };
+    use crate::audio_transcription::journal::{
+        TranscriptionDestinationIdentity, TranscriptionDispatchService,
+    };
+    use crate::external_journal::ExternalJournal;
+    use crate::tool_media_authority::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
+    use crate::tool_media_authority::revalidator::RevalidatedSubject;
+    use crate::tool_media_authority::session_authority::{
+        AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, HandleEvidence,
+        LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority,
+    };
+    use crate::tools::common::test_ctx;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const FIXTURE_AUDIO: &[u8] = b"RIFF....WAVEfmt ";
+    const OK_BODY: &[u8] = br#"{"text":"hello from fixture","languages":[]}"#;
+
+    struct BytesResolver {
+        attachments: HashMap<[u8; 16], (AdmittedAttachment, Vec<u8>)>,
+    }
+
+    impl AttachmentResolver for BytesResolver {
+        fn resolve(
+            &self,
+            _session_id: &str,
+            attachment_id: &[u8; 16],
+        ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
+            Ok(self
+                .attachments
+                .get(attachment_id)
+                .map(|(att, _)| att.clone()))
+        }
+
+        fn read_bytes(&self, attachment: &AdmittedAttachment) -> Result<Vec<u8>, AdmissionDenial> {
+            self.attachments
+                .get(&attachment.attachment_id())
+                .map(|(_, bytes)| bytes.clone())
+                .ok_or(AdmissionDenial::AttachmentNotFound)
+        }
+    }
+
+    struct AllowAllPaths;
+    impl LocalPathPolicy for AllowAllPaths {
+        fn authorize(
+            &self,
+            _session_id: &str,
+            path: &str,
+        ) -> Result<(PathBuf, HandleEvidence), AdmissionDenial> {
+            Ok((
+                PathBuf::from(path),
+                HandleEvidence {
+                    metadata_fingerprint: [0x11; 32],
+                },
+            ))
+        }
+    }
+
+    struct HttpsFixture {
+        content: Vec<u8>,
+    }
+    impl RetainedHttpsPolicy for HttpsFixture {
+        fn admit(
+            &self,
+            _session_id: &str,
+            url: &str,
+        ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
+            Ok(AdmittedRetainedSource {
+                canonical_url: url.to_string(),
+                content: self.content.clone(),
+                content_type: "audio/wav".to_string(),
+            })
+        }
+    }
+
+    fn authority_with_attachment(
+        session_id: [u8; 16],
+        attachment_id: [u8; 16],
+        bytes: Vec<u8>,
+    ) -> SessionMediaAuthority {
+        let subject = RevalidatedSubject {
+            receipt: ToolMediaSubjectReceiptV1 {
+                issuer_kind: IssuerKind::LocalOwner,
+                principal_digest: [0x11; 32],
+                project_digest: [0x22; 32],
+                session_id,
+                authorization_epoch: 0,
+                subject_digest: [0x33; 32],
+            },
+            issuer_kind: IssuerKind::LocalOwner,
+            principal_digest: [0x11; 32],
+            project_digest: [0x22; 32],
+            session_id,
+            authorization_epoch: 0,
+        };
+        let mut attachments = HashMap::new();
+        attachments.insert(
+            attachment_id,
+            (
+                AdmittedAttachment {
+                    attachment_id,
+                    attachment_version: 1,
+                    checksum: {
+                        let digest = Sha256::digest(&bytes);
+                        let mut checksum = [0u8; 32];
+                        checksum.copy_from_slice(&digest);
+                        checksum
+                    },
+                    kind: 2,
+                },
+                bytes.clone(),
+            ),
+        );
+        SessionMediaAuthority::new(
+            subject,
+            Arc::new(BytesResolver { attachments }),
+            Arc::new(AllowAllPaths),
+            Arc::new(HttpsFixture { content: bytes }),
         )
+    }
+
+    struct OkTransport {
+        sends: AtomicUsize,
+    }
+    impl OkTransport {
+        fn new() -> Self {
+            Self {
+                sends: AtomicUsize::new(0),
+            }
+        }
+    }
+    #[async_trait]
+    impl TranscriptionEgressTransport for OkTransport {
+        async fn post_multipart(
+            &self,
+            _boundary: &str,
+            _body: Vec<u8>,
+        ) -> std::result::Result<TranscriptionHttpResponse, TranscriptionEgressError> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(TranscriptionHttpResponse {
+                status: 200,
+                body: OK_BODY.to_vec(),
+            })
+        }
+    }
+
+    fn dispatch_service(
+        tmp: &tempfile::TempDir,
+        transport: Arc<dyn TranscriptionEgressTransport>,
+    ) -> TranscriptionDispatchService {
+        let db = cockpit_db::Db::open(&tmp.path().join("journal.db")).unwrap();
+        let journal = ExternalJournal::for_test_at(db, &tmp.path().join("spool"));
+        TranscriptionDispatchService::new(
+            Arc::new(journal),
+            transport,
+            TranscriptionDestinationIdentity {
+                provider_id: "openai".into(),
+                origin: "https://api.openai.com".into(),
+                resolved_location: "public_network".into(),
+                credential_fingerprint: CredentialFingerprintDigest::from_raw_for_test(
+                    "aa".repeat(32),
+                ),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_fails_closed_without_media_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let err = TranscribeAudioTool
+            .call(
+                json!({"source": {"attachment_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("media_attachment_authority_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_tool_call_with_fake_egress_and_fixture_attachment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let attachment_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let authority = authority_with_attachment(
+            *ctx.session.id.as_bytes(),
+            *attachment_id.as_bytes(),
+            FIXTURE_AUDIO.to_vec(),
+        );
+        ctx = ctx.with_media_authority(Arc::new(authority));
+        let transport = Arc::new(OkTransport::new());
+        let journal_tmp = tempfile::tempdir().unwrap();
+        ctx.transcription_dispatch =
+            Some(Arc::new(dispatch_service(&journal_tmp, transport.clone())));
+
+        let output = TranscribeAudioTool
+            .call(
+                json!({"source": {"attachment_id": attachment_id.to_string()}}),
+                &ctx,
+            )
+            .await
+            .expect("tool call");
+        assert!(output.content.contains("hello from fixture"));
+        assert!(output.content.contains("\"kind\":\"plain\""));
+        assert_eq!(transport.sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_admits_https_source_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let authority = authority_with_attachment(
+            *ctx.session.id.as_bytes(),
+            [0x44; 16],
+            FIXTURE_AUDIO.to_vec(),
+        );
+        ctx = ctx.with_media_authority(Arc::new(authority));
+        let transport = Arc::new(OkTransport::new());
+        let journal_tmp = tempfile::tempdir().unwrap();
+        ctx.transcription_dispatch = Some(Arc::new(dispatch_service(&journal_tmp, transport)));
+
+        let output = TranscribeAudioTool
+            .call(
+                json!({"source": {"url": "https://example.test/a.wav"}}),
+                &ctx,
+            )
+            .await
+            .expect("https source");
+        assert!(output.content.contains("hello from fixture"));
     }
 }

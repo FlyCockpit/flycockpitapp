@@ -8017,6 +8017,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         shutdown_gate: agent.model.shutdown_gate(),
         approver: approver.clone(),
         image_generation_dispatch: None,
+        transcription_dispatch: None,
         deferred_log,
         root_agent_frame: false,
         skill_write_origin: payload.resume.call_origin,

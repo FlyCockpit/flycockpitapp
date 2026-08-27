@@ -789,6 +789,22 @@ impl ExternalJournal {
         Ok(())
     }
 
+    /// Load one operation by id. `None` if it does not exist.
+    pub async fn get(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<Option<ExternalJournalRecord>, ExternalJournalError> {
+        if self.db_faults().db_offline {
+            return Err(ExternalJournalError::Database(
+                "injected database outage".to_string(),
+            ));
+        }
+        self.db
+            .external_operation(operation_id)
+            .await
+            .map_err(db_error)
+    }
+
     /// Commit a `prepared` record. No filesystem or provider work happens here.
     pub async fn prepare(
         &self,

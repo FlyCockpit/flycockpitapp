@@ -318,6 +318,7 @@ impl Driver {
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
             image_generation_dispatch: None,
+            transcription_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,

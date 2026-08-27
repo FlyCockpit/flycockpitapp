@@ -146,6 +146,7 @@ impl App {
         self.rich_text_copy = tui_cfg.rich_text_copy;
         self.clipboard_recovery = tui_cfg.clipboard_recovery;
         self.use_emojis = tui_cfg.use_emojis;
+        self.file_icons = crate::tui::file_icons::file_icons_resolved(tui_cfg.file_icons);
         // Attention notification settings (implementation note):
         // pick up a `/settings` change so it takes effect immediately. The
         // debounce state intentionally survives — toggling the setting

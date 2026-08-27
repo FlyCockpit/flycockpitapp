@@ -810,6 +810,17 @@ impl UserSubmissionQueue {
         max: usize,
         target_id: Option<&str>,
     ) {
+        self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::Any)
+            .await;
+    }
+
+    pub async fn drain_into_for_filtered(
+        &self,
+        into: &mut Vec<UserSubmission>,
+        max: usize,
+        target_id: Option<&str>,
+        filter: QueueDrainFilter,
+    ) {
         while into.len() < max {
             // Independently addressable run invocations never share a provider
             // dispatch with another submission.
@@ -817,7 +828,7 @@ impl UserSubmissionQueue {
                 break;
             }
             if into.is_empty() {
-                match self.pop_one(target_id).await {
+                match self.pop_one_filtered(target_id, filter).await {
                     QueuePop::Item(submission) => {
                         let is_run = submission.run_invocation_id.is_some();
                         into.push(*submission);
@@ -830,25 +841,52 @@ impl UserSubmissionQueue {
                 continue;
             }
             // Do not fold a following run invocation into interactive work.
-            if self.peek_front_is_run_invocation(target_id).await {
+            if self
+                .peek_front_is_run_invocation_filtered(target_id, filter)
+                .await
+            {
                 break;
             }
-            match self.pop_one(target_id).await {
+            match self.pop_one_filtered(target_id, filter).await {
                 QueuePop::Item(submission) => into.push(*submission),
                 QueuePop::Empty | QueuePop::Closed | QueuePop::Deferred(_) => break,
             }
         }
     }
 
+    /// Drain steering (and send-now) items first, then held, preserving
+    /// original order within each group.
+    pub async fn drain_group_order_into_for(
+        &self,
+        into: &mut Vec<UserSubmission>,
+        max: usize,
+        target_id: Option<&str>,
+    ) {
+        self.drain_into_for_filtered(
+            into,
+            max,
+            target_id,
+            QueueDrainFilter::SteeringOrSendNow,
+        )
+        .await;
+        self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::Held)
+            .await;
+    }
+
     async fn peek_front_is_run_invocation(&self, target_id: Option<&str>) -> bool {
+        self.peek_front_is_run_invocation_filtered(target_id, QueueDrainFilter::Any)
+            .await
+    }
+
+    async fn peek_front_is_run_invocation_filtered(
+        &self,
+        target_id: Option<&str>,
+        filter: QueueDrainFilter,
+    ) -> bool {
         let state = self.inner.lock().await;
-        let item = match target_id {
-            Some(target_id) => state
-                .pending
-                .iter()
-                .find(|item| item.target.id == target_id),
-            None => state.pending.front(),
-        };
+        let item = state.pending.iter().find(|item| {
+            target_id.is_none_or(|target_id| item.target.id == target_id) && filter.matches(item)
+        });
         item.is_some_and(|item| item.submission.run_invocation_id.is_some())
     }
 
@@ -901,6 +939,14 @@ impl UserSubmissionQueue {
     }
 
     async fn pop_one(&self, target_id: Option<&str>) -> QueuePop {
+        self.pop_one_filtered(target_id, QueueDrainFilter::Any).await
+    }
+
+    async fn pop_one_filtered(
+        &self,
+        target_id: Option<&str>,
+        filter: QueueDrainFilter,
+    ) -> QueuePop {
         let (item, snapshot) = {
             let mut state = self.inner.lock().await;
             if state.closed {
@@ -909,13 +955,10 @@ impl UserSubmissionQueue {
             if state.staged_removal.is_some() {
                 return QueuePop::Empty;
             }
-            let idx = match target_id {
-                Some(target_id) => state
-                    .pending
-                    .iter()
-                    .position(|item| item.target.id == target_id),
-                None => (!state.pending.is_empty()).then_some(0),
-            };
+            let idx = state.pending.iter().position(|item| {
+                target_id.is_none_or(|target_id| item.target.id == target_id)
+                    && filter.matches(item)
+            });
             let Some(idx) = idx else {
                 return if state.closed {
                     QueuePop::Closed
@@ -966,6 +1009,25 @@ enum QueuePop {
     Empty,
     Deferred(tokio::time::Instant),
     Closed,
+}
+
+/// Which pending items a drain/pop may take. Mid-run steering uses
+/// [`Self::SteeringOrSendNow`]; run-end drains steering first, then held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueDrainFilter {
+    Any,
+    SteeringOrSendNow,
+    Held,
+}
+
+impl QueueDrainFilter {
+    fn matches(self, item: &QueuedSubmission) -> bool {
+        match self {
+            Self::Any => true,
+            Self::SteeringOrSendNow => item.send_now || item.delivery_class.is_steering(),
+            Self::Held => !item.send_now && item.delivery_class == QueueDeliveryClass::Held,
+        }
+    }
 }
 
 fn snapshot_pending(state: &UserSubmissionQueueState) -> Vec<QueuedUserMessage> {
@@ -2543,6 +2605,122 @@ mod tests {
                 .map(|item| item.delivery_class)
                 .collect::<Vec<_>>(),
             vec![QueueDeliveryClass::Held, QueueDeliveryClass::Held]
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_steering_preserves_group_order_and_leaves_held() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        let child = QueueTarget::child("explore", 1, "call-1", "default");
+
+        let mut first = UserSubmission::text("steer first");
+        first.delivery_class = QueueDeliveryClass::Steering;
+        let mut held = UserSubmission::text("hold");
+        held.delivery_class = QueueDeliveryClass::Held;
+        let mut second = UserSubmission::text("steer second");
+        second.delivery_class = QueueDeliveryClass::Steering;
+        let mut child_steer = UserSubmission::text("child steer");
+        child_steer.delivery_class = QueueDeliveryClass::Steering;
+
+        queue.push(first, target.clone()).await;
+        queue.push(held, target.clone()).await;
+        queue.push(second, target.clone()).await;
+        queue.push(child_steer, child.clone()).await;
+
+        let mut steering = Vec::new();
+        queue
+            .drain_into_for_filtered(
+                &mut steering,
+                16,
+                Some(&target.id),
+                QueueDrainFilter::SteeringOrSendNow,
+            )
+            .await;
+        assert_eq!(
+            steering
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["steer first", "steer second"]
+        );
+
+        let mut remaining = Vec::new();
+        queue
+            .drain_group_order_into_for(&mut remaining, usize::MAX, Some(&target.id))
+            .await;
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hold"]
+        );
+
+        let mut child_drained = Vec::new();
+        queue
+            .drain_into_for_filtered(
+                &mut child_drained,
+                16,
+                Some(&child.id),
+                QueueDrainFilter::SteeringOrSendNow,
+            )
+            .await;
+        assert_eq!(
+            child_drained
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child steer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_now_held_item_drains_with_steering_before_siblings() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+
+        let mut first_held = UserSubmission::text("held one");
+        first_held.delivery_class = QueueDeliveryClass::Held;
+        let mut second_held = UserSubmission::text("held two");
+        second_held.delivery_class = QueueDeliveryClass::Held;
+        let (first_id, _) = queue.push(first_held, target.clone()).await;
+        queue.push(second_held, target.clone()).await;
+        let (result, _, _) = queue.mark_send_now(first_id).await;
+        assert_eq!(result, RemoveQueuedMessageResult::Removed);
+
+        let mut send_now = Vec::new();
+        queue
+            .drain_into_for_filtered(
+                &mut send_now,
+                16,
+                Some(&target.id),
+                QueueDrainFilter::SteeringOrSendNow,
+            )
+            .await;
+        assert_eq!(
+            send_now
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["held one"]
+        );
+        let mut rest = Vec::new();
+        queue
+            .drain_into_for_filtered(
+                &mut rest,
+                16,
+                Some(&target.id),
+                QueueDrainFilter::Held,
+            )
+            .await;
+        assert_eq!(
+            rest.iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["held two"]
         );
     }
 }

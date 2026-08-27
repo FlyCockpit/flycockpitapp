@@ -157,6 +157,11 @@ pub enum DriverControl {
     #[cfg(test)]
     #[allow(dead_code)]
     AbortForTest,
+    /// Ask the driver to deliver send-now items at the next safe boundary.
+    /// Never cancels an in-flight tool; backgroundable tools (`bash`) are
+    /// intended to convert to async completion, and every other tool waits
+    /// for Continue/Done.
+    FlushSendNow,
     /// Run snapshot dedup on the foreground agent now. `confirmed` is
     /// always true here — the confirm UX lives in the TUI; by the time a
     /// `Prune` reaches the driver the user has already accepted the
@@ -572,6 +577,12 @@ pub enum ParkedReplayOutcome {
 /// concat-joining a hundred would bloat the next inference. If we
 /// hit this cap, extras stay in the channel for the *next* fold.
 const MAX_FOLD: usize = 16;
+
+enum SteeringInject {
+    NextPrompt(crate::engine::message::Message),
+    Requeued,
+    Aborted,
+}
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
 /// After a goal-supervision swarm spawn is refused, its control job stays leased
 /// for the 300s lease TTL. Wake the goal loop a bit past that so a QUIESCENT
@@ -5046,6 +5057,16 @@ impl Driver {
                     tracing::warn!(%error, "waking supervised goal failed");
                 }
             }
+            DriverControl::FlushSendNow => {
+                // Safe-point path: this control is only applied at idle
+                // (`at_safe_boundary`). In-flight `bash` conversion to async
+                // completion is TODO; until then send-now items drain with
+                // steering at the next Continue/Done. Never kill the tool.
+                tracing::debug!(
+                    backgroundable = ?Self::SEND_NOW_BACKGROUNDABLE_TOOLS,
+                    "send-now flush observed at a safe boundary"
+                );
+            }
             DriverControl::ResumeAcceptedLateUserDecisionSteer {
                 agent_instance_id,
                 steer_id,
@@ -7003,6 +7024,96 @@ impl Driver {
         );
         self.auto_compact_gate
             .observe_submission(submission.origin, has_oversized_artifact_lease);
+    }
+
+    /// Tools whose in-flight execution can be adopted by the
+    /// background-terminal/async machinery so `[send now]` injects without
+    /// waiting for the call to finish. Conversion itself is still a
+    /// follow-on; until it lands, send-now waits for the next Continue/Done
+    /// safe point. Never cancel/kill the in-flight call.
+    const SEND_NOW_BACKGROUNDABLE_TOOLS: &'static [&'static str] = &["bash"];
+
+    /// Fold steering/send-now (and run-end remaining) items as `ExternalRoot`
+    /// user messages. Gate observation is owned by [`Self::record_queued_user_fold`];
+    /// the rebuilt prompt is inventory-only and cannot move the gate.
+    async fn inject_steering_user_submissions(
+        &mut self,
+        queued: Vec<UserSubmission>,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> SteeringInject {
+        let mut next_prompt = None;
+        for queued in queued {
+            let queue_item_ids = queued.queue_item_ids.clone();
+            match queued.kind {
+                UserSubmissionKind::Compact => {
+                    input_rx
+                        .requeue_front(queued, self.active_queue_target())
+                        .await;
+                    if let Some(frame) = self.stack.last_mut()
+                        && next_prompt.is_none()
+                    {
+                        let _ = frame.history.pop();
+                    }
+                    return match next_prompt {
+                        Some(message) => SteeringInject::NextPrompt(message),
+                        None => SteeringInject::Requeued,
+                    };
+                }
+                UserSubmissionKind::User => {
+                    let Some(prepared) = self
+                        .prepare_queued_user_submission(queued, input_rx, tx)
+                        .await
+                    else {
+                        input_rx.finish(&queue_item_ids).await;
+                        return SteeringInject::Aborted;
+                    };
+                    if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+                        input_rx
+                            .requeue_front_after(
+                                prepared,
+                                self.active_queue_target(),
+                                DURABLE_SUBMISSION_RETRY_BACKOFF,
+                            )
+                            .await;
+                        return match next_prompt {
+                            Some(message) => SteeringInject::NextPrompt(message),
+                            None => SteeringInject::Requeued,
+                        };
+                    }
+                    input_rx.finish(&queue_item_ids).await;
+                    self.reset_delegation_retry_budget();
+                    let message = crate::engine::message::build_user_message(UserSubmission {
+                        expected_model_state_generation: None,
+                        expected_model: None,
+                        kind: UserSubmissionKind::User,
+                        origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+                        text: self.with_time_prelude(prepared.text),
+                        display_text: prepared.display_text,
+                        tag_expansions: prepared.tag_expansions,
+                        images: prepared.images,
+                        forced_skill: None,
+                        origin_principal: prepared.origin_principal,
+                        job_id: None,
+                        preflight_cleaned: prepared.preflight_cleaned,
+                        queue_item_ids: prepared.queue_item_ids,
+                        client_submissions: prepared.client_submissions,
+                        queue_target: prepared.queue_target,
+                        pending_terminal_disposition: None,
+                        run_invocation_id: prepared.run_invocation_id,
+                    });
+                    if let Some(previous) = next_prompt.replace(message)
+                        && let Some(frame) = self.stack.last_mut()
+                    {
+                        frame.history.push(previous);
+                    }
+                }
+            }
+        }
+        match next_prompt {
+            Some(message) => SteeringInject::NextPrompt(message),
+            None => SteeringInject::Requeued,
+        }
     }
 
     async fn record_queued_user_fold(
@@ -10805,62 +10916,27 @@ impl Driver {
                             .expect("Continue with empty history is unreachable")
                     };
 
-                    // Carry at most one queued user message onto this upcoming
-                    // inference. Later queued messages remain pending so their
-                    // original turn boundaries and metadata are preserved.
+                    // Steering (and send-now) inject at this focused-agent
+                    // turn boundary. Held items wait for run-end. Within the
+                    // steering group, original queue order is preserved.
                     let mut queued: Vec<UserSubmission> = Vec::new();
-                    drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
-                    if let Some(queued) = queued.into_iter().next() {
-                        let queue_item_ids = queued.queue_item_ids.clone();
+                    drain_steering_queue(input_rx, &mut queued, &target_id, MAX_FOLD).await;
+                    if queued.is_empty() {
+                        next_prompt = last_tool_result;
+                    } else {
                         self.stack
                             .last_mut()
                             .expect("stack never empty")
                             .history
                             .push(last_tool_result.clone());
-                        match queued.kind {
-                            UserSubmissionKind::Compact => {
-                                input_rx
-                                    .requeue_front(queued, self.active_queue_target())
-                                    .await;
-                                if let Some(frame) = self.stack.last_mut() {
-                                    let _ = frame.history.pop();
-                                }
-                                next_prompt = last_tool_result;
-                            }
-                            UserSubmissionKind::User => {
-                                let Some(prepared) = self
-                                    .prepare_queued_user_submission(queued, input_rx, tx)
-                                    .await
-                                else {
-                                    input_rx.finish(&queue_item_ids).await;
-                                    return Ok(());
-                                };
-                                if self.record_queued_user_fold(&prepared, tx).await.is_err() {
-                                    input_rx
-                                        .requeue_front_after(
-                                            prepared,
-                                            self.active_queue_target(),
-                                            DURABLE_SUBMISSION_RETRY_BACKOFF,
-                                        )
-                                        .await;
-                                    if let Some(frame) = self.stack.last_mut() {
-                                        let _ = frame.history.pop();
-                                    }
-                                    next_prompt = last_tool_result;
-                                    continue;
-                                }
-                                input_rx.finish(&queue_item_ids).await;
-                                self.reset_delegation_retry_budget();
-                                next_prompt = crate::engine::message::build_user_message(
-                                    auto_continue_submission(
-                                        self.with_time_prelude(prepared.text),
-                                        prepared.images,
-                                    ),
-                                );
-                            }
+                        match self
+                            .inject_steering_user_submissions(queued, input_rx, tx)
+                            .await
+                        {
+                            SteeringInject::NextPrompt(message) => next_prompt = message,
+                            SteeringInject::Requeued => next_prompt = last_tool_result,
+                            SteeringInject::Aborted => return Ok(()),
                         }
-                    } else {
-                        next_prompt = last_tool_result;
                     }
                     continue;
                 }
@@ -10964,46 +11040,42 @@ impl Driver {
                     if late_user_steer_permit.is_none() {
                         let mut queued: Vec<UserSubmission> = Vec::new();
                         let target_id = self.active_queue_target_id();
-                        drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
-                        if let Some(queued) = queued.into_iter().next() {
-                            let queue_item_ids = queued.queue_item_ids.clone();
-                            match queued.kind {
-                                UserSubmissionKind::Compact => {
-                                    self.do_compact(tx).await;
-                                    input_rx.finish(&queue_item_ids).await;
+                        // Run completion is a delivery boundary: remaining
+                        // steering then held items deliver in group order so
+                        // nothing is stranded.
+                        drain_group_order_queue(
+                            input_rx,
+                            &mut queued,
+                            &target_id,
+                            usize::MAX,
+                        )
+                        .await;
+                        if queued
+                            .first()
+                            .is_some_and(|item| item.kind == UserSubmissionKind::Compact)
+                        {
+                            let compact = queued.remove(0);
+                            let queue_item_ids = compact.queue_item_ids.clone();
+                            self.do_compact(tx).await;
+                            input_rx.finish(&queue_item_ids).await;
+                            for leftover in queued.into_iter().rev() {
+                                input_rx
+                                    .requeue_front(leftover, self.active_queue_target())
+                                    .await;
+                            }
+                            continue;
+                        }
+                        if !queued.is_empty() {
+                            match self
+                                .inject_steering_user_submissions(queued, input_rx, tx)
+                                .await
+                            {
+                                SteeringInject::NextPrompt(message) => {
+                                    next_prompt = message;
                                     continue;
                                 }
-                                UserSubmissionKind::User => {
-                                    let Some(prepared) = self
-                                        .prepare_queued_user_submission(queued, input_rx, tx)
-                                        .await
-                                    else {
-                                        input_rx.finish(&queue_item_ids).await;
-                                        return Ok(());
-                                    };
-                                    if self.record_queued_user_fold(&prepared, tx).await.is_err() {
-                                        input_rx
-                                            .requeue_front_after(
-                                                prepared,
-                                                self.active_queue_target(),
-                                                DURABLE_SUBMISSION_RETRY_BACKOFF,
-                                            )
-                                            .await;
-                                        return Ok(());
-                                    }
-                                    input_rx.finish(&queue_item_ids).await;
-                                    self.reset_delegation_retry_budget();
-                                    next_prompt = crate::engine::message::build_user_message(
-                                        goal_continuation_submission(
-                                            prepared.text,
-                                            prepared.images,
-                                            prepared.run_invocation_id,
-                                        ),
-                                    );
-                                    // Continue under the next invocation's identity when present.
-                                    // (Outer `run_invocation_id` still binds the original run.)
-                                    continue;
-                                }
+                                SteeringInject::Requeued => {}
+                                SteeringInject::Aborted => return Ok(()),
                             }
                         }
                     }

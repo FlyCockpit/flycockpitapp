@@ -9376,6 +9376,16 @@ pub(super) async fn run_worker(
                 } => {
                     let (result, item, snapshot) =
                         driver_input_queue.mark_send_now(queue_item_id).await;
+                    if matches!(result, crate::engine::message::RemoveQueuedMessageResult::Removed)
+                    {
+                        // TODO: if the in-flight tool is backgroundable (`bash`),
+                        // convert it to async completion so the boundary arrives
+                        // immediately. Until then this control is observed at
+                        // idle; mid-run send-now waits for Continue/Done.
+                        let _ = driver_control_tx
+                            .send(crate::engine::driver::DriverControl::FlushSendNow)
+                            .await;
+                    }
                     let reason = remove_reason_to_proto(result);
                     let _ = respond_to.send(Ok(proto::SendNowQueuedUserMessageResult {
                         applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),

@@ -118,9 +118,7 @@ impl App {
                 + geometry.entry_start_row(idx)
                 + geometry.entry_height(idx).saturating_sub(1);
             if last_row < visible_top {
-                found = Some(StickyUserTarget {
-                    history_index: idx,
-                });
+                found = Some(StickyUserTarget { history_index: idx });
             }
         }
         found

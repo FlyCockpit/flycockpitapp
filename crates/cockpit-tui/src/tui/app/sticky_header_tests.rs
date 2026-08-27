@@ -147,7 +147,10 @@ fn layout_carves_two_lines_when_header_is_on() {
     let header = app.sticky_header_area.expect("header should show at tail");
     assert_eq!(header.height, STICKY_USER_HEADER_HEIGHT);
     assert_eq!(header.y, 0);
-    assert_eq!(app.chat_visible_lines, 10 - STICKY_USER_HEADER_HEIGHT as usize);
+    assert_eq!(
+        app.chat_visible_lines,
+        10 - STICKY_USER_HEADER_HEIGHT as usize
+    );
     let chat = app.chat_area.expect("history area after carve");
     assert_eq!(chat.y, STICKY_USER_HEADER_HEIGHT);
     assert_eq!(chat.height, 10 - STICKY_USER_HEADER_HEIGHT);
@@ -230,10 +233,7 @@ fn target_derivation_matrix() {
     }
 
     // Scrolled to the top of the buffer: every user is visible.
-    let max_offset = app
-        .chat_total_lines
-        .saturating_sub(10)
-        .max(1);
+    let max_offset = app.chat_total_lines.saturating_sub(10).max(1);
     app.set_chat_scroll_offset_from_interaction(max_offset);
     assert!(
         app.sticky_user_target(10).is_none(),
@@ -258,11 +258,7 @@ fn target_derivation_matrix() {
     banner.history = vec![user("hello")].into();
     render_history_direct(&mut banner, 100, 24);
     if banner.chat_banner_lines > 0 {
-        let top = chat_visible_top(
-            banner.chat_total_lines,
-            24,
-            banner.chat_scroll_offset,
-        );
+        let top = chat_visible_top(banner.chat_total_lines, 24, banner.chat_scroll_offset);
         if top < banner.chat_banner_lines {
             assert!(
                 banner.sticky_user_target(24).is_none(),
@@ -322,13 +318,14 @@ fn click_jump_lands_with_two_row_margin() {
     render_sticky(&mut app, 40, 10);
     let header = app.sticky_header_area.expect("header");
     let idx = app.sticky_header_history_index.expect("target");
-    let rel = *app
-        .msg_abs_line
-        .get(&idx)
-        .expect("target has an abs line");
+    let rel = *app.msg_abs_line.get(&idx).expect("target has an abs line");
     let abs = app.chat_banner_lines + rel;
 
-    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), header.x, header.y));
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        header.x,
+        header.y,
+    ));
 
     let visible = app.chat_visible_lines.max(1);
     let top = chat_visible_top(app.chat_total_lines, visible, app.chat_scroll_offset);
@@ -351,7 +348,10 @@ fn home_key_jumps_to_sticky_target_when_composer_empty() {
     let before = app.chat_scroll_offset;
 
     app.handle_key(press(KeyCode::Home));
-    assert_ne!(app.chat_scroll_offset, before, "Home jumps when composer is empty");
+    assert_ne!(
+        app.chat_scroll_offset, before,
+        "Home jumps when composer is empty"
+    );
     let visible = app.chat_visible_lines.max(1);
     let top = chat_visible_top(app.chat_total_lines, visible, app.chat_scroll_offset);
     assert_eq!(top, abs.saturating_sub(2));
@@ -434,9 +434,8 @@ fn anchor_round_trip_is_stable_across_header_appear_and_disappear() {
         offset_with_header,
     );
 
-    app.history.push(agent(
-        "new bottom row should not yank the sticky viewport",
-    ));
+    app.history
+        .push(agent("new bottom row should not yank the sticky viewport"));
     render_sticky(&mut app, 40, 10);
     let top_after_push = chat_visible_top(
         app.chat_total_lines,

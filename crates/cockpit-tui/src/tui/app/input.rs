@@ -1433,9 +1433,7 @@ impl App {
                 self.scroll_chat_down(self.chat_scroll_offset);
                 true
             }
-            KeyCode::Home
-                if self.composer.is_empty() && self.sticky_header_area.is_some() =>
-            {
+            KeyCode::Home if self.composer.is_empty() && self.sticky_header_area.is_some() => {
                 self.jump_to_sticky_user_header();
                 true
             }

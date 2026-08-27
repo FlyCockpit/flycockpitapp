@@ -74,6 +74,198 @@ fn write_host_tool_surface(agents_dir: &std::path::Path, name: &str, tools: &[&s
     .unwrap();
 }
 
+/// Issue #57 AC1/AC3 at the production Driver boundary.  This intentionally
+/// goes through `run_user_input`: the provider-authored mixed turn is planned,
+/// admitted, executed, persisted, folded back into provider history, and only
+/// then followed by the next inference.  Planner-only tests cannot prove any
+/// of those wiring points.
+#[test]
+fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
+
+        let delegate = |id: &str, agent: &str, prompt: &str| {
+            (
+                id.to_string(),
+                "task".to_string(),
+                serde_json::json!({
+                    "intent": "delegate",
+                    "payload": {
+                        "agent": agent,
+                        "prompt": prompt,
+                        "mode": "subagent",
+                        "context": "fresh"
+                    }
+                }),
+            )
+        };
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ParallelToolCalls(vec![
+                delegate("delegate-a", "readonly-probe", "inspect alpha"),
+                (
+                    "read-middle".into(),
+                    "read".into(),
+                    serde_json::json!({ "path": "middle.txt" }),
+                ),
+                delegate("delegate-b", "readonly-probe", "inspect beta"),
+                // `explore` carries Dynamic `bash`, so parallel admission
+                // rejects it and the real lane must drain before it runs as a
+                // serial delegate barrier.
+                delegate("delegate-barrier", "explore", "inspect serially"),
+            ]))
+            // The two concurrently admitted children may claim these two
+            // equivalent terminal responses in either wall-clock order.
+            .turn(Turn::Text("delegate completed".into()))
+            .turn(Turn::Text("delegate completed".into()))
+            .turn(Turn::Text("serial delegate completed".into()))
+            .turn(Turn::Text("parent observed all results".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = test_driver_with_url_vnext(8, provider.base_url());
+        std::fs::write(tmp.path().join("middle.txt"), "middle body").unwrap();
+
+        let config_dir = tmp.path().join(".cockpit");
+        let agents_dir = config_dir.join("agents");
+        let providers_dir = config_dir.join("providers");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("readonly-probe.md"),
+            vnext_coding_agent_document(
+                "readonly-probe",
+                "read-only scheduler fixture",
+                "Return a short deterministic report.",
+            ),
+        )
+        .unwrap();
+        write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
+        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
+        std::fs::write(
+            config_dir.join("config.json"),
+            serde_json::json!({
+                "active_model": { "provider": "lmstudio", "model": "local" },
+                "delegation": { "maxParallel": 2 }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            providers_dir.join("lmstudio.json"),
+            serde_json::json!({
+                "url": provider.base_url(),
+                "wireApi": "completions",
+                "models": [{ "id": "local", "subagent_invokable": true }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        driver.refresh_config_from_disk_for_tests();
+
+        let trust = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+        crate::config::trust::scope_workspace_trust_policy(
+            trust,
+            driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx),
+        )
+        .await
+        .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let spawned = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::SubagentSpawned { task_call_id, .. } => Some(task_call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spawned,
+            vec!["delegate-a", "delegate-b", "delegate-barrier"]
+        );
+
+        let posts = provider
+            .captured()
+            .into_iter()
+            .filter(|request| request.request_line.starts_with("POST "))
+            .collect::<Vec<_>>();
+        let parent_resume = posts
+            .iter()
+            .find(|request| {
+                request.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .count()
+                        == 4
+                })
+            })
+            .expect("parent resumes only after the complete mixed lane drains");
+        let result_ids = parent_resume.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| message["tool_call_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result_ids,
+            vec![
+                "delegate-a",
+                "read-middle",
+                "delegate-b",
+                "delegate-barrier"
+            ]
+        );
+
+        let lifecycle = driver
+            .session
+            .db
+            .list_task_delegation_children(driver.session.id)
+            .await
+            .unwrap();
+        assert_eq!(lifecycle.len(), 3);
+        assert_ne!(lifecycle[0].task_call_id, lifecycle[1].task_call_id);
+        assert_eq!(
+            lifecycle
+                .iter()
+                .map(|row| row.task_call_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["delegate-a", "delegate-b", "delegate-barrier"])
+        );
+
+        let durable = driver
+            .session
+            .db
+            .list_session_events(driver.session.id)
+            .await
+            .unwrap();
+        let terminal_ids = durable
+            .iter()
+            .filter(|event| event.kind == "tool_call_scheduling")
+            .filter(|event| event.data.get("terminal_outcome").is_some())
+            .filter_map(|event| event.call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal_ids,
+            vec![
+                "delegate-a",
+                "read-middle",
+                "delegate-b",
+                "delegate-barrier"
+            ]
+        );
+    });
+}
+
 #[tokio::test]
 async fn child_failure_carries_structured_envelope_to_parent() {
     let fallback_tried = vec![crate::engine::agent::FailoverAttempt {

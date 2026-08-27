@@ -1847,6 +1847,10 @@ struct PendingTurn {
     /// resumed Responses turn echoes the provider's wire handle without
     /// losing Cockpit's durable call correlation.
     results: Vec<(ToolCallId, Option<ProviderCallId>, String, String)>,
+    /// Durable scheduler source positions for calls in this inference. Public
+    /// timeline rows and crash-only continuation rows can be encountered in a
+    /// different order, but provider replay must retain the model's order.
+    scheduler_source_order: std::collections::HashMap<String, (uuid::Uuid, usize)>,
 }
 
 impl PendingTurn {
@@ -1857,9 +1861,25 @@ impl PendingTurn {
     /// Flush the buffered assistant turn (text + tool calls) and its tool
     /// results into `history`. A turn with no text and no calls contributes
     /// nothing.
-    fn flush(self, history: &mut Vec<Message>) {
+    fn flush(mut self, history: &mut Vec<Message>) {
         if self.is_empty() {
             return;
+        }
+        let source_order = &self.scheduler_source_order;
+        if scheduler_turn_is_complete(source_order, self.calls.iter().map(|call| call.id.as_ref()))
+        {
+            self.calls.sort_by_key(|call| {
+                source_order
+                    .get(call.id.as_ref())
+                    .expect("scheduler completeness checked")
+                    .1
+            });
+            self.results.sort_by_key(|result| {
+                source_order
+                    .get(result.0.as_ref())
+                    .expect("scheduler completeness checked")
+                    .1
+            });
         }
         let mut content: Vec<AssistantContent> = Vec::new();
         let text = self.text_parts.join("\n");
@@ -1890,6 +1910,25 @@ impl PendingTurn {
     }
 }
 
+fn scheduler_turn_is_complete<'a>(
+    source_order: &std::collections::HashMap<String, (uuid::Uuid, usize)>,
+    call_ids: impl Iterator<Item = &'a str>,
+) -> bool {
+    let mut turn_id = None;
+    let mut saw_call = false;
+    for call_id in call_ids {
+        let Some((call_turn_id, _)) = source_order.get(call_id) else {
+            return false;
+        };
+        if turn_id.is_some_and(|turn_id| turn_id != *call_turn_id) {
+            return false;
+        }
+        turn_id = Some(*call_turn_id);
+        saw_call = true;
+    }
+    saw_call
+}
+
 /// Walk the root agent's events (seq order) + the tool-call rows and
 /// assemble the provider-valid message list. The tool-call rows are keyed
 /// by `call_id` for the canonical wire input + result body; `task`
@@ -1918,6 +1957,10 @@ fn append_interrupted_scheduler_continuation(
     continuation: &crate::db::turn_scheduler_continuations::TurnSchedulerContinuationRow,
     durable_tool_call: Option<&ToolCallEvent>,
 ) {
+    pending.scheduler_source_order.insert(
+        continuation.call_id.clone(),
+        (continuation.turn_id, continuation.source_index),
+    );
     let provider = continuation
         .provider_call_id
         .clone()
@@ -2524,6 +2567,10 @@ fn rebuild_history(
                 for continuation in scheduler_continuations.iter().filter(|continuation| {
                     continuation.agent_id == root_agent && continuation.turn_id == turn_id
                 }) {
+                    pending.scheduler_source_order.insert(
+                        continuation.call_id.clone(),
+                        (continuation.turn_id, continuation.source_index),
+                    );
                     if !publicly_represented_calls.contains(&continuation.call_id) {
                         append_interrupted_scheduler_continuation(
                             &mut pending,
@@ -6124,6 +6171,49 @@ mod tests {
                 && body != ABORTED_CALL_BODY
         }));
         validate_pairing(&restored.history).unwrap();
+    }
+
+    #[test]
+    fn scheduler_partial_crash_materialization_keeps_source_order() {
+        let turn_id = uuid::Uuid::new_v4();
+        let call = |id: &str| ToolCall {
+            id: ToolCallId::new_or_mint(id.to_string()),
+            provider: None,
+            function: ToolFunction {
+                name: "read".to_string(),
+                arguments: json!({ "path": id }),
+            },
+            signature: None,
+            additional_params: None,
+        };
+        let mut pending = PendingTurn::default();
+        // A crash can expose the later private continuation before replay
+        // encounters the earlier call's public settled row.
+        for (id, source_index, body) in [("later", 1, "interrupted"), ("earlier", 0, "ok")] {
+            let call = call(id);
+            pending.calls.push(call.clone());
+            pending
+                .results
+                .push((call.id, None, "read".to_string(), body.to_string()));
+            pending
+                .scheduler_source_order
+                .insert(id.to_string(), (turn_id, source_index));
+        }
+
+        let mut history = Vec::new();
+        pending.flush(&mut history);
+        assert_eq!(
+            assistant_calls(&history[0])
+                .iter()
+                .map(|call| call.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["earlier", "later"]
+        );
+        assert_eq!(result_ids(&history[1]), vec!["earlier"]);
+        assert_eq!(result_ids(&history[2]), vec!["later"]);
+        assert_eq!(tool_result_body(&history[1]), "ok");
+        assert_eq!(tool_result_body(&history[2]), "interrupted");
+        validate_pairing(&history).expect("source-ordered materialization remains provider-valid");
     }
 
     /// The live heal is a no-op (byte-identical, no heals) on an already-paired

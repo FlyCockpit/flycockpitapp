@@ -76,12 +76,12 @@ impl SchedulerDurablePermit {
         }
     }
 
-    async fn await_started(&self) {
+    pub(crate) async fn await_started(&self) {
         SchedulerDurableOrder::wait_for(&self.order.next_started, self.ordinal, &self.order.notify)
             .await;
     }
 
-    fn release_started(&mut self) {
+    pub(crate) fn release_started(&mut self) {
         if !self.started_released {
             self.started_released = true;
             self.order.release(
@@ -92,7 +92,7 @@ impl SchedulerDurablePermit {
         }
     }
 
-    async fn await_commit(&mut self) {
+    pub(crate) async fn await_commit(&mut self) {
         SchedulerDurableOrder::wait_for(&self.order.next_commit, self.ordinal, &self.order.notify)
             .await;
     }

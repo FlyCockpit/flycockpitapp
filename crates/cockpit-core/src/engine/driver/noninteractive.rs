@@ -2654,14 +2654,20 @@ impl Driver {
         errors: &mut std::collections::BTreeMap<usize, anyhow::Error>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
+        let first_delegate_source = delegates
+            .values()
+            .map(|(source_index, _)| *source_index)
+            .min();
         let pending_delegate_id = delegates
-            .keys()
-            .find(|call_id| {
-                self.pending_noninteractive_completions
-                    .iter()
-                    .any(|completion| completion.task_call_id() == call_id.as_str())
+            .iter()
+            .find(|(call_id, (source_index, _))| {
+                Some(*source_index) == first_delegate_source
+                    && self
+                        .pending_noninteractive_completions
+                        .iter()
+                        .any(|completion| completion.task_call_id() == call_id.as_str())
             })
-            .cloned();
+            .map(|(call_id, _)| call_id.clone());
         let completion = pending_delegate_id
             .as_deref()
             .and_then(|call_id| self.take_pending_noninteractive_completion(call_id));
@@ -2695,11 +2701,24 @@ impl Driver {
             }
             Ready::Delegate(Some(completion)) => {
                 let task_call_id = completion.task_call_id().to_string();
-                let Some((source_index, delegate)) = delegates.remove(&task_call_id) else {
+                let next_delegate_source = delegates
+                    .values()
+                    .map(|(source_index, _)| *source_index)
+                    .min();
+                let completion_source = delegates
+                    .get(&task_call_id)
+                    .map(|(source_index, _)| *source_index);
+                if completion_source != next_delegate_source {
+                    self.pending_noninteractive_completions
+                        .push_back(completion);
+                    return;
+                }
+                let Some((source_index, mut delegate)) = delegates.remove(&task_call_id) else {
                     self.pending_noninteractive_completions
                         .push_back(completion);
                     return;
                 };
+                delegate.await_durable_commit().await;
                 match self
                     .finalize_background_noninteractive_completion(Some(completion), tx)
                     .await
@@ -2729,7 +2748,13 @@ impl Driver {
                     .map(|(source_index, _)| *source_index)
                     .min()
                     .unwrap_or(usize::MAX);
-                for (_, (source_index, delegate)) in delegates.drain() {
+                let mut interrupted = delegates
+                    .drain()
+                    .map(|(_, entry)| entry)
+                    .collect::<Vec<_>>();
+                interrupted.sort_by_key(|(source_index, _)| *source_index);
+                for (source_index, mut delegate) in interrupted {
+                    delegate.await_durable_commit().await;
                     results.insert(source_index, SchedulerLaneSettled {
                         messages: vec![delegate.interrupted_message()],
                         terminal_record: delegate.terminal_record(),
@@ -2798,9 +2823,10 @@ impl Driver {
                             .await;
                     });
                 }
-                crate::engine::agent::DeferredParallelCall::Delegate(delegate) => {
+                crate::engine::agent::DeferredParallelCall::Delegate(mut delegate) => {
                     let source_index = delegate.source_index;
                     let call_id = delegate.call_id.clone();
+                    delegate.await_durable_start().await;
                     // This exact FIFO source position is now ready. Repin before
                     // even resolving the structural delegate recipe; no later
                     // candidate is selected/built ahead of a discovered barrier.
@@ -2808,6 +2834,8 @@ impl Driver {
                     let resolved_outcome = match delegate.resolve_outcome(&self.config).await {
                         Ok(outcome) => outcome,
                         Err(error) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
                             results.insert(source_index, SchedulerLaneSettled {
                                 messages: vec![delegate.interrupted_message()],
                                 terminal_record: delegate.terminal_record(),
@@ -2824,6 +2852,8 @@ impl Driver {
                             task_function_call_id,
                             body,
                         } => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
                             let terminal = if body.trim_start().starts_with("Error:") {
                                 crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused
                             } else {
@@ -2848,6 +2878,8 @@ impl Driver {
                         &outcome,
                         crate::engine::agent::TurnOutcome::SpawnNoninteractive { .. }
                     ) {
+                        delegate.release_durable_start();
+                        delegate.await_durable_commit().await;
                         results.insert(source_index, SchedulerLaneSettled {
                             messages: vec![delegate.interrupted_message()],
                             terminal_record: delegate.terminal_record(),
@@ -2864,6 +2896,8 @@ impl Driver {
                     let mut task = match self.scheduler_probe_task_from_outcome(outcome) {
                         Ok(task) => task,
                         Err(message) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
                             results.insert(source_index, SchedulerLaneSettled {
                                 messages: vec![message],
                                 terminal_record: delegate.terminal_record(),
@@ -2877,6 +2911,8 @@ impl Driver {
                     {
                         Ok(admissible) => admissible,
                         Err(error) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
                             results.insert(source_index, SchedulerLaneSettled {
                                     messages: vec![crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                         task.task_call_id.clone(),
@@ -2910,6 +2946,8 @@ impl Driver {
                         {
                             Ok(admissible) => admissible,
                             Err(error) => {
+                                delegate.release_durable_start();
+                                delegate.await_durable_commit().await;
                                 results.insert(source_index, SchedulerLaneSettled {
                                         messages: vec![crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                             task.task_call_id.clone(),
@@ -2930,6 +2968,8 @@ impl Driver {
                     // the immutable surface above is the generation bound to
                     // this immediately-starting attempt.
                     if let Err(message) = self.admit_scheduler_probe_task(&task).await {
+                        delegate.release_durable_start();
+                        delegate.await_durable_commit().await;
                         results.insert(source_index, SchedulerLaneSettled {
                             messages: vec![message],
                             terminal_record: delegate.terminal_record(),
@@ -2947,6 +2987,8 @@ impl Driver {
                         .await
                     {
                         Ok(Some(message)) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
                             results.insert(source_index, SchedulerLaneSettled {
                                 messages: vec![message],
                                 terminal_record: delegate.terminal_record(),
@@ -2954,9 +2996,12 @@ impl Driver {
                             });
                         }
                         Ok(None) => {
+                            delegate.release_durable_start();
                             delegates.insert(call_id, (source_index, delegate));
                         }
                         Err(error) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
                             results.insert(source_index, SchedulerLaneSettled {
                                 messages: vec![delegate.interrupted_message()],
                                 terminal_record: delegate.terminal_record(),

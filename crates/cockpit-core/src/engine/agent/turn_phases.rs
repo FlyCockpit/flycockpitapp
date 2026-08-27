@@ -409,9 +409,22 @@ pub(crate) struct DeferredDelegateCall {
     session: Arc<Session>,
     tx: mpsc::Sender<TurnEvent>,
     agent_id: String,
+    durable_permit: super::tool_dispatch::SchedulerDurablePermit,
 }
 
 impl DeferredDelegateCall {
+    pub(crate) async fn await_durable_start(&self) {
+        self.durable_permit.await_started().await;
+    }
+
+    pub(crate) fn release_durable_start(&mut self) {
+        self.durable_permit.release_started();
+    }
+
+    pub(crate) async fn await_durable_commit(&mut self) {
+        self.durable_permit.await_commit().await;
+    }
+
     pub(crate) fn terminal_record(&self) -> DeferredSchedulerTerminalRecord {
         DeferredSchedulerTerminalRecord {
             scheduled: self.scheduled.clone(),
@@ -634,7 +647,12 @@ impl DeferredTurnPlan {
                         session: self.session.clone(),
                         tx: self.tx.clone(),
                         agent_id: self.tool_ctx.agent_id.clone(),
+                        durable_permit: super::tool_dispatch::SchedulerDurablePermit::new(
+                            durable_order.clone(),
+                            durable_ordinal,
+                        ),
                     }));
+                    durable_ordinal += 1;
                 }
                 return Ok(TurnOutcome::ScheduledParallelLane {
                     lane: Box::new(DeferredParallelLane {
@@ -706,6 +724,102 @@ impl DeferredTurnPlan {
                     }
                 },
             }
+        }
+    }
+}
+
+/// Advance a scheduler plan for an isolated utility loop that has no Driver.
+/// Such loops may execute ordinary tools only; structural/delegate outcomes
+/// remain fail-closed because only the Driver owns their lifecycle authority.
+pub(crate) async fn advance_ordinary_utility_turn_plan(
+    plan: &mut DeferredTurnPlan,
+    agent: &Agent,
+    history: &mut Vec<Message>,
+) -> Result<TurnOutcome> {
+    loop {
+        match plan.advance_for_driver(agent, history).await? {
+            TurnOutcome::ScheduledParallelLane { lane } => {
+                let mut calls = lane.calls.into_iter();
+                while let Some(call) = calls.next() {
+                    match call {
+                        DeferredParallelCall::Ordinary(call) => {
+                            let (messages, error, terminal_record, terminal) = call.execute().await;
+                            history.extend(messages);
+                            terminal_record.record(terminal).await;
+                            if let Some(error) = error {
+                                for unprocessed in calls {
+                                    cancel_utility_lane_call(unprocessed, history).await;
+                                }
+                                plan.settle_unreachable_remainder(history).await;
+                                return Err(error);
+                            }
+                        }
+                        DeferredParallelCall::Delegate(delegate) => {
+                            history.push(delegate.interrupted_message());
+                            delegate
+                                .terminal_record()
+                                .record(turn_scheduler::SchedulerTerminalOutcome::Refused)
+                                .await;
+                            for unprocessed in calls {
+                                cancel_utility_lane_call(unprocessed, history).await;
+                            }
+                            plan.settle_unreachable_remainder(history).await;
+                            anyhow::bail!(
+                                "isolated utility scheduler cannot execute delegated calls"
+                            );
+                        }
+                    }
+                }
+            }
+            outcome => {
+                if !plan.is_finished() {
+                    plan.settle_unreachable_remainder(history).await;
+                }
+                return Ok(outcome);
+            }
+        }
+    }
+}
+
+async fn cancel_utility_lane_call(call: DeferredParallelCall, history: &mut Vec<Message>) {
+    match call {
+        DeferredParallelCall::Ordinary(call) => {
+            let DeferredOrdinaryCall {
+                scheduled,
+                call,
+                continuation_turn_id,
+                session,
+                tool_ctx,
+                ..
+            } = call;
+            history.push(
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    scheduled.call_id.clone(),
+                    call.provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    call.provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
+                    &scheduled.resolved_name,
+                    turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                ),
+            );
+            DeferredSchedulerTerminalRecord {
+                scheduled,
+                continuation_turn_id,
+                session,
+                agent_id: tool_ctx.agent_id,
+            }
+            .record(turn_scheduler::SchedulerTerminalOutcome::Cancelled)
+            .await;
+        }
+        DeferredParallelCall::Delegate(delegate) => {
+            history.push(delegate.interrupted_message());
+            delegate
+                .terminal_record()
+                .record(turn_scheduler::SchedulerTerminalOutcome::Cancelled)
+                .await;
         }
     }
 }

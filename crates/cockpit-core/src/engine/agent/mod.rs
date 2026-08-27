@@ -51,6 +51,7 @@ mod text_recovery;
 pub(crate) mod tool_dispatch;
 mod tool_timeout;
 mod turn_phases;
+pub(crate) use turn_phases::advance_ordinary_utility_turn_plan;
 pub(crate) mod turn_scheduler;
 
 pub(crate) use turn_phases::{

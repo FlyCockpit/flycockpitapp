@@ -4168,6 +4168,35 @@ impl Driver {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
             };
+            let scheduled_turn_result = if let Some(pending_index) =
+                self.active_pending_scheduled_turn_index()
+            {
+                let mut pending = self.pending_scheduled_turn.remove(pending_index);
+                self.stack
+                    .last_mut()
+                    .expect("stack never empty")
+                    .history
+                    .push(next_prompt.clone());
+                let result = self
+                    .advance_driver_owned_turn_plan(&mut pending.plan, &agent, tx, cancel.clone())
+                    .await;
+                let waits_for_driver_result = matches!(
+                    &result,
+                    Ok(outcome)
+                        if !matches!(
+                            outcome,
+                            TurnOutcome::Continue
+                                | TurnOutcome::Done
+                                | TurnOutcome::Return { .. }
+                        )
+                );
+                if !pending.plan.is_finished() || waits_for_driver_result {
+                    self.pending_scheduled_turn.push(pending);
+                }
+                Some(result)
+            } else {
+                None
+            };
             self.publish_active_tool_names().await;
             self.emit_command_capability_notice_if_new(tx).await;
             let is_root = self.stack.len() == 1;
@@ -4197,7 +4226,9 @@ impl Driver {
             {
                 return Err(error);
             }
-            let turn_result = {
+            let turn_result = if let Some(result) = scheduled_turn_result {
+                result
+            } else {
                 let top = self.stack.last_mut().expect("stack never empty");
                 let deferred_log = top.deferred_log.clone();
                 crate::engine::agent::with_agent_instance_id(
@@ -4251,7 +4282,7 @@ impl Driver {
                 self.note_backup_fallback_for_active_frame(fallback, tx)
                     .await;
             }
-            let outcome = match turn_result {
+            let mut outcome = match turn_result {
                 Ok(outcome) => outcome,
                 Err(e) if crate::engine::interrupt::is_parked(&e) => {
                     tracing::info!(agent = %agent.name, "turn paused on parked interrupt");
@@ -4341,6 +4372,27 @@ impl Driver {
                 }
                 Err(e) => return Err(e),
             };
+
+            while let TurnOutcome::ScheduledCalls { plan } = outcome {
+                let owner_agent_instance_id =
+                    self.stack.last().and_then(|frame| frame.agent_instance_id);
+                let owner_stack_depth = self.stack.len();
+                let mut plan = plan;
+                outcome = self
+                    .advance_driver_owned_turn_plan(&mut plan, &agent, tx, cancel.clone())
+                    .await?;
+                let waits_for_driver_result = !matches!(
+                    &outcome,
+                    TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
+                );
+                if !plan.is_finished() || waits_for_driver_result {
+                    self.pending_scheduled_turn.push(PendingScheduledTurn {
+                        owner_agent_instance_id,
+                        owner_stack_depth,
+                        plan,
+                    });
+                }
+            }
 
             if is_root {
                 self.persist_prune_ledger().await;

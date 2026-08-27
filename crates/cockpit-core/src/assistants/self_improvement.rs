@@ -190,7 +190,7 @@ async fn run_review_turn(
         if cancel.is_cancelled() {
             return Ok(None);
         }
-        let outcome = turn_with_backup(
+        let mut outcome = turn_with_backup(
             &agent,
             None,
             &[],
@@ -220,6 +220,15 @@ async fn run_review_turn(
             None,
         )
         .await?;
+        while let TurnOutcome::ScheduledCalls { plan } = outcome {
+            let mut plan = plan;
+            outcome = crate::engine::agent::advance_ordinary_utility_turn_plan(
+                &mut plan,
+                &agent,
+                &mut history,
+            )
+            .await?;
+        }
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history

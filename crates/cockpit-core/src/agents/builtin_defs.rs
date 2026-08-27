@@ -77,9 +77,6 @@ pub fn is_builtin_primary(name: &str) -> bool {
 /// available.
 pub const FALLBACK_PRIMARY: &str = "Build";
 
-/// The shipped single-model-defensive preset primary.
-pub const DEFENSIVE_PRIMARY: &str = "Careful";
-
 /// Resolve the primary agent for a session (issue #75): the mode axis no
 /// longer selects `Careful` automatically — `defaultPrimaryAgent` (the
 /// configured default) governs. A stored/requested name wins (with
@@ -742,7 +739,7 @@ mod tests {
         // default (`FALLBACK_PRIMARY` here) governs for brand-new sessions.
         assert_eq!(resolve_primary(None, FALLBACK_PRIMARY), FALLBACK_PRIMARY);
         assert_eq!(
-            embedded_default(DEFENSIVE_PRIMARY)
+            embedded_default("Careful")
                 .expect("defensive primary embedded default")
                 .name,
             "Careful"

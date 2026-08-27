@@ -286,10 +286,7 @@ async fn fork_context_refusal(
     }
     match crate::agents::resolve_with_assistant_db(&session.project_root, child, &session.db).await
     {
-        Ok(Some(def)) if def.fork_eligible => None,
-        Ok(Some(_)) => Some(format!(
-            "Error: agent `{child}` is not fork eligible; set `forkEligible: true` in its agent frontmatter to allow `task.context=\"fork\"`"
-        )),
+        Ok(Some(_)) => None,
         Ok(None) => {
             let reachable = crate::engine::builtin::reachable_subagent_names(
                 &parent.name,

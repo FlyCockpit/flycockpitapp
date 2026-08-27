@@ -729,6 +729,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         vnext_local_installation_resolver:
             crate::agents::LocalInstallationResolver::no_installations(),
         parent_vnext_grant: None,
+        parent_posture: Some(ctx.agent.posture.clone()),
         swarm_depth: spec.depth,
         swarm_max_depth: spec.max_depth,
         // Background swarm children carry no per-delegation grants.

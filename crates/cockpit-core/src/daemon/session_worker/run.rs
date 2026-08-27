@@ -4652,9 +4652,7 @@ pub(super) async fn run_worker(
         Some(name) => name,
         None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
     };
-    if session.assistant_name.is_none()
-        && let Some(text) =
-            super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
+    if let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
     {
         send_current_session_event(
             &session,
@@ -4796,6 +4794,7 @@ pub(super) async fn run_worker(
         )),
         vnext_local_installation_resolver,
         parent_vnext_grant: None,
+        parent_posture: None,
         // Recursive-`Swarm` depth (GOALS §24): the `Swarm` root is depth 0;
         // each `bee` fan-out spawn advances it. The ceiling rides along so
         // the `spawn` description shows the remaining budget.

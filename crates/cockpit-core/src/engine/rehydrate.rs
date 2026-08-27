@@ -69,8 +69,7 @@ use crate::engine::prune::{PruneLedger, ledger_is_empty, reapply_ledger};
 /// silently dropped. The stub body reflects this: it says the call was in
 /// progress, not that it was interrupted "before resume" (the old wording
 /// implied the call might never have started).
-const ABORTED_CALL_BODY: &str =
-    "[cockpit] tool call was in progress when the session was interrupted; its result is unavailable.";
+const ABORTED_CALL_BODY: &str = "[cockpit] tool call was in progress when the session was interrupted; its result is unavailable.";
 
 /// Honest stub body for a `task` delegation whose `subagent_report` never
 /// landed (the delegation did not complete before the session was resumed).
@@ -5866,7 +5865,10 @@ mod tests {
         // "interrupted before resume" wording.
         assert_eq!(history_interrupted.len(), 3);
         assert_eq!(tool_result_body(&history_interrupted[2]), ABORTED_CALL_BODY);
-        assert_eq!(result_ids(&history_interrupted[2]), vec!["read".to_string()]);
+        assert_eq!(
+            result_ids(&history_interrupted[2]),
+            vec!["read".to_string()]
+        );
         assert!(
             !tool_result_body(&history_interrupted[2]).contains("before resume"),
             "scheduler-owned call must not use the old 'before resume' wording"

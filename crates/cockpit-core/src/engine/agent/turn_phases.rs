@@ -2878,6 +2878,112 @@ mod tests {
         assert!(matches!(flow, ControlFlow::Continue(())));
     }
 
+    /// AC3 (issue #57): `explicit_batch_and_distinct_delegates_keep_separate_lifecycles`
+    /// proves explicit `intent=batch` retains bounded grouping behavior
+    /// (returns `SpawnNoninteractiveBatch`) while separately emitted
+    /// delegates retain separate IDs/lifecycles (each returns its own
+    /// `SpawnNoninteractive` with a distinct `task_call_id`) and are not
+    /// rewritten into a synthetic batch.
+    #[tokio::test]
+    async fn explicit_batch_and_distinct_delegates_keep_separate_lifecycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+
+        // 1. Explicit batch: two entries, bounded by max_parallel.
+        let batch_call = tool_call(
+            "task",
+            serde_json::json!({
+                "intent": "batch",
+                "payload": [
+                    { "label": "a", "agent": "explore", "prompt": "look at a" },
+                    { "label": "b", "agent": "explore", "prompt": "look at b" }
+                ]
+            }),
+        );
+        let batch_flow =
+            phase_10_dispatch_one_call(&agent, &session, &config, &tx, &batch_call, "task")
+                .await
+                .unwrap();
+
+        match batch_flow {
+            ControlFlow::Break(TurnOutcome::SpawnNoninteractiveBatch {
+                entries,
+                task_call_id,
+                ..
+            }) => {
+                assert_eq!(entries.len(), 2, "batch retains both entries");
+                assert_eq!(entries[0].label, "a");
+                assert_eq!(entries[1].label, "b");
+                assert_eq!(task_call_id, "call-1", "batch carries its own task_call_id");
+            }
+            other => panic!("expected SpawnNoninteractiveBatch, got {other:?}"),
+        }
+
+        // 2. Two separately emitted delegates: each gets its own
+        // SpawnNoninteractive with a distinct task_call_id. They are NOT
+        // rewritten into a synthetic batch.
+        let delegate_a = ToolCall {
+            id: rig::message::ToolCallId::new_or_mint("delegate-a".to_string()),
+            provider: rig::message::ProviderCallId::new("fn-a".to_string()),
+            function: ToolFunction {
+                name: "task".to_string(),
+                arguments: serde_json::json!({
+                    "intent": "delegate",
+                    "payload": { "agent": "explore", "prompt": "look at a" }
+                }),
+            },
+            signature: None,
+            additional_params: None,
+        };
+        let delegate_b = ToolCall {
+            id: rig::message::ToolCallId::new_or_mint("delegate-b".to_string()),
+            provider: rig::message::ProviderCallId::new("fn-b".to_string()),
+            function: ToolFunction {
+                name: "task".to_string(),
+                arguments: serde_json::json!({
+                    "intent": "delegate",
+                    "payload": { "agent": "explore", "prompt": "look at b" }
+                }),
+            },
+            signature: None,
+            additional_params: None,
+        };
+
+        let flow_a =
+            phase_10_dispatch_one_call(&agent, &session, &config, &tx, &delegate_a, "task")
+                .await
+                .unwrap();
+        let flow_b =
+            phase_10_dispatch_one_call(&agent, &session, &config, &tx, &delegate_b, "task")
+                .await
+                .unwrap();
+
+        // Each delegate is a separate SpawnNoninteractive (or SpawnSubagent
+        // for interactive), NOT a batch.
+        let id_a = match flow_a {
+            ControlFlow::Break(TurnOutcome::SpawnNoninteractive { task_call_id, .. })
+            | ControlFlow::Break(TurnOutcome::SpawnSubagent { task_call_id, .. }) => task_call_id,
+            other => {
+                panic!("expected SpawnNoninteractive/SpawnSubagent for delegate a, got {other:?}")
+            }
+        };
+        let id_b = match flow_b {
+            ControlFlow::Break(TurnOutcome::SpawnNoninteractive { task_call_id, .. })
+            | ControlFlow::Break(TurnOutcome::SpawnSubagent { task_call_id, .. }) => task_call_id,
+            other => {
+                panic!("expected SpawnNoninteractive/SpawnSubagent for delegate b, got {other:?}")
+            }
+        };
+
+        // Distinct IDs/lifecycles — not coalesced into a batch.
+        assert_eq!(id_a, "delegate-a");
+        assert_eq!(id_b, "delegate-b");
+        assert_ne!(id_a, id_b, "delegates keep separate lifecycles");
+    }
+
     #[tokio::test]
     async fn phase_10_spawn_retains_responses_dual_identity() {
         let tmp = tempfile::tempdir().unwrap();

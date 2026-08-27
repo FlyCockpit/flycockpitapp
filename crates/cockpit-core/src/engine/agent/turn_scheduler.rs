@@ -37,13 +37,9 @@ pub(crate) enum CallClassification {
     /// May run in a parallel lane: a registered `ReadOnly` ordinary tool, or
     /// a noninteractive delegate whose `ResolvedChildExecutionSurface` proves
     /// `parallel_read_only_eligible`.
-    ParallelLane {
-        reason: ParallelLaneReason,
-    },
+    ParallelLane { reason: ParallelLaneReason },
     /// Must run serially, draining any in-flight lane first.
-    SerialBarrier {
-        reason: SerialBarrierReason,
-    },
+    SerialBarrier { reason: SerialBarrierReason },
 }
 
 impl CallClassification {
@@ -250,22 +246,22 @@ fn classify_call(
         "schedule" => {
             return CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::Schedule,
-            }
+            };
         }
         "spawn" => {
             return CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::Spawn,
-            }
+            };
         }
         "return" => {
             return CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::Return,
-            }
+            };
         }
         "done" => {
             return CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::Done,
-            }
+            };
         }
         _ => {}
     }
@@ -547,10 +543,7 @@ mod tests {
     }
 
     fn resolved_names(calls: &[crate::engine::message::ToolCall]) -> Vec<String> {
-        calls
-            .iter()
-            .map(|tc| tc.function.name.clone())
-            .collect()
+        calls.iter().map(|tc| tc.function.name.clone()).collect()
     }
 
     /// AC1: A read-only ordinary tool is classified as parallel-lane. A
@@ -632,7 +625,10 @@ mod tests {
 
         let calls = vec![
             tool_call("schedule", serde_json::json!({})),
-            tool_call("spawn", serde_json::json!({ "prompt": "x", "write_scope": "s" })),
+            tool_call(
+                "spawn",
+                serde_json::json!({ "prompt": "x", "write_scope": "s" }),
+            ),
             tool_call("return", serde_json::json!({ "summary": "done" })),
             tool_call("done", serde_json::json!({})),
         ];
@@ -847,11 +843,12 @@ mod tests {
         );
     }
 
-    /// AC3: `explicit_batch_and_distinct_delegates_keep_separate_lifecycles` —
-    /// explicit `intent=batch` retains bounded grouping behavior (serial
-    /// barrier) while separately emitted delegates retain separate IDs.
+    /// AC3 (plan-level): `plan_keeps_batch_and_distinct_delegates_separate` —
+    /// the scheduler plan classifies explicit `intent=batch` as a serial
+    /// barrier (TaskBatch) while separately emitted delegates are distinct
+    /// plan entries (not coalesced).
     #[test]
-    fn explicit_batch_and_distinct_delegates_keep_separate_lifecycles() {
+    fn plan_keeps_batch_and_distinct_delegates_separate() {
         let toolbox = ToolBox::new();
 
         // An explicit batch followed by two distinct delegates.

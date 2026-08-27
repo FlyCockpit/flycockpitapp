@@ -158,6 +158,10 @@ pub enum StoreError {
     /// harness config itself as `always_allow`.
     #[error("harness grants can only be stored at session scope")]
     HarnessSessionScopeOnly,
+    /// Image-generation grants are once/session/project only — global scope
+    /// is unrepresentable in the schema and rejected by the API.
+    #[error("image-generation grants cannot be stored at global scope")]
+    ImageGenerationNoGlobalScope,
     /// No project root could be resolved for a `Project`-scope grant
     /// (the cwd isn't inside a git worktree).
     #[error("no project root for the current directory; cannot store a project grant")]
@@ -847,6 +851,230 @@ impl GrantStore {
             }
             Scope::Project | Scope::Global => Err(StoreError::HarnessSessionScopeOnly),
         }
+    }
+
+    // ---- image-generation grants -----------------------------------------
+
+    /// Returns the scope of a matching, non-revoked `allow` grant for the
+    /// given plan digest, or `None`. Session scope (keyed by the current
+    /// session + plan digest) is checked first, then project scope (keyed by
+    /// the machine-local `project_id` + plan digest). The project-scope
+    /// membership audit is enforced by the caller passing the live session's
+    /// `project_id`: a grant recorded for a different project never matches.
+    ///
+    /// Fails closed: any lookup error is logged and yields `None`, so a
+    /// transient DB failure re-prompts the human rather than faking an allow.
+    pub async fn image_generation_grant_scope(
+        &self,
+        project_id: &str,
+        plan_digest: &str,
+    ) -> Option<Scope> {
+        if self
+            .session_image_generation_grant_allows(plan_digest)
+            .await
+        {
+            return Some(Scope::Session);
+        }
+        if self
+            .project_image_generation_grant_allows(project_id, plan_digest)
+            .await
+        {
+            return Some(Scope::Project);
+        }
+        None
+    }
+
+    /// Record a standing image-generation grant at `scope`. `Once` is never
+    /// stored (the caller acts on it directly); `Global` is rejected — global
+    /// scope is unrepresentable in the `image_generation_grants` schema. The
+    /// grant keys on the immutable `plan_digest` (which already encodes the
+    /// destination set, sizes, formats, parameters, fanout, total outputs,
+    /// and the output write-authority digest); `output_path_authority` is
+    /// retained for disclosure/audit. Recording an allow clears any prior
+    /// reject for the same key (and vice-versa) so a key never carries both
+    /// polarities.
+    pub async fn record_image_generation_grant(
+        &self,
+        scope: Scope,
+        project_id: &str,
+        plan_digest: &str,
+        output_path_authority: &str,
+    ) -> Result<(), StoreError> {
+        match scope {
+            Scope::Once => Err(StoreError::OnceNotPersistable),
+            Scope::Global => Err(StoreError::ImageGenerationNoGlobalScope),
+            Scope::Session | Scope::Project => {
+                self.image_generation_grant_upsert(scope, project_id, plan_digest, output_path_authority)
+                    .await
+                    .map_err(StoreError::Io)
+            }
+        }
+    }
+
+    /// Revoke (mark `revoked_at_unix_ms`) every non-revoked grant matching the
+    /// `(scope, project_id, plan_digest)` key so it can no longer short-circuit
+    /// a future prompt. Returns the number of grants revoked. Best-effort
+    /// against the current scopes; a lookup error is logged and yields zero.
+    pub async fn revoke_image_generation_grant(
+        &self,
+        scope: Scope,
+        project_id: &str,
+        plan_digest: &str,
+    ) -> usize {
+        match scope {
+            Scope::Once | Scope::Global => 0,
+            Scope::Session | Scope::Project => {
+                self.image_generation_grant_revoke(scope, project_id, plan_digest)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(?error, "image generation grant revoke failed");
+                        0
+                    })
+            }
+        }
+    }
+
+    /// Session-scope allow lookup against `image_generation_grants`.
+    async fn session_image_generation_grant_allows(&self, plan_digest: &str) -> bool {
+        let session_id = self.session_id;
+        let plan_digest = plan_digest.to_owned();
+        self.db
+            .read(move |conn| {
+                let n: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM image_generation_grants \
+                     WHERE scope = 'session' AND session_id = ?1 AND plan_digest = ?2 \
+                       AND verdict = 'allow' AND revoked_at_unix_ms IS NULL",
+                    rusqlite::params![session_id.to_string(), plan_digest],
+                    |row| row.get(0),
+                )?;
+                Ok(n > 0)
+            })
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Project-scope allow lookup against `image_generation_grants`. The
+    /// `project_id` is the live session's machine-local project identity, so a
+    /// grant recorded for a different project never matches.
+    async fn project_image_generation_grant_allows(
+        &self,
+        project_id: &str,
+        plan_digest: &str,
+    ) -> bool {
+        let project_id = project_id.to_owned();
+        let plan_digest = plan_digest.to_owned();
+        self.db
+            .read(move |conn| {
+                let n: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM image_generation_grants \
+                     WHERE scope = 'project' AND project_id = ?1 AND plan_digest = ?2 \
+                       AND verdict = 'allow' AND revoked_at_unix_ms IS NULL",
+                    rusqlite::params![project_id, plan_digest],
+                    |row| row.get(0),
+                )?;
+                Ok(n > 0)
+            })
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Insert (or replace) an image-generation grant row, first clearing the
+    /// opposite verdict for the same key so a key never carries both.
+    async fn image_generation_grant_upsert(
+        &self,
+        scope: Scope,
+        project_id: &str,
+        plan_digest: &str,
+        output_path_authority: &str,
+    ) -> Result<()> {
+        let session_id = self.session_id.to_string();
+        let project_id = project_id.to_owned();
+        let plan_digest = plan_digest.to_owned();
+        let output_path_authority = output_path_authority.to_owned();
+        let scope_str = scope.as_str().to_owned();
+        let session_param: Option<String> = match scope {
+            Scope::Session => Some(session_id.clone()),
+            Scope::Project => None,
+            _ => unreachable!("image_generation_grant_upsert guards Once/Global upstream"),
+        };
+        self.db
+            .write(move |conn| {
+                let now = now_epoch_seconds() * 1000;
+                let grant_id = uuid::Uuid::new_v4().to_string();
+                // Clear any prior opposite-verdict row for this exact key.
+                conn.execute(
+                    "DELETE FROM image_generation_grants \
+                     WHERE scope = ?1 AND ifnull(session_id, '') = ifnull(?2, '') \
+                       AND project_id = ?3 AND plan_digest = ?4 \
+                       AND verdict <> 'allow'",
+                    rusqlite::params![
+                        &scope_str,
+                        session_param.as_ref(),
+                        &project_id,
+                        &plan_digest,
+                    ],
+                )
+                .context("clearing prior image-generation reject grant")?;
+                // Insert the allow row. `INSERT OR REPLACE` on the unique match
+                // index flips a stale allow in place (refreshing granted_at).
+                conn.execute(
+                    "INSERT OR REPLACE INTO image_generation_grants \
+                     (grant_id, scope, session_id, project_id, plan_digest, \
+                      output_path_authority, verdict, granted_at_unix_ms, revoked_at_unix_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'allow', ?7, NULL)",
+                    rusqlite::params![
+                        &grant_id,
+                        &scope_str,
+                        session_param.as_ref(),
+                        &project_id,
+                        &plan_digest,
+                        &output_path_authority,
+                        now,
+                    ],
+                )
+                .context("inserting image-generation allow grant")?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Mark every non-revoked grant matching `(scope, project_id, plan_digest)`
+    /// revoked. Returns the count revoked.
+    async fn image_generation_grant_revoke(
+        &self,
+        scope: Scope,
+        project_id: &str,
+        plan_digest: &str,
+    ) -> Result<usize> {
+        let session_id = self.session_id.to_string();
+        let project_id = project_id.to_owned();
+        let plan_digest = plan_digest.to_owned();
+        let scope_str = scope.as_str().to_owned();
+        let session_param: Option<String> = match scope {
+            Scope::Session => Some(session_id.clone()),
+            Scope::Project => None,
+            _ => unreachable!("image_generation_grant_revoke guards Once/Global upstream"),
+        };
+        self.db
+            .write(move |conn| {
+                let now = now_epoch_seconds() * 1000;
+                let n = conn.execute(
+                    "UPDATE image_generation_grants SET revoked_at_unix_ms = ?1 \
+                     WHERE scope = ?2 AND ifnull(session_id, '') = ifnull(?3, '') \
+                       AND project_id = ?4 AND plan_digest = ?5 \
+                       AND revoked_at_unix_ms IS NULL",
+                    rusqlite::params![
+                        now,
+                        &scope_str,
+                        session_param.as_ref(),
+                        &project_id,
+                        &plan_digest,
+                    ],
+                )
+                .context("revoking image-generation grant")?;
+                Ok(n)
+            })
+            .await
     }
 
     // ---- loop-guard rules -------------------------------------------------

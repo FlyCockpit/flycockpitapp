@@ -1143,7 +1143,7 @@ impl Approver {
         );
 
         // 3. Grant-matching seam (fails closed this increment; see below).
-        let grant_matches = self.image_generation_grant_matches(&facts);
+        let grant_matches = self.image_generation_grant_matches(&facts).await;
 
         // 4. Approval-mode dispatch over the shared session mode.
         match self.approval_mode() {
@@ -1182,20 +1182,30 @@ impl Approver {
     /// lets Manual short-circuit to a standing-grant allow and Auto to a
     /// safe-risk policy allow without a human prompt.
     ///
-    /// TODO(image-generation-grant-persistence): this increment ships no
-    /// once/session/project grant SQLite schema or store yet, so the seam fails
-    /// closed — no grant ever matches, and Manual/Auto always ask the human. A
-    /// later increment folds the grant store into `0001_initial.sql` and
-    /// consults it here, keyed by the plan/destination digests carried on
-    /// `facts`. It must fail closed on any lookup error and never fake a match.
-    fn image_generation_grant_matches(&self, _facts: &ImageGenerationAuthzFacts<'_>) -> bool {
-        false
+    /// Consults the [`GrantStore`] image-generation grant table, keyed by the
+    /// immutable plan digest carried on `facts` (which already encodes the
+    /// destination set, sizes, formats, parameters, fanout, total outputs, and
+    /// the output write-authority digest). Session scope is checked first,
+    /// then project scope (bound to the live session's machine-local
+    /// `project_id`). Fails closed on any lookup error or when no session is
+    /// attached: no grant ever fakes an allow.
+    async fn image_generation_grant_matches(&self, facts: &ImageGenerationAuthzFacts<'_>) -> bool {
+        let Some(session) = self.session.as_deref() else {
+            return false;
+        };
+        self.store
+            .image_generation_grant_scope(&session.project_id, facts.plan_digest.as_str())
+            .await
+            .is_some()
     }
 
     /// Raise the human image-generation approval prompt (Manual/Auto without a
-    /// matching grant). Mirrors the once-only computer-action prompt: a single
-    /// approve/deny question carrying only the secret-free destination count
-    /// and plan-digest prefix. Approve → allow once; deny/dismiss → deny.
+    /// matching grant). Carries only the secret-free destination count, plan
+    /// digest prefix, and redacted output write-authority identity. The human
+    /// may approve once, for this session, or for this project; deny; or
+    /// dismiss (deny). A session/project allow is persisted as a standing
+    /// grant before the decision returns so a future matching request
+    /// short-circuits the prompt.
     async fn raise_image_generation_prompt(
         &self,
         facts: &ImageGenerationAuthzFacts<'_>,
@@ -1212,7 +1222,9 @@ impl Approver {
         let question = InterruptQuestion::Single {
             prompt,
             options: vec![
-                opt(ApprovalOptionId::ApproveOnce, "Yes, generate"),
+                opt(ApprovalOptionId::ApproveOnce, "Yes, generate once"),
+                opt(ApprovalOptionId::ApproveSession, "Allow for this session"),
+                opt(ApprovalOptionId::ApproveProject, "Allow for this project"),
                 opt(ApprovalOptionId::Reject, "Deny"),
             ],
             allow_freetext: false,
@@ -1226,47 +1238,84 @@ impl Approver {
         );
         let set = ApprovalOptionSet::new(
             "image_generation_approval",
-            [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],
+            [
+                ApprovalOptionId::ApproveOnce,
+                ApprovalOptionId::ApproveSession,
+                ApprovalOptionId::ApproveProject,
+                ApprovalOptionId::Reject,
+            ],
         );
-        self.raise_and_decode(
-            &description,
-            question,
-            "image_generation",
-            serde_json::json!({
-                "plan_digest": facts.plan_digest.as_str(),
-                "destinations": facts.destinations,
-                "fanout": facts.fanout,
-                "total_outputs": facts.total_outputs,
-                "cost_maximum": facts.cost_maximum,
-                "reference_egress_unmatched": facts.reference_egress_unmatched,
-                "base_threshold_usd_micros": facts.base_threshold_usd_micros,
-                "spend_request": facts.spend_request,
-                "spend_session": facts.spend_session,
-                "spend_project": facts.spend_project,
-                "path_read_authorized": facts.path_read_authorized,
-                "output_write_authorized": facts.output_write_authorized,
-                "destination_enabled": facts.destination_enabled,
-                "capability_fresh": facts.capability_fresh,
-                "insecure_transport_allowed": facts.insecure_transport_allowed,
-                "output_path_authority": facts.output_path_authority.as_str(),
-                "candidate_effects": [
-                    {"selection": "approve_once", "execute": {"plan_digest": facts.plan_digest.as_str(), "destinations": facts.destinations, "fanout": facts.fanout, "total_outputs": facts.total_outputs, "cost_maximum": facts.cost_maximum, "output_path_authority": facts.output_path_authority.as_str()}},
-                    {"selection": "reject", "effect": "deny"}
-                ],
-            }),
-            |response| {
-            // Dismissal (no selection) denies, fail closed.
-            let Some(id) = decode_option_response(response, &set)? else {
-                return Ok(Decision::Deny);
-            };
-            match id {
-                ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
-                ApprovalOptionId::Reject => Ok(Decision::Deny),
-                _ => Err(ForeignOptionId::new(&set, id.as_str())),
+        let plan_digest = facts.plan_digest.as_str().to_owned();
+        let output_path_authority = facts.output_path_authority.as_str().to_owned();
+        let decision = self
+            .raise_and_decode(
+                &description,
+                question,
+                "image_generation",
+                serde_json::json!({
+                    "plan_digest": facts.plan_digest.as_str(),
+                    "destinations": facts.destinations,
+                    "fanout": facts.fanout,
+                    "total_outputs": facts.total_outputs,
+                    "cost_maximum": facts.cost_maximum,
+                    "reference_egress_unmatched": facts.reference_egress_unmatched,
+                    "base_threshold_usd_micros": facts.base_threshold_usd_micros,
+                    "spend_request": facts.spend_request,
+                    "spend_session": facts.spend_session,
+                    "spend_project": facts.spend_project,
+                    "path_read_authorized": facts.path_read_authorized,
+                    "output_write_authorized": facts.output_write_authorized,
+                    "destination_enabled": facts.destination_enabled,
+                    "capability_fresh": facts.capability_fresh,
+                    "insecure_transport_allowed": facts.insecure_transport_allowed,
+                    "output_path_authority": facts.output_path_authority.as_str(),
+                    "candidate_effects": [
+                        {"selection": "approve_once", "execute": {"plan_digest": facts.plan_digest.as_str(), "destinations": facts.destinations, "fanout": facts.fanout, "total_outputs": facts.total_outputs, "cost_maximum": facts.cost_maximum, "output_path_authority": facts.output_path_authority.as_str()}},
+                        {"selection": "approve_session", "persist_grant": {"scope": "session", "plan_digest": facts.plan_digest.as_str(), "output_path_authority": facts.output_path_authority.as_str()}},
+                        {"selection": "approve_project", "persist_grant": {"scope": "project", "plan_digest": facts.plan_digest.as_str(), "output_path_authority": facts.output_path_authority.as_str()}},
+                        {"selection": "reject", "effect": "deny"}
+                    ],
+                }),
+                |response| {
+                // Dismissal (no selection) denies, fail closed.
+                let Some(id) = decode_option_response(response, &set)? else {
+                    return Ok(Decision::Deny);
+                };
+                match id {
+                    ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
+                    ApprovalOptionId::ApproveSession => {
+                        Ok(Decision::Allow { scope: Scope::Session })
+                    }
+                    ApprovalOptionId::ApproveProject => {
+                        Ok(Decision::Allow { scope: Scope::Project })
+                    }
+                    ApprovalOptionId::Reject => Ok(Decision::Deny),
+                    _ => Err(ForeignOptionId::new(&set, id.as_str())),
+                }
+                },
+            )
+            .await?;
+        // Persist a standing grant for a non-Once allow so a future matching
+        // request short-circuits the prompt. Best-effort: a persistence failure
+        // is logged but does not strand the already-authorized turn — the next
+        // matching request simply re-prompts (fail-closed on the match seam).
+        if let Decision::Allow { scope: scope @ (Scope::Session | Scope::Project) } = decision {
+            if let Some(session) = self.session.as_deref() {
+                if let Err(error) = self
+                    .store
+                    .record_image_generation_grant(
+                        scope,
+                        &session.project_id,
+                        &plan_digest,
+                        &output_path_authority,
+                    )
+                    .await
+                {
+                    tracing::warn!(?error, "image generation grant persistence failed");
+                }
             }
-            },
-        )
-        .await
+        }
+        Ok(decision)
     }
 }
 

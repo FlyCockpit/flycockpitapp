@@ -3048,6 +3048,50 @@ CREATE TABLE loop_guard_rules (
 
 CREATE INDEX idx_loop_guard_rules_session ON loop_guard_rules (session_id);
 
+-- ---- image_generation_grants --------------------------------------------------
+-- Standing image-generation dispatch grants recorded after a human approval
+-- prompt resolves "allow for session/project". Scoped to once/session/project
+-- ONLY — there is no global scope: the `scope` CHECK rejects any value other
+-- than 'session' or 'project'. A grant keys on the immutable plan digest
+-- (which already encodes the destination set, sizes, formats, parameters,
+-- fanout, total outputs, and the output write-authority digest) plus the
+-- output-path authority digest for disclosure/audit. `verdict` mirrors the
+-- approval_grants polarity toggle; `revoked_at_unix_ms` marks a revoked grant
+-- so it can no longer short-circuit a prompt. Session-scope rows bind an
+-- exact session (session_id NOT NULL, FK cascade); project-scope rows bind the
+-- machine-local project identity (session_id NULL) and require a current
+-- session membership audit at match time (the caller passes the live session's
+-- project_id, so a foreign project's grant never matches).
+
+CREATE TABLE image_generation_grants (
+    grant_id              TEXT    PRIMARY KEY CHECK (length(CAST(grant_id AS BLOB)) = 36),
+    scope                 TEXT    NOT NULL CHECK (scope IN ('session', 'project')),
+    session_id            TEXT    CHECK (
+        (scope = 'session' AND session_id IS NOT NULL)
+        OR (scope = 'project' AND session_id IS NULL)
+    ),
+    project_id            TEXT    NOT NULL CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 1024),
+    plan_digest           TEXT    NOT NULL CHECK (
+        length(plan_digest) = 64 AND plan_digest = lower(plan_digest)
+        AND plan_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    output_path_authority TEXT    NOT NULL CHECK (length(CAST(output_path_authority AS BLOB)) BETWEEN 1 AND 255),
+    verdict               TEXT    NOT NULL DEFAULT 'allow'
+        CHECK (verdict IN ('allow', 'reject')),
+    granted_at_unix_ms    INTEGER NOT NULL,
+    revoked_at_unix_ms    INTEGER,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+);
+
+-- One live grant per exact (scope, session-or-project, plan, verdict) tuple.
+-- `ifnull` collapses the NULL session_id of project-scope rows so two
+-- project-scope allow grants for the same plan cannot coexist.
+CREATE UNIQUE INDEX uq_image_generation_grants_match
+    ON image_generation_grants (scope, ifnull(session_id, ''), project_id, plan_digest, verdict);
+
+CREATE INDEX idx_image_generation_grants_session ON image_generation_grants (session_id);
+CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (project_id, plan_digest);
+
 -- ---- session full-text search (`session_search` / `session_read`) -----------------
 -- A single FTS5 virtual table indexes the *searchable* surface of every
 -- session: the session TITLE plus the text of `user_message` /

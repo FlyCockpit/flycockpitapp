@@ -799,8 +799,6 @@ mod tests {
             "resolve_interrupt",
             "set_active_model",
             "set_agent",
-            "set_llm_mode",
-            "set_session_llm_mode",
             "set_approval_mode",
             "set_delegation_recursion",
             "set_sandbox",

@@ -50,7 +50,7 @@ const UNCONFINED_COMMAND_DENIAL: &str =
 /// when a toolbox is rebuilt with the effective `PATH`.
 pub struct BashTool {
     description: String,
-    /// The explicit, steering [`LlmMode::Defensive`] description
+    /// The explicit, steering verbose (formerly defensive) description
     /// (implementation note).
     verbose_description: String,
     prelude: String,
@@ -67,8 +67,8 @@ impl BashTool {
         let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
             .to_string();
 
-        // The defensive, explicitly-steering form (`llm-modes-
-        // defensive-normal.md`). Same PATH-probe hints, more guidance.
+        // The defensive, explicitly-steering form (the verbose steering
+        // variant). Same PATH-probe hints, more guidance.
         let verbose_description =
             "Run a single shell command — builds, tests, git, package managers, \
              process/binary inspection — and get back combined stdout, stderr, and exit code. \
@@ -540,8 +540,7 @@ async fn call_bash_inner(
             resource_profiles: command_resource_plan.metas.clone(),
         };
         if !options.escalated
-            && crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode)
-                == crate::agents::ToolSteering::Verbose
+            && ctx.tool_steering == crate::agents::ToolSteering::Verbose
             && ctx.session.sandbox_escalation_enabled()
             && let Some(output) = defensive_human_escalation_offer(
                 args.clone(),
@@ -828,8 +827,7 @@ async fn call_bash_inner(
         && !options.escalated
         && ctx.write_scope.is_none()
         && !final_outcome.success
-        && crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode)
-            == crate::agents::ToolSteering::Verbose
+        && ctx.tool_steering == crate::agents::ToolSteering::Verbose
         && ctx.session.sandbox_escalation_enabled()
         && let Some(output) = defensive_human_escalation_offer(
             args.clone(),
@@ -878,11 +876,9 @@ async fn call_bash_inner(
     // off its first program and — unless the model has already adopted the
     // dedicated tool this session (self-suppression) — append ONE terse tip
     // line to the model-facing body, after the `exit:` line and outside
-    // compression. `Normal` mode appends nothing (token economy §10), and a
-    // command with no file/search replacement classifies to `None`.
-    let tip = if crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode)
-        == crate::agents::ToolSteering::Verbose
-    {
+    // compression. Terse steering appends nothing (token economy §10), and
+    // a command with no file/search replacement classifies to `None`.
+    let tip = if ctx.tool_steering == crate::agents::ToolSteering::Verbose {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {
@@ -1389,8 +1385,12 @@ fn sandbox_escalation_note(
         || !first_attempt
         || outcome.success
         || !ctx.session.sandbox_escalation_enabled()
-        || !crate::engine::tool::Capability::SandboxEscalate
-            .enabled(&crate::agents::PostureResolution::legacy(ctx.llm_mode))
+        // The SandboxEscalate capability is now resolved at toolbox-construction
+        // time (the `escalate` tool is registered based on the agent's posture,
+        // issue #75). The bash runtime gate checks whether `escalate` is
+        // available in this frame's tool set rather than re-evaluating the
+        // capability from a session-global mode.
+        || !ctx.available_tools.contains("escalate")
     {
         return None;
     }
@@ -1446,8 +1446,10 @@ fn sandbox_unavailable_refusal(reason: &str, ctx: &ToolCtx, first_attempt: bool)
     );
     if first_attempt
         && ctx.session.sandbox_escalation_enabled()
-        && crate::engine::tool::Capability::SandboxEscalate
-            .enabled(&crate::agents::PostureResolution::legacy(ctx.llm_mode))
+        // The `escalate` tool is registered based on the agent's posture at
+        // toolbox-construction time (issue #75); the bash runtime checks its
+        // presence rather than re-evaluating the capability from a mode.
+        && ctx.available_tools.contains("escalate")
     {
         let call_id = ctx
             .current_tool_call_id
@@ -2445,9 +2447,7 @@ fn render_bash_outcome(
     timeout_note: Option<&str>,
 ) -> ToolOutput {
     let compress = ctx.session.shell_compression_enabled();
-    let tip = if crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode)
-        == crate::agents::ToolSteering::Verbose
-    {
+    let tip = if ctx.tool_steering == crate::agents::ToolSteering::Verbose {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {

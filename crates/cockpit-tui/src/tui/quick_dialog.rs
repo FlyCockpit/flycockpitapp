@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use cockpit_config::extended::{ApprovalMode, LlmMode};
+use cockpit_config::extended::ApprovalMode;
 use cockpit_config::providers::{CapabilityStatus, ModelTrust, PromptCacheRetention};
 use cockpit_proto::SandboxMode;
 
@@ -17,7 +17,6 @@ pub struct QuickModelChoice {
     pub model_id: String,
     pub label: String,
     pub trust: ModelTrust,
-    pub mode: LlmMode,
 }
 
 impl From<crate::tui::model_picker::ModelChoice> for QuickModelChoice {
@@ -27,14 +26,12 @@ impl From<crate::tui::model_picker::ModelChoice> for QuickModelChoice {
             model_id: choice.model_id,
             label: choice.label,
             trust: choice.trust,
-            mode: choice.mode,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuickCurrent {
-    pub llm_mode: LlmMode,
     pub recursion_enabled: bool,
     pub recursion_depth: u32,
     pub sandbox_mode: SandboxMode,
@@ -49,7 +46,6 @@ pub struct QuickCurrent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuickCommit {
-    pub llm_mode: Option<LlmMode>,
     pub recursion: Option<(bool, u32)>,
     pub sandbox_mode: Option<SandboxMode>,
     pub container_network_enabled: Option<bool>,
@@ -66,7 +62,6 @@ pub enum QuickOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
-    Mode,
     Recursion,
     Sandbox,
     Permissions,
@@ -74,8 +69,7 @@ enum Tab {
     Model,
 }
 
-const TABS: [Tab; 6] = [
-    Tab::Mode,
+const TABS: [Tab; 5] = [
     Tab::Recursion,
     Tab::Sandbox,
     Tab::Permissions,
@@ -93,8 +87,7 @@ pub struct QuickDialog {
     current: QuickCurrent,
     models: Vec<QuickModelChoice>,
     tab: usize,
-    cursors: [usize; 6],
-    staged_llm_mode: Option<LlmMode>,
+    cursors: [usize; 5],
     staged_recursion: Option<RecursionChoice>,
     staged_sandbox_mode: Option<SandboxMode>,
     staged_container_network_enabled: Option<bool>,
@@ -149,8 +142,7 @@ impl QuickDialog {
             current,
             models,
             tab: 0,
-            cursors: [0; 6],
-            staged_llm_mode: None,
+            cursors: [0; 5],
             staged_recursion: None,
             staged_sandbox_mode: None,
             staged_container_network_enabled: None,
@@ -263,27 +255,23 @@ impl QuickDialog {
     }
 
     fn align_cursors_to_current(&mut self) {
-        self.cursors[0] = mode_options()
-            .iter()
-            .position(|mode| *mode == self.current.llm_mode)
-            .unwrap_or(0);
-        self.cursors[1] = recursion_options()
+        self.cursors[0] = recursion_options()
             .iter()
             .position(|choice| *choice == self.current_recursion())
             .unwrap_or(0);
-        self.cursors[2] = sandbox_mode_options()
+        self.cursors[1] = sandbox_mode_options()
             .iter()
             .position(|mode| *mode == self.current.sandbox_mode)
             .unwrap_or(1);
-        self.cursors[3] = approval_options()
+        self.cursors[2] = approval_options()
             .iter()
             .position(|mode| *mode == self.current.approval_mode)
             .unwrap_or(0);
-        self.cursors[4] = retention_options()
+        self.cursors[3] = retention_options()
             .iter()
             .position(|retention| *retention == self.current.prompt_cache_retention)
             .unwrap_or(0);
-        self.cursors[5] = self
+        self.cursors[4] = self
             .current
             .active_model
             .as_ref()
@@ -310,7 +298,6 @@ impl QuickDialog {
 
     fn option_count(&self, tab: Tab) -> usize {
         match tab {
-            Tab::Mode => mode_options().len(),
             Tab::Recursion => recursion_options().len(),
             Tab::Sandbox => sandbox_mode_options().len() + 1,
             Tab::Permissions => approval_options().len(),
@@ -321,9 +308,6 @@ impl QuickDialog {
 
     fn stage_active(&mut self) {
         match TABS[self.tab] {
-            Tab::Mode => {
-                self.staged_llm_mode = Some(mode_options()[self.cursors[self.tab]]);
-            }
             Tab::Recursion => {
                 self.staged_recursion = Some(recursion_options()[self.cursors[self.tab]]);
             }
@@ -381,11 +365,6 @@ impl QuickDialog {
 
     fn commit(&self) -> QuickCommit {
         let mut commit = QuickCommit::default();
-        if let Some(mode) = self.staged_llm_mode
-            && mode != self.current.llm_mode
-        {
-            commit.llm_mode = Some(mode);
-        }
         if let Some(choice) = self.staged_recursion
             && choice != self.current_recursion()
         {
@@ -445,20 +424,6 @@ impl QuickDialog {
 
     fn option_lines(&self) -> Vec<Line<'static>> {
         match TABS[self.tab] {
-            Tab::Mode => mode_options()
-                .iter()
-                .enumerate()
-                .map(|(i, mode)| {
-                    self.option_line(
-                        i,
-                        mode.as_str(),
-                        mode_description(*mode),
-                        self.current.llm_mode == *mode,
-                        self.staged_llm_mode == Some(*mode),
-                        false,
-                    )
-                })
-                .collect(),
             Tab::Recursion => recursion_options()
                 .iter()
                 .enumerate()
@@ -565,15 +530,11 @@ impl QuickDialog {
                             self.option_line(
                                 i,
                                 &choice.label,
-                                &format!(
-                                    "{}  {}",
-                                    if choice.trust.is_trusted() {
-                                        "trusted"
-                                    } else {
-                                        "untrusted"
-                                    },
-                                    choice.mode.as_str()
-                                ),
+                                if choice.trust.is_trusted() {
+                                    "trusted"
+                                } else {
+                                    "untrusted"
+                                },
                                 current,
                                 staged,
                                 false,

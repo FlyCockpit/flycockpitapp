@@ -36,7 +36,7 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 /// The fixed schema for the `schedule` meta-tool.
 pub const SCHEDULE_DESCRIPTION: &str = "Schedule async loop/background work without blocking the conversation; choose `action` (`loop.start`, `loop.cancel`, `background.start`, `background.tail`, `background.cancel`, `list`) and put per-action details in `args`; use limit=1 for one-shot timers";
 
-/// The defensive (`LlmMode::Defensive`) `schedule` description
+/// The verbose-steering `schedule` description
 /// (implementation note): explicit steering for the
 /// weak-model target. Same schema shape — only the prose is richer. Call
 /// `schedule` directly as a native tool with an `action` argument; do not
@@ -67,7 +67,7 @@ pub fn schedule_parameters() -> Value {
     })
 }
 
-/// The defensive (`LlmMode::Defensive`) parameter schema for the `schedule`
+/// The verbose-steering parameter schema for the `schedule`
 /// meta-tool: identical shape + required set to [`schedule_parameters`], with
 /// explicit parameter descriptions.
 pub fn schedule_parameters_defensive() -> Value {

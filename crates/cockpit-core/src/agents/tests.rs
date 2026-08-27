@@ -567,15 +567,14 @@ fn load_from_file_rejects_oversized_agent_markdown() {
 }
 
 #[test]
-fn load_from_dir_rejects_oversized_mode_markdown() {
+fn load_from_dir_rejects_oversized_override_markdown() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("agents");
     let agent_dir = dir.join("large");
     fs::create_dir_all(&agent_dir).unwrap();
-    write_large_agent(
-        &agent_dir.join(crate::config::extended::LlmMode::Normal.prompt_file()),
-        MAX_MARKDOWN_BYTES + 1,
-    );
+    // The directory form reads per-model override files (`<key>.md`); an
+    // oversized override is rejected just like an oversized flat file.
+    write_large_agent(&agent_dir.join("m1.md"), MAX_MARKDOWN_BYTES + 1);
 
     let err = load_from_dir(&dir, "large").unwrap_err();
 
@@ -1238,9 +1237,7 @@ fn agent_path_in_prefers_dir_form_over_flat() {
     assert_eq!(agent_path_in(tmp.path(), "rev"), dir);
 }
 
-// ── Per-`llm_mode` directory-form resolution ──────────────────────────────
-
-use crate::config::extended::LlmMode;
+// ── Per-model directory-form resolution ───────────────────────────────────
 
 /// Write a per-model override agent markdown file (frontmatter + body) into
 /// `<agents>/<name>/<key>.md`.
@@ -1691,7 +1688,6 @@ fn apply_tool_surface_override_rejects_invalid_surface() {
 
 #[test]
 fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
-    use crate::config::extended::LlmMode;
     use crate::engine::tool::{Tool, definition_of};
     use crate::tools::{glob::GlobTool, grep::GrepTool};
 

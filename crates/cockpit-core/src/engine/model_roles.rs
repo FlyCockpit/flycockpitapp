@@ -238,7 +238,6 @@ pub fn resolve_spawn_selector_with_store(
         role: default_role_for_agent(agent_name).map(CodingModelRole::as_str),
         agent: Some(agent_name),
         availability: AvailabilityScope::Discovery,
-        global_mode: extended.llm_mode,
     };
     build_redacted_policy_model(criteria, providers, session_model, store)
 }
@@ -353,7 +352,6 @@ pub fn resolve_policy_selector_with_store(
                 // is exactly how a host scopes a model to one agent). This
                 // matches the model-authored `spawn.model` path.
                 availability: AvailabilityScope::Discovery,
-                global_mode: extended.llm_mode,
             }
         }
         DelegationModelSelector::Category {
@@ -383,7 +381,6 @@ pub fn resolve_policy_selector_with_store(
                 role: Some(category),
                 agent: Some(agent_name),
                 availability: AvailabilityScope::Discovery,
-                global_mode: extended.llm_mode,
             }
         }
     };
@@ -538,7 +535,6 @@ pub fn resolve_delegated_model_with_custody(
             role: Some(role.as_str()),
             agent: Some(agent_name),
             availability: AvailabilityScope::Discovery,
-            global_mode: extended.llm_mode,
         };
         match build_redacted_policy_model(criteria, providers, session_model, store.clone()) {
             Ok((model, mut custody)) => {
@@ -608,7 +604,6 @@ pub fn resolve_trusted_child_model(
         // so allowlists gate it. `HostNamedTarget` is only ever correct for an
         // explicitly named `provider:model`.
         availability: AvailabilityScope::Discovery,
-        global_mode: extended.llm_mode,
     };
     let request = SensitiveModelPolicyRequest::new(
         criteria,
@@ -625,8 +620,8 @@ pub fn resolve_trusted_child_model(
     // `PrivateRemote`, or MISSING location fails closed HERE — before the grant
     // is minted — so `SensitivePayload::raw_provider_bytes` returns `None` and
     // no raw request bytes, retries, diagnostics, or exports can be assembled
-    // downstream. Location, not mode, gates the raw release: `ModelCustody`/
-    // trust already filtered the selection above, and `LlmMode` is never
+    // downstream. Location, not posture, gates the raw release: `ModelCustody`/
+    // trust already filtered the selection above, and harness posture is never
     // consulted. This is the single mint point for trusted-child grants, so
     // gating it closes the raw path for every non-local trusted child.
     if resolved.policy.location != Some(ModelLocation::Local) {
@@ -923,7 +918,6 @@ fn build_host_selected_policy_model(
         // The host named this exact provider/model, so `availability` (which
         // scopes discovery) does not gate it.
         availability: AvailabilityScope::HostNamedTarget,
-        global_mode: extended.llm_mode,
     };
     let request = SensitiveModelPolicyRequest::new(
         criteria,
@@ -991,7 +985,6 @@ fn host_selected_custody_for_model(
             role: None,
             agent: None,
             availability: AvailabilityScope::HostNamedTarget,
-            global_mode: extended.llm_mode,
         };
         SensitiveModelPolicyRequest::new(
             criteria,
@@ -1008,7 +1001,6 @@ fn host_selected_custody_for_model(
         provider: provider.clone(),
         model: model_id.clone(),
         trust,
-        mode: providers.resolve_mode(&provider, &model_id, extended.llm_mode),
         location: providers.resolve_location(&provider, &model_id),
         quality_rank: providers.resolve_quality_rank(&provider, &model_id),
         cost_rank: providers.resolve_cost_rank(&provider, &model_id),
@@ -1098,7 +1090,6 @@ pub fn render_model_discovery(caller_agent: &str, providers: &ProvidersConfig) -
             role: Some(&category),
             agent: Some(caller_agent),
             availability: AvailabilityScope::Discovery,
-            global_mode: crate::config::extended::LlmMode::default(),
         });
         if let Ok(resolved) = providers.resolve_non_sensitive_model_policy(&request) {
             if resolved.trust.is_trusted() {
@@ -1139,7 +1130,6 @@ pub fn render_model_discovery(caller_agent: &str, providers: &ProvidersConfig) -
                     role: None,
                     agent: Some(caller_agent),
                     availability: AvailabilityScope::Discovery,
-                    global_mode: crate::config::extended::LlmMode::default(),
                 });
             if let Ok(resolved) = providers.resolve_non_sensitive_model_policy(&request) {
                 if resolved.trust.is_trusted() {
@@ -1470,7 +1460,6 @@ fn policy_error_message(error: ModelPolicyError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::extended::LlmMode;
     use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry, ProviderModelRef};
     use std::collections::BTreeMap;
 
@@ -2165,132 +2154,93 @@ mod tests {
         providers
     }
 
-    /// AC5. Trust — not mode — decides redaction posture.
+    /// AC5. Trust — not posture — decides redaction posture.
     ///
-    /// For each of the three harness postures the test actually configures the
-    /// mode, dispatches a real delegation under it, and asserts:
+    /// The test dispatches a real delegation and asserts:
     /// (a) the resolved custody class and the model's effective redaction table
-    ///     are identical across modes — a trusted (self-hosted / no-log)
-    ///     destination resolves to the empty pass-through table, an untrusted
-    ///     one keeps the session table;
+    ///     follow trust only — a trusted (self-hosted / no-log) destination
+    ///     resolves to the empty pass-through table, an untrusted one keeps the
+    ///     session table;
     /// (b) the brief rendered for the destination is redacted for untrusted and
-    ///     unchanged for trusted, again identically across modes; and
-    /// (c) only the documented harness-steering output differs by mode.
+    ///     unchanged for trusted.
     #[test]
     fn model_trust_controls_redaction_not_mode() {
         let providers = trust_mode_providers();
         let session = session_model_with_secret(&providers);
         let brief = format!("deploy with {REDACTION_TEST_SECRET} now");
+        let extended = ExtendedConfig {
+            agent_chooses_subagent_model: true,
+            ..ExtendedConfig::default()
+        };
 
-        let mut redaction_by_mode = Vec::new();
-        let mut steering_by_mode = Vec::new();
-
-        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            let extended = ExtendedConfig {
-                agent_chooses_subagent_model: true,
-                llm_mode: mode,
-                ..ExtendedConfig::default()
-            };
-
-            // (a) Redaction posture follows trust only.
-            let untrusted_model = Model::for_provider(
-                &providers,
-                "minimax",
-                "MiniMax-M2",
-                session.session_redact_table(),
-            )
-            .unwrap();
-            let trusted_model = Model::for_provider(
-                &providers,
-                "minimax",
-                "trusted-code",
-                session.session_redact_table(),
-            )
-            .unwrap();
-            assert!(!untrusted_model.is_trusted(), "mode {mode:?}");
-            assert!(trusted_model.is_trusted(), "mode {mode:?}");
-            assert!(
-                !untrusted_model.redact_table().is_empty(),
-                "mode {mode:?}: an untrusted destination keeps the session table"
-            );
-            assert!(
-                trusted_model.redact_table().is_empty(),
-                "mode {mode:?}: a trusted destination resolves to the pass-through table"
-            );
-
-            // (b) Dispatch a real delegation under this mode and render its
-            //     brief through the resolved custody. Untrusted is redacted.
-            let untrusted_selector = DelegationModelSelector::Exact {
-                selector: "minimax:MiniMax-M2".into(),
-                required_capabilities: Vec::new(),
-                min_context_tokens: None,
-            };
-            let (model, custody) = resolve_delegated_model_with_custody(
-                "explore",
-                None,
-                Some(&untrusted_selector),
-                &extended,
-                &providers,
-                &session,
-                None,
-            )
-            .expect("untrusted delegation resolves");
-            assert_eq!(model.model_id_ref(), "MiniMax-M2");
-            assert_eq!(custody.custody(), ModelCustody::Untrusted);
-            let untrusted_render = custody.render_brief(&brief);
-            assert!(
-                !untrusted_render.contains(REDACTION_TEST_SECRET),
-                "mode {mode:?}: {untrusted_render}"
-            );
-
-            // Trusted is host-authored (an agent file naming a self-hosted
-            // endpoint): the brief reaches it unchanged, which is the intended
-            // outcome for a no-log destination.
-            let (trusted_child, trusted_custody) = resolve_delegated_model_with_custody(
-                "explore",
-                Some("minimax:trusted-code"),
-                None,
-                &extended,
-                &providers,
-                &session,
-                None,
-            )
-            .expect("host-authored trusted delegation resolves");
-            assert_eq!(trusted_child.model_id_ref(), "trusted-code");
-            assert_eq!(trusted_custody.custody(), ModelCustody::Trusted);
-            let trusted_render = trusted_custody.render_brief(&brief);
-            assert_eq!(trusted_render, brief, "mode {mode:?}");
-
-            redaction_by_mode.push((
-                custody.custody(),
-                untrusted_render,
-                trusted_custody.custody(),
-                trusted_render,
-                trusted_custody.route().trust,
-            ));
-
-            // (c) Only the documented harness steering varies with mode.
-            steering_by_mode.push((mode, mode.prompt_file(), mode.as_str()));
-        }
-
-        let baseline = &redaction_by_mode[0];
-        for observed in &redaction_by_mode[1..] {
-            assert_eq!(
-                observed, baseline,
-                "custody, redaction posture, and rendered briefs must be identical across modes: {redaction_by_mode:?}"
-            );
-        }
-        let mut steering_files: Vec<&str> = steering_by_mode
-            .iter()
-            .map(|(_, prompt_file, _)| *prompt_file)
-            .collect();
-        steering_files.sort_unstable();
-        steering_files.dedup();
-        assert_eq!(
-            steering_files.len(),
-            3,
-            "each mode must select its own harness prompt: {steering_by_mode:?}"
+        // (a) Redaction posture follows trust only.
+        let untrusted_model = Model::for_provider(
+            &providers,
+            "minimax",
+            "MiniMax-M2",
+            session.session_redact_table(),
+        )
+        .unwrap();
+        let trusted_model = Model::for_provider(
+            &providers,
+            "minimax",
+            "trusted-code",
+            session.session_redact_table(),
+        )
+        .unwrap();
+        assert!(!untrusted_model.is_trusted());
+        assert!(trusted_model.is_trusted());
+        assert!(
+            !untrusted_model.redact_table().is_empty(),
+            "an untrusted destination keeps the session table"
         );
+        assert!(
+            trusted_model.redact_table().is_empty(),
+            "a trusted destination resolves to the pass-through table"
+        );
+
+        // (b) Dispatch a real delegation and render its brief through the
+        //     resolved custody. Untrusted is redacted.
+        let untrusted_selector = DelegationModelSelector::Exact {
+            selector: "minimax:MiniMax-M2".into(),
+            required_capabilities: Vec::new(),
+            min_context_tokens: None,
+        };
+        let (model, custody) = resolve_delegated_model_with_custody(
+            "explore",
+            None,
+            Some(&untrusted_selector),
+            &extended,
+            &providers,
+            &session,
+            None,
+        )
+        .expect("untrusted delegation resolves");
+        assert_eq!(model.model_id_ref(), "MiniMax-M2");
+        assert_eq!(custody.custody(), ModelCustody::Untrusted);
+        let untrusted_render = custody.render_brief(&brief);
+        assert!(
+            !untrusted_render.contains(REDACTION_TEST_SECRET),
+            "{untrusted_render}"
+        );
+
+        // Trusted is host-authored (an agent file naming a self-hosted
+        // endpoint): the brief reaches it unchanged, which is the intended
+        // outcome for a no-log destination.
+        let (trusted_child, trusted_custody) = resolve_delegated_model_with_custody(
+            "explore",
+            Some("minimax:trusted-code"),
+            None,
+            &extended,
+            &providers,
+            &session,
+            None,
+        )
+        .expect("host-authored trusted delegation resolves");
+        assert_eq!(trusted_child.model_id_ref(), "trusted-code");
+        assert_eq!(trusted_custody.custody(), ModelCustody::Trusted);
+        let trusted_render = trusted_custody.render_brief(&brief);
+        assert_eq!(trusted_render, brief);
     }
 
     /// F1/AC7 (spawn surface). `spawn.model` is a model-authored selector, so
@@ -2759,9 +2709,8 @@ mod tests {
         providers
     }
 
-    fn extended_mode(mode: LlmMode) -> ExtendedConfig {
+    fn extended_mode() -> ExtendedConfig {
         ExtendedConfig {
-            llm_mode: mode,
             agent_chooses_subagent_model: true,
             ..ExtendedConfig::default()
         }
@@ -2776,7 +2725,6 @@ mod tests {
             provider: model.provider_id().to_string(),
             model: model.model_id_ref().to_string(),
             trust: ModelTrust::Trusted,
-            mode: LlmMode::Normal,
             location: Some(ModelLocation::Local),
             quality_rank: 0,
             cost_rank: 0,
@@ -2797,7 +2745,7 @@ mod tests {
         match resolve_trusted_child_model(
             "reasoning",
             "deepthink",
-            &extended_mode(LlmMode::Normal),
+            &extended_mode(),
             &providers,
             &session,
             None,
@@ -2830,7 +2778,7 @@ mod tests {
         let (model, grant) = resolve_trusted_child_model(
             "reasoning",
             "deepthink",
-            &extended_mode(LlmMode::Normal),
+            &extended_mode(),
             &providers,
             &session,
             None,
@@ -2859,7 +2807,7 @@ mod tests {
                 resolve_trusted_child_model(
                     "reasoning",
                     "deepthink",
-                    &extended_mode(LlmMode::Normal),
+                    &extended_mode(),
                     &providers,
                     &session,
                     None,
@@ -2903,7 +2851,7 @@ mod tests {
             resolve_trusted_child_model(
                 "reasoning",
                 "deepthink",
-                &extended_mode(LlmMode::Normal),
+                &extended_mode(),
                 &providers,
                 &session,
                 None,
@@ -2913,43 +2861,40 @@ mod tests {
         );
     }
 
-    /// AC5. `ModelTrust`, not `LlmMode`, controls custody: a trusted `Local`
-    /// child gets raw bytes in every harness posture, and a trusted `Remote`
-    /// child fails closed in every posture. Mode alone changes no custody.
+    /// AC5. `ModelTrust`, not harness posture, controls custody: a trusted
+    /// `Local` child gets raw bytes, and a trusted `Remote` child fails closed.
     #[test]
     fn trusted_child_custody_ignores_harness_mode() {
-        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            let providers = trusted_child_providers(Some(ModelLocation::Local));
-            let session = session_model(&providers);
-            let (model, grant) = resolve_trusted_child_model(
+        let providers = trusted_child_providers(Some(ModelLocation::Local));
+        let session = session_model(&providers);
+        let (model, grant) = resolve_trusted_child_model(
+            "reasoning",
+            "deepthink",
+            &extended_mode(),
+            &providers,
+            &session,
+            None,
+        )
+        .expect("a local trusted child must route");
+        assert_eq!(
+            raw_bytes_released_by(&grant, &model).as_deref(),
+            Some(PLANTED_SECRET),
+            "a host-local trusted child must release raw bytes"
+        );
+
+        let providers = trusted_child_providers(Some(ModelLocation::Remote));
+        let session = session_model(&providers);
+        assert!(
+            resolve_trusted_child_model(
                 "reasoning",
                 "deepthink",
-                &extended_mode(mode),
+                &extended_mode(),
                 &providers,
                 &session,
                 None,
             )
-            .unwrap_or_else(|e| panic!("{mode:?}: a local trusted child must route: {e:?}"));
-            assert_eq!(
-                raw_bytes_released_by(&grant, &model).as_deref(),
-                Some(PLANTED_SECRET),
-                "{mode:?}: a host-local trusted child must release raw bytes regardless of mode"
-            );
-
-            let providers = trusted_child_providers(Some(ModelLocation::Remote));
-            let session = session_model(&providers);
-            assert!(
-                resolve_trusted_child_model(
-                    "reasoning",
-                    "deepthink",
-                    &extended_mode(mode),
-                    &providers,
-                    &session,
-                    None,
-                )
-                .is_err(),
-                "{mode:?}: a trusted Remote child must fail closed regardless of mode"
-            );
-        }
+            .is_err(),
+            "a trusted Remote child must fail closed"
+        );
     }
 }

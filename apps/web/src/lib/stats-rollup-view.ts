@@ -6,7 +6,6 @@ export type StatsViewRow = {
 
 export type StatsRollupView = {
   tokenRows: StatsViewRow[];
-  recoveryModeRows: StatsViewRow[];
   fallbackTotal: string | null;
 };
 
@@ -32,17 +31,12 @@ function formatCount(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
 }
 
-function formatPercent(value: number | undefined) {
-  return typeof value === "number" ? `${value.toFixed(1)}%` : "0.0%";
-}
-
 export function statsRollupToView(
   rollup: unknown,
   fallbackTotalTokens?: number | null,
 ): StatsRollupView {
   const root = asRecord(rollup);
   const tokens = asRecord(root?.tokens);
-  const recovery = asRecord(root?.recovery);
 
   const tokenRows = asArray(tokens?.by_model).flatMap((item): StatsViewRow[] => {
     const row = asRecord(item);
@@ -60,23 +54,8 @@ export function statsRollupToView(
     ];
   });
 
-  const recoveryModeRows = asArray(recovery?.by_llm_mode).flatMap((item): StatsViewRow[] => {
-    const row = asRecord(item);
-    if (!row) return [];
-    const mode = stringField(row, "llm_mode") ?? "unknown";
-    const calls = numberField(row, "calls") ?? 0;
-    return [
-      {
-        label: mode,
-        value: formatCount(calls),
-        detail: `${formatPercent(numberField(row, "recovered_pct"))} recovered`,
-      },
-    ];
-  });
-
   return {
     tokenRows,
-    recoveryModeRows,
     fallbackTotal:
       tokenRows.length || typeof fallbackTotalTokens !== "number"
         ? null

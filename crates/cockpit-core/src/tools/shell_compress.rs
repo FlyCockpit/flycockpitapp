@@ -391,11 +391,11 @@ pub fn first_program(command: &str) -> Option<String> {
     None
 }
 
-/// The dedicated tool a defensive-mode `bash` file/search command should have
-/// been routed to (implementation note). A
-/// `bash` run in [`crate::config::extended::LlmMode::Defensive`] classifies its
-/// command off [`first_program`] and, when it lands on one of these, appends a
-/// single terse tip line steering the model to the dedicated tool next time.
+/// The dedicated tool a verbose-steering `bash` file/search command should
+/// have been routed to (implementation note). A `bash` run under verbose
+/// steering classifies its command off [`first_program`] and, when it lands
+/// on one of these, appends a single terse tip line steering the model to
+/// the dedicated tool next time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BashTip {
     /// `cat`/`head`/`tail`/`less`/`more` → `read`.

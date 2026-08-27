@@ -719,7 +719,6 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         model_system_prompt_snapshot: ctx.session.model_system_prompt_snapshot(),
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
-        llm_mode: ctx.agent.llm_mode,
         // Plan-level overrides don't apply to ad-hoc swarm fan-out.
         model_override: None,
         delegation_model: None,
@@ -1058,7 +1057,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
         let config_path = tmp.path().join(".cockpit/config.json");
-        std::fs::write(&config_path, r#"{"llm_mode":"normal"}"#).unwrap();
+        std::fs::write(&config_path, r#"{}"#).unwrap();
         let mut providers = crate::config::providers::ProvidersConfig::default();
         providers.providers.insert(
             "cloud".into(),
@@ -1124,7 +1123,8 @@ mod tests {
             model: parent_model,
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
             context_policy: None,
             lock_identity: "Swarm".to_string(),
             write_scope: None,
@@ -1241,7 +1241,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
         let config_path = tmp.path().join(".cockpit/config.json");
-        std::fs::write(&config_path, r#"{"llm_mode":"normal"}"#).unwrap();
+        std::fs::write(&config_path, r#"{}"#).unwrap();
         let mut providers = crate::config::providers::ProvidersConfig::default();
         providers.providers.insert(
             "cloud".into(),
@@ -1301,7 +1301,8 @@ mod tests {
             model: parent_model,
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
             context_policy: None,
             lock_identity: "Swarm".to_string(),
             write_scope: None,
@@ -1436,7 +1437,8 @@ mod tests {
             model,
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
             context_policy: None,
             lock_identity: "Swarm".to_string(),
             write_scope: None,

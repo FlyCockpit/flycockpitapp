@@ -115,15 +115,11 @@ pub enum ToolSteering {
 }
 
 impl ToolSteering {
-    /// Derive steering from the legacy [`crate::config::extended::LlmMode`]
-    /// at the existing seams: `Defensive` -> `Verbose`, else `Terse`. Used
-    /// while undeclared defs still fall back to the mode.
-    pub fn from_llm_mode(mode: crate::config::extended::LlmMode) -> Self {
-        match mode {
-            crate::config::extended::LlmMode::Defensive => Self::Verbose,
-            crate::config::extended::LlmMode::Normal
-            | crate::config::extended::LlmMode::Frontier => Self::Terse,
-        }
+    /// Resolve the steering from an agent definition: the declared
+    /// `toolSteering` wins, otherwise the default `Terse` (issue #75
+    /// closure — no code path derives steering from a session-global mode).
+    pub fn from_def(def: &AgentDef) -> Self {
+        def.tool_steering.unwrap_or_default()
     }
 }
 
@@ -164,61 +160,55 @@ impl ContextPolicy {
 }
 
 /// The resolved posture of one agent node (issue #75): the single value the
-/// engine consults in place of the session-global [`LlmMode`]. It carries
-/// either an explicit capability-grant set (when the [`AgentDef`] declares
-/// `capabilities`) or a legacy [`LlmMode`] for the not-yet-declared fallback.
+/// engine consults in place of the former session-global `LlmMode`. It carries
+/// the resolved capability-grant set. When the [`AgentDef`] declares
+/// `capabilities`, that set is authoritative; when it does not (`None`), the
+/// `standard` fallback grant set (empty — none of the four capabilities)
+/// applies.
 ///
-/// The only constructor that injects a declared grant set is
-/// [`PostureResolution::from_def`]; the legacy seam is
-/// [`PostureResolution::legacy`]. This keeps the closure ratchet (Stage 5)
-/// enforceable: no engine site can synthesize a grant set.
+/// The only constructor is [`PostureResolution::from_def`], which lives in
+/// this module: no engine site can synthesize a grant set (closure ratchet).
 #[derive(Debug, Clone)]
 pub struct PostureResolution {
-    declared: Option<BTreeSet<AgentCapability>>,
-    legacy_mode: crate::config::extended::LlmMode,
+    grants: BTreeSet<AgentCapability>,
 }
 
 impl PostureResolution {
-    /// Resolve posture from an agent definition plus the legacy mode the
-    /// session would have used. When `def.capabilities` is `Some`, the
-    /// declared set is authoritative; when `None`, the legacy mode gate
-    /// applies (Stage 2 fallback).
-    pub fn from_def(def: &AgentDef, legacy_mode: crate::config::extended::LlmMode) -> Self {
+    /// Resolve posture from an agent definition. When `def.capabilities` is
+    /// `Some`, the declared set is authoritative; when `None`, the `standard`
+    /// fallback (no capabilities) applies.
+    pub fn from_def(def: &AgentDef) -> Self {
         Self {
-            declared: def.capabilities.clone(),
-            legacy_mode,
+            grants: def.capabilities.clone().unwrap_or_default(),
         }
     }
 
-    /// The legacy-only posture (no declared grants): the mode gate applies.
-    /// Used at seams that have not yet been threaded through a def.
-    pub fn legacy(legacy_mode: crate::config::extended::LlmMode) -> Self {
+    /// The `standard` fallback posture: no capability grants (issue #75,
+    /// decision 6). Used for cold start and delegation to an undescribed
+    /// model.
+    pub fn standard() -> Self {
         Self {
-            declared: None,
-            legacy_mode,
+            grants: BTreeSet::new(),
         }
     }
 
-    /// The declared grant set, or `None` when the def has not declared
-    /// capabilities (legacy mode-gate fallback).
-    pub fn declared_grants(&self) -> Option<&BTreeSet<AgentCapability>> {
-        self.declared.as_ref()
+    /// Construct a posture from an explicit grant set. This is the derivation
+    /// seam for a model-override def (the governing def's grants, slot
+    /// substituted) and the test fixture seam. Production resolution paths
+    /// use [`Self::from_def`].
+    pub(crate) fn from_grants(grants: BTreeSet<AgentCapability>) -> Self {
+        Self { grants }
     }
 
-    /// The legacy [`LlmMode`], consulted only when [`Self::declared_grants`]
-    /// is `None`.
-    pub fn legacy_mode(&self) -> crate::config::extended::LlmMode {
-        self.legacy_mode
+    /// The resolved grant set.
+    pub fn grants(&self) -> &BTreeSet<AgentCapability> {
+        &self.grants
     }
 
     /// Whether a given [`crate::engine::tool::Capability`] is enabled under
-    /// this posture. When grants are declared, membership decides; otherwise
-    /// the legacy mode gate applies.
+    /// this posture: membership in the resolved grant set decides.
     pub fn capability_enabled(&self, cap: crate::engine::tool::Capability) -> bool {
-        if let Some(grants) = &self.declared {
-            return grants.contains(&cap.into());
-        }
-        cap.enabled_for_mode(self.legacy_mode)
+        self.grants.contains(&cap.into())
     }
 }
 
@@ -278,20 +268,19 @@ pub struct AgentDef {
     /// and user-authored agents do not inherit fork eligibility accidentally.
     #[serde(rename = "forkEligible", default)]
     pub fork_eligible: bool,
-    /// Explicit per-agent capability grants (issue #75). `None` = "not yet
-    /// declared" (legacy fallback to the mode gate until Stage 5 closes the
-    /// ratchet); `Some(empty)` = explicitly none. The four variants mirror the
-    /// legacy [`crate::engine::tool::Capability`] set.
+    /// Explicit per-agent capability grants (issue #75). `None` = "not
+    /// declared" (resolves to the `standard` fallback grant set — none of
+    /// the four capabilities); `Some(empty)` = explicitly none. The four
+    /// variants mirror the [`crate::engine::tool::Capability`] set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<BTreeSet<AgentCapability>>,
     /// Per-agent tool-description steering (issue #75). `None` = not declared
-    /// (derive from the legacy mode at the existing seams); `Some` selects the
-    /// rendering directly.
+    /// (default `Terse`); `Some` selects the rendering directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_steering: Option<ToolSteering>,
     /// Per-agent context policy (issue #75): the auto-compact floor and inline
-    /// caps profile that previously came from the mode. `None` = not declared
-    /// (inherit the default 80 / `standard`).
+    /// caps profile. `None` = not declared (inherit the default 80 /
+    /// `standard`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_policy: Option<ContextPolicy>,
     /// Parsed v2 declarative contract.  v2 never projects into the legacy

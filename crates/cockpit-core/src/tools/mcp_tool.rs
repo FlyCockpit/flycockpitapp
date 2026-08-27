@@ -153,12 +153,11 @@ fn rendered_result_output(out: String) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::extended::LlmMode;
     use std::sync::Arc;
 
-    fn mcp_description(toolbox: &ToolBox, mode: LlmMode) -> String {
+    fn mcp_description(toolbox: &ToolBox, steering: crate::agents::ToolSteering) -> String {
         toolbox
-            .definitions(crate::agents::ToolSteering::from_llm_mode(mode))
+            .definitions(steering)
             .into_iter()
             .find(|definition| definition.name == "mcp")
             .unwrap()
@@ -230,12 +229,12 @@ mod tests {
             .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
 
         assert_eq!(
-            mcp_description(&disabled, LlmMode::Normal),
-            mcp_description(&discoverable, LlmMode::Normal)
+            mcp_description(&disabled, crate::agents::ToolSteering::Terse),
+            mcp_description(&discoverable, crate::agents::ToolSteering::Terse)
         );
         assert_eq!(
-            mcp_description(&disabled, LlmMode::Defensive),
-            mcp_description(&discoverable, LlmMode::Defensive)
+            mcp_description(&disabled, crate::agents::ToolSteering::Verbose),
+            mcp_description(&discoverable, crate::agents::ToolSteering::Verbose)
         );
     }
 
@@ -245,8 +244,8 @@ mod tests {
             .with(Arc::new(McpTool))
             .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
 
-        let normal = mcp_description(&toolbox, LlmMode::Normal);
-        let defensive = mcp_description(&toolbox, LlmMode::Defensive);
+        let normal = mcp_description(&toolbox, crate::agents::ToolSteering::Terse);
+        let defensive = mcp_description(&toolbox, crate::agents::ToolSteering::Verbose);
 
         assert_eq!(normal, NORMAL_DESCRIPTION);
         assert_eq!(defensive, DEFENSIVE_DESCRIPTION);
@@ -563,7 +562,7 @@ mod tests {
                 output: raw_output.clone(),
                 truncated: false,
                 duration_ms: 0,
-                llm_mode: LlmMode::Normal,
+                llm_mode: crate::config::extended::LlmMode::Normal,
                 shape_fingerprint: None,
                 hint: None,
             })

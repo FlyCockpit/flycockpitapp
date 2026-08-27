@@ -1257,7 +1257,6 @@ async fn execute_ordinary_call_unscoped(
                 output: output_str.clone(),
                 truncated,
                 duration_ms,
-                llm_mode: env.agent.llm_mode,
                 shape_fingerprint: repair_fingerprint.clone(),
                 hint: hint_value.clone(),
             },
@@ -2227,7 +2226,8 @@ mod tests {
             model: test_model(),
             params: ModelParams::default(),
             scan_tool_results: false,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
             context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
@@ -2263,7 +2263,7 @@ mod tests {
             lock_identity: "Build".to_string().clone(),
             write_scope: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),
             session,
             cwd: root.to_path_buf(),
@@ -3229,11 +3229,7 @@ mod tests {
         // to.
         let providers_dir = tmp.path().join(".cockpit").join("providers");
         std::fs::create_dir_all(&providers_dir).unwrap();
-        std::fs::write(
-            tmp.path().join(".cockpit").join("config.json"),
-            r#"{"llm_mode":"defensive"}"#,
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(".cockpit").join("config.json"), r#"{}"#).unwrap();
         std::fs::write(
             providers_dir.join("openai.json"),
             serde_json::json!({
@@ -5137,7 +5133,7 @@ mod tests {
             !toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()

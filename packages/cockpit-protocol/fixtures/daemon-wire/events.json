@@ -243,7 +243,6 @@
           "inlineThink": true,
           "intelCentralityRanking": true,
           "knowledge_inject_max_tokens": 2048,
-          "llm_mode": "defensive",
           "loop_guard": {
             "repeat_threshold": 2
           },
@@ -889,15 +888,6 @@
       }
     },
     "event": "image_control_config_changed",
-    "kind": "evt",
-    "v": 20
-  },
-  "llm_mode_changed": {
-    "data": {
-      "mode": "normal",
-      "session_id": "11111111-1111-4111-8111-111111111111"
-    },
-    "event": "llm_mode_changed",
     "kind": "evt",
     "v": 20
   },

@@ -353,23 +353,10 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub skills: SkillsConfig,
 
-    /// The LLM-strength steering axis. `defensive` (the default) renders
-    /// explicit, steering tool/parameter descriptions and selects
-    /// `defensive.md` per-mode agent prompts — tuned for the weak-model target
-    /// (GOALS §1). `normal` keeps the terse token-economy descriptions and
-    /// `normal.md` prompts. `frontier` is the top-tier-model tier: it keeps
-    /// terse tool descriptions and selects `frontier.md` prompts when present,
-    /// falling back through `normal.md` to the defensive flat body. Distinct
-    /// from [`crate::agents::AgentMode`] (`primary`/`subagent`/`all`
-    /// reachability) — not auto-inferred from model identity. An unknown value
-    /// is rejected with the offending value backticked and the valid set listed.
-    #[serde(default, deserialize_with = "deserialize_llm_mode")]
-    pub llm_mode: LlmMode,
-
     /// Which primary agent a new session starts on. `build` (the default)
     /// starts on the coding agent; the user may pin `plan` for plan-mode
     /// deliberation. `/settings` exposes the cycle; [`initial_active_agent`]
-    /// reads this. Distinct from [`crate::agents::AgentMode`] and [`LlmMode`].
+    /// reads this. Distinct from [`crate::agents::AgentMode`].
     ///
     /// [`initial_active_agent`]: crate::daemon::session_worker
     #[serde(rename = "defaultPrimaryAgent", default)]
@@ -404,7 +391,7 @@ pub struct ExtendedConfig {
     /// (implementation note). `manual` (the default)
     /// asks the user for every gated call; `auto` runs each gated call past
     /// the utility-model safety gate (safe → run, unsafe → ask); `yolo` runs
-    /// everything unprompted. Distinct from [`LlmMode`]. `/settings` exposes
+    /// everything unprompted. `/settings` exposes
     /// the cycle; the session reads this at spawn.
     #[serde(rename = "defaultApprovalMode", default)]
     pub default_approval_mode: ApprovalMode,
@@ -983,7 +970,7 @@ impl DefaultPrimaryAgent {
 /// Manual asks after applicable grants are checked; Auto routes ungranted work
 /// through the safety gate before asking; Yolo is unattended and opens no human
 /// permission interrupt. Successful confined commands remain silent under all
-/// modes — the sandbox is their gate. Deliberately distinct from [`LlmMode`].
+/// modes — the sandbox is their gate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
@@ -1049,77 +1036,6 @@ impl ApprovalMode {
             ApprovalMode::Auto => ApprovalMode::Yolo,
             ApprovalMode::Yolo => ApprovalMode::Manual,
         }
-    }
-}
-
-/// The LLM-strength steering axis.
-/// The only thing called a *mode* in cockpit's agent surface; `Plan` and
-/// `Build` are agents, not modes.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum LlmMode {
-    /// Cheaper/weaker ~120k-context models (the default, GOALS §1 target):
-    /// explicit steering descriptions, `defensive.md` prompts, interactive-
-    /// subagent decomposition.
-    #[default]
-    Defensive,
-    /// Middle/default strong-model tier: terse descriptions, `normal.md`
-    /// prompts, and existing non-defensive behavior.
-    Normal,
-    /// Top-tier models: terse descriptions, optional `frontier.md` prompts,
-    /// and high-autonomy policy hooks for later prompts.
-    Frontier,
-}
-
-impl LlmMode {
-    /// The on-disk per-mode agent-prompt file name (`<name>/<mode>.md`).
-    pub fn prompt_file(self) -> &'static str {
-        match self {
-            LlmMode::Defensive => "defensive.md",
-            LlmMode::Normal => "normal.md",
-            LlmMode::Frontier => "frontier.md",
-        }
-    }
-
-    /// The lowercase config/serde spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            LlmMode::Defensive => "defensive",
-            LlmMode::Normal => "normal",
-            LlmMode::Frontier => "frontier",
-        }
-    }
-
-    /// Cycle through the values — the `/llm-mode toggle` action.
-    pub fn cycled(self) -> Self {
-        match self {
-            LlmMode::Defensive => LlmMode::Normal,
-            LlmMode::Normal => LlmMode::Frontier,
-            LlmMode::Frontier => LlmMode::Defensive,
-        }
-    }
-}
-
-/// Reject an unknown `llm_mode` with the offending value backticked and
-/// the valid set listed — mirrors [`deserialize_vim_mode_setting`]'s
-/// error style.
-fn deserialize_llm_mode<'de, D>(d: D) -> Result<LlmMode, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    let v = serde_json::Value::deserialize(d)?;
-    match v {
-        serde_json::Value::Null => Ok(LlmMode::default()),
-        serde_json::Value::String(s) => match s.as_str() {
-            "defensive" => Ok(LlmMode::Defensive),
-            "normal" => Ok(LlmMode::Normal),
-            "frontier" => Ok(LlmMode::Frontier),
-            other => Err(D::Error::custom(format!(
-                "unknown llm_mode `{other}` (expected defensive|normal|frontier)"
-            ))),
-        },
-        _ => Err(D::Error::custom("llm_mode must be a string")),
     }
 }
 
@@ -1624,7 +1540,6 @@ impl Default for ExtendedConfig {
             max_primary_rounds: 0,
             dialog: DialogConfig::default(),
             skills: SkillsConfig::default(),
-            llm_mode: LlmMode::default(),
             default_primary_agent: DefaultPrimaryAgent::default(),
             removed_default_primary_agent: None,
             translation: TranslationConfig::default(),
@@ -2563,7 +2478,17 @@ impl ExtendedConfigDoc {
         parse_field!("maxPrimaryRounds", max_primary_rounds);
         parse_field!("dialog", dialog);
         parse_field!("skills", skills);
-        parse_field!("llm_mode", llm_mode);
+        if raw.contains_key("llm_mode") {
+            tracing::warn!(
+                path = %self.path.display(),
+                key = "llm_mode",
+                "llm_mode is no longer supported; agent posture now comes from agent definitions"
+            );
+            warnings.push(format!(
+                "llm_mode is no longer supported; agent posture now comes from agent definitions (ignored in {})",
+                self.path.display()
+            ));
+        }
         if let Some(value) = raw.get("defaultPrimaryAgent") {
             match value.as_str() {
                 Some("build") => cfg.default_primary_agent = DefaultPrimaryAgent::Build,
@@ -2680,7 +2605,6 @@ impl ExtendedConfigDoc {
         remove_malformed!("sandboxEscalationEnabled", bool);
         remove_malformed!("sandbox_escalation_enabled", bool);
         remove_malformed!("prompt_injection_guard", PromptInjectionGuardConfig);
-        remove_malformed!("llm_mode", LlmMode);
         remove_malformed!("approvalPolicy", ApprovalPolicyConfig);
         remove_malformed!("sandbox", SandboxConfig);
         remove_malformed!("review", ReviewConfig);
@@ -2829,6 +2753,7 @@ impl ExtendedConfigDoc {
             }
         }
         obj.remove("sandboxEscalationEnabled");
+        obj.remove("llm_mode");
         obj.remove(&["trusted", "Only"].concat());
         obj.remove(&["trusted", "_only"].concat());
         Ok(())

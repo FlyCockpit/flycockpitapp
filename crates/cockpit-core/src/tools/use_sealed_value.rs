@@ -4,7 +4,7 @@
 //! returns exactly the granted action's declared safe projection. There is no
 //! sibling tool that returns a literal, for any caller: a trusted model's raw
 //! custody is an *inference egress* contract governed by `ModelTrust`, not a
-//! tool API. Untrusted callers in every `LlmMode` reach only this surface.
+//! tool API. Untrusted callers reach only this surface regardless of steering.
 //!
 //! Every failure renders the single content-free denial, so the tool is not an
 //! oracle over the sealed inventory.
@@ -139,7 +139,6 @@ impl Tool for UseSealedValueTool {
             // the default keeps the custody predicate honest rather than
             // inventing a trusted claim the tool cannot verify.
             caller_trust: crate::config::providers::ModelTrust::default(),
-            caller_mode: ctx.llm_mode,
             project_key: SealedProjectKey::from_canonical(ctx.session.project_id.clone()),
             project_trust,
             session_id: ctx.session.id,

@@ -137,13 +137,6 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
-    /// The active LLM-strength mode (implementation note).
-    /// Threaded onto every spawned [`Agent`] so the centralized tool-
-    /// description rendering seam ([`ToolBox::definitions`]) and the per-agent
-    /// prompt resolution ([`crate::agents::AgentDef::resolved_prompt`])
-    /// both read one value. Resolved from the layered `config.json`
-    /// at session start.
-    pub llm_mode: crate::config::extended::LlmMode,
     /// Plan-level model override (prompt
     /// `plan-duplication-and-model-override.md`): when a plan pins a `model`,
     /// every agent spawned by that plan's run uses it, **overriding** even an
@@ -301,7 +294,6 @@ pub(crate) fn computer_use_custody_route(
     providers: &crate::config::providers::ProvidersConfig,
     provider_id: &str,
     model_id: &str,
-    global_mode: crate::config::extended::LlmMode,
 ) -> Result<crate::config::providers::ResolvedModelPolicy, crate::config::providers::ModelPolicyError>
 {
     let custody = crate::engine::model_roles::custody_for_trust(
@@ -311,17 +303,13 @@ pub(crate) fn computer_use_custody_route(
     // be used to render anything through an identity no-op table. The worker
     // construction site builds the paired custody/payload request instead.
     let selector = format!("{provider_id}:{model_id}");
-    providers.resolve_sensitive_model_policy_eligibility(
-        &computer_use_criteria(&selector, global_mode),
-        custody,
-    )
+    providers.resolve_sensitive_model_policy_eligibility(&computer_use_criteria(&selector), custody)
 }
 
 /// The shared selection criteria for a computer-use route, so the candidate
 /// scan and the worker construction site cannot drift apart.
 pub(crate) fn computer_use_criteria(
     selector: &str,
-    global_mode: crate::config::extended::LlmMode,
 ) -> crate::config::providers::ModelPolicyCriteria<'_> {
     use crate::config::providers::{
         AvailabilityScope, ModelOptimization, ModelPolicyCriteria, ModelPolicySelector,
@@ -337,14 +325,12 @@ pub(crate) fn computer_use_criteria(
         agent: Some("computer"),
         // The host enabled `computer_use` on this exact model.
         availability: AvailabilityScope::HostNamedTarget,
-        global_mode,
     }
 }
 
 fn computer_subagent_candidate(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
-    global_mode: crate::config::extended::LlmMode,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
     let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
     for (provider_id, provider) in &providers.providers {
@@ -374,7 +360,7 @@ fn computer_subagent_candidate(
             // The custody class is the configured computer-use model's own
             // trust class: the host authorized this model for computer use, a
             // model never picks it.
-            if computer_use_custody_route(providers, provider_id, &model.id, global_mode).is_err() {
+            if computer_use_custody_route(providers, provider_id, &model.id).is_err() {
                 continue;
             }
             return Some((
@@ -395,8 +381,8 @@ fn computer_subagent_reachable(
     config: &crate::daemon::session_worker::SessionConfigHandle,
     cwd: &Path,
 ) -> bool {
-    let (extended, providers) = config.configs();
-    computer_subagent_candidate(&providers, cwd, extended.llm_mode).is_some()
+    let (_extended, providers) = config.configs();
+    computer_subagent_candidate(&providers, cwd).is_some()
 }
 
 /// Append the direct full codebase-intelligence tool set (GOALS §21) to `tb`.
@@ -1916,30 +1902,6 @@ fn is_delegating(agent: &Agent) -> bool {
     agent.tools.names().contains(&"task")
 }
 
-/// Resolve the harness posture ([`crate::config::extended::LlmMode`]) the agent
-/// built from `args` should render and enforce, from the child's OWN selected
-/// `model` rather than the inherited root frame.
-///
-/// A root/primary spawn (`!args.delegated`) keeps `args.llm_mode`: the session
-/// posture, already resolved for the session model at session start and on each
-/// `/llm-mode` switch. A delegated child resolves its own posture from its
-/// selected provider/model with the same precedence as a root turn — model
-/// `mode` override → provider `mode` override → global default — reading the
-/// config generation pinned on `args` so identity and posture always come from
-/// one generation. This is the delegated analogue of
-/// [`crate::engine::driver::Driver::effective_llm_mode_for`], and it never
-/// re-reads the parent frame's posture.
-pub(crate) fn child_llm_mode_for_model(
-    args: &SpawnArgs,
-    model: &Model,
-) -> crate::config::extended::LlmMode {
-    if !args.delegated {
-        return args.llm_mode;
-    }
-    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.config);
-    providers.resolve_mode(model.provider_id(), model.model_id_ref(), extended.llm_mode)
-}
-
 /// Side-effect-free resolution of the concrete model a delegated child named
 /// `name` would run under, using the SAME precedence the agent build applies
 /// (`model_override` → agent-file frontmatter / caller selector → session
@@ -2000,67 +1962,41 @@ async fn resolve_child_def_with_db(
 }
 
 /// Re-render an already-built delegated child's mode-dependent surface for a
-/// FAILOVER/BACKUP candidate `candidate_model` whose effective posture differs
-/// from the child's primary posture, so **every dispatched target renders its
-/// own effective mode** (not the primary's).
+/// FAILOVER/BACKUP candidate `candidate_model`, recomposing the agent's
+/// system prompt for the candidate model. Per issue #75 the posture (tool
+/// steering, capability grants, context policy) comes from the agent's def
+/// and is model-independent, so only the composed `system` and `model`
+/// change — the role body, toolbox, grants, and steering are preserved.
 ///
-/// The toolbox is preserved intact — only its descriptions/schemas re-render at
-/// [`ToolBox::definitions`] time from the new `llm_mode`, so per-delegation
-/// grants and the exact tool SET are never disturbed. Only `llm_mode`, the
-/// composed `system` (role body recomposed for the candidate posture from the
-/// SAME def), and `role_prompt` change.
+/// Returns `Ok(None)` ONLY when the candidate is the SAME model as the
+/// current agent (the primary attempt — no re-render needed). Any different
+/// MODEL re-renders, because the composed `system` is model-specific (it
+/// prepends the candidate model's own system prompt): a same-def,
+/// different-model backup must NOT reuse the primary model's composed system.
 ///
-/// Returns `Ok(None)` ONLY when the candidate is the SAME model AND the same
-/// posture as the current agent (the primary attempt — no re-render needed).
-/// Any different MODEL (even at the same mode) re-renders, because the composed
-/// `system` is model-specific (it prepends the candidate model's own system
-/// prompt): a same-mode, different-model backup must NOT reuse the primary
-/// model's composed system.
-///
-/// For a SAME-mode candidate the agent's OWN role body is reused (no
-/// re-resolution — this works for assistant-DB-backed agents too). For a
-/// DIFFERENT-mode candidate the def is re-resolved through the SAME workspace +
-/// assistant-DB path the original build used, so a DB-backed agent's failover
-/// succeeds with the candidate mode's role + its own identity. Fails CLOSED with
-/// a content-safe error only when the agent's def can no longer be resolved by
-/// ANY path — never dispatching the wrong mode's role text on a different model.
+/// The role body is the agent's OWN resolved role (unchanged by the model
+/// swap), so this works for assistant-DB-backed agents too. Fails CLOSED with
+/// a content-safe error only when the system cannot be recomposed.
 pub(crate) async fn reposture_agent_for_candidate(
     agent: &Agent,
     candidate_model: &Arc<Model>,
-    candidate_mode: crate::config::extended::LlmMode,
     session: &crate::session::Session,
     cwd: &Path,
     db: &crate::db::Db,
 ) -> Result<Option<Agent>> {
+    let _ = db;
     let same_model = agent.model.provider_id() == candidate_model.provider_id()
         && agent.model.model_id_ref() == candidate_model.model_id_ref();
-    if same_model && candidate_mode == agent.llm_mode {
+    if same_model {
         return Ok(None);
     }
-    let role = if candidate_mode == agent.llm_mode {
-        // Same posture, different model: the role body is unchanged, so reuse the
-        // agent's OWN resolved role (no re-resolution — works for DB-backed
-        // agents even when `resolve_child_def` cannot find them).
-        agent.role_prompt.clone()
-    } else {
-        // Different posture: re-resolve the def (through the SAME workspace +
-        // assistant-DB path the original build used) for the candidate mode's
-        // role body. Fail closed if it cannot be resolved by any path — never
-        // retain the wrong mode's role text.
-        let def = resolve_child_def_with_db(&agent.name, cwd, db)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "cannot re-resolve agent `{}` to render its failover posture: {e}",
-                    agent.name
-                )
-            })?;
-        def.resolved_prompt(None).to_string()
-    };
-    // Recompose the system for the ACTUAL candidate model (its own model-specific
-    // system prompt), applying the SAME assistant identity prefix the initial
-    // build used, so the repostured system is byte-identical to a fresh build for
-    // this candidate model+mode.
+    // The role body is unchanged by a model swap (it comes from the def, not
+    // the model), so reuse the agent's OWN resolved role.
+    let role = agent.role_prompt.clone();
+    // Recompose the system for the ACTUAL candidate model (its own
+    // model-specific system prompt), applying the SAME assistant identity
+    // prefix the initial build used, so the repostured system is byte-identical
+    // to a fresh build for this candidate model.
     let system = compose_reposture_system(
         &role,
         candidate_model,
@@ -2069,7 +2005,6 @@ pub(crate) async fn reposture_agent_for_candidate(
         cwd,
     );
     let mut reposed = agent.clone();
-    reposed.llm_mode = candidate_mode;
     reposed.role_prompt = role;
     reposed.system = system;
     reposed.model = candidate_model.clone();
@@ -2128,9 +2063,15 @@ pub struct ResolvedChildExecutionSurface {
     /// The config generation this surface was resolved from. The caller binds
     /// the admitted attempt to this value; a generation change invalidates it.
     pub config_generation: u64,
-    /// The harness posture resolved from the child's OWN model — never the
+    /// The tool-description steering resolved from the child's OWN def —
+    /// never the parent frame's.
+    pub tool_steering: crate::agents::ToolSteering,
+    /// The capability posture resolved from the child's OWN def — never the
     /// parent frame's.
-    pub llm_mode: crate::config::extended::LlmMode,
+    pub posture: crate::agents::PostureResolution,
+    /// The context policy resolved from the child's OWN def — used for
+    /// handoff-tag inline caps.
+    pub context_policy: Option<crate::agents::ContextPolicy>,
     /// The child's actual tool/capability names (its enumerated surface).
     pub tools: Vec<String>,
     /// Whether the attempt carries write authority — it holds a single-writer
@@ -2221,7 +2162,9 @@ fn surface_from_built_child(
         provider: child.model.provider_id().to_string(),
         model: child.model.model_id_ref().to_string(),
         config_generation,
-        llm_mode: child.llm_mode,
+        tool_steering: child.tool_steering,
+        posture: child.posture.clone(),
+        context_policy: child.context_policy.clone(),
         tools: child
             .tools
             .names()
@@ -2326,7 +2269,8 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     if def.name == "deepthink" {
         let model = resolve_agent_model(def, args)?;
         // Posture follows the child's OWN resolved model, not the root frame.
-        let llm_mode = child_llm_mode_for_model(args, &model);
+        let tool_steering = crate::agents::ToolSteering::from_def(def);
+        let posture = crate::agents::PostureResolution::from_def(def);
         let mut params = args.params.clone();
         if let Some(temp) = def.temperature {
             params.temperature = Some(temp as f64);
@@ -2340,7 +2284,8 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             model,
             params,
             scan_tool_results: false,
-            llm_mode,
+            tool_steering,
+            posture,
             context_policy: def.context_policy.clone(),
             lock_identity: args
                 .lock_identity
@@ -2460,11 +2405,10 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // session). A malformed explicit frontmatter selector fails loudly because
     // it is a direct user setting; unset or unconfigured role slots fall back.
     let model = resolve_agent_model(def, args)?;
-    // The child's harness posture is resolved from its OWN selected model
-    // (model → provider → global precedence), never inherited from the root
-    // frame. Rendered into the role prompt below and carried on the agent so
-    // the tool-description seam ([`ToolBox::definitions`]) uses it too.
-    let llm_mode = child_llm_mode_for_model(args, &model);
+    // The child's posture (tool steering + capability grants) is resolved
+    // from its OWN def (issue #75), never inherited from the root frame.
+    let tool_steering = crate::agents::ToolSteering::from_def(def);
+    let posture = crate::agents::PostureResolution::from_def(def);
 
     let mut params = args.params.clone();
     if let Some(temp) = def.temperature {
@@ -2482,7 +2426,8 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         scan_tool_results: def
             .scan_tool_results
             .unwrap_or_else(|| crate::agents::default_scan_tool_results(&def.name)),
-        llm_mode,
+        tool_steering,
+        posture,
         context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
@@ -2905,7 +2850,8 @@ pub fn build(args: &SpawnArgs) -> Agent {
     );
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
+    let tool_steering = crate::agents::ToolSteering::from_def(def);
+    let posture = crate::agents::PostureResolution::from_def(def);
     let role = BUILD_PROMPT;
     let params = params_with_direct_computer(args, &model);
     Agent {
@@ -2916,7 +2862,8 @@ pub fn build(args: &SpawnArgs) -> Agent {
         model,
         params,
         scan_tool_results: true,
-        llm_mode,
+        tool_steering,
+        posture,
         context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
@@ -2974,7 +2921,8 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
         system: compose_system_prompt_for_effective_model(DEEPTHINK_PROMPT, args),
         role_prompt: DEEPTHINK_PROMPT.to_string(),
         tools: ToolBox::new(),
-        llm_mode: child_llm_mode_for_model(args, &model),
+        tool_steering: crate::agents::ToolSteering::from_def(def),
+        posture: crate::agents::PostureResolution::from_def(def),
         model,
         params: args.params.clone(),
         scan_tool_results: false,
@@ -3001,9 +2949,9 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
 /// vision-capable, subagent-invokable model with a native computer contract
 /// and refuses loudly when none exists.
 pub fn computer(args: &SpawnArgs) -> Result<Agent> {
-    let (extended, providers) = args.config.configs();
+    let (_extended, providers) = args.config.configs();
     let Some((provider_id, model_id, native_computer)) =
-        computer_subagent_candidate(&providers, &args.cwd, extended.llm_mode)
+        computer_subagent_candidate(&providers, &args.cwd)
     else {
         bail!(
             "computer-use subagent requires a configured vision-capable, subagent-invokable model with native computer_use enabled"
@@ -3020,7 +2968,7 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
     );
     let worker_selector = format!("{provider_id}:{model_id}");
     let request = crate::config::providers::SensitiveModelPolicyRequest::new(
-        computer_use_criteria(&worker_selector, extended.llm_mode),
+        computer_use_criteria(&worker_selector),
         custody,
         crate::engine::model_roles::custody_payload_for(custody, &session_redact),
     )
@@ -3093,7 +3041,8 @@ pub fn scout(args: &SpawnArgs) -> Agent {
     let tools = with_return_tool(tools, "scout");
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
+    let tool_steering = crate::agents::ToolSteering::from_def(def);
+    let posture = crate::agents::PostureResolution::from_def(def);
     let role = SCOUT_PROMPT;
     Agent {
         name: "scout".to_string(),
@@ -3103,7 +3052,8 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         model,
         params: args.params.clone(),
         scan_tool_results: false,
-        llm_mode,
+        tool_steering,
+        posture,
         context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
@@ -3159,7 +3109,8 @@ pub fn goal_control(
         tools,
         // Scheduler-only goal workers inherit the parent's host-chosen model
         // (no selector), so posture resolves from that model's own config.
-        llm_mode: child_llm_mode_for_model(args, &model),
+        tool_steering: crate::agents::ToolSteering::from_def(def),
+        posture: crate::agents::PostureResolution::from_def(def),
         model,
         params: args.params.clone(),
         scan_tool_results: true,
@@ -3208,7 +3159,8 @@ pub fn plan(args: &SpawnArgs) -> Agent {
     );
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
+    let tool_steering = crate::agents::ToolSteering::from_def(def);
+    let posture = crate::agents::PostureResolution::from_def(def);
     let role = PLAN_PROMPT;
     Agent {
         name: "Plan".to_string(),
@@ -3218,7 +3170,8 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode,
+        tool_steering,
+        posture,
         context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
@@ -3261,7 +3214,8 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
     );
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
+    let tool_steering = crate::agents::ToolSteering::from_def(def);
+    let posture = crate::agents::PostureResolution::from_def(def);
     let role = MULTIREVIEW_PROMPT;
     Agent {
         name: "Multireview".to_string(),
@@ -3271,7 +3225,8 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode,
+        tool_steering,
+        posture,
         context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
@@ -3331,7 +3286,8 @@ pub fn bee(args: &SpawnArgs) -> Agent {
     let tools = with_return_tool(tools, "bee");
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
+    let tool_steering = crate::agents::ToolSteering::from_def(def);
+    let posture = crate::agents::PostureResolution::from_def(def);
     let role = BEE_PROMPT;
     Agent {
         name: "bee".to_string(),
@@ -3341,7 +3297,8 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode,
+        tool_steering,
+        posture,
         context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity

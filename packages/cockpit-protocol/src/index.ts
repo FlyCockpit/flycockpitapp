@@ -1917,7 +1917,6 @@ export const knownEventKindSchema = z.enum([
   "interrupt_queue_changed",
   "interrupt_raised",
   "interrupt_resolved",
-  "llm_mode_changed",
   "longcache_state",
   "lsp_notice",
   "model_selection_result",

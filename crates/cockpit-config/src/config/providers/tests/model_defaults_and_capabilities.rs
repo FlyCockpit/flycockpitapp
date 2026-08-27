@@ -992,32 +992,8 @@ fn frontier_default_provider_ids_are_exact_matches() {
 }
 
 #[test]
-fn copilot_model_mode_defaults_are_exact_matches_by_tier() {
-    assert_eq!(
-        COPILOT_MODEL_MODE_DEFAULTS.len(),
-        30,
-        "the product table should remain exact"
-    );
-    for (id, mode) in [
-        ("gpt-5.5", LlmMode::Frontier),
-        ("claude-opus-4.8", LlmMode::Frontier),
-        ("claude-sonnet-4.7", LlmMode::Normal),
-        ("kimi-k2.7-code", LlmMode::Normal),
-        ("gpt-4-o-preview", LlmMode::Defensive),
-        ("gpt-4o-preview", LlmMode::Defensive),
-        ("gemini-3.5-flash", LlmMode::Defensive),
-    ] {
-        assert_eq!(copilot_default_mode_for_model_id(id), Some(mode), "{id}");
-    }
-    assert_eq!(copilot_default_mode_for_model_id("gpt-5.5-mini"), None);
-    assert_eq!(copilot_default_mode_for_model_id("openai/gpt-5.5"), None);
-    assert_eq!(copilot_default_mode_for_model_id("claude-opus-4-8"), None);
-}
-
-#[test]
 fn copilot_defaults_apply_only_to_newly_discovered_copilot_models() {
-    let mut pinned = model("claude-sonnet-4.7", false);
-    pinned.mode = Some(LlmMode::Defensive);
+    let pinned = model("claude-sonnet-4.7", false);
     let cleared = model("gpt-4o", false);
 
     let merged = merge_fetched_models_with_policy(
@@ -1033,8 +1009,9 @@ fn copilot_defaults_apply_only_to_newly_discovered_copilot_models() {
     );
     let by_id = |id: &str| merged.iter().find(|m| m.id == id).unwrap();
 
+    // Newly-discovered frontier-tier Copilot id → frontier riders
+    // (auto-prune off + ephemeral cache) set directly on the ModelEntry.
     let frontier = by_id("gpt-5.5");
-    assert_eq!(frontier.mode, Some(LlmMode::Frontier));
     assert_eq!(frontier.auto_prune, Some(false));
     assert_eq!(
         frontier.cache,
@@ -1044,44 +1021,19 @@ fn copilot_defaults_apply_only_to_newly_discovered_copilot_models() {
         })
     );
 
+    // A pre-existing id is never re-defaulted.
     let preserved_pinned = by_id("claude-sonnet-4.7");
-    assert_eq!(preserved_pinned.mode, Some(LlmMode::Defensive));
     assert_eq!(preserved_pinned.auto_prune, None);
     assert_eq!(preserved_pinned.cache, None);
 
     let preserved_cleared = by_id("gpt-4o");
-    assert_eq!(preserved_cleared.mode, None);
     assert_eq!(preserved_cleared.auto_prune, None);
     assert_eq!(preserved_cleared.cache, None);
 
+    // Non-frontier Copilot ids get no riders.
     let ordinary = by_id("ordinary");
-    assert_eq!(ordinary.mode, None);
     assert_eq!(ordinary.auto_prune, None);
     assert_eq!(ordinary.cache, None);
-}
-
-#[test]
-fn copilot_normal_and_defensive_defaults_set_mode_only() {
-    let merged = merge_fetched_models_with_policy(
-        Some("copilot"),
-        &[],
-        vec![
-            model("claude-sonnet-4.6", false),
-            model("gpt-4o-mini", false),
-        ],
-        ModelMergePolicy::KeepUnlisted,
-    );
-    let by_id = |id: &str| merged.iter().find(|m| m.id == id).unwrap();
-
-    let normal = by_id("claude-sonnet-4.6");
-    assert_eq!(normal.mode, Some(LlmMode::Normal));
-    assert_eq!(normal.auto_prune, None);
-    assert_eq!(normal.cache, None);
-
-    let defensive = by_id("gpt-4o-mini");
-    assert_eq!(defensive.mode, Some(LlmMode::Defensive));
-    assert_eq!(defensive.auto_prune, None);
-    assert_eq!(defensive.cache, None);
 }
 
 #[test]
@@ -1097,7 +1049,6 @@ fn copilot_defaults_do_not_apply_to_other_aggregators() {
         ModelMergePolicy::KeepUnlisted,
     );
     for m in &merged {
-        assert_eq!(m.mode, None, "{}", m.id);
         assert_eq!(m.auto_prune, None, "{}", m.id);
         assert_eq!(m.cache, None, "{}", m.id);
     }
@@ -1107,16 +1058,15 @@ fn copilot_defaults_do_not_apply_to_other_aggregators() {
 fn copilot_defaults_apply_on_manual_model_add_helper() {
     let mut frontier = model("claude-fable-5", true);
     apply_template_model_defaults(Some("copilot"), &mut frontier);
-    assert_eq!(frontier.mode, Some(LlmMode::Frontier));
     assert_eq!(frontier.auto_prune, Some(false));
     assert_eq!(
         frontier.cache.as_ref().map(|c| c.mode),
         Some(CacheMode::Ephemeral)
     );
 
+    // A non-frontier Copilot id gets no riders.
     let mut normal = model("gpt-5.6-terra", true);
     apply_template_model_defaults(Some("copilot"), &mut normal);
-    assert_eq!(normal.mode, Some(LlmMode::Normal));
     assert_eq!(normal.auto_prune, None);
     assert_eq!(normal.cache, None);
 }
@@ -1134,21 +1084,24 @@ fn renamed_copilot_template_connection_gets_copilot_defaults() {
         ModelMergePolicy::KeepUnlisted,
     );
     let m = merged.iter().find(|m| m.id == "gpt-4o-mini").unwrap();
-    assert_eq!(m.mode, Some(LlmMode::Defensive));
+    // gpt-4o-mini is not a frontier-tier Copilot id, so no riders apply.
     assert_eq!(m.auto_prune, None);
     assert_eq!(m.cache, None);
 }
 
 /// Frontier defaults are applied only to ids this fetch newly discovers.
-/// Pre-existing ids keep whatever mode they had (here both are pinned);
-/// only the genuinely-new known id (`glm-5.2`) is defaulted to frontier,
-/// and non-known new ids are left alone.
+/// Pre-existing ids keep whatever riders they had (here both are pinned);
+/// only the genuinely-new known id (`glm-5.2`) is defaulted to the frontier
+/// riders, and non-known new ids are left alone.
 #[test]
 fn merge_defaults_known_fetched_models_to_frontier_only_when_newly_discovered() {
     let mut existing_normal = model("gpt-5.5", false);
-    existing_normal.mode = Some(LlmMode::Normal);
+    existing_normal.auto_prune = Some(true);
     let mut existing_defensive = model("claude-opus-4-7", false);
-    existing_defensive.mode = Some(LlmMode::Defensive);
+    existing_defensive.cache = Some(CacheConfig {
+        mode: CacheMode::None,
+        ttl_secs: 60,
+    });
 
     let fetched = vec![
         model("glm-5.2", false),
@@ -1163,26 +1116,31 @@ fn merge_defaults_known_fetched_models_to_frontier_only_when_newly_discovered() 
         fetched,
         ModelMergePolicy::RemoveUnlisted,
     );
-    let mode_for = |id: &str| merged.iter().find(|m| m.id == id).and_then(|m| m.mode);
+    let auto_prune_for = |id: &str| {
+        merged
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| m.auto_prune)
+    };
 
-    // Newly-discovered known id → frontier default.
-    assert_eq!(mode_for("glm-5.2"), Some(LlmMode::Frontier));
-    // Pre-existing ids keep their pinned modes (no re-default).
-    assert_eq!(mode_for("gpt-5.5"), Some(LlmMode::Normal));
-    assert_eq!(mode_for("claude-opus-4-7"), Some(LlmMode::Defensive));
+    // Newly-discovered known id → frontier riders.
+    assert_eq!(auto_prune_for("glm-5.2"), Some(false));
+    // Pre-existing ids keep their pinned riders (no re-default).
+    assert_eq!(auto_prune_for("gpt-5.5"), Some(true));
+    assert_eq!(auto_prune_for("claude-opus-4-7"), None);
     // New but non-known ids are untouched.
-    assert_eq!(mode_for("gpt-5.5-mini"), None);
-    assert_eq!(mode_for("ordinary"), None);
+    assert_eq!(auto_prune_for("gpt-5.5-mini"), None);
+    assert_eq!(auto_prune_for("ordinary"), None);
 }
 
-/// An existing known-frontier id whose `mode` the user cleared back to
-/// inherit stays `None` after a `/models` re-merge — the frontier default
-/// is not re-applied to already-configured ids.
+/// An existing known-frontier id whose `auto_prune` the user cleared back
+/// to inherit stays `None` after a `/models` re-merge — the frontier
+/// default is not re-applied to already-configured ids.
 #[test]
-fn merge_does_not_repin_cleared_mode_on_existing_known_frontier_id() {
-    // gpt-5.5 already configured with mode explicitly cleared to inherit.
+fn merge_does_not_repin_cleared_riders_on_existing_known_frontier_id() {
+    // gpt-5.5 already configured with auto_prune explicitly cleared to inherit.
     let existing = model("gpt-5.5", false);
-    assert_eq!(existing.mode, None);
+    assert_eq!(existing.auto_prune, None);
 
     let merged = merge_fetched_models_with_policy(
         Some("codex-oauth"),
@@ -1192,7 +1150,10 @@ fn merge_does_not_repin_cleared_mode_on_existing_known_frontier_id() {
     );
 
     let out = merged.iter().find(|m| m.id == "gpt-5.5").unwrap();
-    assert_eq!(out.mode, None, "cleared mode must survive a refresh");
+    assert_eq!(
+        out.auto_prune, None,
+        "cleared auto_prune must survive a refresh"
+    );
 }
 
 /// A manual entry's hand-set display name and context window survive an
@@ -1244,15 +1205,14 @@ fn frontier_defaults_do_not_apply_outside_the_standard_providers() {
         ModelMergePolicy::KeepUnlisted,
     );
     for m in &merged {
-        assert_eq!(m.mode, None, "{}", m.id);
         assert_eq!(m.auto_prune, None, "{}", m.id);
         assert_eq!(m.cache, None, "{}", m.id);
     }
 }
 
 /// Discovered known-frontier models on the standard providers get the
-/// full default set: frontier mode, auto-prune off, ephemeral cache —
-/// each only when the field is still unset.
+/// full default set: auto-prune off + ephemeral cache — each only when
+/// the field is still unset.
 #[test]
 fn frontier_defaults_set_auto_prune_off_and_ephemeral_cache() {
     let mut pinned = model("claude-fable-5", false);
@@ -1274,9 +1234,8 @@ fn frontier_defaults_set_auto_prune_off_and_ephemeral_cache() {
     );
     let by_id = |id: &str| merged.iter().find(|m| m.id == id).unwrap();
 
-    // Fresh known id → all three defaults.
+    // Fresh known id → both frontier riders.
     let opus = by_id("claude-opus-4-8");
-    assert_eq!(opus.mode, Some(LlmMode::Frontier));
     assert_eq!(opus.auto_prune, Some(false));
     assert_eq!(
         opus.cache,
@@ -1287,15 +1246,13 @@ fn frontier_defaults_set_auto_prune_off_and_ephemeral_cache() {
     );
 
     // A pre-existing known id is never re-defaulted: its pinned values
-    // survive and its unset `mode` stays `None` (no re-pin to frontier).
+    // survive and its unset fields stay unset.
     let fable = by_id("claude-fable-5");
     assert_eq!(fable.auto_prune, Some(true));
     assert_eq!(fable.cache, pinned.cache);
-    assert_eq!(fable.mode, None);
 
     // Non-frontier ids on the same provider stay untouched.
     let haiku = by_id("claude-haiku-4-5-20251001");
-    assert_eq!(haiku.mode, None);
     assert_eq!(haiku.auto_prune, None);
     assert_eq!(haiku.cache, None);
 }
@@ -1313,7 +1270,6 @@ fn merge_applies_frontier_defaults_for_openai_and_grok_templates() {
             ModelMergePolicy::KeepUnlisted,
         );
         let m = merged.iter().find(|m| m.id == id).unwrap();
-        assert_eq!(m.mode, Some(LlmMode::Frontier), "{template}/{id} mode");
         assert_eq!(m.auto_prune, Some(false), "{template}/{id} auto_prune");
         assert_eq!(
             m.cache.as_ref().map(|c| c.mode),
@@ -1382,13 +1338,11 @@ fn frontier_defaults_follow_template_identity_not_the_config_key() {
         vec![model("claude-opus-4-8", false)],
         ModelMergePolicy::KeepUnlisted,
     );
+    let work_model = merged.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
+    assert_eq!(work_model.auto_prune, Some(false));
     assert_eq!(
-        merged
-            .iter()
-            .find(|m| m.id == "claude-opus-4-8")
-            .unwrap()
-            .mode,
-        Some(LlmMode::Frontier),
+        work_model.cache.as_ref().map(|c| c.mode),
+        Some(CacheMode::Ephemeral)
     );
 
     // Custom provider that merely serves a known id gets nothing.
@@ -1403,7 +1357,6 @@ fn frontier_defaults_follow_template_identity_not_the_config_key() {
         ModelMergePolicy::KeepUnlisted,
     );
     let m = merged.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
-    assert_eq!(m.mode, None);
     assert_eq!(m.auto_prune, None);
     assert_eq!(m.cache, None);
 }

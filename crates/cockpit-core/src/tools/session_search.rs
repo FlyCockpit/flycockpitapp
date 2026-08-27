@@ -360,11 +360,7 @@ mod tests {
     fn write_untrusted_provider(root: &std::path::Path) {
         let providers = root.join(".cockpit/providers");
         std::fs::create_dir_all(&providers).unwrap();
-        std::fs::write(
-            root.join(".cockpit/config.json"),
-            r#"{"llm_mode":"normal"}"#,
-        )
-        .unwrap();
+        std::fs::write(root.join(".cockpit/config.json"), r#"{}"#).unwrap();
         std::fs::write(
             providers.join("local.json"),
             serde_json::json!({
@@ -372,7 +368,6 @@ mod tests {
                 "models": [{
                     "id": "local-model",
                     "trust": "untrusted",
-                    "mode": "normal"
                 }]
             })
             .to_string(),

@@ -174,13 +174,6 @@ fn describe_sandbox(app: &App, _: &SlashCommand) -> String {
     desc
 }
 
-fn describe_llm_mode(app: &App, _: &SlashCommand) -> String {
-    format!(
-        "LLM steering mode is `{}` (arg: toggle/defend/normal; bare = toggle)",
-        app.llm_mode.as_str()
-    )
-}
-
 fn describe_mouse(app: &App, _: &SlashCommand) -> String {
     format!(
         "{} Toggle mouse capture (click-to-position, drag-select) on/off",
@@ -970,11 +963,6 @@ fn run_new_session(app: &mut App, _: &str) -> bool {
 
 fn run_mouse(app: &mut App, _: &str) -> bool {
     app.toggle_mouse_capture_inline();
-    false
-}
-
-fn run_llm_mode(app: &mut App, args: &str) -> bool {
-    app.handle_llm_mode_command(args);
     false
 }
 
@@ -1789,44 +1777,6 @@ impl App {
             return;
         }
         self.cancel_schedule(job_id, "/stop");
-    }
-
-    /// `/plan` / `/build` — swap the session's primary agent (`plan.md
-    /// §4.6.d`). Sends `SetAgent`, which the worker persists and forwards to
-    /// the driver as a live root-frame swap at the idle boundary; the chrome
-    /// updates off the daemon's `PrimarySwapped` event. A no-op message when
-    /// no runner is connected yet.
-    /// `/llm-mode [toggle|defend|defensive|normal|frontier]` — switch the
-    /// active LLM-strength steering mode live. No argument or `toggle` cycles
-    /// `defensive → normal → frontier → defensive`; `defend` (advertised,
-    /// shorter to type) and its silent alias `defensive` select defensive;
-    /// `normal` and `frontier` select those modes. Switching busts the cached
-    /// system prefix and forces a prune, so we surface the shared warning
-    /// (suppressed on a no-cache provider). The actual rebuild happens
-    /// daemon-side; the `LlmModeChanged` event confirms it.
-    pub(super) fn handle_llm_mode_command(&mut self, arg: &str) {
-        let requested = match parse_llm_mode_arg(arg) {
-            Ok(r) => r,
-            Err(usage) => {
-                self.push_plain(usage);
-                return;
-            }
-        };
-        // Resolve the target (for the no-op check + warning), against the
-        // tracked authoritative value. The daemon re-resolves a toggle too,
-        // so a stale client value can't desync the outcome.
-        let target = requested.unwrap_or_else(|| self.llm_mode.cycled());
-        if target == self.llm_mode {
-            self.push_plain(format!("Already in `{}` LLM mode", target.as_str()));
-            return;
-        }
-        self.send_daemon_request(
-            "/llm-mode",
-            cockpit_proto::Request::SetLlmMode { mode: requested },
-            ControlApplied::LlmModeSwitchWarning,
-        );
-        // The `LlmModeChanged` event pushes the "Switched to …" confirmation
-        // once the daemon applies it.
     }
 
     /// Handle `/mcp …` (GOALS §18a). Reads and mutations are queued as
@@ -3700,41 +3650,6 @@ mod table_tests {
         app.composer.set("/?".to_string());
         app.execute_slash(alias);
         assert!(matches!(app.overlay, Overlay::Help(_)));
-    }
-
-    #[test]
-    fn llm_mode_command_warning_names_prune_and_descriptions() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let mut app = App::new(Some(tmp.path()), false);
-        app.launch.active_model = None;
-        let warning = app
-            .llm_mode_switch_warning()
-            .expect("default test provider should cache");
-
-        assert!(warning.contains("forces a prune"), "{warning}");
-        assert!(warning.contains("updates tool descriptions"), "{warning}");
-        assert!(warning.contains("prompt cache"), "{warning}");
-
-        let cache_only = app.cache_break_warning().expect("cache warning");
-        assert!(!cache_only.contains("prune"), "{cache_only}");
-        assert!(!cache_only.contains("tool descriptions"), "{cache_only}");
-    }
-
-    #[test]
-    fn llm_mode_command_noop_copy_unchanged() {
-        use cockpit_config::extended::LlmMode;
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let mut app = App::new(Some(tmp.path()), false);
-        app.llm_mode = LlmMode::Defensive;
-
-        app.handle_llm_mode_command("defend");
-
-        assert!(app.history.iter().any(|entry| matches!(
-            entry,
-            crate::tui::history::HistoryEntry::Plain { line }
-                if line == "Already in `defensive` LLM mode"
-        )));
     }
 
     #[test]

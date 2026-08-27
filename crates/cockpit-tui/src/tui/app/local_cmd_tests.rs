@@ -1,9 +1,8 @@
 use super::{
     App, GIT_AGENT_TOKEN_CAP, McpAction, PaneSide, SandboxCommand, SandboxEscalationCommand,
     cache_config_caches, cap_tokens, editor_argv_for_cwd, new_external_editor_tempfile,
-    parse_llm_mode_arg, parse_mcp_action, parse_pane_side, parse_sandbox_arg,
-    parse_sandbox_escalation_arg, sanitize_for_raw_stdout, slash_args, strip_ansi, tool_invocation,
-    xml_escape,
+    parse_mcp_action, parse_pane_side, parse_sandbox_arg, parse_sandbox_escalation_arg,
+    sanitize_for_raw_stdout, slash_args, strip_ansi, tool_invocation, xml_escape,
 };
 use crate::tui::history::HistoryEntry;
 use serde_json::json;
@@ -333,30 +332,6 @@ fn slash_sandbox_on_recheck_then_reject_when_host_missing() {
     })
     .expect_err("/sandbox container must include a remedy and not apply");
     assert!(!err.message.is_empty());
-}
-
-#[test]
-fn parse_llm_mode_arg_toggle_default_and_aliases() {
-    use cockpit_config::extended::LlmMode;
-    // No arg or `toggle` → toggle (None).
-    assert_eq!(parse_llm_mode_arg(""), Ok(None));
-    assert_eq!(parse_llm_mode_arg("  "), Ok(None));
-    assert_eq!(parse_llm_mode_arg("toggle"), Ok(None));
-    assert_eq!(parse_llm_mode_arg("TOGGLE"), Ok(None));
-    // `defend` is the advertised form; `defensive` is a silent alias.
-    assert_eq!(parse_llm_mode_arg("defend"), Ok(Some(LlmMode::Defensive)));
-    assert_eq!(
-        parse_llm_mode_arg("defensive"),
-        Ok(Some(LlmMode::Defensive))
-    );
-    assert_eq!(parse_llm_mode_arg(" Defend "), Ok(Some(LlmMode::Defensive)));
-    // `normal` selects normal.
-    assert_eq!(parse_llm_mode_arg("normal"), Ok(Some(LlmMode::Normal)));
-    // `frontier` selects frontier; no short alias is accepted.
-    assert_eq!(parse_llm_mode_arg("frontier"), Ok(Some(LlmMode::Frontier)));
-    assert!(parse_llm_mode_arg("front").is_err());
-    // Anything else is a usage error.
-    assert!(parse_llm_mode_arg("yolo").is_err());
 }
 
 #[test]

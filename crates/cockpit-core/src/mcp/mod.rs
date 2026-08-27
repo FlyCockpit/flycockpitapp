@@ -5,9 +5,10 @@
 //! ([`crate::tools::mcp_tool`]), using `mcp.search`/`mcp.describe`/
 //! `mcp.invoke`.
 //!
-//! Layered config ([`config`]), three transports ([`transport`]), four
-//! auth kinds ([`auth`]), a SHA256+TTL catalog [`cache`], and the
-//! [`catalog`] operations (search / describe / invoke) make up the host side.
+//! Layered config ([`config`]), a source-tagged effective [`resolver`],
+//! three transports ([`transport`]), four auth kinds ([`auth`]), a
+//! SHA256+TTL catalog [`cache`], and the [`catalog`] operations
+//! (search / describe / invoke) make up the host side.
 
 pub mod auth;
 pub mod builtin;
@@ -18,6 +19,7 @@ pub mod client;
 pub mod config;
 pub mod invoke_prep;
 pub mod protocol;
+pub mod resolver;
 pub mod sandbox;
 mod suggest;
 pub mod transport;

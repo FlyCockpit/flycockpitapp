@@ -89,9 +89,39 @@ pub async fn prepare_invoke_args(
     call_name: &str,
     connect_context: McpConnectContext,
 ) -> NestedRepair {
-    let Ok(tools) =
-        crate::mcp::catalog::list_tools_cached_with_context(server, server_cfg, connect_context)
-            .await
+    prepare_invoke_args_identified(
+        server,
+        server_cfg,
+        tool,
+        nested,
+        outer,
+        call_name,
+        connect_context,
+        crate::mcp::resolver::McpScope::Workspace,
+        crate::mcp::resolver::DEFAULT_PROFILE,
+    )
+    .await
+}
+
+pub async fn prepare_invoke_args_identified(
+    server: &str,
+    server_cfg: &ServerConfig,
+    tool: &str,
+    nested: Value,
+    outer: Option<&Value>,
+    call_name: &str,
+    connect_context: McpConnectContext,
+    scope: crate::mcp::resolver::McpScope,
+    profile: &str,
+) -> NestedRepair {
+    let Ok(tools) = crate::mcp::catalog::list_tools_cached_identified(
+        server,
+        server_cfg,
+        scope,
+        profile,
+        connect_context,
+    )
+    .await
     else {
         return NestedRepair::Dispatch {
             args: nested,

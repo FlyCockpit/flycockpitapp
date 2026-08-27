@@ -70,7 +70,7 @@ fn mark_stray_warned(stray: &Path) -> bool {
 }
 
 /// Where a cockpit config directory was discovered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigDirKind {
     /// `~/.config/cockpit/`
     HomeXdg,
@@ -236,17 +236,34 @@ pub fn most_specific_config_write_target(cwd: &Path) -> Option<PathBuf> {
 /// always uses normal layered discovery and is never redirected by
 /// [`COCKPIT_CONFIG_ENV`].
 pub fn mcp_file_paths_for_load(cwd: &Path) -> Vec<PathBuf> {
-    file_paths_for_load(cwd, MCP_FILE)
+    mcp_file_layers_for_load(cwd)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Same order as [`mcp_file_paths_for_load`], with each path tagged by the
+/// config-dir kind that produced it. Home / machine-local layers are global;
+/// project `.cockpit/` layers are workspace.
+pub fn mcp_file_layers_for_load(cwd: &Path) -> Vec<(ConfigDirKind, PathBuf)> {
+    file_layers_for_load(cwd, MCP_FILE)
 }
 
 fn file_paths_for_load(cwd: &Path, filename: &str) -> Vec<PathBuf> {
+    file_layers_for_load(cwd, filename)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn file_layers_for_load(cwd: &Path, filename: &str) -> Vec<(ConfigDirKind, PathBuf)> {
     let mut home_and_local = Vec::new();
     let mut project = Vec::new();
     for dir in discover_config_dirs(cwd) {
         match dir.kind {
-            ConfigDirKind::Project => project.push(dir.path.join(filename)),
+            ConfigDirKind::Project => project.push((dir.kind, dir.path.join(filename))),
             ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot | ConfigDirKind::MachineLocal => {
-                home_and_local.push(dir.path.join(filename));
+                home_and_local.push((dir.kind, dir.path.join(filename)));
             }
         }
     }
@@ -510,6 +527,18 @@ mod tests {
         assert_eq!(
             config_paths_as_mcp, mcp_paths,
             "mcp.json follows the same home-to-project layer order as config.json"
+        );
+        let mcp_layers = mcp_file_layers_for_load(&child);
+        assert_eq!(
+            mcp_layers
+                .iter()
+                .map(|(kind, path)| (*kind, path.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ConfigDirKind::HomeXdg, home.join(".config/cockpit/mcp.json")),
+                (ConfigDirKind::Project, parent.join(".cockpit/mcp.json")),
+                (ConfigDirKind::Project, child.join(".cockpit/mcp.json")),
+            ]
         );
         assert_eq!(
             mcp_paths,

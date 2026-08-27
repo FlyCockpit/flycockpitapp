@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::config::ServerConfig;
 use super::protocol::ToolDescriptor;
+use super::resolver::{DEFAULT_PROFILE, McpScope};
 
 /// A cached catalog: the tools plus the unix-seconds fetch time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,8 +25,14 @@ pub struct CachedCatalog {
 
 /// SHA256-derived cache key for a server identity. Uses the first 16 hex
 /// chars (matching mcp2cli-rs), namespaced by server name so two servers
-/// sharing an endpoint don't collide.
+/// sharing an endpoint don't collide. Scope and credential-profile identity
+/// are part of the key so two agents bound to different profiles (or the
+/// same name at different scopes) never share a cached tool list.
 pub fn cache_key(name: &str, cfg: &ServerConfig) -> String {
+    cache_key_for(name, cfg, McpScope::Workspace, DEFAULT_PROFILE)
+}
+
+pub fn cache_key_for(name: &str, cfg: &ServerConfig, scope: McpScope, profile: &str) -> String {
     let ident = match cfg.transport {
         super::config::Transport::Stdio => format!(
             "stdio|{}|{}",
@@ -42,6 +49,10 @@ pub fn cache_key(name: &str, cfg: &ServerConfig) -> String {
     hasher.update(name.as_bytes());
     hasher.update(b"\0");
     hasher.update(ident.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(scope.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(profile.as_bytes());
     let hex = crate::intel::hex_lower(&hasher.finalize());
     format!("{name}-{}", &hex[..16])
 }
@@ -134,6 +145,32 @@ mod tests {
         assert_eq!(a, b, "same server → same key");
         assert_ne!(a, c, "different name → different key");
         assert!(a.starts_with("s1-"));
+    }
+
+    #[test]
+    fn cache_key_separates_scope_and_profile() {
+        let cfg = server();
+        let workspace_default = cache_key_for("s1", &cfg, McpScope::Workspace, DEFAULT_PROFILE);
+        let global_default = cache_key_for("s1", &cfg, McpScope::Global, DEFAULT_PROFILE);
+        let agent_default = cache_key_for("s1", &cfg, McpScope::Agent, DEFAULT_PROFILE);
+        let workspace_admin = cache_key_for("s1", &cfg, McpScope::Workspace, "admin");
+        assert_ne!(
+            workspace_default, global_default,
+            "same server at different scopes must not share a cache key"
+        );
+        assert_ne!(
+            workspace_default, agent_default,
+            "agent-scope catalog must not reuse the workspace cache key"
+        );
+        assert_ne!(
+            workspace_default, workspace_admin,
+            "two credential profiles must not share a cached tool list"
+        );
+        assert_eq!(
+            cache_key("s1", &cfg),
+            workspace_default,
+            "legacy cache_key is workspace + default profile"
+        );
     }
 
     #[test]

@@ -341,6 +341,10 @@ impl Driver {
             resource_scheduler: self.resource_scheduler.clone(),
             config: self.config.clone(),
             env_overlay: agent.env_overlay.clone(),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::with_config_generation(
+                self.cwd.clone(),
+                self.config.snapshot().generation,
+            ),
         };
 
         let started = std::time::Instant::now();

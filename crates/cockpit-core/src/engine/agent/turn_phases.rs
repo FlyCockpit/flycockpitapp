@@ -2287,6 +2287,10 @@ pub(crate) async fn run_turn(
         lsp,
         resource_scheduler,
         config: config.clone(),
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::with_config_generation(
+            cwd.clone(),
+            config.snapshot().generation,
+        ),
     };
 
     // Per-call dispatch repair pipeline (fixed order, idempotent — a reorder

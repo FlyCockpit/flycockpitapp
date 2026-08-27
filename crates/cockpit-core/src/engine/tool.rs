@@ -1014,6 +1014,11 @@ pub struct ToolCtx {
     /// machine/user queue.
     #[allow(dead_code)]
     pub resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    /// Source-tagged MCP catalog for this agent. Built once per agent
+    /// construction (or test `ToolCtx`) and refreshed when layer files or
+    /// the session config generation change. Tool dispatch must not call
+    /// [`crate::mcp::config::McpConfig::discover`].
+    pub mcp_resolver: Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 
 impl ToolCtx {

@@ -1369,6 +1369,7 @@ mod redaction_placeholder_guard_tests {
             lsp: None,
             resource_scheduler: None,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         }
     }
 

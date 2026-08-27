@@ -15,6 +15,7 @@ use super::cache;
 use super::client::{self, McpConnectContext};
 use super::config::{McpConfig, ServerConfig};
 use super::protocol::{ToolDescriptor, sanitize_tool_descriptor};
+use super::resolver::{CatalogEntry, DEFAULT_PROFILE, EffectiveCatalog, McpScope};
 
 pub(crate) const DISCOVERY_RESULT_CAP: usize = 50;
 const DEFINITION_SNIPPET_MAX_CHARS: usize = 160;
@@ -50,7 +51,17 @@ pub async fn list_tools_cached_with_context(
     cfg: &ServerConfig,
     context: McpConnectContext,
 ) -> Result<Vec<ToolDescriptor>> {
-    let key = cache::cache_key(name, cfg);
+    list_tools_cached_identified(name, cfg, McpScope::Workspace, DEFAULT_PROFILE, context).await
+}
+
+pub async fn list_tools_cached_identified(
+    name: &str,
+    cfg: &ServerConfig,
+    scope: McpScope,
+    profile: &str,
+    context: McpConnectContext,
+) -> Result<Vec<ToolDescriptor>> {
+    let key = cache::cache_key_for(name, cfg, scope, profile);
     if let Some(cached) = cache::load(&key, cfg.cache_ttl_secs) {
         return Ok(sanitize_tool_descriptors(cached.tools));
     }
@@ -58,6 +69,24 @@ pub async fn list_tools_cached_with_context(
     let tools = sanitize_tool_descriptors(conn.list_tools().await?);
     let _ = cache::save(&key, &tools);
     Ok(tools)
+}
+
+async fn list_tools_for_entry(
+    entry: &CatalogEntry,
+    context: McpConnectContext,
+) -> Result<Vec<ToolDescriptor>> {
+    list_tools_cached_identified(
+        &entry.name,
+        &entry.server,
+        entry.source,
+        &entry.profile,
+        context,
+    )
+    .await
+}
+
+fn catalog_view(cfg: &McpConfig, host: &HostContext) -> EffectiveCatalog {
+    host.effective_catalog(cfg)
 }
 
 /// Fuzzy/keyword search over all enabled servers' tools.
@@ -68,9 +97,9 @@ pub async fn list_tools_cached_with_context(
 pub async fn search(cfg: &McpConfig, host: &HostContext, query: &str) -> Vec<SearchHit> {
     let q = query.trim().to_lowercase();
     let mut hits = builtin::search(host, query);
-    for (name, server) in cfg.enabled_servers() {
-        let tools = match list_tools_cached_with_context(name, server, connect_context(host)).await
-        {
+    let catalog = catalog_view(cfg, host);
+    for (name, _server, entry) in catalog.enabled_servers() {
+        let tools = match list_tools_for_entry(entry, connect_context(host)).await {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -106,9 +135,9 @@ pub async fn grep_tool_names(
             });
         }
     }
-    for (name, server) in cfg.enabled_servers() {
-        let tools = match list_tools_cached_with_context(name, server, connect_context(host)).await
-        {
+    let catalog = catalog_view(cfg, host);
+    for (name, _server, entry) in catalog.enabled_servers() {
+        let tools = match list_tools_for_entry(entry, connect_context(host)).await {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -137,9 +166,9 @@ pub async fn grep_tool_definitions(
     for tool in builtin::available_descriptors(host) {
         push_definition_hit(&mut hits, &re, builtin::BUILTIN_SERVER_ID, &tool);
     }
-    for (name, server) in cfg.enabled_servers() {
-        let tools = match list_tools_cached_with_context(name, server, connect_context(host)).await
-        {
+    let catalog = catalog_view(cfg, host);
+    for (name, _server, entry) in catalog.enabled_servers() {
+        let tools = match list_tools_for_entry(entry, connect_context(host)).await {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -162,13 +191,14 @@ pub async fn describe(
     if builtin::is_builtin_server(server) {
         return builtin::describe(host, tool);
     }
-    let Some(server_cfg) = cfg.servers.get(server) else {
+    let catalog = catalog_view(cfg, host);
+    let Some(entry) = catalog.get(server) else {
         bail!("unknown MCP server `{server}`");
     };
-    if !server_cfg.enabled {
+    if !entry.server.enabled {
         bail!("MCP server `{server}` is disabled");
     }
-    let tools = list_tools_cached_with_context(server, server_cfg, connect_context(host)).await?;
+    let tools = list_tools_for_entry(entry, connect_context(host)).await?;
     let Some(desc) = tools.into_iter().find(|desc| desc.name == tool) else {
         bail!("unknown MCP tool `{server}.{tool}`");
     };
@@ -265,18 +295,21 @@ pub async fn invoke(
     if builtin::is_builtin_server(server) {
         return builtin::invoke(host, tool, args).await;
     }
-    let Some(server_cfg) = cfg.servers.get(server) else {
+    let catalog = catalog_view(cfg, host);
+    let Some(entry) = catalog.get(server) else {
         if let Some(suggestion) = crate::mcp::suggest::closest_server(
             server,
-            cfg.enabled_servers()
+            catalog
+                .enabled_servers()
                 .into_iter()
-                .map(|(name, _)| name)
+                .map(|(name, _, _)| name)
                 .chain(std::iter::once(builtin::BUILTIN_SERVER_ID)),
         ) {
             bail!("unknown MCP server `{server}` — did you mean `{suggestion}`?");
         }
         bail!("unknown MCP server `{server}`");
     };
+    let server_cfg = &entry.server;
     if !server_cfg.enabled {
         bail!("MCP server `{server}` is disabled");
     }
@@ -311,7 +344,7 @@ pub async fn invoke(
     if let Some(result) = host.test_external_invoke(server, tool, args.clone()) {
         return result;
     }
-    let tools = list_tools_cached_with_context(server, server_cfg, connect_context(host)).await?;
+    let tools = list_tools_for_entry(entry, connect_context(host)).await?;
     if !tools.iter().any(|desc| desc.name == tool) {
         if let Some(suggestion) = crate::mcp::suggest::closest_tool(
             tool,

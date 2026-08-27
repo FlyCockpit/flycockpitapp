@@ -95,6 +95,19 @@ impl HostContext {
         }
     }
 
+    /// Prefer the ToolCtx-threaded resolver; fall back to wrapping `cfg` as
+    /// workspace-scoped entries for tests that construct a catalog by hand.
+    pub fn effective_catalog(
+        &self,
+        fallback: &crate::mcp::config::McpConfig,
+    ) -> crate::mcp::resolver::EffectiveCatalog {
+        if let Some(ctx) = &self.native_tool_ctx {
+            (*ctx.mcp_resolver.catalog()).clone()
+        } else {
+            crate::mcp::resolver::EffectiveCatalog::from_mcp_config(fallback)
+        }
+    }
+
     #[allow(dead_code)]
     pub fn empty_for_tests() -> Self {
         Self {

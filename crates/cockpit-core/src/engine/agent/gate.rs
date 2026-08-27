@@ -591,6 +591,7 @@ mod safety_gate_tests {
             resource_scheduler: None,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         }
     }
 

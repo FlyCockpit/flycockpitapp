@@ -113,14 +113,17 @@ impl Tool for McpTool {
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`script` (a Python string) is required"))?;
 
-        let cfg = crate::mcp::config::McpConfig::discover(&ctx.cwd);
-        if cfg.has_reserved_builtin_server_config()
+        ctx.mcp_resolver
+            .observe_config_generation(ctx.config.snapshot().generation);
+        let catalog = ctx.mcp_resolver.catalog();
+        if catalog.has_reserved_builtin_server_config()
             && let Some(text) = ctx.session.mcp_reserved_cockpit_server_notice()
             && let Some(events) = &ctx.events
         {
             let _ = events.send(TurnEvent::Notice { text }).await;
         }
         let host = crate::mcp::builtin::HostContext::from_tool_ctx(ctx);
+        let cfg = catalog.to_mcp_config();
         match crate::mcp::sandbox::run_with_host(script, &cfg, &host).await {
             Ok(out) => Ok(rendered_result_output(out)),
             // Unhandled Monty compile/runtime/OS denial/import/host

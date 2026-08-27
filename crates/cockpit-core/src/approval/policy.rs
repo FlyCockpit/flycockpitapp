@@ -324,9 +324,14 @@ impl Approver {
         input: &serde_json::Value,
         effect_target: &serde_json::Value,
     ) -> Result<Decision> {
-        let grant_target = crate::approval::store::mcp_tool_key(server, tool);
+        let agent_bound = effect_target
+            .get("agent_bound")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let agent = agent_bound.then_some(self.agent_id.as_str());
+        let grant_target = crate::approval::store::mcp_tool_key_for(agent, server, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self.store.mcp_tool_reject_scope(server, tool).await {
+        if let Some(scope) = self.store.mcp_tool_reject_scope_for_key(&grant_target).await {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -338,7 +343,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self.store.mcp_tool_grant_scope(server, tool).await {
+        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&grant_target).await {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -361,9 +366,16 @@ impl Approver {
         {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
-        let prompt = format!(
-            "`{tool}` on MCP server `{server}` wants to run. This server is external to cockpit."
-        );
+        let prompt = if agent_bound {
+            format!(
+                "`{tool}` on MCP server `{server}` wants to run for agent `{}`. This server is external to cockpit.",
+                self.agent_id
+            )
+        } else {
+            format!(
+                "`{tool}` on MCP server `{server}` wants to run. This server is external to cockpit."
+            )
+        };
         let question = approval_question(
             &grant_target,
             false,
@@ -587,14 +599,12 @@ impl Approver {
         &self,
         server: &str,
         identity: &str,
+        agent_bound: bool,
     ) -> Result<Decision> {
-        let target = crate::approval::store::mcp_server_connect_key(server, identity);
+        let agent = agent_bound.then_some(self.agent_id.as_str());
+        let target = crate::approval::store::mcp_server_connect_key_for(agent, server, identity);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self
-            .store
-            .mcp_server_connect_reject_scope(server, identity)
-            .await
-        {
+        if let Some(scope) = self.store.mcp_tool_reject_scope_for_key(&target).await {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_server_connect",
@@ -606,10 +616,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self
-            .store
-            .mcp_server_connect_grant_scope(server, identity)
-            .await
+        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&target).await
         {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(

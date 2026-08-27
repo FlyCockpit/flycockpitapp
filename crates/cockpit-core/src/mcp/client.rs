@@ -33,6 +33,8 @@ pub struct McpConnectContext {
     /// by this server/root.
     project_root: Option<String>,
     credential_profile: String,
+    agent_id: String,
+    agent_bound: bool,
 }
 
 impl Default for McpConnectContext {
@@ -45,6 +47,8 @@ impl Default for McpConnectContext {
             vault: None,
             project_root: None,
             credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
+            agent_id: String::new(),
+            agent_bound: false,
         }
     }
 }
@@ -62,11 +66,19 @@ impl McpConnectContext {
             vault: Some(ctx.session.secret_vault().clone()),
             project_root: Some(ctx.session.project_root.display().to_string()),
             credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
+            agent_id: ctx.agent_id.clone(),
+            agent_bound: false,
         }
     }
 
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
         self.credential_profile = profile.into();
+        self
+    }
+
+    pub fn with_agent_binding(mut self, agent_id: impl Into<String>, agent_bound: bool) -> Self {
+        self.agent_id = agent_id.into();
+        self.agent_bound = agent_bound;
         self
     }
 
@@ -82,6 +94,7 @@ impl McpConnectContext {
             .authorize(AuthorizationRequest::McpServerConnect {
                 server: name,
                 identity: &identity,
+                agent_bound: self.agent_bound,
             })
             .await?
         {

@@ -334,6 +334,9 @@ pub async fn invoke(
         "mode": format!("{:?}", server_cfg.mode),
         "auth_kind": server_cfg.auth.kind_str(),
         "oauth_scopes": oauth_scopes,
+        "profile": entry.profile,
+        "agent_bound": entry.agent_bound,
+        "agent": host.native_tool_ctx.as_ref().map(|ctx| ctx.agent_id.clone()),
     });
     match approve_external_mcp_tool(host, server, tool, &args, &effect_target).await? {
         crate::approval::Decision::Allow { .. } => {}
@@ -368,7 +371,15 @@ pub async fn invoke(
     let mut conn = client::connect_with_context(
         server,
         &server_cfg,
-        connect_context(host).with_profile(entry.profile.clone()),
+        connect_context(host)
+            .with_profile(entry.profile.clone())
+            .with_agent_binding(
+                host.native_tool_ctx
+                    .as_ref()
+                    .map(|ctx| ctx.agent_id.clone())
+                    .unwrap_or_default(),
+                entry.agent_bound,
+            ),
     )
     .await?;
     // `tools/call` is a distinct remote effect from client initialization.
@@ -382,6 +393,8 @@ pub async fn invoke(
                 "tool": tool,
                 "wire_input": &args,
                 "target": &effect_target,
+                "profile": entry.profile,
+                "agent_bound": entry.agent_bound,
             }
         })],
     )

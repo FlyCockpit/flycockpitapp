@@ -3215,6 +3215,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
             crate::model_system_prompt::ModelSystemPromptSnapshot::empty(),
         ),
         interactive: true,
+        mcp_parent_reachable: None,
         model_override: None,
         delegation_model: None,
         delegated: false,

@@ -332,6 +332,7 @@ pub enum AuthorizationRequest<'a> {
     McpServerConnect {
         server: &'a str,
         identity: &'a str,
+        agent_bound: bool,
     },
     /// Replace existing file contents after a visible approval.
     FileWrite {
@@ -589,8 +590,12 @@ impl Approver {
                 self.approve_custom_tool_inner(tool, command, input, cwd)
                     .await
             }
-            AuthorizationRequest::McpServerConnect { server, identity } => {
-                self.approve_mcp_server_connect_inner(server, identity)
+            AuthorizationRequest::McpServerConnect {
+                server,
+                identity,
+                agent_bound,
+            } => {
+                self.approve_mcp_server_connect_inner(server, identity, agent_bound)
                     .await
             }
             AuthorizationRequest::FileWrite {

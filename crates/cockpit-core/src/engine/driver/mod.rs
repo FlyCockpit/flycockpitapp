@@ -12002,6 +12002,7 @@ impl Driver {
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
+            mcp_parent_reachable: None,
             // Root construction may consume explicit/resumed selection
             // provenance or a legacy plan-level override. vNext children
             // discard it at the delegated-spawn boundary and resolve their own
@@ -12077,6 +12078,16 @@ impl Driver {
                 .and_then(|frame| frame.agent.vnext_grant.clone()),
             parent_posture: self.stack.last().map(|frame| frame.agent.posture.clone()),
             model_override,
+            mcp_parent_reachable: self.stack.last().map(|frame| {
+                frame
+                    .agent
+                    .mcp_resolver
+                    .catalog()
+                    .servers
+                    .keys()
+                    .cloned()
+                    .collect()
+            }),
             ..self.spawn_args(interactive)
         }
     }
@@ -12133,6 +12144,16 @@ impl Driver {
             cwd: child_cwd.to_path_buf(),
             lock_identity: confinement.lock_identity,
             write_scope: confinement.write_scope,
+            mcp_parent_reachable: self.stack.last().map(|frame| {
+                frame
+                    .agent
+                    .mcp_resolver
+                    .catalog()
+                    .servers
+                    .keys()
+                    .cloned()
+                    .collect()
+            }),
             ..self.spawn_args(interactive)
         }
     }

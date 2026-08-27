@@ -6,7 +6,7 @@
 //! that defined each server, and refreshed when the underlying files or
 //! session config generation change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -64,6 +64,10 @@ pub struct CatalogEntry {
     /// Credential profile selected for this agent. Stage 1 always uses
     /// [`DEFAULT_PROFILE`].
     pub profile: String,
+    /// True when this server is bound to the agent (agent-scope definition
+    /// or an explicit `mcpBindings` entry). Agent-bound servers use
+    /// agent-dimensioned approval grant keys.
+    pub agent_bound: bool,
 }
 
 impl CatalogEntry {
@@ -102,6 +106,7 @@ impl EffectiveCatalog {
                     source,
                     shadowed_by: None,
                     profile: DEFAULT_PROFILE.to_string(),
+                    agent_bound: source == McpScope::Agent,
                 },
             );
         }
@@ -120,6 +125,7 @@ impl EffectiveCatalog {
                 source,
                 shadowed_by: None,
                 profile: DEFAULT_PROFILE.to_string(),
+                agent_bound: source == McpScope::Agent,
             });
         }
     }
@@ -206,9 +212,22 @@ impl EffectiveCatalog {
                 continue;
             }
             entry.profile = profile.to_string();
+            entry.agent_bound = true;
             next.insert(name, entry);
         }
         self.servers = next;
+    }
+
+    /// Child catalogs keep scope-level servers and intersect agent-bound
+    /// servers with the parent's reachable set.
+    pub fn intersect_parent_reachable(&mut self, parent_reachable: &BTreeSet<String>) {
+        self.servers.retain(|name, entry| {
+            if entry.agent_bound {
+                parent_reachable.contains(name)
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -240,6 +259,7 @@ pub struct EffectiveCatalogResolver {
     agent_layer: Option<McpConfig>,
     agent_reserved_rejected: bool,
     bindings: Vec<crate::agents::McpBinding>,
+    parent_reachable: Option<BTreeSet<String>>,
     inner: Mutex<Option<CachedCatalog>>,
 }
 
@@ -251,6 +271,7 @@ impl EffectiveCatalogResolver {
             agent_layer: None,
             agent_reserved_rejected: false,
             bindings: Vec::new(),
+            parent_reachable: None,
             inner: Mutex::new(Some(CachedCatalog {
                 fingerprint: CatalogFingerprint {
                     layers: Vec::new(),
@@ -268,12 +289,13 @@ impl EffectiveCatalogResolver {
             agent_layer: None,
             agent_reserved_rejected: false,
             bindings: Vec::new(),
+            parent_reachable: None,
             inner: Mutex::new(None),
         })
     }
 
     pub fn with_config_generation(cwd: impl Into<PathBuf>, generation: u64) -> Arc<Self> {
-        Self::for_agent_layer(cwd, generation, None, false, Vec::new())
+        Self::for_agent_layer(cwd, generation, None, false, Vec::new(), None)
     }
 
     pub fn for_agent(
@@ -282,7 +304,29 @@ impl EffectiveCatalogResolver {
         def: &crate::agents::AgentDef,
     ) -> Arc<Self> {
         let (layer, reserved) = parse_agent_package_mcp(def);
-        Self::for_agent_layer(cwd, generation, layer, reserved, def.mcp_bindings.clone())
+        Self::for_agent_layer(
+            cwd,
+            generation,
+            layer,
+            reserved,
+            def.mcp_bindings.clone(),
+            None,
+        )
+    }
+
+    pub fn with_parent_reachable(self: &Arc<Self>, parent: BTreeSet<String>) -> Arc<Self> {
+        Arc::new(Self {
+            cwd: self.cwd.clone(),
+            config_generation: std::sync::atomic::AtomicU64::new(
+                self.config_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            agent_layer: self.agent_layer.clone(),
+            agent_reserved_rejected: self.agent_reserved_rejected,
+            bindings: self.bindings.clone(),
+            parent_reachable: Some(parent),
+            inner: Mutex::new(None),
+        })
     }
 
     fn for_agent_layer(
@@ -291,6 +335,7 @@ impl EffectiveCatalogResolver {
         agent_layer: Option<McpConfig>,
         agent_reserved_rejected: bool,
         bindings: Vec<crate::agents::McpBinding>,
+        parent_reachable: Option<BTreeSet<String>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             cwd: cwd.into(),
@@ -298,6 +343,7 @@ impl EffectiveCatalogResolver {
             agent_layer,
             agent_reserved_rejected,
             bindings,
+            parent_reachable,
             inner: Mutex::new(None),
         })
     }
@@ -309,6 +355,7 @@ impl EffectiveCatalogResolver {
             agent_layer: None,
             agent_reserved_rejected: catalog.reserved_builtin_rejected,
             bindings: Vec::new(),
+            parent_reachable: None,
             inner: Mutex::new(Some(CachedCatalog {
                 fingerprint: CatalogFingerprint {
                     layers: Vec::new(),
@@ -380,6 +427,9 @@ impl EffectiveCatalogResolver {
         );
         catalog.reserved_builtin_rejected |= self.agent_reserved_rejected;
         catalog.apply_bindings(&self.bindings);
+        if let Some(parent) = &self.parent_reachable {
+            catalog.intersect_parent_reachable(parent);
+        }
         catalog
     }
 }
@@ -766,6 +816,22 @@ mod tests {
         assert!(catalog.servers.contains_key("alpha"));
         assert!(!catalog.servers.contains_key("beta"));
         assert_eq!(catalog.servers["alpha"].profile, "admin");
+        assert!(catalog.servers["alpha"].agent_bound);
+    }
+
+    #[test]
+    fn child_intersection_keeps_scope_level_and_intersects_agent_bound() {
+        let mut catalog = EffectiveCatalog::default();
+        catalog.merge_layer(named_cfg("global", "https://g/mcp"), McpScope::Global);
+        catalog.merge_layer(named_cfg("bound", "https://a/mcp"), McpScope::Agent);
+        catalog.servers.get_mut("bound").unwrap().agent_bound = true;
+        let parent = BTreeSet::from(["global".to_string()]);
+        catalog.intersect_parent_reachable(&parent);
+        assert!(catalog.servers.contains_key("global"));
+        assert!(
+            !catalog.servers.contains_key("bound"),
+            "agent-bound servers not reachable to the parent must drop"
+        );
     }
 
     #[test]

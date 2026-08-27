@@ -25068,6 +25068,7 @@ async fn run_docs_ask_pipeline(
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,
+        mcp_parent_reachable: None,
         model_override: None,
         delegation_model: None,
         delegated: true,

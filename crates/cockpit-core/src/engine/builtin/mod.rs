@@ -130,6 +130,9 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
+    /// Parent-reachable MCP servers. Child catalogs intersect agent-bound
+    /// servers with this set; scope-level servers stay visible.
+    pub mcp_parent_reachable: Option<std::collections::BTreeSet<String>>,
     /// Root selection (explicit fresh choice, persisted installed-root resume,
     /// or legacy plan-level override). A delegated vNext child never inherits
     /// this field: it resolves its own prepared slot default unless its direct
@@ -1100,11 +1103,15 @@ fn mcp_resolver_for(
     args: &SpawnArgs,
     def: &crate::agents::AgentDef,
 ) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
-    crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
+    let resolver = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
         args.cwd.clone(),
         args.config.snapshot().generation,
         def,
-    )
+    );
+    match args.mcp_parent_reachable.clone() {
+        Some(parent) => resolver.with_parent_reachable(parent),
+        None => resolver,
+    }
 }
 
 fn mcp_resolver_for_cwd(
@@ -4026,6 +4033,7 @@ mod tests {
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
+            mcp_parent_reachable: None,
             model_override: None,
             delegation_model: None,
             delegated: false,

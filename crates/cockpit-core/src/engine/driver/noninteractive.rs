@@ -7447,6 +7447,15 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             assistant_identity_prefix: parent_agent.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
             interactive: false,
+            mcp_parent_reachable: Some(
+                parent_agent
+                    .mcp_resolver
+                    .catalog()
+                    .servers
+                    .keys()
+                    .cloned()
+                    .collect(),
+            ),
             model_override: None,
             delegation_model: model,
             delegated: true,
@@ -9483,6 +9492,15 @@ pub(crate) async fn run_noninteractive_resumable(
                     assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                     model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
                     interactive: false,
+                    mcp_parent_reachable: Some(
+                        agent
+                            .mcp_resolver
+                            .catalog()
+                            .servers
+                            .keys()
+                            .cloned()
+                            .collect(),
+                    ),
                     model_override: None,
                     delegation_model: model,
                     delegated: true,
@@ -9861,6 +9879,15 @@ pub(crate) async fn run_noninteractive_resumable(
                         assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
                         interactive: false,
+                        mcp_parent_reachable: Some(
+                            agent
+                                .mcp_resolver
+                                .catalog()
+                                .servers
+                                .keys()
+                                .cloned()
+                                .collect(),
+                        ),
                         model_override: None,
                         delegation_model: entry.model.clone(),
                         delegated: true,

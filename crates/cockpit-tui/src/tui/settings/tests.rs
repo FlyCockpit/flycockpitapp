@@ -1641,9 +1641,10 @@ fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
         },
         |tmp| {
             let mut session = sidecar_pointer_session();
-            session.confirm_revoke = Some(image_sidecar::PendingRevoke {
+            *session.confirm_revoke.borrow_mut() = Some(image_sidecar::PendingRevoke {
                 grant_id: "g1".into(),
                 version: 1,
+                layout: None,
             });
             dialog_with_sidecar_page(
                 tmp,

@@ -5,7 +5,7 @@
 //! matching, dispatch, or journal internals.
 
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -42,6 +42,7 @@ const REASON_REVOKED_GRANT: &str = "revoked_grant";
 const REASON_MISSING_CREDENTIAL: &str = "missing_credential";
 const REASON_PROVIDER_FAILURE: &str = "provider_failure";
 const REASON_REVOKE_REQUIRES_AUTHORIZATION: &str = "revoke_requires_current_authorization";
+const REASON_REVOKE_CONFIRMATION_STALE: &str = "revoke_confirmation_stale";
 const REASON_YOLO_NO_GRANT: &str = "yolo_no_standing_grant";
 const REASON_SAVE_PENDING: &str = "save_pending";
 const REASON_FORBIDDEN_SIDECAR_ADMIN: &str = "forbidden_requires_sidecar_admin";
@@ -406,6 +407,7 @@ pub(crate) struct SidecarRowView {
     pub destination: Option<String>,
     pub scope: Option<String>,
     pub error: Option<String>,
+    pub project_grant_warning: Option<String>,
     pub busy: bool,
 }
 
@@ -864,6 +866,33 @@ impl SidecarPageKind {
 pub(crate) struct PendingRevoke {
     pub grant_id: String,
     pub version: u64,
+    /// The exact presentation geometry that showed this irreversible action.
+    /// A confirmation is valid only while that target remains stable.
+    pub(super) layout: Option<SidecarLayoutIdentity>,
+}
+
+/// The geometry that determines the visible confirmation controls. Terminal
+/// coordinates are included as a settings dialog can be embedded in a rect
+/// whose origin changes without its dimensions changing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SidecarLayoutIdentity {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    viewport: SidecarViewportMode,
+}
+
+impl SidecarLayoutIdentity {
+    fn from_area(area: Rect, viewport: SidecarViewportMode) -> Self {
+        Self {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: area.height,
+            viewport,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -874,7 +903,10 @@ pub(super) struct SidecarSession {
     pub reducer: SidecarReducer,
     pub approval_mode: ApprovalMode,
     pub policy: CentralPolicyView,
-    pub confirm_revoke: Option<PendingRevoke>,
+    pub confirm_revoke: RefCell<Option<PendingRevoke>>,
+    /// Most recent render identity. A confirmation opened after a render
+    /// captures this rather than trusting a stale pointer target.
+    layout_identity: Cell<Option<SidecarLayoutIdentity>>,
     pub selected_invocation: Option<String>,
     pub cursor: Cell<usize>,
     /// The line range actually rendered in the last frame. The accessibility
@@ -912,7 +944,8 @@ impl SidecarSession {
                 source: SidecarInvocationCapProvenance::Configured,
                 hard_ceiling: MediaResourceLimits::hard_ceilings().sidecar_invocations_per_session,
             },
-            confirm_revoke: None,
+            confirm_revoke: RefCell::new(None),
+            layout_identity: Cell::new(None),
             selected_invocation: None,
             cursor: Cell::new(0),
             a11y_viewport: Cell::new((0, usize::MAX)),
@@ -939,8 +972,43 @@ impl SidecarSession {
         }
     }
 
-    pub(crate) fn cancel_confirm(&mut self) {
-        self.confirm_revoke = None;
+    pub(crate) fn cancel_confirm(&self) {
+        *self.confirm_revoke.borrow_mut() = None;
+    }
+
+    fn has_confirm_revoke(&self) -> bool {
+        self.confirm_revoke.borrow().is_some()
+    }
+
+    fn set_confirm_revoke(&self, grant_id: String, version: u64) {
+        *self.confirm_revoke.borrow_mut() = Some(PendingRevoke {
+            grant_id,
+            version,
+            layout: self.layout_identity.get(),
+        });
+    }
+
+    /// Synchronize the confirmation with the actual rendered layout. This is
+    /// intentionally called even for the blocked layout: losing the surface
+    /// that presented an irreversible action invalidates its confirmation.
+    fn sync_layout_identity(&self, identity: SidecarLayoutIdentity) {
+        self.layout_identity.set(Some(identity));
+        let mut confirmation = self.confirm_revoke.borrow_mut();
+        let changed = confirmation
+            .as_ref()
+            .and_then(|pending| pending.layout)
+            .is_some_and(|expected| expected != identity);
+        let unrendered_on_blocked_layout = confirmation
+            .as_ref()
+            .is_some_and(|pending| pending.layout.is_none())
+            && identity.viewport == SidecarViewportMode::Blocked;
+        if changed || unrendered_on_blocked_layout {
+            *confirmation = None;
+        } else if let Some(pending) = confirmation.as_mut()
+            && pending.layout.is_none()
+        {
+            pending.layout = Some(identity);
+        }
     }
 
     pub(crate) fn rebind_identity(
@@ -966,7 +1034,8 @@ impl SidecarSession {
         };
         self.authoritative_mutations = false;
         self.authoritative_snapshot = false;
-        self.confirm_revoke = None;
+        *self.confirm_revoke.borrow_mut() = None;
+        self.layout_identity.set(None);
         self.selected_invocation = None;
         self.cursor.set(0);
         self.a11y_viewport.set((0, usize::MAX));
@@ -1192,10 +1261,12 @@ impl SidecarPage {
         let viewport_start = self.session.a11y_viewport.get().0;
         let focused_index = self.normalized_cursor().saturating_sub(viewport_start);
         let focused = rows.get(focused_index).or_else(|| rows.first());
-        let grant_warning = focused.and_then(|row| {
-            (row.view.scope.as_deref() == Some(GrantScope::Project.as_str()))
-                .then(|| PROJECT_GRANT_WARNING.to_string())
-        });
+        // Row-local failures take precedence over a page-level status so the
+        // projection describes the focused rendered row. The latter remains a
+        // deliberate fallback for pages and controls that have no row error.
+        let focused_error = focused
+            .and_then(|row| row.view.error.clone())
+            .or_else(|| self.session.error.clone());
         SidecarA11yProjection {
             focused_label: focused
                 .map(|row| row.view.label.clone())
@@ -1224,8 +1295,8 @@ impl SidecarPage {
                 .map(|row| row.view.state.clone())
                 .unwrap_or_else(|| "idle".into()),
             busy: self.session.busy,
-            error: self.session.error.clone(),
-            project_grant_warning: grant_warning,
+            error: focused_error,
+            project_grant_warning: focused.and_then(|row| row.view.project_grant_warning.clone()),
         }
     }
 
@@ -1276,6 +1347,7 @@ impl SidecarPage {
                 destination: Some(sanitized_display_origin(&grant.destination)),
                 scope: Some(grant.scope.as_str().into()),
                 error: None,
+                project_grant_warning: grant.project_warning().map(str::to_string),
                 busy: self.session.busy,
             };
         }
@@ -1293,6 +1365,7 @@ impl SidecarPage {
                 destination: Some(format!("{}:{}", invocation.provider, invocation.model)),
                 scope: invocation.grant_id.clone(),
                 error: invocation.safe_error.clone(),
+                project_grant_warning: None,
                 busy: self.session.busy,
             };
         }
@@ -1320,11 +1393,15 @@ impl SidecarPage {
             destination: None,
             scope: None,
             error,
+            project_grant_warning: None,
             busy: self.session.busy,
         }
     }
 
     fn push_kind(&self, kind: SidecarPageKind) -> Nav {
+        // A new settings page has a different control layout, so it cannot
+        // inherit a confirmation that was presented by the grant list.
+        self.session.cancel_confirm();
         Nav::Push(sidecar_page(kind, self.session.clone()))
     }
 }
@@ -1671,7 +1748,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     )),
                 ));
             }
-            if let Some(pending) = &page.session.confirm_revoke {
+            if let Some(pending) = page.session.confirm_revoke.borrow().as_ref() {
                 rows.push(("Revoke grant? [Revoke grant] [Cancel]".into(), None));
                 rows.push((
                     "[Revoke grant]".into(),
@@ -1829,7 +1906,7 @@ impl SettingsPage for SidecarPage {
         self.normalize_cursor();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {
-                if self.session.confirm_revoke.is_some() {
+                if self.session.has_confirm_revoke() {
                     self.session.cancel_confirm();
                     self.normalize_cursor();
                     Nav::Stay
@@ -1838,7 +1915,7 @@ impl SettingsPage for SidecarPage {
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.session.confirm_revoke.is_some() {
+                if self.session.has_confirm_revoke() {
                     self.session.cancel_confirm();
                     self.normalize_cursor();
                     return Nav::Stay;
@@ -1849,7 +1926,7 @@ impl SettingsPage for SidecarPage {
                 Nav::Stay
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.session.confirm_revoke.is_some() {
+                if self.session.has_confirm_revoke() {
                     self.session.cancel_confirm();
                     self.normalize_cursor();
                     return Nav::Stay;
@@ -2047,10 +2124,8 @@ impl SettingsPage for SidecarPage {
                     .iter()
                     .find(|g| g.grant_id == id.0)
                 {
-                    self.session.confirm_revoke = Some(PendingRevoke {
-                        grant_id: grant.grant_id.clone(),
-                        version: grant.version,
-                    });
+                    self.session
+                        .set_confirm_revoke(grant.grant_id.clone(), grant.version);
                 }
                 Nav::Stay
             }
@@ -2061,17 +2136,37 @@ impl SettingsPage for SidecarPage {
                     self.normalize_cursor();
                     return Nav::Stay;
                 }
-                let Some(pending) = self.session.confirm_revoke.take() else {
-                    return Nav::Stay;
-                };
-                if pending.grant_id != id.0 {
+                if !self.session.principal.can_revoke() {
+                    self.session.cancel_confirm();
+                    self.session.error = Some(REASON_REVOKE_REQUIRES_AUTHORIZATION.into());
                     self.normalize_cursor();
                     return Nav::Stay;
                 }
-                let _ = self
+                let Some(pending) = self.session.confirm_revoke.borrow_mut().take() else {
+                    return Nav::Stay;
+                };
+                if pending.grant_id != id.0 {
+                    self.session.error = Some(REASON_REVOKE_CONFIRMATION_STALE.into());
+                    self.normalize_cursor();
+                    return Nav::Stay;
+                }
+                let current_grant_matches = self.session.reducer.grants.iter().any(|grant| {
+                    grant.grant_id == pending.grant_id
+                        && grant.version == pending.version
+                        && !grant.revoked
+                });
+                if !current_grant_matches {
+                    self.session.error = Some(REASON_REVOKE_CONFIRMATION_STALE.into());
+                    self.normalize_cursor();
+                    return Nav::Stay;
+                }
+                if !self
                     .session
                     .reducer
-                    .revoke_grant(&pending.grant_id, pending.version);
+                    .revoke_grant(&pending.grant_id, pending.version)
+                {
+                    self.session.error = Some(REASON_REVOKE_CONFIRMATION_STALE.into());
+                }
                 self.normalize_cursor();
                 Nav::Stay
             }
@@ -2090,7 +2185,7 @@ impl SettingsPage for SidecarPage {
         _region: SettingsScrollRegionId,
         delta: isize,
     ) -> Nav {
-        if self.session.confirm_revoke.is_some() {
+        if self.session.has_confirm_revoke() {
             self.session.cancel_confirm();
             self.normalize_cursor();
             return Nav::Stay;
@@ -2118,6 +2213,8 @@ impl SettingsPage for SidecarPage {
         self.normalize_cursor();
         let mode = sidecar_viewport_mode(area.width, area.height);
         self.session.viewport.set(mode);
+        self.session
+            .sync_layout_identity(SidecarLayoutIdentity::from_area(area, mode));
         if mode == SidecarViewportMode::Blocked {
             self.session.a11y_viewport.set((0, 0));
         } else {

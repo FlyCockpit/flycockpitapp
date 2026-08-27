@@ -322,7 +322,7 @@ fn image_sidecar_settings_grant_scope_and_revoke() {
             "grant-1".into(),
         ))),
     );
-    assert!(list.session.confirm_revoke.is_some());
+    assert!(list.session.confirm_revoke.borrow().is_some());
     let lines = render_page_lines(&list, &dialog, 100, 30);
     assert!(
         lines
@@ -338,10 +338,16 @@ fn image_sidecar_settings_grant_scope_and_revoke() {
         )),
     );
     assert!(!list.session.reducer.grants[0].revoked);
+    assert!(list.session.confirm_revoke.borrow().is_none());
+    assert_eq!(
+        list.session.error.as_deref(),
+        Some(REASON_REVOKE_CONFIRMATION_STALE)
+    );
 
-    list.session.confirm_revoke = Some(PendingRevoke {
+    *list.session.confirm_revoke.borrow_mut() = Some(PendingRevoke {
         grant_id: "grant-1".into(),
         version: 1,
+        layout: None,
     });
     list.handle_pointer_control(
         &mut dialog,
@@ -351,7 +357,87 @@ fn image_sidecar_settings_grant_scope_and_revoke() {
         )),
     );
     assert!(list.session.reducer.grants[0].revoked);
-    assert!(list.session.confirm_revoke.is_none());
+    assert!(list.session.confirm_revoke.borrow().is_none());
+}
+
+#[test]
+fn image_sidecar_revoke_confirmation_rechecks_current_authorization_and_grant_identity() {
+    let mut page = page_with(SidecarPageKind::GrantList);
+    page.session.reducer.grants = vec![sample_grant(GrantScope::Once)];
+    let mut dialog = test_dialog();
+
+    page.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
+            "grant-1".into(),
+        ))),
+    );
+    page.session.principal = SidecarPrincipal::default();
+    page.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::ConfirmRevokeGrant(
+            SidecarGrantId("grant-1".into()),
+            ConfirmationChoice::Confirm,
+        )),
+    );
+    assert!(!page.session.reducer.grants[0].revoked);
+    assert!(page.session.confirm_revoke.borrow().is_none());
+    assert_eq!(
+        page.session.error.as_deref(),
+        Some(REASON_REVOKE_REQUIRES_AUTHORIZATION)
+    );
+
+    page.session.principal = SidecarPrincipal::local_owner();
+    page.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
+            "grant-1".into(),
+        ))),
+    );
+    page.session.reducer.grants[0].version = 2;
+    page.handle_pointer_control(
+        &mut dialog,
+        SettingsPointerAction::Sidecar(SidecarAction::ConfirmRevokeGrant(
+            SidecarGrantId("grant-1".into()),
+            ConfirmationChoice::Confirm,
+        )),
+    );
+    assert!(!page.session.reducer.grants[0].revoked);
+    assert!(page.session.confirm_revoke.borrow().is_none());
+    assert_eq!(
+        page.session.error.as_deref(),
+        Some(REASON_REVOKE_CONFIRMATION_STALE)
+    );
+}
+
+#[test]
+fn image_sidecar_revoke_confirmation_cancels_when_layout_changes_or_blocks() {
+    let mut page = page_with(SidecarPageKind::GrantList);
+    page.session.reducer.grants = vec![sample_grant(GrantScope::Once)];
+    let dialog = test_dialog();
+
+    let _ = render_page_lines(&page, &dialog, 100, 30);
+    page.handle_pointer_control(
+        &mut test_dialog(),
+        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
+            "grant-1".into(),
+        ))),
+    );
+    assert!(page.session.confirm_revoke.borrow().is_some());
+    let _ = render_page_lines(&page, &dialog, 80, 24);
+    assert!(page.session.confirm_revoke.borrow().is_none());
+    assert!(!page.session.reducer.grants[0].revoked);
+
+    page.handle_pointer_control(
+        &mut test_dialog(),
+        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
+            "grant-1".into(),
+        ))),
+    );
+    assert!(page.session.confirm_revoke.borrow().is_some());
+    let _ = render_page_lines(&page, &dialog, 40, 10);
+    assert!(page.session.confirm_revoke.borrow().is_none());
+    assert!(!page.session.reducer.grants[0].revoked);
 }
 
 #[test]
@@ -622,7 +708,7 @@ fn image_sidecar_settings_a11y_and_layout_snapshots() {
     page.session
         .rebind_identity("d2".into(), "p2".into(), "s2".into(), "sel2".into());
     assert!(page.session.reducer.grants.is_empty());
-    assert!(page.session.confirm_revoke.is_none());
+    assert!(page.session.confirm_revoke.borrow().is_none());
     assert!(page.session.error.is_none());
     assert!(!page.session.authoritative_snapshot);
     assert!(!page.session.authoritative_mutations);
@@ -697,6 +783,32 @@ fn image_sidecar_settings_cursor_and_a11y_follow_rendered_rows() {
     resolver.session.a11y_viewport.set((0, 1));
     let a11y = resolver.a11y();
     assert!(a11y.destination.is_empty());
+}
+
+#[test]
+fn image_sidecar_a11y_projects_focused_invocation_error_and_project_warning() {
+    let mut invocations = page_with(SidecarPageKind::InvocationList);
+    let mut invocation = sample_invocation();
+    invocation.safe_error = Some("provider_failure".into());
+    invocations.session.reducer.invocations = vec![invocation];
+    invocations.session.error = Some("page_error".into());
+    invocations.session.cursor.set(0);
+
+    let invocation_a11y = invocations.a11y();
+    assert_eq!(invocation_a11y.focused_label, "inv-1");
+    assert_eq!(invocation_a11y.error.as_deref(), Some("provider_failure"));
+    assert!(invocation_a11y.project_grant_warning.is_none());
+
+    let mut grants = page_with(SidecarPageKind::GrantList);
+    grants.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
+    grants.session.cursor.set(0);
+
+    let grant_a11y = grants.a11y();
+    assert_eq!(grant_a11y.focused_label, "grant-1");
+    assert_eq!(
+        grant_a11y.project_grant_warning.as_deref(),
+        Some(PROJECT_GRANT_WARNING)
+    );
 }
 
 #[test]
@@ -799,18 +911,18 @@ fn image_sidecar_settings_pointer_surface_contract() {
             "grant-1".into(),
         ))),
     );
-    assert!(grants.session.confirm_revoke.is_some());
+    assert!(grants.session.confirm_revoke.borrow().is_some());
     grants.handle_pointer_scroll(
         &mut dialog,
         crate::tui::settings::shell::SettingsScrollRegionId("sidecar"),
         1,
     );
-    assert!(grants.session.confirm_revoke.is_none());
+    assert!(grants.session.confirm_revoke.borrow().is_none());
     assert!(!grants.session.reducer.grants[0].revoked);
 
     grants.handle_key(&mut dialog, press(KeyCode::Enter));
     assert!(!grants.session.reducer.grants[0].revoked);
-    assert!(grants.session.confirm_revoke.is_none());
+    assert!(grants.session.confirm_revoke.borrow().is_none());
 
     grants.handle_pointer_control(
         &mut dialog,
@@ -819,7 +931,7 @@ fn image_sidecar_settings_pointer_surface_contract() {
         ))),
     );
     grants.cancel_pointer_transients();
-    assert!(grants.session.confirm_revoke.is_none());
+    assert!(grants.session.confirm_revoke.borrow().is_none());
 
     let surfaces: std::collections::HashSet<_> =
         SettingsPointerSurfaceKind::ALL.into_iter().collect();
@@ -846,9 +958,10 @@ fn image_sidecar_settings_state_action_registry() {
                 fresh: true,
             }];
             if kind == SidecarPageKind::GrantList {
-                page.session.confirm_revoke = Some(PendingRevoke {
+                *page.session.confirm_revoke.borrow_mut() = Some(PendingRevoke {
                     grant_id: "grant-1".into(),
                     version: 1,
+                    layout: None,
                 });
             }
             seen_surfaces.insert(page.pointer_surface_kind());
@@ -891,22 +1004,24 @@ fn image_sidecar_settings_state_action_registry() {
     );
     assert!(!grants.session.reducer.grants[0].revoked);
 
-    grants.session.confirm_revoke = Some(PendingRevoke {
+    *grants.session.confirm_revoke.borrow_mut() = Some(PendingRevoke {
         grant_id: "grant-1".into(),
         version: 1,
+        layout: None,
     });
     grants
         .session
         .rebind_identity("d".into(), "p".into(), "s".into(), "sel".into());
-    assert!(grants.session.confirm_revoke.is_none());
+    assert!(grants.session.confirm_revoke.borrow().is_none());
 
-    grants.session.confirm_revoke = Some(PendingRevoke {
+    *grants.session.confirm_revoke.borrow_mut() = Some(PendingRevoke {
         grant_id: "grant-1".into(),
         version: 1,
+        layout: None,
     });
     grants.session.reducer.grants = vec![sample_grant(GrantScope::Once)];
     grants.cancel_pointer_transients();
-    assert!(grants.session.confirm_revoke.is_none());
+    assert!(grants.session.confirm_revoke.borrow().is_none());
     assert!(!grants.session.reducer.grants[0].revoked);
 
     assert_eq!(

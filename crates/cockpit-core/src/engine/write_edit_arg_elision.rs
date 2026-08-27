@@ -32,7 +32,7 @@
 //! rewrites the latest assistant message, signed or otherwise. Once a newer
 //! assistant message exists, the prior turn is settled and may be rewritten.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rig::message::UserContent;
 use serde_json::Value;
@@ -74,6 +74,14 @@ pub fn elide_applied_write_edit_args_with_upcoming(
     history: &mut [Message],
     upcoming_result: Option<&Message>,
 ) -> usize {
+    elide_applied_write_edit_args_except(history, upcoming_result, &HashSet::new())
+}
+
+fn elide_applied_write_edit_args_except(
+    history: &mut [Message],
+    upcoming_result: Option<&Message>,
+    retain_full_args: &HashSet<String>,
+) -> usize {
     let successful = successful_write_edit_calls(history, upcoming_result);
     if successful.is_empty() {
         return 0;
@@ -98,6 +106,9 @@ pub fn elide_applied_write_edit_args_with_upcoming(
             let AssistantContent::ToolCall(tc) = part else {
                 continue;
             };
+            if retain_full_args.contains(tc.id.as_str()) {
+                continue;
+            }
             let Some(applied_tool) = successful.get(tc.id.as_str()) else {
                 continue;
             };
@@ -107,46 +118,56 @@ pub fn elide_applied_write_edit_args_with_upcoming(
     changed
 }
 
-/// Apply the live model-history projection using durable canonical tool-call
-/// rows as the authority for any argument/name repair that could not safely
-/// rewrite a provider-signed latest assistant turn at dispatch time.
-pub async fn project_live_history(
+/// Reconcile only settled signed assistant turns that could not safely be
+/// repaired at dispatch time, then apply the pure live projection.
+///
+/// Ordinary live elision is deliberately independent of the audit ledger. A
+/// durable canonical row is needed solely for deferred repair of a signed
+/// turn: if that best-effort read cannot produce a row, its in-memory args are
+/// kept intact rather than aborting a later inference or ordinary dispatch.
+pub async fn reconcile_deferred_signed_turns_and_elide(
     session: &crate::session::Session,
     agent_name: &str,
     history: &mut [Message],
     upcoming_result: Option<&Message>,
-) -> anyhow::Result<usize> {
-    let rows = session.db.list_tool_calls_for_session(session.id).await?;
-    reconcile_settled_calls(history, upcoming_result, agent_name, &rows)?;
-    Ok(elide_applied_write_edit_args_with_upcoming(
-        history,
-        upcoming_result,
-    ))
+) -> usize {
+    let deferred = deferred_signed_write_edit_call_ids(history, upcoming_result);
+    if deferred.is_empty() {
+        return elide_applied_write_edit_args_with_upcoming(history, upcoming_result);
+    }
+
+    let rows = match session.db.list_tool_calls_for_session(session.id).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                deferred_calls = deferred.len(),
+                "deferred signed write/edit canonical reconciliation unavailable; retaining in-memory args"
+            );
+            return elide_applied_write_edit_args_except(history, upcoming_result, &deferred);
+        }
+    };
+    let unreconciled = reconcile_deferred_signed_calls(history, agent_name, &rows, &deferred);
+    elide_applied_write_edit_args_except(history, upcoming_result, &unreconciled)
 }
 
-fn reconcile_settled_calls(
+fn reconcile_deferred_signed_calls(
     history: &mut [Message],
-    upcoming_result: Option<&Message>,
     agent_name: &str,
     rows: &[cockpit_db::db::tool_calls::ToolCallEvent],
-) -> anyhow::Result<()> {
-    let successful = successful_write_edit_calls(history, upcoming_result);
-    let Some(last_assistant) = history
-        .iter()
-        .rposition(|msg| matches!(msg, Message::Assistant { .. }))
-    else {
-        return Ok(());
-    };
+    deferred: &HashSet<String>,
+) -> HashSet<String> {
+    if deferred.is_empty() {
+        return HashSet::new();
+    }
     let canonical: HashMap<&str, _> = rows
         .iter()
         .filter(|row| row.agent == agent_name && matches!(row.tool.as_str(), "write" | "edit"))
         .map(|row| (row.call_id.as_str(), row))
         .collect();
+    let mut unreconciled = HashSet::new();
 
-    for (idx, msg) in history.iter_mut().enumerate() {
-        if idx == last_assistant {
-            continue;
-        }
+    for msg in history {
         let Message::Assistant { content, .. } = msg else {
             continue;
         };
@@ -154,28 +175,77 @@ fn reconcile_settled_calls(
             let AssistantContent::ToolCall(tc) = part else {
                 continue;
             };
-            let Some(applied_tool) = successful.get(tc.id.as_str()) else {
-                continue;
-            };
-            if tc.function.arguments.as_object().is_some_and(|args| {
-                args.values()
-                    .any(|value| value.as_str().is_some_and(is_applied_marker))
-            }) {
+            if !deferred.contains(tc.id.as_str()) {
                 continue;
             }
-            let row = canonical.get(tc.id.as_str()).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "missing canonical audit row for settled applied {} call {} owned by agent {}",
-                    applied_tool,
-                    tc.id,
-                    agent_name
-                )
-            })?;
+            let Some(row) = canonical.get(tc.id.as_str()) else {
+                tracing::warn!(
+                    call_id = %tc.id,
+                    agent = agent_name,
+                    "deferred signed write/edit canonical row missing; retaining in-memory args"
+                );
+                unreconciled.insert(tc.id.to_string());
+                continue;
+            };
             tc.function.name.clone_from(&row.tool);
             tc.function.arguments.clone_from(&row.wire_input_json);
         }
     }
-    Ok(())
+    unreconciled
+}
+
+fn deferred_signed_write_edit_call_ids(
+    history: &[Message],
+    upcoming_result: Option<&Message>,
+) -> HashSet<String> {
+    let successful = successful_write_edit_calls(history, upcoming_result);
+    let last_assistant = history
+        .iter()
+        .rposition(|msg| matches!(msg, Message::Assistant { .. }));
+    let mut deferred = HashSet::new();
+
+    for (idx, msg) in history.iter().enumerate() {
+        if last_assistant == Some(idx) {
+            continue;
+        }
+        let Message::Assistant { content, .. } = msg else {
+            continue;
+        };
+        if !assistant_content_has_signed_reasoning(content) {
+            continue;
+        }
+        for part in content {
+            let AssistantContent::ToolCall(tc) = part else {
+                continue;
+            };
+            let already_reconciled = tc.function.arguments.as_object().is_some_and(|args| {
+                args.values()
+                    .any(|value| value.as_str().is_some_and(is_applied_marker))
+            });
+            if successful.contains_key(tc.id.as_str()) && !already_reconciled {
+                deferred.insert(tc.id.to_string());
+            }
+        }
+    }
+    deferred
+}
+
+fn assistant_content_has_signed_reasoning(content: &[AssistantContent]) -> bool {
+    content.iter().any(|part| {
+        matches!(
+            part,
+            AssistantContent::Reasoning(reasoning)
+                if reasoning.content.iter().any(|item| {
+                    matches!(
+                        item,
+                        rig::message::ReasoningContent::Text {
+                            signature: Some(signature),
+                            ..
+                        } if !signature.is_empty()
+                    )
+                })
+        )
+    })
 }
 
 fn elide_tool_call(tc: &mut ToolCall, applied_tool: &str) -> usize {
@@ -387,6 +457,22 @@ mod tests {
             panic!("tool call");
         };
         tc.function.arguments.clone()
+    }
+
+    fn call_args(history: &[Message], id: &str) -> Value {
+        for msg in history {
+            let Message::Assistant { content, .. } = msg else {
+                continue;
+            };
+            for part in content {
+                if let AssistantContent::ToolCall(tc) = part
+                    && tc.id.as_str() == id
+                {
+                    return tc.function.arguments.clone();
+                }
+            }
+        }
+        panic!("tool call {id} not found in history");
     }
 
     fn object_keys(args: &Value) -> Vec<String> {
@@ -666,6 +752,47 @@ mod tests {
         assert_eq!(
             first_call_args(&history[0])["content"],
             json!(applied_marker(content.len()))
+        );
+    }
+
+    #[test]
+    fn unavailable_signed_turn_reconciliation_keeps_full_args_without_blocking_normal_elision() {
+        let signed_content = long_payload();
+        let normal_content = long_payload();
+        let mut history = vec![
+            signed_assistant_call(
+                "signed-write",
+                "Write",
+                json!({ "path": "signed.rs", "content": signed_content.clone() }),
+            ),
+            write_result("signed-write", "wrote `signed.rs` (1200 bytes, LF)"),
+            assistant_call(
+                "normal-write",
+                "write",
+                json!({ "path": "normal.rs", "content": normal_content.clone() }),
+            ),
+            write_result("normal-write", "wrote `normal.rs` (1200 bytes, LF)"),
+        ];
+        settle_prior_turn(&mut history);
+
+        let deferred = deferred_signed_write_edit_call_ids(&history, None);
+        assert_eq!(deferred, HashSet::from(["signed-write".to_string()]));
+        let unavailable = reconcile_deferred_signed_calls(&mut history, "Build", &[], &deferred);
+        assert_eq!(unavailable, deferred);
+
+        assert_eq!(
+            elide_applied_write_edit_args_except(&mut history, None, &unavailable),
+            1
+        );
+        assert_eq!(
+            call_args(&history, "signed-write")["content"],
+            json!(signed_content),
+            "an unavailable canonical row must retain the full signed-turn args"
+        );
+        assert_eq!(
+            call_args(&history, "normal-write")["content"],
+            json!(applied_marker(normal_content.len())),
+            "ordinary settled calls stay audit-independent"
         );
     }
 

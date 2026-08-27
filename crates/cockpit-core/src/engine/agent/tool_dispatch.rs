@@ -1654,16 +1654,11 @@ async fn execute_ordinary_call_unscoped(
         wire_output,
     ));
     // Model-visible write/edit args: stub large applied fields from prior
-    // assistant turns now that their matching results are in history. Durable
-    // rows above already stored the full `wire_input_json`. The latest
-    // assistant message is always left intact until a later turn settles it.
-    crate::engine::write_edit_arg_elision::project_live_history(
-        env.session,
-        &env.agent.name,
-        history,
-        None,
-    )
-    .await?;
+    // assistant turns now that their matching results are in history. This
+    // live projection is pure and must not make a completed filesystem effect
+    // depend on a best-effort audit read. The latest assistant message is
+    // always left intact until a later turn settles it.
+    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(history);
     Ok(())
 }
 
@@ -4587,14 +4582,7 @@ mod tests {
             content: vec![AssistantContent::text("newer assistant turn")],
         });
         assert_eq!(
-            crate::engine::write_edit_arg_elision::project_live_history(
-                &session,
-                "Build",
-                &mut live_history,
-                None
-            )
-            .await
-            .unwrap(),
+            crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut live_history),
             1
         );
         let live_args = write_call_args(&live_history);
@@ -4698,14 +4686,13 @@ mod tests {
             content: vec![AssistantContent::text("next turn")],
         });
         assert_eq!(
-            crate::engine::write_edit_arg_elision::project_live_history(
+            crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
                 &session,
                 "Build",
                 &mut history,
                 None,
             )
-            .await
-            .unwrap(),
+            .await,
             1
         );
         assert_eq!(first_tool_call(&history).function.name, "write");

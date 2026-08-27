@@ -1386,13 +1386,13 @@ pub(crate) async fn run_turn(
     // as the upcoming result: a write/edit that settled last turn is eligible
     // even though its result is not currently in `history`. Catches signed-
     // thinking turns once a newer assistant message exists.
-    crate::engine::write_edit_arg_elision::project_live_history(
+    crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
         session,
         &agent.name,
         history,
         Some(&prompt),
     )
-    .await?;
+    .await;
 
     let mut prepared_request = model.prepare_completion_request(
         &agent.system,

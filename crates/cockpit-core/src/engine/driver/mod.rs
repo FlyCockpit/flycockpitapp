@@ -5229,30 +5229,25 @@ impl Driver {
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone()
                             .unwrap_or_default();
-                        match crate::engine::write_edit_arg_elision::project_live_history(
+                        crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
                             &self.session,
                             &agent_name,
                             &mut history,
                             None,
                         )
-                        .await
-                        {
-                            Err(error) => {
-                                Err(format!("warm parent history projection failed: {error:#}"))
-                            }
-                            Ok(_) => model
-                                .text_completion_with_live_context(
-                                    crate::engine::model::UtilityCallSite::AgentTreeDecision,
-                                    params,
-                                    &system,
-                                    &history,
-                                    &prompt,
-                                    &agent_name,
-                                    &cancel,
-                                )
-                                .await
-                                .map_err(|error| format!("warm parent resolver failed: {error:#}")),
-                        }
+                        .await;
+                        model
+                            .text_completion_with_live_context(
+                                crate::engine::model::UtilityCallSite::AgentTreeDecision,
+                                params,
+                                &system,
+                                &history,
+                                &prompt,
+                                &agent_name,
+                                &cancel,
+                            )
+                            .await
+                            .map_err(|error| format!("warm parent resolver failed: {error:#}"))
                     }
                     None => {
                         Err("warm parent resolver has no live exact agent executor".to_string())

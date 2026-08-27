@@ -12,7 +12,7 @@ impl Tool for WordTool {
     fn description(&self) -> &str {
         "List whole-token identifier uses from the index; use `code` kind `symbol_find` for definitions and `search`/`grep` for regex text"
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Find every place an identifier TOKEN appears across the codebase — all uses, not \
              just the definition — returning the file + line of each. Use this to trace where a \
@@ -36,7 +36,7 @@ impl Tool for WordTool {
             "required": ["token"]
         })
     }
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

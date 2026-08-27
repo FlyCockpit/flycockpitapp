@@ -12,7 +12,7 @@ impl Tool for CircularTool {
     fn description(&self) -> &str {
         "Detect import cycles via strongly-connected components of the dependency graph"
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Find import cycles in the codebase: groups of files that depend on each other \
              directly or transitively. Use this when you suspect a circular-dependency problem, \
@@ -28,7 +28,7 @@ impl Tool for CircularTool {
     fn parameters(&self) -> Value {
         serde_json::json!({ "type": "object", "properties": {} })
     }
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({ "type": "object", "properties": {} }))
     }
 

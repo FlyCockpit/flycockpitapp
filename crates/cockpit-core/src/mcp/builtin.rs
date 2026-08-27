@@ -691,10 +691,10 @@ pub type BuiltinAvailability = Arc<dyn Fn(&HostContext) -> Availability + Send +
 pub struct BuiltinFunction {
     name: String,
     description: String,
-    defensive_description: Option<String>,
+    verbose_description: Option<String>,
     presentation: BuiltinPresentation,
     input_schema: BuiltinSchema,
-    defensive_input_schema: Option<BuiltinSchema>,
+    verbose_input_schema: Option<BuiltinSchema>,
     availability: BuiltinAvailability,
     check_availability_on_invoke: bool,
     handler: BuiltinHandler,
@@ -707,37 +707,37 @@ pub struct BuiltinPresentation {
 }
 
 impl BuiltinFunction {
-    fn description_for_mode(&self, mode: LlmMode) -> &str {
-        match mode {
-            LlmMode::Defensive => self
-                .defensive_description
+    fn description_for_steering(&self, steering: crate::agents::ToolSteering) -> &str {
+        match steering {
+            crate::agents::ToolSteering::Verbose => self
+                .verbose_description
                 .as_deref()
                 .unwrap_or(&self.description),
-            LlmMode::Normal | LlmMode::Frontier => &self.description,
+            crate::agents::ToolSteering::Terse => &self.description,
         }
     }
 
-    fn input_schema_for_mode(&self, mode: LlmMode) -> &BuiltinSchema {
-        match mode {
-            LlmMode::Defensive => self
-                .defensive_input_schema
+    fn input_schema_for_steering(&self, steering: crate::agents::ToolSteering) -> &BuiltinSchema {
+        match steering {
+            crate::agents::ToolSteering::Verbose => self
+                .verbose_input_schema
                 .as_ref()
                 .unwrap_or(&self.input_schema),
-            LlmMode::Normal | LlmMode::Frontier => &self.input_schema,
+            crate::agents::ToolSteering::Terse => &self.input_schema,
         }
     }
 
-    /// Return the descriptor text for the active model mode.
+    /// Return the descriptor text for the active tool steering (issue #75).
     ///
-    /// Defensive mode is expected to lean on Monty for more discoverable tools,
-    /// so this path must preserve defensive wording. The extra text is paid only
-    /// for one on-demand `mcp.describe`/`mcp.search` result, not every turn's
-    /// tools array.
-    fn descriptor(&self, mode: LlmMode) -> ToolDescriptor {
+    /// Verbose steering is expected to lean on Monty for more discoverable
+    /// tools, so this path must preserve verbose wording. The extra text is
+    /// paid only for one on-demand `mcp.describe`/`mcp.search` result, not
+    /// every turn's tools array.
+    fn descriptor(&self, steering: crate::agents::ToolSteering) -> ToolDescriptor {
         sanitize_tool_descriptor(ToolDescriptor {
             name: self.name.clone(),
-            description: self.description_for_mode(mode).to_string(),
-            input_schema: (self.input_schema_for_mode(mode))(),
+            description: self.description_for_steering(steering).to_string(),
+            input_schema: (self.input_schema_for_steering(steering))(),
         })
     }
 }
@@ -813,11 +813,12 @@ pub fn is_builtin_server(server: &str) -> bool {
 
 pub fn search(ctx: &HostContext, query: &str) -> Vec<SearchHit> {
     let q = query.trim().to_lowercase();
+    let steering = crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode);
     ctx.builtin_registry
         .iter()
         .filter(|func| (func.availability)(ctx).available)
         .filter(|func| {
-            let description = func.description_for_mode(ctx.llm_mode);
+            let description = func.description_for_steering(steering);
             q.is_empty()
                 || func.name.to_lowercase().contains(&q)
                 || description.to_lowercase().contains(&q)
@@ -826,17 +827,18 @@ pub fn search(ctx: &HostContext, query: &str) -> Vec<SearchHit> {
             server: BUILTIN_SERVER_ID.to_string(),
             tool: sanitize_tool_name(&func.name),
             description: sanitize_tool_description(&first_line(
-                func.description_for_mode(ctx.llm_mode),
+                func.description_for_steering(steering),
             )),
         })
         .collect()
 }
 
 pub fn available_descriptors(ctx: &HostContext) -> Vec<ToolDescriptor> {
+    let steering = crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode);
     ctx.builtin_registry
         .iter()
         .filter(|func| (func.availability)(ctx).available)
-        .map(|func| func.descriptor(ctx.llm_mode))
+        .map(|func| func.descriptor(steering))
         .collect()
 }
 
@@ -845,7 +847,8 @@ pub fn describe(ctx: &HostContext, tool: &str) -> Result<ToolDescriptor> {
         bail!("unknown MCP tool `{BUILTIN_SERVER_ID}.{tool}`");
     };
     ensure_available(ctx, func)?;
-    Ok(func.descriptor(ctx.llm_mode))
+    let steering = crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode);
+    Ok(func.descriptor(steering))
 }
 
 pub async fn invoke(ctx: &HostContext, tool: &str, args: Value) -> Result<Value> {
@@ -965,10 +968,10 @@ impl BuiltinFunction {
         Self {
             name: name.into(),
             description: description.into(),
-            defensive_description: None,
+            verbose_description: None,
             presentation,
             input_schema,
-            defensive_input_schema: None,
+            verbose_input_schema: None,
             availability,
             check_availability_on_invoke,
             handler,
@@ -980,8 +983,8 @@ impl BuiltinFunction {
         description: impl Into<String>,
         input_schema: BuiltinSchema,
     ) -> Self {
-        self.defensive_description = Some(description.into());
-        self.defensive_input_schema = Some(input_schema);
+        self.verbose_description = Some(description.into());
+        self.verbose_input_schema = Some(input_schema);
         self
     }
 }
@@ -1040,15 +1043,15 @@ impl ToolOutputBuiltinAdapter {
             );
         }
 
-        let normal = definition_of(self.tool.as_ref(), LlmMode::Normal, None);
-        let defensive = definition_of(self.tool.as_ref(), LlmMode::Defensive, None);
+        let normal = definition_of(self.tool.as_ref(), crate::agents::ToolSteering::Terse, None);
+        let defensive = definition_of(self.tool.as_ref(), crate::agents::ToolSteering::Verbose, None);
 
         let name = normal.name.clone();
         let mut description = normal.description;
-        let mut defensive_description = defensive.description;
+        let mut verbose_description = defensive.description;
         if self.direct_call_marker {
             append_direct_call_marker(&mut description);
-            append_direct_call_marker(&mut defensive_description);
+            append_direct_call_marker(&mut verbose_description);
         }
         let normal_schema = normal.parameters;
         let defensive_schema = defensive.parameters;
@@ -1069,7 +1072,7 @@ impl ToolOutputBuiltinAdapter {
             }),
         )
         .with_defensive_variant(
-            defensive_description,
+            verbose_description,
             Arc::new(move || defensive_schema.clone()),
         ))
     }
@@ -1432,8 +1435,8 @@ mod tests {
     struct MontyAdapterTool {
         name: String,
         description: String,
-        defensive_description: Option<String>,
-        defensive_parameters: Option<Value>,
+        verbose_description: Option<String>,
+        verbose_parameters: Option<Value>,
         output: String,
         effect: ToolEffect,
         params_calls: Arc<AtomicUsize>,
@@ -1447,8 +1450,8 @@ mod tests {
             Self {
                 name: name.into(),
                 description: "Adapter test tool.".to_string(),
-                defensive_description: None,
-                defensive_parameters: None,
+                verbose_description: None,
+                verbose_parameters: None,
                 output: output.into(),
                 effect: ToolEffect::ReadOnly,
                 params_calls: Arc::new(AtomicUsize::new(0)),
@@ -1468,13 +1471,13 @@ mod tests {
             self
         }
 
-        fn with_defensive_description(mut self, description: impl Into<String>) -> Self {
-            self.defensive_description = Some(description.into());
+        fn with_verbose_description(mut self, description: impl Into<String>) -> Self {
+            self.verbose_description = Some(description.into());
             self
         }
 
-        fn with_defensive_parameters(mut self, parameters: Value) -> Self {
-            self.defensive_parameters = Some(parameters);
+        fn with_verbose_parameters(mut self, parameters: Value) -> Self {
+            self.verbose_parameters = Some(parameters);
             self
         }
 
@@ -1504,8 +1507,8 @@ mod tests {
             &self.description
         }
 
-        fn defensive_description(&self) -> Option<String> {
-            self.defensive_description.clone()
+        fn verbose_description(&self) -> Option<String> {
+            self.verbose_description.clone()
         }
 
         fn effect(&self) -> ToolEffect {
@@ -1526,8 +1529,8 @@ mod tests {
             schema
         }
 
-        fn defensive_parameters(&self) -> Option<Value> {
-            self.defensive_parameters.clone()
+        fn verbose_parameters(&self) -> Option<Value> {
+            self.verbose_parameters.clone()
         }
 
         async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -1814,7 +1817,7 @@ mod tests {
             );
 
             let defensive_schema = tool
-                .defensive_parameters()
+                .verbose_parameters()
                 .unwrap_or_else(|| tool.parameters());
             let defensive_descriptor = func.descriptor(LlmMode::Defensive);
             assert_faithful_schema(
@@ -1906,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn monty_describe_uses_defensive_description_in_defensive_mode() {
+    fn monty_describe_uses_verbose_description_in_defensive_mode() {
         let tmp = tempfile::tempdir().unwrap();
         let defensive_schema = serde_json::json!({
             "type": "object",
@@ -1918,8 +1921,8 @@ mod tests {
         let tool = Arc::new(
             MontyAdapterTool::new("mode_probe", "ok")
                 .with_description("normal descriptor text")
-                .with_defensive_description("defensive descriptor text")
-                .with_defensive_parameters(defensive_schema.clone()),
+                .with_verbose_description("defensive descriptor text")
+                .with_verbose_parameters(defensive_schema.clone()),
         );
 
         let defensive = describe(
@@ -1967,7 +1970,7 @@ mod tests {
         let defensive_text_only = Arc::new(
             MontyAdapterTool::new("text_only", "ok")
                 .with_description("normal text")
-                .with_defensive_description("defensive text without schema"),
+                .with_verbose_description("defensive text without schema"),
         );
         let desc = describe(
             &host_with_tool_mode(tmp.path(), defensive_text_only, LlmMode::Defensive),
@@ -2021,7 +2024,7 @@ mod tests {
         let func = ToolOutputBuiltinAdapter::new(Arc::new(
             MontyAdapterTool::new("marked_tool", "ok")
                 .with_description("normal marker text")
-                .with_defensive_description("defensive marker text"),
+                .with_verbose_description("defensive marker text"),
         ))
         .with_direct_call_marker(true)
         .into_function()
@@ -2043,7 +2046,7 @@ mod tests {
         let tool = Arc::new(
             MontyAdapterTool::new("search_probe", "ok")
                 .with_description("normal searchable text")
-                .with_defensive_description("defensive-only-needle first line\nsecond line"),
+                .with_verbose_description("defensive-only-needle first line\nsecond line"),
         );
         let defensive_host = host_with_tool_mode(tmp.path(), tool.clone(), LlmMode::Defensive);
         let normal_host = host_with_tool(tmp.path(), tool);

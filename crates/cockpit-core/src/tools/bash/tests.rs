@@ -165,7 +165,7 @@ async fn bash_description_mentions_cap_and_tmpdir_redirection() {
     assert!(tool.description().contains("capped at 8 KB"));
     assert!(tool.description().contains("declare resources"));
     assert!(tool.description().contains("$TMPDIR"));
-    let defensive = tool.defensive_description().unwrap();
+    let defensive = tool.verbose_description().unwrap();
     assert!(defensive.contains("declare `resources`"));
     assert!(defensive.contains("Display output caps at 8 KB"));
     assert!(defensive.contains("$TMPDIR"));
@@ -230,7 +230,7 @@ async fn resources_schema_is_closed_and_matches_scheduler_permits() {
         .collect();
     let tool = BashTool::new();
 
-    for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+    for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
         let resources = &schema["properties"]["resources"];
         assert_eq!(resources["type"], "object");
         assert_eq!(resources["additionalProperties"], false);
@@ -1201,7 +1201,7 @@ async fn sealed_child_injection_is_absent() {
     // Schema has no sealed_values property.
     let params = BashTool::new().parameters();
     assert!(params["properties"].get("sealed_values").is_none());
-    if let Some(def) = BashTool::new().defensive_parameters() {
+    if let Some(def) = BashTool::new().verbose_parameters() {
         assert!(def["properties"].get("sealed_values").is_none());
     }
 }
@@ -3405,7 +3405,7 @@ fn retirement_structural_inventory() {
     // Schema must not advertise sealed_values (rejection path may name the field).
     let params_snippet = bash_mod.split("fn parameters").nth(1).unwrap_or_default();
     let normal_params = params_snippet
-        .split("fn defensive_parameters")
+        .split("fn verbose_parameters")
         .next()
         .unwrap_or_default();
     assert!(
@@ -3413,7 +3413,7 @@ fn retirement_structural_inventory() {
         "parameters() must not declare sealed_values property"
     );
     let defensive = bash_mod
-        .split("fn defensive_parameters")
+        .split("fn verbose_parameters")
         .nth(1)
         .unwrap_or_default();
     assert!(
@@ -3422,7 +3422,7 @@ fn retirement_structural_inventory() {
             .next()
             .unwrap_or_default()
             .contains("\"sealed_values\":"),
-        "defensive_parameters() must not declare sealed_values"
+        "verbose_parameters() must not declare sealed_values"
     );
 
     let harness_env = include_str!("../../harness/env.rs");

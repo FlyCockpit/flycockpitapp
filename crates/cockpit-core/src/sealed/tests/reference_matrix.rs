@@ -529,7 +529,7 @@ async fn built_in_and_monty_sealed_reference_matrix() {
         );
     }
     let defensive = tool
-        .defensive_description()
+        .verbose_description()
         .expect("defensive steering exists");
     assert!(
         defensive.contains("cannot supply an endpoint"),
@@ -537,7 +537,11 @@ async fn built_in_and_monty_sealed_reference_matrix() {
     );
     // Mode selects prose only; the schema is identical across modes.
     for mode in ALL_LLM_MODES {
-        let definition = crate::engine::tool::definition_of(&tool as &dyn Tool, mode, None);
+        let definition = crate::engine::tool::definition_of(
+            &tool as &dyn Tool,
+            crate::agents::ToolSteering::from_llm_mode(*mode),
+            None,
+        );
         assert_eq!(
             definition.parameters,
             use_sealed_value_schema(),

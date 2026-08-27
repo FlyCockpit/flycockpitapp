@@ -24,7 +24,7 @@ impl Tool for SkillManageTool {
         "Create and safely mutate writable Agent Skills packages"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Use `skill_manage` only to create a new reusable skill, delete a skill after guarded \
              consolidation, or remove an obsolete support file. Do not use it to patch, rewrite, \
@@ -38,7 +38,7 @@ impl Tool for SkillManageTool {
         skill_manage_schema(false)
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(skill_manage_schema(true))
     }
 

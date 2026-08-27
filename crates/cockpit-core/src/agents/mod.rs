@@ -104,7 +104,7 @@ impl AgentCapability {
 }
 
 /// Per-agent tool-description steering (issue #75). `Verbose` renders the
-/// former `defensive_description()`/`defensive_parameters()` text; `Terse`
+/// former `verbose_description()`/`verbose_parameters()` text; `Terse`
 /// renders the normal/base text. Defaults to `Terse`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -630,7 +630,7 @@ fn tool_family(name: &str) -> &'static str {
 ///
 /// Tool authors write **two** tiers: [`crate::engine::tool::Tool::description`]
 /// (normal, also used for frontier) and
-/// [`crate::engine::tool::Tool::defensive_description`]. Agent authors may
+/// [`crate::engine::tool::Tool::verbose_description`]. Agent authors may
 /// override **any of the three modes** independently. `frontier` is the only
 /// place frontier-specific tool text can exist anywhere in the system — the
 /// trait-level `frontier_description` slot was deliberately removed. An
@@ -741,25 +741,24 @@ impl<'de> Deserialize<'de> for ToolDescriptionSpec {
 
 impl ToolDescriptionSpec {
     /// Project to the engine-level [`crate::engine::tool::ToolDescOverride`].
-    /// `Text` maps to all three legacy slots (so the single text overrides
-    /// every mode until the per-mode engine is collapsed). Each per-mode
-    /// field maps straight across; omitted modes remain `None` so the tool's
-    /// own description for that mode is preserved.
+    /// `Text` maps to both the terse (`text`) and verbose (`verbose_text`)
+    /// slots so the single canonical string overrides every steering.
+    /// `PerMode` collapses: `normal` → `text`, `defensive` → `verbose_text`;
+    /// the `frontier` slot is dropped (frontier and normal share the terse
+    /// rendering under the new steering model).
     pub fn to_override(&self) -> crate::engine::tool::ToolDescOverride {
         match self {
             ToolDescriptionSpec::Text(text) => crate::engine::tool::ToolDescOverride {
-                normal: Some(text.clone()),
-                frontier: Some(text.clone()),
-                defensive: Some(text.clone()),
+                text: Some(text.clone()),
+                verbose_text: Some(text.clone()),
             },
             ToolDescriptionSpec::PerMode {
                 normal,
-                frontier,
+                frontier: _,
                 defensive,
             } => crate::engine::tool::ToolDescOverride {
-                normal: normal.clone(),
-                frontier: frontier.clone(),
-                defensive: defensive.clone(),
+                text: normal.clone(),
+                verbose_text: defensive.clone(),
             },
         }
     }

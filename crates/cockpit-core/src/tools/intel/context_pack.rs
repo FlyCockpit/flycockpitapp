@@ -44,7 +44,7 @@ impl Tool for ContextPackTool {
         "First move: overview/file/symbol/query packet; use `search` text, `code` structure, `graph` relationships, `change_impact` diffs; never prints file contents; follow with ranged `read`"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Fast first move for broad orientation: combine indexed files, symbols, imports, dependencies, centrality, recency, and call context into one compact read-only packet. It never prints file contents; use `read` after it for narrow ranges."
                 .to_string(),
@@ -67,7 +67,7 @@ impl Tool for ContextPackTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(self.parameters())
     }
 

@@ -653,16 +653,16 @@ mod agent_tiering {
     }
 
     #[test]
-    fn read_image_tool_has_defensive_description() {
+    fn read_image_tool_has_verbose_description() {
         let tool = ReadImageTool;
-        assert!(tool.defensive_description().is_some());
+        assert!(tool.verbose_description().is_some());
     }
 
     #[test]
-    fn read_image_tool_defensive_parameters_match_parameters() {
+    fn read_image_tool_verbose_parameters_match_parameters() {
         let tool = ReadImageTool;
         let params = tool.parameters();
-        let defensive = tool.defensive_parameters().unwrap();
+        let defensive = tool.verbose_parameters().unwrap();
         assert_eq!(
             params
                 .get("properties")

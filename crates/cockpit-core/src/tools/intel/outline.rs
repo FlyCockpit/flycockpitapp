@@ -12,7 +12,7 @@ impl Tool for OutlineTool {
     fn description(&self) -> &str {
         "Show one file's symbols/imports in line order; use `code` kind `tree` for file lists, `context_pack` for overview, `read` for contents"
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Get a structural outline of one file — its functions, types, methods, and imports \
              in source order with line numbers — without reading the whole file. Use this to see \
@@ -31,7 +31,7 @@ impl Tool for OutlineTool {
             "required": ["path"]
         })
     }
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

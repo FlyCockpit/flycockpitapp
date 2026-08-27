@@ -54,7 +54,7 @@ impl Tool for HarnessListTool {
         "List configured external harnesses (e.g. `harness:codex`, `harness:claude`, `harness:opencode`) and their available models. Not a provider catalog."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "List configured external harnesses (e.g. `harness:codex`, `harness:claude`, \
              `harness:opencode`) and their available models. Not a provider catalog. Shows each \
@@ -78,7 +78,7 @@ impl Tool for HarnessListTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -285,7 +285,7 @@ impl Tool for HarnessInvokeTool {
         "Run a configured external harness selector on a prompt; use `task` for Cockpit subagent delegation."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Delegate a self-contained unit of work to an external harness selector such as \
              `harness:claude`, `harness:codex`, or `harness:opencode`. Use `task` instead for \
@@ -312,7 +312,7 @@ impl Tool for HarnessInvokeTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn invoke_schema_is_fixed_and_requires_harness_and_prompt() {
         let tool = HarnessInvokeTool;
-        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
             let props = schema["properties"].as_object().unwrap();
             for key in ["harness", "model", "prompt", "write"] {
                 assert!(props.contains_key(key), "missing `{key}` in {schema}");
@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn list_schema_has_optional_refresh() {
         let tool = HarnessListTool;
-        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
             assert!(schema["properties"]["refresh"].is_object());
             // No required fields — refresh is optional.
             assert!(schema.get("required").is_none());
@@ -1085,7 +1085,7 @@ mod tests {
             tool.description()
         );
         assert!(
-            tool.defensive_description()
+            tool.verbose_description()
                 .unwrap()
                 .contains("Use `task` instead for Cockpit subagent delegation")
         );

@@ -1730,7 +1730,7 @@ fn apply_tool_surface_override_rejects_invalid_surface() {
 }
 
 #[test]
-fn docs_answerer_keeps_grep_and_glob_defensive_descriptions() {
+fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
     use crate::config::extended::LlmMode;
     use crate::engine::tool::{Tool, definition_of};
     use crate::tools::{glob::GlobTool, grep::GrepTool};
@@ -1740,32 +1740,27 @@ fn docs_answerer_keeps_grep_and_glob_defensive_descriptions() {
     let grep_override = def.tool_descriptions.get("grep").unwrap().to_override();
     let grep = GrepTool;
     let grep_docs_text = "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches.";
+    // Terse steering renders the override's canonical (normal) text.
     assert_eq!(
-        definition_of(&grep, LlmMode::Normal, Some(&grep_override)).description,
+        definition_of(&grep, crate::agents::ToolSteering::Terse, Some(&grep_override)).description,
         grep_docs_text
     );
+    // Verbose steering: no verbose_text in the override, so it falls back to
+    // the tool's own verbose description.
     assert_eq!(
-        definition_of(&grep, LlmMode::Frontier, Some(&grep_override)).description,
-        grep.description()
-    );
-    assert_eq!(
-        definition_of(&grep, LlmMode::Defensive, Some(&grep_override)).description,
-        grep.defensive_description().unwrap()
+        definition_of(&grep, crate::agents::ToolSteering::Verbose, Some(&grep_override)).description,
+        grep.verbose_description().unwrap()
     );
 
     let glob_override = def.tool_descriptions.get("glob").unwrap().to_override();
     let glob = GlobTool;
     assert_eq!(
-        definition_of(&glob, LlmMode::Normal, Some(&glob_override)).description,
+        definition_of(&glob, crate::agents::ToolSteering::Terse, Some(&glob_override)).description,
         "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
     );
     assert_eq!(
-        definition_of(&glob, LlmMode::Frontier, Some(&glob_override)).description,
-        glob.description()
-    );
-    assert_eq!(
-        definition_of(&glob, LlmMode::Defensive, Some(&glob_override)).description,
-        glob.defensive_description().unwrap()
+        definition_of(&glob, crate::agents::ToolSteering::Verbose, Some(&glob_override)).description,
+        glob.verbose_description().unwrap()
     );
 }
 

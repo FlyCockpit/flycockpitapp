@@ -12,7 +12,7 @@ impl Tool for SymbolFindTool {
     fn description(&self) -> &str {
         "Find symbol definitions by name; use `code` kind `word` for uses and `search`/`grep` for general text"
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Find where a symbol is DEFINED — function, struct, class, method — by name across \
              the indexed codebase, returning the file + line of each definition. Use this to \
@@ -33,7 +33,7 @@ impl Tool for SymbolFindTool {
             "required": ["name"]
         })
     }
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

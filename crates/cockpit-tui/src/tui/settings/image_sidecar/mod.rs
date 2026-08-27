@@ -5,6 +5,7 @@
 //! matching, dispatch, or journal internals.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -44,6 +45,7 @@ const REASON_REVOKE_REQUIRES_AUTHORIZATION: &str = "revoke_requires_current_auth
 const REASON_YOLO_NO_GRANT: &str = "yolo_no_standing_grant";
 const REASON_SAVE_PENDING: &str = "save_pending";
 const REASON_FORBIDDEN_SIDECAR_ADMIN: &str = "forbidden_requires_sidecar_admin";
+const REASON_AUTHORITATIVE_UNAVAILABLE: &str = "authoritative_sidecar_operation_unavailable";
 
 const SIDECAR_NODE_TITLES: &[&str] = &[
     "Mode",
@@ -242,7 +244,7 @@ impl GrantView {
             "{} | project={} dest={} media={} purpose={} scope={}{}{} created={} used={} revoked={} consumed={}",
             self.grant_id,
             self.project,
-            self.destination,
+            sanitized_display_origin(&self.destination),
             self.media_class,
             self.purpose,
             self.scope.as_str(),
@@ -466,11 +468,31 @@ impl SidecarRemediation {
 }
 
 pub(crate) fn strip_query_and_fragment(origin: &str) -> String {
-    origin
+    sanitized_display_origin(origin)
+}
+
+fn sanitized_display_origin(origin: &str) -> String {
+    let without_query = origin
         .split(['?', '#'])
         .next()
         .unwrap_or(origin)
-        .to_string()
+        .to_string();
+    let Some(scheme_end) = without_query.find("://") else {
+        return without_query;
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = without_query[authority_start..]
+        .find('/')
+        .map_or(without_query.len(), |offset| authority_start + offset);
+    let authority = &without_query[authority_start..authority_end];
+    let Some(userinfo_end) = authority.rfind('@') else {
+        return without_query;
+    };
+    format!(
+        "{}{}",
+        &without_query[..authority_start],
+        &without_query[authority_start + userinfo_end + 1..]
+    )
 }
 
 pub(crate) fn offered_grant_scopes() -> [GrantScope; 3] {
@@ -582,13 +604,14 @@ impl SidecarReducer {
         project_id: String,
         session_id: String,
         selection_id: String,
+        config_generation: u64,
     ) -> Self {
         Self {
             daemon_instance,
             project_id,
             session_id,
             selection_id,
-            config_generation: 0,
+            config_generation,
             entity_version: 0,
             grants: Vec::new(),
             invocations: Vec::new(),
@@ -601,6 +624,9 @@ impl SidecarReducer {
     }
 
     pub(crate) fn apply(&mut self, event: SidecarEvent) -> SidecarEventOutcome {
+        if self.stale {
+            return SidecarEventOutcome::RehydrateRequired;
+        }
         if self.daemon_instance != event.daemon_instance
             || self.project_id != event.project_id
             || self.session_id != event.session_id
@@ -608,10 +634,10 @@ impl SidecarReducer {
         {
             return SidecarEventOutcome::Discarded;
         }
-        if self.config_generation == 0 {
-            self.config_generation = event.config_generation;
-        } else if self.config_generation != event.config_generation {
-            return SidecarEventOutcome::Discarded;
+        if self.config_generation == 0 || self.config_generation != event.config_generation {
+            self.stale = true;
+            self.invalidate_projections();
+            return SidecarEventOutcome::RehydrateRequired;
         }
         if event.entity_version < self.entity_version {
             return SidecarEventOutcome::Discarded;
@@ -619,7 +645,9 @@ impl SidecarReducer {
         if event.entity_version == self.entity_version && self.entity_version > 0 {
             return SidecarEventOutcome::Discarded;
         }
-        if event.entity_version > self.entity_version + 1 && self.entity_version > 0 {
+        if event.entity_version != self.entity_version.saturating_add(1) {
+            self.stale = true;
+            self.invalidate_projections();
             return SidecarEventOutcome::RehydrateRequired;
         }
         match event.payload {
@@ -639,6 +667,10 @@ impl SidecarReducer {
             }
             SidecarEventPayload::Invocation(inv) => {
                 if !self.commit_invocation(inv) {
+                    // The envelope sequence is authoritative even when its
+                    // per-invocation transition is stale. Consuming it avoids
+                    // turning the next valid envelope into a false gap.
+                    self.entity_version = event.entity_version;
                     return SidecarEventOutcome::Discarded;
                 }
             }
@@ -654,8 +686,8 @@ impl SidecarReducer {
             .iter()
             .find(|i| i.invocation_id == inv.invocation_id)
         {
-            if invocation_rank(existing.state) > invocation_rank(inv.state)
-                && is_terminal(existing.state)
+            if is_terminal(existing.state)
+                || invocation_rank(existing.state) > invocation_rank(inv.state)
             {
                 return false;
             }
@@ -681,8 +713,16 @@ impl SidecarReducer {
 
     pub(crate) fn mark_stale(&mut self) {
         self.stale = true;
+        self.invalidate_projections();
+    }
+
+    fn invalidate_projections(&mut self) {
         self.health = None;
         self.resolution = None;
+        self.grants.clear();
+        self.invocations.clear();
+        self.charged_invocation_ids.clear();
+        self.charged_count = 0;
     }
 
     pub(crate) fn rebind(
@@ -692,7 +732,7 @@ impl SidecarReducer {
         session_id: String,
         selection_id: String,
     ) {
-        *self = Self::new(daemon_instance, project_id, session_id, selection_id);
+        *self = Self::new(daemon_instance, project_id, session_id, selection_id, 0);
     }
 
     pub(crate) fn revoke_grant(&mut self, grant_id: &str, expected_version: u64) -> bool {
@@ -807,7 +847,7 @@ pub(crate) struct PendingRevoke {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SidecarSession {
     pub principal: SidecarPrincipal,
-    pub viewport: SidecarViewportMode,
+    pub viewport: Cell<SidecarViewportMode>,
     pub form: SidecarFormState,
     pub reducer: SidecarReducer,
     pub approval_mode: ApprovalMode,
@@ -821,19 +861,24 @@ pub(super) struct SidecarSession {
     pub save_pending: bool,
     pub health_refresh_pending: bool,
     pub remediation: Option<SidecarRemediation>,
+    /// Test seams can exercise reducer transitions, but production remains
+    /// fail-closed until the daemon exposes authoritative sidecar mutations.
+    pub authoritative_mutations: bool,
+    pub authoritative_snapshot: bool,
 }
 
 impl SidecarSession {
     pub(crate) fn new(principal: SidecarPrincipal) -> Self {
         Self {
             principal,
-            viewport: SidecarViewportMode::Full,
+            viewport: Cell::new(SidecarViewportMode::Full),
             form: SidecarFormState::default(),
             reducer: SidecarReducer::new(
                 "local".into(),
                 "project".into(),
                 "session".into(),
                 "selection".into(),
+                0,
             ),
             approval_mode: ApprovalMode::Ask,
             policy: CentralPolicyView {
@@ -850,11 +895,21 @@ impl SidecarSession {
             save_pending: false,
             health_refresh_pending: false,
             remediation: None,
+            authoritative_mutations: false,
+            authoritative_snapshot: false,
         }
     }
 
     pub(crate) fn first_use(&self) -> FirstUseView {
         FirstUseView::for_mode(self.approval_mode)
+    }
+
+    fn effective_policy_line(&self) -> String {
+        if self.authoritative_snapshot {
+            self.policy.render_line()
+        } else {
+            format!("Effective: unavailable source={REASON_AUTHORITATIVE_UNAVAILABLE}")
+        }
     }
 
     pub(crate) fn cancel_confirm(&mut self) {
@@ -1017,27 +1072,40 @@ fn accept_or_back(action: &SettingsPointerAction, accepted: bool) -> Nav {
 }
 
 impl SidecarPage {
-    pub(crate) fn visible_rows(&self) -> Vec<SidecarRowView> {
-        let mut rows = Vec::new();
-        let policy = self.session.policy.render_line();
-        rows.push(SidecarRowView {
-            label: "effective_policy".into(),
-            value: policy,
-            state: if self.session.busy {
-                "busy".into()
-            } else {
-                "idle".into()
-            },
-            destination: self
+    fn max_cursor(&self) -> usize {
+        match self.kind {
+            SidecarPageKind::Overview => SIDECAR_NODE_TITLES.len().saturating_sub(1),
+            SidecarPageKind::InvocationList => {
+                self.session.reducer.invocations.len().saturating_sub(1)
+            }
+            SidecarPageKind::GrantList => self.session.reducer.grants.len().saturating_sub(1),
+            _ => self.named_actions().len().saturating_sub(1),
+        }
+    }
+
+    fn focused_keyboard_action(&self) -> Option<SidecarAction> {
+        match self.kind {
+            SidecarPageKind::InvocationList => self
                 .session
                 .reducer
-                .resolution
-                .as_ref()
-                .map(|t| t.origin.clone()),
-            scope: None,
-            error: self.session.error.clone(),
-            busy: self.session.busy,
-        });
+                .invocations
+                .get(self.session.cursor)
+                .map(|inv| {
+                    SidecarAction::OpenInvocationDetail(SidecarInvocationId(
+                        inv.invocation_id.clone(),
+                    ))
+                }),
+            SidecarPageKind::GrantList => None,
+            SidecarPageKind::Overview => None,
+            _ => self
+                .named_actions()
+                .get(self.session.cursor)
+                .and_then(|(action, enabled, _)| enabled.then(|| action.clone())),
+        }
+    }
+
+    pub(crate) fn visible_rows(&self) -> Vec<SidecarRowView> {
+        let mut rows = Vec::new();
         match self.kind {
             SidecarPageKind::Overview => {
                 for title in SIDECAR_NODE_TITLES {
@@ -1073,7 +1141,7 @@ impl SidecarPage {
                         } else {
                             "active".into()
                         },
-                        destination: Some(grant.destination.clone()),
+                        destination: Some(sanitized_display_origin(&grant.destination)),
                         scope: Some(grant.scope.as_str().into()),
                         error: None,
                         busy: false,
@@ -1110,8 +1178,16 @@ impl SidecarPage {
     }
 
     pub(crate) fn a11y(&self) -> SidecarA11yProjection {
-        let rows = self.visible_rows();
-        let focused = rows.get(self.session.cursor).or_else(|| rows.first());
+        let rendered_rows = build_rows(self);
+        let focused_text = rendered_rows
+            .get(self.session.cursor)
+            .or_else(|| rendered_rows.first())
+            .map(|(text, _)| text.clone())
+            .unwrap_or_default();
+        let typed_rows = self.visible_rows();
+        let focused = typed_rows
+            .get(self.session.cursor)
+            .or_else(|| typed_rows.first());
         let grant_warning = self
             .session
             .reducer
@@ -1119,11 +1195,19 @@ impl SidecarPage {
             .iter()
             .find_map(|g| g.project_warning().map(str::to_string));
         SidecarA11yProjection {
-            focused_label: focused.map(|r| r.label.clone()).unwrap_or_default(),
-            focused_value: focused.map(|r| r.value.clone()).unwrap_or_default(),
+            focused_label: focused_text.clone(),
+            focused_value: focused_text,
             effective_policy: "sidecar_invocations_per_session".into(),
-            effective_value: self.session.policy.value.to_string(),
-            effective_source: self.session.policy.source_label().into(),
+            effective_value: if self.session.authoritative_snapshot {
+                self.session.policy.value.to_string()
+            } else {
+                "unavailable".into()
+            },
+            effective_source: if self.session.authoritative_snapshot {
+                self.session.policy.source_label().into()
+            } else {
+                REASON_AUTHORITATIVE_UNAVAILABLE.into()
+            },
             destination: focused
                 .and_then(|r| r.destination.clone())
                 .or_else(|| {
@@ -1131,7 +1215,7 @@ impl SidecarPage {
                         .reducer
                         .resolution
                         .as_ref()
-                        .map(|t| t.origin.clone())
+                        .map(|t| sanitized_display_origin(&t.origin))
                 })
                 .unwrap_or_default(),
             scope: focused.and_then(|r| r.scope.clone()).unwrap_or_default(),
@@ -1156,17 +1240,22 @@ impl SidecarPage {
     }
 }
 
-fn sample_model() -> SidecarModelRef {
-    SidecarModelRef {
-        provider: "openai".into(),
-        model: "gpt-4o".into(),
-    }
-}
-
 fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
     let mut rows: Vec<(String, SidecarBinding)> = Vec::new();
-    let can_mutate = page.session.principal.can_mutate();
-    let mutate_reason = page.session.principal.config_reason();
+    if page.kind != SidecarPageKind::Overview && !page.session.authoritative_snapshot {
+        rows.push((
+            format!("Sidecar data unavailable: {REASON_AUTHORITATIVE_UNAVAILABLE}"),
+            None,
+        ));
+        rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
+        return rows;
+    }
+    let can_mutate = page.session.principal.can_mutate() && page.session.authoritative_mutations;
+    let mutate_reason = if !page.session.authoritative_mutations {
+        Some(REASON_AUTHORITATIVE_UNAVAILABLE)
+    } else {
+        page.session.principal.config_reason()
+    };
     match page.kind {
         SidecarPageKind::Overview => {
             for (i, title) in SIDECAR_NODE_TITLES.iter().enumerate() {
@@ -1199,7 +1288,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                 "[open health detail]".into(),
                 Some((SidecarAction::OpenHealthDetail, true, None)),
             ));
-            rows.push((page.session.policy.render_line(), None));
+            rows.push((page.session.effective_policy_line(), None));
         }
         SidecarPageKind::ModeEditor => {
             rows.push((
@@ -1219,52 +1308,67 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
             rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
         }
         SidecarPageKind::DefaultEditor => {
-            let model = page
-                .session
-                .form
-                .selectable_models()
-                .first()
-                .map(|m| SidecarModelRef {
+            let models = page.session.form.selectable_models();
+            rows.push(("Trusted-primary default".into(), None));
+            for m in &models {
+                let model = SidecarModelRef {
                     provider: m.provider.clone(),
                     model: m.model.clone(),
-                })
-                .unwrap_or_else(sample_model);
-            rows.push(("Trusted-primary default".into(), None));
-            rows.push((
-                "[set trusted default]".into(),
-                Some((
-                    SidecarAction::SetTrustedDefault(model.clone()),
-                    can_mutate,
-                    mutate_reason,
-                )),
-            ));
+                };
+                rows.push((
+                    format!("[set trusted default {}:{}]", model.provider, model.model),
+                    Some((
+                        SidecarAction::SetTrustedDefault(model),
+                        can_mutate,
+                        mutate_reason,
+                    )),
+                ));
+            }
+            if models.is_empty() {
+                rows.push((
+                    "set trusted default [disabled: missing_selection]".into(),
+                    None,
+                ));
+            }
             rows.push(("Untrusted-primary default".into(), None));
-            rows.push((
-                "[set untrusted default]".into(),
-                Some((
-                    SidecarAction::SetUntrustedDefault(model),
-                    can_mutate,
-                    mutate_reason,
-                )),
-            ));
+            for m in &models {
+                let model = SidecarModelRef {
+                    provider: m.provider.clone(),
+                    model: m.model.clone(),
+                };
+                rows.push((
+                    format!("[set untrusted default {}:{}]", model.provider, model.model),
+                    Some((
+                        SidecarAction::SetUntrustedDefault(model),
+                        can_mutate,
+                        mutate_reason,
+                    )),
+                ));
+            }
+            if models.is_empty() {
+                rows.push((
+                    "set untrusted default [disabled: missing_selection]".into(),
+                    None,
+                ));
+            }
             rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
         }
         SidecarPageKind::OverrideEditor => {
-            let model = page
-                .session
-                .form
-                .selectable_models()
-                .first()
-                .map(|m| SidecarModelRef {
+            let models = page.session.form.selectable_models();
+            rows.push(("Optional per-primary override".into(), None));
+            for m in &models {
+                let model = SidecarModelRef {
                     provider: m.provider.clone(),
                     model: m.model.clone(),
-                })
-                .unwrap_or_else(sample_model);
-            rows.push(("Optional per-primary override".into(), None));
-            rows.push((
-                "[set override]".into(),
-                Some((SidecarAction::SetOverride(model), can_mutate, mutate_reason)),
-            ));
+                };
+                rows.push((
+                    format!("[set override {}:{}]", model.provider, model.model),
+                    Some((SidecarAction::SetOverride(model), can_mutate, mutate_reason)),
+                ));
+            }
+            if models.is_empty() {
+                rows.push(("set override [disabled: missing_selection]".into(), None));
+            }
             rows.push((
                 "[clear override]".into(),
                 Some((SidecarAction::ClearOverride, can_mutate, mutate_reason)),
@@ -1272,7 +1376,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
             rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
         }
         SidecarPageKind::CentralPolicyEditor => {
-            rows.push((page.session.policy.render_line(), None));
+            rows.push((page.session.effective_policy_line(), None));
             rows.push((
                 format!(
                     "Draft sidecar_invocations_per_session={}",
@@ -1281,6 +1385,29 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                 None,
             ));
             rows.push(("No sidecar-local cap is stored.".into(), None));
+            let lower = page.session.form.central_cap.saturating_sub(1).max(1);
+            let upper = page
+                .session
+                .form
+                .central_cap
+                .saturating_add(1)
+                .min(MediaResourceLimits::hard_ceilings().sidecar_invocations_per_session);
+            rows.push((
+                "[decrease central cap]".into(),
+                Some((
+                    SidecarAction::SetCentralCap(lower),
+                    can_mutate,
+                    mutate_reason,
+                )),
+            ));
+            rows.push((
+                "[increase central cap]".into(),
+                Some((
+                    SidecarAction::SetCentralCap(upper),
+                    can_mutate,
+                    mutate_reason,
+                )),
+            ));
             let save_reason = if !can_mutate {
                 mutate_reason
             } else if page.session.save_pending {
@@ -1307,6 +1434,16 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     ),
                     None,
                 ));
+                for line in TrustDisclosure::for_trust(trace.primary_trust == "trusted").lines() {
+                    rows.push((line, None));
+                }
+                rows.push((
+                    format!(
+                        "Egress authority: destination={} scopes=once/session/project",
+                        sanitized_display_origin(&trace.origin)
+                    ),
+                    None,
+                ));
                 rows.push((format!("matched={}", trace.matched_source), None));
                 rows.push((
                     format!(
@@ -1316,7 +1453,10 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     ),
                     None,
                 ));
-                rows.push((format!("origin={}", trace.origin), None));
+                rows.push((
+                    format!("origin={}", sanitized_display_origin(&trace.origin)),
+                    None,
+                ));
                 rows.push((format!("location={}", trace.location), None));
                 rows.push((
                     format!("credential_fingerprint={}", trace.credential_fingerprint),
@@ -1345,7 +1485,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
             } else {
                 rows.push(("No resolver projection.".into(), None));
             }
-            rows.push((page.session.policy.render_line(), None));
+            rows.push((page.session.effective_policy_line(), None));
             rows.push((
                 "[refresh health]".into(),
                 Some((
@@ -1428,15 +1568,19 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                 "[open grant editor]".into(),
                 Some((SidecarAction::OpenGrantEditor, true, None)),
             ));
-            if let Some(grant) = page.session.reducer.grants.first() {
-                let revoke_ok = page.session.principal.can_revoke() && !grant.revoked;
+            for grant in &page.session.reducer.grants {
+                let revoke_ok = page.session.principal.can_revoke()
+                    && page.session.authoritative_mutations
+                    && !grant.revoked;
                 rows.push((
-                    "[revoke grant]".into(),
+                    format!("[revoke grant {}]", grant.grant_id),
                     Some((
                         SidecarAction::RevokeGrant(SidecarGrantId(grant.grant_id.clone())),
                         revoke_ok,
                         if revoke_ok {
                             None
+                        } else if !page.session.authoritative_mutations {
+                            Some(REASON_AUTHORITATIVE_UNAVAILABLE)
                         } else {
                             Some(REASON_REVOKE_REQUIRES_AUTHORIZATION)
                         },
@@ -1468,7 +1612,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     )),
                 ));
             }
-            rows.push((page.session.policy.render_line(), None));
+            rows.push((page.session.effective_policy_line(), None));
         }
         SidecarPageKind::GrantEditor => {
             let first_use = page.session.first_use();
@@ -1576,7 +1720,9 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                 if let Some(err) = &inv.safe_error {
                     rows.push((format!("error={err}"), None));
                 }
-                if let Some(detail) = &inv.owner_detail {
+                if page.session.principal.local_owner
+                    && let Some(detail) = &inv.owner_detail
+                {
                     rows.push((
                         format!(
                             "owner purpose={} version={} digest={} scalars={} bytes={}",
@@ -1610,7 +1756,7 @@ impl SettingsPage for SidecarPage {
     }
 
     fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
-        if self.session.viewport == SidecarViewportMode::Blocked {
+        if self.session.viewport.get() == SidecarViewportMode::Blocked {
             return match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
                 _ => Nav::Stay,
@@ -1638,7 +1784,7 @@ impl SettingsPage for SidecarPage {
                     self.session.cancel_confirm();
                     return Nav::Stay;
                 }
-                self.session.cursor = self.session.cursor.saturating_add(1);
+                self.session.cursor = self.session.cursor.saturating_add(1).min(self.max_cursor());
                 Nav::Stay
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -1654,6 +1800,21 @@ impl SettingsPage for SidecarPage {
                         _ => SidecarNodeId::Invocations,
                     };
                     return Nav::Push(open_node(node, self.session.clone()));
+                }
+                if let Some(action) = self.focused_keyboard_action() {
+                    return self
+                        .handle_pointer_control(_cx, SettingsPointerAction::Sidecar(action));
+                }
+                Nav::Stay
+            }
+            KeyCode::Char('r') if self.kind == SidecarPageKind::GrantList => {
+                if let Some(grant) = self.session.reducer.grants.get(self.session.cursor) {
+                    return self.handle_pointer_control(
+                        _cx,
+                        SettingsPointerAction::Sidecar(SidecarAction::RevokeGrant(SidecarGrantId(
+                            grant.grant_id.clone(),
+                        ))),
+                    );
                 }
                 Nav::Stay
             }
@@ -1679,15 +1840,41 @@ impl SettingsPage for SidecarPage {
                 self.push_kind(SidecarPageKind::InvocationDetail)
             }
             SidecarAction::SetMode(mode) => {
+                if !self.session.authoritative_mutations {
+                    self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                    return Nav::Stay;
+                }
                 self.session.form.mode = mode;
                 Nav::Stay
             }
             SidecarAction::SetTrustedDefault(model) => {
-                self.session.form.trusted_default = Some(model);
+                if self.session.authoritative_mutations
+                    && self
+                        .session
+                        .form
+                        .selectable_models()
+                        .iter()
+                        .any(|m| m.provider == model.provider && m.model == model.model)
+                {
+                    self.session.form.trusted_default = Some(model);
+                } else {
+                    self.session.remediation = Some(SidecarRemediation::MissingSelection);
+                }
                 Nav::Stay
             }
             SidecarAction::SetUntrustedDefault(model) => {
-                self.session.form.untrusted_default = Some(model);
+                if self.session.authoritative_mutations
+                    && self
+                        .session
+                        .form
+                        .selectable_models()
+                        .iter()
+                        .any(|m| m.provider == model.provider && m.model == model.model)
+                {
+                    self.session.form.untrusted_default = Some(model);
+                } else {
+                    self.session.remediation = Some(SidecarRemediation::MissingSelection);
+                }
                 Nav::Stay
             }
             SidecarAction::SetOverride(model) => {
@@ -1697,7 +1884,7 @@ impl SettingsPage for SidecarPage {
                     .selectable_models()
                     .iter()
                     .any(|m| m.provider == model.provider && m.model == model.model)
-                    || self.session.form.models.is_empty()
+                    && self.session.authoritative_mutations
                 {
                     self.session.form.override_pair = Some(model);
                     self.session.remediation = None;
@@ -1707,23 +1894,40 @@ impl SettingsPage for SidecarPage {
                 Nav::Stay
             }
             SidecarAction::ClearOverride => {
-                self.session.form.override_pair = None;
+                if self.session.authoritative_mutations {
+                    self.session.form.override_pair = None;
+                } else {
+                    self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                }
+                Nav::Stay
+            }
+            SidecarAction::SetCentralCap(value) => {
+                if self.session.authoritative_mutations {
+                    self.session.form.set_central_cap(value);
+                } else {
+                    self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                }
                 Nav::Stay
             }
             SidecarAction::SaveCentralPolicy => {
-                // TODO: persist via daemon typed-document edit once sidecar
-                // config is a first-class extended-config field.
-                if self.session.principal.can_mutate() && !self.session.save_pending {
+                if self.session.authoritative_mutations
+                    && self.session.principal.can_mutate()
+                    && !self.session.save_pending
+                {
                     self.session.policy.value = self.session.form.central_cap;
                     self.session.policy.source = SidecarInvocationCapProvenance::Configured;
                     self.session.save_pending = false;
+                } else {
+                    self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
                 }
                 Nav::Stay
             }
             SidecarAction::RefreshHealth => {
-                // TODO: request a daemon health projection; commit only when
-                // selection/config/project/session identities match.
-                self.session.health_refresh_pending = true;
+                if self.session.authoritative_mutations {
+                    self.session.health_refresh_pending = true;
+                } else {
+                    self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                }
                 Nav::Stay
             }
             SidecarAction::SelectGrantScope(scope) => {
@@ -1739,7 +1943,12 @@ impl SettingsPage for SidecarPage {
                 }
                 if self.session.approval_mode == ApprovalMode::Yolo
                     || !self.session.principal.can_mutate()
+                    || !self.session.authoritative_mutations
+                    || self.session.reducer.resolution.is_none()
+                    || (self.session.form.draft_scope == GrantScope::Once
+                        && self.session.selected_invocation.is_none())
                 {
+                    self.session.remediation = Some(SidecarRemediation::MissingSelection);
                     return Nav::Stay;
                 }
                 let grant = GrantView {
@@ -1751,15 +1960,16 @@ impl SettingsPage for SidecarPage {
                         .reducer
                         .resolution
                         .as_ref()
-                        .map(|t| t.origin.clone())
-                        .unwrap_or_else(|| "https://example.invalid".into()),
+                        .map(|t| sanitized_display_origin(&t.origin))
+                        .unwrap_or_default(),
                     media_class: MediaClass::Image.as_str().into(),
                     purpose: Purpose::AskImage.as_str().into(),
                     scope: self.session.form.draft_scope,
                     session_binding: (self.session.form.draft_scope == GrantScope::Session)
                         .then(|| self.session.reducer.session_id.clone()),
                     invocation_binding: (self.session.form.draft_scope == GrantScope::Once)
-                        .then(|| "invocation-pending".into()),
+                        .then(|| self.session.selected_invocation.clone())
+                        .flatten(),
                     created_at: "0".into(),
                     last_used_at: None,
                     revoked: false,
@@ -1769,7 +1979,7 @@ impl SettingsPage for SidecarPage {
                 Nav::Stay
             }
             SidecarAction::RevokeGrant(id) => {
-                if !self.session.principal.can_revoke() {
+                if !self.session.principal.can_revoke() || !self.session.authoritative_mutations {
                     return Nav::Stay;
                 }
                 if let Some(grant) = self
@@ -1787,6 +1997,11 @@ impl SettingsPage for SidecarPage {
                 Nav::Stay
             }
             SidecarAction::ConfirmRevokeGrant(id, ConfirmationChoice::Confirm) => {
+                if !self.session.authoritative_mutations {
+                    self.session.cancel_confirm();
+                    self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                    return Nav::Stay;
+                }
                 let Some(pending) = self.session.confirm_revoke.take() else {
                     return Nav::Stay;
                 };
@@ -1836,6 +2051,9 @@ impl SettingsPage for SidecarPage {
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        self.session
+            .viewport
+            .set(sidecar_viewport_mode(area.width, area.height));
         let rows = build_rows(self);
         render_sidecar_page(
             cx,

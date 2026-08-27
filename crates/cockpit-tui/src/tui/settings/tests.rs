@@ -1482,6 +1482,8 @@ fn dialog_with_sidecar_page(tmp: &TempDir, page: PageBox) -> SettingsDialog {
 fn sidecar_pointer_session() -> image_sidecar::SidecarSession {
     let mut session =
         image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner());
+    session.authoritative_mutations = true;
+    session.authoritative_snapshot = true;
     session.form.models = vec![image_sidecar::SidecarModelOption {
         provider: "openai".into(),
         model: "gpt-4o".into(),

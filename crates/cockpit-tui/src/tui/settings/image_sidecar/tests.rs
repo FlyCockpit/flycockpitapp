@@ -129,6 +129,8 @@ fn sample_invocation() -> InvocationView {
 
 fn page_with(kind: SidecarPageKind) -> SidecarPage {
     let mut session = SidecarSession::new(SidecarPrincipal::local_owner());
+    session.authoritative_mutations = true;
+    session.authoritative_snapshot = true;
     session.form.models = vec![
         SidecarModelOption {
             provider: "openai".into(),
@@ -425,7 +427,7 @@ fn image_sidecar_settings_invocation_accounting_redaction() {
 
 #[test]
 fn image_sidecar_settings_reducer_rejects_stale_events() {
-    let mut reducer = SidecarReducer::new("d1".into(), "p1".into(), "s1".into(), "sel1".into());
+    let mut reducer = SidecarReducer::new("d1".into(), "p1".into(), "s1".into(), "sel1".into(), 1);
     let inv = sample_invocation();
     let mk = |version: u64, payload: SidecarEventPayload| SidecarEvent {
         daemon_instance: "d1".into(),
@@ -446,10 +448,6 @@ fn image_sidecar_settings_reducer_rejects_stale_events() {
         SidecarEventOutcome::Discarded
     );
     assert_eq!(reducer.charged_count, 1);
-    assert_eq!(
-        reducer.apply(mk(10, SidecarEventPayload::Invocation(inv.clone()))),
-        SidecarEventOutcome::RehydrateRequired
-    );
     let mut late = inv.clone();
     late.state = InvocationState::Pending;
     assert_eq!(
@@ -468,18 +466,6 @@ fn image_sidecar_settings_reducer_rejects_stale_events() {
         }),
     );
     wrong.selection_id = "other".into();
-    assert_eq!(reducer.apply(wrong), SidecarEventOutcome::Discarded);
-
-    let mut wrong = mk(
-        3,
-        SidecarEventPayload::Health(HealthView {
-            available: false,
-            capability_source: "x".into(),
-            freshness: "stale".into(),
-            reason: "late".into(),
-        }),
-    );
-    wrong.config_generation = 9;
     assert_eq!(reducer.apply(wrong), SidecarEventOutcome::Discarded);
 
     let mut wrong = mk(
@@ -503,19 +489,43 @@ fn image_sidecar_settings_reducer_rejects_stale_events() {
     wrong.daemon_instance = "d2".into();
     assert_eq!(reducer.apply(wrong), SidecarEventOutcome::Discarded);
 
-    let mut gap = mk(
+    let mut wrong = mk(
         3,
-        SidecarEventPayload::Grant(sample_grant(GrantScope::Once)),
+        SidecarEventPayload::Health(HealthView {
+            available: false,
+            capability_source: "x".into(),
+            freshness: "stale".into(),
+            reason: "late".into(),
+        }),
     );
-    gap.entity_version = 0;
-    assert_eq!(reducer.apply(gap), SidecarEventOutcome::Discarded);
+    wrong.config_generation = 9;
+    assert_eq!(reducer.apply(wrong), SidecarEventOutcome::RehydrateRequired);
+    assert!(reducer.stale);
+    assert!(reducer.invocations.is_empty());
+
+    let mut gap_reducer =
+        SidecarReducer::new("d1".into(), "p1".into(), "s1".into(), "sel1".into(), 1);
+    assert_eq!(
+        gap_reducer.apply(mk(1, SidecarEventPayload::Invocation(inv.clone()))),
+        SidecarEventOutcome::Applied
+    );
+    assert_eq!(
+        gap_reducer.apply(mk(10, SidecarEventPayload::Invocation(inv.clone()))),
+        SidecarEventOutcome::RehydrateRequired
+    );
+    assert_eq!(
+        gap_reducer.apply(mk(2, SidecarEventPayload::Invocation(inv))),
+        SidecarEventOutcome::RehydrateRequired
+    );
 }
 
 #[test]
 fn image_sidecar_settings_a11y_and_layout_snapshots() {
     let dialog = test_dialog();
     let mut page = page_with(SidecarPageKind::GrantList);
-    page.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
+    let mut project_grant = sample_grant(GrantScope::Project);
+    project_grant.destination = "https://user:secret@api.openai.com/v1?sig=secret".into();
+    page.session.reducer.grants = vec![project_grant];
     page.session.error = Some("cap_exhausted".into());
     page.session.busy = true;
     page.session.conflict = Some("config generation moved".into());
@@ -533,14 +543,15 @@ fn image_sidecar_settings_a11y_and_layout_snapshots() {
         Some(PROJECT_GRANT_WARNING)
     );
     let focused = rows.get(page.session.cursor).unwrap();
-    assert_eq!(a11y.focused_label, focused.label);
-    assert_eq!(a11y.focused_value, focused.value);
+    assert!(a11y.focused_label.contains(&focused.label));
+    assert_eq!(a11y.focused_value, a11y.focused_label);
     assert_eq!(a11y.non_color_state, focused.state);
     assert_eq!(
         a11y.destination,
         focused.destination.clone().unwrap_or_default()
     );
     assert_eq!(a11y.scope, focused.scope.clone().unwrap_or_default());
+    assert_eq!(a11y.destination, "https://api.openai.com/v1");
 
     for (w, h, token) in [
         (100, 30, "Layout: Full"),
@@ -732,5 +743,9 @@ fn image_sidecar_settings_state_action_registry() {
     assert!(grants.session.confirm_revoke.is_none());
     assert!(!grants.session.reducer.grants[0].revoked);
 
-    let _ = seen_actions;
+    assert_eq!(
+        seen_actions.len(),
+        18,
+        "every SidecarAction variant must be emitted by the state registry"
+    );
 }

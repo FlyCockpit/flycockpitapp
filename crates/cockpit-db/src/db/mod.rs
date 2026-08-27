@@ -3740,7 +3740,13 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         migrate_with(&conn, MIGRATIONS).unwrap();
 
-        create_migration_backup(&conn, &path, EXPECTED_SCHEMA_VERSION, "test promotion").unwrap();
+        create_migration_backup(
+            &conn,
+            &path,
+            EXPECTED_SCHEMA_VERSION,
+            PrereleaseBackupReason::PendingMigration,
+        )
+        .unwrap();
 
         let names = std::fs::read_dir(temp.path())
             .unwrap()

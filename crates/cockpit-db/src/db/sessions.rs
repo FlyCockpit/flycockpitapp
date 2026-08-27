@@ -2064,9 +2064,11 @@ impl Db {
         Ok(removed)
     }
 
-    /// Remove durable sessions that were flushed on attach but never received
-    /// a user or assistant message. Display-only TUI attaches and failed
-    /// worker startups otherwise leave resumable phantom rows.
+    /// Remove durable sessions that were flushed on attach and never became
+    /// active. Retention may prune transcript events after
+    /// `transcript_window_days` while keeping the session row for
+    /// `session_window_days`; those emptied-but-real rows, plus pinned,
+    /// renamed, ended, or parent sessions, must survive.
     pub async fn sweep_empty_display_sessions(&self) -> Result<usize> {
         let ids = self
             .read(|conn| {
@@ -2075,11 +2077,23 @@ impl Db {
                         "SELECT session_id
                            FROM sessions
                           WHERE ephemeral = 0
+                            AND ended_at_unix_ms IS NULL
+                            AND user_renamed = 0
                             AND NOT EXISTS (
                                   SELECT 1
                                     FROM session_events AS e
                                    WHERE e.session_id = sessions.session_id
-                                     AND e.type IN ('user_message', 'assistant_message')
+                                )
+                            AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM pins
+                                   WHERE pins.session_id = sessions.session_id
+                                )
+                            AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM sessions AS child
+                                   WHERE child.parent_session_id = sessions.session_id
+                                      OR child.btw_parent_session_id = sessions.session_id
                                 )",
                     )
                     .context("preparing empty-session sweep")?;
@@ -3389,6 +3403,53 @@ mod tests {
         assert_eq!(db.sweep_empty_display_sessions().await.unwrap(), 1);
         assert!(db.get_session(phantom.session_id).await.unwrap().is_none());
         assert!(db.get_session(first.session_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn sweep_empty_display_sessions_keeps_real_emptied_and_linked_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let ended = db.create_session("p", "/proj", "Build").await.unwrap();
+        record_message(&db, ended.session_id, "later pruned", false).await;
+        db.end_session(ended.session_id).await.unwrap();
+        db.write({
+            let ended_id = ended.session_id;
+            move |conn| {
+                conn.execute(
+                    "DELETE FROM session_events WHERE session_id = ?1",
+                    [ended_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let tool_only = db.create_session("p", "/proj", "Build").await.unwrap();
+        record_tool_timeline(&db, tool_only.session_id, "call-1").await;
+
+        let renamed = db.create_session("p", "/proj", "Build").await.unwrap();
+        db.rename_session(renamed.session_id, "kept by rename")
+            .await
+            .unwrap();
+
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        record_message(&db, child.session_id, "child has the transcript", false).await;
+
+        let phantom = db.create_session("p", "/proj", "Build").await.unwrap();
+
+        assert_eq!(db.sweep_empty_display_sessions().await.unwrap(), 1);
+        assert!(db.get_session(ended.session_id).await.unwrap().is_some());
+        assert!(
+            db.get_session(tool_only.session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(db.get_session(renamed.session_id).await.unwrap().is_some());
+        assert!(db.get_session(parent.session_id).await.unwrap().is_some());
+        assert!(db.get_session(child.session_id).await.unwrap().is_some());
+        assert!(db.get_session(phantom.session_id).await.unwrap().is_none());
     }
 
     #[tokio::test]

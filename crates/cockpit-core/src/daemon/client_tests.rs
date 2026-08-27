@@ -517,3 +517,74 @@ fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
         LifecycleMode::AttachOwnEphemeral
     );
 }
+
+#[test]
+fn discover_attach_plan_restart_release_spawns_instead_of_failing() {
+    use crate::daemon::DaemonStatus;
+
+    assert_eq!(
+        discover_attach_plan(
+            LifecycleMode::AttachOrAutoPromote,
+            DaemonStatus::LivePidSocketUnreachable,
+            false,
+        ),
+        DiscoverAttachPlan::WaitForRestart
+    );
+    assert_eq!(
+        after_restart_wait(
+            LifecycleMode::AttachOrAutoPromote,
+            SharedWaitError::Released
+        ),
+        RestartWaitPlan::Spawn
+    );
+    assert_eq!(
+        after_restart_wait(LifecycleMode::AlwaysEphemeral, SharedWaitError::Released),
+        RestartWaitPlan::Spawn
+    );
+    assert_eq!(
+        after_restart_wait(LifecycleMode::AttachOrEphemeral, SharedWaitError::Wedged),
+        RestartWaitPlan::Spawn
+    );
+    assert_eq!(
+        after_restart_wait(LifecycleMode::AttachOrAutoPromote, SharedWaitError::Wedged),
+        RestartWaitPlan::FailWedged
+    );
+}
+
+#[test]
+fn discover_attach_plan_ephemeral_spawns_beside_incompatible_or_unverified() {
+    use crate::daemon::DaemonStatus;
+
+    assert_eq!(
+        discover_attach_plan(
+            LifecycleMode::AlwaysEphemeral,
+            DaemonStatus::IncompatibleProtocol,
+            true,
+        ),
+        DiscoverAttachPlan::Spawn
+    );
+    assert_eq!(
+        discover_attach_plan(
+            LifecycleMode::AttachOrEphemeral,
+            DaemonStatus::UnverifiedPid,
+            false,
+        ),
+        DiscoverAttachPlan::Spawn
+    );
+    assert_eq!(
+        discover_attach_plan(
+            LifecycleMode::AttachOrAutoPromote,
+            DaemonStatus::IncompatibleProtocol,
+            true,
+        ),
+        DiscoverAttachPlan::FailIncompatible
+    );
+    assert_eq!(
+        discover_attach_plan(
+            LifecycleMode::AttachOrAutoPromote,
+            DaemonStatus::UnverifiedPid,
+            false,
+        ),
+        DiscoverAttachPlan::FailUnreachable
+    );
+}

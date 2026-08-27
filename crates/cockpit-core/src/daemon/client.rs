@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use cockpit_client::DaemonClient;
+use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
 
 use crate::daemon::proto::{self, Request};
 
@@ -193,6 +193,9 @@ impl OwnedDaemonSession {
                     );
                 }
             };
+        if let Some(notice) = connected.startup_notice.take() {
+            eprintln!("{notice}");
+        }
         Ok(Self {
             client: connected.client,
             guard,
@@ -444,6 +447,61 @@ pub fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
     client
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoverAttachPlan {
+    AttachRunning,
+    WaitForRestart,
+    Spawn,
+    FailIncompatible,
+    FailUnreachable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartWaitPlan {
+    Spawn,
+    FailWedged,
+}
+
+fn ephemeral_may_spawn_private(mode: LifecycleMode) -> bool {
+    matches!(
+        mode,
+        LifecycleMode::AlwaysEphemeral | LifecycleMode::AttachOrEphemeral
+    )
+}
+
+fn discover_attach_plan(
+    mode: LifecycleMode,
+    status: crate::daemon::DaemonStatus,
+    has_hello: bool,
+) -> DiscoverAttachPlan {
+    use crate::daemon::DaemonStatus;
+    match status {
+        DaemonStatus::Running => DiscoverAttachPlan::AttachRunning,
+        DaemonStatus::IncompatibleProtocol if ephemeral_may_spawn_private(mode) => {
+            DiscoverAttachPlan::Spawn
+        }
+        DaemonStatus::IncompatibleProtocol => DiscoverAttachPlan::FailIncompatible,
+        DaemonStatus::LivePidSocketUnreachable if !has_hello => DiscoverAttachPlan::WaitForRestart,
+        DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid
+            if ephemeral_may_spawn_private(mode) =>
+        {
+            DiscoverAttachPlan::Spawn
+        }
+        DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid => {
+            DiscoverAttachPlan::FailUnreachable
+        }
+        DaemonStatus::NotRunning | DaemonStatus::Stale => DiscoverAttachPlan::Spawn,
+    }
+}
+
+fn after_restart_wait(mode: LifecycleMode, error: SharedWaitError) -> RestartWaitPlan {
+    match error {
+        SharedWaitError::Released => RestartWaitPlan::Spawn,
+        SharedWaitError::Wedged if ephemeral_may_spawn_private(mode) => RestartWaitPlan::Spawn,
+        SharedWaitError::Wedged => RestartWaitPlan::FailWedged,
+    }
+}
+
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
@@ -456,102 +514,88 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
         | LifecycleMode::AttachOrEphemeral
         | LifecycleMode::AlwaysEphemeral => {
             let discovered = discover().await;
-            if matches!(discovered.status, DaemonStatus::Running) {
-                let attach_notice = matches!(mode, LifecycleMode::AlwaysEphemeral)
-                    .then(|| EPHEMERAL_ATTACH_NOTICE.to_string());
-                let attached = if matches!(
-                    mode,
-                    LifecycleMode::AttachOrAutoPromote | LifecycleMode::AlwaysEphemeral
-                ) {
-                    attach_running_with_skew_check(discovered.paths.clone(), attach_notice).await
-                } else {
-                    connect_shared_running(discovered.paths.clone(), None).await
-                };
-                match attached {
-                    Ok(connected) => return Ok(connected),
-                    Err(error)
-                        if matches!(
-                            mode,
-                            LifecycleMode::AlwaysEphemeral | LifecycleMode::AttachOrEphemeral
-                        ) =>
-                    {
-                        tracing::debug!(
-                            error = %error,
-                            "shared daemon disappeared after discover; spawning a private daemon"
+            match discover_attach_plan(mode, discovered.status, discovered.hello.is_some()) {
+                DiscoverAttachPlan::AttachRunning => {
+                    let attach_notice = matches!(mode, LifecycleMode::AlwaysEphemeral)
+                        .then(|| EPHEMERAL_ATTACH_NOTICE.to_string());
+                    let attached = if matches!(
+                        mode,
+                        LifecycleMode::AttachOrAutoPromote | LifecycleMode::AlwaysEphemeral
+                    ) {
+                        attach_running_with_skew_check(discovered.paths.clone(), attach_notice)
+                            .await
+                    } else {
+                        connect_shared_running(discovered.paths.clone(), None).await
+                    };
+                    match attached {
+                        Ok(connected) => return Ok(connected),
+                        Err(error) if is_protocol_version_mismatch(&error) => {
+                            return Err(error);
+                        }
+                        Err(error) if ephemeral_may_spawn_private(mode) => {
+                            tracing::debug!(
+                                error = %error,
+                                "shared daemon disappeared after discover; spawning a private daemon"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                DiscoverAttachPlan::WaitForRestart => {
+                    let observed_pid =
+                        cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
+                    let startup_notice =
+                        matches!(mode, LifecycleMode::AlwaysEphemeral).then(|| {
+                            "waiting for the already-running persistent daemon to finish restart"
+                                .to_string()
+                        });
+                    match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
+                        Ok(client) => {
+                            return Ok(ConnectedDaemon {
+                                endpoint: local_daemon_endpoint(&discovered.paths.socket),
+                                client,
+                                owns_daemon: false,
+                                socket: discovered.paths.socket,
+                                startup_notice,
+                                owned_daemon_guard: None,
+                                owned_in_process_guard: None,
+                            });
+                        }
+                        Err(error) => match after_restart_wait(mode, error) {
+                            RestartWaitPlan::Spawn => {
+                                tracing::info!(
+                                    "canonical daemon pid released or never bound; spawning a replacement"
+                                );
+                            }
+                            RestartWaitPlan::FailWedged => {
+                                anyhow::bail!(
+                                    "shared daemon pid is live but socket never became ready: {}",
+                                    discovered.paths.socket.display()
+                                );
+                            }
+                        },
+                    }
+                }
+                DiscoverAttachPlan::Spawn => {}
+                DiscoverAttachPlan::FailIncompatible => {
+                    if let Some(hello) = discovered.hello.as_ref() {
+                        anyhow::bail!(
+                            "{}",
+                            proto::incompatible_daemon_protocol_message(hello.protocol_version)
                         );
                     }
-                    Err(error) => return Err(error),
-                }
-            }
-            if matches!(discovered.status, DaemonStatus::IncompatibleProtocol) {
-                if let Some(hello) = discovered.hello.as_ref() {
-                    anyhow::bail!(
-                        "{}",
-                        proto::incompatible_daemon_protocol_message(hello.protocol_version)
-                    );
-                } else {
                     anyhow::bail!(
                         "shared daemon pid is live but socket is unreachable: {}",
                         discovered.paths.socket.display()
                     );
                 }
-            }
-            if discovered.status == DaemonStatus::LivePidSocketUnreachable
-                && discovered.hello.is_none()
-            {
-                // Wait for a restarting canonical child, but re-probe pid
-                // liveness so a wedged or exited process does not consume
-                // the full spawn timeout and then abort `--ephemeral`.
-                let observed_pid =
-                    cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
-                let startup_notice = matches!(mode, LifecycleMode::AlwaysEphemeral).then(|| {
-                    "waiting for the already-running persistent daemon to finish restart"
-                        .to_string()
-                });
-                match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
-                    Ok(client) => {
-                        return Ok(ConnectedDaemon {
-                            endpoint: local_daemon_endpoint(&discovered.paths.socket),
-                            client,
-                            owns_daemon: false,
-                            socket: discovered.paths.socket,
-                            startup_notice,
-                            owned_daemon_guard: None,
-                            owned_in_process_guard: None,
-                        });
-                    }
-                    Err(SharedWaitError::Released) => {
-                        tracing::info!(
-                            "canonical daemon pid released before hello; spawning a replacement"
+                DiscoverAttachPlan::FailUnreachable => {
+                    if let Some(hello) = discovered.hello.as_ref() {
+                        anyhow::bail!(
+                            "{}",
+                            proto::incompatible_daemon_protocol_message(hello.protocol_version)
                         );
                     }
-                    Err(SharedWaitError::Wedged) => {
-                        if matches!(
-                            mode,
-                            LifecycleMode::AlwaysEphemeral | LifecycleMode::AttachOrEphemeral
-                        ) {
-                            tracing::warn!(
-                                "canonical daemon never bound a socket; spawning a private daemon"
-                            );
-                        } else {
-                            anyhow::bail!(
-                                "shared daemon pid is live but socket never became ready: {}",
-                                discovered.paths.socket.display()
-                            );
-                        }
-                    }
-                }
-            }
-            if matches!(
-                discovered.status,
-                DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid
-            ) {
-                if let Some(hello) = discovered.hello.as_ref() {
-                    anyhow::bail!(
-                        "{}",
-                        proto::incompatible_daemon_protocol_message(hello.protocol_version)
-                    );
-                } else {
                     anyhow::bail!(
                         "shared daemon pid is live but socket is unreachable: {}",
                         discovered.paths.socket.display()
@@ -850,9 +894,6 @@ async fn wait_for_shared_daemon(
             return Err(SharedWaitError::Released);
         }
         if std::time::Instant::now() >= deadline {
-            if pid.is_some_and(|pid| !cockpit_host::daemon_lifecycle::process_exists(pid)) {
-                return Err(SharedWaitError::Released);
-            }
             return Err(SharedWaitError::Wedged);
         }
         tokio::time::sleep(backoff).await;

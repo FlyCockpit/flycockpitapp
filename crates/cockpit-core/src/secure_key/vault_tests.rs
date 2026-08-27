@@ -1202,6 +1202,27 @@ fn resolve_first_run_does_not_persist_database_when_keyring_probe_failed() {
         resolve_secret_store(None, &failed_probe()).expect_err("failed probe is not a placement");
     assert!(error.reason.contains("panicked"), "{}", error.reason);
     assert_eq!(error.intent, SecretStoreIntent::Unconfigured);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek_dir = tmp.path().join("secret-vault");
+    let ensure = ensure_secret_vault(
+        &db,
+        &failed_probe(),
+        &kek_dir,
+        SecretStoreInjected::default(),
+    );
+    assert!(
+        ensure.is_err(),
+        "failed first-run probe must not open a vault"
+    );
+    let authority = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap();
+    assert!(
+        authority.is_none(),
+        "failed first-run probe must not persist a secret-vault authority row"
+    );
 }
 
 #[test]

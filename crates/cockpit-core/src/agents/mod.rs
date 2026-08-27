@@ -71,7 +71,7 @@ const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 /// Per-agent capability grants (issue #75). These replace the four
 /// mode-gated [`crate::engine::tool::Capability`] variants: a grant is now
 /// an explicit member of the agent definition's `capabilities` set rather
-/// than a side effect of the session-global `LlmMode`. Wire names are the
+/// than a side effect of a session-global steering posture. Wire names are the
 /// camelCase spellings below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,7 +160,7 @@ impl ContextPolicy {
 }
 
 /// The resolved posture of one agent node (issue #75): the single value the
-/// engine consults in place of the former session-global `LlmMode`. It carries
+/// engine consults for capability grants. It carries
 /// the resolved capability-grant set. When the [`AgentDef`] declares
 /// `capabilities`, that set is authoritative; when it does not (`None`), the
 /// `standard` fallback grant set (empty — none of the four capabilities)
@@ -242,7 +242,7 @@ pub struct AgentDef {
     /// for **this** agent without touching its ID or schema, so the same tool
     /// can encode different per-agent intent (e.g. `Build` "delegate-eager" vs
     /// a "do-it-yourself" primary). Keyed by tool name; the value carries the
-    /// per-`llm_mode` text. Applied at
+    /// terse/verbose steering text. Applied at
     /// [`crate::engine::builtin`] construction time onto the toolbox via
     /// [`crate::engine::tool::ToolBox::with_override`] — fixed at session
     /// start, so the tools array stays byte-stable (cache-safe). Empty / absent
@@ -290,9 +290,9 @@ pub struct AgentDef {
     #[serde(skip)]
     pub vnext: Option<VnextAgentDef>,
     /// Body of the markdown file (the agent's system prompt). This is *the*
-    /// single canonical body for the agent (issue #75: the per-`llm_mode`
-    /// defensive/normal/frontier body trios are merged into one). Per-model
-    /// override bodies live in [`Self::prompt_overrides`]. Resolved through
+    /// single canonical body for the agent (issue #75: the old per-posture
+    /// body trios are merged into one). Per-model override bodies live in
+    /// [`Self::prompt_overrides`]. Resolved through
     /// [`AgentDef::resolved_prompt`] rather than read directly so the
     /// per-model override threads through one path.
     #[serde(skip)]
@@ -1455,9 +1455,8 @@ pub fn load_profile_definition_from_owned_path(
     })
 }
 
-/// Load a per-`llm_mode` directory-form agent
-/// (implementation note): `<dir>/<name>/<mode>.md`,
-/// one file per model override. Each override file is a full agent markdown
+/// Load a directory-form agent (implementation note): `<dir>/<name>/<key>.md`,
+/// one file per model-slot override. Each override file is a full agent markdown
 /// with frontmatter and body; only the **prompt body** is used as a
 /// per-model override (keyed by the file stem), the frontmatter is read from
 /// the flat `<dir>/<name>.md` sibling. The invariant validation runs once on
@@ -1548,10 +1547,9 @@ fn read_agent_markdown(path: &Path) -> Result<String> {
 }
 
 /// Extract the agent name from a path. For the flat-file form that is the
-/// file stem (`builder.md` → `builder`); the dir form (`builder/`) — reserved
-/// for the future per-`llm_mode` layout — would resolve to the directory
-/// name. Centralized so the dir form can be accepted later without
-/// touching call sites.
+/// file stem (`builder.md` → `builder`); the dir form (`builder/`) — the
+/// per-model-slot layout — resolves to the directory name. Centralized so
+/// both forms share one name extraction path.
 fn agent_name_from_path(path: &Path) -> Option<String> {
     if path.is_dir() {
         return path.file_name().map(|s| s.to_string_lossy().into_owned());
@@ -1638,15 +1636,15 @@ fn resolve_agent_dir_entry(config_path: &Path, dir: &Path) -> Option<PathBuf> {
 }
 
 /// Resolve the on-disk path an agent named `name` would resolve to in
-/// `dir`, **without** requiring it to exist. The per-`llm_mode` directory
-/// form (`<dir>/<name>/`, holding `normal.md`/`defensive.md`) takes
-/// precedence when present — it is the richer multi-mode source and
+/// `dir`, **without** requiring it to exist. The directory form
+/// (`<dir>/<name>/`, holding per-model-slot `<key>.md` files) takes
+/// precedence when present — it is the richer multi-body source and
 /// internally falls back to the flat `<dir>/<name>.md` sibling for any
-/// absent mode (implementation note). Otherwise the
+/// absent slot (implementation note). Otherwise the
 /// flat-file form (`<dir>/<name>.md`, the form eject writes) is returned;
 /// when neither exists the flat path is returned as the canonical default.
 pub fn agent_path_in(dir: &Path, name: &str) -> PathBuf {
-    // The per-mode directory form wins when it exists.
+    // The directory form wins when it exists.
     let dir_form = dir.join(name);
     if dir_form.is_dir() {
         return dir_form;
@@ -1702,14 +1700,14 @@ fn resolve_inner(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
     for dir in agent_search_dirs(cwd) {
         let candidate = agent_path_in(&dir, name);
         if candidate.is_dir() {
-            // Per-`llm_mode` directory form: load every mode file present,
-            // falling back to the flat sibling per mode.
+            // Directory form: load every per-model-slot override file present,
+            // falling back to the flat sibling.
             // Built-ins use the flat eject form.  Do not accept a directory
             // form here because its individual files would otherwise bypass
             // the trusted builtin-override provenance check.
             if is_builtin_agent(name) {
                 bail!(
-                    "built-in override `{name}` must be the ejected flat markdown file, not a mode directory"
+                    "built-in override `{name}` must be the ejected flat markdown file, not a directory-form override"
                 );
             }
             return Ok(Some(load_from_dir(&dir, name)?));

@@ -11,8 +11,8 @@
 //! untrusted model. Nothing widens that — not a steering posture, not a tool,
 //! not a grant.
 //!
-//! Steering posture (formerly `LlmMode`) is an independent harness-steering
-//! axis that selects context variants and verbose tool-definition prose. It
+//! Steering posture is an independent harness-steering axis that selects
+//! context variants and verbose tool-definition prose. It
 //! never decides whether an already-selected provider sees a raw literal,
 //! whether a provider is eligible for a sensitive request, or any sealed
 //! authorization outcome. This module is where that orthogonality is made

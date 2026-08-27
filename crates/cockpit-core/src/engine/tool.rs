@@ -462,15 +462,14 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
 
     /// One-sentence description per GOALS §10. Keep this terse enough for the
-    /// normal/frontier tool array; the invariant test treats ~200 chars as the
+    /// default tool array; the invariant test treats ~200 chars as the
     /// hard ceiling for built-ins.
-    /// This is the **normal** `llm_mode` form (terse, the token-economy
-    /// budget the CI check enforces).
+    /// This is the **terse** form (the token-economy budget the CI check
+    /// enforces).
     fn description(&self) -> &str;
 
     /// The **verbose** description: explicit, steering prose rendered when the
-    /// agent def's `toolSteering` is [`crate::agents::ToolSteering::Verbose`]
-    /// (issue #75 — formerly the defensive `llm_mode` form).
+    /// agent def's `toolSteering` is [`crate::agents::ToolSteering::Verbose`].
     /// `None` (the default) means "no verbose variant — fall back to the
     /// terse [`Self::description`]." Registry-driven tests enforce verbose
     /// coverage for built-ins that reach the normal agent surface; dynamic or
@@ -509,8 +508,8 @@ pub trait Tool: Send + Sync {
 
     /// JSON Schema for the arguments. Returning `Value::Null` means "no
     /// arguments." See plan.md §12 for the conventions the schema must
-    /// follow for the repair catalog to fire. This is the **normal**
-    /// `llm_mode` form (noun-phrase parameter descriptions).
+    /// follow for the repair catalog to fire. This is the **terse** form
+    /// (noun-phrase parameter descriptions).
     fn parameters(&self) -> Value;
 
     /// The **verbose** parameter schema: same structure + required set as
@@ -995,8 +994,8 @@ pub struct ToolCtx {
 /// A per-agent description override for a single tool, carried on the
 /// [`ToolBox`] alongside the tool itself. The **same tool ID and the same
 /// SCHEMA** are shared across every agent — only the *description text* is
-/// selected per agent + per [`LlmMode`]. This is the per-agent axis that
-/// composes onto the steering axis applied in [`definition_of`]:
+/// selected per agent + per tool-description steering. This is the per-agent
+/// axis that composes onto the steering axis applied in [`definition_of`]:
 /// the override's text, when present for the active steering, *replaces* the
 /// description the steering logic would otherwise render; the parameters are
 /// never touched (schema variation would change validation/repair behavior —
@@ -1078,7 +1077,7 @@ pub fn definition_of(
     }
 }
 
-/// Behavioral capabilities gated on the [`LlmMode`] axis.
+/// Behavioral capabilities gated on the agent-definition grant set.
 ///
 /// [`definition_of`] above is the *description-verbosity* seam — it changes
 /// how a tool's schema reads, never what the engine will accept. This is the
@@ -1414,50 +1413,20 @@ impl ToolBox {
 mod capability_tests {
     use super::*;
     use crate::agents::PostureResolution;
-    use crate::config::extended::LlmMode;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    /// The follow-up/seed capability is disabled only for defensive mode.
+    /// Issue #75: a declared grant set is authoritative; the empty
+    /// (undeclared) set enables none of the four capabilities.
     #[test]
-    fn followup_seed_is_enabled_outside_defensive_mode() {
-        assert!(Capability::FollowupSeed.enabled(&PostureResolution::legacy(LlmMode::Normal)));
-        assert!(Capability::FollowupSeed.enabled(&PostureResolution::legacy(LlmMode::Frontier)));
-        assert!(!Capability::FollowupSeed.enabled(&PostureResolution::legacy(LlmMode::Defensive)));
-    }
-
-    #[test]
-    fn fork_context_capability_is_frontier_only() {
-        assert!(!Capability::ForkContext.enabled(&PostureResolution::legacy(LlmMode::Normal)));
-        assert!(Capability::ForkContext.enabled(&PostureResolution::legacy(LlmMode::Frontier)));
-        assert!(!Capability::ForkContext.enabled(&PostureResolution::legacy(LlmMode::Defensive)));
-    }
-
-    #[test]
-    fn scoped_parallel_write_capability_is_frontier_only() {
-        assert!(
-            !Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(LlmMode::Normal))
-        );
-        assert!(
-            Capability::ScopedParallelWrite.enabled(&PostureResolution::legacy(LlmMode::Frontier))
-        );
-        assert!(
-            !Capability::ScopedParallelWrite
-                .enabled(&PostureResolution::legacy(LlmMode::Defensive))
-        );
-    }
-
-    /// Issue #75 Stage 2: a declared grant set overrides the legacy mode
-    /// gate in both directions.
-    #[test]
-    fn declared_grants_override_mode_fallback() {
+    fn declared_grants_control_capabilities() {
         use crate::agents::{AgentCapability, AgentDef};
         let mut grants = BTreeSet::new();
         grants.insert(AgentCapability::ForkContext);
-        // A def that declares forkContext but is in defensive mode: the grant
-        // wins (legacy would disable it).
+        // A def that declares forkContext: the grant is on; undeclared
+        // capabilities stay off.
         let mut def = AgentDef {
             name: "test".into(),
             description: "d".into(),
@@ -1479,28 +1448,28 @@ mod capability_tests {
             prompt_overrides: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         };
-        let posture = PostureResolution::from_def(&def, LlmMode::Defensive);
+        let posture = PostureResolution::from_def(&def);
         assert!(
             Capability::ForkContext.enabled(&posture),
-            "declared grant overrides defensive mode"
+            "declared grant is on"
         );
         assert!(
             !Capability::FollowupSeed.enabled(&posture),
-            "an undeclared capability is off even in a mode that would enable it"
+            "an undeclared capability is off"
         );
 
-        // Empty grant set disables everything regardless of mode.
+        // Empty grant set disables everything.
         def.capabilities = Some(BTreeSet::new());
-        let posture_empty = PostureResolution::from_def(&def, LlmMode::Frontier);
+        let posture_empty = PostureResolution::from_def(&def);
         assert!(!Capability::ForkContext.enabled(&posture_empty));
         assert!(!Capability::FollowupSeed.enabled(&posture_empty));
 
-        // SandboxEscalate: a declared grant enables it even in defensive mode
-        // (the tool-registration seam consults the same posture).
+        // SandboxEscalate: a declared grant enables it (the tool-registration
+        // seam consults the same posture).
         let mut escalate_grants = BTreeSet::new();
         escalate_grants.insert(AgentCapability::SandboxEscalate);
         def.capabilities = Some(escalate_grants);
-        let posture_escalate = PostureResolution::from_def(&def, LlmMode::Defensive);
+        let posture_escalate = PostureResolution::from_def(&def);
         assert!(Capability::SandboxEscalate.enabled(&posture_escalate));
         assert!(!Capability::FollowupSeed.enabled(&posture_escalate));
     }
@@ -1744,7 +1713,6 @@ mod capability_tests {
 #[cfg(test)]
 mod definition_cache_tests {
     use super::*;
-    use crate::config::extended::LlmMode;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1905,9 +1873,8 @@ mod sandbox_meta_tests {
 }
 
 #[cfg(test)]
-mod llm_mode_tests {
+mod steering_tests {
     use super::*;
-    use crate::config::extended::LlmMode;
     use crate::tools;
 
     fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
@@ -2070,10 +2037,10 @@ mod llm_mode_tests {
     fn every_builtin_tool_has_a_verbose_description() {
         for tool in all_builtin_tools() {
             if tool.name() == "escalate" {
-                // `escalate` is removed from Defensive toolboxes by
-                // Capability::SandboxEscalate, so a defensive variant is
-                // unrenderable by construction. Keep this a named exemption so
-                // other built-ins cannot silently lose Defensive coverage.
+                // `escalate` is removed when the agent lacks the sandboxEscalate
+                // grant, so a verbose variant is unrenderable by construction.
+                // Keep this a named exemption so other built-ins cannot
+                // silently lose verbose coverage.
                 continue;
             }
             let terse = tool.description().to_string();

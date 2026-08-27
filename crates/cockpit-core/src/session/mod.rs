@@ -2516,8 +2516,6 @@ mod tests {
         .unwrap();
         let override_json = r#"{"tools":["read","bash"],"toolTiers":{"bash":"disabled"}}"#;
 
-        s.set_session_llm_mode(crate::config::extended::LlmMode::Frontier)
-            .unwrap();
         s.set_tool_surface_override_json(Some(override_json.to_string()))
             .unwrap();
         let goal_override_json = r#"{"enabled":false,"coldSkepticCount":2}"#;
@@ -2527,7 +2525,6 @@ mod tests {
 
         s.persist_if_needed().unwrap();
         let row = db.get_session(s.id).await.unwrap().unwrap();
-        assert_eq!(row.session_llm_mode.as_deref(), Some("frontier"));
         assert_eq!(
             row.tool_surface_override_json.as_deref(),
             Some(override_json)
@@ -2615,7 +2612,6 @@ mod tests {
             output: "1: fn main()".into(),
             truncated: false,
             duration_ms: 4,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -2671,7 +2667,6 @@ mod tests {
             output: "body".into(),
             truncated: false,
             duration_ms: 4,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })

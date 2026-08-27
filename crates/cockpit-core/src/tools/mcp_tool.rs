@@ -562,7 +562,6 @@ mod tests {
                 output: raw_output.clone(),
                 truncated: false,
                 duration_ms: 0,
-                llm_mode: crate::config::extended::LlmMode::Normal,
                 shape_fingerprint: None,
                 hint: None,
             })

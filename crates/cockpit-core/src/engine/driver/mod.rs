@@ -2388,12 +2388,12 @@ impl Driver {
         };
         self.schedule
             .set_agent(self.stack[active_idx].agent.clone());
-        // Modes AC5 turn-consumption: consume any pending per-node session
-        // override for the active node into effect at this turn boundary. The
-        // llm-mode axis is applied per-frame (below); the sandbox axis is
-        // applied through the session posture (see the method) — verification
-        // and question axes are consumed into the node's effective override and
-        // await their resolver-site application (documented follow-on).
+        // Consume any pending per-node session override for the active node
+        // into effect at this turn boundary. The model axis is applied
+        // per-frame (below); the sandbox axis is applied through the session
+        // posture (see the method) — verification and question axes are
+        // consumed into the node's effective override and await their
+        // resolver-site application (documented follow-on).
         let consumed = self.consume_active_node_override_for_turn(active_idx).await;
         let model_pin = self
             .refresh_active_model_for_turn(active_idx, consumed, tx)
@@ -2406,14 +2406,13 @@ impl Driver {
     }
 
     /// Consume any pending per-node session override for the active node into
-    /// its effective override at this turn boundary (modes AC5 "second
-    /// transaction": pending is merged into effective and cleared; the revision
-    /// is unchanged). Returns the model/mode axes to apply to this frame's next
-    /// turn.
+    /// its effective override at this turn boundary (pending is merged into
+    /// effective and cleared; the revision is unchanged). Returns the model
+    /// axis to apply to this frame's next turn.
     ///
     /// Application status by axis:
-    ///  - `model` and `mode`: applied per-frame by the caller (returned here) —
-    ///    isolated to the active frame, so an ancestor or sibling frame is never
+    ///  - `model`: applied per-frame by the caller (returned here) — isolated
+    ///    to the active frame, so an ancestor or sibling frame is never
     ///    affected. The daemon already re-validated the model choice as
     ///    hard-compatible before it was stored.
     ///  - `sandbox`: applied to the session posture below. This is session-scoped

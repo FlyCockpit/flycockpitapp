@@ -18,7 +18,6 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::config::extended::LlmMode;
 use crate::db::session_log::SessionEventKind;
 use crate::engine::agent::TurnEvent;
 use crate::engine::tool::{
@@ -42,7 +41,7 @@ pub struct HostContext {
     pub session_id: Option<uuid::Uuid>,
     #[allow(dead_code)]
     pub cwd: PathBuf,
-    pub llm_mode: LlmMode,
+    pub tool_steering: crate::agents::ToolSteering,
     /// Session config reader for host-function availability checks
     /// (`engine-config-snapshot-adoption`).
     pub config: crate::daemon::session_worker::SessionConfigHandle,
@@ -69,7 +68,6 @@ impl HostContext {
                 ctx.events.clone(),
                 ctx.agent_id.clone(),
                 parent_call_id.clone(),
-                ctx.llm_mode,
                 DEFAULT_CHILD_EVENT_CAP,
                 ctx.config.clone(),
                 ctx.redact.clone(),
@@ -79,7 +77,7 @@ impl HostContext {
             db: Some(ctx.session.db.clone()),
             session_id: Some(ctx.session.id),
             cwd: ctx.cwd.clone(),
-            llm_mode: ctx.llm_mode,
+            tool_steering: ctx.tool_steering,
             config: ctx.config.clone(),
             session: Some(ctx.session.clone()),
             root_agent_frame: ctx.root_agent_frame,
@@ -103,7 +101,7 @@ impl HostContext {
             db: None,
             session_id: None,
             cwd: PathBuf::new(),
-            llm_mode: LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             session: None,
             root_agent_frame: true,
@@ -170,8 +168,8 @@ impl HostContext {
     }
 
     #[cfg(test)]
-    pub fn with_llm_mode_for_tests(mut self, mode: LlmMode) -> Self {
-        self.llm_mode = mode;
+    pub fn with_tool_steering_for_tests(mut self, steering: crate::agents::ToolSteering) -> Self {
+        self.tool_steering = steering;
         self
     }
 
@@ -256,7 +254,6 @@ pub struct McpChildEventRecorder {
     events: Option<mpsc::Sender<TurnEvent>>,
     agent: String,
     parent_call_id: String,
-    llm_mode: crate::config::extended::LlmMode,
     cap: usize,
     /// Turn-pinned config snapshot of the DISPATCHING model, so the recorded
     /// ToolCall/ToolCallStarted events (which embed the model-supplied MCP
@@ -294,7 +291,6 @@ impl McpChildEventRecorder {
         events: Option<mpsc::Sender<TurnEvent>>,
         agent: String,
         parent_call_id: String,
-        llm_mode: crate::config::extended::LlmMode,
         cap: usize,
         config: crate::daemon::session_worker::SessionConfigHandle,
         session_table: Arc<crate::redact::RedactionTable>,
@@ -308,7 +304,6 @@ impl McpChildEventRecorder {
             events,
             agent,
             parent_call_id,
-            llm_mode,
             cap,
             config,
             session_table,
@@ -635,7 +630,6 @@ impl McpChildEventRecorder {
                     output: output.to_string(),
                     truncated: false,
                     duration_ms,
-                    llm_mode: self.llm_mode,
                     shape_fingerprint: None,
                     hint: None,
                 },
@@ -813,7 +807,7 @@ pub fn is_builtin_server(server: &str) -> bool {
 
 pub fn search(ctx: &HostContext, query: &str) -> Vec<SearchHit> {
     let q = query.trim().to_lowercase();
-    let steering = crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode);
+    let steering = ctx.tool_steering;
     ctx.builtin_registry
         .iter()
         .filter(|func| (func.availability)(ctx).available)
@@ -834,7 +828,7 @@ pub fn search(ctx: &HostContext, query: &str) -> Vec<SearchHit> {
 }
 
 pub fn available_descriptors(ctx: &HostContext) -> Vec<ToolDescriptor> {
-    let steering = crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode);
+    let steering = ctx.tool_steering;
     ctx.builtin_registry
         .iter()
         .filter(|func| (func.availability)(ctx).available)
@@ -847,7 +841,7 @@ pub fn describe(ctx: &HostContext, tool: &str) -> Result<ToolDescriptor> {
         bail!("unknown MCP tool `{BUILTIN_SERVER_ID}.{tool}`");
     };
     ensure_available(ctx, func)?;
-    let steering = crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode);
+    let steering = ctx.tool_steering;
     Ok(func.descriptor(steering))
 }
 
@@ -1590,16 +1584,16 @@ mod tests {
     }
 
     fn host_with_tool(root: &std::path::Path, tool: Arc<dyn Tool>) -> HostContext {
-        host_with_tool_mode(root, tool, LlmMode::Normal)
+        host_with_tool_mode(root, tool, crate::agents::ToolSteering::Terse)
     }
 
     fn host_with_tool_mode(
         root: &std::path::Path,
         tool: Arc<dyn Tool>,
-        mode: LlmMode,
+        steering: crate::agents::ToolSteering,
     ) -> HostContext {
         let mut ctx = crate::tools::common::test_ctx(root);
-        ctx.llm_mode = mode;
+        ctx.tool_steering = steering;
         ctx.approver = None;
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
@@ -1813,21 +1807,21 @@ mod tests {
             };
 
             let normal_schema = tool.parameters();
-            let normal_descriptor = func.descriptor(LlmMode::Normal);
+            let normal_descriptor = func.descriptor(crate::agents::ToolSteering::Terse);
             assert_faithful_schema(
                 &normal_schema,
                 &normal_descriptor.input_schema,
-                &format!("{} Normal schema", tool.name()),
+                &format!("{} Terse schema", tool.name()),
             );
 
             let defensive_schema = tool
                 .verbose_parameters()
                 .unwrap_or_else(|| tool.parameters());
-            let defensive_descriptor = func.descriptor(LlmMode::Defensive);
+            let defensive_descriptor = func.descriptor(crate::agents::ToolSteering::Verbose);
             assert_faithful_schema(
                 &defensive_schema,
                 &defensive_descriptor.input_schema,
-                &format!("{} Defensive schema", tool.name()),
+                &format!("{} Verbose schema", tool.name()),
             );
 
             checked.push(tool.name().to_string());
@@ -1930,7 +1924,11 @@ mod tests {
         );
 
         let defensive = describe(
-            &host_with_tool_mode(tmp.path(), tool.clone(), LlmMode::Defensive),
+            &host_with_tool_mode(
+                tmp.path(),
+                tool.clone(),
+                crate::agents::ToolSteering::Verbose,
+            ),
             "mode_probe",
         )
         .unwrap();
@@ -1964,7 +1962,11 @@ mod tests {
             MontyAdapterTool::new("normal_only", "ok").with_description("normal only text"),
         );
         let desc = describe(
-            &host_with_tool_mode(tmp.path(), no_defensive, LlmMode::Defensive),
+            &host_with_tool_mode(
+                tmp.path(),
+                no_defensive,
+                crate::agents::ToolSteering::Verbose,
+            ),
             "normal_only",
         )
         .unwrap();
@@ -1977,24 +1979,16 @@ mod tests {
                 .with_verbose_description("defensive text without schema"),
         );
         let desc = describe(
-            &host_with_tool_mode(tmp.path(), defensive_text_only, LlmMode::Defensive),
+            &host_with_tool_mode(
+                tmp.path(),
+                defensive_text_only,
+                crate::agents::ToolSteering::Verbose,
+            ),
             "text_only",
         )
         .unwrap();
         assert_eq!(desc.description, "defensive text without schema");
         assert_eq!(desc.input_schema, normal_schema);
-    }
-
-    #[test]
-    fn monty_frontier_descriptor_matches_normal_for_every_builtin() {
-        for func in default_registry().iter() {
-            assert_eq!(
-                func.descriptor(LlmMode::Frontier),
-                func.descriptor(LlmMode::Normal),
-                "`{}` descriptor drifted between Frontier and Normal",
-                func.name
-            );
-        }
     }
 
     #[test]
@@ -2033,8 +2027,8 @@ mod tests {
         .with_direct_call_marker(true)
         .into_function()
         .unwrap();
-        let normal = func.descriptor(LlmMode::Normal);
-        let defensive = func.descriptor(LlmMode::Defensive);
+        let normal = func.descriptor(crate::agents::ToolSteering::Terse);
+        let defensive = func.descriptor(crate::agents::ToolSteering::Verbose);
 
         for description in [normal.description, defensive.description] {
             assert!(
@@ -2052,7 +2046,11 @@ mod tests {
                 .with_description("normal searchable text")
                 .with_verbose_description("defensive-only-needle first line\nsecond line"),
         );
-        let defensive_host = host_with_tool_mode(tmp.path(), tool.clone(), LlmMode::Defensive);
+        let defensive_host = host_with_tool_mode(
+            tmp.path(),
+            tool.clone(),
+            crate::agents::ToolSteering::Verbose,
+        );
         let normal_host = host_with_tool(tmp.path(), tool);
 
         let hits = search(&defensive_host, "defensive-only-needle");
@@ -2825,7 +2823,7 @@ mod tests {
             db: Some(session.db.clone()),
             session_id: Some(session.id),
             cwd: tmp.path().to_path_buf(),
-            llm_mode: LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                 tmp.path(),
             ),
@@ -2923,7 +2921,7 @@ mod tests {
             db: Some(session.db.clone()),
             session_id: Some(session.id),
             cwd: tmp.path().to_path_buf(),
-            llm_mode: LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                 tmp.path(),
             ),
@@ -3039,16 +3037,12 @@ mod tests {
     fn write_trusted_openai_provider(root: &std::path::Path, trust: &str) {
         let providers = root.join(".cockpit").join("providers");
         std::fs::create_dir_all(&providers).unwrap();
-        std::fs::write(
-            root.join(".cockpit").join("config.json"),
-            r#"{"llm_mode":"defensive"}"#,
-        )
-        .unwrap();
+        std::fs::write(root.join(".cockpit").join("config.json"), "{}").unwrap();
         std::fs::write(
             providers.join("openai.json"),
             serde_json::json!({
                 "url": "https://example.test/v1",
-                "models": [{"id": "gpt-5", "trust": trust, "mode": "frontier"}],
+                "models": [{"id": "gpt-5", "trust": trust}],
             })
             .to_string(),
         )
@@ -3101,7 +3095,6 @@ mod tests {
             None,
             "Build".to_string(),
             "parent-call-1".to_string(),
-            LlmMode::Normal,
             DEFAULT_CHILD_EVENT_CAP,
             config,
             table,
@@ -3177,7 +3170,7 @@ mod tests {
             providers.join("root.json"),
             serde_json::json!({
                 "url": "https://example.test/v1",
-                "models": [{"id": "root-model", "trust": "untrusted", "mode": "defensive"}],
+                "models": [{"id": "root-model", "trust": "untrusted"}],
             })
             .to_string(),
         )
@@ -3202,7 +3195,6 @@ mod tests {
             None,
             "Build".to_string(),
             "parent-call-1".to_string(),
-            LlmMode::Normal,
             DEFAULT_CHILD_EVENT_CAP,
             config,
             table,

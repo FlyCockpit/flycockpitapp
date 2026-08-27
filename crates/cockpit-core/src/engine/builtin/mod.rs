@@ -2841,6 +2841,9 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Resul
     if let Some(model) = &args.model_override {
         return Ok(model.clone());
     }
+    if def.vnext.is_some() {
+        return resolve_vnext_slot_model(def, args);
+    }
     let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.config);
     match crate::engine::model_roles::resolve_delegated_model_with_store(
         &def.name,
@@ -2857,6 +2860,119 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Resul
         }
         Err(crate::engine::model_roles::SelectorResolution::Unset) => Ok(args.model.clone()),
     }
+}
+
+/// vNext children and installed roots run their primary-slot default unless a
+/// parent-named selector names one of the slot's allowed models. Naming
+/// anything else is a structured refusal (never a silent session-model inherit).
+fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Arc<Model>> {
+    let vnext = def
+        .vnext
+        .as_ref()
+        .expect("resolve_vnext_slot_model requires a vNext def");
+    let slot = vnext
+        .model_slots
+        .get("primary")
+        .context("vNext definition is missing the required primary slot")?;
+    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.config);
+    let allowed: Vec<(String, String)> = slot
+        .models
+        .iter()
+        .map(|model| (model.provider_id.clone(), model.model_id.clone()))
+        .collect();
+    let allowed_label = if allowed.is_empty() {
+        "any hard-compatible installed model".to_string()
+    } else {
+        allowed
+            .iter()
+            .map(|(provider, model)| format!("{provider}/{model}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if let Some(selector) = &args.delegation_model {
+        if !extended.agent_chooses_subagent_model {
+            bail!(
+                "parent-named model selector is refused because agent_chooses_subagent_model is off; allowed models: {allowed_label}"
+            );
+        }
+        let crate::engine::model_roles::DelegationModelSelector::Exact { selector, .. } = selector
+        else {
+            bail!(
+                "parent-named category selector is refused; child slot allowed models: {allowed_label}"
+            );
+        };
+        let (provider, model) = selector.split_once('/').ok_or_else(|| {
+            anyhow::anyhow!(
+                "parent-named model `{selector}` is not in the child slot allowed set: {allowed_label}"
+            )
+        })?;
+        if !allowed.is_empty()
+            && !allowed
+                .iter()
+                .any(|(allowed_provider, allowed_model)| {
+                    allowed_provider == provider && allowed_model == model
+                })
+        {
+            bail!(
+                "parent-named model `{selector}` is not in the child slot allowed set: {allowed_label}"
+            );
+        }
+        return build_vnext_slot_model(args, &providers, provider, model);
+    }
+
+    if let Some(default) = slot.default_model() {
+        if args.model.provider_id() == default.provider_id
+            && args.model.model_id_ref() == default.model_id
+        {
+            return Ok(args.model.clone());
+        }
+        if slot.models.is_empty() {
+            return Ok(args.model.clone());
+        }
+        return build_vnext_slot_model(
+            args,
+            &providers,
+            &default.provider_id,
+            &default.model_id,
+        );
+    }
+    Ok(args.model.clone())
+}
+
+fn build_vnext_slot_model(
+    args: &SpawnArgs,
+    providers: &crate::config::providers::ProvidersConfig,
+    provider: &str,
+    model: &str,
+) -> Result<Arc<Model>> {
+    let env_overlay = args.env_overlay.clone();
+    let lookup = move |name: &str| {
+        env_overlay
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .cloned()
+    };
+    let built = match &args.credential_store {
+        Some(store) => crate::engine::model::Model::for_provider_with_store(
+            providers,
+            provider,
+            model,
+            args.model.session_redact_table(),
+            lookup,
+            store.clone(),
+        ),
+        None => crate::engine::model::Model::for_provider_with_env(
+            providers,
+            provider,
+            model,
+            args.model.session_redact_table(),
+            lookup,
+        ),
+    }
+    .with_context(|| format!("resolving vNext slot model {provider}/{model}"))?;
+    Ok(Arc::new(built.with_shutdown_gate(args.model.shutdown_gate())))
 }
 
 /// `Build` — the user-facing, **write-capable** primary agent. Owns the chat

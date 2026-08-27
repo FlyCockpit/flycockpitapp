@@ -464,6 +464,10 @@ fn resolve_session_active_model(
     providers_cfg: &ProvidersConfig,
     session: &Session,
 ) -> Result<ActiveModelRef> {
+    // Resume keeps the session's persisted model. Fresh sessions with a
+    // prepared vNext installation resolve the primary-slot default from the
+    // agent factory (`resolve_vnext_slot_model`); this path remains the
+    // no-installation / legacy `active_model` fallback.
     if let Some(active) = session.active_model_ref() {
         return Ok(active);
     }

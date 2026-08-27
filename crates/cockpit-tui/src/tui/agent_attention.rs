@@ -49,11 +49,7 @@ fn tier_of(entry: &AgentDecisionAttention) -> Tier {
     }
 }
 
-fn within_tier(
-    tier: Tier,
-    a: &AgentDecisionAttention,
-    b: &AgentDecisionAttention,
-) -> Ordering {
+fn within_tier(tier: Tier, a: &AgentDecisionAttention, b: &AgentDecisionAttention) -> Ordering {
     match tier {
         // Newest-resolved first.
         Tier::Resolved => b.resolved_at_unix_ms.cmp(&a.resolved_at_unix_ms),
@@ -102,7 +98,12 @@ mod tests {
             decision_request_id: Uuid::from_u128(id),
             agent_instance_id: Uuid::from_u128(1),
             state: "waiting".to_string(),
-            decision_state: if resolved.is_some() { "resolved" } else { "pending" }.to_string(),
+            decision_state: if resolved.is_some() {
+                "resolved"
+            } else {
+                "pending"
+            }
+            .to_string(),
             decision_class: class.to_string(),
             task_call_id: None,
             workspace_ref: None,
@@ -155,7 +156,10 @@ mod tests {
         let c = attn(3, "user_question", None, 30, None);
         let forward = order_ids(&[a.clone(), b.clone(), c.clone()]);
         let reversed = order_ids(&[c, b, a]);
-        assert_eq!(forward, reversed, "order must not depend on daemon page order");
+        assert_eq!(
+            forward, reversed,
+            "order must not depend on daemon page order"
+        );
         assert_eq!(forward, vec![2, 1, 3]);
     }
 

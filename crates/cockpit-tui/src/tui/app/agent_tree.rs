@@ -54,10 +54,12 @@ impl App {
                     })
                     .await
                     .map_err(|error| error.to_string())?;
-                Ok(crate::tui::async_action::AsyncActionPayload::AgentTreeSnapshot {
-                    tree: Box::new(tree),
-                    attention: Box::new(attention),
-                })
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::AgentTreeSnapshot {
+                        tree: Box::new(tree),
+                        attention: Box::new(attention),
+                    },
+                )
             },
         );
     }
@@ -68,8 +70,10 @@ impl App {
         tree: cockpit_proto::Response,
         attention: cockpit_proto::Response,
     ) {
-        let (cockpit_proto::Response::AgentTreePage { nodes, .. },
-             cockpit_proto::Response::AgentAttentionPage { entries, .. }) = (tree, attention)
+        let (
+            cockpit_proto::Response::AgentTreePage { nodes, .. },
+            cockpit_proto::Response::AgentAttentionPage { entries, .. },
+        ) = (tree, attention)
         else {
             return;
         };
@@ -241,7 +245,10 @@ impl App {
 
     /// Handle an override outcome: surface any rejection, then re-fetch the
     /// node's effective settings so the controls show the new revision.
-    pub(super) fn apply_agent_session_override_outcome(&mut self, response: cockpit_proto::Response) {
+    pub(super) fn apply_agent_session_override_outcome(
+        &mut self,
+        response: cockpit_proto::Response,
+    ) {
         let cockpit_proto::Response::AgentSessionOverrideOutcome {
             agent_instance_id,
             status,

@@ -1419,7 +1419,10 @@ impl Db {
     ) -> Result<DefaultModelUpdateReceiptWrite> {
         let config_generation = receipt
             .config_generation
-            .map(|generation| i64::try_from(generation).context("default-model receipt generation exceeds SQLite range"))
+            .map(|generation| {
+                i64::try_from(generation)
+                    .context("default-model receipt generation exceeds SQLite range")
+            })
             .transpose()?;
         ensure!(
             receipt.authority_revision.is_some() == receipt.config_generation.is_some(),
@@ -2379,30 +2382,21 @@ mod tests {
         let receipt = DefaultModelUpdateReceipt {
             outcome_json: outcome.clone(),
             authority_revision: Some(
-                "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
-                    .to_string(),
+                "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c".to_string(),
             ),
             config_generation: Some(7),
         };
 
         assert_eq!(
-            db.record_default_model_update_receipt(
-                session.session_id,
-                update_id,
-                receipt.clone(),
-            )
-            .await
-            .unwrap(),
+            db.record_default_model_update_receipt(session.session_id, update_id, receipt.clone(),)
+                .await
+                .unwrap(),
             DefaultModelUpdateReceiptWrite::Recorded
         );
         assert_eq!(
-            db.record_default_model_update_receipt(
-                session.session_id,
-                update_id,
-                receipt.clone(),
-            )
-            .await
-            .unwrap(),
+            db.record_default_model_update_receipt(session.session_id, update_id, receipt.clone(),)
+                .await
+                .unwrap(),
             DefaultModelUpdateReceiptWrite::Existing {
                 receipt: receipt.clone(),
             }
@@ -2437,8 +2431,7 @@ mod tests {
             DefaultModelUpdateReceipt {
                 outcome_json: outcome.clone(),
                 authority_revision: Some(
-                    "5d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
-                        .to_string(),
+                    "5d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c".to_string(),
                 ),
                 config_generation: Some(7),
             },

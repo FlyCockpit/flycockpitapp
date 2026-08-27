@@ -7,10 +7,10 @@ use crate::tui::agent_runner::{
     AgentRunner, ControlRequest, QueuedTurnEvent, TestRunnerOverrides, control_response_outcome,
 };
 use crate::tui::history::HistoryEntry;
-use cockpit_core::config::extended::ApprovalMode;
 use cockpit_client::presentation::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
+use cockpit_core::config::extended::ApprovalMode;
 use cockpit_proto::{Request, Response};
 
 fn app() -> App {

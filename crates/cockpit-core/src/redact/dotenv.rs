@@ -422,11 +422,7 @@ mod case_variant_tests {
     fn secret_shaped_dotenv_key_scrubs_uppercase_and_capitalized_echoes() {
         let dir = tempfile::TempDir::new().unwrap();
         // Long value (>= min_secret_length) under a `*_TOKEN` key.
-        std::fs::write(
-            dir.path().join(".env"),
-            "SERVICE_TOKEN=CaseTokenValue123\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(".env"), "SERVICE_TOKEN=CaseTokenValue123\n").unwrap();
         let cfg = cfg();
         let table = RedactionTable::build(&cfg, dir.path()).unwrap();
 

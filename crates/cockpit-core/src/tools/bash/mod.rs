@@ -2604,13 +2604,7 @@ async fn run_shell(
             "sandbox": if confine { "confined" } else { "unconfined" },
         }}),
     ];
-    run_prepared_command(
-        cmd,
-        ctx,
-        timeout_ms,
-        concrete_effects,
-    )
-    .await
+    run_prepared_command(cmd, ctx, timeout_ms, concrete_effects).await
 }
 
 async fn run_prepared_command(

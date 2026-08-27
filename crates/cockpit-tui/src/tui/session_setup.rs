@@ -349,9 +349,7 @@ fn styled(text: String, kind: RowKind, color: bool) -> Span<'static> {
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
         RowKind::CandidateUnselected => Style::default().add_modifier(Modifier::BOLD),
-        RowKind::CandidateLocked | RowKind::SlotUnavailable => {
-            Style::default().fg(Color::Red)
-        }
+        RowKind::CandidateLocked | RowKind::SlotUnavailable => Style::default().fg(Color::Red),
         RowKind::Slot => Style::default().fg(Color::Cyan),
         RowKind::ChoiceSuggested => Style::default().fg(Color::Green),
         RowKind::ChoiceCompatible => Style::default(),
@@ -366,7 +364,10 @@ mod tests {
     use super::*;
     use cockpit_proto::AgentInstallationScopeWire::{Global, WorkspaceShared};
 
-    fn record(source_agent_id: &str, scope: AgentInstallationScopeWire) -> AgentInstallationRecordV1 {
+    fn record(
+        source_agent_id: &str,
+        scope: AgentInstallationScopeWire,
+    ) -> AgentInstallationRecordV1 {
         AgentInstallationRecordV1 {
             installation_id: format!("{source_agent_id}-{scope:?}"),
             scope,
@@ -379,7 +380,12 @@ mod tests {
         }
     }
 
-    fn choice(provider: &str, model: &str, suggested: bool, exact: bool) -> AgentInstallationChoiceV1 {
+    fn choice(
+        provider: &str,
+        model: &str,
+        suggested: bool,
+        exact: bool,
+    ) -> AgentInstallationChoiceV1 {
         AgentInstallationChoiceV1 {
             choice_id: format!("{provider}/{model}"),
             slot_id: "primary".to_string(),
@@ -425,7 +431,13 @@ mod tests {
     fn modes_session_setup_colliding_scope_entries_remain_distinct() {
         let snap = snapshot(vec![
             candidate("authored/reviewer", Global, false, Vec::new(), None),
-            candidate("authored/reviewer", WorkspaceShared, false, Vec::new(), None),
+            candidate(
+                "authored/reviewer",
+                WorkspaceShared,
+                false,
+                Vec::new(),
+                None,
+            ),
         ]);
         let rows = build_rows(&snap);
         let headers: Vec<&str> = rows
@@ -473,7 +485,12 @@ mod tests {
         let rows = build_rows(&snap);
         let choice_rows: Vec<&DisplayRow> = rows
             .iter()
-            .filter(|row| matches!(row.kind, RowKind::ChoiceSuggested | RowKind::ChoiceCompatible))
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    RowKind::ChoiceSuggested | RowKind::ChoiceCompatible
+                )
+            })
             .collect();
         assert_eq!(choice_rows.len(), 2);
         assert_eq!(choice_rows[0].kind, RowKind::ChoiceSuggested);
@@ -511,7 +528,9 @@ mod tests {
         }));
         assert!(rows.iter().any(|row| {
             row.kind == RowKind::SlotUnavailable
-                && row.text.contains("unavailable: no hard-compatible local model")
+                && row
+                    .text
+                    .contains("unavailable: no hard-compatible local model")
         }));
     }
 
@@ -532,8 +551,15 @@ mod tests {
         for row in build_rows(&snap) {
             let colored = styled(row.text.clone(), row.kind, true);
             let plain = styled(row.text.clone(), row.kind, false);
-            assert_eq!(colored.content, plain.content, "text must not depend on colour");
-            assert_eq!(plain.style, Style::default(), "no-colour projection is unstyled");
+            assert_eq!(
+                colored.content, plain.content,
+                "text must not depend on colour"
+            );
+            assert_eq!(
+                plain.style,
+                Style::default(),
+                "no-colour projection is unstyled"
+            );
         }
     }
 
@@ -559,7 +585,10 @@ mod tests {
             .map(|row| row.text.clone())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!text.contains(&"b".repeat(64)), "source_digest must not render");
+        assert!(
+            !text.contains(&"b".repeat(64)),
+            "source_digest must not render"
+        );
         assert!(!text.contains("publisher/repo:agents/reviewer.md"));
     }
 }

@@ -10,10 +10,7 @@ impl Approver {
         let target = format!("harness:{harness}");
         if self.yolo_mode()
             || self
-                .auto_allows(
-                    crate::agent_tree::HostEffectClass::ExternalAction,
-                    &target,
-                )
+                .auto_allows(crate::agent_tree::HostEffectClass::ExternalAction, &target)
                 .await
         {
             return Ok(Decision::Allow { scope: Scope::Once });
@@ -97,7 +94,9 @@ impl Approver {
                         // not silently downgrade it to a one-off external
                         // execution when that mutation did not commit.
                         tracing::warn!(error = %e, harness, "recording harness session grant failed; rejecting selected capability");
-                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(
+                            false,
+                        );
                         Decision::Deny
                     } else {
                         Decision::Allow {

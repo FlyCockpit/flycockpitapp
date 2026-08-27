@@ -267,7 +267,9 @@ impl Approver {
                 }
                 for path in &offer.paths {
                     if let Err(error) = self.store.record_path(path, scope, offer.access).await {
-                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(
+                            false,
+                        );
                         return Err(error.into());
                     }
                     self.record_permission_decision(
@@ -668,11 +670,7 @@ impl Approver {
                 // never reach here at a non-Once scope: the prompt only
                 // offered Once for wrappers. The store rejects it anyway as
                 // a belt-and-braces guard.
-                if let Err(error) = self
-                    .store
-                    .record_command(info, info.risk.tier, scope)
-                    .await
-                {
+                if let Err(error) = self.store.record_command(info, info.risk.tier, scope).await {
                     crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
                     return Err(error.into());
                 }

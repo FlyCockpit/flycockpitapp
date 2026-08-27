@@ -983,9 +983,13 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
     let object = value
         .as_object()
         .ok_or_else(|| anyhow!("import manifest session must be an object"))?;
-    let session_entry_mode = required_string(object, "session_entry_mode", "import manifest session")?;
+    let session_entry_mode =
+        required_string(object, "session_entry_mode", "import manifest session")?;
     anyhow::ensure!(
-        matches!(session_entry_mode.as_str(), "code" | "assistant" | "computer"),
+        matches!(
+            session_entry_mode.as_str(),
+            "code" | "assistant" | "computer"
+        ),
         "import manifest session has invalid session_entry_mode"
     );
     Ok(ImportedSession {

@@ -3014,9 +3014,19 @@ fn modes_session_setup_tool_row_verifying_uses_distinct_color_and_accessible_lab
         modes_session_setup_label_fg(ToolCallState::Verifying),
         Some(VERIFYING_TEXT)
     );
-    assert_ne!(VERIFYING_TEXT, WARNING_TEXT, "verifying must differ from running");
-    assert_ne!(VERIFYING_TEXT, Color::White, "verifying must differ from done");
-    assert_ne!(VERIFYING_TEXT, ERROR_TEXT, "verifying must differ from error");
+    assert_ne!(
+        VERIFYING_TEXT, WARNING_TEXT,
+        "verifying must differ from running"
+    );
+    assert_ne!(
+        VERIFYING_TEXT,
+        Color::White,
+        "verifying must differ from done"
+    );
+    assert_ne!(
+        VERIFYING_TEXT, ERROR_TEXT,
+        "verifying must differ from error"
+    );
 }
 
 #[test]

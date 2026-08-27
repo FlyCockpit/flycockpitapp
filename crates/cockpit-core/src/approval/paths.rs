@@ -491,29 +491,31 @@ mod gitignore_binding_tests {
 
     #[test]
     fn gitignore_shape_requires_exact_nonempty_candidates() {
-        assert!(validate_gitignore_shape_binding(
-            "ignored/private.txt",
-            "ignored/",
-            GitignoreShape::File,
-        )
-        .is_ok());
+        assert!(
+            validate_gitignore_shape_binding(
+                "ignored/private.txt",
+                "ignored/",
+                GitignoreShape::File,
+            )
+            .is_ok()
+        );
         assert!(validate_gitignore_shape_binding("", "ignored/", GitignoreShape::File).is_err());
-        assert!(validate_gitignore_shape_binding(
-            "ignored/private.txt",
-            "not-a-directory",
-            GitignoreShape::Parent,
-        )
-        .is_err());
+        assert!(
+            validate_gitignore_shape_binding(
+                "ignored/private.txt",
+                "not-a-directory",
+                GitignoreShape::Parent,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn gitignore_root_parent_and_persistence_scope_are_not_reinterpreted() {
-        assert!(validate_gitignore_shape_binding(
-            "ignored-at-root.txt",
-            "",
-            GitignoreShape::Parent,
-        )
-        .is_ok());
+        assert!(
+            validate_gitignore_shape_binding("ignored-at-root.txt", "", GitignoreShape::Parent,)
+                .is_ok()
+        );
         for persistence in [
             GitignorePersistence::Once,
             GitignorePersistence::Session,
@@ -521,8 +523,10 @@ mod gitignore_binding_tests {
         ] {
             assert!(validate_gitignore_persistence_binding("ignored/", persistence).is_ok());
         }
-        assert!(validate_gitignore_persistence_binding("bad\0glob", GitignorePersistence::Once)
-            .is_err());
+        assert!(
+            validate_gitignore_persistence_binding("bad\0glob", GitignorePersistence::Once)
+                .is_err()
+        );
     }
 }
 

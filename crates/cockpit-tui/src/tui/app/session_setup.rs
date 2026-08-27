@@ -49,7 +49,10 @@ impl App {
 
     /// Apply a completed `GetSessionSetupSnapshot` response into the open
     /// overlay. Inert if the overlay was closed or already replaced.
-    pub(super) fn apply_session_setup_snapshot_response(&mut self, response: cockpit_proto::Response) {
+    pub(super) fn apply_session_setup_snapshot_response(
+        &mut self,
+        response: cockpit_proto::Response,
+    ) {
         let cockpit_proto::Response::SessionSetupSnapshot { snapshot } = response else {
             return;
         };

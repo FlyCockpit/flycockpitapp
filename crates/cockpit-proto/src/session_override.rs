@@ -157,7 +157,9 @@ pub enum AgentSessionOverrideFieldV1 {
     /// Set a non-escalating LLM mode for this node.
     Mode { mode: LlmMode },
     /// Reduce or disable verification for a daemon-resolved effective region.
-    Verification { reduction: AgentVerificationReductionV1 },
+    Verification {
+        reduction: AgentVerificationReductionV1,
+    },
     /// Apply a monotonic question-policy override.
     Question { policy: AgentQuestionOverrideV1 },
 }
@@ -195,7 +197,9 @@ pub enum AgentVerificationReductionV1 {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentQuestionOverrideV1 {
     Disable,
-    Reduce { required_decision_timeout_seconds: u32 },
+    Reduce {
+        required_decision_timeout_seconds: u32,
+    },
 }
 
 /// Outcome of an [`crate::Request::ApplyAgentSessionOverride`]. A rejection or

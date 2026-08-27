@@ -23,10 +23,12 @@ use crate::config::trust::WorkspaceTrustPolicy;
 
 type LoadFn = dyn Fn(&Path) -> Result<(ProvidersConfig, ExtendedConfig)> + Send + Sync;
 type DaemonLoadFn = dyn Fn(&Path) -> Result<DaemonConfigLoad> + Send + Sync;
-type WorkspaceDaemonLoadFn =
-    dyn Fn(&Path, &cockpit_config::config::WorkspaceConfigLayerSnapshotChain) -> Result<DaemonConfigLoad>
-        + Send
-        + Sync;
+type WorkspaceDaemonLoadFn = dyn Fn(
+        &Path,
+        &cockpit_config::config::WorkspaceConfigLayerSnapshotChain,
+    ) -> Result<DaemonConfigLoad>
+    + Send
+    + Sync;
 type WriteTargetFn = dyn Fn(&Path, &str) -> Option<PathBuf> + Send + Sync;
 type WatchPathsFn = dyn Fn(&Path) -> ConfigWatchPaths + Send + Sync;
 type PrepareGlobalLayersFn = dyn Fn(&Path, &WorkspaceTrustPolicy) -> Result<()> + Send + Sync;
@@ -168,7 +170,9 @@ impl ConfigSource {
         Self {
             load: Arc::new(load),
             daemon_load,
-            workspace_daemon_load: Arc::new(move |cwd, _workspace| workspace_daemon_load_source(cwd)),
+            workspace_daemon_load: Arc::new(move |cwd, _workspace| {
+                workspace_daemon_load_source(cwd)
+            }),
             write_target: Arc::new(write_target),
             watch_paths: Arc::new(watch_paths),
             prepare_global_layers: Arc::new(|_, _| Ok(())),
@@ -231,20 +235,18 @@ impl ConfigSource {
             },
         ) as Arc<WorkspaceDaemonLoadFn>;
         let preparation_vault = vault.clone();
-        let prepare_global_layers = Arc::new(
-            move |cwd: &Path, policy: &WorkspaceTrustPolicy| {
-                // This precedes retained-capability capture. The temporary
-                // policy keeps the existing global literal-header migration
-                // but excludes project discovery (and an explicit override
-                // is deliberately skipped by the registry before this hook).
-                let mut global_policy = policy.clone();
-                global_policy.mode = crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig;
-                crate::config::trust::with_workspace_trust_policy(global_policy, || {
-                    let store = installed_store(&preparation_vault)?;
-                    crate::secret_ref::prepare_effective_layers_with_store(cwd, store)
-                })
-            },
-        ) as Arc<PrepareGlobalLayersFn>;
+        let prepare_global_layers = Arc::new(move |cwd: &Path, policy: &WorkspaceTrustPolicy| {
+            // This precedes retained-capability capture. The temporary
+            // policy keeps the existing global literal-header migration
+            // but excludes project discovery (and an explicit override
+            // is deliberately skipped by the registry before this hook).
+            let mut global_policy = policy.clone();
+            global_policy.mode = crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig;
+            crate::config::trust::with_workspace_trust_policy(global_policy, || {
+                let store = installed_store(&preparation_vault)?;
+                crate::secret_ref::prepare_effective_layers_with_store(cwd, store)
+            })
+        }) as Arc<PrepareGlobalLayersFn>;
         Self {
             load,
             daemon_load,
@@ -381,9 +383,8 @@ impl ConfigSource {
         // composes `workspace` from the current DB policy before calling this
         // method. Its denied project slots are already empty, so an exclusive
         // chain here prevents only ambient rediscovery, never policy gating.
-        let ignored_workspace = cockpit_config::config::workspace_config_layer_snapshot_chain(
-            Vec::new(),
-        );
+        let ignored_workspace =
+            cockpit_config::config::workspace_config_layer_snapshot_chain(Vec::new());
         // Compatibility callers retain the historical policy check. Daemon
         // callers select the policy-projected path above, so this branch
         // cannot turn a complete retained chain into a policy bypass.
@@ -544,8 +545,7 @@ mod tests {
         std::fs::write(&global_config, r#"{"maxPrimaryRounds":22}"#).unwrap();
         std::fs::write(&replacement_config, r#"{"maxPrimaryRounds":33}"#).unwrap();
         let ignored_project = workspace.path().join(".cockpit/config.json");
-        std::fs::create_dir_all(ignored_project.parent().expect("project config parent"))
-            .unwrap();
+        std::fs::create_dir_all(ignored_project.parent().expect("project config parent")).unwrap();
         std::fs::write(&ignored_project, r#"{"maxPrimaryRounds":999}"#).unwrap();
 
         let policy = crate::config::trust::WorkspaceTrustPolicy {
@@ -565,11 +565,7 @@ mod tests {
 
         env.set_cockpit_config(&replacement_config);
         let (_, extended) = ConfigSource::production()
-            .load_effective_for_daemon_with_workspace_layer(
-                workspace.path(),
-                &policy,
-                &retained,
-            )
+            .load_effective_for_daemon_with_workspace_layer(workspace.path(), &policy, &retained)
             .expect("retained complete chain must not rediscover replacement config");
         assert_eq!(extended.max_primary_rounds, 22);
     }
@@ -601,8 +597,7 @@ mod tests {
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
         let authority = crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority::capture(
-            &workspace,
-            &policy,
+            &workspace, &policy,
         )
         .expect("capture exact attach-time effective project layer");
         let chain = authority
@@ -740,8 +735,8 @@ mod tests {
         ] {
             std::fs::create_dir_all(config.parent().unwrap().join("providers")).unwrap();
             std::fs::write(config, "{}\n").unwrap();
-            let provider = crate::config::providers::provider_file_path_for_config(config, "p")
-                .unwrap();
+            let provider =
+                crate::config::providers::provider_file_path_for_config(config, "p").unwrap();
             std::fs::write(
                 provider,
                 serde_json::to_vec(&serde_json::json!({
@@ -770,7 +765,8 @@ mod tests {
         assert!(!first_global.contains(literal_global), "{first_global}");
         assert!(
             std::fs::read_to_string(
-                crate::config::providers::provider_file_path_for_config(&project_config, "p").unwrap(),
+                crate::config::providers::provider_file_path_for_config(&project_config, "p")
+                    .unwrap(),
             )
             .unwrap()
             .contains(literal_project),
@@ -781,7 +777,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(
-                crate::config::providers::provider_file_path_for_config(&global_config, "p").unwrap(),
+                crate::config::providers::provider_file_path_for_config(&global_config, "p")
+                    .unwrap(),
             )
             .unwrap(),
             first_global,
@@ -794,7 +791,8 @@ mod tests {
             .unwrap();
         assert!(
             std::fs::read_to_string(
-                crate::config::providers::provider_file_path_for_config(&explicit_config, "p").unwrap(),
+                crate::config::providers::provider_file_path_for_config(&explicit_config, "p")
+                    .unwrap(),
             )
             .unwrap()
             .contains(literal_explicit),
@@ -809,7 +807,8 @@ mod tests {
             .unwrap();
         assert!(
             std::fs::read_to_string(
-                crate::config::providers::provider_file_path_for_config(&project_config, "p").unwrap(),
+                crate::config::providers::provider_file_path_for_config(&project_config, "p")
+                    .unwrap(),
             )
             .unwrap()
             .contains(literal_project),

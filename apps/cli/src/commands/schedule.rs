@@ -22,7 +22,11 @@ pub async fn run(cmd: ScheduleCommand) -> Result<()> {
 async fn list(args: ScheduleListArgs) -> Result<()> {
     let response =
         crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
-            Box::pin(async move { client.request_ok(Request::ListScheduledJobs { owner: args.owner }).await })
+            Box::pin(async move {
+                client
+                    .request_ok(Request::ListScheduledJobs { owner: args.owner })
+                    .await
+            })
         })
         .await?;
     let Response::ScheduledJobs { jobs } = response else {

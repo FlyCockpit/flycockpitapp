@@ -19,9 +19,12 @@ fn production_paths_keep_agent_tree_authoritative() {
     let attention_persistence = include_str!("../../cockpit-db/src/db/needs_attention.rs");
     let migration = include_str!("../../cockpit-db/src/db/migrations/0001_initial.sql");
     let protocol = include_str!("../../../packages/cockpit-protocol/src/index.ts");
-    let requests = include_str!("../../../packages/cockpit-protocol/fixtures/daemon-wire/requests.json");
-    let responses = include_str!("../../../packages/cockpit-protocol/fixtures/daemon-wire/responses.json");
-    let events = include_str!("../../../packages/cockpit-protocol/fixtures/daemon-wire/events.json");
+    let requests =
+        include_str!("../../../packages/cockpit-protocol/fixtures/daemon-wire/requests.json");
+    let responses =
+        include_str!("../../../packages/cockpit-protocol/fixtures/daemon-wire/responses.json");
+    let events =
+        include_str!("../../../packages/cockpit-protocol/fixtures/daemon-wire/events.json");
 
     for required in [
         "AgentTreeRuntime::new",
@@ -106,7 +109,10 @@ fn production_paths_keep_agent_tree_authoritative() {
         "cancel_unbound_host_approval_final_operation",
         "mark_interrupt_interrupted",
     ] {
-        assert!(interrupt.contains(required), "interrupt bridge lost {required}");
+        assert!(
+            interrupt.contains(required),
+            "interrupt bridge lost {required}"
+        );
     }
     // The real waiter has to exist before the durable request becomes eligible
     // for automatic delivery; otherwise an immediate resolver result can win
@@ -156,7 +162,10 @@ fn production_paths_keep_agent_tree_authoritative() {
         "recovered_child_has_parked_continuation",
         "synthetic empty submission",
     ] {
-        assert!(driver.contains(required), "interactive task path lost {required}");
+        assert!(
+            driver.contains(required),
+            "interactive task path lost {required}"
+        );
     }
     for required in [
         "publish_task_delegation_children_and_agents",
@@ -189,7 +198,10 @@ fn production_paths_keep_agent_tree_authoritative() {
         "settle_recursive_noninteractive_child_outcome",
         "drain_task_delegation_steers",
     ] {
-        assert!(noninteractive.contains(required), "background task path lost {required}");
+        assert!(
+            noninteractive.contains(required),
+            "background task path lost {required}"
+        );
     }
     for required in [
         "begin_delivery",
@@ -247,7 +259,10 @@ fn production_paths_keep_agent_tree_authoritative() {
         "reap_stale_host_capability_refresh_operations",
         "reap_stale_host_capability_refresh_operations_globally",
     ] {
-        assert!(persistence.contains(required), "persistence lost {required}");
+        assert!(
+            persistence.contains(required),
+            "persistence lost {required}"
+        );
     }
     for required in [
         "park_interrupt",
@@ -276,7 +291,10 @@ fn production_paths_keep_agent_tree_authoritative() {
         "root_agent_continuations",
         "host_capability_refresh_operation_publication_is_forward_only",
     ] {
-        assert!(migration.contains(required), "0001 lifecycle enforcement lost {required}");
+        assert!(
+            migration.contains(required),
+            "0001 lifecycle enforcement lost {required}"
+        );
     }
 
     // The cross-language daemon contract cannot silently lose the lifecycle
@@ -323,7 +341,10 @@ fn recovered_executors_publish_then_claim_then_activate_or_abort() {
         "recovery_activation: Some(recovery.activation_gate)",
         "recovered executor activation was aborted",
     ] {
-        assert!(driver.contains(required), "driver lost recovery gate: {required}");
+        assert!(
+            driver.contains(required),
+            "driver lost recovery gate: {required}"
+        );
     }
     for required in [
         "activation_gate: RecoveryActivationGate",
@@ -347,7 +368,10 @@ fn recovered_executors_publish_then_claim_then_activate_or_abort() {
         "activation_gate.release()",
         "consume_agent_resume_claims_atomically",
     ] {
-        assert!(worker.contains(required), "worker lost recovery gate: {required}");
+        assert!(
+            worker.contains(required),
+            "worker lost recovery gate: {required}"
+        );
     }
 
     let root = worker
@@ -355,8 +379,7 @@ fn recovered_executors_publish_then_claim_then_activate_or_abort() {
         .nth(1)
         .expect("root recovery activation must be installed");
     assert!(
-        root
-            .find(".consume_agent_resume_claim(")
+        root.find(".consume_agent_resume_claim(")
             .expect("root claim consumption")
             < root
                 .find("gate.release()")
@@ -388,7 +411,10 @@ fn recovered_executors_publish_then_claim_then_activate_or_abort() {
         let release = branch
             .find("activation_gate.release()")
             .expect("recovered branch releases after claim");
-        assert!(consume < release, "recovered branch activates before its claim");
+        assert!(
+            consume < release,
+            "recovered branch activates before its claim"
+        );
     }
     let publication = noninteractive
         .split("NoninteractiveAgentTreeEndpointRegistration")

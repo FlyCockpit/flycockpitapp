@@ -573,14 +573,18 @@ impl Approver {
                 input,
                 target,
             } => {
-                self.approve_mcp_tool_inner(server, tool, input, target).await
+                self.approve_mcp_tool_inner(server, tool, input, target)
+                    .await
             }
             AuthorizationRequest::CustomTool {
                 tool,
                 command,
                 input,
                 cwd,
-            } => self.approve_custom_tool_inner(tool, command, input, cwd).await,
+            } => {
+                self.approve_custom_tool_inner(tool, command, input, cwd)
+                    .await
+            }
             AuthorizationRequest::McpServerConnect { server, identity } => {
                 self.approve_mcp_server_connect_inner(server, identity)
                     .await
@@ -2299,8 +2303,7 @@ mod tests {
             action_class: "unknown",
             action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             lease_binding_digest: None,
-            target_evidence_binding_digest:
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         }
     }
 
@@ -2396,8 +2399,7 @@ mod tests {
             action_class: "unknown",
             action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             lease_binding_digest: None,
-            target_evidence_binding_digest:
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         }
     }
 
@@ -4549,7 +4551,10 @@ mod tests {
                 sandbox_escalation: None,
             }],
         };
-        assert!(host_approval_response_declines(&ResolveResponse::Cancel, &offered));
+        assert!(host_approval_response_declines(
+            &ResolveResponse::Cancel,
+            &offered
+        ));
         assert!(host_approval_response_declines(
             &ResolveResponse::Single {
                 selected_id: ApprovalOptionId::Reject.as_str().into(),
@@ -4566,7 +4571,9 @@ mod tests {
             ResolveResponse::Multi {
                 selected_ids: vec![ApprovalOptionId::Reject.as_str().into()],
             },
-            ResolveResponse::Freetext { text: "deny".into() },
+            ResolveResponse::Freetext {
+                text: "deny".into(),
+            },
             ResolveResponse::Batch {
                 responses: vec![ResolveResponse::Cancel],
             },

@@ -23,11 +23,10 @@
 use cockpit_config::config::extended::LlmMode;
 use cockpit_config::config::sandbox_mode::SandboxMode;
 use cockpit_proto::{
-    AgentControlLockedReasonV1, AgentEffectiveSettingsV1, AgentModeControlV1,
-    AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
+    AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
+    AgentModeControlV1, AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
     AgentSandboxControlV1, AgentSessionOverrideFieldV1, AgentSessionOverrideStatusV1,
     AgentVerificationControlV1, AgentVerificationReductionV1, AgentVerificationRegionV1,
-    AGENT_EFFECTIVE_SETTINGS_DTO_VERSION,
 };
 use uuid::Uuid;
 
@@ -333,7 +332,9 @@ pub fn authorize_non_model_field(
         }
         AgentSessionOverrideFieldV1::Sandbox { mode } => {
             if sandbox_rank(*mode) >= sandbox_rank(ctx.effective_sandbox()) {
-                Ok(StoredOverrideField::Sandbox(sandbox_label(*mode).to_string()))
+                Ok(StoredOverrideField::Sandbox(
+                    sandbox_label(*mode).to_string(),
+                ))
             } else {
                 Err(AgentSessionOverrideStatusV1::RejectedEscalation)
             }
@@ -371,16 +372,16 @@ fn authorize_verification(
         AgentVerificationReductionV1::Off { region_id } => region_id,
         AgentVerificationReductionV1::Restrict { region_id, .. } => region_id,
     };
-    let region = find_region(ctx, region_id)
-        .ok_or(AgentSessionOverrideStatusV1::RejectedIncompatible)?;
+    let region =
+        find_region(ctx, region_id).ok_or(AgentSessionOverrideStatusV1::RejectedIncompatible)?;
     // Only a still-verifying, not-yet-off region can be reduced.
     let verifying = matches!(region.effective_action, VerificationEffectiveAction::Verify);
     if !verifying || region.whole_region_off {
         return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
     }
     match reduction {
-        AgentVerificationReductionV1::Off { region_id } => {
-            Ok(StoredOverrideField::Verification(StoredVerificationReduction {
+        AgentVerificationReductionV1::Off { region_id } => Ok(StoredOverrideField::Verification(
+            StoredVerificationReduction {
                 region_id: region_id.clone(),
                 off: true,
                 selector_intersection: Vec::new(),
@@ -388,8 +389,8 @@ fn authorize_verification(
                 max_total_tokens: None,
                 max_estimated_cost_microusd: None,
                 max_collection_millis: None,
-            }))
-        }
+            },
+        )),
         AgentVerificationReductionV1::Restrict {
             region_id,
             selector_intersection,
@@ -415,15 +416,17 @@ fn authorize_verification(
             {
                 return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
             }
-            Ok(StoredOverrideField::Verification(StoredVerificationReduction {
-                region_id: region_id.clone(),
-                off: false,
-                selector_intersection: selector_intersection.clone(),
-                max_candidates: *max_candidates,
-                max_total_tokens: *max_total_tokens,
-                max_estimated_cost_microusd: *max_estimated_cost_microusd,
-                max_collection_millis: *max_collection_millis,
-            }))
+            Ok(StoredOverrideField::Verification(
+                StoredVerificationReduction {
+                    region_id: region_id.clone(),
+                    off: false,
+                    selector_intersection: selector_intersection.clone(),
+                    max_candidates: *max_candidates,
+                    max_total_tokens: *max_total_tokens,
+                    max_estimated_cost_microusd: *max_estimated_cost_microusd,
+                    max_collection_millis: *max_collection_millis,
+                },
+            ))
         }
     }
 }
@@ -456,9 +459,9 @@ fn authorize_question(
         return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
     };
     match policy {
-        AgentQuestionOverrideV1::Disable => {
-            Ok(StoredOverrideField::Question(StoredQuestionOverride::Disable))
-        }
+        AgentQuestionOverrideV1::Disable => Ok(StoredOverrideField::Question(
+            StoredQuestionOverride::Disable,
+        )),
         AgentQuestionOverrideV1::Reduce {
             required_decision_timeout_seconds,
         } => {
@@ -470,9 +473,11 @@ fn authorize_question(
             {
                 return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
             }
-            Ok(StoredOverrideField::Question(StoredQuestionOverride::Reduce {
-                required_decision_timeout_seconds: *required_decision_timeout_seconds,
-            }))
+            Ok(StoredOverrideField::Question(
+                StoredQuestionOverride::Reduce {
+                    required_decision_timeout_seconds: *required_decision_timeout_seconds,
+                },
+            ))
         }
     }
 }
@@ -496,7 +501,11 @@ mod tests {
         }
     }
 
-    fn active_question(timeout_ms: u64, ceiling_ms: u64, auto_disabled: bool) -> RedactedQuestionPolicy {
+    fn active_question(
+        timeout_ms: u64,
+        ceiling_ms: u64,
+        auto_disabled: bool,
+    ) -> RedactedQuestionPolicy {
         RedactedQuestionPolicy::Active {
             auto_answer_disabled: auto_disabled,
             prohibited_classes: Vec::new(),
@@ -554,13 +563,15 @@ mod tests {
             Err(AgentSessionOverrideStatusV1::RejectedEscalation)
         );
         // Tightening (Sandbox -> Container) is allowed.
-        assert!(authorize_non_model_field(
-            &AgentSessionOverrideFieldV1::Sandbox {
-                mode: SandboxMode::Container
-            },
-            &ctx
-        )
-        .is_ok());
+        assert!(
+            authorize_non_model_field(
+                &AgentSessionOverrideFieldV1::Sandbox {
+                    mode: SandboxMode::Container
+                },
+                &ctx
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -581,13 +592,15 @@ mod tests {
             ),
             Err(AgentSessionOverrideStatusV1::RejectedEscalation)
         );
-        assert!(authorize_non_model_field(
-            &AgentSessionOverrideFieldV1::Mode {
-                mode: LlmMode::Defensive
-            },
-            &ctx
-        )
-        .is_ok());
+        assert!(
+            authorize_non_model_field(
+                &AgentSessionOverrideFieldV1::Mode {
+                    mode: LlmMode::Defensive
+                },
+                &ctx
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -624,13 +637,15 @@ mod tests {
             Err(AgentSessionOverrideStatusV1::RejectedIncompatible)
         );
         // Lengthening within the ceiling is a valid reduction.
-        assert!(authorize_question(
-            &AgentQuestionOverrideV1::Reduce {
-                required_decision_timeout_seconds: 45
-            },
-            &ctx
-        )
-        .is_ok());
+        assert!(
+            authorize_question(
+                &AgentQuestionOverrideV1::Reduce {
+                    required_decision_timeout_seconds: 45
+                },
+                &ctx
+            )
+            .is_ok()
+        );
         // Disable is always the strictest valid state.
         assert!(authorize_question(&AgentQuestionOverrideV1::Disable, &ctx).is_ok());
     }
@@ -672,13 +687,15 @@ mod tests {
             bindings: Vec::new(),
         });
         // Off is a valid reduction for a verifying region.
-        assert!(authorize_verification(
-            &AgentVerificationReductionV1::Off {
-                region_id: "rule-1".to_string()
-            },
-            &ctx
-        )
-        .is_ok());
+        assert!(
+            authorize_verification(
+                &AgentVerificationReductionV1::Off {
+                    region_id: "rule-1".to_string()
+                },
+                &ctx
+            )
+            .is_ok()
+        );
         // A restrict above the token ceiling is rejected (cannot raise budget).
         assert_eq!(
             authorize_verification(
@@ -755,13 +772,15 @@ mod tests {
             bindings: Vec::new(),
         });
         // Equal to the current required timeout is a no-op reduction (allowed).
-        assert!(authorize_question(
-            &AgentQuestionOverrideV1::Reduce {
-                required_decision_timeout_seconds: 30
-            },
-            &ctx
-        )
-        .is_ok());
+        assert!(
+            authorize_question(
+                &AgentQuestionOverrideV1::Reduce {
+                    required_decision_timeout_seconds: 30
+                },
+                &ctx
+            )
+            .is_ok()
+        );
         // Effective rendering: auto-answer enabled, ceiling reflected, disable
         // offerable while live.
         let effective = build_effective_settings(&ctx).question.effective.unwrap();
@@ -841,18 +860,20 @@ mod tests {
             Err(AgentSessionOverrideStatusV1::RejectedIncompatible)
         );
         // A selector intersection within the ceiling is a valid narrowing.
-        assert!(authorize_verification(
-            &AgentVerificationReductionV1::Restrict {
-                region_id: "rule-1".to_string(),
-                selector_intersection: vec!["tool_class:write".to_string()],
-                max_candidates: None,
-                max_total_tokens: Some(500),
-                max_estimated_cost_microusd: None,
-                max_collection_millis: None,
-            },
-            &ctx
-        )
-        .is_ok());
+        assert!(
+            authorize_verification(
+                &AgentVerificationReductionV1::Restrict {
+                    region_id: "rule-1".to_string(),
+                    selector_intersection: vec!["tool_class:write".to_string()],
+                    max_candidates: None,
+                    max_total_tokens: Some(500),
+                    max_estimated_cost_microusd: None,
+                    max_collection_millis: None,
+                },
+                &ctx
+            )
+            .is_ok()
+        );
     }
 
     #[test]

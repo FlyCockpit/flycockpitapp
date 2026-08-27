@@ -219,7 +219,11 @@ impl AgentTreePane {
     }
 
     /// Apply a fresh tree + attention snapshot.
-    pub(crate) fn apply(&mut self, nodes: Vec<AgentTreeNode>, attention: Vec<AgentDecisionAttention>) {
+    pub(crate) fn apply(
+        &mut self,
+        nodes: Vec<AgentTreeNode>,
+        attention: Vec<AgentDecisionAttention>,
+    ) {
         self.rows = build_rows(&nodes, &attention);
         self.status = Status::Ready;
         let first = self.rows.iter().position(|row| row.selectable);
@@ -297,10 +301,12 @@ impl AgentTreePane {
                 .selected()
                 .and_then(|index| self.rows.get(index))
                 .and_then(|row| row.decision)
-                .map(|(decision_request_id, agent_instance_id)| AgentTreeOutcome::Resolve {
-                    decision_request_id,
-                    agent_instance_id,
-                })
+                .map(
+                    |(decision_request_id, agent_instance_id)| AgentTreeOutcome::Resolve {
+                        decision_request_id,
+                        agent_instance_id,
+                    },
+                )
                 .unwrap_or(AgentTreeOutcome::Stay),
             _ => AgentTreeOutcome::Stay,
         }
@@ -387,7 +393,11 @@ impl AgentTreePane {
         let lines: Vec<Line<'static>> = match &self.status {
             Status::Loading => vec![Line::from(Span::raw("Loading agent tree…"))],
             Status::Error(message) => {
-                vec![Line::from(styled(message.clone(), RowKind::AttentionResolved, self.color))]
+                vec![Line::from(styled(
+                    message.clone(),
+                    RowKind::AttentionResolved,
+                    self.color,
+                ))]
             }
             Status::Ready => self
                 .rows
@@ -428,7 +438,11 @@ impl AgentTreePane {
             )));
         }
         for row in &view.rows {
-            lines.push(Line::from(override_styled(row.text.clone(), row.kind, color)));
+            lines.push(Line::from(override_styled(
+                row.text.clone(),
+                row.kind,
+                color,
+            )));
         }
         let items: Vec<ListItem<'static>> = lines.into_iter().map(ListItem::new).collect();
         // The list selection indexes into `view.rows`; the optional error/
@@ -527,7 +541,11 @@ fn build_rows(nodes: &[AgentTreeNode], attention: &[AgentDecisionAttention]) -> 
             .unwrap_or_default();
         rows.push(TreeRow {
             kind: RowKind::Node,
-            text: format!("{indent}{} [{}]{workspace}", short_id(node.agent_instance_id), node.state),
+            text: format!(
+                "{indent}{} [{}]{workspace}",
+                short_id(node.agent_instance_id),
+                node.state
+            ),
             selectable: true,
             node: Some(node.agent_instance_id),
             decision: None,
@@ -622,7 +640,10 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
 
     // --- Sandbox ---
     let sandbox = &snapshot.sandbox;
-    rows.push(header(format!("Sandbox — {}", sandbox_label(sandbox.effective))));
+    rows.push(header(format!(
+        "Sandbox — {}",
+        sandbox_label(sandbox.effective)
+    )));
     if let Some(pending) = sandbox.pending {
         rows.push(effective(format!("  pending → {}", sandbox_label(pending))));
     }
@@ -690,7 +711,9 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
     rows.push(header("Questions".to_string()));
     match &snapshot.question.effective {
         None => {
-            rows.push(locked("  off (cannot be enabled by a session override)".to_string()));
+            rows.push(locked(
+                "  off (cannot be enabled by a session override)".to_string(),
+            ));
         }
         Some(effective_policy) => {
             let auto = if effective_policy.auto_answer_enabled {
@@ -704,7 +727,10 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
                 effective_policy.host_ceiling_seconds,
             )));
             if let Some(pending) = &snapshot.question.pending {
-                rows.push(effective(format!("  pending → {}", question_pending_label(pending))));
+                rows.push(effective(format!(
+                    "  pending → {}",
+                    question_pending_label(pending)
+                )));
             }
             if !terminal {
                 if effective_policy.can_disable_auto_answer {
@@ -894,7 +920,12 @@ mod tests {
             decision_request_id: Uuid::from_u128(id),
             agent_instance_id: Uuid::from_u128(agent),
             state: "waiting".to_string(),
-            decision_state: if resolved.is_some() { "resolved" } else { "pending" }.to_string(),
+            decision_state: if resolved.is_some() {
+                "resolved"
+            } else {
+                "pending"
+            }
+            .to_string(),
             decision_class: class.to_string(),
             task_call_id: None,
             workspace_ref: None,
@@ -933,7 +964,10 @@ mod tests {
         let node_rows: Vec<&TreeRow> = rows.iter().filter(|r| r.kind == RowKind::Node).collect();
         assert_eq!(node_rows.len(), 2);
         assert!(!node_rows[0].text.starts_with(' '), "root is not indented");
-        assert!(node_rows[1].text.starts_with("  "), "child is indented one level");
+        assert!(
+            node_rows[1].text.starts_with("  "),
+            "child is indented one level"
+        );
         // Tree nodes are navigable but carry no resolve intent (read-only).
         assert!(node_rows.iter().all(|r| r.decision.is_none()));
     }
@@ -949,7 +983,12 @@ mod tests {
         let rows = build_rows(&nodes, &attention);
         let attention_rows: Vec<&TreeRow> = rows
             .iter()
-            .filter(|r| matches!(r.kind, RowKind::AttentionPending | RowKind::AttentionResolved))
+            .filter(|r| {
+                matches!(
+                    r.kind,
+                    RowKind::AttentionPending | RowKind::AttentionResolved
+                )
+            })
             .collect();
         // Ordered: critical approval, then question, then resolved.
         assert_eq!(attention_rows[0].kind, RowKind::AttentionPending);
@@ -1185,7 +1224,11 @@ mod tests {
             .iter()
             .filter(|r| matches!(&r.field, Some(AgentSessionOverrideFieldV1::Model { .. })))
             .collect();
-        assert_eq!(actions.len(), 2, "each hard-compatible choice is a rebind action");
+        assert_eq!(
+            actions.len(),
+            2,
+            "each hard-compatible choice is a rebind action"
+        );
         assert_eq!(
             actions[0].field,
             Some(AgentSessionOverrideFieldV1::Model {

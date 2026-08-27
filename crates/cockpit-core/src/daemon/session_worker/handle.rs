@@ -339,7 +339,8 @@ pub(crate) struct HostCapabilityRefreshRuntime {
     /// A durable operation has at most one local dispatcher task. Other
     /// callers return promptly and the worker's bounded maintenance tick
     /// retries after the owner exits or a lease is reaped.
-    pub(crate) in_flight_operations: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    pub(crate) in_flight_operations:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -372,10 +373,8 @@ pub struct SessionConfigSnapshot {
     /// Daemon-private source proofs for provider/model choices visible in
     /// this generation. They are derived from capability-captured layer bytes
     /// and deliberately never cross the protocol or diagnostic boundary.
-    pub(crate) provider_model_sources: HashMap<
-        (String, String),
-        cockpit_config::config::providers::RetainedProviderModelSource,
-    >,
+    pub(crate) provider_model_sources:
+        HashMap<(String, String), cockpit_config::config::providers::RetainedProviderModelSource>,
     pub extended: crate::config::extended::ExtendedConfig,
     /// Turn-pinned hook registry resolved under the same workspace-trust scope
     /// and generation as providers/extended config. A config reload affects
@@ -938,13 +937,13 @@ impl SessionWorkerHandle {
             active_agent_name: "Build".to_string(),
             trust_policy: crate::config::trust::shared_workspace_trust_policy(
                 crate::config::trust::WorkspaceTrustPolicy {
-                root: crate::config::trust::resolve_trust_root(&session.project_root)
-                    .unwrap_or_else(|_| crate::config::trust::TrustRoot {
-                        opened_path: session.project_root.clone(),
-                        root: session.project_root.clone(),
-                        kind: crate::config::trust::TrustRootKind::Directory,
-                    }),
-                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                    root: crate::config::trust::resolve_trust_root(&session.project_root)
+                        .unwrap_or_else(|_| crate::config::trust::TrustRoot {
+                            opened_path: session.project_root.clone(),
+                            root: session.project_root.clone(),
+                            kind: crate::config::trust::TrustRootKind::Directory,
+                        }),
+                    mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 },
             ),
             trust_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -1290,7 +1289,8 @@ impl SessionWorkerHandle {
     }
 
     pub(crate) fn current_trust_revision(&self) -> i64 {
-        self.trust_revision.load(std::sync::atomic::Ordering::Acquire)
+        self.trust_revision
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn trust_transition_matches(
@@ -1329,10 +1329,7 @@ impl SessionWorkerHandle {
     /// Install a new policy only after the caller has published the matching
     /// retained config snapshot.  The shared task-local used by the driver
     /// observes this same cell on its next policy read.
-    pub(crate) fn replace_trust_policy(
-        &self,
-        policy: crate::config::trust::WorkspaceTrustPolicy,
-    ) {
+    pub(crate) fn replace_trust_policy(&self, policy: crate::config::trust::WorkspaceTrustPolicy) {
         crate::config::trust::replace_shared_workspace_trust_policy(&self.trust_policy, policy);
     }
 
@@ -1863,7 +1860,8 @@ pub enum SessionWork {
     ResolveAgentDecision {
         decision_request_id: Uuid,
         answer: crate::agent_tree::PublicDecisionAnswer,
-        respond_to: oneshot::Sender<std::result::Result<crate::agent_tree::DecisionSettlement, String>>,
+        respond_to:
+            oneshot::Sender<std::result::Result<crate::agent_tree::DecisionSettlement, String>>,
     },
     /// Request the one daemon-classified low-risk host effect through the
     /// same durable AgentTree decision/continuation path as a tool question.
@@ -2004,7 +2002,9 @@ pub fn spawn(
         crate::engine::model::EndpointRecoveryAdditionalParams,
     >,
     project_root: PathBuf,
-    workspace_root_authority: Arc<crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority>,
+    workspace_root_authority: Arc<
+        crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority,
+    >,
     client_no_sandbox: bool,
     daemon_no_sandbox: bool,
     extended_cfg: &crate::config::extended::ExtendedConfig,

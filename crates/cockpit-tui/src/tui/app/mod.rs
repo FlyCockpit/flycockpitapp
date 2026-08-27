@@ -13,7 +13,6 @@
 mod agent_inventory;
 mod agent_tree;
 mod async_actions;
-mod session_setup;
 mod attach_lifecycle;
 mod attention;
 mod blocking_operations;
@@ -31,6 +30,7 @@ mod inventory;
 #[cfg(test)]
 mod inventory_tests;
 mod response_metrics_tokenizer;
+mod session_setup;
 pub(crate) use response_metrics_tokenizer::{TokenizerConfirmOutcome, TokenizerConfirmPending};
 #[cfg(test)]
 pub(crate) use response_metrics_tokenizer::{

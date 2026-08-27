@@ -319,12 +319,18 @@ pub struct AgentDecisionAttention {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentDecisionAnswer {
-    Option { option_id: String },
-    FreeText { text: String },
+    Option {
+        option_id: String,
+    },
+    FreeText {
+        text: String,
+    },
     /// Exact wire continuation for a linked QuestionTool interrupt.  It has
     /// the same serde envelope as `ResolveResponse`, but lives in the
     /// protocol crate so clients never depend on the daemon storage crate.
-    InterruptResponse { response: AgentInterruptResponse },
+    InterruptResponse {
+        response: AgentInterruptResponse,
+    },
 }
 
 /// A QuestionTool continuation supplied through `ResolveAgentDecision`.
@@ -334,10 +340,18 @@ pub enum AgentDecisionAnswer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", content = "data")]
 pub enum AgentInterruptResponse {
-    Single { selected_id: String },
-    Multi { selected_ids: Vec<String> },
-    Freetext { text: String },
-    Batch { responses: Vec<AgentInterruptResponse> },
+    Single {
+        selected_id: String,
+    },
+    Multi {
+        selected_ids: Vec<String>,
+    },
+    Freetext {
+        text: String,
+    },
+    Batch {
+        responses: Vec<AgentInterruptResponse>,
+    },
     Cancel,
 }
 
@@ -1978,9 +1992,9 @@ fn default_client_protocol_version() -> u32 {
 
 mod event;
 pub use event::{
-    AgentTreeEventSubject, AgentTreeTransition, AuthFailureKind, DefaultModelStandaloneOutcome, DefaultModelUpdateOutcome, Event,
-    InferenceErrorClass, ModelSelectionActiveState, ModelSelectionOutcome, ResponsePerformance,
-    UserMessageTerminalDisposition,
+    AgentTreeEventSubject, AgentTreeTransition, AuthFailureKind, DefaultModelStandaloneOutcome,
+    DefaultModelUpdateOutcome, Event, InferenceErrorClass, ModelSelectionActiveState,
+    ModelSelectionOutcome, ResponsePerformance, UserMessageTerminalDisposition,
 };
 
 // ---- Errors ----------------------------------------------------------------
@@ -7839,7 +7853,10 @@ mod tests {
 
     #[test]
     fn modes_session_setup_entry_mode_has_exact_three_value_wire_contract() {
-        assert_eq!(serde_json::to_value(SessionEntryMode::Code).unwrap(), "code");
+        assert_eq!(
+            serde_json::to_value(SessionEntryMode::Code).unwrap(),
+            "code"
+        );
         assert_eq!(
             serde_json::to_value(SessionEntryMode::Assistant).unwrap(),
             "assistant"

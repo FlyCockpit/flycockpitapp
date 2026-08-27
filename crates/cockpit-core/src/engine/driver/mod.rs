@@ -12,6 +12,7 @@
 //! changes, and the user's messages route to whoever's on top.
 
 mod context_reduction;
+mod computer_native;
 mod delegation_helpers;
 mod inbound;
 mod noninteractive;
@@ -4293,6 +4294,24 @@ impl Driver {
 
             match outcome {
                 TurnOutcome::Continue => {
+                    // Native computer-use live loop: after a provider
+                    // completion, intercept raw `computer_call` / Anthropic
+                    // `tool_use` items and execute them on the opened
+                    // coordinator before assembling the next request. This
+                    // replaces the prior silent drop of every model-emitted
+                    // computer action (issue #58).
+                    //
+                    // TODO: When the driver holds an opened
+                    // `ComputerActionCoordinator` for the active delegation
+                    // (open-before-advertise), call
+                    // `computer_native::handle_native_computer_items` here
+                    // with the retained raw provider output and inject the
+                    // returned `NativeComputerContinuation`s as
+                    // provider-native user items (`computer_call_output` /
+                    // Anthropic `tool_result` image blocks) into
+                    // `next_prompt`. The raw output must be retained at the
+                    // completion boundary in `engine/model/dispatch.rs`
+                    // (currently only Rig messages survive).
                     if is_root && max_primary_rounds > 0 {
                         primary_rounds_in_chunk = primary_rounds_in_chunk.saturating_add(1);
                         if !self
@@ -10777,6 +10796,24 @@ impl Driver {
 
             match outcome {
                 TurnOutcome::Continue => {
+                    // Native computer-use live loop: after a provider
+                    // completion, intercept raw `computer_call` / Anthropic
+                    // `tool_use` items and execute them on the opened
+                    // coordinator before assembling the next request. This
+                    // replaces the prior silent drop of every model-emitted
+                    // computer action (issue #58).
+                    //
+                    // TODO: When the driver holds an opened
+                    // `ComputerActionCoordinator` for the active delegation
+                    // (open-before-advertise), call
+                    // `computer_native::handle_native_computer_items` here
+                    // with the retained raw provider output and inject the
+                    // returned `NativeComputerContinuation`s as
+                    // provider-native user items (`computer_call_output` /
+                    // Anthropic `tool_result` image blocks) into
+                    // `next_prompt`. The raw output must be retained at the
+                    // completion boundary in `engine/model/dispatch.rs`
+                    // (currently only Rig messages survive).
                     if is_root && max_primary_rounds > 0 {
                         primary_rounds_in_chunk = primary_rounds_in_chunk.saturating_add(1);
                         if !self

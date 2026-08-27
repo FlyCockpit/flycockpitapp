@@ -468,14 +468,15 @@ pub trait Tool: Send + Sync {
     /// budget the CI check enforces).
     fn description(&self) -> &str;
 
-    /// The **defensive** `llm_mode` description: explicit, steering prose
-    /// for the weak-model target (implementation note).
-    /// `None` (the default) means "no defensive variant — fall back to the
-    /// terse [`Self::description`]." Registry-driven tests enforce defensive
+    /// The **verbose** description: explicit, steering prose rendered when the
+    /// agent def's `toolSteering` is [`crate::agents::ToolSteering::Verbose`]
+    /// (issue #75 — formerly the defensive `llm_mode` form).
+    /// `None` (the default) means "no verbose variant — fall back to the
+    /// terse [`Self::description`]." Registry-driven tests enforce verbose
     /// coverage for built-ins that reach the normal agent surface; dynamic or
     /// user-authored tools may rely on the terse fallback where that is the
     /// correct wording.
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         None
     }
 
@@ -512,12 +513,14 @@ pub trait Tool: Send + Sync {
     /// `llm_mode` form (noun-phrase parameter descriptions).
     fn parameters(&self) -> Value;
 
-    /// The **defensive** `llm_mode` parameter schema: same structure +
-    /// required set as [`Self::parameters`], with explicit steering
-    /// parameter descriptions. `None` (the default) reuses
-    /// [`Self::parameters`]. Tool *grants* never vary by mode — only how
-    /// the schema's descriptions read — so the shape here must match.
-    fn defensive_parameters(&self) -> Option<Value> {
+    /// The **verbose** parameter schema: same structure + required set as
+    /// [`Self::parameters`], with explicit steering parameter descriptions,
+    /// rendered when the agent def's `toolSteering` is
+    /// [`crate::agents::ToolSteering::Verbose`] (issue #75). `None` (the
+    /// default) reuses [`Self::parameters`]. Tool *grants* never vary by
+    /// steering — only how the schema's descriptions read — so the shape
+    /// here must match.
+    fn verbose_parameters(&self) -> Option<Value> {
         None
     }
 
@@ -994,86 +997,81 @@ pub struct ToolCtx {
 /// [`ToolBox`] alongside the tool itself. The **same tool ID and the same
 /// SCHEMA** are shared across every agent — only the *description text* is
 /// selected per agent + per [`LlmMode`]. This is the per-agent axis that
-/// composes onto the existing per-mode axis applied in [`definition_of`]:
-/// the override's text, when present for the active mode, *replaces* the
-/// description the per-mode logic would otherwise render; the parameters are
+/// composes onto the steering axis applied in [`definition_of`]:
+/// the override's text, when present for the active steering, *replaces* the
+/// description the steering logic would otherwise render; the parameters are
 /// never touched (schema variation would change validation/repair behavior —
 /// project guidance design rule). Authored both by the built-in factories (via
 /// [`ToolBox::with_override`]) and by markdown agent defs (their
 /// `tool_descriptions:` frontmatter).
 ///
 /// Each field is `None` by default → fall through to the tool's own base
-/// (per-mode) description, so an agent with no override behaves
+/// (steering-selected) description, so an agent with no override behaves
 /// byte-identically to today. Per the token-economy budget (§10) each
 /// override stays one terse sentence.
-///
-/// [`LlmMode`]: crate::config::extended::LlmMode
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolDescOverride {
-    /// The `Normal`-mode description text. `None` → keep the tool's terse
+    /// The canonical (terse) description text, applied under
+    /// [`crate::agents::ToolSteering::Terse`]. `None` → keep the tool's terse
     /// [`Tool::description`].
-    pub normal: Option<String>,
-    /// The `Frontier`-mode description text. `None` → keep the tool's terse
-    /// [`Tool::description`].
-    pub frontier: Option<String>,
-    /// The `Defensive`-mode description text. `None` → keep the tool's
-    /// [`Tool::defensive_description`] (or its terse fallback).
-    pub defensive: Option<String>,
+    pub text: Option<String>,
+    /// The verbose description text, applied under
+    /// [`crate::agents::ToolSteering::Verbose`]. `None` → keep the tool's
+    /// [`Tool::verbose_description`] (or its terse fallback).
+    pub verbose_text: Option<String>,
 }
 
 impl ToolDescOverride {
-    /// The override text selected for `mode`, if this override supplies one.
-    fn text_for(&self, mode: crate::config::extended::LlmMode) -> Option<&str> {
-        use crate::config::extended::LlmMode;
-        match mode {
-            LlmMode::Normal => self.normal.as_deref(),
-            LlmMode::Frontier => self.frontier.as_deref(),
-            LlmMode::Defensive => self.defensive.as_deref(),
+    /// The override text selected for `steering`, if this override supplies
+    /// one.
+    fn text_for(&self, steering: crate::agents::ToolSteering) -> Option<&str> {
+        match steering {
+            crate::agents::ToolSteering::Terse => self.text.as_deref(),
+            crate::agents::ToolSteering::Verbose => self.verbose_text.as_deref(),
         }
     }
 
-    /// True when neither mode carries an override — a no-op override that the
-    /// builder can drop so the `ToolBox`'s serialized form stays byte-stable
-    /// (an empty override is indistinguishable from no override).
+    /// True when neither steering carries an override — a no-op override that
+    /// the builder can drop so the `ToolBox`'s serialized form stays
+    /// byte-stable (an empty override is indistinguishable from no override).
     fn is_empty(&self) -> bool {
-        self.normal.is_none() && self.frontier.is_none() && self.defensive.is_none()
+        self.text.is_none() && self.verbose_text.is_none()
     }
 }
 
 /// Project the `Tool` trait into a `ToolDefinition` rig understands.
 ///
 /// This is the **single** place both description axes are applied. First the
-/// `llm_mode` description-verbosity axis
-/// (implementation note): in [`LlmMode::Defensive`] we
-/// render each tool's [`Tool::defensive_description`] /
-/// [`Tool::defensive_parameters`] when present, falling back to the terse
-/// [`Tool::description`] / [`Tool::parameters`] otherwise; in
-/// [`LlmMode::Normal`] and [`LlmMode::Frontier`] we always render the terse
-/// form. Then the **per-agent**
-/// axis composes on top: when `desc_override` supplies text for the active
-/// mode, it *replaces* the description chosen above — the parameters (schema)
-/// are never overridden, so the tool's ID and SCHEMA stay uniform across every
-/// agent. Both switches live here and nowhere else — no per-tool conditionals
-/// at call sites.
+/// `toolSteering` description-verbosity axis (issue #75): under
+/// [`crate::agents::ToolSteering::Verbose`] we render each tool's
+/// [`Tool::verbose_description`] / [`Tool::verbose_parameters`] when present,
+/// falling back to the terse [`Tool::description`] / [`Tool::parameters`]
+/// otherwise; under [`crate::agents::ToolSteering::Terse`] we always render
+/// the terse form. Then the **per-agent** axis composes on top: when
+/// `desc_override` supplies text for the active steering, it *replaces* the
+/// description chosen above — the parameters (schema) are never overridden,
+/// so the tool's ID and SCHEMA stay uniform across every agent. Both switches
+/// live here and nowhere else — no per-tool conditionals at call sites.
 pub fn definition_of(
     tool: &dyn Tool,
-    mode: crate::config::extended::LlmMode,
+    steering: crate::agents::ToolSteering,
     desc_override: Option<&ToolDescOverride>,
 ) -> ToolDefinition {
-    use crate::config::extended::LlmMode;
-    let (base_description, parameters) = match mode {
-        LlmMode::Defensive => (
-            tool.defensive_description()
+    let (base_description, parameters) = match steering {
+        crate::agents::ToolSteering::Verbose => (
+            tool.verbose_description()
                 .unwrap_or_else(|| tool.description().to_string()),
-            tool.defensive_parameters()
+            tool.verbose_parameters()
                 .unwrap_or_else(|| tool.parameters()),
         ),
-        LlmMode::Normal | LlmMode::Frontier => (tool.description().to_string(), tool.parameters()),
+        crate::agents::ToolSteering::Terse => {
+            (tool.description().to_string(), tool.parameters())
+        }
     };
-    // Per-agent axis: an override for the active mode wins over the base
+    // Per-agent axis: an override for the active steering wins over the base
     // description. Schema is intentionally untouched.
     let description = desc_override
-        .and_then(|o| o.text_for(mode))
+        .and_then(|o| o.text_for(steering))
         .map(str::to_string)
         .unwrap_or(base_description);
     ToolDefinition {
@@ -1173,7 +1171,7 @@ pub struct ToolBox {
     overrides: BTreeMap<String, ToolDescOverride>,
     /// Rendered tool schemas for this finalized toolbox, keyed by LLM mode.
     /// Builder-style mutations clear it so per-agent overrides stay exact.
-    definition_cache: Arc<Mutex<HashMap<crate::config::extended::LlmMode, Vec<ToolDefinition>>>>,
+    definition_cache: Arc<Mutex<HashMap<crate::agents::ToolSteering, Vec<ToolDefinition>>>>,
     capability_unavailable: BTreeMap<String, Vec<crate::capabilities::ToolCapabilityIssue>>,
     capability_description_suffixes: BTreeMap<String, Vec<String>>,
 }
@@ -1385,12 +1383,13 @@ impl ToolBox {
     }
 
     /// Project every tool to a `ToolDefinition`, rendering descriptions in
-    /// the given `llm_mode` and applying any per-agent override. The `mode`
-    /// flows from the active [`crate::config::extended::LlmMode`] through the
-    /// agent spawn; the overrides are the ones registered via
-    /// [`Self::with_override`] at construction time.
-    pub fn definitions(&self, mode: crate::config::extended::LlmMode) -> Vec<ToolDefinition> {
-        if let Some(cached) = self.definition_cache.lock().unwrap().get(&mode).cloned() {
+    /// the given `steering` and applying any per-agent override. The
+    /// `steering` flows from the agent def's `toolSteering` (derived from the
+    /// legacy mode at the existing seams until defs declare it); the
+    /// overrides are the ones registered via [`Self::with_override`] at
+    /// construction time.
+    pub fn definitions(&self, steering: crate::agents::ToolSteering) -> Vec<ToolDefinition> {
+        if let Some(cached) = self.definition_cache.lock().unwrap().get(&steering).cloned() {
             return cached;
         }
         let definitions: Vec<ToolDefinition> = self
@@ -1398,7 +1397,7 @@ impl ToolBox {
             .values()
             .filter(|t| !self.capability_unavailable.contains_key(t.name()))
             .map(|t| {
-                let mut definition = definition_of(&**t, mode, self.overrides.get(t.name()));
+                let mut definition = definition_of(&**t, steering, self.overrides.get(t.name()));
                 if let Some(suffixes) = self.capability_description_suffixes.get(t.name()) {
                     definition.description.push_str(&suffixes.join(""));
                 }
@@ -1408,7 +1407,7 @@ impl ToolBox {
         self.definition_cache
             .lock()
             .unwrap()
-            .insert(mode, definitions.clone());
+            .insert(steering, definitions.clone());
         definitions
     }
 
@@ -1668,7 +1667,7 @@ mod capability_tests {
         assert!(toolbox.get("present_tool").is_some());
         assert!(toolbox.get("missing_a").is_none());
         assert!(toolbox.get("missing_b").is_none());
-        let definitions = toolbox.definitions(LlmMode::Normal);
+        let definitions = toolbox.definitions(crate::agents::ToolSteering::Terse);
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].name, "present_tool");
         let notice = toolbox.capability_notice_text().unwrap();
@@ -1722,7 +1721,7 @@ mod capability_tests {
         );
 
         assert!(toolbox.get("optional_tool").is_some());
-        let definitions = toolbox.definitions(LlmMode::Normal);
+        let definitions = toolbox.definitions(crate::agents::ToolSteering::Terse);
         assert_eq!(definitions.len(), 1);
         assert!(
             definitions[0]
@@ -1801,18 +1800,19 @@ mod definition_cache_tests {
     }
 
     #[test]
-    fn definitions_build_schema_once_per_mode() {
+    fn definitions_build_schema_once_per_steering() {
         let calls = Arc::new(AtomicUsize::new(0));
         let toolbox = ToolBox::new().with(Arc::new(CountingTool {
             calls: calls.clone(),
         }));
 
-        let first = toolbox.definitions(LlmMode::Normal);
-        let second = toolbox.definitions(LlmMode::Normal);
+        let first = toolbox.definitions(crate::agents::ToolSteering::Terse);
+        let second = toolbox.definitions(crate::agents::ToolSteering::Terse);
         assert_eq!(first, second);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let _ = toolbox.definitions(LlmMode::Frontier);
+        // A different steering is a different cache key → rebuild.
+        let _ = toolbox.definitions(crate::agents::ToolSteering::Verbose);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
@@ -2039,7 +2039,7 @@ mod llm_mode_tests {
         use crate::engine::repair::alias_invariants;
         for tool in all_builtin_tools() {
             let mut schemas = vec![tool.parameters()];
-            if let Some(d) = tool.defensive_parameters() {
+            if let Some(d) = tool.verbose_parameters() {
                 schemas.push(d);
             }
             for schema in &schemas {
@@ -2066,7 +2066,7 @@ mod llm_mode_tests {
         use crate::engine::repair::PRIMARY_FIELD_KEY;
         for tool in all_builtin_tools() {
             let mut schemas = vec![tool.parameters()];
-            if let Some(d) = tool.defensive_parameters() {
+            if let Some(d) = tool.verbose_parameters() {
                 schemas.push(d);
             }
             for schema in &schemas {
@@ -2094,7 +2094,7 @@ mod llm_mode_tests {
     /// terse one — no terse-fallback gaps, no TODO tools. Registry-driven,
     /// so a future built-in tool can't silently skip.
     #[test]
-    fn every_builtin_tool_has_a_defensive_description() {
+    fn every_builtin_tool_has_a_verbose_description() {
         for tool in all_builtin_tools() {
             if tool.name() == "escalate" {
                 // `escalate` is removed from Defensive toolboxes by
@@ -2104,9 +2104,9 @@ mod llm_mode_tests {
                 continue;
             }
             let terse = tool.description().to_string();
-            let defensive = tool.defensive_description().unwrap_or_else(|| {
+            let defensive = tool.verbose_description().unwrap_or_else(|| {
                 panic!(
-                    "built-in tool `{}` has no defensive_description — full-surface coverage requires one",
+                    "built-in tool `{}` has no verbose_description — full-surface coverage requires one",
                     tool.name()
                 )
             });
@@ -2179,7 +2179,7 @@ mod llm_mode_tests {
         for name in ["websearch", "webfetch"] {
             let tool = tool_by_name(name);
             let normal = tool.description().to_string();
-            let defensive = tool.defensive_description().unwrap();
+            let defensive = tool.verbose_description().unwrap();
             assert!(has_description_steering_shape(&normal, &defensive));
         }
     }
@@ -2367,9 +2367,9 @@ mod llm_mode_tests {
     /// how descriptions render. We compare the structural skeleton
     /// (property names + `required` + `enum`s), ignoring `description`.
     #[test]
-    fn defensive_parameters_preserve_shape() {
+    fn verbose_parameters_preserve_shape() {
         for tool in all_builtin_tools() {
-            let Some(defensive) = tool.defensive_parameters() else {
+            let Some(defensive) = tool.verbose_parameters() else {
                 continue;
             };
             let terse = tool.parameters();
@@ -2409,12 +2409,12 @@ mod llm_mode_tests {
     #[test]
     fn definition_of_switches_description_on_mode() {
         let tool = tools::read::ReadTool;
-        let normal = definition_of(&tool, LlmMode::Normal, None);
-        let frontier = definition_of(&tool, LlmMode::Frontier, None);
-        let defensive = definition_of(&tool, LlmMode::Defensive, None);
+        let normal = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
+        let frontier = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
+        let defensive = definition_of(&tool, crate::agents::ToolSteering::Verbose, None);
         assert_eq!(normal.description, tool.description());
         assert_eq!(frontier.description, tool.description());
-        assert_eq!(defensive.description, tool.defensive_description().unwrap());
+        assert_eq!(defensive.description, tool.verbose_description().unwrap());
         assert_ne!(normal.description, defensive.description);
         assert_ne!(frontier.description, defensive.description);
     }
@@ -2437,8 +2437,8 @@ mod llm_mode_tests {
             (Arc::new(tools::intel::GraphTool), "indexed graph"),
         ];
         for (tool, needle) in cases {
-            let normal = definition_of(&*tool, LlmMode::Normal, None);
-            let defensive = definition_of(&*tool, LlmMode::Defensive, None);
+            let normal = definition_of(&*tool, crate::agents::ToolSteering::Terse, None);
+            let defensive = definition_of(&*tool, crate::agents::ToolSteering::Verbose, None);
             // Normal renders the terse one-liner.
             assert_eq!(
                 normal.description,
@@ -2450,7 +2450,7 @@ mod llm_mode_tests {
             // the terse fallback, and carries the spec'd steering phrase.
             assert_eq!(
                 defensive.description,
-                tool.defensive_description().unwrap(),
+                tool.verbose_description().unwrap(),
                 "tool `{}` defensive-mode must be the defensive description",
                 tool.name()
             );
@@ -2475,8 +2475,8 @@ mod llm_mode_tests {
     #[test]
     fn bash_search_hint_drops_for_searches_in_both_modes() {
         let tool = tools::bash::BashTool::new();
-        let normal = definition_of(&tool, LlmMode::Normal, None);
-        let defensive = definition_of(&tool, LlmMode::Defensive, None);
+        let normal = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
+        let defensive = definition_of(&tool, crate::agents::ToolSteering::Verbose, None);
         assert!(
             !normal.description.contains("for searches"),
             "terse bash description still says `for searches`: {}",
@@ -2511,13 +2511,13 @@ mod llm_mode_tests {
         }
         let t = Terse;
         assert_eq!(
-            definition_of(&t, LlmMode::Normal, None).description,
-            definition_of(&t, LlmMode::Defensive, None).description,
+            definition_of(&t, crate::agents::ToolSteering::Terse, None).description,
+            definition_of(&t, crate::agents::ToolSteering::Verbose, None).description,
             "a tool with no defensive variant renders identically in defensive and normal"
         );
         assert_eq!(
-            definition_of(&t, LlmMode::Normal, None).description,
-            definition_of(&t, LlmMode::Frontier, None).description,
+            definition_of(&t, crate::agents::ToolSteering::Terse, None).description,
+            definition_of(&t, crate::agents::ToolSteering::Terse, None).description,
             "a tool with no defensive variant renders identically in normal and frontier"
         );
     }
@@ -2531,8 +2531,8 @@ mod llm_mode_tests {
     #[test]
     fn terse_mode_descriptions_stay_within_budget() {
         for tool in all_builtin_tools() {
-            for mode in [LlmMode::Normal, LlmMode::Frontier] {
-                let def = definition_of(&*tool, mode, None);
+            for steering in [crate::agents::ToolSteering::Terse] {
+                let def = definition_of(&*tool, steering, None);
                 let budget = match tool.name() {
                     "bash" => 400,
                     "schedule" => 280,
@@ -2541,7 +2541,7 @@ mod llm_mode_tests {
                 };
                 assert!(
                     def.description.len() <= budget,
-                    "tool `{}` {mode:?} description exceeds the terse budget ({} chars): {}",
+                    "tool `{}` {steering:?} description exceeds the terse budget ({} chars): {}",
                     tool.name(),
                     def.description.len(),
                     def.description
@@ -2558,31 +2558,28 @@ mod llm_mode_tests {
     fn definition_of_applies_per_agent_override_and_composes_with_mode() {
         let tool = tools::read::ReadTool;
         let ov = ToolDescOverride {
-            normal: Some("agent-specific terse intent".to_string()),
-            frontier: Some("agent-specific frontier intent".to_string()),
-            defensive: Some("agent-specific explicit steering intent".to_string()),
+            text: Some("agent-specific terse intent".to_string()),
+            verbose_text: Some("agent-specific explicit steering intent".to_string()),
         };
-        let normal = definition_of(&tool, LlmMode::Normal, Some(&ov));
-        let frontier = definition_of(&tool, LlmMode::Frontier, Some(&ov));
-        let defensive = definition_of(&tool, LlmMode::Defensive, Some(&ov));
-        // Per-agent text wins over the tool's own description in each mode.
-        assert_eq!(normal.description, "agent-specific terse intent");
-        assert_eq!(frontier.description, "agent-specific frontier intent");
+        let terse = definition_of(&tool, crate::agents::ToolSteering::Terse, Some(&ov));
+        let verbose = definition_of(&tool, crate::agents::ToolSteering::Verbose, Some(&ov));
+        // Per-agent text wins over the tool's own description in each steering.
+        assert_eq!(terse.description, "agent-specific terse intent");
         assert_eq!(
-            defensive.description,
+            verbose.description,
             "agent-specific explicit steering intent"
         );
-        // Per-mode strings still select different text.
-        assert_ne!(normal.description, defensive.description);
+        // The two steerings select different text.
+        assert_ne!(terse.description, verbose.description);
         // SCHEMA is identical to the no-override form — only the description
-        // changed. The tool's own (mode-specific) parameters are untouched.
+        // changed. The tool's own (steering-specific) parameters are untouched.
         assert_eq!(
-            normal.parameters,
-            definition_of(&tool, LlmMode::Normal, None).parameters
+            terse.parameters,
+            definition_of(&tool, crate::agents::ToolSteering::Terse, None).parameters
         );
         assert_eq!(
-            defensive.parameters,
-            definition_of(&tool, LlmMode::Defensive, None).parameters
+            verbose.parameters,
+            definition_of(&tool, crate::agents::ToolSteering::Verbose, None).parameters
         );
     }
 
@@ -2592,23 +2589,21 @@ mod llm_mode_tests {
     fn definition_of_partial_override_falls_back_per_mode() {
         let tool = tools::read::ReadTool;
         let ov = ToolDescOverride {
-            normal: Some("only normal is overridden".to_string()),
-            frontier: None,
-            defensive: None,
+            text: Some("only normal is overridden".to_string()),            verbose_text: None,
         };
         assert_eq!(
-            definition_of(&tool, LlmMode::Normal, Some(&ov)).description,
+            definition_of(&tool, crate::agents::ToolSteering::Terse, Some(&ov)).description,
             "only normal is overridden"
         );
         // Defensive falls through to the tool's own defensive description.
         assert_eq!(
-            definition_of(&tool, LlmMode::Defensive, Some(&ov)).description,
-            tool.defensive_description().unwrap()
+            definition_of(&tool, crate::agents::ToolSteering::Verbose, Some(&ov)).description,
+            tool.verbose_description().unwrap()
         );
     }
 
     #[test]
-    fn override_cannot_silently_clobber_defensive_description() {
+    fn override_cannot_silently_clobber_verbose_description() {
         struct FakeTool;
 
         #[async_trait]
@@ -2621,7 +2616,7 @@ mod llm_mode_tests {
                 "fake terse"
             }
 
-            fn defensive_description(&self) -> Option<String> {
+            fn verbose_description(&self) -> Option<String> {
                 Some("fake defensive".to_string())
             }
 
@@ -2636,22 +2631,19 @@ mod llm_mode_tests {
 
         let tool = FakeTool;
         let ov = ToolDescOverride {
-            normal: Some("normal override only".to_string()),
-            frontier: None,
-            defensive: None,
+            text: Some("normal override only".to_string()),
+            verbose_text: None,
         };
 
         assert_eq!(
-            definition_of(&tool, LlmMode::Normal, Some(&ov)).description,
+            definition_of(&tool, crate::agents::ToolSteering::Terse, Some(&ov)).description,
             "normal override only"
         );
+        // With no verbose_text, Verbose falls back to the tool's own verbose
+        // description (the override only supplied terse text).
         assert_eq!(
-            definition_of(&tool, LlmMode::Frontier, Some(&ov)).description,
-            tool.description()
-        );
-        assert_eq!(
-            definition_of(&tool, LlmMode::Defensive, Some(&ov)).description,
-            tool.defensive_description().unwrap()
+            definition_of(&tool, crate::agents::ToolSteering::Verbose, Some(&ov)).description,
+            tool.verbose_description().unwrap()
         );
     }
 
@@ -2666,9 +2658,7 @@ mod llm_mode_tests {
             .with_override(
                 "read",
                 ToolDescOverride {
-                    normal: Some("Build: skim before delegating".to_string()),
-                    frontier: None,
-                    defensive: None,
+                    text: Some("Build: skim before delegating".to_string()),                    verbose_text: None,
                 },
             );
         let builder_box = ToolBox::new()
@@ -2676,13 +2666,11 @@ mod llm_mode_tests {
             .with_override(
                 "read",
                 ToolDescOverride {
-                    normal: Some("builder: read the file you will edit yourself".to_string()),
-                    frontier: None,
-                    defensive: None,
+                    text: Some("builder: read the file you will edit yourself".to_string()),                    verbose_text: None,
                 },
             );
-        let a = &build_box.definitions(LlmMode::Normal)[0];
-        let b = &builder_box.definitions(LlmMode::Normal)[0];
+        let a = &build_box.definitions(crate::agents::ToolSteering::Terse)[0];
+        let b = &builder_box.definitions(crate::agents::ToolSteering::Terse)[0];
         // Same ID.
         assert_eq!(a.name, "read");
         assert_eq!(a.name, b.name);
@@ -2703,13 +2691,11 @@ mod llm_mode_tests {
             .with_override(
                 "read",
                 ToolDescOverride {
-                    normal: Some("agent intent".to_string()),
-                    frontier: None,
-                    defensive: Some("agent intent, explicit".to_string()),
+                    text: Some("agent intent".to_string()),                    verbose_text: Some("agent intent, explicit".to_string()),
                 },
             );
-        let first = serde_json::to_string(&tb.definitions(LlmMode::Normal)).unwrap();
-        let second = serde_json::to_string(&tb.definitions(LlmMode::Normal)).unwrap();
+        let first = serde_json::to_string(&tb.definitions(crate::agents::ToolSteering::Terse)).unwrap();
+        let second = serde_json::to_string(&tb.definitions(crate::agents::ToolSteering::Terse)).unwrap();
         assert_eq!(first, second, "tools array must be byte-stable per render");
 
         // An all-`None` override is a no-op: the box serializes identically to
@@ -2720,14 +2706,12 @@ mod llm_mode_tests {
         let empty_override = no_override.clone().with_override(
             "read",
             ToolDescOverride {
-                normal: None,
-                frontier: None,
-                defensive: None,
+                text: None,                verbose_text: None,
             },
         );
         assert_eq!(
-            serde_json::to_string(&no_override.definitions(LlmMode::Normal)).unwrap(),
-            serde_json::to_string(&empty_override.definitions(LlmMode::Normal)).unwrap(),
+            serde_json::to_string(&no_override.definitions(crate::agents::ToolSteering::Terse)).unwrap(),
+            serde_json::to_string(&empty_override.definitions(crate::agents::ToolSteering::Terse)).unwrap(),
             "an empty override must not change the serialized tools array"
         );
     }

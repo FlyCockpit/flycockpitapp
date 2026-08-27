@@ -2115,13 +2115,13 @@ fn remove_agent_override(root: &std::path::Path, name: &str) {
 }
 
 fn tool_definitions_value(agent: &crate::engine::agent::Agent) -> serde_json::Value {
-    serde_json::to_value(agent.tools.definitions(agent.llm_mode)).unwrap()
+    serde_json::to_value(agent.tools.definitions(crate::agents::ToolSteering::from_llm_mode(agent.llm_mode))).unwrap()
 }
 
 fn task_definition_mentions_agent(agent: &crate::engine::agent::Agent, name: &str) -> bool {
     agent
         .tools
-        .definitions(agent.llm_mode)
+        .definitions(crate::agents::ToolSteering::from_llm_mode(agent.llm_mode))
         .into_iter()
         .find(|definition| definition.name == "task")
         .map(|definition| serde_json::to_string(&definition).unwrap().contains(name))

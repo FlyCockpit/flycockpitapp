@@ -2903,15 +2903,11 @@ pub fn build(args: &SpawnArgs) -> Agent {
     let tools = tools.with_override(
         "task",
         crate::engine::tool::ToolDescOverride {
-            normal: Some(
+            text: Some(
                 "Delegate substantive feature work to a subagent (builder writes, explore investigates); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
             ),
-            frontier: Some(
-                "Write small local edits directly; delegate larger, multi-file, risky, or isolated work to builder/explore; backgrounded JSON means the task call closed but the child is detached/result-pending; use docs when APIs are unfamiliar or version-sensitive"
-                    .to_string(),
-            ),
-            defensive: Some(
+            verbose_text: Some(
                 "Delegate substantive implementation instead of doing it inline: hand each \
                  well-scoped piece to `builder` to write/edit files, or to `explore` for \
                  read-only investigation, with a complete standalone brief (goal, constraints, \
@@ -4450,9 +4446,9 @@ mod tests {
         let glob = crate::tools::glob::GlobTool;
         for desc in [
             grep.description().to_string(),
-            grep.defensive_description().unwrap(),
+            grep.verbose_description().unwrap(),
             glob.description().to_string(),
-            glob.defensive_description().unwrap(),
+            glob.verbose_description().unwrap(),
         ] {
             assert!(!desc.contains("dependency you're inspecting"), "{desc}");
             assert!(!desc.contains("You have no shell here"), "{desc}");
@@ -4463,7 +4459,7 @@ mod tests {
         for tool in ["grep", "glob"] {
             let desc = answerer
                 .tools
-                .definitions(crate::config::extended::LlmMode::Normal)
+                .definitions(crate::agents::ToolSteering::Terse)
                 .into_iter()
                 .find(|definition| definition.name == tool)
                 .unwrap()
@@ -4510,7 +4506,7 @@ mod tests {
             let agent = load(name, &args).unwrap();
             let mcp_description = agent
                 .tools
-                .definitions(crate::config::extended::LlmMode::Normal)
+                .definitions(crate::agents::ToolSteering::Terse)
                 .into_iter()
                 .find(|definition| definition.name == "mcp")
                 .map(|definition| definition.description)
@@ -5895,7 +5891,7 @@ mod tests {
             let mut builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
             builder_args.llm_mode = mode;
             for build_agent in [load("Build", &build_args).unwrap(), builder(&builder_args)] {
-                let defs = build_agent.tools.definitions(mode);
+                let defs = build_agent.tools.definitions(crate::agents::ToolSteering::from_llm_mode(mode));
                 let task = defs
                     .iter()
                     .find(|d| d.name == "task")
@@ -6136,19 +6132,19 @@ mod tests {
 
         let task_normal = build_normal
             .tools
-            .definitions(crate::config::extended::LlmMode::Normal)
+            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("Build holds task");
         let task_defensive = build_defensive
             .tools
-            .definitions(crate::config::extended::LlmMode::Defensive)
+            .definitions(crate::agents::ToolSteering::Verbose)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("Build holds task");
         let task_frontier = build_frontier
             .tools
-            .definitions(crate::config::extended::LlmMode::Frontier)
+            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("Build holds task");
@@ -6179,25 +6175,27 @@ mod tests {
         );
         let base_def = crate::engine::tool::definition_of(
             &base,
-            crate::config::extended::LlmMode::Normal,
+            crate::agents::ToolSteering::Terse,
             None,
         );
         let base_frontier = crate::engine::tool::definition_of(
             &base,
-            crate::config::extended::LlmMode::Frontier,
+            crate::agents::ToolSteering::Terse,
             None,
         );
         assert_eq!(task_normal.name, base_def.name);
         assert_eq!(task_normal.parameters, base_def.parameters);
         // …and the description genuinely differs from the un-overridden one.
         assert_ne!(task_normal.description, base_def.description);
+        // Frontier collapsed to Terse (issue #75): the frontier-specific text
+        // is gone, so the frontier render is identical to the terse one.
         assert_eq!(task_frontier.name, base_frontier.name);
         assert_eq!(task_frontier.parameters, base_frontier.parameters);
         assert_ne!(task_frontier.description, base_frontier.description);
         assert!(
             task_frontier
                 .description
-                .contains("Write small local edits directly"),
+                .contains("substantive feature work"),
             "{}",
             task_frontier.description
         );
@@ -6209,7 +6207,7 @@ mod tests {
     ) -> crate::engine::message::ToolDefinition {
         agent
             .tools
-            .definitions(mode)
+            .definitions(crate::agents::ToolSteering::from_llm_mode(mode))
             .into_iter()
             .find(|d| d.name == "task")
             .expect("agent holds task")
@@ -6476,7 +6474,7 @@ mod tests {
         let agent = agent_from_def(&def, &args).unwrap();
         let read_def = agent
             .tools
-            .definitions(crate::config::extended::LlmMode::Normal)
+            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "read")
             .expect("builder holds read");
@@ -6490,7 +6488,7 @@ mod tests {
         // uniform schema.
         let explore_read = explore(&args)
             .tools
-            .definitions(crate::config::extended::LlmMode::Normal)
+            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "read")
             .expect("explore holds read");
@@ -6638,7 +6636,7 @@ mod tests {
         // Its only `task` target is the `docs` pipeline (no general delegation).
         let def = agent
             .tools
-            .definitions(crate::config::extended::LlmMode::Defensive)
+            .definitions(crate::agents::ToolSteering::Verbose)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("bee holds task");
@@ -6657,7 +6655,7 @@ mod tests {
         let agent = build(&test_spawn_args(tmp.path()));
         let def = agent
             .tools
-            .definitions(crate::config::extended::LlmMode::Defensive)
+            .definitions(crate::agents::ToolSteering::Verbose)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("task tool present");
@@ -6688,7 +6686,7 @@ mod tests {
         let agent = bee(&args);
         let def = agent
             .tools
-            .definitions(args.llm_mode)
+            .definitions(crate::agents::ToolSteering::from_llm_mode(args.llm_mode))
             .into_iter()
             .find(|d| d.name == "spawn")
             .expect("spawn tool present");

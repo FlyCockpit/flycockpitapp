@@ -80,7 +80,7 @@ impl Tool for McpTool {
         NORMAL_DESCRIPTION
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(DEFENSIVE_DESCRIPTION.to_string())
     }
 
@@ -94,7 +94,7 @@ impl Tool for McpTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -158,7 +158,7 @@ mod tests {
 
     fn mcp_description(toolbox: &ToolBox, mode: LlmMode) -> String {
         toolbox
-            .definitions(mode)
+            .definitions(crate::agents::ToolSteering::from_llm_mode(mode))
             .into_iter()
             .find(|definition| definition.name == "mcp")
             .unwrap()
@@ -210,12 +210,12 @@ mod tests {
     #[test]
     fn defensive_text_mentions_final_expression_and_print_fallback() {
         let t = McpTool;
-        let desc = t.defensive_description().unwrap();
+        let desc = t.verbose_description().unwrap();
         assert!(desc.contains("final expression"), "{desc}");
         assert!(desc.contains("printed output"), "{desc}");
         assert!(desc.contains("fallback"), "{desc}");
 
-        let p = t.defensive_parameters().unwrap();
+        let p = t.verbose_parameters().unwrap();
         let script_desc = p["properties"]["script"]["description"].as_str().unwrap();
         assert!(script_desc.contains("final expression"), "{script_desc}");
         assert!(script_desc.contains("print"), "{script_desc}");
@@ -294,7 +294,7 @@ mod tests {
 
         assert_eq!(tool.description(), NORMAL_DESCRIPTION);
         assert_eq!(
-            tool.defensive_description().as_deref(),
+            tool.verbose_description().as_deref(),
             Some(DEFENSIVE_DESCRIPTION)
         );
         assert_eq!(plain.content, with_children.content);

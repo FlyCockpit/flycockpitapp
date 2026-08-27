@@ -52,7 +52,7 @@ pub struct BashTool {
     description: String,
     /// The explicit, steering [`LlmMode::Defensive`] description
     /// (implementation note).
-    defensive_description: String,
+    verbose_description: String,
     prelude: String,
 }
 
@@ -69,7 +69,7 @@ impl BashTool {
 
         // The defensive, explicitly-steering form (`llm-modes-
         // defensive-normal.md`). Same PATH-probe hints, more guidance.
-        let defensive_description =
+        let verbose_description =
             "Run a single shell command — builds, tests, git, package managers, \
              process/binary inspection — and get back combined stdout, stderr, and exit code. \
              Use `bash` ONLY to *run* things. For working with files the dedicated tools are \
@@ -93,7 +93,7 @@ impl BashTool {
 
         Self {
             description,
-            defensive_description,
+            verbose_description,
             prelude: macos_sed_prelude(),
         }
     }
@@ -141,8 +141,8 @@ impl Tool for BashTool {
         &self.description
     }
 
-    fn defensive_description(&self) -> Option<String> {
-        Some(self.defensive_description.clone())
+    fn verbose_description(&self) -> Option<String> {
+        Some(self.verbose_description.clone())
     }
 
     fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
@@ -168,7 +168,7 @@ impl Tool for BashTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "x-cockpit-primary-field": "command",
@@ -540,7 +540,7 @@ async fn call_bash_inner(
             resource_profiles: command_resource_plan.metas.clone(),
         };
         if !options.escalated
-            && matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive)
+            && crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode) == crate::agents::ToolSteering::Verbose
             && ctx.session.sandbox_escalation_enabled()
             && let Some(output) = defensive_human_escalation_offer(
                 args.clone(),
@@ -827,7 +827,7 @@ async fn call_bash_inner(
         && !options.escalated
         && ctx.write_scope.is_none()
         && !final_outcome.success
-        && matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive)
+        && crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode) == crate::agents::ToolSteering::Verbose
         && ctx.session.sandbox_escalation_enabled()
         && let Some(output) = defensive_human_escalation_offer(
             args.clone(),
@@ -878,7 +878,7 @@ async fn call_bash_inner(
     // line to the model-facing body, after the `exit:` line and outside
     // compression. `Normal` mode appends nothing (token economy §10), and a
     // command with no file/search replacement classifies to `None`.
-    let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
+    let tip = if crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode) == crate::agents::ToolSteering::Verbose {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {
@@ -2441,7 +2441,7 @@ fn render_bash_outcome(
     timeout_note: Option<&str>,
 ) -> ToolOutput {
     let compress = ctx.session.shell_compression_enabled();
-    let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
+    let tip = if crate::agents::ToolSteering::from_llm_mode(ctx.llm_mode) == crate::agents::ToolSteering::Verbose {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {

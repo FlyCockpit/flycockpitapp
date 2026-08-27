@@ -101,7 +101,7 @@ impl Tool for UseSealedValueTool {
         "Use a sealed value you were granted, by reference, through a granted action; the value's content is never returned"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Use a sealed value without ever seeing it. Name the sealed value id and the action id you were granted, plus that action's declared bounded parameters. You cannot supply an endpoint, command, environment key, header, request template, or output projection, and you cannot list which sealed values exist. The result is only the action's declared safe fields. If anything about the grant is wrong, missing, stale, or revoked you get one identical unavailable answer."
                 .to_string(),

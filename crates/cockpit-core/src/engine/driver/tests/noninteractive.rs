@@ -3621,7 +3621,7 @@ fn dmh_build_host_selected_child(
 fn dmh_read_desc(agent: &crate::engine::agent::Agent) -> String {
     agent
         .tools
-        .definitions(agent.llm_mode)
+        .definitions(crate::agents::ToolSteering::from_llm_mode(agent.llm_mode))
         .into_iter()
         .find(|d| d.name == "read")
         .map(|d| d.description)

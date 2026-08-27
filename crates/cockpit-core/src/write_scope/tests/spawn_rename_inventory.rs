@@ -102,7 +102,7 @@ fn spawn_tool_schema_requires_write_scope_and_has_no_output_dir() {
 fn spawn_descriptions_teach_write_scope_as_an_authority_transfer() {
     let tool = crate::tools::spawn::SpawnTool::for_depth(1, 4);
     let description = crate::engine::tool::Tool::description(&tool).to_string();
-    let defensive = crate::engine::tool::Tool::defensive_description(&tool).unwrap_or_default();
+    let defensive = crate::engine::tool::Tool::verbose_description(&tool).unwrap_or_default();
 
     for text in [&description, &defensive] {
         assert!(
@@ -470,7 +470,7 @@ const FORBIDDEN_ENFORCEMENT_CLAIMS: &[(&str, &str)] = &[
 ///
 /// The first sweep for these claims was scoped with `--include="*.md"` and so
 /// never looked at `.rs` at all. That is exactly how `tools/spawn.rs`'s
-/// `defensive_description` went on asserting that the parent could not write in
+/// `verbose_description` went on asserting that the parent could not write in
 /// a child's scope after the `bee` prompts had been corrected — the claim was
 /// not in a prompt file, it was in a Rust string literal. Walking both
 /// extensions is the point of this test.

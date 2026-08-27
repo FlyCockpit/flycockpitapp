@@ -2350,8 +2350,9 @@ impl Driver {
     /// The model binding and the tool surface are refreshed as separate steps.
     /// The model step re-resolves the active frame's current provider/model
     /// pair from layered config without changing the frame's pinned identity.
-    /// The tool-surface step then reloads the same active agent name so live
-    /// config and custom subagent files update the `task` schema every turn.
+    /// The tool-surface step then rebuilds from the exact pinned definition so
+    /// live config and newly admitted custom subagents update the `task` schema
+    /// every turn without re-reading the running agent's definition from disk.
     /// Parked parent frames, tandem models, and `model_override` remain pinned.
     async fn refresh_active_frame_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
         let Some(active_idx) = self.active_frame_index() else {
@@ -2517,15 +2518,6 @@ impl Driver {
             model_pin.clone(),
         ) {
             Ok(rebuilt) => {
-                self.stack[active_idx].agent = Arc::new(rebuilt);
-                self.schedule
-                    .set_agent(self.stack[active_idx].agent.clone());
-                self.active_tool_surface_refresh_failure_notice = None;
-            }
-            Err(e) if active_idx == 0 => {
-                tracing::warn!(error = %e, "refreshing root tool surface from config fell back to default Build");
-                let rebuilt =
-                    self.rebuild_frame_with_model(active_idx, model, &selection, model_pin);
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
@@ -7803,8 +7795,7 @@ impl Driver {
         // frontmatter `model:` in `resolve_agent_model`. `None` for ordinary
         // rebuilds, preserving the previous behaviour.
         model_pin: Option<Arc<crate::engine::model::Model>>,
-    ) -> (String, crate::engine::builtin::SpawnArgs) {
-        let name = self.stack[frame_idx].agent.name.clone();
+    ) -> crate::engine::builtin::SpawnArgs {
         let (additional_params, endpoint_recovery_additional_params) =
             self.resolve_reasoning_params_for_selection(&new_model, selection);
         let prompt_cache_retention =
@@ -7829,7 +7820,7 @@ impl Driver {
             prompt_cache_retention,
             ..crate::engine::model::ModelParams::default()
         };
-        (name, args)
+        args
     }
 
     fn try_rebuild_frame_with_model(
@@ -7839,29 +7830,11 @@ impl Driver {
         selection: &crate::config::providers::ActiveModelRef,
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> Result<Agent> {
-        let (_name, args) = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
+        let args = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
         crate::engine::builtin::rebuild_from_pinned_definition(
             self.stack[frame_idx].agent.as_ref(),
             &args,
         )
-    }
-
-    fn rebuild_frame_with_model(
-        &self,
-        frame_idx: usize,
-        new_model: Arc<crate::engine::model::Model>,
-        selection: &crate::config::providers::ActiveModelRef,
-        model_pin: Option<Arc<crate::engine::model::Model>>,
-    ) -> Agent {
-        let (_name, args) = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
-        // Rebuild from the pinned definition; fall back to the default Build
-        // agent on a load failure so the swap never strands the session without
-        // a primary.
-        crate::engine::builtin::rebuild_from_pinned_definition(
-            self.stack[frame_idx].agent.as_ref(),
-            &args,
-        )
-        .unwrap_or_else(|_| crate::engine::builtin::default_build(&args))
     }
 
     /// Re-resolve the reasoning-param fragment for `model` from the config's
@@ -8062,52 +8035,46 @@ impl Driver {
                 .await;
             return;
         }
-        let name = self.stack[0].agent.name.clone();
+        let current = self.stack[0].agent.clone();
         let mut args = self.spawn_args(true);
-        args.vnext_grant = self.stack[0].agent.vnext_grant.clone();
-        match crate::agents::resolve(&self.cwd, &name) {
-            Ok(Some(mut def)) => {
-                match crate::agents::apply_tool_surface_override(&mut def, &selection)
-                    .and_then(|_| crate::engine::builtin::agent_from_def(&def, &args))
-                {
-                    Ok(agent) => {
-                        self.stack[0].agent = Arc::new(agent);
-                        self.schedule.set_agent(self.stack[0].agent.clone());
-                        if let Some(note) = monty_nudge {
-                            self.pending_monty_tool_nudge = Some(note);
-                        }
-                        let _ = tx
-                            .send(TurnEvent::Notice {
-                                text: "Tool surface updated for this session.".to_string(),
-                            })
-                            .await;
-                        self.emit_context_projection(tx).await;
-                        if prune_after_switch {
-                            self.do_prune(false, tx).await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "tool surface override failed to rebuild agent");
-                        let _ = tx
-                            .send(TurnEvent::Notice {
-                                text: format!(
-                                    "Tool surface update failed — {e:#}. Keeping the current tool surface active."
-                                ),
-                            })
-                            .await;
-                    }
+        args.model = current.model.clone();
+        args.model_override = Some(current.model.clone());
+        args.params = current.params.clone();
+        args.vnext_grant = current.vnext_grant.clone();
+        let updated = (|| -> Result<Agent> {
+            let mut def =
+                current.definition.as_deref().cloned().ok_or_else(|| {
+                    anyhow::anyhow!("running frame has no pinned agent definition")
+                })?;
+            crate::agents::apply_tool_surface_override(&mut def, &selection)?;
+            let rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
+            let mut updated = (*current).clone();
+            // This control changes only the requested tool surface. All other
+            // running-frame state stays pinned, while the adjusted definition
+            // becomes the snapshot used by later model/config rebuilds.
+            updated.tools = rebuilt.tools;
+            updated.definition = rebuilt.definition;
+            Ok(updated)
+        })();
+        match updated {
+            Ok(updated) => {
+                self.stack[0].agent = Arc::new(updated);
+                self.schedule.set_agent(self.stack[0].agent.clone());
+                if let Some(note) = monty_nudge {
+                    self.pending_monty_tool_nudge = Some(note);
                 }
-            }
-            Ok(None) => {
                 let _ = tx
                     .send(TurnEvent::Notice {
-                        text: format!(
-                            "Tool surface update failed — agent `{name}` could not be resolved."
-                        ),
+                        text: "Tool surface updated for this session.".to_string(),
                     })
                     .await;
+                self.emit_context_projection(tx).await;
+                if prune_after_switch {
+                    self.do_prune(false, tx).await;
+                }
             }
             Err(e) => {
+                tracing::warn!(error = %e, "tool surface override failed to rebuild agent");
                 let _ = tx
                     .send(TurnEvent::Notice {
                         text: format!(

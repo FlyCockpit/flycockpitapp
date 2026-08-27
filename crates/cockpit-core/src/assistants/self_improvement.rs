@@ -256,7 +256,7 @@ fn review_agent_from(root_agent: Agent) -> Agent {
         scan_tool_results: false,
         tool_steering: root_agent.tool_steering,
         posture: root_agent.posture.clone(),
-        context_policy: None,
+        context_policy: root_agent.context_policy,
         lock_identity: root_agent.lock_identity,
         assistant_identity_prefix: root_agent.assistant_identity_prefix,
         write_scope: root_agent.write_scope,

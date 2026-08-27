@@ -1537,6 +1537,36 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
     assert_terminal_model_selection(&mut rx, Some("model_selection_build_failed"));
 }
 
+#[tokio::test]
+async fn live_model_switch_fails_closed_without_pinned_root_definition() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    Arc::make_mut(&mut driver.stack[0].agent).definition = None;
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
+    assert_notice_contains(&mut rx, "no pinned definition");
+    drain_until_active_model_state(&mut rx);
+    assert_terminal_model_selection(&mut rx, Some("model_selection_rebuild_failed"));
+}
+
 /// A session-row persistence failure aborts before config commit and restores
 /// the live root model and in-memory session state.
 #[tokio::test]
@@ -2288,6 +2318,30 @@ async fn active_frame_refresh_ignores_malformed_newer_definition() {
         );
     })
     .await;
+}
+
+#[tokio::test]
+async fn active_tool_surface_refresh_retains_root_without_pinned_definition() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let root = Arc::make_mut(&mut driver.stack[0].agent);
+    root.name = "pinned-root-marker".to_string();
+    root.definition = None;
+    let before = driver.stack[0].agent.clone();
+
+    driver
+        .refresh_active_tool_surface_for_turn(0, None, &tx)
+        .await;
+
+    assert!(Arc::ptr_eq(&driver.stack[0].agent, &before));
+    assert_eq!(driver.stack[0].agent.name, "pinned-root-marker");
+    let notices = drain_notices(&mut rx);
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.contains("no pinned definition")),
+        "root reconstruction failure must be surfaced: {notices:?}"
+    );
 }
 
 #[tokio::test]

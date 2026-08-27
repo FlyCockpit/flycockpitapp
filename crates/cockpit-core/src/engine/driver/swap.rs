@@ -521,53 +521,49 @@ impl Driver {
                 return false;
             }
         };
-        let rebuilt =
-            match self.try_rebuild_frame_with_model(root_idx, new_model.clone(), &target, None) {
-                Ok(agent) => Arc::new(agent),
-                Err(_) if root_idx == 0 => {
-                    Arc::new(self.rebuild_frame_with_model(root_idx, new_model, &target, None))
-                }
-                Err(e) => {
-                    let error = format!("{e:#}");
-                    self.record_model_switch_audit(crate::session::ModelSwitchAudit {
-                        from_provider: old_session_provider.as_deref(),
-                        from_model: old_session_model.as_deref(),
-                        to_provider: provider,
-                        to_model: model,
-                        trigger,
-                        outcome: crate::session::ModelSwitchOutcome::BuildFailed,
-                        error: Some(&error),
+        let rebuilt = match self.try_rebuild_frame_with_model(root_idx, new_model, &target, None) {
+            Ok(agent) => Arc::new(agent),
+            Err(e) => {
+                let error = format!("{e:#}");
+                self.record_model_switch_audit(crate::session::ModelSwitchAudit {
+                    from_provider: old_session_provider.as_deref(),
+                    from_model: old_session_model.as_deref(),
+                    to_provider: provider,
+                    to_model: model,
+                    trigger,
+                    outcome: crate::session::ModelSwitchOutcome::BuildFailed,
+                    error: Some(&error),
+                })
+                .await;
+                self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "Model switch to `{provider}/{model}` failed — {error}. \
+                             Keeping the current model active."
+                        ),
                     })
                     .await;
-                    self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
-                    let _ = tx
-                        .send(TurnEvent::Notice {
-                            text: format!(
-                                "Model switch to `{provider}/{model}` failed — {error}. \
-                             Keeping the current model active."
-                            ),
-                        })
-                        .await;
-                    self.emit_active_model_state(tx).await;
-                    self.emit_model_selection_result(
-                        selection_id,
+                self.emit_active_model_state(tx).await;
+                self.emit_model_selection_result(
+                    selection_id,
+                    &target,
+                    DefaultModelUpdateResult::not_requested(None),
+                    Some(ModelSelectionRejection::failure(
                         &target,
-                        DefaultModelUpdateResult::not_requested(None),
-                        Some(ModelSelectionRejection::failure(
-                            &target,
-                            &error,
-                            "model_selection_rebuild_failed",
-                        )),
-                        ModelSelectionTerminalEmission {
-                            claimed: terminal_claimed,
-                            owned: false,
-                        },
-                        tx,
-                    )
-                    .await;
-                    return false;
-                }
-            };
+                        &error,
+                        "model_selection_rebuild_failed",
+                    )),
+                    ModelSelectionTerminalEmission {
+                        claimed: terminal_claimed,
+                        owned: false,
+                    },
+                    tx,
+                )
+                .await;
+                return false;
+            }
+        };
         let prepared_default = match self.prepare_default_model(default_write) {
             Ok(prepared) => prepared,
             Err(rejection) => {
@@ -1114,12 +1110,7 @@ impl Driver {
         }
         let new_model = Arc::new(self.build_live_model(requested)?);
         let rebuilt =
-            match self.try_rebuild_frame_with_model(root_idx, new_model.clone(), requested, None) {
-                Ok(agent) => Arc::new(agent),
-                Err(_) => {
-                    Arc::new(self.rebuild_frame_with_model(root_idx, new_model, requested, None))
-                }
-            };
+            Arc::new(self.try_rebuild_frame_with_model(root_idx, new_model, requested, None)?);
         self.stack[root_idx].agent = rebuilt;
         if self.active_frame_index() == Some(root_idx) {
             self.schedule.set_agent(self.stack[root_idx].agent.clone());

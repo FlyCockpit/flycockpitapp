@@ -1723,9 +1723,6 @@ fn scrub_agent_inventory_entry(entry: &mut proto::AgentInventoryEntry, redact: &
     scrub_option_string(&mut entry.description, redact);
     scrub_option_string(&mut entry.model, redact);
     scrub_option_string(&mut entry.diagnostic, redact);
-    for warning in &mut entry.warnings {
-        scrub_string(warning, redact);
-    }
 }
 
 fn scrub_agent_edit_snapshot(snapshot: &mut proto::AgentEditSnapshot, redact: &RedactionTable) {
@@ -6126,9 +6123,7 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
             ]
             .into_iter()
             .flatten()
-            .chain(entry.warnings.iter().map(String::as_str))
             .all(|value| value.len() <= proto::MAX_AGENT_METADATA_BYTES)
-            && entry.warnings.len() <= 16
             && proto::is_opaque_authority_token(&entry.source_identity)
             && proto::is_opaque_authority_token(&entry.revision)
             && proto::is_opaque_authority_token(&entry.projection_digest)

@@ -201,7 +201,8 @@ fn header_preview_uses_raw_user_text() {
     prime_overflowing(&mut app, 48, 10);
     let buf = render_sticky_buffer(&mut app, 48, 10);
     let header = app.sticky_header_area.expect("header");
-    let idx = app.sticky_header_history_index.expect("target");
+    let id = app.sticky_header_target.expect("target");
+    let idx = app.history_position_for_id(id).expect("target index");
     let HistoryEntry::User { text, .. } = &app.history[idx] else {
         panic!("target must be a user message");
     };
@@ -317,7 +318,8 @@ fn click_jump_lands_with_two_row_margin() {
     prime_overflowing(&mut app, 40, 10);
     render_sticky(&mut app, 40, 10);
     let header = app.sticky_header_area.expect("header");
-    let idx = app.sticky_header_history_index.expect("target");
+    let id = app.sticky_header_target.expect("target");
+    let idx = app.history_position_for_id(id).expect("target index");
     let rel = *app.msg_abs_line.get(&idx).expect("target has an abs line");
     let abs = app.chat_banner_lines + rel;
 
@@ -342,7 +344,8 @@ fn home_key_jumps_to_sticky_target_when_composer_empty() {
     let mut app = overflowing_app(tmp.path());
     prime_overflowing(&mut app, 40, 10);
     render_sticky(&mut app, 40, 10);
-    let idx = app.sticky_header_history_index.expect("target");
+    let id = app.sticky_header_target.expect("target");
+    let idx = app.history_position_for_id(id).expect("target index");
     let rel = *app.msg_abs_line.get(&idx).expect("abs line");
     let abs = app.chat_banner_lines + rel;
     let before = app.chat_scroll_offset;
@@ -383,7 +386,8 @@ fn find_indices_ignore_the_sticky_header() {
         app.chat_total_lines,
         "find lines stay aligned with the scroll buffer, not the carved header"
     );
-    let header_idx = app.sticky_header_history_index.unwrap();
+    let id = app.sticky_header_target.unwrap();
+    let header_idx = app.history_position_for_id(id).unwrap();
     let HistoryEntry::User { text, .. } = &app.history[header_idx] else {
         panic!("target is a user message");
     };

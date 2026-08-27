@@ -1324,7 +1324,7 @@ impl App {
             // it (codex bottom-pane style), so render the chat into `body`
             // and the dialog into the `compact` slot. The dialog owns the
             // cursor while it's open.
-            self.render_history(frame, rects.body);
+            self.render_chat_history_pane(frame, rects.body);
             self.paint_transcript_control_buttons(frame);
             if let Some(dialog) = self.question_dialog.as_mut() {
                 // Sync both body regions' scroll viewports to the real
@@ -1463,7 +1463,7 @@ impl App {
                         None => {
                             self.chat_area = None;
                             self.sticky_header_area = None;
-                            self.sticky_header_history_index = None;
+                            self.sticky_header_target = None;
                         }
                     }
                     if geom.indicator > 0 {
@@ -2131,7 +2131,7 @@ impl App {
         self.history.ids().iter().position(|id| *id == target)
     }
 
-    fn cached_history_entry_rows_at(&self, idx: usize) -> usize {
+    pub(super) fn cached_history_entry_rows_at(&self, idx: usize) -> usize {
         self.history
             .id_at(idx)
             .and_then(|id| self.history_render_cache.get(&id))

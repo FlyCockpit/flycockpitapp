@@ -2176,9 +2176,9 @@ pub struct App {
     /// Lives *outside* `chat_area` so history clamps, selection grid,
     /// and row-meta tables never see it.
     pub(super) sticky_header_area: Option<Rect>,
-    /// History index of the user message currently shown in the sticky
+    /// Stable id of the user message currently shown in the sticky
     /// header. `None` when the header is hidden.
-    pub(super) sticky_header_history_index: Option<usize>,
+    pub(super) sticky_header_target: Option<HistoryEntryId>,
     /// Last-rendered composer-input `Rect` (the outer rect — block
     /// border included). Used by `handle_mouse` to route clicks into
     /// click-to-position-cursor (plan.md T8.d).
@@ -3772,7 +3772,7 @@ impl App {
             startup_dependency_notice,
             chat_area: None,
             sticky_header_area: None,
-            sticky_header_history_index: None,
+            sticky_header_target: None,
             input_area: None,
             suggestion_box_area: None,
             suggestion_row_hits: Vec::new(),

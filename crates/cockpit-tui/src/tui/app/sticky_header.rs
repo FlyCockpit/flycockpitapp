@@ -3,9 +3,8 @@
 //! The header is carved out of the chat pane *before* `render_history`
 //! so `chat_visible_lines`, the six scroll clamps, `chat_row_meta`,
 //! live buttons, and the selection grid all see the remaining height.
-//! Height is 0 or [`STICKY_USER_HEADER_HEIGHT`] per frame, derived from
-//! the uncarved pane size so a mid-frame flip cannot oscillate the
-//! scroll-anchor round-trip.
+//! Height is 0 or [`STICKY_USER_HEADER_HEIGHT`] per frame. A stale layout
+//! decision is settled within the same frame after geometry refresh.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -14,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::render::chat_visible_top;
-use super::{App, MouseGestureInvalidation};
+use super::{App, HistoryEntryId, MouseGestureInvalidation};
 use crate::tui::history::HistoryEntry;
 use crate::tui::pins_overlay::{PIN_YELLOW, preview_text_rows};
 use crate::tui::theme::{MUTED_COLOR_INDEX, TRANSCRIPT_HOVER_BG};
@@ -25,73 +24,74 @@ pub(super) const STICKY_USER_HEADER_HEIGHT: u16 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StickyUserTarget {
     pub history_index: usize,
+    pub id: HistoryEntryId,
 }
 
 impl App {
     /// Render the chat pane, carving a sticky header rect out of the top
     /// when the previous user message has scrolled out of view.
     pub(super) fn render_chat_history_pane(&mut self, frame: &mut Frame, pane: Rect) {
-        let header_h = self.sticky_user_header_height(pane);
+        let mut target = self.sticky_user_target_for_pane(pane);
+        self.apply_sticky_visibility(pane, target.is_some());
+        self.render_history(frame, history_rect(pane, target.is_some()));
+
+        // The first render after startup, a resize, or a history mutation refreshes
+        // wrapping and total-row state. Settle once against that current geometry so
+        // an idle event loop never leaves a previous-frame header decision onscreen.
+        let refreshed = self.sticky_user_target_for_pane(pane);
+        if refreshed.is_some() != target.is_some() {
+            target = refreshed;
+            self.apply_sticky_visibility(pane, target.is_some());
+            self.chat_find_lines_dirty = true;
+            self.render_history(frame, history_rect(pane, target.is_some()));
+            target = self.sticky_user_target_for_pane(pane);
+        } else {
+            // Visibility may be unchanged while front trimming or rewrapping selects
+            // a different last-hidden user message.
+            target = refreshed;
+        }
+
+        self.sticky_header_target = target.map(|target| target.id);
+        if let Some(header) = self.sticky_header_area {
+            self.render_sticky_user_header(frame, header);
+        }
+    }
+
+    fn sticky_user_target_for_pane(&self, pane: Rect) -> Option<StickyUserTarget> {
+        if !self.sticky_user_message || pane.height <= STICKY_USER_HEADER_HEIGHT {
+            return None;
+        }
+        // The message must leave the existing viewport before it becomes sticky;
+        // carving the header must not itself turn a visible message into a target.
+        self.sticky_user_target(pane.height as usize)
+    }
+
+    fn apply_sticky_visibility(&mut self, pane: Rect, visible: bool) {
         let was_visible = self.sticky_header_area.is_some();
-        let now_visible = header_h > 0;
-        if was_visible != now_visible {
+        if was_visible != visible {
             self.invalidate_mouse_gesture(
                 MouseGestureInvalidation::ViewChange,
                 self.event_loop_monotonic_now,
             );
-            // Keep offset-from-bottom; recapture the anchor against the
-            // new (carved or full) height inside `render_history`.
             self.chat_scroll_anchor = None;
         }
-
-        if now_visible {
-            let header = Rect {
-                x: pane.x,
-                y: pane.y,
-                width: pane.width,
-                height: header_h,
-            };
-            let history = Rect {
-                x: pane.x,
-                y: pane.y.saturating_add(header_h),
-                width: pane.width,
-                height: pane.height.saturating_sub(header_h),
-            };
-            self.sticky_header_area = Some(header);
-            if let Some(target) = self.sticky_user_target(pane.height as usize) {
-                self.sticky_header_history_index = Some(target.history_index);
-            }
-            self.render_sticky_user_header(frame, header);
-            self.render_history(frame, history);
-        } else {
-            self.sticky_header_area = None;
-            self.sticky_header_history_index = None;
-            self.render_history(frame, pane);
+        self.sticky_header_area = visible.then(|| Rect {
+            x: pane.x,
+            y: pane.y,
+            width: pane.width,
+            height: STICKY_USER_HEADER_HEIGHT,
+        });
+        if !visible {
+            self.sticky_header_target = None;
         }
-    }
-
-    /// 0 or [`STICKY_USER_HEADER_HEIGHT`], derived from the *uncarved*
-    /// pane height so the decision does not depend on whether the header
-    /// is currently shown.
-    pub(super) fn sticky_user_header_height(&self, pane: Rect) -> u16 {
-        if !self.sticky_user_message {
-            return 0;
-        }
-        if pane.height <= STICKY_USER_HEADER_HEIGHT {
-            return 0;
-        }
-        if self.sticky_user_target(pane.height as usize).is_none() {
-            return 0;
-        }
-        STICKY_USER_HEADER_HEIGHT
     }
 
     /// Last `HistoryEntry::User` whose last display row sits strictly
-    /// above the uncarved viewport top. `None` when that message is
+    /// above the history viewport top. `None` when that message is
     /// already visible, when the view is at the tail with nothing above,
     /// or when the in-scroll banner still occupies the top.
-    pub(super) fn sticky_user_target(&self, uncarved_visible: usize) -> Option<StickyUserTarget> {
-        let visible = uncarved_visible.max(1);
+    pub(super) fn sticky_user_target(&self, visible_lines: usize) -> Option<StickyUserTarget> {
+        let visible = visible_lines.max(1);
         let total = self.chat_total_lines;
         if total == 0 {
             return None;
@@ -113,12 +113,18 @@ impl App {
             if !matches!(self.history.get(idx), Some(HistoryEntry::User { .. })) {
                 continue;
             }
-            let last_row = banner
-                + prefix
-                + geometry.entry_start_row(idx)
-                + geometry.entry_height(idx).saturating_sub(1);
+            let rendered_rows = self.cached_history_entry_rows_at(idx);
+            if rendered_rows == 0 {
+                continue;
+            }
+            let last_row =
+                banner + prefix + geometry.entry_start_row(idx) + rendered_rows.saturating_sub(1);
             if last_row < visible_top {
-                found = Some(StickyUserTarget { history_index: idx });
+                let id = self.history.id_at(idx)?;
+                found = Some(StickyUserTarget {
+                    history_index: idx,
+                    id,
+                });
             }
         }
         found
@@ -126,7 +132,8 @@ impl App {
 
     fn render_sticky_user_header(&self, frame: &mut Frame, area: Rect) {
         let raw = self
-            .sticky_header_history_index
+            .sticky_header_target
+            .and_then(|id| self.history_position_for_id(id))
             .and_then(|idx| self.history.get(idx))
             .and_then(user_raw_text)
             .unwrap_or("");
@@ -172,7 +179,10 @@ impl App {
     }
 
     pub(super) fn jump_to_sticky_user_header(&mut self) {
-        let Some(idx) = self.sticky_header_history_index else {
+        let Some(id) = self.sticky_header_target else {
+            return;
+        };
+        let Some(idx) = self.history_position_for_id(id) else {
             return;
         };
         let Some(&rel) = self.msg_abs_line.get(&idx) else {
@@ -185,6 +195,18 @@ impl App {
     pub(super) fn mouse_in_sticky_header(&self, col: u16, row: u16) -> bool {
         self.sticky_header_area
             .is_some_and(|area| super::mouse::point_in(area, col, row))
+    }
+}
+
+fn history_rect(pane: Rect, visible: bool) -> Rect {
+    if !visible {
+        return pane;
+    }
+    Rect {
+        x: pane.x,
+        y: pane.y.saturating_add(STICKY_USER_HEADER_HEIGHT),
+        width: pane.width,
+        height: pane.height.saturating_sub(STICKY_USER_HEADER_HEIGHT),
     }
 }
 

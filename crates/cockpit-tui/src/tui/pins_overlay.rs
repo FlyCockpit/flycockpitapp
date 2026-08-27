@@ -14,6 +14,8 @@ use ratatui::text::{Line, Span};
 
 use cockpit_proto::PinnedMessage;
 
+use crate::tui::composer::display_width;
+
 /// Grey for the `pin` half of the mouse control + muted chrome.
 pub const PIN_GREY: Color = Color::Indexed(244);
 /// Yellow for the `unpin` half of the mouse control + the pick arrow.
@@ -291,13 +293,12 @@ pub fn preview_text_rows(text: &str, width: usize, max_rows: usize) -> Vec<Strin
             let last_slot = rows.len() + 1 >= max_rows;
             if last_slot {
                 let later_lines = i + 1 < source.len();
-                let rest_overflows = rest.chars().count() > width;
-                let preview = if later_lines && !rest_overflows {
-                    preview_text(&format!("{rest} …"), width.max(8))
-                } else {
-                    preview_text(rest, width.max(8))
-                };
-                rows.push(fit_preview_to_width(&preview, width));
+                let rest_overflows = display_width(rest) > width;
+                rows.push(ellipsize_display_width(
+                    rest,
+                    width,
+                    later_lines || rest_overflows,
+                ));
                 return rows;
             }
             let (head, tail) = split_preview_line(rest, width);
@@ -318,23 +319,44 @@ fn truncate_preview_line(first: &str, max: usize) -> String {
 }
 
 fn split_preview_line(line: &str, width: usize) -> (String, &str) {
-    if line.chars().count() <= width {
+    if display_width(line) <= width {
         return (line.to_string(), "");
     }
-    let split = line
-        .char_indices()
-        .nth(width)
-        .map(|(i, _)| i)
-        .unwrap_or(line.len());
+    let mut split = 0;
+    let mut used = 0;
+    for grapheme in crate::tui::markdown::semantic_graphemes(line) {
+        let grapheme_width = display_width(&grapheme);
+        if used.saturating_add(grapheme_width) > width {
+            break;
+        }
+        used = used.saturating_add(grapheme_width);
+        split = split.saturating_add(grapheme.len());
+    }
+    // A grapheme wider than the whole row cannot be displayed there. Consume it
+    // so callers always make progress while keeping the returned row width-safe.
+    if split == 0 {
+        split = crate::tui::markdown::semantic_graphemes(line)
+            .first()
+            .map_or(line.len(), String::len);
+        return (String::new(), &line[split..]);
+    }
     (line[..split].to_string(), &line[split..])
 }
 
-fn fit_preview_to_width(preview: &str, width: usize) -> String {
-    if preview.chars().count() <= width {
-        preview.to_string()
-    } else {
-        truncate_preview_line(preview, width)
+fn ellipsize_display_width(text: &str, width: usize, truncated: bool) -> String {
+    if !truncated && display_width(text) <= width {
+        return text.to_string();
     }
+    let ellipsis = "…";
+    let budget = width.saturating_sub(display_width(ellipsis));
+    let (mut prefix, _) = split_preview_line(text, budget);
+    while display_width(&prefix) > budget {
+        prefix.pop();
+    }
+    if display_width(ellipsis) <= width {
+        prefix.push('…');
+    }
+    prefix
 }
 
 /// The fork mouse control: grey `[fork]`, rendered unemphasized. It is drawn
@@ -544,6 +566,14 @@ mod tests {
         assert_eq!(rows[0].chars().count(), 10);
         assert!(rows[1].ends_with('…'), "{rows:?}");
         assert_eq!(rows[1].chars().count(), 10);
+    }
+
+    #[test]
+    fn preview_text_rows_fits_wide_graphemes_by_display_width() {
+        let rows = preview_text_rows("界界界界界界", 6, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| display_width(row) <= 6), "{rows:?}");
+        assert!(rows[1].ends_with('…'), "{rows:?}");
     }
 
     #[test]

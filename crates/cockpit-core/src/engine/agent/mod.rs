@@ -51,6 +51,7 @@ mod text_recovery;
 pub(crate) mod tool_dispatch;
 mod tool_timeout;
 mod turn_phases;
+mod turn_scheduler;
 
 pub(crate) use backup::{InferenceOutcomeRecord, record_inference_outcome};
 pub(crate) use turn_phases::{

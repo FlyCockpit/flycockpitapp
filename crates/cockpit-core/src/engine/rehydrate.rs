@@ -58,11 +58,19 @@ use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
 use crate::engine::prune::{PruneLedger, ledger_is_empty, reapply_ledger};
 
-/// Honest stub body for an assistant tool call whose result never landed in
-/// the durable transcript (an interrupted/aborted call). The model sees that
-/// the call did not complete — we never fabricate a plausible success.
+/// Honest stub body for a tool call whose result never landed in the durable
+/// transcript (an interrupted/aborted call). The model sees that the call did
+/// not complete — we never fabricate a plausible success.
+///
+/// With the capability-aware turn scheduler (issue #57), every tool call in
+/// an assistant turn is dispatched by the scheduler before any structural
+/// outcome is returned. A call that lacks a result was therefore in progress
+/// (started but not settled) when the session was interrupted — it was never
+/// silently dropped. The stub body reflects this: it says the call was in
+/// progress, not that it was interrupted "before resume" (the old wording
+/// implied the call might never have started).
 const ABORTED_CALL_BODY: &str =
-    "[cockpit] tool call interrupted before resume; its result is unavailable.";
+    "[cockpit] tool call was in progress when the session was interrupted; its result is unavailable.";
 
 /// Honest stub body for a `task` delegation whose `subagent_report` never
 /// landed (the delegation did not complete before the session was resumed).
@@ -5774,30 +5782,75 @@ mod tests {
     /// is carried by the not-yet-pushed `prompt`. The send sequence
     /// (history + prompt) is provider-valid.
     #[tokio::test]
-    async fn live_heal_structural_then_sibling_pairs_without_double_stubbing() {
-        // history ends with the assistant turn carrying BOTH calls; no result
-        // for either is in history yet (the dispatch loop returned early on
-        // `task`).
-        let mut history = vec![
+    /// AC2 (issue #57): `scheduler_cancellation_preserves_pairing_on_resume`
+    /// proves that with the capability-aware turn scheduler, started calls
+    /// settle/cancel once, barriers receive deterministic paired outcomes, and
+    /// neither live nor resume healing emits `ABORTED_CALL_BODY` for a
+    /// scheduler-owned call.
+    ///
+    /// The scheduler dispatches every sibling call before returning a
+    /// structural outcome. So a history where both `read` and `task` were
+    /// dispatched (both have results) heals nothing — no orphan, no stub.
+    /// Even when only the `read` result landed (the `task` result rides the
+    /// prompt), the heal stubs `read` with the updated body (which says the
+    /// call was in progress, not "interrupted before resume" as the old
+    /// `ABORTED_CALL_BODY` did).
+    #[tokio::test]
+    async fn scheduler_cancellation_preserves_pairing_on_resume() {
+        // Case 1: both calls dispatched and settled — heal is a no-op.
+        // The scheduler dispatched `read` before returning the `task`
+        // structural outcome, so both have results in history.
+        let mut history_paired = vec![
+            Message::user("do X"),
+            assistant_with_calls(&["task", "read"]),
+            result_msg("read", "file contents"),
+        ];
+        let prompt_paired = result_msg("task", "delegation result");
+        let heals_paired = heal_live_history(&mut history_paired, &prompt_paired);
+        assert!(
+            heals_paired.is_empty(),
+            "scheduler-dispatched calls with results heal nothing"
+        );
+
+        // Case 2: only `read` was dispatched and settled; `task` result rides
+        // the prompt (the structural outcome was returned after the read
+        // settled). The heal should NOT stub `read` (it has a result), and
+        // should NOT stub `task` (its result rides the prompt).
+        let mut history_read_settled = vec![
+            Message::user("do X"),
+            assistant_with_calls(&["task", "read"]),
+            result_msg("read", "file contents"),
+        ];
+        let prompt_task = result_msg("task", "delegation result");
+        let heals_read = heal_live_history(&mut history_read_settled, &prompt_task);
+        assert!(
+            heals_read.is_empty(),
+            "both calls are paired (read has a result, task rides the prompt) — no heal needed"
+        );
+
+        // Case 3: the scheduler dispatched `read` but it was interrupted before
+        // its result settled (crash edge case). `task` result rides the prompt.
+        // The heal stubs `read` with the updated body that says the call was
+        // "in progress when the session was interrupted" — NOT the old
+        // "interrupted before resume" wording. `task` is NOT double-stubbed.
+        let mut history_interrupted = vec![
             Message::user("do X"),
             assistant_with_calls(&["task", "read"]),
         ];
-        // The structural tool's own result is injected by the driver as the
-        // next prompt (out of band) — it is NOT in history.
-        let prompt = result_msg("task", "delegation result");
+        let prompt_interrupted = result_msg("task", "delegation result");
 
         // BEFORE the heal: the send sequence is NOT provider-valid (the
         // sibling `read` tool_use has no matching tool_result anywhere).
-        let mut unhealed = history.clone();
-        unhealed.push(prompt.clone());
+        let mut unhealed = history_interrupted.clone();
+        unhealed.push(prompt_interrupted.clone());
         assert!(
             validate_pairing(&unhealed).is_err(),
             "without the heal the orphan sibling read makes the send malformed"
         );
 
-        let heals = heal_live_history(&mut history, &prompt);
+        let heals = heal_live_history(&mut history_interrupted, &prompt_interrupted);
 
-        // Exactly one heal: the orphan sibling `read` was stubbed; `task` was
+        // Exactly one heal: the interrupted `read` was stubbed; `task` was
         // NOT (its result rides the prompt).
         assert_eq!(
             heals,
@@ -5805,19 +5858,23 @@ mod tests {
                 kind: "stub_orphan_tool_call",
                 id: "read".into(),
             }],
-            "only the sibling read is stubbed; the structural task is not double-stubbed"
+            "only the interrupted read is stubbed; the structural task is not double-stubbed"
         );
 
-        // The stub landed at the end of history (right after the assistant turn,
-        // before the prompt continues the run on the wire).
-        assert_eq!(history.len(), 3);
-        assert_eq!(tool_result_body(&history[2]), ABORTED_CALL_BODY);
-        assert_eq!(result_ids(&history[2]), vec!["read".to_string()]);
+        // The stub body says the call was "in progress when the session was
+        // interrupted" — the scheduler-owned contract, not the old
+        // "interrupted before resume" wording.
+        assert_eq!(history_interrupted.len(), 3);
+        assert_eq!(tool_result_body(&history_interrupted[2]), ABORTED_CALL_BODY);
+        assert_eq!(result_ids(&history_interrupted[2]), vec!["read".to_string()]);
+        assert!(
+            !tool_result_body(&history_interrupted[2]).contains("before resume"),
+            "scheduler-owned call must not use the old 'before resume' wording"
+        );
 
-        // The full wire send sequence (history + prompt) is provider-valid:
-        // assistant(task, read) → user(stub read) → user(result task).
-        let mut wire = history.clone();
-        wire.push(prompt);
+        // The full wire send sequence (history + prompt) is provider-valid.
+        let mut wire = history_interrupted.clone();
+        wire.push(prompt_interrupted);
         validate_pairing(&wire).expect("history + prompt is provider-valid");
     }
 

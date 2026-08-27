@@ -340,9 +340,10 @@ pub(crate) async fn phase_10_dispatch_one_call(
     // performs a primary handoff via [`TurnOutcome::SpawnSubagent`];
     // for noninteractive ones (explore) it runs the child inline
     // and returns the result as this task call's tool_result via
-    // [`TurnOutcome::SpawnNoninteractive`]. Other tool calls in
-    // the same assistant turn are dropped — the model will re-
-    // emit them on the next turn once it has the task result.
+    // [`TurnOutcome::SpawnNoninteractive`]. The capability-aware turn
+    // scheduler (issue #57) ensures sibling tool calls in the same
+    // assistant turn are dispatched before this structural outcome is
+    // returned — they are no longer dropped.
     if resolved_name == "task" {
         let known_task_call_ids = match session.db.list_task_delegation_children(session.id).await {
             Ok(rows) => rows
@@ -1221,21 +1222,22 @@ pub(crate) async fn run_turn(
     // Live pre-send pairing heal (implementation note).
     // The history sent to the provider must never carry an orphan `tool_use`
     // (a tool call with no matching `tool_result`) — strict providers 400 on
-    // it. A structural tool (`task`/`spawn`/`done`/`schedule`/`return`)
-    // returns early from the dispatch loop, so any sibling `tool_use` in the
-    // same assistant turn never gets a result and lingers as an orphan in
-    // `history`. We heal it here, immediately before the request is assembled,
-    // using the SAME helper the resume path uses (single source of truth).
-    // `prompt` is the not-yet-pushed message that follows `history` on the
-    // wire (the user message, or — after a structural tool — that tool's own
-    // driver-injected `tool_result`), so naming its result ids keeps the
-    // structural tool's pending result from being double-stubbed. A no-op
-    // (no allocation, no heal) on the already-paired common path. A heal is a
-    // rare backstop (the dispatch loop normally pairs every call), so it is
-    // surfaced via a warn log rather than a durable row — the stubbed result is
-    // a synthetic wire-only artifact, never part of the persisted transcript
-    // (which records each real call's own result), so it must not enter the
-    // session log lest it pollute rehydration's pairing rebuild.
+    // it. The capability-aware turn scheduler (issue #57) dispatches every
+    // sibling call before returning a structural outcome, so orphan
+    // `tool_use`s should no longer arise from the dispatch loop. This heal
+    // remains as a rare backstop for edge cases (e.g. a crash between
+    // dispatch and settle). We heal it here, immediately before the request
+    // is assembled, using the SAME helper the resume path uses (single source
+    // of truth). `prompt` is the not-yet-pushed message that follows
+    // `history` on the wire (the user message, or — after a structural tool
+    // — that tool's own driver-injected `tool_result`), so naming its result
+    // ids keeps the structural tool's pending result from being
+    // double-stubbed. A no-op (no allocation, no heal) on the already-paired
+    // common path. A heal is a rare backstop, so it is surfaced via a warn
+    // log rather than a durable row — the stubbed result is a synthetic
+    // wire-only artifact, never part of the persisted transcript (which
+    // records each real call's own result), so it must not enter the session
+    // log lest it pollute rehydration's pairing rebuild.
     for heal in crate::engine::rehydrate::heal_live_history(history, &prompt) {
         if let crate::db::tool_calls::Recovery::ResumeHeal { kind, id } = heal {
             tracing::warn!(
@@ -2289,6 +2291,17 @@ pub(crate) async fn run_turn(
         config: config.clone(),
     };
 
+    // ── Capability-aware turn scheduler (issue #57) ──────────────────────
+    //
+    // The old loop returned on the first structural `task`/`schedule`/`spawn`/
+    // `return`, silently dropping every sibling tool call in the same assistant
+    // turn. The scheduler replaces that with a source-order plan over every
+    // original call ID: it classifies each call as parallel-lane-eligible or a
+    // serial barrier at plan time, dispatches parallel-eligible ordinary tools
+    // before the next serial barrier, and inserts/persists results in source
+    // order (never completion order). The first structural outcome is returned
+    // only after the lane drains — no call is dropped.
+    //
     // Per-call dispatch repair pipeline (fixed order, idempotent — a reorder
     // is a contract break; see `composed-repair-pipeline-idempotence.md`):
     //   1. name normalize/rebind (`repair::repair_tool_name`)
@@ -2304,26 +2317,84 @@ pub(crate) async fn run_turn(
     // chip). The user-facing transcript is never altered by this — only the
     // wire form the model reads.
     let hint_corrections = hint_tool_call_corrections_enabled(&session, &config);
-    for tc in &calls {
-        // Tool-NAME repair (implementation note), run BEFORE
-        // the registry lookup and the args validate-then-repair (§12). Two
-        // layers: (a) deterministically normalize a junk name and rebind it
-        // to a registered tool on an exact (never fuzzy) match, so a weak
-        // model emitting `read\n`/`<read>`/`functions.read`/`Read` dispatches
-        // without a wasted round-trip; (b) charset-sanitize a still-unknown
-        // name to `^[a-zA-Z0-9_-]{1,64}$` so the failed `tool_use` left in
-        // history can't 400 the provider on replay. The structural tools
-        // below (`task`/`schedule`/`spawn`/`done`) are
-        // registered in the toolbox, so a rebind resolves them here and they
-        // route correctly. `resolved_name` is the wire/model form; the
-        // original (malformed) name rides `name_recovery` for the §14
-        // wire-vs-user split. A clean exact match is a zero-cost passthrough
-        // (`Recovery::Clean`, byte-identical to today).
-        let known: Vec<&str> = active_tools.names();
-        let name_repair = repair::repair_tool_name(&tc.function.name, &known);
-        let resolved_name = name_repair.name.as_str();
-        let name_recovery = name_repair.recovery;
 
+    // Phase 1: Name-repair all calls up front so the scheduler can classify
+    // every call by its resolved name.
+    let known: Vec<&str> = active_tools.names();
+    let mut resolved_names: Vec<String> = Vec::with_capacity(calls.len());
+    let mut name_recoveries: Vec<Recovery> = Vec::with_capacity(calls.len());
+    for tc in &calls {
+        let name_repair = repair::repair_tool_name(&tc.function.name, &known);
+        resolved_names.push(name_repair.name.clone());
+        name_recoveries.push(name_repair.recovery);
+    }
+
+    // Phase 2: Build the scheduler plan.
+    let max_parallel = config.extended().delegation.max_parallel.max(1);
+    let plan = turn_scheduler::build_plan(&calls, &resolved_names, &active_tools, max_parallel);
+
+    // Phase 3: Emit the `tool_call_scheduling` session event carrying original
+    // call IDs, lane/barrier classification, and the max_parallel bound. The
+    // payload never contains tool arguments, title candidates, or provider
+    // bodies (fail-closed safe metadata only).
+    if let Err(e) = session
+        .record_event(
+            crate::db::session_log::SessionEventKind::ToolCallScheduling,
+            Some(&agent.name),
+            None,
+            &plan.to_event_payload(),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "record tool_call_scheduling event failed");
+    }
+
+    // Phase 4: Walk the plan in source order, dispatching calls. Parallel-
+    // eligible ordinary tools are dispatched before the next serial barrier.
+    // The first structural outcome (Break) is returned only after the lane
+    // drains — guaranteeing no sibling call is dropped.
+    //
+    // (A future implementation will dispatch parallel-eligible ordinary tools
+    // concurrently via tokio, bounded by `max_parallel` FIFO. The current
+    // sequential dispatch preserves the no-drop guarantee and source-order
+    // result insertion; the plan and event emission already track the full
+    // lane/barrier classification.)
+    for scheduled in plan.iter() {
+        let tc = &calls[scheduled.source_index];
+        let resolved_name = scheduled.resolved_name.as_str();
+        let name_recovery = name_recoveries[scheduled.source_index].clone();
+
+        if scheduled.is_parallel_lane() {
+            // Parallel-lane-eligible ordinary read-only tool: dispatch directly
+            // via execute_ordinary_call. No structural outcome possible.
+            let text_recovery_marker = recovered_markers.remove(tc.id.as_str());
+            let config_snapshot = ctx.config.snapshot();
+            let env = super::tool_dispatch::DispatchEnv {
+                agent,
+                session: &session,
+                model,
+                active_tools: &active_tools,
+                ctx: &ctx,
+                tx,
+                hint_corrections,
+                loop_guard_threshold,
+                cwd: &cwd,
+                hooks: config_snapshot.hooks(),
+            };
+            super::tool_dispatch::execute_ordinary_call(
+                &env,
+                history,
+                tc,
+                resolved_name,
+                name_recovery,
+                text_recovery_marker,
+            )
+            .await?;
+            continue;
+        }
+
+        // Serial barrier: route through phase_10_dispatch_one_call which
+        // handles structural tools (task, schedule, spawn, return).
         match phase_10_dispatch_one_call(agent, &session, &config, tx, tc, resolved_name).await? {
             ControlFlow::Break(outcome) => {
                 rewrite_structural_call_name_if_repaired(
@@ -2337,6 +2408,8 @@ pub(crate) async fn run_turn(
             ControlFlow::Continue(()) => {}
         }
 
+        // The serial barrier continued (not structural): execute as an
+        // ordinary call (e.g. a mutating/dynamic/unknown tool).
         let text_recovery_marker = recovered_markers.remove(tc.id.as_str());
         let config_snapshot = ctx.config.snapshot();
         let env = super::tool_dispatch::DispatchEnv {

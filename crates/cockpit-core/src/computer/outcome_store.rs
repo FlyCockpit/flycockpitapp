@@ -16,7 +16,7 @@ use super::coordinator::{ActionIdentity, ActionPayloadDigest, CoordinatedOutcome
 
 /// A stored outcome entry: the full sanitized terminal outcome plus the
 /// payload digest it was committed under.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StoredOutcome {
     pub outcome: CoordinatedOutcome,
     pub digest: ActionPayloadDigest,
@@ -156,10 +156,12 @@ mod tests {
         }
     }
 
-    fn digest(n: u8) -> ActionPayloadDigest {
+    fn digest(n: u64) -> ActionPayloadDigest {
         // ActionPayloadDigest has a private [u8; 32] field; use from_actions
         // with a simple action to get a deterministic digest.
-        ActionPayloadDigest::from_actions(&[crate::computer::ComputerAction::CaptureFull])
+        ActionPayloadDigest::from_actions(&[crate::computer::ComputerAction::Wait {
+            duration: std::time::Duration::from_nanos(n),
+        }])
     }
 
     /// AC13: persist a full sanitized CoordinatedOutcome in the memory store;

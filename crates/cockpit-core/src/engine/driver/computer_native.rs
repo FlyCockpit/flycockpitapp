@@ -57,13 +57,12 @@ pub async fn handle_native_computer_items(
 mod tests {
     use super::*;
     use crate::computer::coordinator::{
-        ComputerApprovalTier, ComputerAuthorizer, ComputerToolContract, CoordinatorParams,
-        DelegationId, FakeComputerAuthorizer, ModelId, NativeComputerCall,
-        NativeComputerContinuation, NativeResponseExtractor, OwnerInstance, ProviderId,
+        ComputerApprovalTier, ComputerAuthorizer, CoordinatorParams, DelegationId,
+        FakeComputerAuthorizer, ModelId, NativeComputerContinuation, OwnerInstance, ProviderId,
     };
     use crate::computer::{
         ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerBatchReport,
-        DisplayGeometry, LogicalSize, PixelSize, ScaleFactor,
+        ComputerToolContract, DisplayGeometry, LogicalSize, PixelSize, ScaleFactor,
     };
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -154,7 +153,7 @@ mod tests {
     /// injection.
     #[tokio::test]
     async fn computer_live_rig_seam_openai() {
-        let coordinator = make_coordinator().await;
+        let mut coordinator = make_coordinator().await;
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
@@ -164,7 +163,7 @@ mod tests {
         })];
 
         let continuations = handle_native_computer_items(
-            Some(coordinator),
+            Some(&mut coordinator),
             ComputerToolContract::OpenAiResponses,
             &output,
         )
@@ -196,7 +195,7 @@ mod tests {
     /// AC5: Anthropic variant through the driver seam.
     #[tokio::test]
     async fn computer_live_rig_seam_anthropic() {
-        let coordinator = make_coordinator().await;
+        let mut coordinator = make_coordinator().await;
         let content = vec![serde_json::json!({
             "type": "tool_use",
             "id": "toolu-1",
@@ -207,7 +206,7 @@ mod tests {
         })];
 
         let continuations = handle_native_computer_items(
-            Some(coordinator),
+            Some(&mut coordinator),
             ComputerToolContract::Anthropic20251124,
             &content,
         )

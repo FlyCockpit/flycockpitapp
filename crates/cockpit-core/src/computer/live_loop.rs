@@ -127,9 +127,8 @@ impl<'a> NativeComputerLiveLoop<'a> {
 mod tests {
     use super::*;
     use crate::computer::coordinator::{
-        ComputerActionCoordinator, ComputerApprovalTier, ComputerAuthorizer, ComputerToolContract,
-        CoordinatorParams, DelegationId, FakeComputerAuthorizer, ModelId, OwnerInstance,
-        ProviderId,
+        ComputerActionCoordinator, ComputerApprovalTier, ComputerAuthorizer, CoordinatorParams,
+        DelegationId, FakeComputerAuthorizer, ModelId, OwnerInstance, ProviderId,
     };
     use crate::computer::{
         ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerBatchReport,

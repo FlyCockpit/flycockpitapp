@@ -1851,48 +1851,16 @@ pub struct ActionIdentity {
 pub struct ActionPayloadDigest([u8; 32]);
 
 impl ActionPayloadDigest {
-    /// Compute a payload digest for a slice of backend actions. The digest
-    /// covers the action kinds and safe coordinates only — never typed text
-    /// content. Type/key actions contribute their kind but not their text.
+    /// Compute a payload digest for the complete canonical backend action
+    /// sequence. Sensitive values enter only the one-way digest and are never
+    /// retained in the identity journal.
     pub fn from_actions(actions: &[ComputerAction]) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for action in actions {
-            // Hash the discriminant (kind) and safe coordinates only.
-            // TypeText and KeyChord contribute their kind but NOT text content.
-            std::mem::discriminant(action).hash(&mut hasher);
-            match action {
-                ComputerAction::MoveCursor { to, .. } => {
-                    to.space.hash(&mut hasher);
-                    // Coordinates are safe to hash (not sensitive).
-                    (to.x.to_bits(), to.y.to_bits()).hash(&mut hasher);
-                }
-                ComputerAction::Click {
-                    button,
-                    count,
-                    modifiers,
-                } => {
-                    button.hash(&mut hasher);
-                    count.hash(&mut hasher);
-                    modifiers.hash(&mut hasher);
-                }
-                ComputerAction::Scroll {
-                    delta_x, delta_y, ..
-                } => {
-                    (delta_x, delta_y).hash(&mut hasher);
-                }
-                ComputerAction::CaptureRegion { rect }
-                | ComputerAction::CaptureNativeZoom { rect, .. } => {
-                    rect.space.hash(&mut hasher);
-                }
-                // TypeText/KeyChord/HoldKey: kind only, NO text/key content.
-                _ => {}
-            }
-        }
-        let h = hasher.finish();
+        let encoded = canonical_computer_action_payload_digest(actions);
         let mut digest = [0u8; 32];
-        for (i, byte) in digest.iter_mut().enumerate() {
-            *byte = ((h >> ((i % 8) * 8)) & 0xFF) as u8;
+        for (index, byte) in digest.iter_mut().enumerate() {
+            let offset = index * 2;
+            *byte = u8::from_str_radix(&encoded[offset..offset + 2], 16)
+                .expect("canonical SHA-256 encoder emitted invalid hex");
         }
         Self(digest)
     }
@@ -2533,6 +2501,7 @@ impl ComputerActionCoordinator {
         actions: &[ComputerAction],
         _action_label: &str,
     ) -> ExecuteArtifacts {
+        self.batch_item_outcomes.clear();
         // Generation-check BEFORE committing dispatching state, so a cancel
         // between the check and the irreversible dispatching commit is still
         // pre-handoff (zero input).  The `Dispatching` state is committed
@@ -2582,20 +2551,13 @@ impl ComputerActionCoordinator {
             };
         }
 
-        // Commit dispatching state immediately before the backend handoff —
-        // after every pre-handoff gate has passed.  This is the irreversible
-        // boundary: a cancel past this point is `DispatchUnknown`, never an
-        // auto-retry (AC10).
-        self.dispatch_states
-            .insert(call_id.to_string(), DispatchState::Dispatching);
-
         // ExternalJournal prepare→dispatching→complete around the physical
         // backend.execute handoff (AC15/AC16). For physical targets
         // (host_lease is Some), the handoff journal is required — fail closed
         // with zero input if unavailable. Virtual/test targets may omit it.
         let handoff_ticket = if self.host_lease.is_some() {
             let journal = match self.handoff_journal.as_ref() {
-                Some(j) => j,
+                Some(j) => Arc::clone(j),
                 None => {
                     tracing::error!(
                         "physical computer handoff without an ExternalJournal — \
@@ -2617,6 +2579,17 @@ impl ComputerActionCoordinator {
             );
             match journal.prepare(&target_digest, actions.len() as u32).await {
                 Ok(ticket) => {
+                    // `prepare` is reversible and may await storage. Recheck
+                    // target/lease currency after it returns and before the
+                    // journal's irreversible dispatching transition.
+                    if let Err(reason) = self.pre_handoff_check() {
+                        self.dispatch_states
+                            .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                        return ExecuteArtifacts {
+                            outcome: CoordinatedOutcome::Invalidated { reason },
+                            live_frame: None,
+                        };
+                    }
                     // begin_dispatch is the only proof backend.execute may
                     // proceed. If it fails, fail closed with zero input.
                     if let Err(err) = journal.begin_dispatch(&ticket).await {
@@ -2651,6 +2624,12 @@ impl ComputerActionCoordinator {
         } else {
             None
         };
+
+        // All reversible admission gates, including durable journal prepare
+        // and its dispatching transition, have now succeeded. Commit the
+        // coordinator's irreversible state immediately before backend input.
+        self.dispatch_states
+            .insert(call_id.to_string(), DispatchState::Dispatching);
 
         // Execute through the backend.
         let report: ComputerBatchReport = self.backend.execute(actions).await;
@@ -3319,11 +3298,10 @@ impl ComputerActionCoordinator {
             }
             Err(()) => {
                 // identity_conflict — same identity, different payload.
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
+                let outcome = CoordinatedOutcome::IdentityConflict { identity };
+                // Preserve the first committed identity digest and receipt as
+                // the replay authority. A conflicting attempt is terminal for
+                // this invocation but must never replace the original record.
                 return outcome;
             }
         }
@@ -3525,11 +3503,7 @@ impl ComputerActionCoordinator {
                 };
             }
             Err(()) => {
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
+                let outcome = CoordinatedOutcome::IdentityConflict { identity };
                 return outcome;
             }
         }
@@ -3671,11 +3645,7 @@ impl ComputerActionCoordinator {
                 };
             }
             Err(()) => {
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
+                let outcome = CoordinatedOutcome::IdentityConflict { identity };
                 return outcome;
             }
         }
@@ -4085,11 +4055,18 @@ impl NativeResponseExtractor {
             if item.get("name").and_then(serde_json::Value::as_str) != Some("computer") {
                 continue;
             }
-            let tool_use_id = item
+            let Some(tool_use_id) = item
                 .get("id")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+            else {
+                results.push(NativeComputerCall::UnsupportedVariant {
+                    provider,
+                    detail: "native computer tool_use is missing a non-empty id".to_string(),
+                });
+                continue;
+            };
             let input = item
                 .get("input")
                 .cloned()

@@ -1247,6 +1247,7 @@ pub(super) fn native_computer_beta_headers(params: &ModelParams) -> Vec<&'static
     params
         .native_computer
         .as_ref()
+        .filter(|computer| computer.geometry.is_some())
         .map(|computer| computer.wire().beta_headers)
         .unwrap_or_default()
 }
@@ -1259,7 +1260,7 @@ fn merge_native_computer_tools(
     let Some(native_computer) = params
         .native_computer
         .as_ref()
-        .filter(|computer| accepts_contract(computer.contract))
+        .filter(|computer| computer.geometry.is_some() && accepts_contract(computer.contract))
     else {
         return vendor;
     };

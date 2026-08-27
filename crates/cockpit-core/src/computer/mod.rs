@@ -55,27 +55,6 @@ pub struct DisplayGeometry {
     pub scale_factor: ScaleFactor,
 }
 
-impl DisplayGeometry {
-    /// Zero geometry — used only as a wire placeholder when the coordinator
-    /// has not yet opened (candidate scan).  Production replaces it with the
-    /// real backend-reported geometry at the open-before-advertise step.
-    /// The coordinator rejects zero geometry with
-    /// [`coordinator::CoordinatorOpenError::ZeroGeometry`].
-    pub fn zero() -> Self {
-        Self {
-            physical: PixelSize {
-                width: 0,
-                height: 0,
-            },
-            logical: LogicalSize {
-                width: 0.0,
-                height: 0.0,
-            },
-            scale_factor: ScaleFactor(1.0),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelSize {
     pub width: u32,
@@ -1461,9 +1440,9 @@ pub struct NativeComputerToolConfig {
     ///
     /// Candidate/reachability scans construct this config with `geometry:
     /// None` and must NOT call full [`coordinator::ComputerActionCoordinator::open`]
-    /// or acquire the host lock.  The wire builder falls back to 0×0 for
-    /// `None`, but production must replace `None` with `Some(opened.geometry)`
-    /// before the first model request that would advertise the tool
+    /// or acquire the host lock. Request assembly suppresses this config until
+    /// production replaces `None` with `Some(opened.geometry)` before the
+    /// first model request that would advertise the tool
     /// (open-before-advertise).  If open fails, `native_computer` stays
     /// `None` entirely (AC17/AC18/AC19).
     pub geometry: Option<DisplayGeometry>,
@@ -1477,10 +1456,11 @@ pub struct NativeComputerToolConfig {
 
 impl NativeComputerToolConfig {
     pub fn wire(&self) -> NativeComputerWire {
-        match &self.geometry {
-            Some(g) => native_computer_wire(self.contract, g),
-            None => native_computer_wire(self.contract, &DisplayGeometry::zero()),
-        }
+        let geometry = self
+            .geometry
+            .as_ref()
+            .expect("native computer wire requested before coordinator open");
+        native_computer_wire(self.contract, geometry)
     }
 }
 

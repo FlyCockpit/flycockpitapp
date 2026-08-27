@@ -1755,7 +1755,12 @@ impl Driver {
         }
         let mut wire = Vec::new();
         if contract == crate::computer::ComputerToolContract::OpenAiResponses {
-            wire.extend(raw_items);
+            wire.extend(raw_items.into_iter().filter(|item| {
+                item.get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+            }));
         }
         wire.extend(computer_native::into_wire_items(continuations));
         frame.pending_computer_continuations.extend(wire);

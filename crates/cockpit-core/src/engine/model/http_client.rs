@@ -96,14 +96,159 @@ fn apply_extra_headers<T>(
     rig::http_client::Request::from_parts(parts, body)
 }
 
-fn inject_native_computer_continuations(bytes: bytes::Bytes) -> bytes::Bytes {
-    let continuations = super::native_computer_continuations();
-    if continuations.is_empty() {
-        return bytes;
+fn retain_anthropic_native_items_from_response(bytes: &[u8]) {
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let Some(content) = body.get("content").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for item in content {
+        if item.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+            && item.get("name").and_then(serde_json::Value::as_str) == Some("computer")
+        {
+            super::retain_native_computer_item(item.clone());
+        }
     }
+}
+
+#[derive(Default)]
+struct AnthropicNativeStreamCapture {
+    blocks: std::collections::HashMap<u64, AnthropicNativeToolBlock>,
+}
+
+struct AnthropicNativeToolBlock {
+    id: Option<String>,
+    input: serde_json::Value,
+    partial_json: String,
+}
+
+impl AnthropicNativeStreamCapture {
+    /// Assemble native computer blocks from Anthropic's raw SSE events at the
+    /// provider boundary. Generic Rig `ToolCall` JSON is never an extraction
+    /// source for this path.
+    fn ingest(&mut self, bytes: &[u8]) {
+        for line in bytes.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let Some(data) = line.strip_prefix(b"data:") else {
+                continue;
+            };
+            let data = data.strip_prefix(b" ").unwrap_or(data);
+            if data == b"[DONE]" {
+                continue;
+            }
+            let Ok(event) = serde_json::from_slice::<serde_json::Value>(data) else {
+                continue;
+            };
+            let Some(index) = event.get("index").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            match event.get("type").and_then(serde_json::Value::as_str) {
+                Some("content_block_start") => {
+                    let Some(block) = event.get("content_block") else {
+                        continue;
+                    };
+                    if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use")
+                        || block.get("name").and_then(serde_json::Value::as_str) != Some("computer")
+                    {
+                        continue;
+                    }
+                    self.blocks.insert(
+                        index,
+                        AnthropicNativeToolBlock {
+                            id: block
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                            input: block
+                                .get("input")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                            partial_json: String::new(),
+                        },
+                    );
+                }
+                Some("content_block_delta") => {
+                    let Some(block) = self.blocks.get_mut(&index) else {
+                        continue;
+                    };
+                    if let Some(partial) = event
+                        .get("delta")
+                        .and_then(|delta| delta.get("partial_json"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        block.partial_json.push_str(partial);
+                    }
+                }
+                Some("content_block_stop") => {
+                    let Some(block) = self.blocks.remove(&index) else {
+                        continue;
+                    };
+                    let input = if block.partial_json.is_empty() {
+                        block.input
+                    } else {
+                        serde_json::from_str(&block.partial_json).unwrap_or(serde_json::Value::Null)
+                    };
+                    let mut item = serde_json::json!({
+                        "type": "tool_use",
+                        "name": "computer",
+                        "input": input,
+                    });
+                    if let Some(id) = block.id {
+                        item["id"] = serde_json::Value::String(id);
+                    }
+                    super::retain_native_computer_item(item);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn inject_native_computer_continuations(bytes: bytes::Bytes) -> bytes::Bytes {
     let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return bytes;
     };
+    let native_tool_type = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tools| {
+            tools.iter().find_map(|tool| {
+                tool.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|tool_type| {
+                        crate::computer::is_reserved_native_computer_tool_name(tool_type)
+                    })
+            })
+        });
+    let target = if native_tool_type == Some(crate::computer::OPENAI_COMPUTER_TOOL_TYPE)
+        && body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+    {
+        Some(super::NativeComputerContinuationWire::OpenAiResponses)
+    } else if (native_tool_type == Some(crate::computer::ANTHROPIC_COMPUTER_TOOL_TYPE_20251124)
+        || native_tool_type == Some(crate::computer::ANTHROPIC_COMPUTER_TOOL_TYPE_20250124))
+        && body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|messages| messages.last())
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+    {
+        Some(super::NativeComputerContinuationWire::AnthropicMessages)
+    } else {
+        None
+    };
+    let Some(target) = target else {
+        return bytes;
+    };
+    let continuations = super::take_native_computer_continuations(target);
+    if continuations.is_empty() {
+        return bytes;
+    }
     if let Some(input) = body
         .get_mut("input")
         .and_then(serde_json::Value::as_array_mut)
@@ -153,6 +298,7 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
             let (parts, body) = response.into_parts();
             let body: rig::http_client::LazyBody<U> = Box::pin(async move {
                 let bytes = body.await?;
+                retain_anthropic_native_items_from_response(&bytes);
                 Ok(U::from(normalize_openai_usage_aliases_bytes(bytes)))
             });
             Ok(rig::http_client::Response::from_parts(parts, body))
@@ -202,8 +348,13 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
                         >,
                 >,
             > = Box::pin(futures::stream::unfold(
-                (body, Vec::<u8>::new(), false),
-                |(mut body, mut pending, aborted)| async move {
+                (
+                    body,
+                    Vec::<u8>::new(),
+                    false,
+                    AnthropicNativeStreamCapture::default(),
+                ),
+                |(mut body, mut pending, aborted, mut native_capture)| async move {
                     // A prior iteration hit the no-newline cap and yielded a
                     // terminal error; end the stream rather than spin.
                     if aborted {
@@ -212,7 +363,8 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
                     loop {
                         let normalized = take_normalized_sse_lines(&mut pending, false);
                         if !normalized.is_empty() {
-                            return Some((Ok(normalized), (body, pending, false)));
+                            native_capture.ingest(&normalized);
+                            return Some((Ok(normalized), (body, pending, false, native_capture)));
                         }
                         match body.next().await {
                             Some(Ok(bytes)) => {
@@ -227,14 +379,25 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
                                             ),
                                         ),
                                     ));
-                                    return Some((Err(error), (body, pending, true)));
+                                    return Some((
+                                        Err(error),
+                                        (body, pending, true, native_capture),
+                                    ));
                                 }
                             }
-                            Some(Err(e)) => return Some((Err(e), (body, pending, false))),
+                            Some(Err(e)) => {
+                                return Some((Err(e), (body, pending, false, native_capture)));
+                            }
                             None => {
                                 let normalized = take_normalized_sse_lines(&mut pending, true);
-                                return (!normalized.is_empty())
-                                    .then_some((Ok(normalized), (body, pending, false)));
+                                if normalized.is_empty() {
+                                    return None;
+                                }
+                                native_capture.ingest(&normalized);
+                                return Some((
+                                    Ok(normalized),
+                                    (body, pending, false, native_capture),
+                                ));
                             }
                         }
                     }
@@ -242,5 +405,61 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
             ));
             Ok(rig::http_client::Response::from_parts(parts, stream))
         }
+    }
+}
+
+#[cfg(test)]
+mod native_computer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn anthropic_native_stream_capture_retains_raw_provider_block() {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::engine::model::capture_native_computer_items(sink.clone(), async {
+            let mut capture = AnthropicNativeStreamCapture::default();
+            capture.ingest(
+                br#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu-raw","name":"computer","input":{}}}
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"action\":\"screenshot\"}"}}
+data: {"type":"content_block_stop","index":2}
+"#,
+            );
+        })
+        .await;
+
+        let retained = sink.lock().unwrap().clone();
+        assert_eq!(
+            retained,
+            vec![serde_json::json!({
+                "type": "tool_use",
+                "id": "toolu-raw",
+                "name": "computer",
+                "input": {"action": "screenshot"},
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_continuation_is_consumed_once_and_never_crosses_wire_api() {
+        let continuation = serde_json::json!({
+            "type": "computer_call_output",
+            "call_id": "call-once",
+            "output": {"type": "text", "text": "done"},
+        });
+        crate::engine::model::with_native_computer_continuations(vec![continuation], async {
+            let anthropic = bytes::Bytes::from_static(
+                br#"{"messages":[{"role":"user","content":[]}],"tools":[{"type":"computer_20251124","name":"computer"}]}"#,
+            );
+            let incompatible = inject_native_computer_continuations(anthropic.clone());
+            assert_eq!(incompatible, anthropic);
+
+            let openai =
+                bytes::Bytes::from_static(br#"{"input":[],"tools":[{"type":"computer"}]}"#);
+            let first = inject_native_computer_continuations(openai.clone());
+            assert!(String::from_utf8_lossy(&first).contains("call-once"));
+
+            let retry = inject_native_computer_continuations(openai.clone());
+            assert_eq!(retry, openai);
+        })
+        .await;
     }
 }

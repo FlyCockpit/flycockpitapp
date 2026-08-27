@@ -330,6 +330,13 @@ pub async fn turn_with_backup(
                 ),
             )
             .await;
+            if result.is_err() {
+                // Continuations are addressed to the immediately-following
+                // primary provider request only. If that attempt fails, never
+                // let an unconsumed batch cross into a credential retry,
+                // endpoint retry, or backup/failover provider.
+                crate::engine::model::clear_native_computer_continuations();
+            }
             if result.is_ok() {
                 let retained = native_items
                     .lock()

@@ -210,7 +210,7 @@ type CompleteOut = (Option<String>, Vec<AssistantContent>, Option<TokenUsage>);
 
 tokio::task_local! {
     static NATIVE_COMPUTER_ITEMS: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
-    static NATIVE_COMPUTER_CONTINUATIONS: Vec<serde_json::Value>;
+    static NATIVE_COMPUTER_CONTINUATIONS: std::sync::Mutex<Option<Vec<serde_json::Value>>>;
 }
 
 pub(crate) async fn with_native_computer_continuations<F: std::future::Future>(
@@ -218,14 +218,58 @@ pub(crate) async fn with_native_computer_continuations<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     NATIVE_COMPUTER_CONTINUATIONS
-        .scope(continuations, future)
+        .scope(std::sync::Mutex::new(Some(continuations)), future)
         .await
 }
 
-pub(crate) fn native_computer_continuations() -> Vec<serde_json::Value> {
+#[derive(Clone, Copy)]
+pub(super) enum NativeComputerContinuationWire {
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
+/// Consume the transient continuation batch for its one permitted provider
+/// request. A batch is deliberately not cloned: retries and backup-model
+/// attempts must never receive another provider's call/output IDs or pixels.
+pub(super) fn take_native_computer_continuations(
+    wire: NativeComputerContinuationWire,
+) -> Vec<serde_json::Value> {
     NATIVE_COMPUTER_CONTINUATIONS
-        .try_with(Clone::clone)
+        .try_with(|slot| {
+            let Ok(mut slot) = slot.lock() else {
+                return Vec::new();
+            };
+            let compatible = slot.as_ref().is_some_and(|items| {
+                !items.is_empty()
+                    && items.iter().all(|item| {
+                        let item_type = item.get("type").and_then(serde_json::Value::as_str);
+                        match wire {
+                            NativeComputerContinuationWire::OpenAiResponses => {
+                                matches!(item_type, Some("computer_call" | "computer_call_output"))
+                            }
+                            NativeComputerContinuationWire::AnthropicMessages => {
+                                item_type == Some("tool_result")
+                            }
+                        }
+                    })
+            });
+            if compatible {
+                slot.take().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        })
         .unwrap_or_default()
+}
+
+/// Abandon an unconsumed native continuation before any retry/fallback can
+/// cross the provider boundary with stale provider-specific state.
+pub(crate) fn clear_native_computer_continuations() {
+    let _ = NATIVE_COMPUTER_CONTINUATIONS.try_with(|slot| {
+        if let Ok(mut slot) = slot.lock() {
+            *slot = None;
+        }
+    });
 }
 
 pub(crate) async fn capture_native_computer_items<F: std::future::Future>(
@@ -238,7 +282,27 @@ pub(crate) async fn capture_native_computer_items<F: std::future::Future>(
 pub(crate) fn retain_native_computer_item(item: serde_json::Value) {
     let _ = NATIVE_COMPUTER_ITEMS.try_with(|sink| {
         if let Ok(mut items) = sink.lock() {
-            items.push(item);
+            let item_type = item.get("type").and_then(serde_json::Value::as_str);
+            let item_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(serde_json::Value::as_str);
+            let duplicate = items.iter().any(|existing| {
+                let existing_type = existing.get("type").and_then(serde_json::Value::as_str);
+                let existing_id = existing
+                    .get("call_id")
+                    .or_else(|| existing.get("id"))
+                    .and_then(serde_json::Value::as_str);
+                item_type == existing_type
+                    && match (item_id, existing_id) {
+                        (Some(item_id), Some(existing_id)) => item_id == existing_id,
+                        (None, None) => existing == &item,
+                        _ => false,
+                    }
+            });
+            if !duplicate {
+                items.push(item);
+            }
         }
     });
 }

@@ -1909,20 +1909,34 @@ pub enum BatchItemOutcome {
     IdentityConflict,
 }
 
+/// Pixel-free durable projection of one backend action result.
+///
+/// [`ComputerActionOutcome`] can own a raw capture buffer and therefore must
+/// never be embedded in the cloneable coordinator receipt. Live pixels leave
+/// dispatch only through [`ExecuteArtifacts::live_frame`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SanitizedComputerActionOutcome {
+    Captured {
+        frame: Option<SanitizedComputerFrame>,
+    },
+    Completed,
+    Waited(std::time::Duration),
+}
+
 /// The terminal outcome of a single coordinated computer action.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CoordinatedOutcome {
     /// The action completed successfully, with outcomes and an optional
     /// sanitized screenshot.
     Completed {
-        completed: Vec<ComputerActionOutcome>,
+        completed: Vec<SanitizedComputerActionOutcome>,
         screenshot: Option<SanitizedComputerFrame>,
     },
     /// The backend completed the input but the semantic outcome is unverified.
     /// This is `backend_completed`, not `verified_success` — the provider/agent
     /// interprets the observation. No automatic retry.
     BackendCompleted {
-        completed: Vec<ComputerActionOutcome>,
+        completed: Vec<SanitizedComputerActionOutcome>,
         screenshot: Option<SanitizedComputerFrame>,
     },
     /// The action failed at the backend.
@@ -2484,37 +2498,25 @@ impl ComputerActionCoordinator {
         call_id: &str,
         receipts: &[(ActionIdentity, ActionPayloadDigest)],
     ) -> Option<CoordinatedOutcome> {
-        let mut replayed = 0_usize;
         // Batch index zero carries the digest of the entire canonical batch,
         // making this single atomic insert the ownership claim for every item.
         // This avoids cross-process partial-claim deadlocks while later rows
         // retain per-item replay detail.
-        for (identity, digest) in receipts.iter().take(1) {
-            match self.journal.check_identity(identity, digest) {
-                Ok(true) => {}
-                Ok(false) => replayed += 1,
-                Err(()) => {
-                    return Some(CoordinatedOutcome::IdentityConflict {
-                        identity: identity.clone(),
-                    });
-                }
-            }
-        }
-        if replayed == receipts.len() && !receipts.is_empty() {
-            return Some(CoordinatedOutcome::DuplicateReplay {
+        let (identity, digest) = receipts.first()?;
+        match self.journal.check_identity(identity, digest) {
+            Ok(true) => None,
+            Ok(false) => Some(CoordinatedOutcome::DuplicateReplay {
                 prior_outcome: Box::new(
                     self.journal
                         .lookup(call_id)
                         .cloned()
                         .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
                 ),
-            });
+            }),
+            Err(()) => Some(CoordinatedOutcome::IdentityConflict {
+                identity: identity.clone(),
+            }),
         }
-        if replayed != 0 {
-            let identity = receipts[replayed].0.clone();
-            return Some(CoordinatedOutcome::IdentityConflict { identity });
-        }
-        None
     }
 
     async fn reserve_action_receipts(
@@ -2620,22 +2622,12 @@ impl ComputerActionCoordinator {
                     // physical targets this stays `None` (they scope by host
                     // lease).
                     virtual_display_uuid = evidence.virtual_display_uuid;
-                    // If physical (not virtual) AND an arbiter is present, take
-                    // the host lock now and hold it for the coordinator's
-                    // lifetime.
-                    //
-                    // DEFERRED ENFORCEMENT (AC5/AC20 — live-loop production
-                    // wiring): *requiring* that a physical open hold the host
-                    // arbiter lock (i.e. failing closed when `host_arbiter` is
-                    // `None`) belongs to the live open-before-advertise path,
-                    // not to this lock-mechanism increment. This increment lands
-                    // the `FileAdvisoryLock` + FIFO `WaitHandle` MECHANISM
-                    // additively — exactly like the already-landed AC9
-                    // authorization increment (mechanism now, enforcement when
-                    // the live open-path lands). Until then, a physical open
-                    // with no arbiter proceeds unlocked (no caller regression);
-                    // callers that DO pass an arbiter get real serialization,
-                    // FIFO promotion, and fail-closed-on-queue below.
+                    // Physical opens must take the host lock now and hold it
+                    // for the coordinator lifetime. The production physical
+                    // composition supplies a FileAdvisoryLock-backed arbiter;
+                    // missing composition fails closed below. Virtual displays
+                    // are local to one delegation and intentionally take no
+                    // host-global lock.
                     if backend_kind != BackendKind::VirtualDisplay {
                         let physical_key = evidence.physical_target_key().map_err(|_| {
                             CoordinatorOpenError::PhysicalCompositionMissing(
@@ -3044,26 +3036,97 @@ impl ComputerActionCoordinator {
         if self.pre_handoff_check().is_err() {
             return ExecuteArtifacts {
                 outcome: CoordinatedOutcome::Completed {
-                    completed: report.completed,
+                    completed: self
+                        .sanitize_backend_outcomes(call_id, report.completed, false)
+                        .0,
                     screenshot: None,
                 },
                 live_frame: None,
             };
         }
 
-        // Capture a screenshot (transient frame through the boundary).
-        let (screenshot, live_frame) = self.capture_screenshot(call_id).await;
+        // Remove pixels from every batch result before it can enter the
+        // cloneable outcome or either journal. If the action itself captured a
+        // frame, retain only its latest live owner and avoid a duplicate
+        // CaptureFull call.
+        let (completed, captured_screenshot, captured_live_frame) =
+            self.sanitize_backend_outcomes(call_id, report.completed, true);
+        let (screenshot, live_frame) = if captured_live_frame.is_some() {
+            (captured_screenshot, captured_live_frame)
+        } else {
+            self.capture_screenshot(call_id).await
+        };
 
         // Backend completion is not semantic success (the prompt calls this
         // `backend_completed`). The provider/agent interprets the observation.
         // No automatic retry. The `Completed` variant IS `backend_completed`.
         ExecuteArtifacts {
             outcome: CoordinatedOutcome::Completed {
-                completed: report.completed,
+                completed,
                 screenshot,
             },
             live_frame,
         }
+    }
+
+    fn sanitize_backend_outcomes(
+        &self,
+        call_id: &str,
+        outcomes: Vec<ComputerActionOutcome>,
+        retain_capture: bool,
+    ) -> (
+        Vec<SanitizedComputerActionOutcome>,
+        Option<SanitizedComputerFrame>,
+        Option<LiveComputerFrame>,
+    ) {
+        let mut sanitized = Vec::with_capacity(outcomes.len());
+        let mut latest_projection = None;
+        let mut latest_live = None;
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            match outcome {
+                ComputerActionOutcome::Captured(capture_frame) if retain_capture => {
+                    let dimensions = FrameDimensions::from_capture(&capture_frame);
+                    let byte_count = capture_frame.png.len();
+                    let reservation: Box<dyn MediaReservationHandle> =
+                        Box::new(InMemoryReservationHandle::new(Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        )));
+                    let live = LiveComputerFrame::try_new(
+                        capture_frame.png,
+                        ScreenshotMediaType::Png,
+                        dimensions,
+                        ObservationId(call_id.to_string()),
+                        ActionId(format!("{call_id}:{index}")),
+                        CaptureEpoch(self.observation_generation.0),
+                        reservation,
+                        None,
+                    )
+                    .ok();
+                    let projection = live.as_ref().map(LiveComputerFrame::sanitized);
+                    if projection.is_none() {
+                        tracing::warn!(
+                            byte_count,
+                            "backend capture could not cross the transient frame boundary"
+                        );
+                    }
+                    sanitized.push(SanitizedComputerActionOutcome::Captured {
+                        frame: projection.clone(),
+                    });
+                    latest_projection = projection;
+                    latest_live = live;
+                }
+                ComputerActionOutcome::Captured(_) => {
+                    sanitized.push(SanitizedComputerActionOutcome::Captured { frame: None });
+                }
+                ComputerActionOutcome::Completed => {
+                    sanitized.push(SanitizedComputerActionOutcome::Completed);
+                }
+                ComputerActionOutcome::Waited(duration) => {
+                    sanitized.push(SanitizedComputerActionOutcome::Waited(duration));
+                }
+            }
+        }
+        (sanitized, latest_projection, latest_live)
     }
 
     /// Capture a screenshot through the screenshot boundary. Returns the
@@ -3078,6 +3141,12 @@ impl ComputerActionCoordinator {
             Ok(c) => c,
             Err(_) => return (None, None),
         };
+        // A host lease or target can become stale while CaptureFull is
+        // awaiting. Discard both the live frame and its durable projection on
+        // that race; the already-completed input is never retried.
+        if self.pre_handoff_check().is_err() {
+            return (None, None);
+        }
         let ComputerActionOutcome::Captured(capture_frame) = capture else {
             return (None, None);
         };
@@ -4246,6 +4315,9 @@ pub enum NativeComputerCall {
     /// backend input.
     UnsupportedVariant {
         provider: NativeProvider,
+        /// Provider address for the malformed item, when the provider supplied
+        /// one. Unsupported outputs must never invent an `unknown` address.
+        provider_call_id: Option<String>,
         detail: String,
     },
 }
@@ -4277,7 +4349,10 @@ pub enum NativeComputerContinuation {
     /// touched.
     Unsupported {
         provider: NativeProvider,
-        wire_payload: serde_json::Value,
+        /// `None` when the malformed provider item had no usable address. In
+        /// that case the driver omits the output instead of sending an invalid
+        /// `call_id` / `tool_use_id` back to the provider.
+        wire_payload: Option<serde_json::Value>,
     },
     /// A text-only continuation (no screenshot, e.g. on failure or denial).
     TextOnly {
@@ -4351,6 +4426,12 @@ impl NativeResponseExtractor {
                         // Malformed computer_call — return as unsupported variant.
                         results.push(NativeComputerCall::UnsupportedVariant {
                             provider: NativeProvider::OpenAi,
+                            provider_call_id: item
+                                .get("call_id")
+                                .or_else(|| item.get("id"))
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .map(str::to_string),
                             detail: err.to_string(),
                         });
                     }
@@ -4393,6 +4474,7 @@ impl NativeResponseExtractor {
             else {
                 results.push(NativeComputerCall::UnsupportedVariant {
                     provider,
+                    provider_call_id: None,
                     detail: "native computer tool_use is missing a non-empty id".to_string(),
                 });
                 continue;
@@ -4413,6 +4495,7 @@ impl NativeResponseExtractor {
                         Err(err) => {
                             results.push(NativeComputerCall::UnsupportedVariant {
                                 provider,
+                                provider_call_id: Some(tool_use_id),
                                 detail: err.to_string(),
                             });
                         }
@@ -4429,6 +4512,7 @@ impl NativeResponseExtractor {
                         Err(err) => {
                             results.push(NativeComputerCall::UnsupportedVariant {
                                 provider,
+                                provider_call_id: Some(tool_use_id),
                                 detail: err.to_string(),
                             });
                         }
@@ -4546,14 +4630,14 @@ impl NativeResponseExtractor {
                     CoordinatedOutcome::UnsupportedProviderVariant { detail } => {
                         NativeComputerContinuation::Unsupported {
                             provider: NativeProvider::OpenAi,
-                            wire_payload: serde_json::json!({
+                            wire_payload: Some(serde_json::json!({
                                 "type": "computer_call_output",
                                 "call_id": call_id,
                                 "output": {
                                     "type": "text",
                                     "text": format!("unsupported computer action: {detail}"),
                                 },
-                            }),
+                            })),
                         }
                     }
                 }
@@ -4576,11 +4660,15 @@ impl NativeResponseExtractor {
                     live_frame,
                 )
             }
-            NativeComputerCall::UnsupportedVariant { provider, detail } => {
-                let wire_payload = match provider {
+            NativeComputerCall::UnsupportedVariant {
+                provider,
+                provider_call_id,
+                detail,
+            } => {
+                let wire_payload = provider_call_id.as_ref().map(|provider_call_id| match provider {
                     NativeProvider::OpenAi => serde_json::json!({
                         "type": "computer_call_output",
-                        "call_id": "unknown",
+                        "call_id": provider_call_id,
                         "output": {
                             "type": "text",
                             "text": format!("unsupported computer action: {detail}"),
@@ -4588,10 +4676,10 @@ impl NativeResponseExtractor {
                     }),
                     _ => serde_json::json!({
                         "type": "tool_result",
-                        "tool_use_id": "unknown",
+                        "tool_use_id": provider_call_id,
                         "content": [{"type": "text", "text": format!("unsupported computer action: {detail}")}],
                     }),
-                };
+                });
                 NativeComputerContinuation::Unsupported {
                     provider: *provider,
                     wire_payload,
@@ -4661,11 +4749,11 @@ impl NativeResponseExtractor {
             CoordinatedOutcome::UnsupportedProviderVariant { detail } => {
                 NativeComputerContinuation::Unsupported {
                     provider,
-                    wire_payload: serde_json::json!({
+                    wire_payload: Some(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
                         "content": [{"type": "text", "text": format!("unsupported computer action: {detail}")}],
-                    }),
+                    })),
                 }
             }
         }
@@ -4739,6 +4827,33 @@ mod tests {
             [4u8; 16],
             1234,
         )
+    }
+
+    /// Physical-kind backend fixture for tests that must exercise the real
+    /// host-lock composition rather than fail earlier on a virtual/physical
+    /// evidence mismatch.
+    struct PhysicalFakeBackend(FakeBackend);
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for PhysicalFakeBackend {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::RealDesktopX11
+        }
+
+        async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+            self.0.geometry().await
+        }
+
+        async fn execute_one(
+            &mut self,
+            action: &ComputerAction,
+        ) -> Result<ComputerActionOutcome, ComputerError> {
+            self.0.execute_one(action).await
+        }
+
+        async fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.0.release_all().await
+        }
     }
 
     #[test]
@@ -5496,6 +5611,25 @@ mod tests {
             OwnerInstance(1),
         )));
         let key = physical_key();
+        let db = crate::db::Db::open(&tmp.path().join("computer-outcomes.db"))
+            .expect("open durable outcome database");
+        let outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> = Arc::new(
+            super::super::outcome_store::SqliteOutcomeStore::new(db.clone()),
+        );
+        let spool = crate::external_journal::spool::Spool::open_at(
+            &tmp.path().join("external-journal"),
+            crate::external_journal::spool::SpoolAccess::Create,
+        )
+        .expect("open durable handoff spool");
+        let keys = crate::external_journal::keys::SpoolKeyRing::for_test(&[(1, [0x51; 32])], 1)
+            .expect("test handoff key ring");
+        let journal = Arc::new(crate::external_journal::ExternalJournal::new(
+            db, spool, keys,
+        ));
+        let handoff_journal: Arc<dyn HandoffJournal> = Arc::new(ExternalJournalHandoff::new(
+            journal,
+            crate::external_journal::projection::SafeToken::for_session(uuid::Uuid::new_v4()),
+        ));
 
         // First delegation opens and acquires the host lease via a real lock.
         let params_a = CoordinatorParams {
@@ -5510,13 +5644,15 @@ mod tests {
             )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
+            outcome_store: Some(outcome_store.clone()),
+            handoff_journal: Some(handoff_journal.clone()),
         };
-        let mut coordinator_a =
-            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_a)
-                .await
-                .expect("first open acquires the host lease");
+        let mut coordinator_a = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params_a,
+        )
+        .await
+        .expect("first open acquires the host lease");
         assert!(arbiter.lock().unwrap().is_held(&key));
 
         // Second delegation contends: `open` maps it to `HostLockQueued` and
@@ -5533,11 +5669,14 @@ mod tests {
             )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
+            outcome_store: Some(outcome_store),
+            handoff_journal: Some(handoff_journal),
         };
-        let result_b =
-            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_b).await;
+        let result_b = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params_b,
+        )
+        .await;
         assert!(matches!(
             result_b,
             Err(CoordinatorOpenError::HostLockQueued)
@@ -6039,6 +6178,7 @@ mod tests {
         // Simulate an unsupported variant.
         let call = NativeComputerCall::UnsupportedVariant {
             provider: NativeProvider::OpenAi,
+            provider_call_id: Some("call-unsupported".to_string()),
             detail: "unknown action type `foo`".to_string(),
         };
         let outcome = CoordinatedOutcome::UnsupportedProviderVariant {
@@ -6051,6 +6191,7 @@ mod tests {
                 wire_payload,
             } => {
                 assert_eq!(provider, NativeProvider::OpenAi);
+                let wire_payload = wire_payload.expect("known provider call id is addressable");
                 assert!(
                     wire_payload["output"]["text"]
                         .as_str()
@@ -6060,6 +6201,19 @@ mod tests {
             }
             other => panic!("expected unsupported continuation, got {other:?}"),
         }
+
+        let unaddressed = NativeComputerCall::UnsupportedVariant {
+            provider: NativeProvider::Anthropic20251124,
+            provider_call_id: None,
+            detail: "missing tool_use id".to_string(),
+        };
+        assert!(matches!(
+            NativeResponseExtractor::build_continuation(&unaddressed, &outcome, None),
+            NativeComputerContinuation::Unsupported {
+                wire_payload: None,
+                ..
+            }
+        ));
     }
 
     // =====================================================================
@@ -6080,7 +6234,16 @@ mod tests {
             .await;
 
         match outcome {
-            CoordinatedOutcome::Completed { screenshot, .. } => {
+            CoordinatedOutcome::Completed {
+                completed,
+                screenshot,
+            } => {
+                assert!(matches!(
+                    completed.as_slice(),
+                    [SanitizedComputerActionOutcome::Captured { frame: Some(_) }]
+                ));
+                let completed_json = serde_json::to_string(&completed).unwrap();
+                assert!(!completed_json.contains("[137,80,78,71]"));
                 let sanitized = screenshot.expect("screenshot should be present");
                 // The sanitized projection is serializable and contains no pixel data.
                 let proj_json = serde_json::to_string(&sanitized).unwrap();

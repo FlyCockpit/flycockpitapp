@@ -2362,16 +2362,6 @@ where
                     crate::engine::model::retain_native_computer_item(value.clone());
                 }
             }
-            StreamedAssistantContent::ToolCall {
-                tool_call: call, ..
-            } if call.function.name == "computer" => {
-                crate::engine::model::retain_native_computer_item(serde_json::json!({
-                    "type": "tool_use",
-                    "id": call.id.to_string(),
-                    "name": call.function.name,
-                    "input": call.function.arguments,
-                }));
-            }
             // ToolCallDelta / ordinary ToolCall / Final are aggregated into
             // `stream.choice` / `stream.message_id` internally; the
             // post-loop reads pick them up.

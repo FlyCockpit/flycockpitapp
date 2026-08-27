@@ -58,16 +58,16 @@ pub async fn handle_native_computer_items(
 pub fn into_wire_items(continuations: Vec<NativeComputerContinuation>) -> Vec<serde_json::Value> {
     continuations
         .into_iter()
-        .map(|continuation| match continuation {
+        .filter_map(|continuation| match continuation {
             NativeComputerContinuation::OpenAi { call_id, transient } => transient.map_or_else(
                 || {
-                    serde_json::json!({
+                    Some(serde_json::json!({
                         "type": "computer_call_output",
                         "call_id": call_id,
                         "output": { "type": "text", "text": "screenshot unavailable" }
-                    })
+                    }))
                 },
-                |transient| transient.with_wire(Clone::clone).0,
+                |transient| Some(transient.with_wire(Clone::clone).0),
             ),
             NativeComputerContinuation::Anthropic {
                 tool_use_id,
@@ -75,13 +75,13 @@ pub fn into_wire_items(continuations: Vec<NativeComputerContinuation>) -> Vec<se
                 ..
             } => transient.map_or_else(
                 || {
-                    serde_json::json!({
+                    Some(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
                         "content": [{"type": "text", "text": "screenshot unavailable"}]
-                    })
+                    }))
                 },
-                |transient| transient.with_wire(Clone::clone).0,
+                |transient| Some(transient.with_wire(Clone::clone).0),
             ),
             NativeComputerContinuation::Unsupported { wire_payload, .. } => wire_payload,
             NativeComputerContinuation::TextOnly {
@@ -89,16 +89,16 @@ pub fn into_wire_items(continuations: Vec<NativeComputerContinuation>) -> Vec<se
                 text,
                 provider,
             } => match provider {
-                crate::computer::coordinator::NativeProvider::OpenAi => serde_json::json!({
+                crate::computer::coordinator::NativeProvider::OpenAi => Some(serde_json::json!({
                     "type": "computer_call_output",
                     "call_id": call_id,
                     "output": { "type": "text", "text": text }
-                }),
-                _ => serde_json::json!({
+                })),
+                _ => Some(serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": call_id,
                     "content": [{"type": "text", "text": text}]
-                }),
+                })),
             },
         })
         .collect()
@@ -311,5 +311,14 @@ mod tests {
             coordinator.take_last_live_frame().is_none(),
             "live frame must be consumed after continuation assembly"
         );
+    }
+
+    #[test]
+    fn computer_live_unaddressed_unsupported_output_is_omitted() {
+        let wire = into_wire_items(vec![NativeComputerContinuation::Unsupported {
+            provider: crate::computer::coordinator::NativeProvider::Anthropic20251124,
+            wire_payload: None,
+        }]);
+        assert!(wire.is_empty());
     }
 }

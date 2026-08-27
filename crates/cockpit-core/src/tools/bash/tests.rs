@@ -832,7 +832,11 @@ async fn bash_queue_timeout_cancels_wait_without_spawning() {
     let hold = scheduler
         .acquire(
             crate::engine::resource_scheduler::ResourceAcquireRequest::new(
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
                 crate::engine::resource_scheduler::ResourceRequirements::new([
+                media_authority: None,
+                media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
                     ("cpu", 1),
                     ("memory", 1),
                 ]),
@@ -867,7 +871,11 @@ async fn bash_cancel_while_queued_removes_scheduler_request() {
     let _hold = scheduler
         .acquire(
             crate::engine::resource_scheduler::ResourceAcquireRequest::new(
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
                 crate::engine::resource_scheduler::ResourceRequirements::new([
+                media_authority: None,
+                media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
                     ("cpu", 1),
                     ("memory", 1),
                 ]),

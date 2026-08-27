@@ -208,6 +208,47 @@ use crate::tokens::TokenUsage;
 /// helper they both call.
 type CompleteOut = (Option<String>, Vec<AssistantContent>, Option<TokenUsage>);
 
+tokio::task_local! {
+    static NATIVE_COMPUTER_ITEMS: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+    static NATIVE_COMPUTER_CONTINUATIONS: Vec<serde_json::Value>;
+}
+
+pub(crate) async fn with_native_computer_continuations<F: std::future::Future>(
+    continuations: Vec<serde_json::Value>,
+    future: F,
+) -> F::Output {
+    NATIVE_COMPUTER_CONTINUATIONS
+        .scope(continuations, future)
+        .await
+}
+
+pub(crate) fn native_computer_continuations() -> Vec<serde_json::Value> {
+    NATIVE_COMPUTER_CONTINUATIONS
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
+pub(crate) async fn capture_native_computer_items<F: std::future::Future>(
+    sink: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    future: F,
+) -> F::Output {
+    NATIVE_COMPUTER_ITEMS.scope(sink, future).await
+}
+
+pub(crate) fn retain_native_computer_item(item: serde_json::Value) {
+    let _ = NATIVE_COMPUTER_ITEMS.try_with(|sink| {
+        if let Ok(mut items) = sink.lock() {
+            items.push(item);
+        }
+    });
+}
+
+pub(crate) fn has_retained_native_computer_items() -> bool {
+    NATIVE_COMPUTER_ITEMS
+        .try_with(|sink| sink.lock().is_ok_and(|items| !items.is_empty()))
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveWireApiState {
     configured: crate::config::providers::WireApi,

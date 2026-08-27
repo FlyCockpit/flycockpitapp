@@ -48,26 +48,26 @@ pub enum DisplayTarget {
     RealDesktop,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DisplayGeometry {
     pub physical: PixelSize,
     pub logical: LogicalSize,
     pub scale_factor: ScaleFactor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PixelSize {
     pub width: u32,
     pub height: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogicalSize {
     pub width: f64,
     pub height: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScaleFactor(pub f64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -183,22 +183,23 @@ pub enum ComputerAction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComputerActionOutcome {
     Captured(CaptureFrame),
     Completed,
     Waited(Duration),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CaptureFrame {
+    #[serde(skip)]
     pub png: Vec<u8>,
     pub geometry: DisplayGeometry,
     pub region: Option<PixelRect>,
     pub native_zoom: Option<ScaleFactor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PixelRect {
     pub x: u32,
     pub y: u32,
@@ -212,29 +213,21 @@ pub struct ComputerBatchReport {
     pub failure: Option<ComputerFailure>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputerFailure {
     pub index: usize,
     pub error: ComputerError,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComputerError {
-    MissingTool {
-        tool: &'static str,
-        install_hint: &'static str,
-    },
-    UnsupportedPlatform {
-        platform: &'static str,
-    },
+    MissingTool { tool: String, install_hint: String },
+    UnsupportedPlatform { platform: String },
     RealDesktopGrantMissing,
     InvalidCoordinates(String),
     Refused(String),
     Cancelled,
-    CommandFailed {
-        program: String,
-        detail: String,
-    },
+    CommandFailed { program: String, detail: String },
 }
 
 impl std::fmt::Display for ComputerError {
@@ -261,6 +254,7 @@ impl std::error::Error for ComputerError {}
 
 #[async_trait]
 pub trait ComputerBackend: Send {
+    fn backend_kind(&self) -> target::BackendKind;
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError>;
     async fn execute_one(
         &mut self,
@@ -342,6 +336,9 @@ impl Default for FakeBackend {
 
 #[async_trait]
 impl ComputerBackend for FakeBackend {
+    fn backend_kind(&self) -> target::BackendKind {
+        target::BackendKind::VirtualDisplay
+    }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
         Ok(self.geometry.clone())
     }
@@ -915,6 +912,9 @@ impl CaptureRunner for RealCaptureRunner {
 
 #[async_trait]
 impl ComputerBackend for VirtualDisplayBackend {
+    fn backend_kind(&self) -> target::BackendKind {
+        target::BackendKind::VirtualDisplay
+    }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
         Ok(self.geometry.clone())
     }
@@ -1364,8 +1364,10 @@ fn require_capability(
     tool: &'static str,
     install_hint: &'static str,
 ) -> Result<PathBuf, ComputerError> {
-    crate::capabilities::resolve_binary(tool)
-        .ok_or(ComputerError::MissingTool { tool, install_hint })
+    crate::capabilities::resolve_binary(tool).ok_or(ComputerError::MissingTool {
+        tool: tool.to_string(),
+        install_hint: install_hint.to_string(),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1377,14 +1379,14 @@ fn require_capture_tool() -> Result<CaptureTool, ComputerError> {
         return Ok(CaptureTool::Import(path));
     }
     Err(ComputerError::MissingTool {
-        tool: "scrot or import",
-        install_hint: "the `scrot` package or ImageMagick",
+        tool: "scrot or import".to_string(),
+        install_hint: "the `scrot` package or ImageMagick".to_string(),
     })
 }
 
 fn unsupported_platform() -> ComputerError {
     ComputerError::UnsupportedPlatform {
-        platform: std::env::consts::OS,
+        platform: std::env::consts::OS.to_string(),
     }
 }
 
@@ -2340,6 +2342,8 @@ pub enum OpenAiComputerWireError {
     MissingCallId,
     #[error("computer_call.actions must be an array")]
     MissingActions,
+    #[error("computer_call.actions must contain at least one action")]
+    EmptyActions,
     #[error("unsupported OpenAI computer action `{0}`")]
     UnsupportedAction(String),
     #[error("malformed OpenAI computer action: {0}")]
@@ -2580,6 +2584,9 @@ pub fn parse_openai_computer_call(
         .get("actions")
         .and_then(serde_json::Value::as_array)
         .ok_or(OpenAiComputerWireError::MissingActions)?;
+    if raw_actions.is_empty() {
+        return Err(OpenAiComputerWireError::EmptyActions);
+    }
     let mut actions = Vec::with_capacity(raw_actions.len());
     for raw in raw_actions {
         let action: OpenAiComputerWireAction =
@@ -3851,7 +3858,9 @@ mod tests {
         {
             assert_eq!(
                 unsupported_platform(),
-                ComputerError::UnsupportedPlatform { platform: "linux" }
+                ComputerError::UnsupportedPlatform {
+                    platform: "linux".to_string(),
+                }
             );
         }
     }

@@ -49,7 +49,7 @@ use super::{CaptureFrame, PixelRect, ScaleFactor};
 pub const MAX_TRANSIENT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Media type labels for screenshot frames, used in the sanitized projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScreenshotMediaType {
     /// PNG-encoded screenshot.
@@ -77,7 +77,7 @@ impl fmt::Display for ScreenshotMediaType {
 ///
 /// Checksums correlate frames across projections but are not focus, target,
 /// authorization, or semantic-success evidence.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FrameChecksum(pub String);
 
 impl FrameChecksum {
@@ -105,15 +105,17 @@ pub(crate) mod hex {
 ///
 /// A late frame whose delegation/observation epoch is obsolete is dropped and
 /// cannot replace a current frame (see [`LiveComputerFrame::is_stale_relative_to`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct CaptureEpoch(pub u64);
 
 /// Unique observation identifier for a single screenshot capture.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ObservationId(pub String);
 
 /// Unique action identifier correlating a frame to the action that requested it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActionId(pub String);
 
 /// Bounded reason code for cleanup failure. Never includes the temp path.
@@ -345,7 +347,7 @@ pub struct LiveComputerFrame {
 }
 
 /// Physical dimensions of a captured frame.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FrameDimensions {
     pub width: u32,
     pub height: u32,
@@ -600,7 +602,7 @@ impl fmt::Debug for LiveComputerFrame {
 }
 
 /// Why the durable projection redacts the pixel bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RedactionReason {
     /// The frame is projected into a durable sink (default).
@@ -638,7 +640,7 @@ impl fmt::Display for RedactionReason {
 /// projection that never had live bytes to hash. A live checksum field can
 /// therefore never carry a not-a-hash sentinel string: absence is modelled as
 /// `None`, not as a magic value in the `FrameChecksum` newtype.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SanitizedComputerFrame {
     /// Physical dimensions of the frame.
     pub dimensions: FrameDimensions,

@@ -787,6 +787,9 @@ struct ConsumedNodeOverride {
 /// One agent's slice of state on the driver stack.
 pub struct AgentSession {
     pub agent: Arc<Agent>,
+    pub computer_coordinator: Option<crate::computer::coordinator::ComputerActionCoordinator>,
+    pub computer_contract: Option<crate::computer::ComputerToolContract>,
+    pub pending_computer_continuations: Vec<serde_json::Value>,
     /// Durable lifecycle identity for this concrete executor.  Agent display
     /// names are intentionally not used as identity: several task children can
     /// share one definition name concurrently.
@@ -1731,6 +1734,137 @@ fn subagent_routing_event_data(
 const JOB_CHANNEL_CAPACITY: usize = 256;
 
 impl Driver {
+    async fn handle_retained_native_computer_items(&mut self, metadata: &mut BackupTurnMetadata) {
+        if metadata.native_computer_items.is_empty() {
+            return;
+        }
+        let raw_items = std::mem::take(&mut metadata.native_computer_items);
+        let Some(frame) = self.stack.last_mut() else {
+            return;
+        };
+        let (Some(coordinator), Some(contract)) =
+            (frame.computer_coordinator.as_mut(), frame.computer_contract)
+        else {
+            return;
+        };
+        let continuations =
+            computer_native::handle_native_computer_items(Some(coordinator), contract, &raw_items)
+                .await;
+        let mut wire = Vec::new();
+        if contract == crate::computer::ComputerToolContract::OpenAiResponses {
+            wire.extend(raw_items);
+        }
+        wire.extend(computer_native::into_wire_items(continuations));
+        frame.pending_computer_continuations.extend(wire);
+        frame.history.push(Message::User {
+            content: vec![rig::message::UserContent::text(
+                "Native computer action output is attached.",
+            )],
+        });
+    }
+
+    /// Open the selected delegation's backend before its first advertised
+    /// native-computer request. Candidate scans leave geometry unset; this is
+    /// the only path that turns that metadata into a live capability.
+    async fn open_native_computer_for_active_frame(&mut self) {
+        let (candidate, provider_id, model_id) = {
+            let Some(frame) = self.stack.last() else {
+                return;
+            };
+            if frame.computer_coordinator.is_some() {
+                return;
+            }
+            let Some(candidate) = frame.agent.params.native_computer.clone() else {
+                return;
+            };
+            (
+                candidate,
+                frame.agent.model.provider_id().to_string(),
+                frame.agent.model.model_id_ref().to_string(),
+            )
+        };
+        let Some(approver) = self.approver.clone() else {
+            Arc::make_mut(&mut self.stack.last_mut().expect("stack nonempty").agent)
+                .params
+                .native_computer = None;
+            return;
+        };
+        let backend = match crate::computer::VirtualDisplayBackend::construct(
+            crate::computer::DisplayTarget::Virtual,
+            None,
+        ) {
+            Ok(backend) => backend,
+            Err(error) => {
+                tracing::warn!(error = %error, "native computer backend open failed");
+                Arc::make_mut(&mut self.stack.last_mut().expect("stack nonempty").agent)
+                    .params
+                    .native_computer = None;
+                return;
+            }
+        };
+        let delegation_id = self
+            .stack
+            .last()
+            .and_then(|frame| frame.agent_instance_id)
+            .unwrap_or(self.session.id)
+            .hyphenated()
+            .to_string();
+        let handoff_journal = self.session.external_journal().map(|journal| {
+            Arc::new(crate::computer::coordinator::ExternalJournalHandoff::new(
+                journal,
+                crate::external_journal::projection::SafeToken::for_session(self.session.id),
+            )) as Arc<dyn crate::computer::coordinator::HandoffJournal>
+        });
+        let params = crate::computer::coordinator::CoordinatorParams {
+            session_id: self.session.id.hyphenated().to_string(),
+            delegation_id: crate::computer::coordinator::DelegationId(delegation_id),
+            tier: if candidate.approval_required {
+                crate::computer::coordinator::ComputerApprovalTier::Ask
+            } else {
+                crate::computer::coordinator::ComputerApprovalTier::Yolo
+            },
+            owner_instance: crate::computer::coordinator::OwnerInstance(1),
+            authorizer: Arc::new(
+                crate::computer::authorizer::ApproverComputerAuthorizer::new(approver),
+            ),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(
+                crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(
+                    *uuid::Uuid::new_v4().as_bytes(),
+                ),
+            )),
+            provider_id: crate::computer::coordinator::ProviderId(provider_id),
+            model_id: crate::computer::coordinator::ModelId(model_id),
+            outcome_store: Some(Arc::new(
+                crate::computer::outcome_store::SqliteOutcomeStore::new(self.session.db.clone()),
+            )),
+            handoff_journal,
+        };
+        match crate::computer::coordinator::ComputerActionCoordinator::open(
+            Box::new(backend),
+            params,
+        )
+        .await
+        {
+            Ok(coordinator) => {
+                let geometry = coordinator.geometry().clone();
+                let frame = self.stack.last_mut().expect("stack nonempty");
+                Arc::make_mut(&mut frame.agent).params.native_computer =
+                    Some(crate::computer::NativeComputerToolConfig {
+                        geometry: Some(geometry),
+                        ..candidate
+                    });
+                frame.computer_contract = Some(candidate.contract);
+                frame.computer_coordinator = Some(coordinator);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "native computer coordinator open failed");
+                Arc::make_mut(&mut self.stack.last_mut().expect("stack nonempty").agent)
+                    .params
+                    .native_computer = None;
+            }
+        }
+    }
     async fn emit_subagent_routing_amend(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
@@ -1843,6 +1977,9 @@ impl Driver {
                 .iter()
                 .map(|frame| AgentSession {
                     agent: frame.agent.clone(),
+                    computer_coordinator: None,
+                    computer_contract: frame.computer_contract,
+                    pending_computer_continuations: Vec::new(),
                     agent_instance_id: frame.agent_instance_id,
                     endpoint_generation: frame.endpoint_generation,
                     history: frame.history.clone(),
@@ -2188,6 +2325,9 @@ impl Driver {
             stack: vec![AgentSession {
                 queue_target: crate::engine::message::QueueTarget::root(root.name.clone()),
                 agent: root,
+                computer_coordinator: None,
+                computer_contract: None,
+                pending_computer_continuations: Vec::new(),
                 agent_instance_id: None,
                 endpoint_generation: None,
                 history: Vec::new(),
@@ -3647,6 +3787,9 @@ impl Driver {
                 recovery.label.clone(),
             ),
             agent: Arc::new(child),
+            computer_coordinator: None,
+            computer_contract: None,
+            pending_computer_continuations: Vec::new(),
             agent_instance_id: Some(recovery.agent_instance_id),
             endpoint_generation: Some(endpoint_generation),
             history,
@@ -4102,6 +4245,7 @@ impl Driver {
 
         loop {
             self.maybe_auto_prune(tx).await;
+            self.open_native_computer_for_active_frame().await;
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
@@ -4138,53 +4282,61 @@ impl Driver {
             let turn_result = {
                 let top = self.stack.last_mut().expect("stack never empty");
                 let deferred_log = top.deferred_log.clone();
-                crate::engine::agent::with_agent_instance_id(
-                    top.agent_instance_id,
-                    crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                        late_user_steer_permit.map(|permit| {
-                            crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                let pending = std::mem::take(&mut top.pending_computer_continuations);
+                crate::engine::model::with_native_computer_continuations(
+                    pending,
+                    crate::engine::agent::with_agent_instance_id(
+                        top.agent_instance_id,
+                        crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                            late_user_steer_permit.map(|permit| {
+                                crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                                    self.session.clone(),
+                                    permit.steer_id,
+                                    permit.continuation_id,
+                                    permit.agent_instance_id,
+                                    permit.recovery_epoch,
+                                    cancel.clone(),
+                                )
+                            }),
+                            turn_with_backup(
+                                &agent,
+                                backup_model.as_ref(),
+                                &fallback_models,
+                                &mut top.history,
+                                next_prompt.clone(),
                                 self.session.clone(),
-                                permit.steer_id,
-                                permit.continuation_id,
-                                permit.agent_instance_id,
-                                permit.recovery_epoch,
+                                self.locks.clone(),
+                                self.redact.clone(),
+                                self.cwd.clone(),
+                                self.config.clone(),
+                                self.interrupts.clone(),
                                 cancel.clone(),
-                            )
-                        }),
-                        turn_with_backup(
-                            &agent,
-                            backup_model.as_ref(),
-                            &fallback_models,
-                            &mut top.history,
-                            next_prompt.clone(),
-                            self.session.clone(),
-                            self.locks.clone(),
-                            self.redact.clone(),
-                            self.cwd.clone(),
-                            self.config.clone(),
-                            self.interrupts.clone(),
-                            cancel.clone(),
-                            self.approver.clone(),
-                            self.lsp.clone(),
-                            self.resource_scheduler.clone(),
-                            self.loop_guard_threshold,
-                            is_root,
-                            crate::skills::manage::SkillWriteOrigin::Foreground,
-                            None,
-                            context_usage,
-                            deferred_log,
-                            call_id,
-                            tandem.as_ref(),
-                            self.goal_root_turn
-                                .map(|(goal_id, generation, _)| (goal_id, generation)),
-                            Some(lifecycle_turn_id.clone()),
-                            tx,
-                            Some(&mut turn_metadata),
+                                self.approver.clone(),
+                                self.lsp.clone(),
+                                self.resource_scheduler.clone(),
+                                self.loop_guard_threshold,
+                                is_root,
+                                crate::skills::manage::SkillWriteOrigin::Foreground,
+                                None,
+                                context_usage,
+                                deferred_log,
+                                call_id,
+                                tandem.as_ref(),
+                                self.goal_root_turn
+                                    .map(|(goal_id, generation, _)| (goal_id, generation)),
+                                Some(lifecycle_turn_id.clone()),
+                                tx,
+                                Some(&mut turn_metadata),
+                            ),
                         ),
                     ),
                 )
                 .await
             };
+            if turn_result.is_ok() {
+                self.handle_retained_native_computer_items(&mut turn_metadata)
+                    .await;
+            }
             if let Some(fallback) = turn_metadata.fallback_decision.take() {
                 self.note_backup_fallback_for_active_frame(fallback, tx)
                     .await;
@@ -4294,24 +4446,6 @@ impl Driver {
 
             match outcome {
                 TurnOutcome::Continue => {
-                    // Native computer-use live loop: after a provider
-                    // completion, intercept raw `computer_call` / Anthropic
-                    // `tool_use` items and execute them on the opened
-                    // coordinator before assembling the next request. This
-                    // replaces the prior silent drop of every model-emitted
-                    // computer action (issue #58).
-                    //
-                    // TODO: When the driver holds an opened
-                    // `ComputerActionCoordinator` for the active delegation
-                    // (open-before-advertise), call
-                    // `computer_native::handle_native_computer_items` here
-                    // with the retained raw provider output and inject the
-                    // returned `NativeComputerContinuation`s as
-                    // provider-native user items (`computer_call_output` /
-                    // Anthropic `tool_result` image blocks) into
-                    // `next_prompt`. The raw output must be retained at the
-                    // completion boundary in `engine/model/dispatch.rs`
-                    // (currently only Rig messages survive).
                     if is_root && max_primary_rounds > 0 {
                         primary_rounds_in_chunk = primary_rounds_in_chunk.saturating_add(1);
                         if !self
@@ -10410,6 +10544,7 @@ impl Driver {
             // model, if the cache is cold and the foreground history has
             // grown something prunable, collapse it for free.
             self.maybe_auto_prune(tx).await;
+            self.open_native_computer_for_active_frame().await;
 
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
@@ -10552,57 +10687,65 @@ impl Driver {
                 // a subagent's `defer_to_orchestrator` calls land here, and
                 // the driver folds them into the report when the frame pops.
                 let deferred_log = top.deferred_log.clone();
-                crate::engine::agent::with_agent_instance_id(
-                    top.agent_instance_id,
-                    crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                        late_user_steer_permit.map(|permit| {
-                            crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                let pending = std::mem::take(&mut top.pending_computer_continuations);
+                crate::engine::model::with_native_computer_continuations(
+                    pending,
+                    crate::engine::agent::with_agent_instance_id(
+                        top.agent_instance_id,
+                        crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                            late_user_steer_permit.map(|permit| {
+                                crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                                    self.session.clone(),
+                                    permit.steer_id,
+                                    permit.continuation_id,
+                                    permit.agent_instance_id,
+                                    permit.recovery_epoch,
+                                    cancel.clone(),
+                                )
+                            }),
+                            turn_with_backup(
+                                &agent,
+                                backup_model.as_ref(),
+                                &fallback_models,
+                                &mut top.history,
+                                next_prompt.clone(),
                                 self.session.clone(),
-                                permit.steer_id,
-                                permit.continuation_id,
-                                permit.agent_instance_id,
-                                permit.recovery_epoch,
+                                self.locks.clone(),
+                                self.redact.clone(),
+                                self.cwd.clone(),
+                                self.config.clone(),
+                                self.interrupts.clone(),
                                 cancel.clone(),
-                            )
-                        }),
-                        turn_with_backup(
-                            &agent,
-                            backup_model.as_ref(),
-                            &fallback_models,
-                            &mut top.history,
-                            next_prompt.clone(),
-                            self.session.clone(),
-                            self.locks.clone(),
-                            self.redact.clone(),
-                            self.cwd.clone(),
-                            self.config.clone(),
-                            self.interrupts.clone(),
-                            cancel.clone(),
-                            self.approver.clone(),
-                            self.lsp.clone(),
-                            self.resource_scheduler.clone(),
-                            self.loop_guard_threshold,
-                            is_root,
-                            crate::skills::manage::SkillWriteOrigin::Foreground,
-                            None,
-                            context_usage,
-                            deferred_log,
-                            // The main/interactive frames never register the `seed`
-                            // tool (it's a read-only-noninteractive-subagent + normal-
-                            // mode affordance, GOALS §3c); a fresh empty collector
-                            // satisfies the signature and is never drained here.
-                            call_id,
-                            tandem.as_ref(),
-                            self.goal_root_turn
-                                .map(|(goal_id, generation, _)| (goal_id, generation)),
-                            Some(lifecycle_turn_id.clone()),
-                            tx,
-                            Some(&mut turn_metadata),
+                                self.approver.clone(),
+                                self.lsp.clone(),
+                                self.resource_scheduler.clone(),
+                                self.loop_guard_threshold,
+                                is_root,
+                                crate::skills::manage::SkillWriteOrigin::Foreground,
+                                None,
+                                context_usage,
+                                deferred_log,
+                                // The main/interactive frames never register the `seed`
+                                // tool (it's a read-only-noninteractive-subagent + normal-
+                                // mode affordance, GOALS §3c); a fresh empty collector
+                                // satisfies the signature and is never drained here.
+                                call_id,
+                                tandem.as_ref(),
+                                self.goal_root_turn
+                                    .map(|(goal_id, generation, _)| (goal_id, generation)),
+                                Some(lifecycle_turn_id.clone()),
+                                tx,
+                                Some(&mut turn_metadata),
+                            ),
                         ),
                     ),
                 )
                 .await
             };
+            if turn_result.is_ok() {
+                self.handle_retained_native_computer_items(&mut turn_metadata)
+                    .await;
+            }
             if let Some(fallback) = turn_metadata.fallback_decision.take() {
                 self.note_backup_fallback_for_active_frame(fallback, tx)
                     .await;
@@ -10796,24 +10939,6 @@ impl Driver {
 
             match outcome {
                 TurnOutcome::Continue => {
-                    // Native computer-use live loop: after a provider
-                    // completion, intercept raw `computer_call` / Anthropic
-                    // `tool_use` items and execute them on the opened
-                    // coordinator before assembling the next request. This
-                    // replaces the prior silent drop of every model-emitted
-                    // computer action (issue #58).
-                    //
-                    // TODO: When the driver holds an opened
-                    // `ComputerActionCoordinator` for the active delegation
-                    // (open-before-advertise), call
-                    // `computer_native::handle_native_computer_items` here
-                    // with the retained raw provider output and inject the
-                    // returned `NativeComputerContinuation`s as
-                    // provider-native user items (`computer_call_output` /
-                    // Anthropic `tool_result` image blocks) into
-                    // `next_prompt`. The raw output must be retained at the
-                    // completion boundary in `engine/model/dispatch.rs`
-                    // (currently only Rig messages survive).
                     if is_root && max_primary_rounds > 0 {
                         primary_rounds_in_chunk = primary_rounds_in_chunk.saturating_add(1);
                         if !self
@@ -11471,6 +11596,9 @@ impl Driver {
                             "default",
                         ),
                         agent: Arc::new(child),
+                        computer_coordinator: None,
+                        computer_contract: None,
+                        pending_computer_continuations: Vec::new(),
                         agent_instance_id: Some(child_agent_instance_id),
                         endpoint_generation: Some(endpoint_generation),
                         history: delegation_payload_history,

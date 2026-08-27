@@ -168,11 +168,14 @@ mod tests {
 
     #[async_trait]
     impl ComputerBackend for CapturingFakeBackend {
-        async fn geometry(&self) -> Result<DisplayGeometry, crate::computer::ComputerError> {
+        fn backend_kind(&self) -> crate::computer::target::BackendKind {
+            crate::computer::target::BackendKind::VirtualDisplay
+        }
+        async fn geometry(&mut self) -> Result<DisplayGeometry, crate::computer::ComputerError> {
             Ok(self.geometry.clone())
         }
 
-        async fn execute(&self, _actions: &[ComputerAction]) -> ComputerBatchReport {
+        async fn execute(&mut self, _actions: &[ComputerAction]) -> ComputerBatchReport {
             self.execute_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             ComputerBatchReport {
@@ -182,7 +185,7 @@ mod tests {
         }
 
         async fn execute_one(
-            &self,
+            &mut self,
             action: &ComputerAction,
         ) -> Result<ComputerActionOutcome, crate::computer::ComputerError> {
             if matches!(action, ComputerAction::CaptureFull) {
@@ -199,7 +202,7 @@ mod tests {
             }
         }
 
-        async fn release_all(&self) -> Result<(), crate::computer::ComputerError> {
+        async fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
             Ok(())
         }
     }

@@ -1761,7 +1761,18 @@ pub(crate) async fn run_turn(
     // secret is installed into the LIVE redaction table BEFORE the turn is acked,
     // and every other buffered item for the turn is then discarded. A turn with no
     // sensitive-ingress call passes through byte-identically to before.
-    let buffered_calls: Vec<ToolCall> = collect_tool_calls(&choice);
+    let native_computer_open = agent
+        .params
+        .native_computer
+        .as_ref()
+        .is_some_and(|config| config.geometry.is_some());
+    let buffered_calls: Vec<ToolCall> = collect_tool_calls(&choice)
+        .into_iter()
+        .filter(|call| {
+            !(native_computer_open
+                && crate::computer::is_reserved_native_computer_tool_name(&call.function.name))
+        })
+        .collect();
     // Decode/contain ONLY on a route that advertised `report_leak`
     // (`report_leak_eligible`) — the SAME funnel that gates the schema append and
     // the withhold sink. A trusted / tool-disabled / unsupported route never
@@ -2237,6 +2248,9 @@ pub(crate) async fn run_turn(
     }
 
     if calls.is_empty() {
+        if native_computer_open && crate::engine::model::has_retained_native_computer_items() {
+            return Ok(TurnOutcome::Continue);
+        }
         return Ok(TurnOutcome::Done);
     }
 

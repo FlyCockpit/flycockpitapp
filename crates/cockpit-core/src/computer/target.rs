@@ -39,7 +39,7 @@ impl BackendKind {
 }
 
 /// Why a field or whole snapshot is unavailable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TargetUnavailableReason {
     HostIdentityUnavailable,
     FocusIdentityUnavailable,

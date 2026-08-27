@@ -96,6 +96,35 @@ fn apply_extra_headers<T>(
     rig::http_client::Request::from_parts(parts, body)
 }
 
+fn inject_native_computer_continuations(bytes: bytes::Bytes) -> bytes::Bytes {
+    let continuations = super::native_computer_continuations();
+    if continuations.is_empty() {
+        return bytes;
+    }
+    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bytes;
+    };
+    if let Some(input) = body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        input.extend(continuations);
+    } else if let Some(content) = body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+        .and_then(|message| message.get_mut("content"))
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        content.extend(continuations);
+    } else {
+        return bytes;
+    }
+    serde_json::to_vec(&body)
+        .map(bytes::Bytes::from)
+        .unwrap_or(bytes)
+}
+
 impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
     fn send<T, U>(
         &self,
@@ -115,7 +144,10 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         let client = self.client.clone();
         let req = apply_extra_headers(req, &self.extra_headers);
         let (parts, body) = req.into_parts();
-        let req = rig::http_client::Request::from_parts(parts, body.into());
+        let req = rig::http_client::Request::from_parts(
+            parts,
+            inject_native_computer_continuations(body.into()),
+        );
         async move {
             let response = client.send::<bytes::Bytes, bytes::Bytes>(req).await?;
             let (parts, body) = response.into_parts();
@@ -156,7 +188,10 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         let client = self.client.clone();
         let req = apply_extra_headers(req, &self.extra_headers);
         let (parts, body) = req.into_parts();
-        let req = rig::http_client::Request::from_parts(parts, body.into());
+        let req = rig::http_client::Request::from_parts(
+            parts,
+            inject_native_computer_continuations(body.into()),
+        );
         async move {
             let response = client.send_streaming(req).await?;
             let (parts, body) = response.into_parts();

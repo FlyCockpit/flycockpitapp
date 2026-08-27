@@ -53,6 +53,57 @@ pub async fn handle_native_computer_items(
     live_loop.handle_native_computer_items(raw_output).await
 }
 
+/// Consume transient continuations into the exact provider-native items that
+/// may live only until the immediately-following HTTP request is assembled.
+pub fn into_wire_items(continuations: Vec<NativeComputerContinuation>) -> Vec<serde_json::Value> {
+    continuations
+        .into_iter()
+        .map(|continuation| match continuation {
+            NativeComputerContinuation::OpenAi { call_id, transient } => transient.map_or_else(
+                || {
+                    serde_json::json!({
+                        "type": "computer_call_output",
+                        "call_id": call_id,
+                        "output": { "type": "text", "text": "screenshot unavailable" }
+                    })
+                },
+                |transient| transient.with_wire(Clone::clone).0,
+            ),
+            NativeComputerContinuation::Anthropic {
+                tool_use_id,
+                transient,
+                ..
+            } => transient.map_or_else(
+                || {
+                    serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": [{"type": "text", "text": "screenshot unavailable"}]
+                    })
+                },
+                |transient| transient.with_wire(Clone::clone).0,
+            ),
+            NativeComputerContinuation::Unsupported { wire_payload, .. } => wire_payload,
+            NativeComputerContinuation::TextOnly {
+                call_id,
+                text,
+                provider,
+            } => match provider {
+                crate::computer::coordinator::NativeProvider::OpenAi => serde_json::json!({
+                    "type": "computer_call_output",
+                    "call_id": call_id,
+                    "output": { "type": "text", "text": text }
+                }),
+                _ => serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": [{"type": "text", "text": text}]
+                }),
+            },
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,11 +143,14 @@ mod tests {
 
     #[async_trait]
     impl ComputerBackend for CapturingFakeBackend {
-        async fn geometry(&self) -> Result<DisplayGeometry, crate::computer::ComputerError> {
+        fn backend_kind(&self) -> crate::computer::target::BackendKind {
+            crate::computer::target::BackendKind::VirtualDisplay
+        }
+        async fn geometry(&mut self) -> Result<DisplayGeometry, crate::computer::ComputerError> {
             Ok(self.geometry.clone())
         }
 
-        async fn execute(&self, _actions: &[ComputerAction]) -> ComputerBatchReport {
+        async fn execute(&mut self, _actions: &[ComputerAction]) -> ComputerBatchReport {
             ComputerBatchReport {
                 completed: Vec::new(),
                 failure: None,
@@ -104,7 +158,7 @@ mod tests {
         }
 
         async fn execute_one(
-            &self,
+            &mut self,
             action: &ComputerAction,
         ) -> Result<ComputerActionOutcome, crate::computer::ComputerError> {
             if matches!(action, ComputerAction::CaptureFull) {
@@ -121,7 +175,7 @@ mod tests {
             }
         }
 
-        async fn release_all(&self) -> Result<(), crate::computer::ComputerError> {
+        async fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
             Ok(())
         }
     }

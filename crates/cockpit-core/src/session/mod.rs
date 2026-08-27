@@ -188,6 +188,10 @@ pub struct Session {
     /// Daemon-owned external side-effect journal. Installed by the registry
     /// before the worker starts; absent in isolated unit sessions.
     external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
+    /// Daemon-worker directory for models selected by immutable agent-profile
+    /// bindings. Utilities resolve an exact profile snapshot and slot instead
+    /// of borrowing the foreground model.
+    profile_utility_model_resolver: Mutex<Option<Arc<ProfileUtilityModelResolver>>>,
     /// Daemon-process command-backed secret cache. Late-installed by the
     /// registry / daemon before the worker (or DocsAsk session) builds any
     /// store, so every `credential_store` / `provider_credential_store` this
@@ -420,6 +424,9 @@ pub struct Session {
     recent_bash: Mutex<std::collections::VecDeque<crate::engine::bash_hints::BashHistoryEntry>>,
 }
 
+pub(crate) type ProfileUtilityModelResolver =
+    dyn Fn(Uuid, Uuid, &str) -> Option<Arc<crate::engine::model::Model>> + Send + Sync;
+
 /// The most recent dispatched tool call's loop-guard signature and its
 /// consecutive-repeat count. See [`Session::bump_consecutive_call`].
 #[derive(Debug, Clone)]
@@ -466,6 +473,25 @@ impl Session {
 
     pub(crate) fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
         self.external_journal.lock().unwrap().clone()
+    }
+
+    pub(crate) fn install_profile_utility_model_resolver(
+        &self,
+        resolver: Arc<ProfileUtilityModelResolver>,
+    ) {
+        *self.profile_utility_model_resolver.lock().unwrap() = Some(resolver);
+    }
+
+    pub(crate) fn profile_utility_model(
+        &self,
+        profile_snapshot_id: Uuid,
+        slot: &str,
+    ) -> Option<Arc<crate::engine::model::Model>> {
+        self.profile_utility_model_resolver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|resolve| resolve(self.id, profile_snapshot_id, slot))
     }
 
     /// Install (or inherit) the daemon-process command-secret cache.

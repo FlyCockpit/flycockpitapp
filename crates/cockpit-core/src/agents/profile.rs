@@ -1293,6 +1293,12 @@ fn snapshot_verification_regions(
                     "verification adjudicator slot has no installed binding"
                 )
             }
+            for generator in &region.rule.generators {
+                ensure!(
+                    slots.contains_key(&generator.slot),
+                    "verification generator slot has no installed binding"
+                )
+            }
             Ok(RedactedVerificationRegion {
                 source_rule_id,
                 source_selector: selector.clone(),
@@ -1475,6 +1481,13 @@ fn validate_snapshot_self_contained(snapshot: &RedactedAgentProfileSnapshot) -> 
             ensure!(
                 slots.contains(slot),
                 "verification region must reference a snapshot binding"
+            );
+            ensure!(
+                region
+                    .generator_slots
+                    .iter()
+                    .all(|generator_slot| slots.contains(generator_slot.as_str())),
+                "verification generator region must reference snapshot bindings"
             );
         }
     }

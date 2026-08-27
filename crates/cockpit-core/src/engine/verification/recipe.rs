@@ -54,13 +54,11 @@ pub async fn assemble_recipe(input: RecipeAssemblyInput<'_>) -> Result<Assembled
 }
 
 fn assemble_inherit(input: RecipeAssemblyInput<'_>) -> Result<AssembledRecipe> {
-    let history = format_history_slice(input.history);
     let diff = proposed_diff(input.tool_name, input.original_args, input.cwd);
     let volatile_tail = format!("{}\n\n## Proposed change\n\n{diff}", input.inherit_framing);
-    let prompt = format!("{history}\n\n{volatile_tail}");
     Ok(AssembledRecipe {
-        prompt,
-        stable_prefix: history,
+        prompt: volatile_tail.clone(),
+        stable_prefix: String::new(),
         volatile_tail,
     })
 }
@@ -116,10 +114,6 @@ async fn assemble_clean_room(input: RecipeAssemblyInput<'_>) -> Result<Assembled
         stable_prefix: stable,
         volatile_tail: volatile,
     })
-}
-
-fn format_history_slice(history: &[Message]) -> String {
-    serde_json::to_string(history).unwrap_or_else(|_| "[]".to_string())
 }
 
 pub fn proposed_diff(tool_name: &str, args: &Value, cwd: &Path) -> String {

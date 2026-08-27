@@ -4904,6 +4904,12 @@ pub(super) async fn run_worker(
     // Construct this before the event forwarder. Child-frame lifecycle events
     // update the same registry that decision delivery consults.
     let tree_resolver_registry = std::sync::Arc::new(WorkerAgentTreeResolverRegistry::default());
+    session.install_profile_utility_model_resolver({
+        let registry = tree_resolver_registry.clone();
+        std::sync::Arc::new(move |session_id, profile_snapshot_id, slot| {
+            registry.utility_model(session_id, profile_snapshot_id, slot)
+        })
+    });
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
     let engine_event_notice_tx = engine_event_tx.clone();
 
@@ -5571,6 +5577,39 @@ pub(super) async fn run_worker(
     {
         tracing::error!(%error, %session_id, "reconciling stranded host approval dispatches failed");
         return;
+    }
+    match session
+        .db
+        .list_nonterminal_verification_operations_for_session(session_id)
+        .await
+    {
+        Ok(operations) => {
+            for operation in operations {
+                let digest = crate::db::verification_ledger::VerificationDigest::of(
+                    format!("verification-restart:{}", operation.operation_id).as_bytes(),
+                );
+                if let Err(error) = session
+                    .db
+                    .recover_verification_operation(
+                        session_id,
+                        operation.operation_id,
+                        None,
+                        crate::db::verification_ledger::RedactedVerificationJson::dispatch_unknown(
+                            digest,
+                        ),
+                        tree_now,
+                    )
+                    .await
+                {
+                    tracing::error!(%error, operation_id = %operation.operation_id, "verification restart recovery failed");
+                    return;
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, %session_id, "listing verification operations for restart recovery failed");
+            return;
+        }
     }
     if let Err(error) = session
         .db

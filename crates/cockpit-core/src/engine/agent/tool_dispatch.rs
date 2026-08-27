@@ -697,6 +697,10 @@ async fn execute_ordinary_call_unscoped(
     let mut tool_was_dispatched = false;
     let mut verification_disclosure: Option<String> = None;
     let mut verification_blocked = false;
+    let verification_original_args = args.clone();
+    let mut verification_dispatch_plan: Option<
+        crate::engine::verification::intercept::VerificationDispatchPlan,
+    > = None;
     let (result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
         // The model reads back a deterministic diagnostic; the native computer
@@ -840,9 +844,8 @@ async fn execute_ordinary_call_unscoped(
         }
         // ArtifactWrite verification: after every human/host approval (safety
         // gate, loop, cage, /btw, pre-tool hooks) and before `dispatch_one_timed`.
-        // Frame inputs are already pinned above. Stage 1 is shadow-mode: a
-        // matching verify rule records a dispatch_original ledger row and the
-        // original call still executes.
+        // Frame inputs are already pinned above. A matching rule completes its
+        // durable collection/adjudication decision before any host effect.
         let verification = crate::engine::verification::intercept_ordinary_call(
             crate::engine::verification::InterceptInput {
                 session: env.session,
@@ -865,6 +868,8 @@ async fn execute_ordinary_call_unscoped(
                 payload.verification =
                     Some(crate::db::needs_attention::InterruptVerificationMemo {
                         operation_id,
+                        dispatch_attempt_revision: -1,
+                        on_failure_dispatch_original: false,
                         outcome: crate::db::needs_attention::InterruptVerificationOutcome::Block {
                             message: message.clone(),
                         },
@@ -874,11 +879,35 @@ async fn execute_ordinary_call_unscoped(
             crate::engine::verification::VerificationOutcome::Revise {
                 args: revised_args,
                 disclosure,
-                operation_id,
+                mut plan,
+                on_failure_dispatch_original,
             } => {
+                let operation_id = plan.operation_id;
+                match env
+                    .session
+                    .db
+                    .mark_verification_dispatch_executing(
+                        env.session.id,
+                        operation_id,
+                        plan.attempt_revision,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    Ok(attempt) => plan.attempt_revision = attempt.revision,
+                    Err(error) => {
+                        verification_blocked = true;
+                        tracing::warn!(%error, %operation_id, "verification dispatch reservation could not enter executing");
+                        return Err(invalid_input(
+                            "verification dispatch could not be reserved safely; revise and re-emit",
+                        ));
+                    }
+                }
                 payload.verification =
                     Some(crate::db::needs_attention::InterruptVerificationMemo {
                         operation_id,
+                        dispatch_attempt_revision: plan.attempt_revision,
+                        on_failure_dispatch_original,
                         outcome: crate::db::needs_attention::InterruptVerificationOutcome::Revise {
                             args: revised_args.clone(),
                             disclosure: disclosure.clone(),
@@ -886,11 +915,28 @@ async fn execute_ordinary_call_unscoped(
                     });
                 if !super::rewrite_assistant_tool_call(history, tc.id.as_str(), &revised_args) {
                     verification_blocked = true;
+                    let _ = env
+                        .session
+                        .db
+                        .cancel_verification_dispatch_no_submission(
+                            env.session.id,
+                            operation_id,
+                            plan.attempt_revision,
+                            crate::db::verification_ledger::NoSubmissionProof::from_digest(
+                                crate::db::verification_ledger::VerificationDigest::of(
+                                    b"verification-provider-signature-rewrite-refused",
+                                ),
+                            ),
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await;
                     let message = "verification produced a revision, but this provider-signed assistant turn cannot be rewritten safely; revise and re-emit"
                         .to_string();
                     payload.verification =
                         Some(crate::db::needs_attention::InterruptVerificationMemo {
                             operation_id,
+                            dispatch_attempt_revision: -1,
+                            on_failure_dispatch_original: false,
                             outcome:
                                 crate::db::needs_attention::InterruptVerificationOutcome::Block {
                                     message: message.clone(),
@@ -901,7 +947,7 @@ async fn execute_ordinary_call_unscoped(
                     args = revised_args;
                     payload.args = args.clone();
                     tool_was_dispatched = true;
-                    let dispatched =
+                    let mut dispatched =
                         crate::engine::interrupt::with_interrupt_park_payload(payload, async {
                             dispatch_one_timed(
                                 env.active_tools,
@@ -913,7 +959,53 @@ async fn execute_ordinary_call_unscoped(
                             .await
                         })
                         .await;
-                    verification_disclosure = Some(disclosure);
+                    let revised_failed = dispatched.0.is_err();
+                    if revised_failed && on_failure_dispatch_original {
+                        let failure_digest = crate::db::verification_ledger::VerificationDigest::of(
+                            dispatched
+                                .0
+                                .as_ref()
+                                .err()
+                                .map(ToString::to_string)
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        );
+                        if let Err(error) = env.session.db.settle_verification_dispatch(
+                            env.session.id,
+                            plan.operation_id,
+                            plan.attempt_revision,
+                            crate::db::verification_ledger::DispatchSettlement::Failed,
+                            crate::db::verification_ledger::RedactedVerificationJson::dispatch_final_error(failure_digest),
+                            chrono::Utc::now().timestamp_millis(),
+                        ).await {
+                            tracing::warn!(%error, operation_id = %plan.operation_id, "failed revised verification attempt could not settle before fallback");
+                        }
+                        rewrite_assistant_tool_call(
+                            history,
+                            tc.id.as_str(),
+                            &verification_original_args,
+                        );
+                        args = verification_original_args.clone();
+                        dispatched = dispatch_one_timed(
+                            env.active_tools,
+                            resolved_name,
+                            args.clone(),
+                            env.ctx,
+                            Some(&tc.id),
+                        )
+                        .await;
+                    }
+                    verification_disclosure = Some(
+                        if revised_failed && on_failure_dispatch_original {
+                            "[cockpit] verification's selected revision failed validation; the original change was attempted under onAdjudicationFailure=dispatch_original"
+                            .to_string()
+                        } else {
+                            disclosure
+                        },
+                    );
+                    if !(revised_failed && on_failure_dispatch_original) {
+                        verification_dispatch_plan = Some(plan);
+                    }
                     dispatched
                 }
             }
@@ -931,25 +1023,41 @@ async fn execute_ordinary_call_unscoped(
                 })
                 .await
             }
-            crate::engine::verification::VerificationOutcome::DispatchOriginal { operation_id } => {
+            crate::engine::verification::VerificationOutcome::DispatchOriginal { mut plan } => {
+                let operation_id = plan.operation_id;
+                let attempt = env.session.db.mark_verification_dispatch_executing(
+                    env.session.id,
+                    operation_id,
+                    plan.attempt_revision,
+                    chrono::Utc::now().timestamp_millis(),
+                ).await.map_err(|error| {
+                    tracing::warn!(%error, %operation_id, "verification original dispatch reservation could not enter executing");
+                    invalid_input("verification dispatch could not be reserved safely; revise and re-emit")
+                })?;
+                plan.attempt_revision = attempt.revision;
                 payload.verification = Some(
                     crate::db::needs_attention::InterruptVerificationMemo {
                         operation_id,
+                        dispatch_attempt_revision: plan.attempt_revision,
+                        on_failure_dispatch_original: false,
                         outcome: crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal,
                     },
                 );
                 tool_was_dispatched = true;
-                crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                    dispatch_one_timed(
-                        env.active_tools,
-                        resolved_name,
-                        args.clone(),
-                        env.ctx,
-                        Some(&tc.id),
-                    )
-                    .await
-                })
-                .await
+                let dispatched =
+                    crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                        dispatch_one_timed(
+                            env.active_tools,
+                            resolved_name,
+                            args.clone(),
+                            env.ctx,
+                            Some(&tc.id),
+                        )
+                        .await
+                    })
+                    .await;
+                verification_dispatch_plan = Some(plan);
+                dispatched
             }
         }
     } else {
@@ -984,6 +1092,42 @@ async fn execute_ordinary_call_unscoped(
             unreachable!("checked error branch above");
         };
         return Err(err);
+    }
+
+    if let Some(plan) = verification_dispatch_plan {
+        let (settlement, receipt) = match &result {
+            Ok(output) => (
+                crate::db::verification_ledger::DispatchSettlement::Succeeded,
+                crate::db::verification_ledger::RedactedVerificationJson::dispatch_success(
+                    crate::db::verification_ledger::VerificationDigest::of(
+                        output.content.as_bytes(),
+                    ),
+                ),
+            ),
+            Err(error) => (
+                crate::db::verification_ledger::DispatchSettlement::Failed,
+                crate::db::verification_ledger::RedactedVerificationJson::dispatch_final_error(
+                    crate::db::verification_ledger::VerificationDigest::of(
+                        error.to_string().as_bytes(),
+                    ),
+                ),
+            ),
+        };
+        if let Err(error) = env
+            .session
+            .db
+            .settle_verification_dispatch(
+                env.session.id,
+                plan.operation_id,
+                plan.attempt_revision,
+                settlement,
+                receipt,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+        {
+            tracing::warn!(%error, operation_id = %plan.operation_id, "verification dispatch settlement failed; recovery will reconcile it");
+        }
     }
 
     // Defensive bash-routing nudge self-suppression

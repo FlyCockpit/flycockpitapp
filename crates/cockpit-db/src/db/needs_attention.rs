@@ -100,6 +100,9 @@ pub struct InterruptGateMemo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterruptVerificationMemo {
     pub operation_id: uuid::Uuid,
+    pub dispatch_attempt_revision: i64,
+    #[serde(default)]
+    pub on_failure_dispatch_original: bool,
     pub outcome: InterruptVerificationOutcome,
 }
 

@@ -2,12 +2,12 @@ use std::ops::ControlFlow;
 
 use super::*;
 
-struct InferenceJournalAttempt {
+pub(crate) struct InferenceJournalAttempt {
     journal: Arc<crate::external_journal::ExternalJournal>,
     ticket: crate::external_journal::DispatchTicket,
 }
 
-async fn prepare_inference_journal(
+pub(crate) async fn prepare_inference_journal(
     session: &Arc<Session>,
     model: &Model,
     payload: &Value,
@@ -59,7 +59,9 @@ async fn prepare_inference_journal(
     Ok(Some(InferenceJournalAttempt { journal, ticket }))
 }
 
-async fn settle_inference_journal_success(attempt: &mut Option<InferenceJournalAttempt>) -> bool {
+pub(crate) async fn settle_inference_journal_success(
+    attempt: &mut Option<InferenceJournalAttempt>,
+) -> bool {
     let Some(attempt) = attempt else { return true };
     let now = chrono::Utc::now().timestamp_millis();
     if attempt
@@ -85,7 +87,7 @@ async fn settle_inference_journal_success(attempt: &mut Option<InferenceJournalA
         .is_ok()
 }
 
-async fn settle_inference_journal_error(
+pub(crate) async fn settle_inference_journal_error(
     attempt: &mut Option<InferenceJournalAttempt>,
     error: &anyhow::Error,
 ) -> bool {

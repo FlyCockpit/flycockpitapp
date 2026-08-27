@@ -52,6 +52,11 @@ pub(crate) mod tool_dispatch;
 mod tool_timeout;
 mod turn_phases;
 
+pub(crate) use backup::{InferenceOutcomeRecord, record_inference_outcome};
+pub(crate) use turn_phases::{
+    prepare_inference_journal, settle_inference_journal_error, settle_inference_journal_success,
+};
+
 #[cfg(test)]
 pub(crate) use turn_phases::phase_10_dispatch_one_call;
 

@@ -15,7 +15,7 @@ use crate::tokens::{TokenizerStrategy, count_with};
 const SAFETY_NUM: u64 = 5;
 const SAFETY_DEN: u64 = 4;
 const FALLBACK_CHARS_PER_TOKEN: u64 = 4;
-const CONSERVATIVE_OUTPUT_TOKENS_PER_CANDIDATE: u64 = 512;
+const CONSERVATIVE_OUTPUT_TOKENS_PER_CANDIDATE: u64 = crate::engine::model::UTILITY_MAX_TOKENS_CAP;
 
 #[derive(Debug, Clone)]
 pub struct CandidateSetEstimateInput<'a> {

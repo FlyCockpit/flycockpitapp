@@ -865,6 +865,27 @@ impl Db {
         .await
     }
 
+    pub async fn list_nonterminal_verification_operations_for_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<VerificationOperationRow>> {
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT operation_id FROM verification_operations
+                 WHERE session_id = ?1
+                   AND state IN ('created', 'collecting', 'synthesizing', 'dispatching')
+                 ORDER BY created_at_unix_ms ASC, operation_id ASC",
+            )?;
+            let ids = statement
+                .query_map([session_id.to_string()], |row| parse_uuid(row.get(0)?))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.into_iter()
+                .map(|operation_id| required_operation(conn, session_id, operation_id))
+                .collect()
+        })
+        .await
+    }
+
     /// Retention hook stub. The ledger has no GC today (`retention_state`
     /// never becomes `'cleaned'`). Wired from the daemon retention tick so a
     /// later media-retention-style sweep can mark envelopes cleaned without a
@@ -1224,6 +1245,93 @@ impl Db {
         }).await
     }
 
+    /// Fill the immutable candidate descriptor after a pre-provider resource
+    /// reservation has entered `running`, but before it becomes terminal.
+    /// Reservation must precede inference; candidate bytes do not exist until
+    /// inference returns, so this is the single legal descriptor-finalization
+    /// seam. Raw bytes are never accepted or persisted.
+    pub async fn finalize_verification_candidate_descriptor(
+        &self,
+        session_id: Uuid,
+        operation_id: Uuid,
+        candidate_id: Uuid,
+        expected_revision: i64,
+        descriptor: NewVerificationCandidate,
+        now_unix_ms: i64,
+    ) -> Result<VerificationCandidateRow> {
+        validate_candidate_input(&descriptor)?;
+        self.transaction(move |conn| {
+            let operation = required_operation(conn, session_id, operation_id)?;
+            ensure!(
+                operation.state == VerificationOperationState::Collecting
+                    && operation.collection_closed_at_unix_ms.is_none()
+                    && now_unix_ms < operation_deadline(conn, operation_id)?,
+                "verification collection closed before candidate finalization"
+            );
+            let candidate = required_candidate(conn, session_id, operation_id, candidate_id)?;
+            ensure!(
+                candidate.state == VerificationCandidateState::Running
+                    && candidate.revision == expected_revision,
+                "verification candidate descriptor finalization revision conflict"
+            );
+            let changed = conn.execute(
+                "UPDATE verification_candidates
+                 SET artifact_kind = ?1, canonical_call_digest = ?2,
+                     artifact_union_digest = ?3, redacted_summary_json = ?4,
+                     revision = revision + 1, updated_at_unix_ms = ?5
+                 WHERE candidate_id = ?6 AND operation_id = ?7 AND session_id = ?8
+                   AND revision = ?9 AND state = 'running'",
+                params![
+                    descriptor.artifact_kind.as_str(),
+                    descriptor.canonical_call_digest.as_str(),
+                    descriptor.artifact_union_digest.as_str(),
+                    descriptor.redacted_summary.as_str(),
+                    now_unix_ms,
+                    candidate_id.to_string(),
+                    operation_id.to_string(),
+                    session_id.to_string(),
+                    expected_revision,
+                ],
+            )?;
+            ensure!(
+                changed == 1,
+                "verification candidate descriptor finalization lost its CAS"
+            );
+            for (ordinal, member) in descriptor.artifact_members.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO verification_candidate_artifacts (
+                        candidate_id, operation_id, session_id, ordinal, operation_kind,
+                        affected_path_digest, prior_path_digest, content_digest,
+                        binary_metadata_digest, mode_digest
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        candidate_id.to_string(),
+                        operation_id.to_string(),
+                        session_id.to_string(),
+                        ordinal as i64,
+                        member.operation_kind.as_str(),
+                        member.affected_path_digest.as_str(),
+                        member
+                            .prior_path_digest
+                            .as_ref()
+                            .map(VerificationDigest::as_str),
+                        member
+                            .content_digest
+                            .as_ref()
+                            .map(VerificationDigest::as_str),
+                        member
+                            .binary_metadata_digest
+                            .as_ref()
+                            .map(VerificationDigest::as_str),
+                        member.mode_digest.as_ref().map(VerificationDigest::as_str),
+                    ],
+                )?;
+            }
+            required_candidate(conn, session_id, operation_id, candidate_id)
+        })
+        .await
+    }
+
     pub async fn close_verification_collection(
         &self,
         session_id: Uuid,
@@ -1291,6 +1399,58 @@ impl Db {
                 RedactedVerificationJson::closed(
                     VerificationRedactionClass::SynthesisSelected,
                     VerificationDigest::of(b"verification-selected"),
+                ),
+                now_unix_ms,
+            )?;
+            set_operation_state(
+                conn,
+                session_id,
+                operation_id,
+                expected_revision,
+                VerificationOperationState::Dispatching,
+                now_unix_ms,
+            )?;
+            required_operation(conn, session_id, operation_id)
+        })
+        .await
+    }
+
+    /// Adjudicator approval of the immutable original call. This is distinct
+    /// from selecting a generator candidate: no fabricated candidate row is
+    /// needed for the cheapest adjudicator-only profile.
+    pub async fn select_verification_original(
+        &self,
+        session_id: Uuid,
+        operation_id: Uuid,
+        expected_revision: i64,
+        now_unix_ms: i64,
+    ) -> Result<VerificationOperationRow> {
+        self.transaction(move |conn| {
+            let operation = required_operation(conn, session_id, operation_id)?;
+            ensure!(
+                operation.state == VerificationOperationState::Synthesizing,
+                "verification operation is not synthesizing"
+            );
+            ensure!(
+                operation.revision == expected_revision,
+                "verification operation revision conflict"
+            );
+            ensure!(
+                operation.collection_closed_at_unix_ms.is_some(),
+                "verification collection must close before adjudication"
+            );
+            transition_synthesis_conn(
+                conn,
+                session_id,
+                operation_id,
+                "selected",
+                None,
+                Some(VerificationArtifactKind::ProposedCall),
+                Some(operation.original_operation_digest.clone()),
+                None,
+                RedactedVerificationJson::closed(
+                    VerificationRedactionClass::SynthesisSelected,
+                    VerificationDigest::of(b"verification-original-approved"),
                 ),
                 now_unix_ms,
             )?;
@@ -1601,6 +1761,9 @@ impl Db {
         self.transaction(move |conn| {
             let attempt = load_attempt(conn, session_id, operation_id)?.context("verification dispatch attempt is missing")?;
             if attempt.state.is_terminal() { return Ok(attempt); }
+            if attempt.state == VerificationDispatchState::Executing {
+                return Ok(attempt);
+            }
             ensure!(attempt.revision == expected_revision && attempt.state == VerificationDispatchState::Reserved, "verification dispatch attempt revision conflict");
             let changed = conn.execute(
                 "UPDATE verification_dispatch_attempts SET state = 'executing', revision = revision + 1, updated_at_unix_ms = ?1
@@ -3064,6 +3227,176 @@ mod tests {
             .await
             .unwrap();
         (created.operation_id, executing)
+    }
+
+    #[tokio::test]
+    async fn verification_ledger_db_finalizes_pre_provider_candidate_descriptor() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, agent_id) = owner(&db, "candidate-finalize").await;
+        let created = db
+            .create_verification_operation(operation(session_id, agent_id), 3)
+            .await
+            .unwrap();
+        let collecting = db
+            .start_verification_collection(session_id, created.operation_id, created.revision, 4)
+            .await
+            .unwrap();
+        let reserved = db
+            .reserve_verification_candidate(session_id, created.operation_id, candidate(), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.transition_verification_candidate(
+                session_id,
+                created.operation_id,
+                reserved.candidate_id,
+                reserved.revision,
+                VerificationCandidateState::Running,
+                digest("running"),
+                6,
+            )
+            .await
+            .unwrap(),
+            CandidateTransitionOutcome::Transitioned
+        );
+        let finalized = db
+            .finalize_verification_candidate_descriptor(
+                session_id,
+                created.operation_id,
+                reserved.candidate_id,
+                reserved.revision + 1,
+                write_candidate(),
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            finalized.artifact_kind,
+            VerificationArtifactKind::WriteChangeSet
+        );
+        assert_eq!(finalized.artifact_union_digest, digest("write-union"));
+        let artifact_count: i64 = db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM verification_candidate_artifacts WHERE candidate_id = ?1",
+                    [reserved.candidate_id.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(artifact_count, 1);
+        assert_eq!(
+            db.transition_verification_candidate(
+                session_id,
+                created.operation_id,
+                reserved.candidate_id,
+                finalized.revision,
+                VerificationCandidateState::Valid,
+                digest("finalized-valid"),
+                8,
+            )
+            .await
+            .unwrap(),
+            CandidateTransitionOutcome::Transitioned
+        );
+        db.close_verification_collection(session_id, created.operation_id, collecting.revision, 9)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verification_ledger_db_adjudicator_only_original_dispatch_is_fully_projected() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, agent_id) = owner(&db, "adjudicator-only").await;
+        let mut input = operation(session_id, agent_id);
+        input.requested_candidate_count = 0;
+        input.effective_candidate_count = 0;
+        let created = db.create_verification_operation(input, 3).await.unwrap();
+        assert_eq!(
+            db.list_nonterminal_verification_operations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let collecting = db
+            .start_verification_collection(session_id, created.operation_id, created.revision, 4)
+            .await
+            .unwrap();
+        let synthesizing = db
+            .close_verification_collection(session_id, created.operation_id, collecting.revision, 5)
+            .await
+            .unwrap();
+        let dispatching = db
+            .select_verification_original(
+                session_id,
+                created.operation_id,
+                synthesizing.revision,
+                6,
+            )
+            .await
+            .unwrap();
+        let reserved = db
+            .reserve_verification_dispatch(
+                session_id,
+                created.operation_id,
+                dispatching.revision,
+                "adjudicator-only-original",
+                envelope(),
+                7,
+            )
+            .await
+            .unwrap();
+        let executing = db
+            .mark_verification_dispatch_executing(
+                session_id,
+                created.operation_id,
+                reserved.revision,
+                8,
+            )
+            .await
+            .unwrap();
+        let settled = db
+            .settle_verification_dispatch(
+                session_id,
+                created.operation_id,
+                executing.revision,
+                DispatchSettlement::Succeeded,
+                redacted(
+                    VerificationRedactionClass::DispatchSuccess,
+                    "original-success",
+                ),
+                9,
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled.state, VerificationOperationState::Succeeded);
+        assert!(
+            db.list_nonterminal_verification_operations_for_session(session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let (selected_candidate_id, projection_events): (Option<String>, i64) = db
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT selected_candidate_id FROM verification_syntheses WHERE operation_id = ?1",
+                        [created.operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM verification_projection_events e JOIN verification_projections p ON p.projection_id = e.projection_id WHERE p.operation_id = ?1",
+                        [created.operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(selected_candidate_id, None);
+        assert_eq!(projection_events, 2);
     }
 
     #[test]

@@ -8,12 +8,13 @@ use anyhow::Result;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::agents::{OnAdjudicationFailure, VerificationMode};
+use crate::agents::VerificationMode;
 use crate::engine::model::Model;
 use crate::engine::model::UtilityCallSite;
 use crate::engine::tool::ToolDefinition;
 
 use super::generate::{CandidateKind, CollectedCandidate, GeneratorAnswer};
+use super::inference::{VerificationInferenceInput, journaled_verification_inference};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdjudicatorVerdict {
@@ -81,11 +82,15 @@ pub fn apply_mode(
 }
 
 pub async fn adjudicate(
+    session: std::sync::Arc<crate::session::Session>,
     model: &Model,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    cancel: &tokio_util::sync::CancellationToken,
+    agent_name: &str,
     original: &Value,
     candidates: &[CollectedCandidate],
     instructions: &str,
-    _on_failure: OnAdjudicationFailure,
+    deadline_unix_ms: i64,
 ) -> Result<AdjudicatorVerdict> {
     if let Some(verdict) = take_override() {
         return Ok(verdict);
@@ -124,14 +129,26 @@ pub async fn adjudicate(
         "candidates": candidate_json,
         "instructions_excerpt": instructions,
     }))?;
-    let calls = model
-        .tool_completion_for(
-            UtilityCallSite::VerificationAdjudication,
-            "Judge a proposed file write or edit against the supplied instructions and candidates. Return exactly one structured verdict through the verification_verdict tool.",
-            &prompt,
-            &tool,
-        )
+    anyhow::ensure!(
+        deadline_unix_ms > chrono::Utc::now().timestamp_millis(),
+        "verification adjudication deadline elapsed"
+    );
+    let calls = journaled_verification_inference(VerificationInferenceInput {
+            session,
+            model,
+            config,
+            system: "Judge a proposed file write or edit against the supplied instructions and candidates. Return exactly one structured verdict through verification_verdict.",
+            history: &[],
+            prompt: &prompt,
+            tools: std::slice::from_ref(&tool),
+            params: crate::engine::model::ModelParams::default(),
+            agent_name,
+            site: UtilityCallSite::VerificationAdjudication,
+            cancel,
+            deadline_unix_ms: Some(deadline_unix_ms),
+        })
         .await?;
+    let calls = crate::engine::message::collect_tool_calls(&calls);
     let call = calls
         .iter()
         .find(|call| call.function.name == tool.name)

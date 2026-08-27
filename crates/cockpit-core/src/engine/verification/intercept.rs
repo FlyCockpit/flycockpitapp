@@ -5,15 +5,10 @@
 //! `dispatch_one_timed`. Model-vs-model verification never sees a call an
 //! approval would have killed.
 //!
-//! Stage 1 is shadow mode: matching `verify` rules record a
-//! `verification_operations` row with `estimate_state='estimate_unavailable'`
-//! and `budget_action='dispatch_original'` (no estimator yet, so every
-//! `Unknown*` arm is treated as dispatch-original) then dispatch the original
-//! call unchanged. Session-snapshot reduction is not applied here; the
-//! compiled policy on [`crate::agents::EffectiveVnextGrant`] is the authority.
-//! Snapshot-based session reduction lands with profile wiring in a later stage.
+//! Runtime decisions combine the running agent's compiled definition grant
+//! with the immutable session profile region and its exact utility bindings.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -23,7 +18,9 @@ use crate::agents::{
 };
 use crate::db::stats::PriceTable;
 use crate::db::verification_ledger::{
-    NewVerificationOperation, VerificationBudgetAction, VerificationDigest,
+    NewVerificationEnvelope, NewVerificationOperation, VerificationArtifactKind,
+    VerificationBudgetAction, VerificationDigest, VerificationSynthesisArtifactSource,
+    VerificationSynthesisTerminal,
 };
 use crate::engine::agent::Agent;
 use crate::engine::model::Model;
@@ -35,7 +32,7 @@ use super::budget::budget_to_ledger;
 use super::classify_tool;
 use super::estimate::{CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set};
 use super::generate::{CollectionInput, collect_candidates};
-use super::recipe::select_guidance_for_target;
+use super::recipe::{RecipeAssemblyInput, assemble_recipe, select_guidance_for_target};
 
 /// Outcome of the verification intercept.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,15 +42,22 @@ pub(crate) enum VerificationOutcome {
     Skip,
     /// Matching verify rule recorded as dispatch-original. Execute the
     /// original call unchanged.
-    DispatchOriginal { operation_id: Uuid },
+    DispatchOriginal { plan: VerificationDispatchPlan },
     /// Gate mode blocked the call. Do not execute.
     Block { message: String, operation_id: Uuid },
     /// Revise mode: dispatch substituted args.
     Revise {
         args: Value,
         disclosure: String,
-        operation_id: Uuid,
+        plan: VerificationDispatchPlan,
+        on_failure_dispatch_original: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerificationDispatchPlan {
+    pub operation_id: Uuid,
+    pub attempt_revision: i64,
 }
 
 pub(crate) struct InterceptInput<'a> {
@@ -68,8 +72,8 @@ pub(crate) struct InterceptInput<'a> {
 }
 
 /// Resolve the dispatching agent's compiled verification policy and, in
-/// shadow mode, record a dispatch-original operation for matching
-/// ArtifactWrite calls.
+/// record a durable operation and resolve it through collection,
+/// adjudication, and actual dispatch for matching ArtifactWrite calls.
 pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> VerificationOutcome {
     if let Some(payload) = crate::engine::interrupt::current_interrupt_park_payload()
         && payload.tool == input.resolved_name
@@ -79,7 +83,10 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
         return match memo.outcome {
             crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal => {
                 VerificationOutcome::DispatchOriginal {
-                    operation_id: memo.operation_id,
+                    plan: VerificationDispatchPlan {
+                        operation_id: memo.operation_id,
+                        attempt_revision: memo.dispatch_attempt_revision,
+                    },
                 }
             }
             crate::db::needs_attention::InterruptVerificationOutcome::Block { message } => {
@@ -94,7 +101,11 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
             } => VerificationOutcome::Revise {
                 args,
                 disclosure,
-                operation_id: memo.operation_id,
+                plan: VerificationDispatchPlan {
+                    operation_id: memo.operation_id,
+                    attempt_revision: memo.dispatch_attempt_revision,
+                },
+                on_failure_dispatch_original: memo.on_failure_dispatch_original,
             },
         };
     }
@@ -108,20 +119,24 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
         return VerificationOutcome::Skip;
     };
 
-    match shadow_record(input, grant, tool_class, instance_id).await {
+    match run_verification(input, grant, tool_class, instance_id).await {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(
                 error = %error,
                 tool = input.resolved_name,
-                "verification intercept failed open; dispatching original"
+                "verification intercept failed closed before host dispatch"
             );
-            VerificationOutcome::Skip
+            VerificationOutcome::Block {
+                message: "verification could not establish its durable decision boundary; revise and re-emit"
+                    .to_string(),
+                operation_id: Uuid::nil(),
+            }
         }
     }
 }
 
-async fn shadow_record(
+async fn run_verification(
     input: InterceptInput<'_>,
     grant: &EffectiveVnextGrant,
     tool_class: ToolClass,
@@ -142,29 +157,237 @@ async fn shadow_record(
     if rule.action == VerificationAction::Off {
         return Ok(VerificationOutcome::Skip);
     }
+    let instance = input
+        .session
+        .db
+        .agent_instance(input.session.id, agent_instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("verification agent instance is absent"))?;
+    let profile_snapshot_id = match instance.resolved_profile_snapshot_id {
+        Some(id) => id,
+        None => {
+            #[cfg(test)]
+            {
+                Uuid::nil()
+            }
+            #[cfg(not(test))]
+            {
+                anyhow::bail!("verification requires an immutable agent profile snapshot")
+            }
+        }
+    };
+    let profile_region = if profile_snapshot_id.is_nil() {
+        None
+    } else {
+        let snapshot = input
+            .session
+            .db
+            .agent_profile_snapshot_by_id(input.session.id, profile_snapshot_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("verification profile snapshot is absent"))?
+            .reconstruct()?;
+        let redacted_subject = crate::db::agent_installations::RedactedVerificationSubject {
+            tool_class: Some("artifact_write".into()),
+            tool_id: Some(input.resolved_name.into()),
+            namespace: Some("host".into()),
+        };
+        snapshot
+            .verification_regions
+            .into_iter()
+            .find(|region| region.matches(&redacted_subject))
+    };
+    if !profile_snapshot_id.is_nil() && profile_region.is_none() {
+        return Ok(VerificationOutcome::Skip);
+    }
+    if profile_region
+        .as_ref()
+        .is_some_and(|region| !region.enabled)
+    {
+        return Ok(VerificationOutcome::Skip);
+    }
+    if let Some(region) = &profile_region {
+        anyhow::ensure!(
+            region.adjudicator_slot.as_deref() == rule.adjudicator_slot.as_deref()
+                && region.mode.as_deref()
+                    == Some(match rule.resolved_mode() {
+                        crate::agents::VerificationMode::Gate => "gate",
+                        crate::agents::VerificationMode::Revise => "revise",
+                    })
+                && region.generator_count == Some(rule.generators.len() as u64)
+                && region.generator_slots
+                    == rule
+                        .generators
+                        .iter()
+                        .map(|generator| generator.slot.clone())
+                        .collect::<Vec<_>>(),
+            "running verification policy disagrees with immutable profile snapshot"
+        );
+    }
     let requested = rule.requested_budget(grant.host_policy.verification_ceiling)?;
     let assembled = serde_json::to_string(&serde_json::json!({
         "tool": input.resolved_name,
         "args": input.args,
     }))?;
     let prices = PriceTable::load_default();
-    let price = prices.get(input.model.model_id_ref());
-    let pre = estimate_candidate_set(CandidateSetEstimateInput {
-        assembled_texts: &[assembled.clone()],
-        encoding: encoding_for_model_id(input.model.model_id_ref()),
-        input_price_per_mtok: price.map(|p| p.input_per_mtok),
-        output_price_per_mtok: price.map(|p| p.output_per_mtok),
-        max_candidates: requested.max_candidates,
-        max_collection_millis: requested.max_collection_millis,
-    });
-    let estimate = pre.to_verification_estimate();
+    let mut estimated_tokens = 0_u64;
+    let mut estimated_cost = Some(0_u64);
+    let guidance_names = input.ctx.config.extended().agent_guidance_files.clone();
+    let target = input
+        .args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                input.ctx.cwd.join(path)
+            }
+        });
+    for generator in &rule.generators {
+        let model = if profile_snapshot_id.is_nil() {
+            Some(input.agent.model.clone())
+        } else {
+            super::models::resolve_profile_utility_model(
+                input.session,
+                input.ctx,
+                profile_snapshot_id,
+                &generator.slot,
+            )
+            .await
+            .ok()
+        };
+        let Some(model) = model else {
+            estimated_cost = None;
+            continue;
+        };
+        let (include_linked_files, last_n_reads) = match generator.recipe {
+            crate::agents::VerificationRecipe::Inherit => (false, 3),
+            crate::agents::VerificationRecipe::CleanRoom {
+                include_linked_files,
+                last_n_reads,
+            } => (include_linked_files, last_n_reads),
+        };
+        let recipe = assemble_recipe(RecipeAssemblyInput {
+            recipe: &generator.recipe,
+            history: input.history,
+            session: input.session,
+            workspace_root: input.session.project_root.as_path(),
+            cwd: input.ctx.cwd.as_path(),
+            target_path: target.as_deref(),
+            tool_name: input.resolved_name,
+            original_args: input.args,
+            guidance_file_names: &guidance_names,
+            last_n_reads,
+            include_linked_files,
+            inherit_framing: "Produce an alternative implementation of the proposed write/edit. Answer through verification_candidate.",
+        }).await?;
+        let assembled_generator =
+            if matches!(generator.recipe, crate::agents::VerificationRecipe::Inherit) {
+                serde_json::to_string(&serde_json::json!({
+                    "history": input.history,
+                    "tools": input.agent.tools.definitions(input.agent.tool_steering),
+                    "prompt": recipe.prompt,
+                }))?
+            } else {
+                recipe.prompt
+            };
+        let price = prices.get(model.model_id_ref());
+        let estimate = estimate_candidate_set(CandidateSetEstimateInput {
+            assembled_texts: std::slice::from_ref(&assembled_generator),
+            encoding: encoding_for_model_id(model.model_id_ref()),
+            input_price_per_mtok: price.map(|price| price.input_per_mtok),
+            output_price_per_mtok: price.map(|price| price.output_per_mtok),
+            max_candidates: 1,
+            max_collection_millis: requested.max_collection_millis,
+        });
+        let turns = u64::from(generator.max_turns.max(1));
+        estimated_tokens = estimated_tokens.saturating_add(estimate.tokens.saturating_mul(turns));
+        estimated_cost = match (estimated_cost, estimate.cost_microusd) {
+            (Some(total), Some(cost)) => Some(total.saturating_add(cost.saturating_mul(turns))),
+            _ => None,
+        };
+    }
+    let adjudicator_model = if profile_snapshot_id.is_nil() {
+        Some(input.agent.model.clone())
+    } else if let Some(slot) = rule.adjudicator_slot.as_deref() {
+        super::models::resolve_profile_utility_model(
+            input.session,
+            input.ctx,
+            profile_snapshot_id,
+            slot,
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
+    if let Some(model) = &adjudicator_model {
+        let price = prices.get(model.model_id_ref());
+        let estimate = estimate_candidate_set(CandidateSetEstimateInput {
+            assembled_texts: std::slice::from_ref(&assembled),
+            encoding: encoding_for_model_id(model.model_id_ref()),
+            input_price_per_mtok: price.map(|price| price.input_per_mtok),
+            output_price_per_mtok: price.map(|price| price.output_per_mtok),
+            max_candidates: 1,
+            max_collection_millis: requested.max_collection_millis,
+        });
+        estimated_tokens = estimated_tokens.saturating_add(estimate.tokens);
+        estimated_cost = match (estimated_cost, estimate.cost_microusd) {
+            (Some(total), Some(cost)) => Some(total.saturating_add(cost)),
+            _ => None,
+        };
+    } else {
+        estimated_cost = None;
+    }
+    let estimate = match estimated_cost {
+        Some(cost) => VerificationEstimate::Known(crate::agents::VerificationBudget {
+            max_candidates: u16::try_from(rule.generators.len()).unwrap_or(u16::MAX),
+            max_total_tokens: estimated_tokens,
+            max_estimated_cost_microusd: cost,
+            max_collection_millis: requested.max_collection_millis,
+        }),
+        None if rule.max_estimated_cost_microusd.is_none() => {
+            VerificationEstimate::Known(crate::agents::VerificationBudget {
+                max_candidates: u16::try_from(rule.generators.len()).unwrap_or(u16::MAX),
+                max_total_tokens: estimated_tokens,
+                max_estimated_cost_microusd: 0,
+                max_collection_millis: requested.max_collection_millis,
+            })
+        }
+        None => VerificationEstimate::UnknownPrice,
+    };
     let estimate_known = matches!(estimate, VerificationEstimate::Known(_));
-    let dispatch = grant.resolve_verification(
-        &subject,
-        VerificationSessionReduction::Inherit,
-        None,
-        estimate,
-    )?;
+    let profile_budget = profile_region
+        .as_ref()
+        .map(|region| crate::agents::VerificationBudget {
+            max_candidates: u16::try_from(region.count_ceiling.unwrap_or_default())
+                .unwrap_or(u16::MAX),
+            max_total_tokens: region.token_ceiling.unwrap_or_default(),
+            max_estimated_cost_microusd: region.cost_ceiling_micros.unwrap_or_default(),
+            max_collection_millis: region.max_collection_duration_ms.unwrap_or_default(),
+        });
+    let session_reduction =
+        profile_region
+            .as_ref()
+            .map_or(VerificationSessionReduction::Inherit, |region| {
+                VerificationSessionReduction::Restrict {
+                    selector: crate::agents::VerificationSelector {
+                        all_of: vec![
+                            crate::agents::SelectorPredicate::ToolClass { tool_class },
+                            crate::agents::SelectorPredicate::ToolId {
+                                tool_id: input.resolved_name.into(),
+                            },
+                            crate::agents::SelectorPredicate::Namespace {
+                                namespace: "host".into(),
+                            },
+                        ],
+                        any_of: Vec::new(),
+                    },
+                    budget: profile_budget,
+                }
+            });
+    let dispatch = grant.resolve_verification(&subject, session_reduction, None, estimate)?;
     match dispatch {
         VerificationDispatch::Off => return Ok(VerificationOutcome::Skip),
         VerificationDispatch::Refuse
@@ -179,7 +402,7 @@ async fn shadow_record(
         VerificationDispatch::Off => return Ok(VerificationOutcome::Skip),
     };
     let now = chrono::Utc::now().timestamp_millis();
-    let ledger = budget_to_ledger(requested);
+    let ledger = budget_to_ledger(profile_budget.unwrap_or(requested));
     let generator_count = i64::try_from(generators.len()).unwrap_or(0);
     let effective_candidate_count = if recorded_action.is_some() {
         0
@@ -189,7 +412,7 @@ async fn shadow_record(
     let original_digest = VerificationDigest::of(assembled.as_bytes());
     let pretool_digest = VerificationDigest::of(
         format!(
-            "shadow-pretool:{}:{}",
+            "verification-pretool:{}:{}",
             input.session.id, input.resolved_name
         )
         .as_bytes(),
@@ -207,9 +430,17 @@ async fn shadow_record(
                 estimated_cost_ceiling_microunits: ledger.estimated_cost_ceiling_microunits,
                 collection_deadline_unix_ms: now.saturating_add(ledger.collection_duration_ms),
                 collection_duration_ms: ledger.collection_duration_ms,
-                conservative_token_reservation: 0,
-                conservative_cost_reservation_microunits: 0,
-                original_operation_digest: original_digest,
+                conservative_token_reservation: if recorded_action.is_some() {
+                    0
+                } else {
+                    i64::try_from(estimated_tokens).unwrap_or(i64::MAX)
+                },
+                conservative_cost_reservation_microunits: if recorded_action.is_some() {
+                    0
+                } else {
+                    i64::try_from(estimated_cost.unwrap_or_default()).unwrap_or(i64::MAX)
+                },
+                original_operation_digest: original_digest.clone(),
                 pretool_context_capability_digest: pretool_digest,
                 estimate_unavailable_action: recorded_action,
                 estimate_known,
@@ -224,9 +455,31 @@ async fn shadow_record(
             operation_id: created.operation_id,
         });
     }
-    let mut collected = Vec::new();
-    if recorded_action.is_none() && !generators.is_empty() {
-        collected = collect_candidates(CollectionInput {
+    let deadline = now.saturating_add(ledger.collection_duration_ms);
+    if recorded_action == Some(VerificationBudgetAction::DispatchOriginal) {
+        let dispatching = input
+            .session
+            .db
+            .start_verification_collection(
+                input.session.id,
+                created.operation_id,
+                created.revision,
+                now,
+            )
+            .await?;
+        let plan = reserve_dispatch(
+            &input,
+            dispatching.operation_id,
+            dispatching.revision,
+            original_digest,
+            VerificationArtifactKind::ProposedCall,
+            input.args,
+        )
+        .await?;
+        return Ok(VerificationOutcome::DispatchOriginal { plan });
+    }
+    let collected = if !generators.is_empty() {
+        collect_candidates(CollectionInput {
             session: input.session,
             agent: input.agent,
             model: input.model,
@@ -238,10 +491,35 @@ async fn shadow_record(
             operation_id: created.operation_id,
             expected_revision: created.revision,
             workspace_root: input.session.project_root.as_path(),
+            profile_snapshot_id,
+            collection_deadline_unix_ms: deadline,
+            original_digest: original_digest.clone(),
         })
         .await
-        .unwrap_or_default();
-    }
+        .unwrap_or_default()
+    } else {
+        let started = input
+            .session
+            .db
+            .start_verification_collection(
+                input.session.id,
+                created.operation_id,
+                created.revision,
+                now,
+            )
+            .await?;
+        input
+            .session
+            .db
+            .close_verification_collection(
+                input.session.id,
+                created.operation_id,
+                started.revision,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?;
+        Vec::new()
+    };
     if recorded_action.is_none() {
         let names = input.ctx.config.extended().agent_guidance_files.clone();
         let target = input
@@ -266,33 +544,137 @@ async fn shadow_record(
         .await
         .map(|(_, body)| body)
         .unwrap_or_default();
-        let verdict = adjudicate(
-            input.model,
-            input.args,
-            &collected,
-            &instructions,
-            rule.resolved_on_adjudication_failure(),
-        )
-        .await
-        .unwrap_or(super::adjudicate::AdjudicatorVerdict {
-            decision: match rule.resolved_on_adjudication_failure() {
-                crate::agents::OnAdjudicationFailure::Refuse => AdjudicatorDecision::Block,
-                crate::agents::OnAdjudicationFailure::DispatchOriginal => {
-                    AdjudicatorDecision::Approve
+        let adjudicator = match adjudicator_model {
+            Some(model) => Ok(model),
+            None if !profile_snapshot_id.is_nil() => {
+                super::models::resolve_profile_utility_model(
+                    input.session,
+                    input.ctx,
+                    profile_snapshot_id,
+                    rule.adjudicator_slot
+                        .as_deref()
+                        .context("verification rule has no adjudicator slot")?,
+                )
+                .await
+            }
+            None => Err(anyhow::anyhow!(
+                "configured verification adjudicator slot is not live"
+            )),
+        };
+        let adjudication_deadline = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(ledger.collection_duration_ms);
+        let adjudication = match adjudicator {
+            Ok(adjudicator) => {
+                let mut adjudicator = adjudicator.as_ref().clone();
+                adjudicator.set_redact_table_for_config(
+                    &input.ctx.config.providers(),
+                    input.ctx.redact.clone(),
+                );
+                adjudicate(
+                    input.ctx.session.clone(),
+                    &adjudicator,
+                    &input.ctx.config,
+                    &input.ctx.cancel,
+                    &format!("{}:verification-adjudicator", input.agent.name),
+                    input.args,
+                    &collected,
+                    &instructions,
+                    adjudication_deadline,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        let verdict = match adjudication {
+            Ok(verdict) => verdict,
+            Err(_)
+                if rule.resolved_on_adjudication_failure()
+                    == crate::agents::OnAdjudicationFailure::DispatchOriginal =>
+            {
+                super::adjudicate::AdjudicatorVerdict {
+                    decision: AdjudicatorDecision::Approve,
+                    selected: None,
+                    feedback: "adjudicator failed; dispatching original".into(),
                 }
-            },
-            selected: None,
-            feedback: "adjudicator failed".into(),
-        });
+            }
+            Err(_) => {
+                let op = input
+                    .session
+                    .db
+                    .host_verification_operation(input.session.id, created.operation_id)
+                    .await?
+                    .context("verification operation disappeared")?;
+                input
+                    .session
+                    .db
+                    .suppress_verification_synthesis(
+                        input.session.id,
+                        created.operation_id,
+                        op.revision,
+                        VerificationSynthesisTerminal::Failed,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                return Ok(VerificationOutcome::Block {
+                    message: "verification adjudication failed; the configured policy refuses this edit; revise and re-emit".into(),
+                    operation_id: created.operation_id,
+                });
+            }
+        };
         let verdict = apply_mode(verdict, rule.resolved_mode(), &collected);
         match (rule.resolved_mode(), verdict.decision) {
-            (_, AdjudicatorDecision::Approve) => {}
+            (_, AdjudicatorDecision::Approve) => {
+                let op = input
+                    .session
+                    .db
+                    .host_verification_operation(input.session.id, created.operation_id)
+                    .await?
+                    .context("verification operation disappeared")?;
+                let dispatching = input
+                    .session
+                    .db
+                    .select_verification_original(
+                        input.session.id,
+                        created.operation_id,
+                        op.revision,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                let plan = reserve_dispatch(
+                    &input,
+                    created.operation_id,
+                    dispatching.revision,
+                    original_digest.clone(),
+                    VerificationArtifactKind::ProposedCall,
+                    input.args,
+                )
+                .await?;
+                return Ok(VerificationOutcome::DispatchOriginal { plan });
+            }
             (crate::agents::VerificationMode::Gate, AdjudicatorDecision::Block) => {
                 let feedback = if verdict.feedback.is_empty() {
                     "verification rejected this change".to_string()
                 } else {
                     verdict.feedback
                 };
+                let op = input
+                    .session
+                    .db
+                    .host_verification_operation(input.session.id, created.operation_id)
+                    .await?
+                    .context("verification operation disappeared")?;
+                input
+                    .session
+                    .db
+                    .suppress_verification_synthesis(
+                        input.session.id,
+                        created.operation_id,
+                        op.revision,
+                        VerificationSynthesisTerminal::Refused,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
                 return Ok(VerificationOutcome::Block {
                     message: format!(
                         "verification blocked this edit: {feedback}; revise and re-emit"
@@ -305,6 +687,38 @@ async fn shadow_record(
                 if let Some(answer) = selected_revision(&verdict, &collected)
                     && let Some(applied) = answer.args.clone()
                 {
+                    let selected_id = verdict
+                        .selected
+                        .context("selected verdict has no candidate")?;
+                    let op = input
+                        .session
+                        .db
+                        .host_verification_operation(input.session.id, created.operation_id)
+                        .await?
+                        .context("verification operation disappeared")?;
+                    let synthesized = input
+                        .session
+                        .db
+                        .synthesize_verification_write(
+                            input.session.id,
+                            created.operation_id,
+                            op.revision,
+                            vec![VerificationSynthesisArtifactSource {
+                                candidate_id: selected_id,
+                                artifact_ordinal: 0,
+                            }],
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await?;
+                    let plan = reserve_dispatch(
+                        &input,
+                        created.operation_id,
+                        synthesized.operation.revision,
+                        synthesized.canonical_output_batch_digest,
+                        VerificationArtifactKind::WriteChangeSet,
+                        &applied,
+                    )
+                    .await?;
                     let original_call = serde_json::to_string_pretty(input.args)?;
                     let applied_call = serde_json::to_string_pretty(&applied)?;
                     let disclosure = format!(
@@ -314,14 +728,63 @@ async fn shadow_record(
                     return Ok(VerificationOutcome::Revise {
                         args: applied,
                         disclosure,
-                        operation_id: created.operation_id,
+                        plan,
+                        on_failure_dispatch_original: rule.resolved_on_adjudication_failure()
+                            == crate::agents::OnAdjudicationFailure::DispatchOriginal,
                     });
+                }
+                if rule.resolved_on_adjudication_failure()
+                    == crate::agents::OnAdjudicationFailure::DispatchOriginal
+                {
+                    let op = input
+                        .session
+                        .db
+                        .host_verification_operation(input.session.id, created.operation_id)
+                        .await?
+                        .context("verification operation disappeared")?;
+                    let dispatching = input
+                        .session
+                        .db
+                        .select_verification_original(
+                            input.session.id,
+                            created.operation_id,
+                            op.revision,
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await?;
+                    let plan = reserve_dispatch(
+                        &input,
+                        created.operation_id,
+                        dispatching.revision,
+                        original_digest.clone(),
+                        VerificationArtifactKind::ProposedCall,
+                        input.args,
+                    )
+                    .await?;
+                    return Ok(VerificationOutcome::DispatchOriginal { plan });
                 }
                 let feedback = if verdict.feedback.is_empty() {
                     "verification rejected this change".to_string()
                 } else {
                     verdict.feedback
                 };
+                let op = input
+                    .session
+                    .db
+                    .host_verification_operation(input.session.id, created.operation_id)
+                    .await?
+                    .context("verification operation disappeared")?;
+                input
+                    .session
+                    .db
+                    .suppress_verification_synthesis(
+                        input.session.id,
+                        created.operation_id,
+                        op.revision,
+                        VerificationSynthesisTerminal::NoValidCandidate,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
                 return Ok(VerificationOutcome::Block {
                     message: format!(
                         "verification blocked this edit: {feedback}; revise and re-emit"
@@ -332,9 +795,59 @@ async fn shadow_record(
             _ => {}
         }
     }
-    Ok(VerificationOutcome::DispatchOriginal {
-        operation_id: created.operation_id,
+    unreachable!("every verification adjudication branch returns")
+}
+
+async fn reserve_dispatch(
+    input: &InterceptInput<'_>,
+    operation_id: Uuid,
+    operation_revision: i64,
+    batch_digest: VerificationDigest,
+    surrogate_kind: VerificationArtifactKind,
+    args: &Value,
+) -> Result<VerificationDispatchPlan> {
+    let attempt = input
+        .session
+        .db
+        .reserve_verification_dispatch(
+            input.session.id,
+            operation_id,
+            operation_revision,
+            &format!("verification-{operation_id}"),
+            NewVerificationEnvelope {
+                batch_digest,
+                surrogate_kind,
+                model_visible_projection: serde_json::json!({
+                    "operation": input.resolved_name,
+                    "arguments": redact_json(args.clone(), input.ctx.redact.as_ref()),
+                }),
+            },
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await?;
+    Ok(VerificationDispatchPlan {
+        operation_id,
+        attempt_revision: attempt.revision,
     })
+}
+
+fn redact_json(value: Value, table: &crate::redact::RedactionTable) -> Value {
+    match value {
+        Value::String(value) => Value::String(table.scrub(&value)),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| redact_json(value, table))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, redact_json(value, table)))
+                .collect(),
+        ),
+        value => value,
+    }
 }
 
 #[cfg(test)]

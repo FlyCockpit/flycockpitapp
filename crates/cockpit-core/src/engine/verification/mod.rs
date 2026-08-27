@@ -13,7 +13,9 @@ pub(crate) mod budget;
 pub(crate) mod classify;
 pub(crate) mod estimate;
 pub(crate) mod generate;
+pub(crate) mod inference;
 pub(crate) mod intercept;
+pub(crate) mod models;
 #[cfg(test)]
 mod ratchet;
 pub(crate) mod recipe;

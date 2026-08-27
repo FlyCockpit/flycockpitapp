@@ -1249,7 +1249,6 @@ mod tests {
             model: Default::default(),
             tools: Vec::new(),
             mcps: Vec::new(),
-            tool_surface_notice: None,
             candidates: vec![cockpit_proto::SessionSetupAgentCandidateV1 {
                 installation: cockpit_proto::AgentInstallationRecordV1 {
                     installation_id: "inst-1".to_string(),
@@ -1459,7 +1458,6 @@ mod tests {
             model: Default::default(),
             tools: Vec::new(),
             mcps: Vec::new(),
-            tool_surface_notice: None,
             candidates: vec![
                 setup_candidate(
                     "inst-root",
@@ -1628,7 +1626,6 @@ mod tests {
             model: Default::default(),
             tools: Vec::new(),
             mcps: Vec::new(),
-            tool_surface_notice: None,
             candidates: vec![
                 setup_candidate(
                     "inst-b",

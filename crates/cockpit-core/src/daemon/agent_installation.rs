@@ -3322,7 +3322,6 @@ impl AgentInstallationService {
                 model: Default::default(),
                 tools: Vec::new(),
                 mcps: Vec::new(),
-                tool_surface_notice: None,
             });
         }
         bail!("session setup authority changed while projecting snapshot; retry request")

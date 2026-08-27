@@ -19,7 +19,8 @@ pub fn enrich_session_setup_snapshot(
     root_foreground: bool,
     root_agent_instance_id: Option<String>,
     override_revision: u64,
-) -> SessionSetupSnapshotV1 {
+    model_override: Option<cockpit_db::db::agent_tree_decisions::StoredModelBinding>,
+) -> anyhow::Result<SessionSetupSnapshotV1> {
     let available = agents::chat_ownable_primaries(project_root);
     snapshot.available_agents = available.clone();
     snapshot.last_used_agent = last_used_agent;
@@ -28,12 +29,9 @@ pub fn enrich_session_setup_snapshot(
     snapshot.root_agent_instance_id = root_agent_instance_id;
     snapshot.override_revision = override_revision;
 
-    let mut def = agents::resolve(project_root, active_agent)
-        .ok()
-        .flatten()
+    let mut def = agents::resolve(project_root, active_agent)?
         .or_else(|| agents::embedded_default(active_agent))
-        .or_else(|| agents::embedded_default("Build"))
-        .expect("Build embedded default");
+        .ok_or_else(|| anyhow::anyhow!("active agent `{active_agent}` could not be resolved"))?;
     if let Some(json) = tool_surface_override_json
         && let Ok(selection) = serde_json::from_str::<ToolSurfaceSelection>(json)
     {
@@ -42,15 +40,33 @@ pub fn enrich_session_setup_snapshot(
     snapshot.tools = project_tools(&def);
     snapshot.mcps = project_mcps(project_root, &def);
     snapshot.model = project_model(&snapshot, active_agent);
-    snapshot
+    if let Some(binding) = model_override {
+        snapshot.model.effective = Some(AgentModelRefV1 {
+            provider_id: binding.provider,
+            model_id: binding.model,
+            is_default: false,
+        });
+    }
+    Ok(snapshot)
 }
 
 fn project_tools(def: &AgentDef) -> Vec<SessionSetupToolV1> {
+    let granted = def.tools.as_deref().unwrap_or_default();
     agents::tool_surface_catalog()
         .into_iter()
-        .filter(|item| item.name != "escalate")
+        .filter(|item| {
+            item.name != "escalate"
+                && (granted.iter().any(|tool| tool == item.name)
+                    || tool_can_be_added(def, item.name))
+        })
         .map(|item| {
-            let tier = agents::computed_tool_tier(def, item.name);
+            let tier = if agents::is_safety_tool(item.name) {
+                crate::agents::ToolTier::Enabled
+            } else if granted.iter().any(|tool| tool == item.name) {
+                agents::computed_tool_tier(def, item.name)
+            } else {
+                crate::agents::ToolTier::Disabled
+            };
             SessionSetupToolV1 {
                 name: item.name.to_string(),
                 tier: tier.label().to_string(),
@@ -63,6 +79,22 @@ fn project_tools(def: &AgentDef) -> Vec<SessionSetupToolV1> {
             }
         })
         .collect()
+}
+
+fn tool_can_be_added(def: &AgentDef, tool: &str) -> bool {
+    let mut tools = def.tools.clone().unwrap_or_default();
+    if !tools.iter().any(|name| name == tool) {
+        tools.push(tool.to_string());
+    }
+    let mut candidate = def.clone();
+    agents::apply_tool_surface_override(
+        &mut candidate,
+        &ToolSurfaceSelection {
+            tools,
+            tool_tiers: def.tool_tiers.clone(),
+        },
+    )
+    .is_ok()
 }
 
 fn project_mcps(project_root: &std::path::Path, def: &AgentDef) -> Vec<SessionSetupMcpV1> {
@@ -80,6 +112,7 @@ fn project_mcps(project_root: &std::path::Path, def: &AgentDef) -> Vec<SessionSe
     });
     entries
         .into_iter()
+        .filter(|entry| entry.server.enabled)
         .map(|entry| SessionSetupMcpV1 {
             name: entry.name,
             scope: entry.source.as_str().to_string(),
@@ -115,15 +148,23 @@ fn scope_rank(scope: McpScope) -> u8 {
 }
 
 fn project_model(snapshot: &SessionSetupSnapshotV1, active_agent: &str) -> AgentModelControlV1 {
-    let candidate = snapshot.candidates.iter().find(|candidate| {
-        candidate.selected
-            || candidate
+    let candidate = snapshot
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate
                 .installation
                 .source_agent_id
                 .rsplit('/')
                 .next()
                 .is_some_and(|name| name == active_agent)
-    });
+        })
+        .or_else(|| {
+            snapshot
+                .candidates
+                .iter()
+                .find(|candidate| candidate.selected)
+        });
     let Some(candidate) = candidate else {
         return AgentModelControlV1::default();
     };
@@ -146,15 +187,30 @@ fn project_model(snapshot: &SessionSetupSnapshotV1, active_agent: &str) -> Agent
             ..Default::default()
         };
     }
-    let allowed: Vec<AgentModelRefV1> = slot
+    let mut allowed: Vec<AgentModelRefV1> = slot
         .choices
         .iter()
+        .filter(|choice| {
+            choice.author_suggested
+                || slot.default_choice_id.as_deref() == Some(choice.choice_id.as_str())
+        })
         .map(|choice| AgentModelRefV1 {
             provider_id: choice.provider_id.clone(),
             model_id: choice.model_id.clone(),
             is_default: slot.default_choice_id.as_deref() == Some(choice.choice_id.as_str()),
         })
         .collect();
+    if allowed.is_empty() {
+        allowed = slot
+            .choices
+            .iter()
+            .map(|choice| AgentModelRefV1 {
+                provider_id: choice.provider_id.clone(),
+                model_id: choice.model_id.clone(),
+                is_default: slot.default_choice_id.as_deref() == Some(choice.choice_id.as_str()),
+            })
+            .collect();
+    }
     let effective = allowed
         .iter()
         .find(|model| model.is_default)

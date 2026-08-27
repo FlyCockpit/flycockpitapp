@@ -3126,11 +3126,13 @@ pub(super) fn tool_surface_override_control(
     selection: crate::agents::ToolSurfaceSelection,
     prune_after_switch: bool,
     monty_nudge: Option<String>,
+    respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 ) -> crate::engine::driver::DriverControl {
     crate::engine::driver::DriverControl::SetToolSurfaceOverride {
         selection,
         prune_after_switch,
         monty_nudge,
+        respond_to,
     }
 }
 
@@ -11697,9 +11699,13 @@ pub(super) async fn run_worker(
                                 )));
                                 continue;
                             }
+                            let (swap_tx, swap_rx) = tokio::sync::oneshot::channel();
                             if !send_driver_control_or_fail(
                                 &driver_control_tx,
-                                crate::engine::driver::DriverControl::SwapPrimary { name },
+                                crate::engine::driver::DriverControl::SwapPrimary {
+                                    name,
+                                    respond_to: swap_tx,
+                                },
                                 &event_tx,
                                 &turn_completions,
                                 &redaction,
@@ -11712,6 +11718,21 @@ pub(super) async fn run_worker(
                                 // selected root. Keep that receipt/row
                                 // authoritative and stop resumably rather than
                                 // return an error while a stale driver remains.
+                                let _ = respond_to.send(Ok(()));
+                                break WorkerStop::Shutdown {
+                                    pause_for_resume: true,
+                                    active: false,
+                                    pending_tool_count: 0,
+                                };
+                            }
+                            if let Err(error) = swap_rx.await.unwrap_or_else(|_| {
+                                Err("driver dropped agent switch result".into())
+                            }) {
+                                tracing::warn!(
+                                    %error,
+                                    session_id = %session_id,
+                                    "live primary swap refused after durable agent persist; closing worker for recovery"
+                                );
                                 let _ = respond_to.send(Ok(()));
                                 break WorkerStop::Shutdown {
                                     pause_for_resume: true,
@@ -11769,6 +11790,7 @@ pub(super) async fn run_worker(
                     persist_session,
                     prune_after_switch,
                     monty_nudge,
+                    respond_to,
                 } => {
                     let selection = match serde_json::from_str::<crate::agents::ToolSurfaceSelection>(
                         &override_json,
@@ -11783,26 +11805,28 @@ pub(super) async fn run_worker(
                                         ),
                                     })
                                     .await;
+                            let _ = respond_to.send(Err(format!("invalid override JSON: {error}")));
                             continue;
                         }
                     };
+                    let prior_override = session.tool_surface_override_json();
                     if persist_session
                         && let Err(error) =
                             session.set_tool_surface_override_json(Some(override_json.clone()))
                     {
-                        tracing::warn!(%error, session_id = %session_id, "persisting tool surface override failed");
-                        let _ = engine_event_notice_tx
-                            .send(TurnEvent::Notice {
-                                text: format!(
-                                    "Tool surface update failed — could not persist session override: {error:#}"
-                                ),
-                            })
-                            .await;
+                        let message = format!("could not persist session override: {error:#}");
+                        let _ = respond_to.send(Err(message));
                         continue;
                     }
+                    let (driver_respond_to, driver_result) = tokio::sync::oneshot::channel();
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
-                        tool_surface_override_control(selection, prune_after_switch, monty_nudge),
+                        tool_surface_override_control(
+                            selection,
+                            prune_after_switch,
+                            monty_nudge,
+                            driver_respond_to,
+                        ),
                         &event_tx,
                         &turn_completions,
                         &redaction,
@@ -11811,8 +11835,30 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
+                        if persist_session {
+                            let _ = session.set_tool_surface_override_json(prior_override);
+                        }
+                        let _ = respond_to.send(Err("driver stopped before tool update".into()));
                         break WorkerStop::DriverFailed;
                     }
+                    let applied = driver_result
+                        .await
+                        .unwrap_or_else(|_| Err("driver dropped tool update result".into()));
+                    if let Err(error) = applied {
+                        if persist_session
+                            && let Err(rollback_error) =
+                                session.set_tool_surface_override_json(prior_override)
+                        {
+                            tracing::error!(%rollback_error, session_id = %session_id, "rolling back refused tool override failed");
+                            let _ = respond_to.send(Err(format!(
+                                "{error}; durable rollback failed: {rollback_error:#}"
+                            )));
+                            continue;
+                        }
+                        let _ = respond_to.send(Err(error));
+                        continue;
+                    }
+                    let _ = respond_to.send(Ok(()));
                 }
                 SessionWork::SetGoalSettingsOverride {
                     override_json,

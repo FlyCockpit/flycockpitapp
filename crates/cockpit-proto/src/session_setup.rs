@@ -148,8 +148,6 @@ pub struct SessionSetupSnapshotV1 {
     pub tools: Vec<SessionSetupToolV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcps: Vec<SessionSetupMcpV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_surface_notice: Option<String>,
 }
 
 fn default_true() -> bool {

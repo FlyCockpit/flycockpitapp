@@ -860,7 +860,11 @@ impl App {
             && self.daemon_prompt.is_none()
             && !self.dialog.is_active()
         {
-            if key.code == KeyCode::Tab {
+            let captures_all_input = self
+                .session_setup_inline
+                .as_ref()
+                .is_some_and(|pane| pane.captures_all_input());
+            if key.code == KeyCode::Tab && !captures_all_input {
                 self.session_setup_focused = !self.session_setup_focused;
                 return false;
             }
@@ -875,7 +879,7 @@ impl App {
                     | KeyCode::Char('q')
             );
             if self.session_setup_focused
-                && setup_nav
+                && (setup_nav || captures_all_input)
                 && let Some(mut pane) = self.session_setup_inline.take()
             {
                 let outcome = pane.handle_key(key);
@@ -2573,7 +2577,6 @@ impl App {
         if submitted.is_empty() && self.composer.paste_is_empty() && pending_probe_ids.is_empty() {
             return false;
         }
-        self.collapse_session_setup_on_first_submit();
         // A selection in flight is deliberately *not* a missing-model state.
         // Build the exact submission below and hold it behind that correlated
         // transaction instead of opening configuration or losing paste/tag
@@ -2761,6 +2764,11 @@ impl App {
             let _ = self.submission_order.complete(fence_sequence);
             return self.commit_compact(submitted);
         }
+
+        // Collapse only after the submission has passed readiness and input
+        // validation and owns its ordered fence. Opening setup or rejecting a
+        // second queued submit must leave the panel available.
+        self.collapse_session_setup_on_first_submit();
 
         // Submitting a new turn implies the user has finished reading
         // history — jump back to the live tail so they see the reply.

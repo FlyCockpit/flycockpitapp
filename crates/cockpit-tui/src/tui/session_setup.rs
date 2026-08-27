@@ -176,6 +176,10 @@ struct AddMcpForm {
     command: TextField,
     transport: usize,
     auth: usize,
+    oauth_authorize_url: TextField,
+    oauth_token_url: TextField,
+    oauth_client_id: TextField,
+    oauth_device_endpoint: TextField,
     scope: SessionSetupMcpScope,
     cursor: usize,
 }
@@ -188,6 +192,10 @@ impl AddMcpForm {
             command: TextField::new(""),
             transport: 0,
             auth: 0,
+            oauth_authorize_url: TextField::new(""),
+            oauth_token_url: TextField::new(""),
+            oauth_client_id: TextField::new(""),
+            oauth_device_endpoint: TextField::new(""),
             scope: SessionSetupMcpScope::Workspace,
             cursor: 0,
         }
@@ -195,7 +203,7 @@ impl AddMcpForm {
 }
 
 const MCP_TRANSPORTS: &[&str] = &["streamable", "stdio", "sse"];
-const MCP_AUTHS: &[&str] = &["none", "oauth", "header", "env"];
+const MCP_AUTHS: &[&str] = &["none", "oauth-browser", "oauth-device", "header", "env"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowKind {
@@ -271,6 +279,10 @@ impl SessionSetupPane {
 
     pub(crate) fn snapshot(&self) -> Option<&SessionSetupSnapshotV1> {
         self.snapshot.as_ref()
+    }
+
+    pub(crate) fn captures_all_input(&self) -> bool {
+        !matches!(self.interaction, Interaction::List)
     }
 
     fn selectable_indices(&self) -> impl Iterator<Item = usize> + '_ {
@@ -543,7 +555,7 @@ impl SessionSetupPane {
                 SessionSetupOutcome::Stay
             }
             KeyCode::Tab | KeyCode::Down => {
-                form.cursor = (form.cursor + 1) % 6;
+                form.cursor = (form.cursor + 1) % 10;
                 self.interaction = Interaction::AddMcp(form);
                 SessionSetupOutcome::Stay
             }
@@ -571,7 +583,7 @@ impl SessionSetupPane {
                 self.interaction = Interaction::AddMcp(form);
                 SessionSetupOutcome::Stay
             }
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.cursor == 5 => {
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.cursor == 9 => {
                 form.scope = match form.scope {
                     SessionSetupMcpScope::Global => SessionSetupMcpScope::Workspace,
                     SessionSetupMcpScope::Workspace => SessionSetupMcpScope::Agent,
@@ -581,14 +593,69 @@ impl SessionSetupPane {
                 SessionSetupOutcome::Stay
             }
             KeyCode::Enter
-                if form.cursor == 5 || form.cursor == 0 && !form.name.text().is_empty() =>
+                if form.cursor == 9 || form.cursor == 0 && !form.name.text().is_empty() =>
             {
+                if form.name.text().trim().is_empty() {
+                    self.notice = Some("MCP name is required.".to_string());
+                    self.interaction = Interaction::AddMcp(form);
+                    return SessionSetupOutcome::Stay;
+                }
                 let transport = MCP_TRANSPORTS[form.transport].to_string();
-                let auth = MCP_AUTHS[form.auth].to_string();
+                let auth_kind = MCP_AUTHS[form.auth];
+                let auth = match auth_kind {
+                    "oauth-browser" => {
+                        if form.oauth_authorize_url.text().is_empty()
+                            || form.oauth_token_url.text().is_empty()
+                        {
+                            self.notice = Some(
+                                "Browser OAuth requires authorize and token URLs.".to_string(),
+                            );
+                            self.interaction = Interaction::AddMcp(form);
+                            return SessionSetupOutcome::Stay;
+                        }
+                        serde_json::json!({
+                            "kind": "oauth",
+                            "authorize_url": form.oauth_authorize_url.text(),
+                            "token_url": form.oauth_token_url.text(),
+                            "client_id": form.oauth_client_id.text(),
+                        })
+                        .to_string()
+                    }
+                    "oauth-device" => {
+                        if form.oauth_device_endpoint.text().is_empty()
+                            || form.oauth_token_url.text().is_empty()
+                        {
+                            self.notice = Some(
+                                "Device OAuth requires device-authorization and token URLs."
+                                    .to_string(),
+                            );
+                            self.interaction = Interaction::AddMcp(form);
+                            return SessionSetupOutcome::Stay;
+                        }
+                        serde_json::json!({
+                            "kind": "oauth",
+                            "device_authorization_endpoint": form.oauth_device_endpoint.text(),
+                            "token_url": form.oauth_token_url.text(),
+                            "client_id": form.oauth_client_id.text(),
+                        })
+                        .to_string()
+                    }
+                    kind => kind.to_string(),
+                };
                 let endpoint =
                     Some(form.endpoint.text().to_string()).filter(|value| !value.is_empty());
                 let command =
                     Some(form.command.text().to_string()).filter(|value| !value.is_empty());
+                if transport == "stdio" && command.is_none() {
+                    self.notice = Some("A stdio MCP requires a command.".to_string());
+                    self.interaction = Interaction::AddMcp(form);
+                    return SessionSetupOutcome::Stay;
+                }
+                if transport != "stdio" && endpoint.is_none() {
+                    self.notice = Some("A remote MCP requires an endpoint.".to_string());
+                    self.interaction = Interaction::AddMcp(form);
+                    return SessionSetupOutcome::Stay;
+                }
                 let outcome = SessionSetupOutcome::AddMcp {
                     scope: form.scope,
                     name: form.name.text().to_string(),
@@ -611,6 +678,10 @@ impl SessionSetupPane {
                     2 => {
                         form.command.handle_key(key);
                     }
+                    5 => form.oauth_authorize_url.handle_key(key),
+                    6 => form.oauth_token_url.handle_key(key),
+                    7 => form.oauth_client_id.handle_key(key),
+                    8 => form.oauth_device_endpoint.handle_key(key),
                     _ => {}
                 }
                 self.interaction = Interaction::AddMcp(form);
@@ -681,7 +752,7 @@ impl SessionSetupPane {
                 self.color,
             ))),
             Status::Ready => {
-                for row in &self.rows {
+                for row in self.inline_visible_rows() {
                     lines.push(Line::from(styled(row.text.clone(), row.kind, self.color)));
                 }
             }
@@ -725,16 +796,55 @@ impl SessionSetupPane {
                     RowKind::Section,
                     self.color,
                 )));
+                let marker = |index| if form.cursor == index { "›" } else { " " };
                 lines.push(Line::from(Span::raw(format!(
-                    "  name: {}",
+                    "{} name: {}",
+                    marker(0),
                     form.name.text()
                 ))));
                 lines.push(Line::from(Span::raw(format!(
-                    "  transport: {}",
+                    "{} endpoint: {}",
+                    marker(1),
+                    form.endpoint.text()
+                ))));
+                lines.push(Line::from(Span::raw(format!(
+                    "{} command: {}",
+                    marker(2),
+                    form.command.text()
+                ))));
+                lines.push(Line::from(Span::raw(format!(
+                    "{} transport: {}",
+                    marker(3),
                     MCP_TRANSPORTS[form.transport]
                 ))));
                 lines.push(Line::from(Span::raw(format!(
-                    "  scope: {}",
+                    "{} auth: {}",
+                    marker(4),
+                    MCP_AUTHS[form.auth]
+                ))));
+                lines.push(Line::from(Span::raw(format!(
+                    "{} authorize URL: {}",
+                    marker(5),
+                    form.oauth_authorize_url.text()
+                ))));
+                lines.push(Line::from(Span::raw(format!(
+                    "{} token URL: {}",
+                    marker(6),
+                    form.oauth_token_url.text()
+                ))));
+                lines.push(Line::from(Span::raw(format!(
+                    "{} client id: {}",
+                    marker(7),
+                    form.oauth_client_id.text()
+                ))));
+                lines.push(Line::from(Span::raw(format!(
+                    "{} device endpoint: {}",
+                    marker(8),
+                    form.oauth_device_endpoint.text()
+                ))));
+                lines.push(Line::from(Span::raw(format!(
+                    "{} scope: {}  (Enter to add)",
+                    marker(9),
                     form.scope.as_str()
                 ))));
             }
@@ -746,6 +856,61 @@ impl SessionSetupPane {
             self.color,
         )));
         lines
+    }
+
+    fn inline_visible_rows(&self) -> Vec<&DisplayRow> {
+        const TOOL_WINDOW: usize = 6;
+        const MCP_WINDOW: usize = 4;
+        let selected = self.list.selected();
+        let selected_tool = selected.and_then(|index| match &self.rows.get(index)?.payload {
+            RowPayload::Tool { name, .. } => Some(name.as_str()),
+            _ => None,
+        });
+        let selected_mcp = selected.and_then(|index| match &self.rows.get(index)?.payload {
+            RowPayload::Mcp { name } => Some(name.as_str()),
+            RowPayload::AddMcp => Some(""),
+            _ => None,
+        });
+        let tools: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|row| matches!(&row.payload, RowPayload::Tool { .. }))
+            .collect();
+        let mcps: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|row| matches!(&row.payload, RowPayload::Mcp { .. } | RowPayload::AddMcp))
+            .collect();
+        let tool_start = selected_tool
+            .and_then(|name| tools.iter().position(|row| matches!(&row.payload, RowPayload::Tool { name: row_name, .. } if row_name == name)))
+            .unwrap_or(0)
+            .saturating_sub(TOOL_WINDOW / 2)
+            .min(tools.len().saturating_sub(TOOL_WINDOW));
+        let mcp_start = selected_mcp
+            .and_then(|name| {
+                mcps.iter().position(|row| match &row.payload {
+                    RowPayload::Mcp { name: row_name } => row_name == name,
+                    RowPayload::AddMcp => name.is_empty(),
+                    _ => false,
+                })
+            })
+            .unwrap_or(0)
+            .saturating_sub(MCP_WINDOW / 2)
+            .min(mcps.len().saturating_sub(MCP_WINDOW));
+        self.rows
+            .iter()
+            .filter(|row| match &row.payload {
+                RowPayload::Tool { .. } => tools
+                    [tool_start..tools.len().min(tool_start + TOOL_WINDOW)]
+                    .iter()
+                    .any(|visible| std::ptr::eq(*visible, *row)),
+                RowPayload::Mcp { .. } | RowPayload::AddMcp => mcps
+                    [mcp_start..mcps.len().min(mcp_start + MCP_WINDOW)]
+                    .iter()
+                    .any(|visible| std::ptr::eq(*visible, *row)),
+                _ => true,
+            })
+            .collect()
     }
 }
 
@@ -1111,64 +1276,51 @@ fn initial_tool_order(tools: &[SessionSetupToolV1]) -> Vec<String> {
 }
 
 fn model_choice_items(snapshot: &SessionSetupSnapshotV1) -> Vec<ModelChoiceItem> {
-    let allowed = &snapshot.model.allowed;
-    let mut items: Vec<ModelChoiceItem> = allowed
-        .iter()
-        .map(|model| ModelChoiceItem {
-            choice_id: format!("{}/{}", model.provider_id, model.model_id),
-            label: {
-                let badge = if model.is_default { "  <default>" } else { "" };
-                format!("{}/{}{badge}", model.provider_id, model.model_id)
-            },
-            is_default: model.is_default,
-            out_of_set: false,
-        })
-        .collect();
+    let active = snapshot.resolved_agent.as_deref();
     let selected = snapshot
         .candidates
         .iter()
-        .find(|candidate| candidate.selected);
-    if let Some(candidate) = selected {
-        if let Some(slot) = candidate
+        .find(|candidate| {
+            active.is_some_and(|active| agent_name(&candidate.installation) == active)
+        })
+        .or_else(|| {
+            snapshot
+                .candidates
+                .iter()
+                .find(|candidate| candidate.selected)
+        });
+    let mut items = Vec::new();
+    if let Some(candidate) = selected
+        && let Some(slot) = candidate
             .slots
             .iter()
             .find(|slot| slot.slot_id == "primary")
             .or_else(|| candidate.slots.first())
-        {
-            for choice in &slot.choices {
-                let in_allowed = allowed.iter().any(|model| {
-                    model.provider_id == choice.provider_id && model.model_id == choice.model_id
-                });
-                if !in_allowed {
-                    items.push(ModelChoiceItem {
-                        choice_id: choice.choice_id.clone(),
-                        label: format!("{}/{}  (out of set)", choice.provider_id, choice.model_id),
-                        is_default: false,
-                        out_of_set: true,
-                    });
-                }
-            }
+    {
+        for choice in &slot.choices {
+            let is_default = slot.default_choice_id.as_deref() == Some(choice.choice_id.as_str());
+            let out_of_set = !snapshot.model.allowed.iter().any(|model| {
+                model.provider_id == choice.provider_id && model.model_id == choice.model_id
+            });
+            items.push(ModelChoiceItem {
+                choice_id: choice.choice_id.clone(),
+                label: format!(
+                    "{}/{}{}",
+                    choice.provider_id,
+                    choice.model_id,
+                    if is_default {
+                        "  <default>"
+                    } else if out_of_set {
+                        "  (compatible, out of set)"
+                    } else {
+                        ""
+                    }
+                ),
+                is_default,
+                out_of_set,
+            });
         }
-    }
-    if items.is_empty() {
-        items = snapshot
-            .candidates
-            .iter()
-            .find(|candidate| candidate.selected)
-            .and_then(|candidate| candidate.slots.first())
-            .map(|slot| {
-                slot.choices
-                    .iter()
-                    .map(|choice| ModelChoiceItem {
-                        choice_id: choice.choice_id.clone(),
-                        label: format!("{}/{}", choice.provider_id, choice.model_id),
-                        is_default: slot.default_choice_id.as_deref()
-                            == Some(choice.choice_id.as_str()),
-                        out_of_set: false,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        items.sort_by_key(|item| item.out_of_set);
     }
     items
 }
@@ -1177,11 +1329,13 @@ fn tool_selection_from_snapshot(snapshot: &SessionSetupSnapshotV1) -> ToolSurfac
     let mut tools = Vec::new();
     let mut tool_tiers = std::collections::BTreeMap::new();
     for tool in &snapshot.tools {
-        tools.push(tool.name.clone());
-        if let Some(tier) = ToolTier::from_label(&tool.tier)
-            && tier != ToolTier::Enabled
-        {
-            tool_tiers.insert(tool.name.clone(), tier);
+        if let Some(tier) = ToolTier::from_label(&tool.tier) {
+            if tier != ToolTier::Disabled {
+                tools.push(tool.name.clone());
+            }
+            if tier == ToolTier::Discoverable {
+                tool_tiers.insert(tool.name.clone(), tier);
+            }
         }
     }
     ToolSurfaceSelection { tools, tool_tiers }
@@ -1286,7 +1440,6 @@ mod tests {
             model: Default::default(),
             tools: Vec::new(),
             mcps: Vec::new(),
-            tool_surface_notice: None,
         }
     }
 

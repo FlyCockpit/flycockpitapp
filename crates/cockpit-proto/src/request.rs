@@ -3300,8 +3300,7 @@ impl Request {
                     | crate::AgentMutation::DeleteCustom { name }
                     | crate::AgentMutation::ResetBuiltin { name }
                     | crate::AgentMutation::SaveGoalSupervision { name, .. }
-                    | crate::AgentMutation::AddMcpServer { name, .. }
-                    | crate::AgentMutation::SavePackageMcp { name, .. } => Some(name),
+                    | crate::AgentMutation::AddMcpServer { name, .. } => Some(name),
                     crate::AgentMutation::ResetAllBuiltins => None,
                 };
                 if let Some(name) = name {

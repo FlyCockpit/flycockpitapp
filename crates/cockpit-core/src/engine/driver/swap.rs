@@ -1719,9 +1719,9 @@ impl Driver {
         &mut self,
         name: &str,
         tx: &mpsc::Sender<TurnEvent>,
-    ) {
+    ) -> bool {
         self.swap_primary_with_context(name, PrimarySwapContext::swap_command(), tx)
-            .await;
+            .await
     }
 
     /// Rebuild a prepared installed root even when its display name already

@@ -21261,6 +21261,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         persist_session,
                         prune_after_switch,
                         monty_nudge,
+                        ..
                     },
                 ) => {
                     assert!(override_json.contains("\"read\""));

@@ -2216,6 +2216,7 @@ pub enum SessionWork {
         persist_session: bool,
         prune_after_switch: bool,
         monty_nudge: Option<String>,
+        respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },
     SetGoalSettingsOverride {
         override_json: Option<String>,

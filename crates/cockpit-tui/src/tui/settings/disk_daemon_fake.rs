@@ -1011,6 +1011,12 @@ fn provider_catalog_snapshot(
             mcp_config_path: Some(mcp_path.display().to_string()),
             mcp_edit_capability: Some(mcp_edit_capability(root, &mcp_path, &mcp_raw_revision)),
             mcp_revision: Some(mcp_raw_revision.clone()),
+            mcp_scope_revisions: [
+                ("global".to_string(), mcp_raw_revision.clone()),
+                ("workspace".to_string(), mcp_raw_revision.clone()),
+            ]
+            .into_iter()
+            .collect(),
             // No TUI surface reads the extended projection from this response;
             // settings loads it through its own layer snapshot instead.
             extended_config_json: None,
@@ -1717,21 +1723,6 @@ fn mutate_agent(
             ensure_revision(&current, expected_revision.as_deref())?;
             let affected = reset_all_builtins(root)?;
             (affected != 0, affected, None)
-        }
-        AgentMutation::SavePackageMcp { name, mcp_json } => {
-            validate_agent_name(&name)?;
-            let current = agent_edit_snapshot(root, &name)?;
-            ensure_revision(&current.revision, expected_revision.as_deref())?;
-            let package_dir = root.join(".cockpit").join("agents").join(&name);
-            std::fs::create_dir_all(&package_dir).map_err(|error| error.to_string())?;
-            let mcp_path = package_dir.join("mcp.json");
-            let body = if mcp_json.contains("mcpServers") {
-                mcp_json
-            } else {
-                format!("{{\"mcpServers\":{mcp_json}}}")
-            };
-            std::fs::write(mcp_path, body).map_err(|error| error.to_string())?;
-            (true, 1, Some(agent_edit_snapshot(root, &name)?))
         }
         AgentMutation::SaveGoalSupervision { name, patch } => {
             validate_agent_name(&name)?;

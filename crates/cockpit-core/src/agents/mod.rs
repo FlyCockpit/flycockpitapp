@@ -420,7 +420,11 @@ pub fn known_tool_names() -> &'static [&'static str] {
 /// Computed runtime tier for display. vNext defs cannot author `toolTiers`;
 /// this is the engine's effective result, not the def.
 pub fn computed_tool_tier(def: &AgentDef, tool: &str) -> ToolTier {
-    crate::engine::builtin::effective_tool_tier(def, tool, false)
+    let is_assistant = def
+        .vnext
+        .as_ref()
+        .is_some_and(|definition| definition.execution_kind == ExecutionKind::Assistant);
+    crate::engine::builtin::effective_tool_tier(def, tool, is_assistant)
 }
 
 pub fn legal_tool_tiers(tool: &str) -> &'static [ToolTier] {

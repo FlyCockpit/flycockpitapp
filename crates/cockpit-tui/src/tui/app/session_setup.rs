@@ -83,6 +83,21 @@ impl App {
                 }
             }
             SessionSetupOutcome::SelectAgent { name } => {
+                if pane
+                    .snapshot()
+                    .is_some_and(|snapshot| !snapshot.root_foreground)
+                {
+                    pane.set_notice(
+                        "Agent changes are unavailable while an interactive subagent holds the foreground."
+                            .to_string(),
+                    );
+                    if as_overlay {
+                        self.overlay = Overlay::SessionSetup(pane);
+                    } else {
+                        self.session_setup_inline = Some(pane);
+                    }
+                    return;
+                }
                 if as_overlay {
                     self.overlay = Overlay::SessionSetup(pane);
                 } else {
@@ -179,9 +194,8 @@ impl App {
                 prune_after_switch: false,
                 monty_nudge: None,
             },
-            ControlApplied::None,
+            ControlApplied::SessionSetupToolSurface,
         );
-        self.request_session_setup_snapshot_refresh();
     }
 
     fn submit_session_setup_add_mcp(
@@ -195,6 +209,13 @@ impl App {
     ) {
         match scope {
             crate::tui::session_setup::SessionSetupMcpScope::Agent => {
+                if session_setup_auth_is_oauth(&auth) {
+                    self.set_session_setup_notice(
+                        "OAuth MCPs must use global or workspace scope so the daemon can own the device/browser flow."
+                            .to_string(),
+                    );
+                    return;
+                }
                 // Agent-scope MCP writes the agent package (one MutateAgent journal).
                 self.start_session_setup_agent_mcp_save(name, transport, endpoint, command, auth);
             }
@@ -222,6 +243,7 @@ impl App {
         auth: String,
     ) {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            self.set_session_setup_notice("Add MCP requires an attached session.".to_string());
             return;
         };
         let attached = runner.attached_request_binding();
@@ -230,6 +252,8 @@ impl App {
             crate::tui::async_action::AsyncActionKind::DaemonRpc("session_setup.add_mcp"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             async move {
+                let oauth = session_setup_auth_is_oauth(&auth);
+                let oauth_server = name.clone();
                 let snapshot_session_id = uuid::Uuid::new_v4().to_string();
                 let snapshot = attached
                     .request(cockpit_proto::Request::GetProviderCatalogSnapshot {
@@ -244,6 +268,11 @@ impl App {
                     return Err("unexpected MCP authority snapshot".to_string());
                 };
                 let server = session_setup_mcp_server_json(&transport, endpoint, command, &auth)?;
+                let expected_revision = config
+                    .mcp_scope_revisions
+                    .get(&target_scope)
+                    .cloned()
+                    .ok_or_else(|| format!("MCP {target_scope} scope is unavailable"))?;
                 let patch = cockpit_proto::McpConfigPatch {
                     operations: vec![cockpit_proto::McpConfigPatchOperation::AddServer {
                         name,
@@ -263,7 +292,7 @@ impl App {
                             .mcp_owner_root
                             .unwrap_or_else(|| project_root.clone()),
                         config_path: config.mcp_config_path.unwrap_or_default(),
-                        expected_revision: config.mcp_revision.unwrap_or_default(),
+                        expected_revision,
                         mutation_intent_hash,
                         patch: cockpit_proto::SensitiveWirePayload::new(patch_wire),
                         secret_values_json: cockpit_proto::SensitiveWirePayload::new("{}".into()),
@@ -271,6 +300,17 @@ impl App {
                     })
                     .await
                     .map_err(|error| error.to_string())?;
+                if oauth {
+                    return attached
+                        .request(cockpit_proto::Request::BeginMcpOAuth {
+                            client_operation_id: uuid::Uuid::new_v4().to_string(),
+                            project_root,
+                            server: oauth_server,
+                        })
+                        .await
+                        .map(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot)
+                        .map_err(|error| error.to_string());
+                }
                 Ok(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot(response))
             },
         );
@@ -284,12 +324,34 @@ impl App {
         command: Option<String>,
         auth: String,
     ) {
+        let active_agent = self
+            .session_setup_inline
+            .as_ref()
+            .and_then(|pane| pane.snapshot())
+            .and_then(|snapshot| snapshot.resolved_agent.clone())
+            .or_else(|| {
+                if let Overlay::SessionSetup(pane) = &self.overlay {
+                    pane.snapshot()
+                        .and_then(|snapshot| snapshot.resolved_agent.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| self.launch.agent_name.clone());
+        if cockpit_core::agents::is_builtin_agent(&active_agent) {
+            self.set_session_setup_notice(
+                "Built-in agents cannot own package MCPs; choose workspace scope or eject the agent first."
+                    .to_string(),
+            );
+            return;
+        }
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            self.set_session_setup_notice("Add MCP requires an attached session.".to_string());
             return;
         };
         let attached = runner.attached_request_binding();
         let project_root = self.launch.cwd.display().to_string();
-        let agent_name = self.launch.agent_name.clone();
+        let agent_name = active_agent;
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("session_setup.add_mcp_agent"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
@@ -306,10 +368,12 @@ impl App {
                     _ => None,
                 };
                 let server = session_setup_mcp_server_json(&transport, endpoint, command, &auth)?;
-                let mcp_json = format!("{{\"{name}\": {server}}}");
-                let mutation = cockpit_proto::AgentMutation::SavePackageMcp {
+                let mutation = cockpit_proto::AgentMutation::AddMcpServer {
                     name: agent_name.clone(),
-                    mcp_json,
+                    server: name,
+                    server_json: server,
+                    profile: "default".to_string(),
+                    secret_values: std::collections::BTreeMap::new(),
                 };
                 let mutation_intent_hash = cockpit_proto::agent_mutation_intent_hash(
                     &project_root,
@@ -320,7 +384,7 @@ impl App {
                     .request(cockpit_proto::Request::MutateAgent {
                         client_operation_id: uuid::Uuid::new_v4().to_string(),
                         mutation_intent_hash,
-                        project_root,
+                        project_root: project_root.clone(),
                         mutation,
                         expected_revision,
                     })
@@ -329,6 +393,15 @@ impl App {
                 Ok(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot(response))
             },
         );
+    }
+
+    pub(super) fn set_session_setup_notice(&mut self, message: String) {
+        if let Overlay::SessionSetup(pane) = &mut self.overlay {
+            pane.set_notice(message.clone());
+        }
+        if let Some(pane) = self.session_setup_inline.as_mut() {
+            pane.set_notice(message);
+        }
     }
 
     /// Schedule an async `GetSessionSetupSnapshot` fetch for the attached
@@ -368,9 +441,28 @@ impl App {
         &mut self,
         response: cockpit_proto::Response,
     ) {
-        let cockpit_proto::Response::SessionSetupSnapshot { snapshot } = response else {
-            self.request_session_setup_snapshot_refresh();
-            return;
+        let snapshot = match response {
+            cockpit_proto::Response::SessionSetupSnapshot { snapshot } => snapshot,
+            cockpit_proto::Response::McpOAuthStarted {
+                authorize_url,
+                user_code,
+                verification_uri,
+                ..
+            } => {
+                let destination = verification_uri.unwrap_or(authorize_url);
+                let code = user_code
+                    .map(|code| format!(" with code `{code}`"))
+                    .unwrap_or_default();
+                self.set_session_setup_notice(format!(
+                    "MCP OAuth started{code}: open {destination}. Finish or poll it in /settings."
+                ));
+                self.request_session_setup_snapshot_refresh();
+                return;
+            }
+            _ => {
+                self.request_session_setup_snapshot_refresh();
+                return;
+            }
         };
         self.prepared_slot_models.clear();
         self.prepared_slot_default = None;
@@ -462,11 +554,17 @@ fn session_setup_mcp_server_json(
     command: Option<String>,
     auth: &str,
 ) -> Result<String, String> {
-    let auth_block = match auth {
-        "oauth" => serde_json::json!({"kind": "oauth"}),
-        "header" => serde_json::json!({"kind": "header", "header": "Authorization", "value": ""}),
-        "env" => serde_json::json!({"kind": "env"}),
-        _ => serde_json::json!({"kind": "none"}),
+    let auth_block = if auth.trim_start().starts_with('{') {
+        serde_json::from_str(auth).map_err(|error| format!("invalid MCP auth: {error}"))?
+    } else {
+        match auth {
+            "oauth" => serde_json::json!({"kind": "oauth"}),
+            "header" => {
+                serde_json::json!({"kind": "header", "header": "Authorization", "value": ""})
+            }
+            "env" => serde_json::json!({"kind": "env"}),
+            _ => serde_json::json!({"kind": "none"}),
+        }
     };
     let value = serde_json::json!({
         "transport": transport,
@@ -476,6 +574,20 @@ fn session_setup_mcp_server_json(
         "enabled": true,
     });
     serde_json::to_string(&value).map_err(|error| error.to_string())
+}
+
+fn session_setup_auth_is_oauth(auth: &str) -> bool {
+    auth == "oauth"
+        || serde_json::from_str::<serde_json::Value>(auth)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some("oauth")
 }
 
 #[cfg(test)]

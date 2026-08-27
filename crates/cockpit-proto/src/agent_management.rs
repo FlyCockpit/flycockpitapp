@@ -130,11 +130,6 @@ pub enum AgentMutation {
         profile: String,
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         secret_values: std::collections::BTreeMap<String, SensitiveWirePayload>,
-    /// Write the agent package `mcp.json` (one journal). Refused while an
-    /// editor lease is open.
-    SavePackageMcp {
-        name: String,
-        mcp_json: String,
     },
 }
 
@@ -211,8 +206,7 @@ pub fn agent_mutation_name(mutation: &AgentMutation) -> Option<&str> {
         | AgentMutation::DeleteCustom { name }
         | AgentMutation::ResetBuiltin { name }
         | AgentMutation::SaveGoalSupervision { name, .. }
-        | AgentMutation::AddMcpServer { name, .. }
-        | AgentMutation::SavePackageMcp { name, .. } => Some(name),
+        | AgentMutation::AddMcpServer { name, .. } => Some(name),
         AgentMutation::ResetAllBuiltins => None,
     }
 }
@@ -251,10 +245,6 @@ pub fn agent_mutation_intent_hash(
             digest_field(&mut digest, server.as_bytes());
             digest_field(&mut digest, profile.as_bytes());
             ("add_mcp_server", Some(name.as_str()))
-        }
-        AgentMutation::SavePackageMcp { name, mcp_json } => {
-            digest_field(&mut digest, mcp_json.as_bytes());
-            ("save_package_mcp", Some(name.as_str()))
         }
     };
     digest_field(&mut digest, action.as_bytes());

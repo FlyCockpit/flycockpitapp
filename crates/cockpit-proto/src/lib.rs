@@ -409,6 +409,10 @@ pub struct ProviderConfigView {
     /// effective projection in `mcp_config_json`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_revision: Option<String>,
+    /// Revisions for explicit Add-MCP targets, minted with the same edit
+    /// capability so a scoped write retains optimistic concurrency.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_scope_revisions: BTreeMap<String, String>,
     /// Optional daemon-redacted extended settings projection. JSON keeps the
     /// settings crate out of the wire/core protocol while ensuring clients do
     /// not load legacy config.json literals locally.

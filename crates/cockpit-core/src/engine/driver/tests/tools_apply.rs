@@ -40,6 +40,7 @@ async fn tools_apply_rebuilds_root_and_prunes() {
         tools.push("skill".to_string());
         tools.sort();
     }
+    let (respond_to, result) = tokio::sync::oneshot::channel();
 
     driver
         .run_control(
@@ -50,10 +51,12 @@ async fn tools_apply_rebuilds_root_and_prunes() {
                 },
                 prune_after_switch: true,
                 monty_nudge: Some("monty tools disabled: code".to_string()),
+                respond_to,
             },
             &tx,
         )
         .await;
+    assert_eq!(result.await.unwrap(), Ok(()));
 
     let names = driver.stack[0].agent.tools.names();
     assert!(names.contains(&"skill"), "{names:?}");
@@ -89,6 +92,7 @@ async fn tools_apply_refused_when_subagent_foreground() {
     install_pinned_build_definition(&mut driver);
     push_test_child(&mut driver, dup_read_history_big());
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let (respond_to, result) = tokio::sync::oneshot::channel();
 
     driver
         .run_control(
@@ -99,10 +103,12 @@ async fn tools_apply_refused_when_subagent_foreground() {
                 },
                 prune_after_switch: true,
                 monty_nudge: None,
+                respond_to,
             },
             &tx,
         )
         .await;
+    assert!(result.await.unwrap().is_err());
 
     assert_eq!(driver.stack.len(), 2);
     assert!(

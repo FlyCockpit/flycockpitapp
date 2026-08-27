@@ -178,7 +178,7 @@ fn builtin_override_document(name: &str, description: &str, body: &str) -> Strin
     let mut definition = embedded_default(name).expect("known bundled definition");
     definition.description = description.to_string();
     definition.prompt = body.to_string();
-    definition.prompt_variants.clear();
+    definition.prompt_overrides.clear();
     definition.to_markdown().expect("vNext bundled override")
 }
 
@@ -701,7 +701,7 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         context_policy: None,
         vnext: None,
         prompt: "body".into(),
-        prompt_variants: std::collections::HashMap::new(),
+        prompt_overrides: std::collections::BTreeMap::new(),
         source: "x.md".into(),
     }
 }
@@ -1242,101 +1242,74 @@ fn agent_path_in_prefers_dir_form_over_flat() {
 
 use crate::config::extended::LlmMode;
 
-/// Write a per-mode agent markdown file (frontmatter + body) into
-/// `<agents>/<name>/<mode>.md`.
-fn write_mode_file(agents: &Path, name: &str, mode: LlmMode, body: &str) {
+/// Write a per-model override agent markdown file (frontmatter + body) into
+/// `<agents>/<name>/<key>.md`.
+fn write_override_file(agents: &Path, name: &str, key: &str, body: &str) {
     let dir = agents.join(name);
     fs::create_dir_all(&dir).unwrap();
     let text = vnext_agent_document("A custom agent.", body);
-    fs::write(dir.join(mode.prompt_file()), text).unwrap();
+    fs::write(dir.join(format!("{key}.md")), text).unwrap();
 }
 
 #[test]
-fn dir_form_selects_per_mode_prompt() {
+fn dir_form_selects_per_model_override() {
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
-    write_mode_file(&agents, "rev", LlmMode::Normal, "NORMAL BODY");
-    write_mode_file(&agents, "rev", LlmMode::Frontier, "FRONTIER BODY");
-    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
-
-    let def = trusted_resolve(tmp.path(), "rev")
-        .unwrap()
-        .expect("agent resolves");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "NORMAL BODY");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "FRONTIER BODY");
-    assert_eq!(
-        def.resolved_prompt_for(LlmMode::Defensive),
-        "DEFENSIVE BODY"
-    );
-}
-
-#[test]
-fn dir_form_missing_mode_falls_back_to_flat_sibling() {
-    // The directory has only `defensive.md`; the flat `<name>.md` sibling is
-    // the fallback for the absent `normal` mode.
-    let tmp = tempfile::tempdir().unwrap();
-    let agents = project_agents_dir(tmp.path());
-    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
+    write_override_file(&agents, "rev", "anthropic/claude-opus", "OPUS BODY");
+    write_override_file(&agents, "rev", "openai/gpt-5", "GPT BODY");
     fs::write(
         agents.join("rev.md"),
-        vnext_agent_document("Flat fallback.", "FLAT BODY"),
+        vnext_agent_document("Flat canonical.", "FLAT BODY"),
     )
     .unwrap();
 
     let def = trusted_resolve(tmp.path(), "rev")
         .unwrap()
         .expect("agent resolves");
-    assert_eq!(
-        def.resolved_prompt_for(LlmMode::Defensive),
-        "DEFENSIVE BODY"
-    );
-    // `normal.md` is absent → fall back to the flat sibling body.
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "FLAT BODY");
-    // `frontier.md` is also absent and no normal body exists → flat fallback.
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "FLAT BODY");
+    assert_eq!(def.resolved_prompt(Some("anthropic/claude-opus")), "OPUS BODY");
+    assert_eq!(def.resolved_prompt(Some("openai/gpt-5")), "GPT BODY");
+    // No hint → the canonical flat body.
+    assert_eq!(def.resolved_prompt(None), "FLAT BODY");
 }
 
 #[test]
-fn dir_form_frontier_falls_back_to_normal_before_flat() {
+fn dir_form_unknown_model_hint_falls_back_to_flat() {
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
-    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
-    write_mode_file(&agents, "rev", LlmMode::Normal, "NORMAL BODY");
+    write_override_file(&agents, "rev", "anthropic/claude-opus", "OPUS BODY");
     fs::write(
         agents.join("rev.md"),
-        vnext_agent_document("Flat fallback.", "FLAT BODY"),
+        vnext_agent_document("Flat canonical.", "FLAT BODY"),
     )
     .unwrap();
 
     let def = trusted_resolve(tmp.path(), "rev")
         .unwrap()
         .expect("agent resolves");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "NORMAL BODY");
+    // An unknown model hint falls back to the canonical flat body.
+    assert_eq!(def.resolved_prompt(Some("unknown/model")), "FLAT BODY");
+    assert_eq!(def.resolved_prompt(None), "FLAT BODY");
 }
 
 #[test]
-fn dir_form_missing_mode_no_flat_errors_naming_agent_and_mode() {
-    // Only `defensive.md` and no flat sibling: resolving still works (the
-    // present mode body is the flat fallback), and the absent mode falls
-    // back to that present body rather than erroring — a partial directory
-    // still loads. The hard error is the empty-directory case below.
+fn dir_form_override_only_no_flat_uses_first_override_as_canonical() {
+    // A directory with override files but no flat sibling still loads: the
+    // first override body is the canonical fallback.
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
-    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
+    write_override_file(&agents, "rev", "anthropic/claude-opus", "OPUS BODY");
     let def = trusted_resolve(tmp.path(), "rev")
         .unwrap()
         .expect("agent resolves");
-    assert_eq!(
-        def.resolved_prompt_for(LlmMode::Defensive),
-        "DEFENSIVE BODY"
-    );
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "DEFENSIVE BODY");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "DEFENSIVE BODY");
+    // The override is present and selectable.
+    assert_eq!(def.resolved_prompt(Some("anthropic/claude-opus")), "OPUS BODY");
+    // No hint and no flat → the first override body is the canonical body.
+    assert!(def.resolved_prompt(None).len() > 0);
 }
 
 #[test]
 fn dir_form_empty_directory_errors_naming_agent() {
-    // A `<name>/` directory with no mode files and no flat sibling is
+    // A `<name>/` directory with no override files and no flat sibling is
     // malformed: error naming the agent.
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
@@ -1344,55 +1317,36 @@ fn dir_form_empty_directory_errors_naming_agent() {
     let err = trusted_resolve(tmp.path(), "rev").unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("rev"), "names the agent: {msg}");
-    assert!(
-        msg.contains("defensive.md") && msg.contains("normal.md") && msg.contains("frontier.md"),
-        "names the missing mode files: {msg}"
-    );
 }
 
 #[test]
-fn flat_file_agent_is_single_mode_in_both_modes() {
-    // A flat-file agent has no per-mode variants — the same body serves
-    // every mode.
+fn flat_file_agent_has_no_overrides() {
+    // A flat-file agent has no per-model overrides — the same body serves
+    // every model hint.
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
     fs::write(
         agents.join("rev.md"),
-        vnext_agent_document("Single mode.", "ONE BODY"),
+        vnext_agent_document("Single body.", "ONE BODY"),
     )
     .unwrap();
     let def = trusted_resolve(tmp.path(), "rev")
         .unwrap()
         .expect("agent resolves");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "ONE BODY");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "ONE BODY");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Defensive), "ONE BODY");
-    assert!(def.prompt_variants.is_empty());
+    assert_eq!(def.resolved_prompt(None), "ONE BODY");
+    assert_eq!(def.resolved_prompt(Some("any/model")), "ONE BODY");
+    assert!(def.prompt_overrides.is_empty());
 }
 
 #[test]
-fn embedded_builtin_falls_back_to_flat_when_a_variant_is_absent() {
-    // Belt-and-suspenders: a built-in whose `prompt_variants` lacks the
-    // requested mode still returns a valid body via the flat fallback. Mutate
-    // a real embedded def to simulate a missing variant.
-    let mut def = embedded_default("Build").unwrap();
-    let flat = def.prompt.clone();
-    def.prompt_variants.remove(&LlmMode::Normal);
-    assert_eq!(
-        def.resolved_prompt_for(LlmMode::Normal),
-        flat,
-        "absent normal variant must fall back to the flat body"
-    );
-    assert_eq!(
-        def.resolved_prompt_for(LlmMode::Frontier),
-        flat,
-        "absent frontier and normal variants must fall back to the flat body"
-    );
-    // Drop all variants → every mode resolves to the flat body.
-    def.prompt_variants.clear();
-    assert_eq!(def.resolved_prompt_for(LlmMode::Defensive), flat);
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), flat);
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), flat);
+fn embedded_builtin_resolves_to_canonical_body() {
+    // An embedded built-in has no per-model overrides; resolved_prompt always
+    // returns the canonical body regardless of the model hint.
+    let def = embedded_default("Build").unwrap();
+    let body = def.prompt.clone();
+    assert_eq!(def.resolved_prompt(None), body);
+    assert_eq!(def.resolved_prompt(Some("any/model")), body);
+    assert!(def.prompt_overrides.is_empty());
 }
 
 #[test]

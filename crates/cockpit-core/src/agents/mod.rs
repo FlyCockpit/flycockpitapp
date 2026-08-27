@@ -296,24 +296,22 @@ pub struct AgentDef {
     /// capability at all.
     #[serde(skip)]
     pub vnext: Option<VnextAgentDef>,
-    /// Body of the markdown file (the agent's system prompt). Resolved
-    /// through [`AgentDef::resolved_prompt`] / [`AgentDef::resolved_prompt_for`]
-    /// rather than read directly so the per-`llm_mode` body variant threads
-    /// through one path (implementation note). For a
-    /// flat-file agent (single-mode) this is *the* body, used for every mode.
-    /// For a per-mode directory agent it holds the body that was selected at
-    /// load time (and [`Self::prompt_variants`] carries the per-mode bodies).
+    /// Body of the markdown file (the agent's system prompt). This is *the*
+    /// single canonical body for the agent (issue #75: the per-`llm_mode`
+    /// defensive/normal/frontier body trios are merged into one). Per-model
+    /// override bodies live in [`Self::prompt_overrides`]. Resolved through
+    /// [`AgentDef::resolved_prompt`] rather than read directly so the
+    /// per-model override threads through one path.
     #[serde(skip)]
     pub prompt: String,
-    /// Per-`llm_mode` prompt bodies for a directory-form agent
-    /// (`<dir>/<name>/<mode>.md`). Empty for a flat-file or embedded agent
-    /// (single-mode — [`Self::prompt`] applies to every mode). When present,
-    /// [`Self::resolved_prompt_for`] selects the body matching the active
-    /// mode, falling back to [`Self::prompt`] (the flat body) when the
-    /// requested mode's file was absent. `frontier` first falls back to the
-    /// `normal` body when present, then to the flat body.
+    /// Per-model prompt-body overrides for a directory-form agent
+    /// (`<dir>/<name>/<key>.md`, keyed by model-slot name or model id). Empty
+    /// for a flat-file or embedded agent. When present,
+    /// [`AgentDef::resolved_prompt`] selects the override matching the
+    /// `model_hint`, falling back to [`Self::prompt`] (the canonical body)
+    /// when no override matches.
     #[serde(skip)]
-    pub prompt_variants: std::collections::HashMap<crate::config::extended::LlmMode, String>,
+    pub prompt_overrides: BTreeMap<String, String>,
     /// Path the definition was loaded from (`<dir>/<name>.md` or the
     /// `<dir>/<name>/` directory), or empty for an embedded default. Used
     /// for diagnostics and override detection.
@@ -894,25 +892,19 @@ pub fn next_primary_in_cycle(current: &str, order: &[String]) -> String {
 }
 
 impl AgentDef {
-    /// The agent's effective system prompt for the active `llm_mode`
-    /// (implementation note). For a directory-form agent
-    /// this is the body of `<name>/<mode>.md`; when that mode's file was
-    /// absent we fall back to the flat body in [`Self::prompt`] — except
-    /// `frontier`, which first tries `normal.md` when present. A flat-file or
-    /// embedded agent has no variants, so this is always [`Self::prompt`].
-    /// Resolution funnels here rather than reading `self.prompt` at scattered
-    /// sites.
-    pub fn resolved_prompt_for(&self, mode: crate::config::extended::LlmMode) -> &str {
-        use crate::config::extended::LlmMode;
-        self.prompt_variants
-            .get(&mode)
-            .or_else(|| {
-                (mode == LlmMode::Frontier)
-                    .then(|| self.prompt_variants.get(&LlmMode::Normal))
-                    .flatten()
-            })
-            .map(String::as_str)
-            .unwrap_or(&self.prompt)
+    /// The agent's effective system prompt (issue #75). The canonical body
+    /// is [`Self::prompt`]; when [`Self::prompt_overrides`] carries a body
+    /// for the given `model_hint` (matched by model-slot name or model id),
+    /// that override wins. A flat-file or embedded agent has no overrides, so
+    /// this is always [`Self::prompt`]. Resolution funnels here rather than
+    /// reading `self.prompt` at scattered sites.
+    pub fn resolved_prompt(&self, model_hint: Option<&str>) -> &str {
+        if let Some(hint) = model_hint {
+            if let Some(body) = self.prompt_overrides.get(hint) {
+                return body;
+            }
+        }
+        &self.prompt
     }
 
     /// Serialize back to the on-disk `<name>.md` form: YAML frontmatter
@@ -1320,7 +1312,7 @@ fn parse_agent_with_scope(
         // body and any trailing newline, so the stored prompt matches the
         // embedded-default form (the composer re-adds a single newline).
         prompt: body.trim_start_matches('\n').trim_end().to_string(),
-        prompt_variants: std::collections::HashMap::new(),
+        prompt_overrides: std::collections::BTreeMap::new(),
         source,
     })
 }
@@ -1470,43 +1462,47 @@ pub fn load_profile_definition_from_owned_path(
 
 /// Load a per-`llm_mode` directory-form agent
 /// (implementation note): `<dir>/<name>/<mode>.md`,
-/// one file per mode. Each mode file is a full agent markdown with
-/// frontmatter and body. Frontmatter (description / mode / tools / model /
-/// temperature) is read from whichever mode file resolves first in
-/// canonical order — the per-mode split is for the **prompt body**, not the
-/// grant; the invariant validation runs once on the resulting def. The
-/// per-mode bodies land in [`AgentDef::prompt_variants`];
-/// [`AgentDef::prompt`] is set to the flat `<dir>/<name>.md` sibling when one
-/// exists (the "fall back to flat" source), else to a present mode body so a
-/// partial directory still loads.
+/// one file per model override. Each override file is a full agent markdown
+/// with frontmatter and body; only the **prompt body** is used as a
+/// per-model override (keyed by the file stem), the frontmatter is read from
+/// the flat `<dir>/<name>.md` sibling. The invariant validation runs once on
+/// the resulting def. The per-model bodies land in
+/// [`AgentDef::prompt_overrides`]; [`AgentDef::prompt`] is set to the flat
+/// `<dir>/<name>.md` sibling when one exists (the canonical body), else to a
+/// present override body so a partial directory still loads.
 ///
 /// `dir` is the search directory, `name` the agent name; the directory
 /// `<dir>/<name>/` must exist (caller checks).
 fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
-    use crate::config::extended::LlmMode;
     let agent_dir = dir.join(name);
 
-    // Read each mode file present. Canonical order: defensive then normal
-    // then frontier — the default mode leads so the frontmatter source is
-    // stable.
-    let modes = [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier];
-    let mut variants: std::collections::HashMap<LlmMode, String> = std::collections::HashMap::new();
-    let mut frontmatter_def: Option<AgentDef> = None;
-    for mode in modes {
-        let mode_path = agent_dir.join(mode.prompt_file());
-        if !mode_path.is_file() {
+    // Read each per-model override file present in the directory. The file
+    // stem (minus `.md`) is the override key (model-slot name or model id).
+    let mut overrides: BTreeMap<String, String> = BTreeMap::new();
+    let mut first_override_def: Option<AgentDef> = None;
+    let entries = std::fs::read_dir(&agent_dir).map_err(|e| {
+        anyhow::anyhow!("reading agent dir {}: {e}", agent_dir.display())
+    })?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let text = read_agent_markdown(&mode_path)?;
-        let parsed = parse_agent(&text, name, mode_path.clone())?;
-        variants.insert(mode, parsed.prompt.clone());
-        if frontmatter_def.is_none() {
-            frontmatter_def = Some(parsed);
+        let key = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(k) if !k.is_empty() => k.to_string(),
+            _ => continue,
+        };
+        let text = read_agent_markdown(&path)?;
+        let parsed = parse_agent(&text, name, path.clone())?;
+        overrides.insert(key, parsed.prompt.clone());
+        if first_override_def.is_none() {
+            first_override_def = Some(parsed);
         }
     }
 
-    // The flat `<dir>/<name>.md` sibling — the fall-back body for any mode
-    // whose file is absent from the directory.
+    // The flat `<dir>/<name>.md` sibling — the canonical body + frontmatter
+    // source.
     let flat_path = dir.join(format!("{name}.md"));
     let flat_def = if flat_path.is_file() {
         Some(load_from_file(&flat_path)?)
@@ -1514,22 +1510,21 @@ fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
         None
     };
 
-    // A directory with no mode files at all and no flat sibling is an
-    // empty/malformed agent: error naming it (the user created `<name>/`
-    // but populated no resolvable prompt).
-    let mut base = match (frontmatter_def, flat_def.clone()) {
+    // A directory with no override files and no flat sibling is an
+    // empty/malformed agent: error naming it.
+    let mut base = match (flat_def.clone(), first_override_def) {
         (Some(def), _) => def,
         (None, Some(def)) => def,
         (None, None) => bail!(
-            "agent `{name}` ({}) has no `defensive.md`/`normal.md`/`frontier.md` and no flat `{name}.md` sibling",
+            "agent `{name}` ({}) has no per-model override `.md` files and no flat `{name}.md` sibling",
             agent_dir.display()
         ),
     };
 
     base.source = agent_dir;
-    base.prompt_variants = variants;
-    // The mode-agnostic flat body: the flat sibling when present (the
-    // explicit fall-back source), else the frontmatter file's own body.
+    base.prompt_overrides = overrides;
+    // The canonical flat body: the flat sibling when present, else the first
+    // override file's own body.
     if let Some(flat) = flat_def {
         base.prompt = flat.prompt;
     }
@@ -1818,10 +1813,13 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
 
 fn agent_markdown_oversized(path: &Path, dir: &Path, name: &str) -> bool {
     let paths: Vec<PathBuf> = if path.is_dir() {
-        use crate::config::extended::LlmMode;
-        [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier]
+        // Per-model override files (`<name>/<key>.md`) plus the flat sibling.
+        std::fs::read_dir(path)
             .into_iter()
-            .map(|mode| path.join(mode.prompt_file()))
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
             .chain(std::iter::once(dir.join(format!("{name}.md"))))
             .filter(|p| p.is_file())
             .collect()

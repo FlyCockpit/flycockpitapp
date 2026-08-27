@@ -129,33 +129,23 @@ fn def(name: &str, description: &str, mode: AgentMode, tools: &[&str], prompt: &
     def_with_normal(name, description, mode, tools, prompt, None)
 }
 
-/// Build an embedded default carrying both LLM-mode prompt variants
-/// (implementation note). `prompt` is the
-/// flat `defensive` body — the default and the mode-agnostic flat fallback;
-/// `normal` is the terser strong-model body. The defensive body is recorded
-/// under both [`AgentDef::prompt`] (the flat fallback) and
-/// `prompt_variants[Defensive]`, so [`AgentDef::resolved_prompt_for`] returns
-/// the mode-appropriate body and still has a valid fallback when a variant is
-/// absent. `normal: None` leaves the agent single-mode (the flat body serves
-/// both modes via the fallback).
+/// Build an embedded default. `prompt` is the single canonical body (issue
+/// #75: the per-`llm_mode` defensive/normal/frontier body trios are merged
+/// into one). The `normal` parameter is retained for call-site compatibility
+/// but is now ignored — the merged `.md` file already carries the canonical
+/// body. Per-model overrides are empty for embedded defaults.
 fn def_with_normal(
     name: &str,
     description: &str,
     mode: AgentMode,
     tools: &[&str],
     prompt: &str,
-    normal: Option<&str>,
+    _normal: Option<&str>,
 ) -> AgentDef {
-    use crate::config::extended::LlmMode;
     // Trim the trailing newline each `include_str!` body carries so an
     // embedded default and the same agent re-parsed from its ejected file
     // compare byte-equal (eject faithfulness).
-    let defensive = prompt.trim_end().to_string();
-    let mut prompt_variants = std::collections::HashMap::new();
-    if let Some(n) = normal {
-        prompt_variants.insert(LlmMode::Defensive, defensive.clone());
-        prompt_variants.insert(LlmMode::Normal, n.trim_end().to_string());
-    }
+    let body = prompt.trim_end().to_string();
     let vnext = if matches!(name, "docs-resolver" | "docs-answerer") {
         // The docs pipeline is an internal two-stage implementation, not a
         // user-authored AgentDef language. Keep its fixed surfaces outside
@@ -181,8 +171,8 @@ fn def_with_normal(
         tool_steering: None,
         context_policy: None,
         vnext,
-        prompt: defensive,
-        prompt_variants,
+        prompt: body,
+        prompt_overrides: std::collections::BTreeMap::new(),
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),
     }
@@ -317,7 +307,7 @@ fn build_def() -> AgentDef {
             "mcp",
         ],
         crate::engine::builtin::BUILD_PROMPT,
-        Some(crate::engine::builtin::BUILD_PROMPT_NORMAL),
+        None,
     );
     def.tool_descriptions.insert(
         "task".to_string(),
@@ -386,7 +376,7 @@ fn builder_def() -> AgentDef {
             "defer_to_orchestrator",
         ],
         crate::engine::builtin::BUILDER_PROMPT,
-        Some(crate::engine::builtin::BUILDER_PROMPT_NORMAL),
+        None,
     );
     def.tool_descriptions.insert(
         "task".to_string(),
@@ -438,7 +428,7 @@ fn explore_def() -> AgentDef {
             "defer_to_orchestrator",
         ],
         crate::engine::builtin::EXPLORE_PROMPT,
-        Some(crate::engine::builtin::EXPLORE_PROMPT_NORMAL),
+        None,
     )
 }
 
@@ -456,7 +446,7 @@ fn history_def() -> AgentDef {
             "session_lineage_search",
         ],
         crate::engine::builtin::HISTORY_PROMPT,
-        Some(crate::engine::builtin::HISTORY_PROMPT_NORMAL),
+        None,
     );
     for tool in ["session_search", "session_read", "session_lineage_search"] {
         def.tool_tiers.insert(tool.to_string(), ToolTier::Enabled);
@@ -496,7 +486,7 @@ fn scout_def() -> AgentDef {
             "return",
         ],
         crate::engine::builtin::SCOUT_PROMPT,
-        Some(crate::engine::builtin::SCOUT_PROMPT_NORMAL),
+        None,
     )
 }
 
@@ -530,7 +520,7 @@ fn plan_def() -> AgentDef {
             "mcp",
         ],
         crate::engine::builtin::PLAN_PROMPT,
-        Some(crate::engine::builtin::PLAN_PROMPT_NORMAL),
+        None,
     )
 }
 
@@ -561,7 +551,7 @@ fn bee_def() -> AgentDef {
             "spawn",
         ],
         crate::engine::builtin::BEE_PROMPT,
-        Some(crate::engine::builtin::BEE_PROMPT_NORMAL),
+        None,
     )
 }
 
@@ -590,7 +580,7 @@ fn multireview_def() -> AgentDef {
             "mcp",
         ],
         crate::engine::builtin::MULTIREVIEW_PROMPT,
-        Some(crate::engine::builtin::MULTIREVIEW_PROMPT_NORMAL),
+        None,
     )
 }
 

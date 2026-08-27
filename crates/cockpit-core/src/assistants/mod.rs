@@ -245,7 +245,7 @@ fn create_assistant_with_installation_id_sync(
         // are intentionally absent from the serialized v2 definition.
         vnext: Some(vnext_for_private_assistant(installation_id)),
         prompt: spec.prompt,
-        prompt_variants: std::collections::HashMap::new(),
+        prompt_overrides: std::collections::BTreeMap::new(),
         source: path.clone(),
     };
     crate::agents::validate_invariants(&agent)?;

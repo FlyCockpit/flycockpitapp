@@ -1897,7 +1897,7 @@ mod tests {
             context_policy: None,
             vnext: Some(selected.clone()),
             prompt: "body".into(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         })
         .unwrap();
@@ -1927,7 +1927,7 @@ mod tests {
             context_policy: None,
             vnext: Some(selected),
             prompt: "body".into(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         };
         assert!(resolver.matches_definition(installation_id, "trusted-helper", &definition));

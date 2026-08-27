@@ -494,7 +494,7 @@ mod grant_tests {
             context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }

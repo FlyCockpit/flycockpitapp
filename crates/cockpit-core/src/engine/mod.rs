@@ -56,7 +56,6 @@ pub mod text_call;
 pub mod think;
 pub mod tool;
 pub mod translate;
-pub(crate) mod verification;
 /// Closed acquisition-outcome type + fail-closed `RequiresUser` validator
 /// (leak-report AC6, sub-increment 2c-3a). A pure module with no provider,
 /// async, or I/O. The production coordinator that dispatches a trusted child
@@ -102,6 +101,7 @@ pub(crate) mod trusted_child_acquisition;
 #[allow(dead_code)]
 pub(crate) mod trusted_child_acquisition_coordinator;
 pub mod validation_hint;
+pub(crate) mod verification;
 
 pub use agent::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress,

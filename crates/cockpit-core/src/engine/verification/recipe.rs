@@ -88,16 +88,11 @@ async fn assemble_clean_room(input: RecipeAssemblyInput<'_>) -> Result<Assembled
     )
     .await
     {
-        stable.push_str(&format!(
-            "## Instructions ({})\n\n{body}\n",
-            path.display()
-        ));
+        stable.push_str(&format!("## Instructions ({})\n\n{body}\n", path.display()));
         if include_linked {
-            for (linked_path, linked_body) in resolve_linked_files(
-                &path,
-                &body,
-                input.workspace_root,
-            ) {
+            for (linked_path, linked_body) in
+                resolve_linked_files(&path, &body, input.workspace_root)
+            {
                 stable.push_str(&format!(
                     "\n## Linked ({})\n\n{linked_body}\n",
                     linked_path.display()
@@ -210,7 +205,11 @@ fn walk_guidance(start: &Path, names: &[String]) -> Option<(PathBuf, String)> {
     None
 }
 
-async fn guidance_is_trusted(session: &Session, workspace_root: &Path, guidance_path: &Path) -> bool {
+async fn guidance_is_trusted(
+    session: &Session,
+    workspace_root: &Path,
+    guidance_path: &Path,
+) -> bool {
     let Some(repo_root) = crate::git::find_worktree_root(guidance_path) else {
         return true;
     };
@@ -438,9 +437,8 @@ mod tests {
 
     #[test]
     fn extract_markdown_links_ignores_urls_and_anchors() {
-        let links = extract_markdown_links(
-            "[a](../x.md) [b](https://ex) [c](#frag) [d](./y.md \"title\")",
-        );
+        let links =
+            extract_markdown_links("[a](../x.md) [b](https://ex) [c](#frag) [d](./y.md \"title\")");
         assert_eq!(links, vec!["../x.md".to_string(), "./y.md".to_string()]);
     }
 }

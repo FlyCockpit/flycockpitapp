@@ -865,6 +865,16 @@ impl Db {
         .await
     }
 
+    /// Retention hook stub. The ledger has no GC today (`retention_state`
+    /// never becomes `'cleaned'`). Wired from the daemon retention tick so a
+    /// later media-retention-style sweep can mark envelopes cleaned without a
+    /// new scheduler.
+    ///
+    /// TODO(media-retention): implement verification envelope cleaning.
+    pub async fn sweep_verification_retention_stub(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     pub async fn list_verification_candidates_for_operation(
         &self,
         session_id: Uuid,
@@ -883,7 +893,9 @@ impl Db {
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             ids.into_iter()
-                .map(|candidate_id| required_candidate(conn, session_id, operation_id, candidate_id))
+                .map(|candidate_id| {
+                    required_candidate(conn, session_id, operation_id, candidate_id)
+                })
                 .collect()
         })
         .await

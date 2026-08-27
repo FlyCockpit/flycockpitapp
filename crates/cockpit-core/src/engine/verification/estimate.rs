@@ -62,7 +62,9 @@ pub fn estimate_tokens(text: &str, encoding: Option<TokenizerStrategy>) -> u64 {
     }
     let raw = match encoding {
         Some(strategy) => count_with(text, strategy) as u64,
-        None => (text.len() as u64).div_ceil(FALLBACK_CHARS_PER_TOKEN).max(1),
+        None => (text.len() as u64)
+            .div_ceil(FALLBACK_CHARS_PER_TOKEN)
+            .max(1),
     };
     raw.saturating_mul(SAFETY_NUM).div_ceil(SAFETY_DEN)
 }
@@ -80,7 +82,12 @@ pub fn estimate_candidate_set(input: CandidateSetEstimateInput<'_>) -> PreCollec
             let output_tokens =
                 u64::from(input.max_candidates.max(1)) * CONSERVATIVE_OUTPUT_TOKENS_PER_CANDIDATE;
             let input_tokens = tokens.saturating_sub(output_tokens);
-            Some(cost_microusd(input_tokens, input_price, output_tokens, output_price))
+            Some(cost_microusd(
+                input_tokens,
+                input_price,
+                output_tokens,
+                output_price,
+            ))
         }
         (Some(input_price), None) if input_price >= 0.0 => {
             Some(cost_microusd(tokens, input_price, 0, 0.0))
@@ -267,12 +274,7 @@ mod tests {
         );
         assert_eq!(
             routing_definition(OnBudgetExceeded::Refuse)
-                .resolve_verification(
-                    &host,
-                    &subject,
-                    None,
-                    VerificationEstimate::UnknownPrice,
-                )
+                .resolve_verification(&host, &subject, None, VerificationEstimate::UnknownPrice,)
                 .unwrap(),
             VerificationDispatch::Refuse
         );

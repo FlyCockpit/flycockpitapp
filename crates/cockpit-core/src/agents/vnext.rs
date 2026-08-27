@@ -1455,7 +1455,11 @@ fn author_slot(slots: &BTreeMap<String, ModelSlot>) -> String {
     if slots.contains_key("primary") {
         "primary".to_string()
     } else {
-        slots.keys().next().cloned().unwrap_or_else(|| "primary".to_string())
+        slots
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "primary".to_string())
     }
 }
 
@@ -1543,7 +1547,10 @@ impl VerificationRule {
 
     /// Custody note: inherit generators on untrusted slots see a redacted
     /// transcript and produce placeholder-bearing (invalid) candidates.
-    pub fn inherit_untrusted_slot_warnings(&self, untrusted_slots: &BTreeSet<String>) -> Vec<String> {
+    pub fn inherit_untrusted_slot_warnings(
+        &self,
+        untrusted_slots: &BTreeSet<String>,
+    ) -> Vec<String> {
         self.generators
             .iter()
             .filter(|generator| {
@@ -1608,9 +1615,7 @@ impl VerificationRule {
                         bail!("verification generator maxTurns must be positive");
                     }
                     if generator.max_turns > MAX_GENERATOR_TURNS {
-                        bail!(
-                            "verification generator maxTurns must be <= {MAX_GENERATOR_TURNS}"
-                        );
+                        bail!("verification generator maxTurns must be <= {MAX_GENERATOR_TURNS}");
                     }
                     if let VerificationRecipe::CleanRoom { last_n_reads, .. } = generator.recipe
                         && last_n_reads == 0
@@ -2780,7 +2785,10 @@ mod tests {
         });
         definition.validate().unwrap();
         let compiled = definition.verification.unwrap().compile();
-        assert_eq!(compiled.regions[0].rule.resolved_mode(), VerificationMode::Gate);
+        assert_eq!(
+            compiled.regions[0].rule.resolved_mode(),
+            VerificationMode::Gate
+        );
         assert_eq!(compiled.regions[0].rule.generators.len(), 1);
 
         let mut adjudicator_only = valid();
@@ -2849,9 +2857,10 @@ mod tests {
         let warnings = rule.inherit_untrusted_slot_warnings(&BTreeSet::from(["untrusted".into()]));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("untrusted"));
-        assert!(rule
-            .inherit_untrusted_slot_warnings(&BTreeSet::new())
-            .is_empty());
+        assert!(
+            rule.inherit_untrusted_slot_warnings(&BTreeSet::new())
+                .is_empty()
+        );
     }
 
     #[test]

@@ -757,6 +757,7 @@ mod tests {
                 "tool-media-subject-binding/test/05050505050505050505050505050505/1".to_string(),
             receipt_bytes: test_binding_receipt(session.session_id),
             now_ms: 20,
+            tool_media_subject_binding: None,
         };
 
         db.transaction(move |conn| Db::insert_tool_media_subject_binding_conn(conn, &insert))
@@ -838,6 +839,7 @@ mod tests {
                 "tool-media-subject-binding/test/07070707070707070707070707070707/1".to_string(),
             receipt_bytes: test_binding_receipt(session.session_id),
             now_ms: 20,
+            tool_media_subject_binding: None,
         };
 
         db.transaction(move |conn| {
@@ -960,6 +962,7 @@ mod tests {
             secure_key_reference_id: "test-ref-2".to_string(),
             receipt_bytes: test_binding_receipt(session.session_id),
             now_ms: 20,
+            tool_media_subject_binding: None,
         };
 
         let result = db

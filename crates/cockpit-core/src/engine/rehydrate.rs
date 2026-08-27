@@ -3442,6 +3442,7 @@ mod tests {
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),
                 now_ms: 11,
+                tool_media_subject_binding: None,
             },
         )
         .await
@@ -3550,6 +3551,7 @@ mod tests {
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),
                 now_ms: 11,
+                tool_media_subject_binding: None,
             },
         )
         .await

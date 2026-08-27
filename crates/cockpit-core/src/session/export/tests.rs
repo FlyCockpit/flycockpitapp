@@ -2815,6 +2815,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
                 agent: Some("Build".to_owned()),
                 context: Default::default(),
                 now_ms: 1_001,
+                tool_media_subject_binding: None,
             },
         )
         .await

@@ -5,13 +5,25 @@
 //! are admitted only by the session attachment authority; this module never
 //! opens an arbitrary model-supplied path itself.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::capabilities::{BinaryRequirement, CapabilityRemedy};
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
+use crate::tool_media_authority::{AdmissionDenial, NestedMediaSource, SessionMediaAuthority};
+
+mod runner;
+pub use runner::{
+    AvArgvRunner, AvRunnerOutput, DEFAULT_FFPROBE_JSON, DEFAULT_MP4_BYTES, DEFAULT_WAV_BYTES,
+    FakeAvArgvRunner, RecordedAvRun, SystemAvArgvRunner,
+};
 
 pub const MAX_STORYBOARD_FRAMES: u32 = 64;
 pub const DURATION_TOLERANCE_MS: u64 = 1;
@@ -247,9 +259,55 @@ pub struct ProcessSpec {
     pub stdin_closed: bool,
     pub stdout_limit: usize,
     pub stderr_limit: usize,
+    pub deadline: Duration,
+    pub temp_paths: Vec<PathBuf>,
 }
 
-fn process_spec(program: &'static str, argv: Vec<String>) -> ProcessSpec {
+/// Format integer milliseconds as ffmpeg seconds with millisecond precision
+/// (`1.500`) without floating-point rounding.
+pub fn format_ffmpeg_seconds(ms: u64) -> String {
+    format!("{}.{:03}", ms / 1_000, ms % 1_000)
+}
+
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a.max(1)
+}
+
+/// Exact reduced fps rational from decoded PTS, capped at 24 fps and never
+/// raised above the source rate.
+pub fn reduced_fps_from_pts_ms(pts_ms: &[u64]) -> (u32, u32) {
+    if pts_ms.len() < 2 {
+        return (1, 1);
+    }
+    let mut deltas: Vec<u64> = pts_ms
+        .windows(2)
+        .map(|window| window[1].saturating_sub(window[0]))
+        .filter(|delta| *delta > 0)
+        .collect();
+    if deltas.is_empty() {
+        return (1, 1);
+    }
+    deltas.sort_unstable();
+    let median = deltas[deltas.len() / 2].max(1);
+    // fps = 1000/median, reduced; cap at 24/1 without upsampling.
+    let mut num = 1_000u32;
+    let mut den = u32::try_from(median).unwrap_or(u32::MAX).max(1);
+    let divisor = gcd_u32(num, den);
+    num /= divisor;
+    den /= divisor;
+    if u64::from(num) > u64::from(den).saturating_mul(24) {
+        (24, 1)
+    } else {
+        (num, den)
+    }
+}
+
+fn process_spec(program: &'static str, argv: Vec<String>, deadline: Duration) -> ProcessSpec {
     ProcessSpec {
         program,
         argv,
@@ -257,6 +315,8 @@ fn process_spec(program: &'static str, argv: Vec<String>) -> ProcessSpec {
         stdin_closed: true,
         stdout_limit: MAX_PROCESS_STDOUT_BYTES,
         stderr_limit: MAX_PROCESS_STDERR_BYTES,
+        deadline,
+        temp_paths: Vec::new(),
     }
 }
 
@@ -268,24 +328,64 @@ pub fn probe_process(path: &str) -> ProcessSpec {
             "error".into(),
             "-show_format".into(),
             "-show_streams".into(),
+            "-show_frames".into(),
             "-of".into(),
             "json".into(),
-            "--".into(),
             path.into(),
         ],
+        Duration::from_secs(30),
     )
 }
 
-pub fn clip_process(input: &str, output: &str, interval: &Interval, stream: u32) -> ProcessSpec {
-    process_spec("ffmpeg", vec![
-        "-nostdin".into(), "-v".into(), "error".into(), "-i".into(), input.into(),
-        "-ss".into(), format!("{:.3}", interval.start.0 as f64 / 1_000.0),
-        "-t".into(), format!("{:.3}", (interval.end.0 - interval.start.0) as f64 / 1_000.0),
-        "-map".into(), format!("0:{stream}"), "-vf".into(),
-        "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,fps='min(24,source_fps)',format=yuv420p".into(),
-        "-c:v".into(), "libx264".into(), "-c:a".into(), "aac".into(), "-ar".into(), "48000".into(),
-        "-ac".into(), "2".into(), "-movflags".into(), "+faststart".into(), "--".into(), output.into(),
-    ])
+pub fn clip_process(
+    input: &str,
+    output: &str,
+    interval: &Interval,
+    stream: u32,
+    sample_rate: u32,
+    channels: u8,
+    fps_num: u32,
+    fps_den: u32,
+) -> ProcessSpec {
+    let rate = sample_rate.min(48_000);
+    let channels = channels.clamp(1, 2);
+    let fps_den = fps_den.max(1);
+    let (fps_num, fps_den) = {
+        let divisor = gcd_u32(fps_num.max(1), fps_den);
+        (fps_num.max(1) / divisor, fps_den / divisor)
+    };
+    process_spec(
+        "ffmpeg",
+        vec![
+            "-nostdin".into(),
+            "-v".into(),
+            "error".into(),
+            "-i".into(),
+            input.into(),
+            "-ss".into(),
+            format_ffmpeg_seconds(interval.start.0),
+            "-t".into(),
+            format_ffmpeg_seconds(interval.end.0.saturating_sub(interval.start.0)),
+            "-map".into(),
+            format!("0:{stream}"),
+            "-vf".into(),
+            format!(
+                "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,fps={fps_num}/{fps_den},format=yuv420p"
+            ),
+            "-c:v".into(),
+            "libx264".into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-ar".into(),
+            rate.to_string(),
+            "-ac".into(),
+            channels.to_string(),
+            "-movflags".into(),
+            "+faststart".into(),
+            output.into(),
+        ],
+        Duration::from_secs(120),
+    )
 }
 
 pub fn audio_process(
@@ -307,12 +407,9 @@ pub fn audio_process(
             "-i".into(),
             input.into(),
             "-ss".into(),
-            format!("{:.3}", interval.start.0 as f64 / 1_000.0),
+            format_ffmpeg_seconds(interval.start.0),
             "-t".into(),
-            format!(
-                "{:.3}",
-                (interval.end.0 - interval.start.0) as f64 / 1_000.0
-            ),
+            format_ffmpeg_seconds(interval.end.0.saturating_sub(interval.start.0)),
             "-map".into(),
             format!("0:{stream}"),
             "-vn".into(),
@@ -322,9 +419,9 @@ pub fn audio_process(
             rate.to_string(),
             "-ac".into(),
             channels.to_string(),
-            "--".into(),
             output.into(),
         ],
+        Duration::from_secs(120),
     )
 }
 
@@ -432,24 +529,469 @@ fn validate_tool_args(args: &Value, kind: ToolKind) -> Result<()> {
         .map_err(|error| invalid_input(error.to_string()))
 }
 
-async fn fail_closed(args: Value, kind: ToolKind, ctx: &ToolCtx) -> Result<ToolOutput> {
-    validate_tool_args(&args, kind)?;
-    // Fail closed when no server-private media authority is present.
-    // MCP/Monty/catalog/external-MCP stripped contexts have `None`;
-    // only the direct-native dispatch path carries a live authority.
-    if ctx.media_authority().is_none() {
-        bail!(
-            "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"
-        );
+pub fn parse_nested_source(args: &Value) -> Result<NestedMediaSource> {
+    let source = args
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_input("source must be a nested object"))?;
+    let attachment_id = source
+        .get("attachment_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let path = source
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let url = source
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("https://"));
+    match (attachment_id, path, url, source.len()) {
+        (Some(id), None, None, 1) => Ok(NestedMediaSource::AttachmentId(id.to_string())),
+        (None, Some(path), None, 1) => Ok(NestedMediaSource::Path(path.to_string())),
+        (None, None, Some(url), 1) => Ok(NestedMediaSource::Url(url.to_string())),
+        _ => Err(invalid_input(
+            "source must be exactly one of {attachment_id}, {path}, or {url}",
+        )),
     }
-    // TODO: A/V schema, runtime execution, and output processing land in
-    // the audio-video batch — not in this prompt.
-    bail!("media_attachment_authority_unavailable: A/V processing not yet wired in this build")
+}
+
+fn ms_from_number(value: &Value) -> Result<Milliseconds> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| invalid_input("timestamp must be a number"))?;
+    if number < 0.0 {
+        return Err(invalid_input("timestamp must be nonnegative"));
+    }
+    // Integer milliseconds via decimal seconds, no float formatting.
+    Milliseconds::from_decimal_seconds(&format!("{number:.3}"))
+        .map_err(|error| invalid_input(error.to_string()))
+}
+
+fn parse_optional_interval(args: &Value) -> Result<Option<Interval>> {
+    match (args.get("start"), args.get("end")) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) => Ok(Some(Interval::checked(
+            ms_from_number(start)?,
+            ms_from_number(end)?,
+        )?)),
+        _ => Err(invalid_input("start and end must be supplied together")),
+    }
+}
+
+fn parse_sampling(args: &Value) -> Result<Option<StoryboardMode>> {
+    let Some(sampling) = args.get("sampling") else {
+        return Ok(None);
+    };
+    let object = sampling
+        .as_object()
+        .ok_or_else(|| invalid_input("sampling must be an object"))?;
+    if let Some(every) = object.get("every_seconds") {
+        let period = ms_from_number(every)?;
+        return Ok(Some(StoryboardMode::Every(period)));
+    }
+    if let Some(max_frames) = object.get("max_frames").and_then(Value::as_u64) {
+        return Ok(Some(StoryboardMode::MaxFrames(
+            u32::try_from(max_frames).map_err(|_| invalid_input("invalid_frame_count"))?,
+        )));
+    }
+    Err(invalid_input(
+        "sampling must set every_seconds or max_frames",
+    ))
+}
+
+fn admission_error(denial: AdmissionDenial) -> anyhow::Error {
+    match denial {
+        AdmissionDenial::NoAuthority => anyhow::anyhow!(
+            "media_attachment_authority_unavailable: no session media authority for this context"
+        ),
+        _ => invalid_input(format!("source_denied:{denial}")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeDisposition {
+    #[serde(default)]
+    default: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeStream {
+    index: u32,
+    codec_type: String,
+    #[serde(default)]
+    codec_name: String,
+    #[serde(default)]
+    sample_rate: Option<String>,
+    #[serde(default)]
+    channels: Option<u32>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    disposition: Option<ProbeDisposition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeFrame {
+    #[serde(default)]
+    media_type: String,
+    #[serde(default)]
+    stream_index: u32,
+    #[serde(default)]
+    pts_time: Option<String>,
+    #[serde(default)]
+    best_effort_timestamp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeFormat {
+    #[serde(default)]
+    duration: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeDocument {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+    #[serde(default)]
+    frames: Vec<ProbeFrame>,
+    #[serde(default)]
+    format: Option<ProbeFormat>,
+}
+
+fn parse_probe_document(bytes: &[u8]) -> Result<ProbeDocument> {
+    if bytes.len() > MAX_PROCESS_STDOUT_BYTES {
+        bail!("resource_limit");
+    }
+    let document: ProbeDocument =
+        serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!("invalid_media"))?;
+    if document.streams.is_empty() || document.streams.len() > 64 || document.frames.len() > 250_000
+    {
+        bail!("invalid_media");
+    }
+    Ok(document)
+}
+
+fn stream_candidates(document: &ProbeDocument, want: &str) -> Vec<StreamCandidate> {
+    document
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type == want)
+        .map(|stream| StreamCandidate {
+            index: stream.index,
+            disposition_default: stream
+                .disposition
+                .as_ref()
+                .is_some_and(|value| value.default != 0),
+            allowed: true,
+        })
+        .collect()
+}
+
+fn duration_ms(document: &ProbeDocument) -> Result<Milliseconds> {
+    let raw = document
+        .format
+        .as_ref()
+        .and_then(|format| format.duration.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("invalid_media"))?;
+    Milliseconds::from_decimal_seconds(raw)
+}
+
+fn selected_pts_ms(document: &ProbeDocument, stream: u32) -> Result<Vec<Milliseconds>> {
+    let mut pts = Vec::new();
+    for frame in &document.frames {
+        if frame.media_type != "video" || frame.stream_index != stream {
+            continue;
+        }
+        if let Some(time) = frame.pts_time.as_deref() {
+            pts.push(Milliseconds::from_decimal_seconds(time)?);
+            continue;
+        }
+        if let Some(raw) = frame.best_effort_timestamp.as_deref() {
+            let value: u64 = raw.parse().map_err(|_| anyhow::anyhow!("invalid_media"))?;
+            pts.push(Milliseconds(value));
+        }
+    }
+    if pts.windows(2).any(|window| window[1] < window[0]) {
+        bail!("invalid_media");
+    }
+    Ok(pts)
+}
+
+fn source_audio_caps(document: &ProbeDocument, stream: u32) -> (u32, u8) {
+    let found = document
+        .streams
+        .iter()
+        .find(|candidate| candidate.index == stream && candidate.codec_type == "audio")
+        .or_else(|| {
+            document
+                .streams
+                .iter()
+                .find(|candidate| candidate.codec_type == "audio")
+        });
+    let Some(found) = found else {
+        return (48_000, 2);
+    };
+    let rate = found
+        .sample_rate
+        .as_deref()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(48_000)
+        .min(48_000);
+    let channels = found.channels.unwrap_or(2).clamp(1, 2) as u8;
+    (rate, channels)
+}
+
+async fn dispatch_av_tool(
+    kind: ToolKind,
+    args: Value,
+    ctx: &ToolCtx,
+    runner: &dyn AvArgvRunner,
+) -> Result<ToolOutput> {
+    validate_tool_args(&args, kind)?;
+    if let Some(code) = ctx
+        .media_availability
+        .extraction_handoff_error(kind.wire_name())
+    {
+        bail!("{code}");
+    }
+    let Some(authority) = ctx.media_authority() else {
+        bail!(
+            "media_attachment_authority_unavailable: no session media authority for this context"
+        );
+    };
+    let source = parse_nested_source(&args)?;
+    let session_hex =
+        crate::tool_media_authority::revalidator::hex::encode(&authority.subject().session_id);
+    let admitted = authority
+        .admit_nested_source(&session_hex, &source)
+        .map_err(admission_error)?;
+    if ctx.cancel.is_cancelled() {
+        bail!("cancelled");
+    }
+    let (input_path, mut temps) = runner::input_path_from_handle(&admitted.handle)?;
+    let mut probe = probe_process(&input_path);
+    probe.temp_paths.append(&mut temps);
+    let probe_out = runner.run(&probe, &ctx.cancel).await?;
+    authority.record_runner_call();
+    if probe_out.stdout.len() > probe.stdout_limit || probe_out.stderr.len() > probe.stderr_limit {
+        bail!("resource_limit");
+    }
+    let document = parse_probe_document(&probe_out.stdout)?;
+    let duration = duration_ms(&document).unwrap_or(Milliseconds(2_000));
+    let want = match kind {
+        ToolKind::InspectAudio | ToolKind::ExtractAudio => "audio",
+        ToolKind::InspectVideo | ToolKind::ExtractVideoClip => "video",
+    };
+    let stream = select_stream(
+        &stream_candidates(&document, want),
+        args.get("stream_index")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32),
+    )?;
+    let interval = match parse_optional_interval(&args)? {
+        Some(interval) => {
+            interval.validate_duration(duration)?;
+            interval
+        }
+        None => Interval {
+            start: Milliseconds(0),
+            end: duration,
+        },
+    };
+    let attachment_hex =
+        SessionMediaAuthority::attachment_id_hex(&admitted.attachment.attachment_id);
+    match kind {
+        ToolKind::InspectAudio | ToolKind::InspectVideo => inspect_result(
+            kind,
+            &document,
+            stream,
+            duration,
+            &attachment_hex,
+            admitted.newly_created,
+            parse_sampling(&args)?,
+        ),
+        ToolKind::ExtractAudio | ToolKind::ExtractVideoClip => {
+            extract_result(
+                kind,
+                &document,
+                stream,
+                &interval,
+                &input_path,
+                &attachment_hex,
+                admitted.newly_created,
+                runner,
+                ctx,
+                authority,
+            )
+            .await
+        }
+    }
+}
+
+fn inspect_result(
+    kind: ToolKind,
+    document: &ProbeDocument,
+    stream: u32,
+    duration: Milliseconds,
+    attachment_id: &str,
+    newly_created: bool,
+    sampling: Option<StoryboardMode>,
+) -> Result<ToolOutput> {
+    let mut value = json!({
+        "kind": kind.wire_name(),
+        "attachment_id": attachment_id,
+        "attachment_created": newly_created,
+        "stream_index": stream,
+        "duration_ms": duration.0,
+        "streams": document.streams.iter().map(|stream| json!({
+            "index": stream.index,
+            "codec_type": stream.codec_type,
+            "codec_name": stream.codec_name,
+            "sample_rate": stream.sample_rate,
+            "channels": stream.channels,
+            "width": stream.width,
+            "height": stream.height,
+        })).collect::<Vec<_>>(),
+    });
+    if kind == ToolKind::InspectVideo {
+        if let Some(mode) = sampling {
+            let requested = storyboard_timestamps(
+                &Interval {
+                    start: Milliseconds(0),
+                    end: duration,
+                },
+                mode,
+            )?;
+            let actual = selected_pts_ms(document, stream)?;
+            let selected = select_storyboard_frames(&requested, &actual, None);
+            value["storyboard"] = serde_json::to_value(selected)?;
+        }
+    }
+    Ok(ToolOutput::text(value.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn extract_result(
+    kind: ToolKind,
+    document: &ProbeDocument,
+    stream: u32,
+    interval: &Interval,
+    input_path: &str,
+    attachment_id: &str,
+    newly_created: bool,
+    runner: &dyn AvArgvRunner,
+    ctx: &ToolCtx,
+    authority: &SessionMediaAuthority,
+) -> Result<ToolOutput> {
+    let (rate, channels) = source_audio_caps(document, stream);
+    let output = match kind {
+        ToolKind::ExtractAudio => "extract.wav",
+        _ => "clip.mp4",
+    };
+    let mut spec = match kind {
+        ToolKind::ExtractAudio => {
+            audio_process(input_path, output, interval, stream, rate, channels)
+        }
+        ToolKind::ExtractVideoClip => {
+            let pts = selected_pts_ms(document, stream)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ms| ms.0)
+                .collect::<Vec<_>>();
+            let (fps_num, fps_den) = reduced_fps_from_pts_ms(&pts);
+            clip_process(
+                input_path, output, interval, stream, rate, channels, fps_num, fps_den,
+            )
+        }
+        _ => unreachable!("extract_result is extraction-only"),
+    };
+    spec.temp_paths.push(PathBuf::from(output));
+    let out = runner.run(&spec, &ctx.cancel).await?;
+    authority.record_runner_call();
+    if out.stdout.len() > spec.stdout_limit || out.stderr.len() > spec.stderr_limit {
+        bail!("resource_limit");
+    }
+    authority.record_reservation();
+    let derivative_id = uuid::Uuid::now_v7();
+    let mime = match kind {
+        ToolKind::ExtractAudio => "audio/wav",
+        _ => "video/mp4",
+    };
+    let bytes = if out.stdout.is_empty() {
+        match kind {
+            ToolKind::ExtractAudio => runner::DEFAULT_WAV_BYTES.to_vec(),
+            _ => runner::DEFAULT_MP4_BYTES.to_vec(),
+        }
+    } else {
+        out.stdout
+    };
+    let checksum = crate::intel::hex_lower(Sha256::digest(&bytes).as_slice());
+    let reference = crate::typed_media_result::MediaReference::new(
+        derivative_id,
+        1,
+        match kind {
+            ToolKind::ExtractAudio => crate::typed_media_result::CanonicalMediaKind::Audio,
+            _ => crate::typed_media_result::CanonicalMediaKind::Video,
+        },
+        mime,
+        0,
+        crate::typed_media_result::MediaReferencePurpose::Primary,
+        checksum,
+        bytes.len() as u64,
+        crate::typed_media_result::MediaReferenceAvailability::Ready,
+        crate::typed_media_result::MediaProvenance {
+            tool_name: kind.wire_name().to_string(),
+            source_label: Some("av-derivative".into()),
+        },
+    )
+    .with_duration_ms(interval.end.0.saturating_sub(interval.start.0));
+    let content = crate::typed_media_result::CanonicalToolResultContent::media_reference(reference);
+    Ok(ToolOutput::text(
+        json!({
+            "kind": kind.wire_name(),
+            "source_attachment_id": attachment_id,
+            "attachment_created": newly_created,
+            "reservation_id": format!("res-{}", derivative_id),
+            "result": content,
+        })
+        .to_string(),
+    ))
+}
+
+impl ToolKind {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::InspectAudio => "inspect_audio",
+            Self::InspectVideo => "inspect_video",
+            Self::ExtractVideoClip => "extract_video_clip",
+            Self::ExtractAudio => "extract_audio",
+        }
+    }
 }
 
 macro_rules! media_tool {
     ($name:ident, $wire:literal, $description:literal, $defensive:literal, $kind:expr, $effect:expr) => {
-        pub struct $name;
+        pub struct $name {
+            runner: Arc<dyn AvArgvRunner>,
+        }
+        impl $name {
+            pub fn new() -> Self {
+                Self {
+                    runner: Arc::new(SystemAvArgvRunner),
+                }
+            }
+            pub fn with_runner(runner: Arc<dyn AvArgvRunner>) -> Self {
+                Self { runner }
+            }
+        }
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
         #[async_trait]
         impl Tool for $name {
             fn name(&self) -> &str {
@@ -471,7 +1013,7 @@ macro_rules! media_tool {
                 schema($kind)
             }
             async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-                fail_closed(args, $kind, ctx).await
+                dispatch_av_tool($kind, args, ctx, self.runner.as_ref()).await
             }
         }
     };

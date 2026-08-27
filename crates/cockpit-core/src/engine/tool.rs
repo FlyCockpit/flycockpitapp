@@ -1454,6 +1454,9 @@ struct McpBuiltinToolEntry {
 }
 
 pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
+    if crate::tool_media_authority::is_media_tool_name(name) {
+        return false;
+    }
     !matches!(
         name,
         "question"
@@ -1581,6 +1584,10 @@ impl ToolBox {
             })
             .map(|(name, _entry)| name.clone())
             .collect()
+    }
+
+    pub(crate) fn mcp_native_tool_names(&self) -> Vec<String> {
+        self.mcp_builtin_tools.keys().cloned().collect()
     }
 
     /// Register a per-agent description override for the tool named `name`.

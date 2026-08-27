@@ -1145,7 +1145,10 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
         SubmissionOrigin::Internal,
     ] {
         assert!(!origin.advances_activity_epoch(), "{origin:?}");
-        assert!(gate.suppresses(&coverage), "{origin:?} must not clear UntilActivity");
+        assert!(
+            gate.suppresses(&coverage),
+            "{origin:?} must not clear UntilActivity"
+        );
     }
 
     // ExternalRoot advances the epoch, clearing UntilActivity.
@@ -3141,7 +3144,10 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
         other => panic!("expected Ready shadow after restart, got {other:?}"),
     };
     assert_eq!(restored.shadow_brief_generation, 5);
-    assert_eq!(ready.brief, "partial shadow brief derived from fitted history");
+    assert_eq!(
+        ready.brief,
+        "partial shadow brief derived from fitted history"
+    );
     // The fit metadata survives the round-trip.
     assert_eq!(ready.fit_rung, CompactFitRung::HistorySelected);
     assert_eq!(ready.input_coverage, CompactInputCoverage::Partial);
@@ -3152,8 +3158,7 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
     // A partial shadow is never a final handoff.  The durable payload
     // itself is a `ReadyBrief` (shadow), not a `PreparedCompaction` (the
     // final handoff).  Verify this structurally.
-    let decoded: DurableCompactionShadow =
-        serde_json::from_str(&payload_json).unwrap();
+    let decoded: DurableCompactionShadow = serde_json::from_str(&payload_json).unwrap();
     assert!(
         matches!(decoded, DurableCompactionShadow::ReadyBrief(_)),
         "a partial shadow must be a ReadyBrief, not a PreparedCompaction handoff"
@@ -3198,7 +3203,10 @@ async fn manual_compact_bypasses_auto_compact_gate() {
 
     let mut saw_compact_event = false;
     while let Some(event) = rx.recv().await {
-        if matches!(event, TurnEvent::CompactReady { .. } | TurnEvent::Notice { .. }) {
+        if matches!(
+            event,
+            TurnEvent::CompactReady { .. } | TurnEvent::Notice { .. }
+        ) {
             saw_compact_event = true;
         }
     }

@@ -686,9 +686,10 @@ mod tests {
         super::rehydrate::validate_pairing(&fitted.history).unwrap();
         // It must not begin at the orphaned tool result.
         assert!(
-            !fitted.history.iter().any(|msg| {
-                serde_json::to_string(msg).unwrap().contains("file1\nfile2")
-            }),
+            !fitted
+                .history
+                .iter()
+                .any(|msg| { serde_json::to_string(msg).unwrap().contains("file1\nfile2") }),
             "a split beginning at an orphaned tool result must be rejected"
         );
     }
@@ -1008,10 +1009,7 @@ mod tests {
 
         // A diagnostic with extra whitespace is normalized.
         let messy = "  compact   model\n\n  returned   an  error  ";
-        assert_eq!(
-            bounded_diagnostic(messy),
-            "compact model returned an error"
-        );
+        assert_eq!(bounded_diagnostic(messy), "compact model returned an error");
     }
 
     #[test]

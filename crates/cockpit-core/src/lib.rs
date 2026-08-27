@@ -56,6 +56,7 @@ pub mod leaks;
 pub mod locks;
 pub mod mcp;
 mod media_https;
+mod media_image;
 pub mod media_reservation;
 mod media_storage;
 pub mod model_system_prompt;

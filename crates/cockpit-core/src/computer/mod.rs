@@ -28,8 +28,6 @@ mod target_tests;
 use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::io::Cursor;
-#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
@@ -1204,24 +1202,22 @@ fn scale_png(png: Vec<u8>, scale: ScaleFactor) -> Result<Vec<u8>, ComputerError>
     if (scale.0 - 1.0).abs() < f64::EPSILON {
         return Ok(png);
     }
-    let image =
-        image::load_from_memory_with_format(&png, image::ImageFormat::Png).map_err(|error| {
-            ComputerError::CommandFailed {
-                program: "image".to_string(),
-                detail: error.to_string(),
-            }
-        })?;
-    let width = scaled_dimension(image.width(), scale)?;
-    let height = scaled_dimension(image.height(), scale)?;
-    let scaled = image.resize_exact(width, height, image::imageops::FilterType::Nearest);
-    let mut out = Vec::new();
-    scaled
-        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
-        .map_err(|error| ComputerError::CommandFailed {
+    let profile = crate::media_image::ImageProfile::screenshot();
+    let image = crate::media_image::decode_and_orient(&png, &profile).map_err(|error| {
+        ComputerError::CommandFailed {
             program: "image".to_string(),
             detail: error.to_string(),
-        })?;
-    Ok(out)
+        }
+    })?;
+    let width = scaled_dimension(image.width(), scale)?;
+    let height = scaled_dimension(image.height(), scale)?;
+    let scaled = crate::media_image::scale(image, width, height, &profile);
+    crate::media_image::encode_png(&scaled, &profile).map_err(|error| {
+        ComputerError::CommandFailed {
+            program: "image".to_string(),
+            detail: error.to_string(),
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]

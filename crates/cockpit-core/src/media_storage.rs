@@ -5159,54 +5159,32 @@ fn verify_mp4a_sample_entry(entry: &[u8]) -> Result<()> {
     Ok(())
 }
 
-struct NormalizedImageDerivatives {
-    model_png: Vec<u8>,
+pub(crate) struct NormalizedImageDerivatives {
+    pub(crate) model_png: Vec<u8>,
     thumbnail_png: Vec<u8>,
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     thumbnail_width: u32,
     thumbnail_height: u32,
 }
 
-fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDerivatives> {
-    use image::{DynamicImage, ImageDecoder as _, ImageFormat, ImageReader, Limits};
-    let (format, exif_orientation) = match container {
-        "png" => {
-            reject_png_color_metadata(bytes)?;
-            (ImageFormat::Png, None)
+pub(crate) fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDerivatives> {
+    match container {
+        "png" => reject_png_color_metadata(bytes)?,
+        "jpeg" => {
+            let _ = reject_jpeg_metadata(bytes)?;
         }
-        "jpeg" => (ImageFormat::Jpeg, reject_jpeg_metadata(bytes)?),
-        "gif" => {
-            reject_gif_structure(bytes)?;
-            (ImageFormat::Gif, None)
+        "gif" => reject_gif_structure(bytes)?,
+        "webp" => {
+            let _ = reject_webp_metadata(bytes)?;
         }
-        "webp" => (ImageFormat::WebP, reject_webp_metadata(bytes)?),
         _ => anyhow::bail!("ambiguous_or_unsupported_container"),
     };
-    let mut reader = ImageReader::with_format(std::io::Cursor::new(bytes), format);
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(8_192);
-    limits.max_image_height = Some(8_192);
-    limits.max_alloc = Some(160_000_000);
-    reader.limits(limits);
-    let decoder = reader.into_decoder().context("invalid_media")?;
-    let (width, height) = decoder.dimensions();
-    ensure!(
-        width > 0 && height > 0 && width <= 8_192 && height <= 8_192,
-        "resource_limit"
-    );
-    ensure!(
-        u64::from(width)
-            .checked_mul(u64::from(height))
-            .is_some_and(|p| p <= 40_000_000),
-        "resource_limit"
-    );
-    let mut decoded = DynamicImage::from_decoder(decoder).context("decode_failed")?;
-    if let Some(value) = exif_orientation {
-        decoded.apply_orientation(
-            image::metadata::Orientation::from_exif(value).context("invalid_media")?,
-        );
-    }
+    let profile = crate::media_image::ImageProfile::storage();
+    let decoded =
+        crate::media_image::decode_and_orient(bytes, &profile).context("decode_failed")?;
+    let width = decoded.width();
+    let height = decoded.height();
     let mut rgba = decoded.into_rgba8();
     for pixel in rgba.pixels_mut() {
         if pixel[3] == 0 {
@@ -5223,12 +5201,13 @@ fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDeriv
             u32::try_from((u64::from(height) * 256 / max_edge).max(1))?,
         )
     };
-    let thumbnail = image::imageops::resize(
-        &rgba,
+    let thumbnail = crate::media_image::scale(
+        image::DynamicImage::ImageRgba8(rgba.clone()),
         thumbnail_width,
         thumbnail_height,
-        image::imageops::FilterType::Triangle,
-    );
+        &profile,
+    )
+    .into_rgba8();
     let thumbnail_png = encode_canonical_png(&thumbnail)?;
     ensure!(thumbnail_png.len() <= 512 * 1024, "resource_limit");
     Ok(NormalizedImageDerivatives {
@@ -5506,19 +5485,8 @@ fn parse_tiff_exif(bytes: &[u8]) -> Result<(Option<u8>, Option<u16>)> {
 }
 
 fn encode_canonical_png(image: &image::RgbaImage) -> Result<Vec<u8>> {
-    use image::ImageEncoder as _;
-    let mut encoded = Vec::new();
-    image::codecs::png::PngEncoder::new_with_quality(
-        &mut encoded,
-        image::codecs::png::CompressionType::Level(6),
-        image::codecs::png::FilterType::Paeth,
-    )
-    .write_image(
-        image,
-        image.width(),
-        image.height(),
-        image::ExtendedColorType::Rgba8,
-    )?;
+    let encoded =
+        crate::media_image::encode_png_rgba(image, &crate::media_image::ImageProfile::storage())?;
     insert_png_srgb(encoded)
 }
 

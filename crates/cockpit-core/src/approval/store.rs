@@ -1371,11 +1371,7 @@ pub fn mcp_server_connect_key(server: &str, identity: &str) -> String {
     mcp_server_connect_key_for(None, server, identity)
 }
 
-pub fn mcp_server_connect_key_for(
-    agent: Option<&str>,
-    server: &str,
-    identity: &str,
-) -> String {
+pub fn mcp_server_connect_key_for(agent: Option<&str>, server: &str, identity: &str) -> String {
     mcp_tool_key_for(agent, server, &format!("\u{0}connect:{identity}"))
 }
 

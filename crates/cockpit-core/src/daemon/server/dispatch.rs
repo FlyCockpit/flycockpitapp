@@ -13022,11 +13022,9 @@ async fn handle_serialized_request_impl(
                 let poll_cancel = cancelled.clone();
                 tokio::spawn(async move {
                     let interval = device.interval_secs;
-                    let _ = crate::mcp::device::run_device_poll_loop(
-                        interval,
-                        poll_cancel,
-                        || crate::mcp::device::poll_device_token(&poll_oauth, &poll_code),
-                    )
+                    let _ = crate::mcp::device::run_device_poll_loop(interval, poll_cancel, || {
+                        crate::mcp::device::poll_device_token(&poll_oauth, &poll_code)
+                    })
                     .await;
                 });
                 let _ = cancelled;

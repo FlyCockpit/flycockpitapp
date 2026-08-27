@@ -137,7 +137,10 @@ pub async fn request_device_authorization(oauth: &OauthAuth) -> Result<DeviceAut
         .await
         .context("requesting MCP device authorization")?;
     if !resp.status().is_success() {
-        bail!("MCP device-authorization request failed ({})", resp.status());
+        bail!(
+            "MCP device-authorization request failed ({})",
+            resp.status()
+        );
     }
     let body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
     let mut parsed: DeviceCodeResponse =
@@ -175,10 +178,7 @@ pub enum DevicePollOutcome {
     Denied(String),
 }
 
-pub async fn poll_device_token(
-    oauth: &OauthAuth,
-    device_code: &str,
-) -> Result<DevicePollOutcome> {
+pub async fn poll_device_token(oauth: &OauthAuth, device_code: &str) -> Result<DevicePollOutcome> {
     let token_url = oauth
         .token_url
         .as_deref()
@@ -331,11 +331,9 @@ mod tests {
         assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) >= 3);
 
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let err = run_device_poll_loop(0, cancelled, || async {
-            Ok(DevicePollOutcome::Pending)
-        })
-        .await
-        .unwrap_err();
+        let err = run_device_poll_loop(0, cancelled, || async { Ok(DevicePollOutcome::Pending) })
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
     }
 }

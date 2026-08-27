@@ -331,7 +331,11 @@ impl Approver {
         let agent = agent_bound.then_some(self.agent_id.as_str());
         let grant_target = crate::approval::store::mcp_tool_key_for(agent, server, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self.store.mcp_tool_reject_scope_for_key(&grant_target).await {
+        if let Some(scope) = self
+            .store
+            .mcp_tool_reject_scope_for_key(&grant_target)
+            .await
+        {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -616,8 +620,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&target).await
-        {
+        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&target).await {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_server_connect",

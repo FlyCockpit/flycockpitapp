@@ -312,9 +312,7 @@ pub async fn invoke(
         }
         bail!("unknown MCP server `{server}`");
     };
-    let server_cfg = entry
-        .server
-        .with_selected_profile(server, &entry.profile)?;
+    let server_cfg = entry.server.with_selected_profile(server, &entry.profile)?;
     if !server_cfg.enabled {
         bail!("MCP server `{server}` is disabled");
     }

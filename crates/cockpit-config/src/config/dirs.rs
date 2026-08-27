@@ -549,7 +549,10 @@ mod tests {
                 .map(|(kind, path)| (*kind, path.clone()))
                 .collect::<Vec<_>>(),
             vec![
-                (ConfigDirKind::HomeXdg, home.join(".config/cockpit/mcp.json")),
+                (
+                    ConfigDirKind::HomeXdg,
+                    home.join(".config/cockpit/mcp.json")
+                ),
                 (ConfigDirKind::Project, parent.join(".cockpit/mcp.json")),
                 (ConfigDirKind::Project, child.join(".cockpit/mcp.json")),
             ]

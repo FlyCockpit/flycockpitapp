@@ -168,6 +168,19 @@ mod tests {
     }
 
     #[test]
+    fn tool_dispatch_does_not_call_mcp_config_discover() {
+        let source = include_str!("mcp_tool.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(
+            !production.contains("McpConfig::discover("),
+            "mcp tool dispatch must use the effective-catalog resolver, not McpConfig::discover"
+        );
+    }
+
+    #[test]
     fn description_is_one_sentence_terse() {
         let t = McpTool;
         assert!(t.description().len() <= 200, "terse budget");

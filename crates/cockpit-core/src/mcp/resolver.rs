@@ -169,9 +169,7 @@ impl EffectiveCatalog {
         self.servers
             .iter()
             .filter(|(name, entry)| {
-                entry.is_live()
-                    && entry.server.enabled
-                    && name.as_str() != BUILTIN_SERVER_ID
+                entry.is_live() && entry.server.enabled && name.as_str() != BUILTIN_SERVER_ID
             })
             .map(|(name, entry)| (name.as_str(), &entry.server, entry))
             .collect()
@@ -421,10 +419,8 @@ impl EffectiveCatalogResolver {
         if self.cwd.as_os_str().is_empty() {
             return EffectiveCatalog::default();
         }
-        let mut catalog = discover_effective_catalog_with_agent(
-            &self.cwd,
-            self.agent_layer.as_ref(),
-        );
+        let mut catalog =
+            discover_effective_catalog_with_agent(&self.cwd, self.agent_layer.as_ref());
         catalog.reserved_builtin_rejected |= self.agent_reserved_rejected;
         catalog.apply_bindings(&self.bindings);
         if let Some(parent) = &self.parent_reachable {
@@ -616,11 +612,7 @@ mod tests {
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         let project = tmp.path().join("repo");
         std::fs::create_dir_all(project.join(".cockpit")).unwrap();
-        write_layer(
-            &project.join(".cockpit/mcp.json"),
-            "svc",
-            "https://one/mcp",
-        );
+        write_layer(&project.join(".cockpit/mcp.json"), "svc", "https://one/mcp");
 
         let policy = crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(&project).unwrap(),
@@ -669,7 +661,10 @@ mod tests {
             },
         );
         let catalog = EffectiveCatalog::from_mcp_config(&cfg);
-        assert_eq!(catalog.to_mcp_config().servers["svc"].endpoint, cfg.servers["svc"].endpoint);
+        assert_eq!(
+            catalog.to_mcp_config().servers["svc"].endpoint,
+            cfg.servers["svc"].endpoint
+        );
         assert_eq!(catalog.servers["svc"].source, McpScope::Workspace);
         assert_eq!(catalog.servers["svc"].profile, DEFAULT_PROFILE);
         let pinned = EffectiveCatalogResolver::from_catalog(catalog.clone());
@@ -799,20 +794,24 @@ mod tests {
         let mut catalog = EffectiveCatalog::default();
         catalog.merge_layer(named_cfg("alpha", "https://a/mcp"), McpScope::Global);
         catalog.merge_layer(named_cfg("beta", "https://b/mcp"), McpScope::Global);
-        catalog.servers.get_mut("alpha").unwrap().server.profiles.insert(
-            "admin".into(),
-            crate::mcp::config::Auth::Header(crate::mcp::config::HeaderAuth {
-                header: "Authorization".into(),
-                value: "Bearer $ADMIN".into(),
-                credential_ref: None,
-            }),
-        );
-        catalog.apply_bindings(&[
-            crate::agents::McpBinding {
-                server: "alpha".into(),
-                profile: "admin".into(),
-            },
-        ]);
+        catalog
+            .servers
+            .get_mut("alpha")
+            .unwrap()
+            .server
+            .profiles
+            .insert(
+                "admin".into(),
+                crate::mcp::config::Auth::Header(crate::mcp::config::HeaderAuth {
+                    header: "Authorization".into(),
+                    value: "Bearer $ADMIN".into(),
+                    credential_ref: None,
+                }),
+            );
+        catalog.apply_bindings(&[crate::agents::McpBinding {
+            server: "alpha".into(),
+            profile: "admin".into(),
+        }]);
         assert!(catalog.servers.contains_key("alpha"));
         assert!(!catalog.servers.contains_key("beta"));
         assert_eq!(catalog.servers["alpha"].profile, "admin");

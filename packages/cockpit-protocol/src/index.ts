@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 20 as const;
+export const PROTOCOL_VERSION = 21 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
@@ -764,29 +764,59 @@ const requestParamSchemas = {
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
     .object({
-      client_submission_id: clientSubmissionIdSchema,
-      expected_model_state_generation: safeU64NumberSchema.optional(),
-      expected_model: activeModelRefSchema.optional(),
-      text: z.string(),
-      display_text: optionalStringSchema,
-      tag_expansions: z.array(passthroughObjectSchema).optional(),
-      image_refs: z.array(z.object({ id: uuidSchema }).passthrough()).optional(),
-      forced_skill: optionalStringSchema,
-      run_invocation_options: z
-        .object({
-          max_turns: z.number().int().positive().optional(),
-          timeout_ms: positiveSafeU64NumberSchema.optional(),
-          approval_mode: z.enum(["manual", "auto", "yolo"]).optional(),
-        })
-        .strict()
-        .optional(),
+      ingress: z.union([
+        z
+          .object({
+            ingress: z.literal("local_owner_direct"),
+            operation_id: uuidSchema,
+            session_locator: z.string().min(1),
+            expected_model_state_generation: safeU64NumberSchema.optional(),
+            expected_model: activeModelRefSchema.optional(),
+            run_invocation_options: z
+              .object({
+                max_turns: z.number().int().positive().optional(),
+                timeout_ms: positiveSafeU64NumberSchema.optional(),
+                approval_mode: z.enum(["manual", "auto", "yolo"]).optional(),
+              })
+              .strict()
+              .optional(),
+            request: z
+              .object({
+                client_submission_id: clientSubmissionIdSchema,
+                text: z.string(),
+                display_text: optionalStringSchema,
+                tag_expansions: z.array(passthroughObjectSchema).optional(),
+                forced_skill: optionalStringSchema,
+                attachments: z.array(passthroughObjectSchema),
+              })
+              .strict(),
+          })
+          .strict(),
+        z
+          .object({
+            ingress: z.literal("authenticated_remote_operation"),
+            session_locator: z.string().min(1),
+            expected_model_state_generation: safeU64NumberSchema.optional(),
+            expected_model: activeModelRefSchema.optional(),
+            request: z
+              .object({
+                client_submission_id: clientSubmissionIdSchema,
+                text: z.string(),
+                display_text: optionalStringSchema,
+                tag_expansions: z.array(passthroughObjectSchema).optional(),
+                forced_skill: optionalStringSchema,
+                attachments: z.array(passthroughObjectSchema),
+              })
+              .strict(),
+          })
+          .strict(),
+      ]),
     })
     .strict()
     .superRefine((value, ctx) => {
-      if (
-        (value.expected_model_state_generation === undefined) !==
-        (value.expected_model === undefined)
-      ) {
+      const gen = value.ingress.expected_model_state_generation;
+      const model = value.ingress.expected_model;
+      if ((gen === undefined) !== (model === undefined)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: "expected model generation and identity must be supplied together",

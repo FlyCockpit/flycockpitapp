@@ -62,7 +62,29 @@ type ParamsOf<Name extends ClientRequest["request"]> = Extract<
   { request: Name }
 >["params"];
 
-export type SendUserMessageParams = ParamsOf<"send_user_message">;
+// TODO(#69, remote): replace this flat legacy shape and `sendUserMessage`
+// with the canonical `sendUserMessageV2` client API that builds the strict
+// V2 `MessageIngressV2` envelope (local_owner_direct / authenticated_remote
+// operation) plus the private `RemoteSessionClient.attachedBinding`. The
+// daemon wire schema for `send_user_message` is now the V2 ingress shape
+// (`ParamsOf<"send_user_message">`); this flat type is retained only so the
+// legacy client method keeps type-checking until the remote client cutover
+// (out of local CLI/TUI launch scope) lands.
+export type SendUserMessageParams = {
+  client_submission_id: string;
+  expected_model_state_generation?: number;
+  expected_model?: { provider: string; model: string; reasoning_effort?: string | null };
+  text: string;
+  display_text?: string;
+  tag_expansions?: unknown[];
+  image_refs?: { id: string }[];
+  forced_skill?: string;
+  run_invocation_options?: {
+    max_turns?: number;
+    timeout_ms?: number;
+    approval_mode?: "manual" | "auto" | "yolo";
+  };
+};
 
 const INLINE_USER_MESSAGE_BYTES = 64 * 1024;
 const MAX_BULK_USER_MESSAGE_BYTES = 8 * 1024 * 1024;

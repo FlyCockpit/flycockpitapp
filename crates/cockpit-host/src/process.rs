@@ -404,11 +404,11 @@ mod tests {
 
     #[test]
     fn bounded_drain_gate_keeps_touched_child_pipe_paths_on_shared_helper() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let core_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cockpit-core/src");
         let touched_files = [
-            manifest_dir.join("src/harness/spawn.rs"),
-            manifest_dir.join("src/tools/bash/mod.rs"),
-            manifest_dir.join("src/tools/custom.rs"),
+            core_src.join("harness/spawn.rs"),
+            core_src.join("tools/bash/mod.rs"),
+            core_src.join("tools/custom.rs"),
         ];
         let bad_read = ["read", "_to_end"].concat();
         let bad_output = [".", "output()"].concat();

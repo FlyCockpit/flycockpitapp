@@ -970,6 +970,45 @@ impl Db {
         workspace_ref: HostWorkspaceRef,
         now_unix_ms: i64,
     ) -> Result<AgentInstanceRow> {
+        self.ensure_session_root_agent_maybe_id(
+            session_id,
+            None,
+            resolved_profile_snapshot_id,
+            workspace_ref,
+            now_unix_ms,
+        )
+        .await
+    }
+
+    /// Same as [`Self::ensure_session_root_agent`], but inserts the reserved
+    /// root identity a deferred worker already bound in memory. An existing
+    /// durable root still wins so resume never replaces it.
+    pub async fn ensure_session_root_agent_with_id(
+        &self,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        resolved_profile_snapshot_id: Option<Uuid>,
+        workspace_ref: HostWorkspaceRef,
+        now_unix_ms: i64,
+    ) -> Result<AgentInstanceRow> {
+        self.ensure_session_root_agent_maybe_id(
+            session_id,
+            Some(agent_instance_id),
+            resolved_profile_snapshot_id,
+            workspace_ref,
+            now_unix_ms,
+        )
+        .await
+    }
+
+    async fn ensure_session_root_agent_maybe_id(
+        &self,
+        session_id: Uuid,
+        assigned_agent_instance_id: Option<Uuid>,
+        resolved_profile_snapshot_id: Option<Uuid>,
+        workspace_ref: HostWorkspaceRef,
+        now_unix_ms: i64,
+    ) -> Result<AgentInstanceRow> {
         let workspace_ref = workspace_ref.into_inner();
         self.transaction(move |conn| {
             let session_id_text = session_id.to_string();
@@ -1026,7 +1065,7 @@ impl Db {
                     "root profile snapshot is not authorized for this session"
                 );
             }
-            let agent_instance_id = Uuid::new_v4();
+            let agent_instance_id = assigned_agent_instance_id.unwrap_or_else(Uuid::new_v4);
             conn.execute(
                 "INSERT INTO agent_instances (
                      agent_instance_id, session_id, runtime_key,

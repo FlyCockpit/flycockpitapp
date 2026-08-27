@@ -1846,7 +1846,7 @@ impl RedactionTable {
     /// this on the [`Self::enforced`] view (never disabled), and the spans are what
     /// a substitution WOULD cover.
     pub fn straddle_fixpoint_cut(&self, body: &str, start: usize) -> usize {
-        let mut cut = crate::text::ceil_char_boundary(body, start);
+        let mut cut = cockpit_host::text::ceil_char_boundary(body, start);
         let max_match = self.max_match_len();
         if max_match <= 1 || self.matcher.is_none() {
             return cut;
@@ -1855,8 +1855,10 @@ impl RedactionTable {
             // Occurrences that could straddle `cut` start in `(cut - M, cut)` and
             // end in `(cut, cut + M)`, so they lie within this window. Snap the
             // window outward to char boundaries so the slice is always valid.
-            let lo = crate::text::floor_char_boundary(body, cut.saturating_sub(max_match - 1));
-            let hi = crate::text::ceil_char_boundary(body, (cut + max_match - 1).min(body.len()));
+            let lo =
+                cockpit_host::text::floor_char_boundary(body, cut.saturating_sub(max_match - 1));
+            let hi =
+                cockpit_host::text::ceil_char_boundary(body, (cut + max_match - 1).min(body.len()));
             let window = &body[lo..hi];
             let mut advanced = cut;
             for entry in &self.entries {
@@ -1878,7 +1880,7 @@ impl RedactionTable {
                     if s < cut && e > cut {
                         advanced = advanced.max(e);
                     }
-                    i = crate::text::ceil_char_boundary(window, start_in_window + 1);
+                    i = cockpit_host::text::ceil_char_boundary(window, start_in_window + 1);
                     if i >= window.len() {
                         break;
                     }
@@ -1918,7 +1920,7 @@ impl RedactionTable {
     /// A returned value `0` means the whole head is unsafe and the caller must
     /// withhold it (fail-closed).
     pub fn straddle_fixpoint_cut_back(&self, body: &str, start: usize) -> usize {
-        let mut cut = crate::text::floor_char_boundary(body, start.min(body.len()));
+        let mut cut = cockpit_host::text::floor_char_boundary(body, start.min(body.len()));
         let max_match = self.max_match_len();
         if max_match <= 1 || self.matcher.is_none() {
             return cut;
@@ -1927,8 +1929,10 @@ impl RedactionTable {
             // Occurrences that could straddle `cut` start in `(cut - M, cut)` and
             // end in `(cut, cut + M)`, so they lie within this window. Snap the
             // window outward to char boundaries so the slice is always valid.
-            let lo = crate::text::floor_char_boundary(body, cut.saturating_sub(max_match - 1));
-            let hi = crate::text::ceil_char_boundary(body, (cut + max_match - 1).min(body.len()));
+            let lo =
+                cockpit_host::text::floor_char_boundary(body, cut.saturating_sub(max_match - 1));
+            let hi =
+                cockpit_host::text::ceil_char_boundary(body, (cut + max_match - 1).min(body.len()));
             let window = &body[lo..hi];
             let mut retreated = cut;
             for entry in &self.entries {
@@ -1947,7 +1951,7 @@ impl RedactionTable {
                     if s < cut && e > cut {
                         retreated = retreated.min(s);
                     }
-                    i = crate::text::ceil_char_boundary(window, start_in_window + 1);
+                    i = cockpit_host::text::ceil_char_boundary(window, start_in_window + 1);
                     if i >= window.len() {
                         break;
                     }

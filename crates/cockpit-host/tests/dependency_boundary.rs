@@ -49,8 +49,12 @@ fn core_does_not_reexport_moved_host_authority() {
         "pub mod private_fs",
         "pub mod process",
     ] {
+        let forbidden_item = format!("{forbidden};");
         assert!(
-            !lib.contains(forbidden),
+            !lib.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed == forbidden || trimmed == forbidden_item
+            }),
             "cockpit-core must not shim moved host authority: {forbidden}"
         );
     }

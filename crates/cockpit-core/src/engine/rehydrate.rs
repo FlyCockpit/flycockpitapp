@@ -1782,7 +1782,11 @@ fn inference_failure_summary(data: &serde_json::Value) -> String {
             "stream stalled past the idle timeout".to_string()
         }
         _ if detail.trim().is_empty() => parsed_class.to_string(),
-        _ => format!("{}: {}", parsed_class, crate::text::first_line(detail, 200)),
+        _ => format!(
+            "{}: {}",
+            parsed_class,
+            cockpit_host::text::first_line(detail, 200)
+        ),
     };
     if provider.is_empty() && model.is_empty() {
         format!("Inference failed: {reason}")

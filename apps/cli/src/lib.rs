@@ -46,9 +46,9 @@ pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
     diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
     knowledge, locks, mcp, media_reservation, model_system_prompt, packages, providers, redact,
-    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools, user_agent, welcome,
-    wizard,
+    secret_ref, session, skills, startup, sync, tokens, tools, user_agent, welcome, wizard,
 };
+pub use cockpit_host::{sysinfo, text};
 
 /// Narrow process-boundary fixtures used by the CLI's integration tests.
 /// Production consumers must not gain access to the daemon lifecycle module.

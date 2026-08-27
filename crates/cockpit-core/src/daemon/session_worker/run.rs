@@ -4248,6 +4248,106 @@ async fn probe_user_message(
     })
 }
 
+fn queued_startup_stop(work_rx: &mut mpsc::Receiver<SessionWork>) -> bool {
+    loop {
+        match work_rx.try_recv() {
+            Ok(SessionWork::Shutdown { .. })
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return true;
+            }
+            Ok(SessionWork::Cancel) => {}
+            Ok(_) => {
+                // Attach-time stop is Cancel+Shutdown only. Any other queued
+                // work is left for the live loop; we already consumed it, so
+                // treat it as "not a stop" and keep draining for Shutdown.
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return false,
+        }
+    }
+}
+
+async fn open_session_write_scope_root(
+    write_scope: &crate::write_scope::WriteScopeSource,
+    session_id: Uuid,
+    project_root: &Path,
+) {
+    // Bind the clone in its own statement: an `if let` scrutinee keeps the
+    // MutexGuard temporary alive for the whole block, and holding a std guard
+    // across the `.await` below would make this future non-Send.
+    let installed_coordinator = crate::sync::lock_or_recover(write_scope).clone();
+    if let Some(coordinator) = installed_coordinator {
+        match crate::write_scope::CanonicalScope::resolve_under(project_root, ".") {
+            Ok(scope) => {
+                if let Err(error) = coordinator
+                    .ensure_session_root_lease(session_id, "session-root", scope)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "could not open the session write-scope root lease"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "session cwd does not resolve; no write-scope root lease opened"
+                );
+            }
+        }
+    }
+}
+
+async fn materialize_deferred_session_lifecycle(
+    session: &Session,
+    session_id: Uuid,
+    project_root: &Path,
+    write_scope: &crate::write_scope::WriteScopeSource,
+    reserved_root_id: Uuid,
+    root_profile_snapshot_id: Option<Uuid>,
+    durable_lifecycle_ready: &mut bool,
+) -> anyhow::Result<()> {
+    if *durable_lifecycle_ready {
+        return Ok(());
+    }
+    open_session_write_scope_root(write_scope, session_id, project_root).await;
+    let tree_now = crate::agent_tree::system_now_unix_ms();
+    let workspace_ref = crate::agent_tree::workspace_ref_for_host_path(project_root)?;
+    let tree_root = session
+        .db
+        .ensure_session_root_agent_with_id(
+            session_id,
+            reserved_root_id,
+            root_profile_snapshot_id,
+            workspace_ref,
+            tree_now,
+        )
+        .await
+        .context("creating durable root agent-tree node after lazy persist")?;
+    if tree_root.state == crate::db::agent_tree_decisions::AgentInstanceState::Created {
+        match session
+            .db
+            .transition_agent_instance(
+                session_id,
+                tree_root.agent_instance_id,
+                tree_root.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                tree_now,
+            )
+            .await
+        {
+            Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_)) => {}
+            Ok(_) => anyhow::bail!("durable root agent-tree node did not enter running"),
+            Err(error) => {
+                return Err(error).context("starting durable root agent-tree node");
+            }
+        }
+    }
+    *durable_lifecycle_ready = true;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_worker(
     session: Arc<Session>,
@@ -4830,44 +4930,12 @@ pub(super) async fn run_worker(
     }
     driver.set_daemon_scheduler_source(scheduler);
     driver.set_write_scope_source(write_scope.clone());
-    // Durable lifecycle rows foreign-key to `sessions`. Resume is already
-    // persisted; a deferred new session must flush before the root lease or
-    // agent-tree insert. Fail closed so this worker cannot run untracked.
-    if let Err(error) = session.persist_if_needed() {
-        tracing::error!(
-            %error,
-            %session_id,
-            "persisting deferred session before durable lifecycle setup failed"
-        );
-        return;
-    }
-    // Open the session's root write authority. Every delegation descends from
-    // it, and it is what session deletion and shutdown drain against. Idempotent
-    // so a worker restart reuses the existing root rather than minting a second.
-    // Bind the clone in its own statement: an `if let` scrutinee keeps the
-    // MutexGuard temporary alive for the whole block, and holding a std guard
-    // across the `.await` below would make this future non-Send.
-    let installed_coordinator = crate::sync::lock_or_recover(&write_scope).clone();
-    if let Some(coordinator) = installed_coordinator {
-        match crate::write_scope::CanonicalScope::resolve_under(&project_root, ".") {
-            Ok(scope) => {
-                if let Err(error) = coordinator
-                    .ensure_session_root_lease(session.id, "session-root", scope)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        "could not open the session write-scope root lease"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "session cwd does not resolve; no write-scope root lease opened"
-                );
-            }
-        }
+    // Durable lifecycle rows foreign-key to `sessions`. A resumed session is
+    // already persisted; a deferred new session stays in-memory until the
+    // first user message (session-id-display-and-lazy-persist) and only then
+    // opens write-scope / agent-tree dependents.
+    if session.is_persisted() {
+        open_session_write_scope_root(&write_scope, session.id, &project_root).await;
     }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
@@ -5394,24 +5462,44 @@ pub(super) async fn run_worker(
             return;
         }
     };
-    let tree_root = match session
-        .db
-        .ensure_session_root_agent(
+    let mut durable_lifecycle_ready = session.is_persisted();
+    let tree_root = if durable_lifecycle_ready {
+        match session
+            .db
+            .ensure_session_root_agent(
+                session_id,
+                root_profile_snapshot_id,
+                root_workspace_ref,
+                tree_now,
+            )
+            .await
+        {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::error!(%error, %session_id, "creating durable root agent-tree node failed");
+                // Do not run an untracked executor when durable lifecycle setup
+                // has failed. The next worker start retries from the DB boundary.
+                return;
+            }
+        }
+    } else {
+        let _reserved_workspace = root_workspace_ref;
+        crate::db::agent_tree_decisions::AgentInstanceRow {
+            agent_instance_id: Uuid::new_v4(),
             session_id,
-            root_profile_snapshot_id,
-            root_workspace_ref,
-            tree_now,
-        )
-        .await
-    {
-        Ok(root) => root,
-        Err(error) => {
-            tracing::error!(%error, %session_id, "creating durable root agent-tree node failed");
-            // Do not run an untracked executor when durable lifecycle setup
-            // has failed. The next worker start retries from the DB boundary.
-            return;
+            parent_agent_instance_id: None,
+            task_delegation_job_id: None,
+            task_delegation_child_uuid: None,
+            resolved_profile_snapshot_id: root_profile_snapshot_id,
+            workspace_ref: None,
+            auto_answer_enabled: false,
+            state: crate::db::agent_tree_decisions::AgentInstanceState::Running,
+            revision: 0,
+            created_at_unix_ms: tree_now,
+            updated_at_unix_ms: tree_now,
         }
     };
+    let reserved_root_id = tree_root.agent_instance_id;
     let tree_root = if tree_root.state
         == crate::db::agent_tree_decisions::AgentInstanceState::Created
     {
@@ -5492,9 +5580,18 @@ pub(super) async fn run_worker(
         registry: tree_resolver_registry.clone(),
         completions: agent_tree_resolver_tx,
     }));
-    let tree_recovery = match Box::pin(tree_runtime.recover_session(session_id, tree_epoch)).await {
-        Ok(recovery) => recovery,
-        Err(_) => return,
+    let tree_recovery = if durable_lifecycle_ready {
+        match Box::pin(tree_runtime.recover_session(session_id, tree_epoch)).await {
+            Ok(recovery) => recovery,
+            Err(_) => return,
+        }
+    } else {
+        crate::agent_tree::AgentTreeRecovery {
+            claimed_agents: Vec::new(),
+            pending_decisions: Vec::new(),
+            claimed_late_user_steers: Vec::new(),
+            accepted_late_user_steers: Vec::new(),
+        }
     };
     // Host-capability refreshes own a small daemon-operation executor rather
     // than parking the foreground root. Every operation state participates in
@@ -6126,6 +6223,9 @@ pub(super) async fn run_worker(
         );
     }
     // Spawn the driver loop.
+    if queued_startup_stop(&mut work_rx) {
+        return;
+    }
     let driver_queue_for_loop = driver_input_queue.clone();
     let resolver_registry_for_driver = tree_resolver_registry.clone();
     let mut driver_handle = tokio::spawn(async move {
@@ -7174,6 +7274,14 @@ pub(super) async fn run_worker(
     // reconciled stale host refreshes, so consume that reaper's immediate tick
     // before the live loop.
     host_capability_refresh_reaper.tick().await;
+    // Same as the other reapers: consume the immediate first tick so the
+    // live loop is not born with a ready maintenance arm that can win
+    // Tokio's randomized select over an already-queued Shutdown.
+    agent_tree_event_relay.tick().await;
+    if queued_startup_stop(&mut work_rx) {
+        driver_handle.abort();
+        return;
+    }
     let stop = loop {
         if consume_host_capability_terminalization_failure_fence(
             &host_capability_terminalization_failure_fence,
@@ -7182,7 +7290,15 @@ pub(super) async fn run_worker(
             driver_handle.abort();
             break WorkerStop::DriverFailed;
         }
-        let input = tokio::select! {
+        // Destructive stop is fail-closed at 50ms in tests. A queued
+        // Shutdown/Cancel must not sit behind an immediately-ready
+        // maintenance tick.
+        let input = match work_rx.try_recv() {
+            Ok(work) => WorkerInput::Work(Box::new(work)),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                break WorkerStop::WorkerStopped;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => tokio::select! {
             // Tokio's default randomized selection prevents a permanently
             // ready work mailbox from being structurally preferred over the
             // periodic maintenance arms. Each maintenance arm performs a
@@ -7235,6 +7351,7 @@ pub(super) async fn run_worker(
                 }
                 break WorkerStop::DriverExited;
             }
+            },
         };
         match input {
             WorkerInput::RelayAgentTreeEvents => {
@@ -7647,6 +7764,26 @@ pub(super) async fn run_worker(
                             )));
                             continue;
                         }
+                        if let Err(error) = materialize_deferred_session_lifecycle(
+                            &session,
+                            session_id,
+                            &project_root,
+                            &write_scope,
+                            reserved_root_id,
+                            root_profile_snapshot_id,
+                            &mut durable_lifecycle_ready,
+                        )
+                        .await
+                        {
+                            tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
+                                "durable lifecycle setup after lazy persist failed");
+                            let _ = respond_to.send(Err(user_message_database_error(
+                                &error,
+                                proto::ErrorCode::UserMessageNotAccepted,
+                                "session lifecycle setup failed before oversized message admission",
+                            )));
+                            continue;
+                        }
                         let now_ms = chrono::Utc::now().timestamp_millis();
                         if let Err(error) = session
                             .db
@@ -7945,14 +8082,56 @@ pub(super) async fn run_worker(
                         continue;
                     }
                     // Lazy persistence (session-id-display-and-lazy-persist):
-                    // worker start already flushed the row for durable
-                    // lifecycle setup. Repeat here before `touch()` and the
-                    // driver so a late first message still has a parent row
-                    // if that earlier flush was skipped. Idempotent. A persist
-                    // failure aborts the message rather than letting dependents
-                    // reference a missing row.
+                    // flush the deferred row on the first user message, then
+                    // open write-scope / agent-tree dependents that foreign-key
+                    // to `sessions`. Idempotent. A persist failure aborts the
+                    // message rather than letting dependents reference a
+                    // missing row.
                     match session.persist_if_needed() {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if let Err(e) = materialize_deferred_session_lifecycle(
+                                &session,
+                                session_id,
+                                &project_root,
+                                &write_scope,
+                                reserved_root_id,
+                                root_profile_snapshot_id,
+                                &mut durable_lifecycle_ready,
+                            )
+                            .await
+                            {
+                                let error = format!("{e:#}");
+                                let database_rejection = user_message_database_error(
+                                    &e,
+                                    proto::ErrorCode::UserMessageNotAccepted,
+                                    format!(
+                                        "session lifecycle setup failed before accepting message {client_submission_id}: {error}"
+                                    ),
+                                );
+                                tracing::error!(error = %error, session_id = %session_id,
+                                "durable lifecycle setup after lazy persist failed; dropping message");
+                                send_current_event(
+                                    &event_tx,
+                                    &redaction,
+                                    proto::Event::SessionPersistFailed {
+                                        session_id,
+                                        client_submission_id,
+                                        error: error.clone(),
+                                    },
+                                );
+                                let rejection = match phase_one_reservation.take() {
+                                    Some(reservation) => reject_oversized_text_artifact_admission(
+                                        &session,
+                                        reservation,
+                                        crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                                    )
+                                    .await,
+                                    None => database_rejection,
+                                };
+                                let _ = respond_to.send(Err(rejection));
+                                continue;
+                            }
+                        }
                         Err(e) => {
                             let error = format!("{e:#}");
                             let database_rejection = user_message_database_error(

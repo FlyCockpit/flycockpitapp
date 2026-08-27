@@ -2191,10 +2191,14 @@ pub(crate) fn project_retained_effective_default_bytes(
         Ok(prior)
     };
 
-    // Readers without durable session/event authority must mask every
-    // session-bearing or correlated transaction with the recorded prior
-    // bytes, exactly as `masked_layers` does for pathname reads.
-    if record.needs_session_authority() || record.correlation.is_some() {
+    // Session-bearing journals stay masked to the validated prior until a
+    // daemon session-authority recovery owns them. A config-only correlated
+    // journal (`RetainedDefaultUpdate`) is not in that class: after the
+    // config leaf is committed, the attached worker must publish those
+    // durable bytes. Masking them back to prior hides the writer's own
+    // refresh and livelocks receipt finalization. Ambient pathname readers
+    // still use `masked_layers` for that correlation.
+    if record.needs_session_authority() {
         anyhow::ensure!(
             current_digest == record.old_config_digest
                 || current_digest == record.new_config_digest,

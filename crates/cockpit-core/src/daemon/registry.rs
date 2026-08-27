@@ -1768,13 +1768,6 @@ impl SessionRegistry {
                 .set_active_model_ref(staged_recovery)
                 .context("committing recovered session model after worker validation")?;
         }
-        // Agent-tree and write-scope rows foreign-key to `sessions`. Flush
-        // the deferred row here, after every fallible construction step and
-        // the recovery model commit, so a new worker never inserts those
-        // dependents against a missing parent.
-        session
-            .persist_if_needed()
-            .context("persisting deferred session before durable lifecycle setup")?;
         let terminal_lock_cleanup_gate = Arc::new(AsyncMutex::new(()));
         let terminal_closing = Arc::new(AtomicBool::new(false));
         let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));

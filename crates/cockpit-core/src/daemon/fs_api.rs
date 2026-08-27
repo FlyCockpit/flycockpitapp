@@ -195,7 +195,7 @@ pub(crate) fn fs_read_sync(
         });
     }
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    let cap = crate::text::floor_char_boundary(&text, FS_TEXT_READ_BYTE_CAP.min(text.len()));
+    let cap = cockpit_host::text::floor_char_boundary(&text, FS_TEXT_READ_BYTE_CAP.min(text.len()));
     let truncated = text.len() > cap;
     Ok(Response::FsRead {
         content: Some(text[..cap].to_string()),
@@ -1771,7 +1771,7 @@ pub(crate) fn git_diff_file_blocking(
     if !outcome.success {
         return Err(bad_request(outcome.stderr.trim().to_string()));
     }
-    let cap = crate::text::floor_char_boundary(
+    let cap = cockpit_host::text::floor_char_boundary(
         &outcome.stdout,
         FS_TEXT_READ_BYTE_CAP.min(outcome.stdout.len()),
     );
@@ -1803,7 +1803,7 @@ pub(crate) fn git_diff_blocking(
         _ => return Err(bad_request("unsupported source for git_diff")),
     }
     .map_err(internal)?;
-    let cap = crate::text::floor_char_boundary(&diff, FS_TEXT_READ_BYTE_CAP.min(diff.len()));
+    let cap = cockpit_host::text::floor_char_boundary(&diff, FS_TEXT_READ_BYTE_CAP.min(diff.len()));
     Ok(Response::GitDiff {
         source,
         diff: diff[..cap].to_string(),

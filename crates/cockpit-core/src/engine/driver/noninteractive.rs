@@ -4336,7 +4336,8 @@ impl Driver {
                         "children": [task_child_detail_json(row, &orphaned)],
                     });
                     if let Some(report) = &row.report {
-                        value["report"] = serde_json::json!(crate::text::cap_chars(report, 1200).0);
+                        value["report"] =
+                            serde_json::json!(cockpit_host::text::cap_chars(report, 1200).0);
                     }
                     return task_envelope(value);
                 }
@@ -4367,7 +4368,7 @@ impl Driver {
                     "child_state_unchanged": true,
                     "report_source": report_source,
                     "children": [task_child_detail_json(row, &orphaned)],
-                    "report": crate::text::cap_chars(&report, 1200).0,
+                    "report": cockpit_host::text::cap_chars(&report, 1200).0,
                 }))
             }
             TaskControlAction::Steer => {
@@ -6170,7 +6171,7 @@ pub(in crate::engine::driver) fn task_child_detail_json(
         "updated_at": row.updated_at,
     });
     if let Some(report) = &row.report {
-        child["report"] = serde_json::json!(crate::text::cap_chars(report, 500).0);
+        child["report"] = serde_json::json!(cockpit_host::text::cap_chars(report, 500).0);
     }
     child
 }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::engine::tool::ToolCtx;
-use crate::text::{ceil_char_boundary, floor_char_boundary};
+use cockpit_host::text::{ceil_char_boundary, floor_char_boundary};
 
 /// Resolve a path argument the way every file tool does:
 ///   - tilde-expand,

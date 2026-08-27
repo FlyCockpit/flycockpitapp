@@ -328,6 +328,11 @@ mod tests {
                 symbol: "clear_runtime_policy_for_tests",
                 reason: "cross-crate test helper resets the production runtime policy cell and inherited trust env",
             },
+            AllowedMutation {
+                file: "crates/cockpit-core/src/daemon/registry.rs",
+                symbol: "assert_preflight_model",
+                reason: "preflight hook swaps COCKPIT_CONFIG under an already-held TestEnvGuard to prove start does not reread the ambient path",
+            },
         ];
 
         let mut violations = Vec::new();

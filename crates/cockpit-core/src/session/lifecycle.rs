@@ -286,11 +286,11 @@ impl Session {
     ///
     /// This is the **only** flush point, and it MUST be called before any
     /// row that references the session (agent-tree, write-scope, tool_calls,
-    /// inference_calls, locks, …) so the FK/ordering invariant holds. The
-    /// registry flushes it after worker construction succeeds and before
-    /// spawn; the worker repeats it before durable lifecycle setup and again
-    /// on the first user message (idempotent). The stored row carries the
-    /// latest provider/model so a model picked before the flush survives.
+    /// inference_calls, locks, …) so the FK/ordering invariant holds. A
+    /// deferred session stays in-memory until the first user message (or an
+    /// ephemeral-daemon attach that must survive process exit). The stored
+    /// row carries the latest provider/model so a model picked before the
+    /// flush survives.
     pub fn persist_if_needed(&self) -> Result<bool> {
         // Model mutation and the deferred INSERT share this lock so a picker
         // update cannot be overwritten by an older selection snapshot.
@@ -364,10 +364,7 @@ impl Session {
     /// Whether this session's `sessions` row has been written
     /// (session-id-display-and-lazy-persist). `false` only for a deferred
     /// session that has not yet seen its first user message; `true`
-    /// otherwise. Used by the lazy-persistence tests; the TUI's own
-    /// exit-print decision tracks the persistence trigger locally (it can't
-    /// reach this daemon-owned state synchronously).
-    #[cfg(test)]
+    /// otherwise.
     pub fn is_persisted(&self) -> bool {
         self.pending_row.lock().unwrap().is_none()
     }

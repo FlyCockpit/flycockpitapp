@@ -14613,6 +14613,17 @@ async fn attached_state_with_worker_receiver(
     );
     let locks = Arc::new(LockManager::in_memory(ctx.db.clone()));
     let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
+    // Production registry constructs the worker only after a positive durable
+    // trust revision is resolved. Bare test handles start at revision 0, which
+    // `SetDefaultModel` now refuses at its attach-time fence.
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            std::path::Path::new(&project_root),
+        )
+        .await
+        .expect("attached test helper seeds the durable workspace trust revision");
+    handle.begin_trust_transition(&resolved_trust);
     (
         MutableClientState {
             principal: ClientPrincipal::owner(),
@@ -23843,7 +23854,7 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
 #[cfg(unix)]
 #[tokio::test]
 async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_message() {
-    let ctx = test_ctx();
+    let ctx = persistent_test_ctx();
     let project = tempfile::tempdir().unwrap();
     ctx.db
         .set_workspace_trust(
@@ -28769,10 +28780,9 @@ async fn assert_set_default_model_happy() {
                     // The response-side verification below deliberately reads
                     // the handle, so make this lightweight receiver model
                     // that production ordering instead of merely acking it.
-                    refreshed_handle.set_config_snapshot_for_tests(
-                        snapshot.providers.clone(),
-                        snapshot.extended.clone(),
-                    );
+                    let mut snapshot = *snapshot;
+                    snapshot.generation = 1;
+                    refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                     respond_to
                         .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
                             generation: 1,
@@ -28897,11 +28907,9 @@ async fn set_default_model_recovers_cleanup_after_durable_receipt_before_cleanup
                 respond_to,
                 ..
             } => {
-                refresh_handle.set_config_snapshot_for_tests_at_generation(
-                    1,
-                    snapshot.providers.clone(),
-                    snapshot.extended.clone(),
-                );
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refresh_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
                     .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
                         generation: 1,
@@ -29130,10 +29138,9 @@ async fn modes_session_setup_clear_default_records_retained_inherited_selection(
                 ..
             } => {
                 assert_eq!(snapshot.providers.active_model, Some(lower_for_refresh));
-                refreshed_handle.set_config_snapshot_for_tests(
-                    snapshot.providers.clone(),
-                    snapshot.extended.clone(),
-                );
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
                     .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
                         generation: 1,
@@ -29244,10 +29251,9 @@ async fn modes_session_setup_set_default_model_keeps_retained_explicit_target_af
                     Some("a"),
                     "published worker snapshot must still resolve retained A"
                 );
-                refreshed_handle.set_config_snapshot_for_tests(
-                    snapshot.providers.clone(),
-                    snapshot.extended.clone(),
-                );
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
                     .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
                         generation: 1,
@@ -29455,11 +29461,9 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
                 respond_to,
                 ..
             } => {
-                refresh_handle.set_config_snapshot_for_tests_at_generation(
-                    1,
-                    snapshot.providers.clone(),
-                    snapshot.extended.clone(),
-                );
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refresh_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
                     .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
                         generation: 1,
@@ -29481,6 +29485,13 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
         prompt_cache_retention: None,
         clear: false,
     };
+    // Journal/backup leaves are keyed by the attach-time canonical path.
+    // After the directory is renamed those files travel with A's inode but
+    // keep that original leaf name; do not rediscover them through B's path.
+    let retained_journal_leaf = crate::config::providers::journal_path_for_layer(&config_a)
+        .file_name()
+        .expect("journal leaf")
+        .to_os_string();
     let target_for_hook = target_dir.clone();
     let moved_for_hook = moved_dir.clone();
     let replacement_for_hook = replacement_dir.clone();
@@ -29529,7 +29540,7 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
     assert_eq!(moved_selection.provider, "p");
     assert_eq!(moved_selection.model, "a");
     assert!(
-        crate::config::providers::journal_path_for_layer(&moved_dir.join("config.json")).exists(),
+        moved_dir.join(&retained_journal_leaf).exists(),
         "the post-fence replacement defers A-only artifact cleanup until A is restored"
     );
 
@@ -29660,11 +29671,9 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
                     ..
                 } => {
                     refreshes += 1;
-                    worker_handle.set_config_snapshot_for_tests_at_generation(
-                        1,
-                        snapshot.providers.clone(),
-                        snapshot.extended.clone(),
-                    );
+                    let mut snapshot = *snapshot;
+                    snapshot.generation = 1;
+                    worker_handle.set_full_config_snapshot_for_tests(snapshot);
                     respond_to
                         .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
                             generation: 1,
@@ -29765,20 +29774,12 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
         .expect_err("replacement authority B must fail before recovery or replay");
     assert_eq!(b_attempt.code, ErrorCode::Conflict);
     assert_eq!(
-        std::fs::read(crate::config::providers::journal_path_for_layer(
-            &moved_dir.join("config.json"),
-        ))
-        .unwrap(),
+        std::fs::read(moved_dir.join(journal_a.file_name().expect("journal leaf"))).unwrap(),
         sealed_bytes,
         "B never rewrites or retires A's sealed journal"
     );
     assert_eq!(
-        std::fs::read(
-            cockpit_config::config::effective_default::backup_path_for_layer(
-                &moved_dir.join("config.json"),
-            )
-        )
-        .unwrap(),
+        std::fs::read(moved_dir.join(backup_a.file_name().expect("backup leaf"))).unwrap(),
         backup_bytes,
         "B never begins A's private cleanup"
     );
@@ -29927,46 +29928,52 @@ async fn set_model_favorite_writes_trusted_project_provider_layer() {
     let project = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
 
-    let write_provider = |root: &Path| {
-        let cockpit_dir = root.join(".cockpit");
-        std::fs::create_dir_all(&cockpit_dir).unwrap();
-        let config_path = cockpit_dir.join("config.json");
-        std::fs::write(&config_path, r#"{"providers":{"p":{}}}"#).unwrap();
+    let write_provider = |config_path: &Path| {
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(config_path, r#"{"providers":{"p":{}}}"#).unwrap();
         let provider_path =
-            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+            crate::config::providers::provider_file_path_for_config(config_path, "p").unwrap();
         std::fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
         std::fs::write(
             provider_path,
             r#"{"url":"https://example.test","models":[{"id":"a","favorite":false}]}"#,
         )
         .unwrap();
-        config_path
+        config_path.to_path_buf()
     };
-    let global_config = write_provider(home.path());
-    let project_config = write_provider(project.path());
+    let global_config = write_provider(&home.path().join("home/.config/cockpit/config.json"));
+    let project_config = write_provider(&project.path().join(".cockpit/config.json"));
 
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
     let (mut state, _, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
-    let trust_policy = state
-        .attached
-        .as_ref()
-        .unwrap()
-        .handle
-        .current_trust_policy();
-    let (providers, extended) = ctx
-        .config_source()
-        .load_with_trust(project.path(), &trust_policy)
-        .unwrap();
-    state
-        .attached
-        .as_ref()
-        .unwrap()
-        .handle
-        .set_config_snapshot_for_tests(providers, extended);
+    let handle = state.attached.as_ref().unwrap().handle.clone();
+    let retained = handle
+        .workspace_root_authority
+        .capture_retained_effective_default_layer_chain()
+        .expect("captured complete provider source chain");
+    let initial = crate::daemon::session_worker::SessionConfigSnapshot::new(
+        0,
+        crate::config::providers::ConfigDoc::providers_from_workspace_layer_snapshots(
+            &retained.layers,
+        )
+        .expect("providers from retained source"),
+        crate::config::extended::ExtendedConfig::default(),
+    )
+    .with_retained_provider_model_sources(&retained)
+    .expect("project provider source proof");
+    handle.set_full_config_snapshot_for_tests(initial);
+    let refreshed_handle = handle.clone();
     let refresh = tokio::spawn(async move {
         match work_rx.recv().await.expect("config refresh work") {
-            SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
+            SessionWork::ReplaceConfigSnapshot {
+                snapshot,
+                respond_to,
+                ..
+            } => {
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
                     .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
                         generation: 1,

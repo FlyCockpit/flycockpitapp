@@ -3384,6 +3384,44 @@ fn modes_session_setup_retained_selected_leaf_projects_exact_effective_default_j
         "a durably committed layer needs no backup to project forward"
     );
 
+    // An attached SetDefaultModel journal is config-only plus a correlation
+    // token. Once committed, the capability projection must expose the
+    // forward bytes so the writing worker can publish them before receipt
+    // cleanup. Prepared remains masked to prior.
+    let retained_correlation = Some(TransactionCorrelation::RetainedDefaultUpdate {
+        default_update_id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        authority: None,
+    });
+    let mut retained_committed = record_for(JournalPhase::Committed, JournalSession::None);
+    retained_committed.correlation = retained_correlation.clone();
+    let retained_committed = serialize(&retained_committed);
+    assert_eq!(
+        project_retained_effective_default_bytes(
+            &canonical,
+            Some(committed.clone()),
+            Some(&retained_committed),
+            Some(&prior),
+        )
+        .unwrap(),
+        Some(committed.clone()),
+        "a committed retained default must project forward for its writer"
+    );
+    let mut retained_prepared = record_for(JournalPhase::Prepared, JournalSession::None);
+    retained_prepared.correlation = retained_correlation;
+    let retained_prepared = serialize(&retained_prepared);
+    assert_eq!(
+        project_retained_effective_default_bytes(
+            &canonical,
+            Some(committed.clone()),
+            Some(&retained_prepared),
+            Some(&prior),
+        )
+        .unwrap(),
+        Some(prior.clone()),
+        "a prepared retained default stays masked until the config leaf commits"
+    );
+
     // A session-bound transaction is always masked back to the validated
     // prior snapshot until a daemon session-authority recovery owns it.
     let session_record = serialize(&record_for(

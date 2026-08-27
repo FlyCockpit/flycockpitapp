@@ -985,34 +985,10 @@ impl SessionWorkerHandle {
         (handle, work_rx)
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_config_snapshot_for_tests(
-        &self,
-        providers: crate::config::providers::ProvidersConfig,
-        extended: crate::config::extended::ExtendedConfig,
-    ) {
-        self.set_config_snapshot_for_tests_at_generation(0, providers, extended);
-    }
-
     /// Test receiver counterpart of the worker's atomic snapshot publication.
     /// Callers that model a real `ReplaceConfigSnapshot` acknowledgement must
-    /// keep this generation equal to the acknowledgement they send, otherwise
-    /// authority-bound receipt replay would be tested against an artificial
-    /// stale handle.
-    #[cfg(test)]
-    pub(crate) fn set_config_snapshot_for_tests_at_generation(
-        &self,
-        generation: u64,
-        providers: crate::config::providers::ProvidersConfig,
-        extended: crate::config::extended::ExtendedConfig,
-    ) {
-        *self
-            .config_snapshot
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            SessionConfigSnapshot::new(generation, providers, extended);
-    }
-
+    /// install that exact snapshot, including retained source proofs and the
+    /// durable trust revision, then ack the same generation.
     #[cfg(test)]
     pub(crate) fn set_full_config_snapshot_for_tests(&self, snapshot: SessionConfigSnapshot) {
         *self

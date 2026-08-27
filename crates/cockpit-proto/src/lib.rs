@@ -7477,20 +7477,6 @@ mod tests {
             Request::GetAssistant {
                 name: "helper-bot".into(),
             },
-            Request::DeleteAssistant {
-                client_operation_id: "delete-assistant".into(),
-                mutation_intent_hash: assistant_mutation_intent_hash(
-                    "/tmp/project",
-                    "delete",
-                    "helper-bot",
-                    "revision",
-                    None,
-                ),
-                project_root: "/tmp/project".into(),
-                name: "helper-bot".into(),
-                expected_revision: "revision".into(),
-                expected_config_generation: 7,
-            },
             Request::DiagnoseMediaReservation {
                 scope: "session".into(),
                 id: "abc".into(),
@@ -7560,18 +7546,6 @@ mod tests {
                 session_ids_json: "[]".into(),
             },
             Response::Assistant { assistant: None },
-            Response::AssistantDeleted {
-                client_operation_id: "delete-assistant".into(),
-                mutation_intent_hash: "11".repeat(32),
-                project_root: "/tmp/project".into(),
-                requested_project_root: "/tmp/project".into(),
-                name: "helper".into(),
-                consumed_revision: "revision".into(),
-                result_revision: "22".repeat(32),
-                consumed_config_generation: 1,
-                result_config_generation: 2,
-                outcome: AgentMutationOutcome::Reconciled,
-            },
             Response::MediaReservationDiagnosis {
                 diagnosis_json: "{}".into(),
             },

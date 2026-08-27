@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageIngressAdmissionReceiptV1 {
     pub schema_version: u8,
     pub kind: String,

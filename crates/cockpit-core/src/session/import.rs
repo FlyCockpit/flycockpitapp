@@ -1334,7 +1334,10 @@ mod tests {
         let error = read_archive_bytes(&archive)
             .expect_err("the obsolete export schema must not be parsed as v4")
             .to_string();
-        assert!(error.contains("unsupported export schema"), "{error}");
+        assert!(
+            error.contains("unsupported session export schema"),
+            "{error}"
+        );
     }
 
     fn archive_bytes(sessions: Vec<Value>, events: Vec<Value>, redacted: bool) -> Vec<u8> {

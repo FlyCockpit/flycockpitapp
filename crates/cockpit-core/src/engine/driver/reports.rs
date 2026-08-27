@@ -19,7 +19,7 @@ pub(super) fn prompt_summary(msg: &Message, max_chars: usize) -> FailedTurnPromp
         Message::Assistant { content, .. } => (extract_text(content), true),
         Message::System { content } => (content.clone(), false),
     };
-    let (text, truncated) = crate::text::cap_chars(&text, max_chars);
+    let (text, truncated) = cockpit_host::text::cap_chars(&text, max_chars);
     FailedTurnPromptSummary {
         text,
         truncated,
@@ -558,7 +558,7 @@ pub(super) fn partial_progress_from_history(history: &[Message]) -> DelegationPa
                         .get("command")
                         .and_then(serde_json::Value::as_str)
                     {
-                        let command = crate::text::first_line_capped(command, 100);
+                        let command = cockpit_host::text::first_line_capped(command, 100);
                         commands.push(PartialProgressCommand {
                             verification: is_verification_command(&command),
                             command: command.clone(),
@@ -721,7 +721,7 @@ pub(super) fn render_failed_subagent_failure(
         }
     }
     if !envelope.detail.trim().is_empty()
-        && let Some(snippet) = crate::text::bounded_snippet(&envelope.detail, 300)
+        && let Some(snippet) = cockpit_host::text::bounded_snippet(&envelope.detail, 300)
     {
         out.push_str("\n\nDetail: ");
         out.push_str(&snippet);

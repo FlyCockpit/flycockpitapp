@@ -9191,11 +9191,8 @@ async fn handle_serialized_request_impl(
                     message: "this default-model operation is pending in a source excluded by the current workspace trust policy; restore trust or reattach before retrying".into(),
                 });
             }
-            let recovery_target = att
-                .handle
-                .workspace_root_authority
-                .retained_effective_default_target_for_policy(&trust_policy)
-                .map_err(|_| bad_request("no cockpit config found"))?;
+            let recovery_target =
+                retained_effective_default_target_for_attached(att, &trust_policy)?;
             let recovery_policy = trust_policy.clone();
             let recovery = match tokio::task::spawn_blocking(move || {
                 crate::config::trust::with_workspace_trust_policy(recovery_policy, || {
@@ -9662,11 +9659,8 @@ async fn handle_serialized_request_impl(
                 None => CONFIG_PUBLICATION_RPC_LOCK.lock().await,
             };
             let trust_policy = attached_trust_policy_fenced_to_worker(ctx, att).await?;
-            let retained_target = att
-                .handle
-                .workspace_root_authority
-                .retained_effective_default_target_for_policy(&trust_policy)
-                .map_err(|_| bad_request("no cockpit config found"))?;
+            let retained_target =
+                retained_effective_default_target_for_attached(att, &trust_policy)?;
             let requested = if clear {
                 None
             } else {
@@ -22387,6 +22381,30 @@ async fn attached_trust_policy_fenced_to_worker(
         });
     }
     Ok(resolved.policy)
+}
+
+/// A replaced retained directory is an attachment conflict, not "no config".
+/// `retained_effective_default_target_for_policy` verifies identity first;
+/// collapsing that failure into BadRequest lets a post-attach swap look like
+/// a missing file instead of forcing reattach.
+fn retained_effective_default_target_for_attached(
+    att: &AttachedSession,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+) -> std::result::Result<
+    cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget,
+    ErrorPayload,
+> {
+    att.handle
+        .workspace_root_authority
+        .verify_retained_config_source_chain_for_policy(trust_policy)
+        .map_err(|_| ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "attached workspace configuration authority changed; reattach required".into(),
+        })?;
+    att.handle
+        .workspace_root_authority
+        .retained_effective_default_target_for_policy(trust_policy)
+        .map_err(|_| bad_request("no cockpit config found"))
 }
 
 pub(super) async fn get_inventory_bundle(

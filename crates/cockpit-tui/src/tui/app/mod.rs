@@ -47,6 +47,8 @@ mod pins;
 mod prediction;
 mod primary_paste;
 mod render;
+#[cfg(feature = "test-support")]
+pub(crate) mod response_performance_e2e;
 mod resume;
 mod scrollback_page_in;
 mod session_services;

@@ -95,7 +95,7 @@ pub(crate) mod rig_boundary;
 mod wire;
 pub(crate) mod wire_schema;
 
-pub(crate) use display_dispatch::DisplayAttemptSlot;
+pub(crate) use display_dispatch::{DisplayAttemptSlot, DisplayClockFactory};
 
 #[allow(unused_imports)]
 pub use build::EndpointRecoveryAdditionalParams;

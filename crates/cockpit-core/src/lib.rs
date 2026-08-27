@@ -94,6 +94,7 @@ pub mod typed_media_result;
 pub mod user_agent;
 pub mod welcome;
 pub mod wizard;
+pub mod workspace_lease;
 pub mod write_scope;
 
 // The storage crate is an implementation detail of the core layer.  Keeping

@@ -215,14 +215,39 @@ pub fn run_git_checked(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(out.stdout)
 }
 
+/// Resolve a git path through symlink-aware containment. A dangling symlink
+/// or `..` escape fails closed.
+pub fn resolve_git_path(path: &Path) -> Result<PathBuf> {
+    cockpit_host::path_containment::effective_path(path)
+        .with_context(|| format!("git path `{}` does not resolve", path.display()))
+}
+
+/// Reject a worktree destination whose syscall-effective path is not under
+/// `parent` (symlink and prefix escapes included).
+pub fn assert_worktree_destination_under(parent: &Path, path: &Path) -> Result<()> {
+    let parent = resolve_git_path(parent)?;
+    let path = resolve_git_path(path)?;
+    if !cockpit_host::path_containment::contained_under(&parent, &path) && path != parent {
+        anyhow::bail!(
+            "worktree destination `{}` escapes `{}`",
+            path.display(),
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
 /// Add a worktree at `path` checking out a **new** branch `branch` based on
 /// `base` (a branch name or commit). The branch must not already exist
-/// (git enforces branch-uniqueness across worktrees).
+/// (git enforces branch-uniqueness across worktrees). Paths are resolved
+/// through symlink-aware containment before they are handed to git.
 pub fn worktree_add(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
     reject_leading_dash("branch", branch)?;
     reject_leading_dash("base", base)?;
+    let repo = resolve_git_path(repo)?;
+    let path = resolve_git_path(path)?;
     let path = path.to_string_lossy();
-    run_git_checked(repo, &["worktree", "add", &path, "-b", branch, "--", base])?;
+    run_git_checked(&repo, &["worktree", "add", &path, "-b", branch, "--", base])?;
     Ok(())
 }
 
@@ -300,6 +325,28 @@ mod tests {
         let err = reject_leading_dash("branch", "-bad").unwrap_err();
         assert!(format!("{err}").contains("branch"));
         assert!(reject_leading_dash("branch", "feature/good").is_ok());
+    }
+
+    #[test]
+    fn worktree_destination_rejects_symlink_and_prefix_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("worktrees");
+        let sibling = tmp.path().join("sibling");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let inside = parent.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(assert_worktree_destination_under(&parent, &inside).is_ok());
+        assert!(assert_worktree_destination_under(&parent, &sibling).is_err());
+        #[cfg(unix)]
+        {
+            let escape = parent.join("escape");
+            std::os::unix::fs::symlink(&sibling, &escape).unwrap();
+            assert!(
+                assert_worktree_destination_under(&parent, &escape).is_err(),
+                "symlink into a sibling must not count as an in-parent worktree"
+            );
+        }
     }
 }
 

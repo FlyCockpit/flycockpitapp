@@ -393,6 +393,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks,

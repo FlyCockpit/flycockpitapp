@@ -496,6 +496,9 @@ pub(super) struct GrantRejectionInput<'a> {
     pub grant: &'a [String],
     pub assistant_db: &'a crate::db::Db,
     pub local_installations: &'a crate::agents::LocalInstallationResolver,
+    pub parent_write_scope: Option<&'a std::path::Path>,
+    pub parent_workspace_lease: Option<&'a crate::workspace_lease::WorkspaceLease>,
+    pub workspace_lease: Option<&'a crate::workspace_lease::WorkspaceLease>,
 }
 
 pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<String> {
@@ -509,6 +512,9 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
         grant,
         assistant_db,
         local_installations,
+        parent_write_scope,
+        parent_workspace_lease,
+        workspace_lease,
     } = input;
     // The live frame is the only authority for classifying a vNext parent.
     // Never re-resolve `parent_agent` from the child cwd: an edited checkout
@@ -631,12 +637,30 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
                     parent.agent_id, child.agent_id
                 ));
             }
-            if !parent.permits_target(parent_cwd, cwd) {
+            if !parent.permits_target_with_lease(parent_cwd, cwd, workspace_lease) {
                 return Some(format!(
                     "Error: vNext caller `{}` does not permit child cwd `{}` under its effective delegation targets",
                     parent.agent_id,
                     cwd.display(),
                 ));
+            }
+            if let Some(lease) = workspace_lease {
+                if let Err(error) = crate::workspace_lease::intersect_lease_with_parent_grant(
+                    parent,
+                    parent_cwd,
+                    parent_write_scope,
+                    parent_workspace_lease,
+                    child.execution_kind,
+                    cwd,
+                    None,
+                    lease,
+                    crate::workspace_lease::now_unix_ms(),
+                ) {
+                    return Some(format!(
+                        "Error: vNext caller `{}` workspace lease is refused: {error}",
+                        parent.agent_id
+                    ));
+                }
             }
             let resolved_reference = portable_references
                 .first()

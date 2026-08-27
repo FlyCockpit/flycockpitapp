@@ -24986,6 +24986,7 @@ async fn run_docs_ask_pipeline(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         credential_store: Some(store),
     };
     let locks = Arc::new(

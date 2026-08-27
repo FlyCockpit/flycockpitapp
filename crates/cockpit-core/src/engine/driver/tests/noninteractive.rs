@@ -366,6 +366,7 @@ fn single_task(
         child_cwd: root_child_cwd(driver),
         context: crate::engine::agent::TaskContext::Fresh,
         write_scope: None,
+        workspace_lease: None,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
@@ -395,6 +396,7 @@ fn batch_entry(
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
         write_scope: None,
+        workspace_lease: None,
     }
 }
 
@@ -534,6 +536,40 @@ async fn overlapping_write_scopes_refuse_whole_batch() {
     assert!(report.contains("overlap"), "{report}");
     assert!(report.contains("left"), "{report}");
     assert!(report.contains("right"), "{report}");
+    assert!(
+        drain_turn_events(&mut rx).is_empty(),
+        "refused batch should not spawn child events"
+    );
+}
+
+#[tokio::test]
+async fn workspace_lease_cannot_bypass_overlapping_write_scopes() {
+    let (mut driver, tmp) = test_driver(8);
+    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
+    std::fs::create_dir_all(tmp.path().join("a/sub")).unwrap();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let mut left = batch_entry_with_scope("left", "builder", "a");
+    left.workspace_lease = Some("subdirectory".to_string());
+    let mut right = batch_entry_with_scope("right", "builder", "a/sub");
+    right.workspace_lease = Some("subdirectory".to_string());
+    let task = BatchNoninteractiveTask {
+        entries: vec![left, right],
+        child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-lease-overlap".to_string(),
+        task_provider_item_id: None,
+        task_function_call_id: None,
+    };
+
+    let completion = driver
+        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(completion.children.len(), 1);
+    assert!(completion.children[0].failed);
+    let report = &completion.children[0].report;
+    assert!(report.contains("overlap"), "{report}");
     assert!(
         drain_turn_events(&mut rx).is_empty(),
         "refused batch should not spawn child events"
@@ -743,6 +779,7 @@ fn scoped_child_holds_no_delegation_tools() {
         DelegationConfinement {
             lock_identity: Some("builder#scoped".to_string()),
             write_scope: Some(scope),
+            workspace_lease: None,
         },
     );
 
@@ -5136,6 +5173,7 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
             DelegationConfinement {
                 lock_identity: None,
                 write_scope: Some(scope.clone()),
+                workspace_lease: None,
             },
         );
         let (surface, write_capable) = dmh_trusted(&cwd, || {
@@ -5196,6 +5234,7 @@ async fn resolved_child_execution_surface_preflight_is_side_effect_free() {
         DelegationConfinement {
             lock_identity: None,
             write_scope: Some(scope.clone()),
+            workspace_lease: None,
         },
     );
     let surface = dmh_trusted(&cwd, || {

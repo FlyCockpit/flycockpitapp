@@ -6,8 +6,9 @@
 //!    (GOALS §7). Everything downstream sees only the scrubbed prompt.
 //! 2. **Preflight**: PATH + auth ([`crate::harness::preflight`]).
 //! 3. **Write policy** ([`WritePolicy`]): Build-mode runs the harness
-//!    directly in the project cwd; Plan-mode runs it in a throwaway git
-//!    worktree and captures the resulting diff without applying it.
+//!    directly in the project cwd; Plan-mode runs it in a host-managed git
+//!    worktree under daemon state and captures the resulting diff without
+//!    applying it.
 //! 4. **Prepare** argv + delivery ([`crate::harness::prepare`]).
 //! 5. **Spawn + drain + timeout** ([`crate::harness::spawn`]).
 //! 6. **Parse** JSON metadata leniently ([`crate::harness::parse`]).
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::extended::HarnessConfig;
 use crate::config::extended::HarnessTrust;
@@ -198,6 +199,11 @@ pub struct RunContext<'a> {
     pub providers: &'a ProvidersConfig,
     pub shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     pub env_overlay: Option<&'a std::collections::HashMap<String, String>>,
+    /// Daemon host state directory. Isolated worktrees are rooted at
+    /// `<daemon-state>/worktrees/<lease-uuid>`, never `std::env::temp_dir()`.
+    pub daemon_state_dir: Option<&'a Path>,
+    /// Host-issued workspace lease id for an isolated managed worktree.
+    pub workspace_lease_id: Option<uuid::Uuid>,
 }
 
 /// The custody posture every external OS harness runs at, resolved from its
@@ -425,21 +431,23 @@ async fn run_harness_inner(
     // 3. Resolve the run directory per write policy.
     let isolation = match ctx.policy {
         WritePolicy::Direct => None,
-        WritePolicy::Isolated => match Worktree::create(ctx.cwd) {
-            Ok(Some(wt)) => Some(wt),
-            // Not a git repo: there is nowhere to isolate into. Only agents
-            // that are already direct-write-capable may degrade to direct.
-            Ok(None) if WritePolicy::direct_allowed_for_agent(ctx.agent_id) => None,
-            Ok(None) => {
-                return Err(format!(
-                    "harness write policy `isolated` requires a git worktree for `{}`; \
+        WritePolicy::Isolated => {
+            match Worktree::create(ctx.cwd, ctx.daemon_state_dir, ctx.workspace_lease_id) {
+                Ok(Some(wt)) => Some(wt),
+                // Not a git repo: there is nowhere to isolate into. Only agents
+                // that are already direct-write-capable may degrade to direct.
+                Ok(None) if WritePolicy::direct_allowed_for_agent(ctx.agent_id) => None,
+                Ok(None) => {
+                    return Err(format!(
+                        "harness write policy `isolated` requires a git worktree for `{}`; \
                      `{}` is not allowed to degrade to direct writes",
-                    ctx.cwd.display(),
-                    ctx.agent_id
-                ));
+                        ctx.cwd.display(),
+                        ctx.agent_id
+                    ));
+                }
+                Err(e) => return Err(format!("preparing isolated worktree: {e}")),
             }
-            Err(e) => return Err(format!("preparing isolated worktree: {e}")),
-        },
+        }
     };
     let run_dir: PathBuf = isolation
         .as_ref()
@@ -453,7 +461,7 @@ async fn run_harness_inner(
             Err(e) => {
                 // Clean up the worktree on an early-out.
                 if let Some(wt) = isolation {
-                    wt.cleanup();
+                    wt.grace_retain();
                 }
                 return Err(e.to_string());
             }
@@ -499,7 +507,7 @@ async fn run_harness_inner(
         Ok(o) => o,
         Err(e) => {
             if let Some(wt) = isolation {
-                wt.cleanup();
+                wt.grace_retain();
             }
             return Err(format!(
                 "spawning harness `{}` (`{}`) failed: {e}",
@@ -532,7 +540,7 @@ async fn run_harness_inner(
         .as_ref()
         .map(|wt| scrub.scrub(&wt.capture_diff().unwrap_or_default()));
     if let Some(wt) = isolation {
-        wt.cleanup();
+        wt.grace_retain();
     }
 
     // 6. Parse JSON metadata leniently (only when the harness advertises JSON
@@ -682,51 +690,82 @@ fn excerpt(text: &str, token_cap: usize) -> String {
     )
 }
 
-/// A throwaway git worktree for Plan-mode isolation. Created off the
-/// current HEAD on a temp branch; reuses the `crate::git` worktree
-/// machinery. The diff is captured via `git add -A` (staging untracked
-/// files so they appear) + `git diff --staged`. Cleaned up on drop of the
-/// invocation (worktree removed, temp branch deleted).
+/// A host-managed git worktree for Plan-mode isolation. Rooted at
+/// `<daemon-state>/worktrees/<lease-uuid>` — never `std::env::temp_dir()`.
+/// Diffs are captured without mutating the index (`git add -A` is forbidden).
+/// Normal completion grace-retains the tree; only explicit host cleanup
+/// removes it. Crash recovery marks the matching workspace lease `uncertain`
+/// instead of deleting the path.
 struct Worktree {
     repo: PathBuf,
     path: PathBuf,
     branch: String,
+    lease_id: uuid::Uuid,
 }
 
 impl Worktree {
     /// Create an isolated worktree for `cwd`. `Ok(None)` when `cwd` isn't
     /// inside a git repo (the caller degrades to direct mode).
-    fn create(cwd: &Path) -> Result<Option<Self>> {
+    fn create(
+        cwd: &Path,
+        daemon_state_dir: Option<&Path>,
+        workspace_lease_id: Option<uuid::Uuid>,
+    ) -> Result<Option<Self>> {
         let Some(repo) = crate::git::find_worktree_root(cwd) else {
             return Ok(None);
         };
+        let repo = crate::git::resolve_git_path(&repo)?;
         let head = crate::git::head_sha(&repo)?;
-        let unique = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        let branch = format!("cockpit-harness/{unique}");
-        let path = std::env::temp_dir().join(format!("cockpit-harness-{unique}"));
+        let lease_id = workspace_lease_id.unwrap_or_else(uuid::Uuid::new_v4);
+        let state_dir = match daemon_state_dir {
+            Some(dir) => dir.to_path_buf(),
+            None => cockpit_config::config::resolve::cockpit_state_dir()
+                .context("daemon state dir required for isolated harness worktrees")?,
+        };
+        let worktrees = state_dir.join("worktrees");
+        std::fs::create_dir_all(&worktrees)
+            .with_context(|| format!("creating `{}`", worktrees.display()))?;
+        let path = crate::workspace_lease::managed_worktree_path(&state_dir, lease_id);
+        crate::git::assert_worktree_destination_under(&worktrees, &path)?;
+        let branch = format!("cockpit-lease/{lease_id}");
         crate::git::worktree_add(&repo, &path, &branch, &head)?;
-        Ok(Some(Self { repo, path, branch }))
+        Ok(Some(Self {
+            repo,
+            path,
+            branch,
+            lease_id,
+        }))
     }
 
-    /// Capture the worktree's changes as a unified diff (staged so
-    /// untracked files are included). Best-effort.
+    /// Capture tracked and untracked changes without mutating the index.
     fn capture_diff(&self) -> Result<String> {
-        // Stage everything so new files show in the diff.
-        let _ = crate::git::run_git(&self.path, &["add", "-A"])?;
-        let out = crate::git::run_git(&self.path, &["diff", "--staged"])?;
-        Ok(out.stdout)
+        let mut out = crate::git::diff_worktree(&self.path).unwrap_or_default();
+        let untracked =
+            crate::git::run_git(&self.path, &["ls-files", "--others", "--exclude-standard"])?;
+        for file in untracked.stdout.lines().filter(|line| !line.is_empty()) {
+            let diff =
+                crate::git::run_git(&self.path, &["diff", "--no-index", "--", "/dev/null", file]);
+            if let Ok(diff) = diff {
+                out.push_str(&diff.stdout);
+            }
+        }
+        Ok(out)
     }
 
-    /// Remove the worktree and delete its temp branch. Best-effort —
-    /// failures are logged, never propagated (cleanup must not fail a run).
-    fn cleanup(self) {
+    /// Leave the managed worktree in place (grace-retain / pin). Force-delete
+    /// is reserved for [`Self::explicit_clean`].
+    fn grace_retain(self) {
+        tracing::debug!(
+            path = %self.path.display(),
+            lease = %self.lease_id,
+            "retaining managed harness worktree"
+        );
+    }
+
+    /// Host-authorized removal. Callers must have already transitioned the
+    /// durable lease toward cleanup; this never runs on Drop or normal
+    /// worker completion.
+    fn explicit_clean(self) {
         if let Err(e) = crate::git::worktree_remove(&self.repo, &self.path) {
             tracing::debug!(error = %e, "harness worktree remove failed; pruning");
             let _ = crate::git::worktree_prune(&self.repo);
@@ -861,6 +900,8 @@ mod tests {
                 providers,
                 shutdown_gate: None,
                 env_overlay: None,
+                daemon_state_dir: None,
+                workspace_lease_id: None,
             })
             .await
             .unwrap();
@@ -993,6 +1034,8 @@ mod tests {
                 providers: &providers,
                 shutdown_gate: None,
                 env_overlay: None,
+                daemon_state_dir: None,
+                workspace_lease_id: None,
             },
             Some(&spawns),
         )
@@ -1029,6 +1072,8 @@ mod tests {
                 providers: &providers,
                 shutdown_gate: None,
                 env_overlay: None,
+                daemon_state_dir: None,
+                workspace_lease_id: None,
             },
             Some(&spawns),
         )
@@ -1079,6 +1124,8 @@ mod tests {
                 providers,
                 shutdown_gate: None,
                 env_overlay: None,
+                daemon_state_dir: None,
+                workspace_lease_id: None,
             })
             .await
             .unwrap()
@@ -1168,6 +1215,8 @@ mod tests {
                 providers,
                 shutdown_gate: None,
                 env_overlay: None,
+                daemon_state_dir: None,
+                workspace_lease_id: None,
             })
             .await
             .unwrap()
@@ -1224,6 +1273,8 @@ mod tests {
             std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
             crate::git::run_git_checked(repo, &["add", "-A"]).unwrap();
             crate::git::run_git_checked(repo, &["commit", "-q", "-m", "init"]).unwrap();
+            let state = repo.join("daemon-state");
+            std::fs::create_dir_all(&state).unwrap();
             // The child writes the secret into a new file inside its worktree.
             let mut cfg = sh_harness(&format!("printf '%s\\n' '{secret}' > leak.txt"));
             cfg.trust = HarnessTrust::Trusted;
@@ -1240,6 +1291,8 @@ mod tests {
                 providers,
                 shutdown_gate: None,
                 env_overlay: None,
+                daemon_state_dir: Some(&state),
+                workspace_lease_id: None,
             })
             .await
             .unwrap()
@@ -1312,6 +1365,8 @@ mod tests {
                 providers,
                 shutdown_gate: None,
                 env_overlay: None,
+                daemon_state_dir: None,
+                workspace_lease_id: None,
             })
             .await
             .unwrap()
@@ -1412,6 +1467,8 @@ mod tests {
             providers: &providers,
             shutdown_gate: None,
             env_overlay: None,
+            daemon_state_dir: None,
+            workspace_lease_id: None,
         })
         .await
         .unwrap();
@@ -1586,6 +1643,8 @@ mod tests {
             providers: &providers,
             shutdown_gate: None,
             env_overlay: None,
+            daemon_state_dir: None,
+            workspace_lease_id: None,
         })
         .await
         .unwrap();
@@ -1613,6 +1672,8 @@ mod tests {
         std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
         crate::git::run_git_checked(repo, &["add", "-A"]).unwrap();
         crate::git::run_git_checked(repo, &["commit", "-q", "-m", "init"]).unwrap();
+        let state = repo.join("daemon-state");
+        std::fs::create_dir_all(&state).unwrap();
 
         // The harness creates a new file in its (worktree) cwd.
         let cfg = sh_harness("printf 'hi\\n' > new.txt");
@@ -1631,6 +1692,8 @@ mod tests {
             providers: &providers,
             shutdown_gate: None,
             env_overlay: None,
+            daemon_state_dir: Some(&state),
+            workspace_lease_id: None,
         })
         .await
         .unwrap();
@@ -1638,8 +1701,20 @@ mod tests {
         let diff = res.diff.expect("isolated run returns a diff");
         assert!(diff.contains("new.txt"), "diff was: {diff}");
         // The real tree is untouched — the new file only exists in the
-        // (now-removed) worktree.
+        // retained managed worktree under daemon-state.
         assert!(!repo.join("new.txt").exists());
+        let worktrees = state.join("worktrees");
+        let retained: Vec<_> = std::fs::read_dir(&worktrees)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(retained.len(), 1, "managed worktree is grace-retained");
+        assert!(retained[0].join("new.txt").exists());
+        assert!(
+            !retained[0].starts_with(std::env::temp_dir().join("cockpit-harness-")),
+            "managed worktree must not use the legacy temp_dir harness prefix"
+        );
+        assert!(!res.diff.as_deref().unwrap_or("").contains("git add -A"));
     }
 
     /// Preflight failure (missing binary) surfaces a clear error naming
@@ -1665,6 +1740,8 @@ mod tests {
             providers: &providers,
             shutdown_gate: None,
             env_overlay: None,
+            daemon_state_dir: None,
+            workspace_lease_id: None,
         })
         .await
         .unwrap_err();
@@ -1692,6 +1769,8 @@ mod tests {
             providers: &providers,
             shutdown_gate: None,
             env_overlay: None,
+            daemon_state_dir: Some(tmp.path()),
+            workspace_lease_id: None,
         })
         .await
         .unwrap_err();
@@ -1700,6 +1779,48 @@ mod tests {
             "{err}"
         );
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn managed_worktree_roots_under_daemon_state_and_explicit_clean_is_host_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            crate::git::run_git_checked(&repo, &args).unwrap();
+        }
+        std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+        crate::git::run_git_checked(&repo, &["add", "seed.txt"]).unwrap();
+        crate::git::run_git_checked(&repo, &["commit", "-q", "-m", "init"]).unwrap();
+        let lease_id = uuid::Uuid::new_v4();
+        let wt = Worktree::create(&repo, Some(&state), Some(lease_id))
+            .unwrap()
+            .expect("git repo yields a managed worktree");
+        assert_eq!(
+            wt.path,
+            crate::workspace_lease::managed_worktree_path(&state, lease_id)
+        );
+        assert!(
+            !wt.path
+                .starts_with(std::env::temp_dir().join("cockpit-harness-"))
+        );
+        std::fs::write(wt.path.join("extra.txt"), "x\n").unwrap();
+        let diff = wt.capture_diff().unwrap();
+        assert!(
+            diff.contains("extra.txt"),
+            "untracked files without git add -A: {diff}"
+        );
+        let path = wt.path.clone();
+        wt.explicit_clean();
+        assert!(
+            !path.exists(),
+            "only explicit host cleanup removes the worktree"
+        );
     }
 
     /// A registered secret positioned so the 256 KiB FRONT-truncation cut lands
@@ -1748,6 +1869,8 @@ mod tests {
             providers: &providers,
             shutdown_gate: None,
             env_overlay: None,
+            daemon_state_dir: None,
+            workspace_lease_id: None,
         })
         .await
         .unwrap();
@@ -1805,6 +1928,8 @@ mod tests {
             providers: &providers,
             shutdown_gate: None,
             env_overlay: None,
+            daemon_state_dir: None,
+            workspace_lease_id: None,
         })
         .await
         .unwrap();
@@ -1847,6 +1972,8 @@ mod tests {
             providers: &providers,
             shutdown_gate: None,
             env_overlay: None,
+            daemon_state_dir: None,
+            workspace_lease_id: None,
         })
         .await
         .unwrap();
@@ -2091,6 +2218,8 @@ mod tests {
             providers: &providers,
             shutdown_gate: None,
             env_overlay: None,
+            daemon_state_dir: None,
+            workspace_lease_id: None,
         })
         .await
         .unwrap();

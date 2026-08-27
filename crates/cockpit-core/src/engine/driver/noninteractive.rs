@@ -626,6 +626,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) child_cwd: ChildCwd,
     pub(in crate::engine::driver) context: crate::engine::agent::TaskContext,
     pub(in crate::engine::driver) write_scope: Option<String>,
+    pub(in crate::engine::driver) workspace_lease: Option<String>,
     pub(in crate::engine::driver) granted_tools: Vec<String>,
     pub(in crate::engine::driver) todo_ids: Vec<uuid::Uuid>,
     pub(in crate::engine::driver) child_recursion:
@@ -1087,7 +1088,9 @@ fn resolve_recursive_vnext_child_cwd(
     if !resolved.is_dir() {
         return Err(format!("cwd `{raw}` does not exist or is not a directory"));
     }
-    if !cockpit_host::path_containment::contained_under(&workspace, &resolved) {
+    if !cockpit_host::path_containment::contained_under(&workspace, &resolved)
+        && !crate::workspace_lease::is_managed_worktree_path(&resolved)
+    {
         return Err(format!(
             "cwd `{raw}` resolves outside trusted workspace `{}`",
             workspace.display()
@@ -1305,6 +1308,7 @@ impl Driver {
                 DelegationConfinement {
                     lock_identity: None,
                     write_scope: scope,
+                    workspace_lease: None,
                 },
             );
             crate::engine::builtin::resolve_child_execution_surface(&task.child_agent, &args)
@@ -1348,6 +1352,7 @@ impl Driver {
                 DelegationConfinement {
                     lock_identity: None,
                     write_scope: scope,
+                    workspace_lease: None,
                 },
             );
             crate::engine::builtin::resolve_child_execution_surface(&entry.child_agent, &args)
@@ -1527,6 +1532,10 @@ impl Driver {
                 .get("write_scope")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            workspace_lease: entry
+                .get("workspace_lease")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             granted_tools,
             todo_ids: entry
                 .get("todo_ids")
@@ -1665,6 +1674,10 @@ impl Driver {
             context: crate::engine::agent::TaskContext::from_value(entry.get("context")),
             write_scope: entry
                 .get("write_scope")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            workspace_lease: entry
+                .get("workspace_lease")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             granted_tools,
@@ -2521,6 +2534,7 @@ impl Driver {
             child_cwd,
             context,
             write_scope,
+            workspace_lease,
             granted_tools,
             todo_ids,
             child_recursion,
@@ -2551,6 +2565,7 @@ impl Driver {
                     DelegationConfinement {
                         lock_identity: Some(format!("{child_agent}#{}", task_call_id)),
                         write_scope: resolved_write_scope,
+                        workspace_lease: None,
                     },
                 ),
             )
@@ -2680,6 +2695,31 @@ impl Driver {
             .stack
             .last()
             .and_then(|frame| frame.agent.vnext_grant.clone());
+        let resolved_workspace_lease = match crate::workspace_lease::lease_from_task_argument(
+            workspace_lease.as_deref(),
+            &self.cwd,
+            &child_cwd.resolved,
+            None,
+        ) {
+            Ok(lease) => lease,
+            Err(err) => {
+                return Ok(SingleNoninteractiveCompletion {
+                    child_agent,
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    report: format!("Error: {err}"),
+                    failed: true,
+                    failure: None,
+                    partial_progress: DelegationPartialProgress::default(),
+                    new_handle: None,
+                    snapshot: NoninteractiveDelegationSnapshot::empty(),
+                    shrink: None,
+                    repair_notes,
+                    child_routing: None,
+                });
+            }
+        };
         if let Some(err) = grant_rejection(GrantRejectionInput {
             parent_cwd: &self.cwd,
             cwd: &child_cwd.resolved,
@@ -2690,6 +2730,15 @@ impl Driver {
             grant: &granted_tools,
             assistant_db: &self.session.db,
             local_installations: &self.vnext_local_installation_resolver,
+            parent_write_scope: self
+                .stack
+                .last()
+                .and_then(|frame| frame.agent.write_scope.as_deref()),
+            parent_workspace_lease: self
+                .stack
+                .last()
+                .and_then(|frame| frame.agent.workspace_lease.as_deref()),
+            workspace_lease: resolved_workspace_lease.as_ref(),
         })
         .await
         {
@@ -2757,6 +2806,7 @@ impl Driver {
                 DelegationConfinement {
                     lock_identity: None,
                     write_scope: resolved_write_scope.clone(),
+                    workspace_lease: resolved_workspace_lease.clone().map(std::sync::Arc::new),
                 },
             );
             match crate::engine::builtin::resolve_child_execution_surface(
@@ -3040,6 +3090,9 @@ impl Driver {
                             DelegationConfinement {
                                 lock_identity: None,
                                 write_scope: resolved_write_scope.clone(),
+                                workspace_lease: resolved_workspace_lease
+                                    .clone()
+                                    .map(std::sync::Arc::new),
                             },
                         ),
                     ) {
@@ -5023,6 +5076,7 @@ impl Driver {
                     DelegationConfinement {
                         lock_identity: None,
                         write_scope: resolved_write_scope.clone(),
+                        workspace_lease: None,
                     },
                 ),
                 pinned_generation,
@@ -5060,6 +5114,8 @@ impl Driver {
             && let Some((left_label, left, right_label, right)) =
                 overlapping_write_scope_pair(&write_capable_scopes)
         {
+            // Workspace leases cannot bypass writer-conflict: overlap is
+            // computed on write_scope paths regardless of selected leases.
             batch_refusal = Some(format!(
                 "write_scope overlap between batch entries `{left_label}` (`{}`) and `{right_label}` (`{}`); write-capable scopes must be disjoint",
                 left.display(),
@@ -5366,6 +5422,7 @@ impl Driver {
                             DelegationConfinement {
                                 lock_identity: None,
                                 write_scope: resolved_write_scope.clone(),
+                                workspace_lease: None,
                             },
                         )
                     };
@@ -5409,6 +5466,15 @@ impl Driver {
                     grant: &entry.granted_tools,
                     assistant_db: &driver.session.db,
                     local_installations: &driver.vnext_local_installation_resolver,
+                    parent_write_scope: driver
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.write_scope.as_deref()),
+                    parent_workspace_lease: driver
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.workspace_lease.as_deref()),
+                    workspace_lease: None,
                 })
                 .await
                 {
@@ -5522,6 +5588,7 @@ impl Driver {
                                     entry.child_agent, entry.label
                                 )),
                                 write_scope: resolved_write_scope.clone(),
+                                workspace_lease: None,
                             },
                         )
                     };
@@ -7386,6 +7453,9 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             grant: &granted_tools,
             assistant_db: &session.db,
             local_installations,
+            parent_write_scope: parent_agent.write_scope.as_deref(),
+            parent_workspace_lease: parent_agent.workspace_lease.as_deref(),
+            workspace_lease: None,
         })
         .await
     {
@@ -8002,6 +8072,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         agent_instance_id: Some(agent_instance_id),
         lock_identity: agent.name.clone(),
         write_scope: None,
+        workspace_lease: None,
         current_tool_call_id: None,
         llm_mode: agent.llm_mode,
         locks: locks.clone(),
@@ -9345,6 +9416,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 resume_handle: _,
                 cwd: requested_cwd,
                 write_scope,
+                workspace_lease: requested_lease,
                 context: _,
                 granted_tools,
                 todo_ids: _,
@@ -9388,6 +9460,24 @@ pub(crate) async fn run_noninteractive_resumable(
                         continue;
                     }
                 };
+                let live_lease = match crate::workspace_lease::lease_from_task_argument(
+                    requested_lease.as_deref(),
+                    &cwd,
+                    &child_cwd,
+                    None,
+                ) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id.clone(),
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(format!("Error: {error}"), &repair_notes),
+                        );
+                        continue;
+                    }
+                };
                 if let Some(error) = super::delegation_helpers::grant_rejection(
                     super::delegation_helpers::GrantRejectionInput {
                         parent_cwd: &cwd,
@@ -9399,6 +9489,9 @@ pub(crate) async fn run_noninteractive_resumable(
                         grant: &granted_tools,
                         assistant_db: &session.db,
                         local_installations: &local_installations,
+                        parent_write_scope: agent.write_scope.as_deref(),
+                        parent_workspace_lease: agent.workspace_lease.as_deref(),
+                        workspace_lease: live_lease.as_ref(),
                     },
                 )
                 .await
@@ -9460,6 +9553,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     granted_tools,
                     lock_identity: None,
                     write_scope: resolved_write_scope,
+                    workspace_lease: None,
                     credential_store: session.provider_credential_store(&config.providers()).ok(),
                 };
                 let nested_steer_target = match (agent_instance_id, steer_target.as_ref()) {
@@ -9757,6 +9851,18 @@ pub(crate) async fn run_noninteractive_resumable(
                             break;
                         }
                     };
+                    let live_lease = match crate::workspace_lease::lease_from_task_argument(
+                        entry.workspace_lease.as_deref(),
+                        &cwd,
+                        &child_cwd,
+                        None,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            rejection = Some(format!("batch entry `{}`: {error}", entry.label));
+                            break;
+                        }
+                    };
                     if let Some(error) = super::delegation_helpers::grant_rejection(
                         super::delegation_helpers::GrantRejectionInput {
                             parent_cwd: &cwd,
@@ -9768,6 +9874,9 @@ pub(crate) async fn run_noninteractive_resumable(
                             grant: &entry.granted_tools,
                             assistant_db: &session.db,
                             local_installations: &local_installations,
+                            parent_write_scope: agent.write_scope.as_deref(),
+                            parent_workspace_lease: agent.workspace_lease.as_deref(),
+                            workspace_lease: live_lease.as_ref(),
                         },
                     )
                     .await
@@ -9815,6 +9924,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         granted_tools: entry.granted_tools.clone(),
                         lock_identity: None,
                         write_scope: resolved_write_scope,
+                        workspace_lease: None,
                         credential_store: session
                             .provider_credential_store(&config.providers())
                             .ok(),

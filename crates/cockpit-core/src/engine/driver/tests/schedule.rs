@@ -471,6 +471,7 @@ fn schedule_journaling_driver(
         llm_mode: crate::config::extended::LlmMode::default(),
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,

@@ -4848,6 +4848,7 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         // Owner-scoped store for delegated/computer-use model construction: a
         // child's `$secret:` model/header ref can only resolve a secret owned by
         // (provider, this session's workspace), never a foreign workspace's. See
@@ -5217,6 +5218,18 @@ pub(super) async fn run_worker(
     // opens write-scope / agent-tree dependents.
     if session.is_persisted() {
         open_session_write_scope_root(&write_scope, session.id, &project_root).await;
+    }
+    // Crash recovery for host-managed workspace leases: identity mismatch
+    // becomes `uncertain`. Paths are never force-removed here.
+    let now_ms = crate::workspace_lease::now_unix_ms();
+    if let Err(error) =
+        crate::workspace_lease::recover_session_workspace_leases(&session.db, session.id, now_ms)
+            .await
+    {
+        tracing::warn!(
+            error = %error,
+            "workspace lease crash recovery failed"
+        );
     }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into

@@ -868,6 +868,9 @@ pub struct ToolCtx {
     /// Optional subtree that write-capable native tools and shell sandboxes must
     /// confine writes to. Reads remain governed by the session boundary.
     pub write_scope: Option<std::path::PathBuf>,
+    /// Host-issued workspace lease for this child. Path checks, the shell
+    /// sandbox, and computer-use gating honor its visibility root and ops.
+    pub workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,
     /// Current outer model tool-call id, when this context was built for a
     /// live model-issued tool dispatch. Host-side tools can use it to parent
     /// synthetic UI/telemetry events without exposing the id to tool schemas or

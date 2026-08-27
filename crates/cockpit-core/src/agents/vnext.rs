@@ -293,6 +293,7 @@ impl VnextHostPolicy {
             allowed_targets: BTreeSet::from([
                 DelegationTarget::SameRoot,
                 DelegationTarget::Subdirectory,
+                DelegationTarget::ManagedWorktree,
             ]),
             computer_delegation_enabled: matches!(
                 config.computer_use,
@@ -712,6 +713,19 @@ impl EffectiveVnextGrant {
         parent_cwd: &std::path::Path,
         child_cwd: &std::path::Path,
     ) -> bool {
+        self.permits_target_with_lease(parent_cwd, child_cwd, None)
+    }
+
+    /// Path authority for a child cwd, optionally under a typed workspace
+    /// lease. `DelegationTarget::ManagedWorktree` is granted only when a live
+    /// host-issued lease is supplied; a raw path in another git worktree is
+    /// never inferred as management.
+    pub fn permits_target_with_lease(
+        &self,
+        parent_cwd: &std::path::Path,
+        child_cwd: &std::path::Path,
+        lease: Option<&crate::workspace_lease::WorkspaceLease>,
+    ) -> bool {
         let Some(delegation) = &self.delegation else {
             return false;
         };
@@ -719,20 +733,46 @@ impl EffectiveVnextGrant {
         // public grant helper is also used by factory/preflight seams. Never
         // let a lexical `starts_with` turn a symlinked or `..` spelling into
         // an authority decision.
-        let (Ok(parent_cwd), Ok(child_cwd)) = (parent_cwd.canonicalize(), child_cwd.canonicalize())
-        else {
-            return false;
+        let parent_cwd = match cockpit_host::path_containment::effective_path(parent_cwd) {
+            Ok(path) => path,
+            Err(_) => return false,
         };
+        let child_cwd = match cockpit_host::path_containment::effective_path(child_cwd) {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+        if let Some(lease) = lease {
+            if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+                return false;
+            }
+            if !lease.covers_cwd(&child_cwd) {
+                return false;
+            }
+            return match lease.kind {
+                crate::workspace_lease::WorkspaceLeaseKind::SameRoot => {
+                    delegation.targets.contains(&DelegationTarget::SameRoot)
+                        && child_cwd == parent_cwd
+                }
+                crate::workspace_lease::WorkspaceLeaseKind::Subdirectory => {
+                    delegation.targets.contains(&DelegationTarget::Subdirectory)
+                        && child_cwd != parent_cwd
+                        && cockpit_host::path_containment::contained_under(&parent_cwd, &child_cwd)
+                }
+                crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree => {
+                    delegation
+                        .targets
+                        .contains(&DelegationTarget::ManagedWorktree)
+                        && child_cwd != parent_cwd
+                        && !cockpit_host::path_containment::contained_under(&parent_cwd, &child_cwd)
+                }
+            };
+        }
         delegation.targets.iter().any(|target| match target {
             DelegationTarget::SameRoot => child_cwd == parent_cwd,
             DelegationTarget::Subdirectory => {
-                child_cwd != parent_cwd && child_cwd.starts_with(&parent_cwd)
+                child_cwd != parent_cwd
+                    && cockpit_host::path_containment::contained_under(&parent_cwd, &child_cwd)
             }
-            // A path in a different git worktree is not itself a managed
-            // worktree grant. Creation/lease ownership is supplied by the
-            // dedicated worktree lifecycle owner, which has not yet threaded
-            // a typed authority token into this vNext preflight seam. Refuse
-            // rather than infer management from raw paths.
             DelegationTarget::ManagedWorktree => false,
         })
     }
@@ -1996,6 +2036,44 @@ mod tests {
         let grant = definition.resolve_grant(&policy).unwrap();
         assert!(grant.permits_target(root, &child));
         assert!(!grant.permits_target(root, root));
+    }
+
+    #[test]
+    fn agent_vnext_managed_worktree_requires_typed_lease_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let worktree = temp
+            .path()
+            .join("state/worktrees")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mut definition = valid();
+        definition.delegation = DelegationPolicy {
+            allowed_children: vec![AllowedChild::PortableRef {
+                portable_agent_ref: "acme/child".into(),
+            }],
+            max_descendant_depth: Some(1),
+            max_concurrent_children: Some(1),
+            targets: vec![DelegationTarget::ManagedWorktree],
+        };
+        let mut policy = host();
+        policy
+            .allowed_targets
+            .insert(DelegationTarget::ManagedWorktree);
+        let grant = definition.resolve_grant(&policy).unwrap();
+        assert!(
+            !grant.permits_target(&root, &worktree),
+            "a raw other-worktree path is not a managed-worktree grant"
+        );
+        let lease = crate::workspace_lease::WorkspaceLease::ephemeral(
+            crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree,
+            worktree.clone(),
+            crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+            crate::workspace_lease::now_unix_ms() + 60_000,
+        );
+        assert!(grant.permits_target_with_lease(&root, &worktree, Some(&lease)));
+        assert!(!grant.permits_target_with_lease(&root, &root, Some(&lease)));
     }
 
     fn host() -> VnextHostPolicy {

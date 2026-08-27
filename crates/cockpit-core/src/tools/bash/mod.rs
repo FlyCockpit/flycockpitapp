@@ -632,8 +632,13 @@ async fn call_bash_inner(
         };
     let extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
+    let sandbox_cwd = ctx
+        .workspace_lease
+        .as_ref()
+        .map(|lease| lease.visibility_root.as_path())
+        .unwrap_or(cwd.as_path());
     let sandbox_policy = crate::tools::shell_sandbox::sandbox_policy(
-        &cwd,
+        sandbox_cwd,
         tmp_dir.as_deref(),
         &session_env,
         &extra_sandbox_paths,

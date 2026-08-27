@@ -395,6 +395,18 @@ pub(crate) fn is_workspace_cockpit_path(cwd: &Path, path: &Path) -> bool {
 }
 
 fn within_boundary(ctx: &ToolCtx, path: &Path) -> bool {
+    if let Some(lease) = ctx.workspace_lease.as_ref() {
+        if lease.covers_path(path) {
+            return true;
+        }
+        // Session scratch remains usable; sibling worktrees and the primary
+        // repository are not implicit lease visibility.
+        return ctx
+            .session
+            .tmp_dir()
+            .as_deref()
+            .is_some_and(|tmp| cockpit_host::path_containment::contained_under(tmp, path));
+    }
     path_inside_boundary(path, &ctx.cwd, ctx.session.tmp_dir().as_deref())
 }
 
@@ -636,6 +648,7 @@ mod tests {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks,

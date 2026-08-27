@@ -237,6 +237,9 @@ pub struct SpawnArgs {
     /// Optional write-confined subtree for delegated children. Native writes
     /// and shell sandboxes enforce this; reads remain cwd-wide.
     pub write_scope: Option<std::path::PathBuf>,
+    /// Host-issued workspace lease for this spawn. Sandboxed children see
+    /// only this lease's visibility root.
+    pub workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,
     /// Vault-backed credential store for delegated model construction.
     /// Production session/driver spawns pass `Some`; tests may leave `None`.
     pub credential_store: Option<crate::credentials::CredentialStore>,
@@ -2374,6 +2377,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
                 .clone()
                 .unwrap_or_else(|| def.name.clone()),
             write_scope: args.write_scope.clone(),
+            workspace_lease: args.workspace_lease.clone(),
             delegated: args.delegated,
             delegation_recursion: DelegationRecursionContext {
                 enabled: args.delegation_recursion.enabled,
@@ -2515,6 +2519,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             .clone()
             .unwrap_or_else(|| def.name.clone()),
         write_scope: args.write_scope.clone(),
+        workspace_lease: None,
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: effective_vnext_grant,
@@ -2957,6 +2962,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
             .clone()
             .unwrap_or_else(|| "Build".to_string()),
         write_scope: args.write_scope.clone(),
+        workspace_lease: None,
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
@@ -3017,6 +3023,7 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
             .clone()
             .unwrap_or_else(|| "deepthink".to_string()),
         write_scope: args.write_scope.clone(),
+        workspace_lease: None,
         delegated: args.delegated,
         delegation_recursion: DelegationRecursionContext {
             enabled: args.delegation_recursion.enabled,
@@ -3035,6 +3042,13 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
 /// vision-capable, subagent-invokable model with a native computer contract
 /// and refuses loudly when none exists.
 pub fn computer(args: &SpawnArgs) -> Result<Agent> {
+    if args
+        .workspace_lease
+        .as_ref()
+        .is_some_and(|lease| !lease.allows_computer())
+    {
+        bail!("workspace lease does not permit computer use");
+    }
     let (extended, providers) = args.config.configs();
     let Some((provider_id, model_id, native_computer)) =
         computer_subagent_candidate(&providers, &args.cwd, extended.llm_mode)
@@ -3143,6 +3157,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
             .clone()
             .unwrap_or_else(|| "scout".to_string()),
         write_scope: args.write_scope.clone(),
+        workspace_lease: None,
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
@@ -3198,6 +3213,7 @@ pub fn goal_control(
         scan_tool_results: true,
         lock_identity: name.to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: true,
         delegation_recursion: DelegationRecursionContext {
             enabled: false,
@@ -3257,6 +3273,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
             .clone()
             .unwrap_or_else(|| "Plan".to_string()),
         write_scope: args.write_scope.clone(),
+        workspace_lease: None,
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
@@ -3314,6 +3331,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
             .clone()
             .unwrap_or_else(|| "Multireview".to_string()),
         write_scope: args.write_scope.clone(),
+        workspace_lease: None,
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
@@ -3388,6 +3406,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
             .clone()
             .unwrap_or_else(|| "bee".to_string()),
         write_scope: args.write_scope.clone(),
+        workspace_lease: None,
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
@@ -3675,6 +3694,7 @@ mod tests {
             granted_tools: Vec::new(),
             lock_identity: None,
             write_scope: None,
+            workspace_lease: None,
             credential_store: None,
         }
     }

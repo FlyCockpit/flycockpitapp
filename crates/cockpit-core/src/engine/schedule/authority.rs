@@ -1065,6 +1065,7 @@ mod tests {
             llm_mode: crate::config::extended::LlmMode::default(),
             lock_identity: "builder".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,

@@ -307,6 +307,7 @@ impl Driver {
             agent_instance_id: None,
             lock_identity: agent.name.clone().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
             llm_mode: agent.llm_mode,
             locks: self.locks.clone(),

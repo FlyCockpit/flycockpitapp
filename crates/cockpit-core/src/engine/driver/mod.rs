@@ -1543,6 +1543,7 @@ struct ChildCwd {
 struct DelegationConfinement {
     lock_identity: Option<String>,
     write_scope: Option<std::path::PathBuf>,
+    workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,
 }
 
 impl ChildCwd {
@@ -3966,6 +3967,7 @@ impl Driver {
             agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
             lock_identity: agent.name.clone().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
             llm_mode: agent.llm_mode,
             locks: self.locks.clone(),
@@ -11163,6 +11165,15 @@ impl Driver {
                         grant: &granted_tools,
                         assistant_db: &self.session.db,
                         local_installations: &self.vnext_local_installation_resolver,
+                        parent_write_scope: self
+                            .stack
+                            .last()
+                            .and_then(|frame| frame.agent.write_scope.as_deref()),
+                        parent_workspace_lease: self
+                            .stack
+                            .last()
+                            .and_then(|frame| frame.agent.workspace_lease.as_deref()),
+                        workspace_lease: None,
                     })
                     .await
                     {
@@ -11530,6 +11541,7 @@ impl Driver {
                     resume_handle,
                     cwd,
                     write_scope,
+                    workspace_lease,
                     context,
                     granted_tools,
                     todo_ids,
@@ -11593,6 +11605,15 @@ impl Driver {
                         grant: &granted_tools,
                         assistant_db: &self.session.db,
                         local_installations: &self.vnext_local_installation_resolver,
+                        parent_write_scope: self
+                            .stack
+                            .last()
+                            .and_then(|frame| frame.agent.write_scope.as_deref()),
+                        parent_workspace_lease: self
+                            .stack
+                            .last()
+                            .and_then(|frame| frame.agent.workspace_lease.as_deref()),
+                        workspace_lease: None,
                     })
                     .await
                     {
@@ -11617,6 +11638,7 @@ impl Driver {
                                 child_cwd,
                                 context,
                                 write_scope,
+                                workspace_lease,
                                 granted_tools,
                                 todo_ids,
                                 child_recursion,
@@ -11692,6 +11714,15 @@ impl Driver {
                             grant: &entry.granted_tools,
                             assistant_db: &self.session.db,
                             local_installations: &self.vnext_local_installation_resolver,
+                            parent_write_scope: self
+                                .stack
+                                .last()
+                                .and_then(|frame| frame.agent.write_scope.as_deref()),
+                            parent_workspace_lease: self
+                                .stack
+                                .last()
+                                .and_then(|frame| frame.agent.workspace_lease.as_deref()),
+                            workspace_lease: None,
                         })
                         .await
                         {
@@ -12109,6 +12140,7 @@ impl Driver {
             granted_tools: Vec::new(),
             lock_identity: None,
             write_scope: None,
+            workspace_lease: None,
             // Owner-scoped store for delegated/computer-use model construction,
             // derived from the driver's pinned providers config: a child can only
             // resolve a `$secret:` owned by (provider, this workspace). See
@@ -12194,6 +12226,7 @@ impl Driver {
             cwd: child_cwd.to_path_buf(),
             lock_identity: confinement.lock_identity,
             write_scope: confinement.write_scope,
+            workspace_lease: confinement.workspace_lease,
             ..self.spawn_args(interactive)
         }
     }
@@ -12364,7 +12397,9 @@ impl Driver {
                 "Error: cwd `{raw}` does not exist or is not a directory"
             ));
         }
-        if !resolved.starts_with(&root) {
+        if !cockpit_host::path_containment::contained_under(&root, &resolved)
+            && !crate::workspace_lease::is_managed_worktree_path(&resolved)
+        {
             return Err(format!(
                 "Error: cwd `{raw}` resolves outside trusted workspace `{}`",
                 root.display()

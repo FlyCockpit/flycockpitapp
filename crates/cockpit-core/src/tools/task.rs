@@ -168,6 +168,10 @@ impl TaskTool {
                     "type": "string",
                     "description": "Hard write-confined subtree; reads stay cwd-wide"
                 },
+                "workspace_lease": {
+                    "type": "string",
+                    "description": "Host-issued workspace lease id, or kind `same_root`/`subdirectory`/`managed_worktree`. Intersected with the parent grant; cannot widen cwd, visibility, tools, model, depth, or concurrency. Managed worktrees require a live lease."
+                },
                 "grant_tools": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -227,6 +231,10 @@ impl TaskTool {
                     "type": "string",
                     "description": "Required for write-capable entries; hard write-confined subtree"
                 },
+                "workspace_lease": {
+                    "type": "string",
+                    "description": "Host-issued workspace lease id or kind; intersected with the parent grant"
+                },
                 "remaining_depth": {
                     "type": "integer",
                     "minimum": 0
@@ -262,6 +270,7 @@ impl TaskTool {
                 "resume_handle": delegate_payload["properties"]["resume_handle"].clone(),
                 "cwd": delegate_payload["properties"]["cwd"].clone(),
                 "write_scope": delegate_payload["properties"]["write_scope"].clone(),
+                "workspace_lease": delegate_payload["properties"]["workspace_lease"].clone(),
                 "grant_tools": delegate_payload["properties"]["grant_tools"].clone(),
                 "todo_ids": delegate_payload["properties"]["todo_ids"].clone(),
                 "remaining_depth": delegate_payload["properties"]["remaining_depth"].clone(),
@@ -612,6 +621,8 @@ mod tests {
 
             assert!(payload_props.contains_key("write_scope"), "{schema}");
             assert!(batch_props.contains_key("write_scope"), "{schema}");
+            assert!(payload_props.contains_key("workspace_lease"), "{schema}");
+            assert!(batch_props.contains_key("workspace_lease"), "{schema}");
             assert!(!payload_props.contains_key("output_dir"), "{schema}");
             assert!(!batch_props.contains_key("output_dir"), "{schema}");
             assert!(

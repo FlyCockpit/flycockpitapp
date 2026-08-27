@@ -2977,6 +2977,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         credential_store: None,
     }
 }

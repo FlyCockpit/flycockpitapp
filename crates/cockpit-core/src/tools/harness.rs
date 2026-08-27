@@ -468,6 +468,8 @@ impl Tool for HarnessInvokeTool {
             providers: &providers,
             shutdown_gate: Some(ctx.shutdown_gate.clone()),
             env_overlay: Some(&env_overlay),
+            daemon_state_dir: None,
+            workspace_lease_id: None,
         })
         .await;
 

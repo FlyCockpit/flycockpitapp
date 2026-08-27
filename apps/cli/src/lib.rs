@@ -308,14 +308,14 @@ pub mod integration {
                                 display_text,
                                 tag_expansions: tag_expansions
                                     .into_iter()
-                                    .map(
-                                        |(tool, path, detail, ok)| crate::daemon::proto::TagExpansionMeta {
+                                    .map(|(tool, path, detail, ok)| {
+                                        crate::daemon::proto::TagExpansionMeta {
                                             tool,
                                             path,
                                             detail,
                                             ok,
-                                        },
-                                    )
+                                        }
+                                    })
                                     .collect(),
                                 forced_skill: None,
                                 attachments: Vec::new(),

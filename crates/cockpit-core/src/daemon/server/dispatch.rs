@@ -2668,8 +2668,7 @@ async fn handle_send_user_message_v2(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     ingress: crate::proto_crate::send_user_message_v2::MessageIngressV2,
-    #[cfg(feature = "remote")]
-    remote_operation: Option<&super::RemoteOperationContext>,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // TODO(#69, remote): the `authenticated_remote_operation` branch must be
     // decoded only through the registered opaque FCM2 FCOR path with a bound
@@ -2682,8 +2681,9 @@ async fn handle_send_user_message_v2(
         _ => {
             return Err(ErrorPayload {
                 code: ErrorCode::BadRequest,
-                message: "authenticated_remote_operation ingress is not supported on the local path"
-                    .into(),
+                message:
+                    "authenticated_remote_operation ingress is not supported on the local path"
+                        .into(),
             });
         }
     };

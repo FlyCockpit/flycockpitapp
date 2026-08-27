@@ -35,10 +35,7 @@ use uuid::Uuid;
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
 use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient};
-use crate::daemon::proto::{
-    self, Request, Response,
-    send_user_message_v2::MessageIngressV2,
-};
+use crate::daemon::proto::{self, Request, Response, send_user_message_v2::MessageIngressV2};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -625,20 +622,20 @@ pub(crate) async fn attach_send_pump(
             client
                 .request(Request::SendUserMessageV2 {
                     ingress: MessageIngressV2::local_direct(
-                    Uuid::now_v7(),
-                    "session",
-                    None,
-                    None,
-                    options.run_invocation_options.clone(),
-                    crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
-                        client_submission_id,
-                        text: prompt,
-                        display_text: None,
-                        tag_expansions: Vec::new(),
-                        forced_skill: None,
-                        attachments: Vec::new(),
-                    },
-                ),
+                        Uuid::now_v7(),
+                        "session",
+                        None,
+                        None,
+                        options.run_invocation_options.clone(),
+                        crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
+                            client_submission_id,
+                            text: prompt,
+                            display_text: None,
+                            tag_expansions: Vec::new(),
+                            forced_skill: None,
+                            attachments: Vec::new(),
+                        },
+                    ),
                 })
                 .await
         }
@@ -2150,20 +2147,20 @@ mod tests {
         };
         let send = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            None,
-            None,
-            Some(options.clone()),
-            crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: id,
-                text: "go".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                Some(options.clone()),
+                crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: id,
+                    text: "go".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         let json = serde_json::to_value(&send).unwrap();
         assert_eq!(json["request"], "send_user_message");
@@ -2189,7 +2186,8 @@ mod tests {
         // Shared envelope requires SendUserMessageV2 with options marker.
         match send {
             Request::SendUserMessageV2 {
-                ingress: cockpit_proto::send_user_message_v2::MessageIngressV2::LocalOwnerDirect(local),
+                ingress:
+                    cockpit_proto::send_user_message_v2::MessageIngressV2::LocalOwnerDirect(local),
             } => {
                 assert_eq!(local.request.client_submission_id, id);
                 assert_eq!(

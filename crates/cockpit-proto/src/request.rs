@@ -2685,36 +2685,34 @@ impl Request {
                             .to_string(),
                     );
                 }
-                if !crate::send_user_message_v2::has_message_text(&request.text) && request.attachments.is_empty() {
+                if !crate::send_user_message_v2::has_message_text(&request.text)
+                    && request.attachments.is_empty()
+                {
                     return Err("message has no content".to_string());
                 }
-                if request.attachments.len()
-                    > crate::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
+                if request.attachments.len() > crate::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
                 {
                     return Err("too many attachments".to_string());
                 }
                 if let Self::SendUserMessageV2 {
-                    ingress:
-                        MessageIngressV2::LocalOwnerDirect(local),
+                    ingress: MessageIngressV2::LocalOwnerDirect(local),
                 } = self
                 {
                     if local.operation_id.is_nil() {
                         return Err("operation_id must not be nil".to_string());
                     }
                     if local.operation_id == request.client_submission_id {
-                        return Err(
-                            "operation_id and client_submission_id must differ".to_string(),
-                        );
+                        return Err("operation_id and client_submission_id must differ".to_string());
                     }
                     if let Some(options) = &local.run_invocation_options {
                         if options.max_turns == Some(0) {
                             return Err(
-                                "run_invocation_options.max_turns must not be zero".to_string(),
+                                "run_invocation_options.max_turns must not be zero".to_string()
                             );
                         }
                         if options.timeout_ms == Some(0) {
                             return Err(
-                                "run_invocation_options.timeout_ms must not be zero".to_string(),
+                                "run_invocation_options.timeout_ms must not be zero".to_string()
                             );
                         }
                     }
@@ -5007,20 +5005,20 @@ mod tests {
     fn semantic_validation_rejects_ambiguous_model_flags_and_nil_submission_id() {
         let nil_submission = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            None,
-            None,
-            None,
-            crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: Uuid::nil(),
-                text: "hello".to_string(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::nil(),
+                    text: "hello".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         assert_eq!(
             nil_submission.validate_semantics().unwrap_err(),
@@ -6341,20 +6339,20 @@ mod tests {
 
         let send = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            None,
-            None,
-            Some(unbounded.clone()),
-            crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: id,
-                text: "run me".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                Some(unbounded.clone()),
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: id,
+                    text: "run me".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         let json = serde_json::to_value(&send).unwrap();
         assert_eq!(json["request"], "send_user_message");
@@ -6370,20 +6368,20 @@ mod tests {
 
         let bounded_send = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            None,
-            None,
-            Some(bounded.clone()),
-            crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: id,
-                text: "run me".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                Some(bounded.clone()),
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: id,
+                    text: "run me".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         let bounded_json = serde_json::to_value(&bounded_send).unwrap();
         assert_eq!(
@@ -6402,20 +6400,20 @@ mod tests {
         };
         let mode_send = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            None,
-            None,
-            Some(with_mode),
-            crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: id,
-                text: "run me".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                Some(with_mode),
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: id,
+                    text: "run me".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         let mode_json = serde_json::to_value(&mode_send).unwrap();
         assert_eq!(
@@ -6428,20 +6426,20 @@ mod tests {
 
         let non_run = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            None,
-            None,
-            None,
-            crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: id,
-                text: "interactive".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                None,
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: id,
+                    text: "interactive".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         let non_run_json = serde_json::to_value(&non_run).unwrap();
         assert!(
@@ -6480,24 +6478,24 @@ mod tests {
         // Zero is never unbounded: semantic validation rejects it.
         let zero_turns = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            None,
-            None,
-            Some(RunInvocationOptions {
-                max_turns: Some(0),
-                timeout_ms: None,
-                approval_mode: None,
-            }),
-            crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: id,
-                text: "x".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                Some(RunInvocationOptions {
+                    max_turns: Some(0),
+                    timeout_ms: None,
+                    approval_mode: None,
+                }),
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: id,
+                    text: "x".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         assert!(
             zero_turns
@@ -6507,24 +6505,24 @@ mod tests {
         );
         let zero_timeout = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            None,
-            None,
-            Some(RunInvocationOptions {
-                max_turns: None,
-                timeout_ms: Some(0),
-                approval_mode: None,
-            }),
-            crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: id,
-                text: "x".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                Some(RunInvocationOptions {
+                    max_turns: None,
+                    timeout_ms: Some(0),
+                    approval_mode: None,
+                }),
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: id,
+                    text: "x".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         assert!(
             zero_timeout
@@ -6538,10 +6536,7 @@ mod tests {
         match again {
             Request::SendUserMessageV2 {
                 ingress: MessageIngressV2::LocalOwnerDirect(local),
-            } => assert_eq!(
-                local.run_invocation_options.as_ref().unwrap(),
-                &bounded
-            ),
+            } => assert_eq!(local.run_invocation_options.as_ref().unwrap(), &bounded),
             other => panic!("expected SendUserMessageV2, got {other:?}"),
         }
     }
@@ -6557,20 +6552,20 @@ mod tests {
         };
         let request = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            Some(7),
-            Some(model.clone()),
-            None,
-            crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: Uuid::new_v4(),
-                text: "fenced".to_string(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                Some(7),
+                Some(model.clone()),
+                None,
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: "fenced".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         request.validate_semantics().unwrap();
         let json = serde_json::to_value(&request).unwrap();
@@ -6579,20 +6574,20 @@ mod tests {
 
         let invalid = Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
-            Some(7),
-            None,
-            None,
-            crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: Uuid::new_v4(),
-                text: "invalid".to_string(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                forced_skill: None,
-                attachments: Vec::new(),
-            },
-        ),
+                Uuid::now_v7(),
+                "session",
+                Some(7),
+                None,
+                None,
+                crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::new_v4(),
+                    text: "invalid".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         assert!(invalid.validate_semantics().is_err());
     }

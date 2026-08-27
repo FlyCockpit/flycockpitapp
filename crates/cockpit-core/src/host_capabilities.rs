@@ -494,13 +494,18 @@ pub async fn collect_shared_host_probes(
                         std::io::Error::other("platform keyring probe thread panicked")
                     })
                 })
-                .unwrap_or_else(|error| KeyringProbeResult {
-                    state: FeatureCapabilityState::Missing,
-                    reason: format!("platform keyring probe failed: {error}"),
-                    fix_command: None,
-                    remedy_text: Some(
-                        "The OS keyring probe panicked while a Tokio runtime was active.".into(),
-                    ),
+                .unwrap_or_else(|error| {
+                    let panicked = error.to_string().contains("panicked");
+                    KeyringProbeResult {
+                        state: FeatureCapabilityState::Failed,
+                        reason: format!("platform keyring probe failed: {error}"),
+                        fix_command: None,
+                        remedy_text: Some(if panicked {
+                            "The OS keyring probe panicked while a Tokio runtime was active.".into()
+                        } else {
+                            format!("The OS keyring probe could not be started: {error}")
+                        }),
+                    }
                 })
         }
         KeyringProbeSource::Injected { result, calls } => {

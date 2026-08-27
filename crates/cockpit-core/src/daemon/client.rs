@@ -50,11 +50,12 @@ pub enum LifecycleMode {
     /// background daemon." The TUI's default.
     AttachOrAutoPromote,
     /// "Attach if running, otherwise spawn a temporary daemon I'll
-    /// stop on exit." Default for `cockpit run`. The flag name on
-    /// the CLI is `--ephemeral`.
+    /// stop on exit." Default for `cockpit run`.
     AttachOrEphemeral,
-    /// "Always spawn a fresh ephemeral daemon, even if one is
-    /// running." Used by `cockpit run --ephemeral`.
+    /// Prefer a private ephemeral daemon that stops when the caller
+    /// exits. If a persistent daemon already holds the exclusive
+    /// ledger lock, attach to that owner instead. Used by
+    /// `cockpit run --ephemeral`.
     AlwaysEphemeral,
     /// "Attach to *my own* per-process ephemeral daemon if it's already
     /// running, otherwise spawn it." The daemonless TUI's mode
@@ -451,95 +452,36 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
     };
 
     match mode {
-        LifecycleMode::AttachOrAutoPromote | LifecycleMode::AttachOrEphemeral => {
+        LifecycleMode::AttachOrAutoPromote
+        | LifecycleMode::AttachOrEphemeral
+        | LifecycleMode::AlwaysEphemeral => {
             let discovered = discover().await;
             if matches!(discovered.status, DaemonStatus::Running) {
-                if matches!(mode, LifecycleMode::AttachOrAutoPromote) {
-                    match crate::daemon::skew_restart::restart_skewed_daemon_if_idle(
-                        &discovered.paths,
-                    )
-                    .await
+                let attach_notice = matches!(mode, LifecycleMode::AlwaysEphemeral)
+                    .then(|| EPHEMERAL_ATTACH_NOTICE.to_string());
+                let attached = if matches!(
+                    mode,
+                    LifecycleMode::AttachOrAutoPromote | LifecycleMode::AlwaysEphemeral
+                ) {
+                    attach_running_with_skew_check(discovered.paths.clone(), attach_notice).await
+                } else {
+                    connect_shared_running(discovered.paths.clone(), None).await
+                };
+                match attached {
+                    Ok(connected) => return Ok(connected),
+                    Err(error)
+                        if matches!(
+                            mode,
+                            LifecycleMode::AlwaysEphemeral | LifecycleMode::AttachOrEphemeral
+                        ) =>
                     {
-                        Ok(crate::daemon::skew_restart::SkewRestartOutcome::Restarted {
-                            pid,
-                            reason,
-                        }) => {
-                            tracing::info!(pid, "daemon version skew auto-restart completed");
-                            let client = wait_for_daemon(&discovered.paths.socket).await?;
-                            return Ok(ConnectedDaemon {
-                                endpoint: local_daemon_endpoint(&discovered.paths.socket),
-                                client,
-                                owns_daemon: false,
-                                socket: discovered.paths.socket,
-                                startup_notice: Some(match reason {
-                                    Some(reason) => {
-                                        format!("daemon version skew resolved: {reason}")
-                                    }
-                                    None => "daemon version skew resolved by restarting the daemon"
-                                        .to_string(),
-                                }),
-                                owned_daemon_guard: None,
-                                owned_in_process_guard: None,
-                            });
-                        }
-                        Ok(crate::daemon::skew_restart::SkewRestartOutcome::Refused {
-                            reason,
-                            skew_reason,
-                        }) => {
-                            tracing::info!(
-                                reason = reason.as_deref().unwrap_or("unknown"),
-                                "daemon version skew auto-restart deferred"
-                            );
-                            let startup_notice = format_skew_restart_notice(
-                                skew_reason.as_deref(),
-                                reason.as_deref(),
-                            );
-                            let client = connect_local_daemon(&discovered.paths.socket).await?;
-                            return Ok(ConnectedDaemon {
-                                endpoint: local_daemon_endpoint(&discovered.paths.socket),
-                                client,
-                                owns_daemon: false,
-                                socket: discovered.paths.socket,
-                                startup_notice,
-                                owned_daemon_guard: None,
-                                owned_in_process_guard: None,
-                            });
-                        }
-                        Ok(crate::daemon::skew_restart::SkewRestartOutcome::NoticeOnly {
-                            reason,
-                        }) => {
-                            tracing::info!("daemon version skew surfaced without auto-restart");
-                            let client = connect_local_daemon(&discovered.paths.socket).await?;
-                            return Ok(ConnectedDaemon {
-                                endpoint: local_daemon_endpoint(&discovered.paths.socket),
-                                client,
-                                owns_daemon: false,
-                                socket: discovered.paths.socket,
-                                startup_notice: reason
-                                    .map(|reason| format!("daemon version skew: {reason}")),
-                                owned_daemon_guard: None,
-                                owned_in_process_guard: None,
-                            });
-                        }
-                        Ok(
-                            crate::daemon::skew_restart::SkewRestartOutcome::NoSkew
-                            | crate::daemon::skew_restart::SkewRestartOutcome::InProcess,
-                        ) => {}
-                        Err(error) => {
-                            tracing::debug!(error = %error, "daemon version skew auto-restart check failed");
-                        }
+                        tracing::debug!(
+                            error = %error,
+                            "shared daemon disappeared after discover; spawning a private daemon"
+                        );
                     }
+                    Err(error) => return Err(error),
                 }
-                let client = connect_local_daemon(&discovered.paths.socket).await?;
-                return Ok(ConnectedDaemon {
-                    endpoint: local_daemon_endpoint(&discovered.paths.socket),
-                    client,
-                    owns_daemon: false,
-                    socket: discovered.paths.socket,
-                    startup_notice: None,
-                    owned_daemon_guard: None,
-                    owned_in_process_guard: None,
-                });
             }
             if matches!(discovered.status, DaemonStatus::IncompatibleProtocol) {
                 if let Some(hello) = discovered.hello.as_ref() {
@@ -554,25 +496,51 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                     );
                 }
             }
-            if mode == LifecycleMode::AttachOrAutoPromote
-                && discovered.status == DaemonStatus::LivePidSocketUnreachable
+            if discovered.status == DaemonStatus::LivePidSocketUnreachable
                 && discovered.hello.is_none()
             {
-                // Persistent attach only. The daemon binds its socket after
-                // boot, so `daemon restart` leaves a verified live pid with
-                // no hello until the replacement is ready. Ephemeral modes
-                // must not wait on that canonical child — they spawn their
-                // own path instead of stalling `cockpit run --ephemeral`.
-                let client = wait_for_daemon(&discovered.paths.socket).await?;
-                return Ok(ConnectedDaemon {
-                    endpoint: local_daemon_endpoint(&discovered.paths.socket),
-                    client,
-                    owns_daemon: false,
-                    socket: discovered.paths.socket,
-                    startup_notice: None,
-                    owned_daemon_guard: None,
-                    owned_in_process_guard: None,
+                // Wait for a restarting canonical child, but re-probe pid
+                // liveness so a wedged or exited process does not consume
+                // the full spawn timeout and then abort `--ephemeral`.
+                let observed_pid =
+                    cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
+                let startup_notice = matches!(mode, LifecycleMode::AlwaysEphemeral).then(|| {
+                    "waiting for the already-running persistent daemon to finish restart"
+                        .to_string()
                 });
+                match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
+                    Ok(client) => {
+                        return Ok(ConnectedDaemon {
+                            endpoint: local_daemon_endpoint(&discovered.paths.socket),
+                            client,
+                            owns_daemon: false,
+                            socket: discovered.paths.socket,
+                            startup_notice,
+                            owned_daemon_guard: None,
+                            owned_in_process_guard: None,
+                        });
+                    }
+                    Err(SharedWaitError::Released) => {
+                        tracing::info!(
+                            "canonical daemon pid released before hello; spawning a replacement"
+                        );
+                    }
+                    Err(SharedWaitError::Wedged) => {
+                        if matches!(
+                            mode,
+                            LifecycleMode::AlwaysEphemeral | LifecycleMode::AttachOrEphemeral
+                        ) {
+                            tracing::warn!(
+                                "canonical daemon never bound a socket; spawning a private daemon"
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "shared daemon pid is live but socket never became ready: {}",
+                                discovered.paths.socket.display()
+                            );
+                        }
+                    }
+                }
             }
             if matches!(
                 discovered.status,
@@ -612,40 +580,6 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                 owned_daemon_guard: None,
                 owned_in_process_guard: guard,
             });
-        }
-        LifecycleMode::AlwaysEphemeral => {
-            // A persistent daemon holds the exclusive ledger boot lock.
-            // A second process cannot open that database, so "fresh
-            // ephemeral" cannot coexist with a live canonical owner.
-            // Attach to that owner instead of spawning a child that can
-            // never bind. When none is running, fall through to spawn.
-            let discovered = discover().await;
-            if matches!(discovered.status, DaemonStatus::Running) {
-                let client = connect_local_daemon(&discovered.paths.socket).await?;
-                return Ok(ConnectedDaemon {
-                    endpoint: local_daemon_endpoint(&discovered.paths.socket),
-                    client,
-                    owns_daemon: false,
-                    socket: discovered.paths.socket,
-                    startup_notice: None,
-                    owned_daemon_guard: None,
-                    owned_in_process_guard: None,
-                });
-            }
-            if discovered.status == DaemonStatus::LivePidSocketUnreachable
-                && discovered.hello.is_none()
-            {
-                let client = wait_for_daemon(&discovered.paths.socket).await?;
-                return Ok(ConnectedDaemon {
-                    endpoint: local_daemon_endpoint(&discovered.paths.socket),
-                    client,
-                    owns_daemon: false,
-                    socket: discovered.paths.socket,
-                    startup_notice: None,
-                    owned_daemon_guard: None,
-                    owned_in_process_guard: None,
-                });
-            }
         }
     }
 
@@ -738,6 +672,79 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
     })
 }
 
+const EPHEMERAL_ATTACH_NOTICE: &str =
+    "attaching to the already-running persistent daemon; this run will not stop it";
+
+async fn connect_shared_running(
+    paths: crate::daemon::DaemonPaths,
+    startup_notice: Option<String>,
+) -> Result<ConnectedDaemon> {
+    let client = connect_local_daemon(&paths.socket).await?;
+    Ok(ConnectedDaemon {
+        endpoint: local_daemon_endpoint(&paths.socket),
+        client,
+        owns_daemon: false,
+        socket: paths.socket,
+        startup_notice,
+        owned_daemon_guard: None,
+        owned_in_process_guard: None,
+    })
+}
+
+async fn attach_running_with_skew_check(
+    paths: crate::daemon::DaemonPaths,
+    fallback_notice: Option<String>,
+) -> Result<ConnectedDaemon> {
+    match crate::daemon::skew_restart::restart_skewed_daemon_if_idle(&paths).await {
+        Ok(crate::daemon::skew_restart::SkewRestartOutcome::Restarted { pid, reason }) => {
+            tracing::info!(pid, "daemon version skew auto-restart completed");
+            let client = wait_for_daemon(&paths.socket).await?;
+            return Ok(ConnectedDaemon {
+                endpoint: local_daemon_endpoint(&paths.socket),
+                client,
+                owns_daemon: false,
+                socket: paths.socket,
+                startup_notice: Some(match reason {
+                    Some(reason) => format!("daemon version skew resolved: {reason}"),
+                    None => "daemon version skew resolved by restarting the daemon".to_string(),
+                }),
+                owned_daemon_guard: None,
+                owned_in_process_guard: None,
+            });
+        }
+        Ok(crate::daemon::skew_restart::SkewRestartOutcome::Refused {
+            reason,
+            skew_reason,
+        }) => {
+            tracing::info!(
+                reason = reason.as_deref().unwrap_or("unknown"),
+                "daemon version skew auto-restart deferred"
+            );
+            return connect_shared_running(
+                paths,
+                format_skew_restart_notice(skew_reason.as_deref(), reason.as_deref()),
+            )
+            .await;
+        }
+        Ok(crate::daemon::skew_restart::SkewRestartOutcome::NoticeOnly { reason }) => {
+            tracing::info!("daemon version skew surfaced without auto-restart");
+            return connect_shared_running(
+                paths,
+                reason.map(|reason| format!("daemon version skew: {reason}")),
+            )
+            .await;
+        }
+        Ok(
+            crate::daemon::skew_restart::SkewRestartOutcome::NoSkew
+            | crate::daemon::skew_restart::SkewRestartOutcome::InProcess,
+        ) => {}
+        Err(error) => {
+            tracing::debug!(error = %error, "daemon version skew auto-restart check failed");
+        }
+    }
+    connect_shared_running(paths, fallback_notice).await
+}
+
 fn format_skew_restart_notice(
     skew_reason: Option<&str>,
     deferred_reason: Option<&str>,
@@ -797,9 +804,26 @@ fn local_daemon_endpoint(socket: &Path) -> cockpit_client::ClientEndpoint {
     }
 }
 
+enum SharedWaitError {
+    Released,
+    Wedged,
+}
+
 /// Poll for the daemon socket and an actual DaemonStatus response.
 /// 2ms initial backoff, doubling up to a 50ms ceiling; total cap 30s.
 async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
+    match wait_for_shared_daemon(socket, None).await {
+        Ok(client) => Ok(client),
+        Err(SharedWaitError::Released | SharedWaitError::Wedged) => {
+            anyhow::bail!("timed out waiting for daemon at {}", socket.display())
+        }
+    }
+}
+
+async fn wait_for_shared_daemon(
+    socket: &Path,
+    pid: Option<u32>,
+) -> std::result::Result<DaemonClient, SharedWaitError> {
     let mut timer = crate::startup::PhaseTimer::start("wait_for_daemon");
     let deadline = std::time::Instant::now() + SPAWN_DAEMON_TIMEOUT;
     // Tight initial backoff: a freshly-spawned daemon child binds and starts
@@ -822,8 +846,14 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
                 }
             }
         }
+        if pid.is_some_and(|pid| !cockpit_host::daemon_lifecycle::process_exists(pid)) {
+            return Err(SharedWaitError::Released);
+        }
         if std::time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for daemon at {}", socket.display());
+            if pid.is_some_and(|pid| !cockpit_host::daemon_lifecycle::process_exists(pid)) {
+                return Err(SharedWaitError::Released);
+            }
+            return Err(SharedWaitError::Wedged);
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_millis(50));
@@ -839,528 +869,6 @@ pub(super) fn temp_ephemeral_paths(root: &std::path::Path, stem: &str) -> super:
     }
 }
 
-#[cfg(test)]
-#[cfg(unix)]
-mod tests {
-    use super::*;
-    use crate::daemon::proto::Response;
-    use cockpit_client::is_protocol_version_mismatch;
-    use cockpit_proto::{Body, Envelope, ProtoStream};
-    use tokio::net::{UnixListener, UnixStream};
-    use uuid::Uuid;
-
-    #[tokio::test]
-    async fn dropping_owned_session_aborts_watcher_and_runs_guard_cleanup() {
-        use tokio::io::AsyncBufReadExt as _;
-
-        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
-        impl Drop for NotifyDrop {
-            fn drop(&mut self) {
-                if let Some(notify) = self.0.take() {
-                    let _ = notify.send(());
-                }
-            }
-        }
-
-        let root = tempfile::tempdir().unwrap();
-        let socket = root.path().join("owned-session.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let stop = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = tokio::io::BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
-            line
-        });
-        let (requests, _request_rx) = tokio::sync::mpsc::channel(1);
-        let (_events, event_rx) = tokio::sync::mpsc::channel(1);
-        let client = DaemonClient::from_in_process(cockpit_client::InProcessConnection {
-            requests,
-            events: event_rx,
-        });
-        let (watcher_dropped, watcher_drop) = tokio::sync::oneshot::channel();
-        let signal_task = tokio::spawn(async move {
-            let _notify = NotifyDrop(Some(watcher_dropped));
-            std::future::pending::<()>().await;
-        });
-        let session = OwnedDaemonSession {
-            client,
-            guard: Some(
-                crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new_for_socket(socket),
-            ),
-            signal_task: Some(signal_task),
-        };
-
-        tokio::task::spawn_blocking(move || drop(session))
-            .await
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), watcher_drop)
-            .await
-            .expect("signal watcher was detached")
-            .unwrap();
-        let line = tokio::time::timeout(Duration::from_secs(2), stop)
-            .await
-            .expect("guard cleanup did not contact daemon")
-            .unwrap();
-        assert!(line.contains("stop_daemon"));
-    }
-
-    #[test]
-    fn ephemeral_spawn_arms_raii_before_the_first_wait() {
-        let source = include_str!("client.rs");
-        let spawn = source
-            .find("let child = spawn_detached_ephemeral(&paths)?;")
-            .expect("ephemeral spawn funnel");
-        let arm = source[spawn..]
-            .find("EphemeralDaemonGuard::new")
-            .map(|offset| spawn + offset)
-            .expect("provisional owner armed after spawn");
-        let wait = source[spawn..]
-            .find("wait_for_daemon(&paths.socket).await")
-            .map(|offset| spawn + offset)
-            .expect("daemon readiness wait");
-        assert!(
-            spawn < arm && arm < wait,
-            "no cancellation window before RAII"
-        );
-    }
-
-    fn daemon_status_response_with(
-        daemon_version: impl Into<String>,
-        protocol_version: u32,
-    ) -> Response {
-        Response::DaemonStatus {
-            pid: 1,
-            uptime_secs: 2,
-            active_sessions: 0,
-            socket_path: "/tmp/cockpit.sock".to_string(),
-            daemon_version: daemon_version.into(),
-            protocol_version,
-            paused_sessions: 0,
-            database_path: ":memory:".to_string(),
-            schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
-        }
-    }
-
-    fn attach_request_with_client_protocol_version(
-        session_id: Option<Uuid>,
-        client_protocol_version: u32,
-    ) -> Request {
-        Request::Attach {
-            session_id,
-            since_seq: None,
-            project_root: Some("/tmp".into()),
-            initial_model: None,
-            no_sandbox: false,
-            interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
-            model_override: None,
-            client_protocol_version,
-            env_snapshot: None,
-            env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
-        }
-    }
-
-    fn attached_response(session_id: Uuid) -> Response {
-        Response::Attached {
-            session_id,
-            session_entry_mode: proto::SessionEntryMode::Code,
-            short_id: "abc123".to_string(),
-            project_root: "/tmp".to_string(),
-            project_id: "project".to_string(),
-            active_agent: "Build".to_string(),
-            active_agent_path: Vec::new(),
-            foreground_target: None,
-            active_subagent: None,
-            active_model_state: None,
-            history: Vec::new(),
-            paused_work: Vec::new(),
-            repair_required: None,
-            daemon_version: proto::DAEMON_VERSION.to_string(),
-            compatible: true,
-            env_baseline: None,
-            env_session: None,
-            env_drift: None,
-            env_policy_applied: crate::env_snapshot::EnvDriftPolicy::Daemon,
-            btw_fork: None,
-        }
-    }
-
-    fn bind_test_socket() -> (tempfile::TempDir, PathBuf, UnixListener) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket).expect("bind daemon socket");
-        (dir, socket, listener)
-    }
-
-    async fn send_daemon_hello(
-        daemon: &mut ProtoStream<UnixStream>,
-        daemon_version: impl Into<String>,
-        protocol_version: u32,
-    ) {
-        daemon
-            .send(&Envelope::response(
-                Uuid::nil(),
-                daemon_status_response_with(daemon_version, protocol_version),
-            ))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn negotiation_parses_daemon_hello_on_connect() {
-        let (_dir, socket, listener) = bind_test_socket();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
-        });
-
-        let client = DaemonClient::connect(&socket).await.unwrap();
-
-        assert_eq!(client.negotiated().daemon_version, "0.1.handshake");
-        assert_eq!(
-            client.negotiated().daemon_protocol_version,
-            proto::PROTOCOL_VERSION
-        );
-        assert_eq!(client.negotiated().version, proto::PROTOCOL_VERSION);
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn negotiation_preserves_typed_protocol_version_mismatch() {
-        let (_dir, socket, listener) = bind_test_socket();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(&mut daemon, "0.1.incompatible", proto::PROTOCOL_VERSION + 1).await;
-        });
-
-        let error = match DaemonClient::connect(&socket).await {
-            Ok(_) => panic!("an incompatible daemon hello must reject the connection"),
-            Err(error) => error,
-        };
-
-        assert!(is_protocol_version_mismatch(&error));
-        let payload = error
-            .downcast_ref::<proto::ErrorPayload>()
-            .expect("the typed protocol error must survive the anyhow boundary");
-        assert_eq!(payload.code, proto::ErrorCode::ProtocolVersion);
-        assert!(!is_protocol_version_mismatch(&anyhow!(
-            "wire protocol version mismatch in unrelated transport text"
-        )));
-        server.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn negotiation_rejects_a_daemon_that_does_not_send_a_hello() {
-        let (_dir, socket, listener) = bind_test_socket();
-        let server = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        });
-        let connect = tokio::spawn({
-            let socket = socket.clone();
-            async move { DaemonClient::connect(&socket).await }
-        });
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(500)).await;
-        let error = match connect.await.unwrap() {
-            Ok(_) => panic!("missing hello must fail closed"),
-            Err(error) => error,
-        };
-        assert!(is_protocol_version_mismatch(&error));
-        let payload = error
-            .downcast_ref::<proto::ErrorPayload>()
-            .expect("missing hello must preserve a typed protocol error");
-        assert_eq!(payload.code, proto::ErrorCode::ProtocolVersion);
-        assert!(payload.message.contains("hello timed out"));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
-        let (_dir, socket, listener) = bind_test_socket();
-        let session_id = Uuid::new_v4();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(
-                &mut daemon,
-                "0.1.handshake",
-                proto::MIN_SUPPORTED_PROTOCOL_VERSION,
-            )
-            .await;
-            daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
-            let request_id = match daemon.recv().await.unwrap().unwrap() {
-                proto::RecvFrame::Envelope(env) => match env.body {
-                    Body::Request { id, request, .. } => {
-                        match request {
-                            Request::Attach {
-                                client_protocol_version,
-                                ..
-                            } => assert_eq!(
-                                client_protocol_version,
-                                proto::MIN_SUPPORTED_PROTOCOL_VERSION
-                            ),
-                            other => panic!("expected attach request, got {other:?}"),
-                        }
-                        id
-                    }
-                    other => panic!("expected request body, got {other:?}"),
-                },
-                other => panic!("expected request envelope, got {other:?}"),
-            };
-            daemon
-                .send(&Envelope::response(
-                    request_id,
-                    attached_response(session_id),
-                ))
-                .await
-                .unwrap();
-        });
-
-        let client = DaemonClient::connect(&socket).await.unwrap();
-        client
-            .request(attach_request_with_client_protocol_version(
-                Some(session_id),
-                client.negotiated().version,
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-
-        server.await.unwrap();
-    }
-
-    /// Daemonless = own ephemeral daemon (`daemonless-tui-ephemeral-lifecycle.md`
-    /// §1). `LifecycleMode::AttachOwnEphemeral` attaches to this process's
-    /// cached ephemeral daemon when it's already up and reports
-    /// `owns_daemon = true` at that exact socket — i.e. a re-attach in the
-    /// same daemonless TUI (`/compact`, `/sessions` resume, `/new`)
-    /// reconnects to the owned daemon instead of spawning a second one. The
-    /// daemon is run in-process at the cached path with isolated XDG dirs, so
-    /// the spawn branch (which would launch a child) is never taken.
-    #[tokio::test]
-    async fn connect_uses_registered_in_process_context_without_socket() {
-        let _guard = crate::test_env::lock_async().await;
-        reset_own_ephemeral_paths_for_test();
-        let root = tempfile::tempdir().expect("daemon path tempdir");
-
-        let paths = temp_ephemeral_paths(root.path(), "cockpit-in-process-test");
-        assert!(
-            !paths.socket.exists(),
-            "in-process transport must not require a socket file"
-        );
-        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
-        let ctx = crate::daemon::boot_in_process_with_db(paths.clone(), db)
-            .await
-            .expect("boot local daemon context");
-        let client = connect_local_daemon(&paths.socket)
-            .await
-            .expect("connect by local socket key");
-        let response = client
-            .request_ok(Request::DaemonStatus)
-            .await
-            .expect("local daemon status");
-        match response {
-            Response::DaemonStatus { socket_path, .. } => {
-                assert_eq!(socket_path, paths.socket.display().to_string());
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
-        assert!(
-            !paths.socket.exists(),
-            "in-process transport must not create a socket file"
-        );
-        drop(client);
-        drop(ctx);
-        reset_own_ephemeral_paths_for_test();
-    }
-
-    #[tokio::test]
-    async fn attach_own_ephemeral_uses_in_process_context() {
-        let _guard = crate::test_env::lock_async().await;
-        reset_own_ephemeral_paths_for_test();
-        let root = tempfile::tempdir().expect("daemon path tempdir");
-
-        let own = temp_ephemeral_paths(root.path(), "cockpit-eph-test-owned");
-        set_own_ephemeral_paths_for_test(own.clone());
-        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
-        let _ctx = crate::daemon::boot_in_process_with_db(own.clone(), db)
-            .await
-            .expect("boot local daemon context");
-
-        let connected = probe_or_spawn(LifecycleMode::AttachOwnEphemeral)
-            .await
-            .expect("attach to own in-process daemon");
-        assert!(
-            !connected.owns_daemon,
-            "in-process daemonless mode needs no child-process guard"
-        );
-        assert_eq!(
-            connected.socket, own.socket,
-            "must reuse the process-local owned path as the local transport key"
-        );
-        assert!(
-            !connected.socket.exists(),
-            "in-process daemonless mode must not bind a Unix socket"
-        );
-        connected
-            .client
-            .request_ok(Request::DaemonStatus)
-            .await
-            .expect("owned in-process daemon answers");
-
-        reset_own_ephemeral_paths_for_test();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn in_process_auto_promote_hellos_without_os_socket() {
-        let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
-        let runtime = env.path().expect("isolated runtime root").join("runtime");
-        env.set_var("XDG_RUNTIME_DIR", &runtime);
-        let _promote = crate::daemon::enable_in_process_auto_promote();
-
-        let session = super::ensure_persistent_daemon()
-            .await
-            .expect("in-process auto-promote must hello");
-        let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
-        assert!(
-            !paths.socket.exists(),
-            "in-process auto-promote must not bind {}",
-            paths.socket.display()
-        );
-        session
-            .client
-            .request_ok(Request::DaemonStatus)
-            .await
-            .expect("promoted owner answers DaemonStatus");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn boot_test_persistent_daemon_hellos_without_os_socket() {
-        let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
-        let runtime = env.path().expect("isolated runtime root").join("runtime");
-        env.set_var("XDG_RUNTIME_DIR", &runtime);
-        let _daemon = crate::daemon::boot_test_persistent_daemon()
-            .await
-            .expect("boot isolated test daemon");
-
-        let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
-        let client = connect_local_daemon(&paths.socket)
-            .await
-            .expect("registered owner must hello");
-        assert!(
-            !paths.socket.exists(),
-            "test persistent daemon must not bind {}",
-            paths.socket.display()
-        );
-        client
-            .request_ok(Request::DaemonStatus)
-            .await
-            .expect("booted owner answers DaemonStatus");
-    }
-
-    #[test]
-    fn attach_own_ephemeral_reuses_cached_path() {
-        let _guard = crate::test_env::lock();
-        let root = tempfile::tempdir().expect("daemon path tempdir");
-        let own = temp_ephemeral_paths(root.path(), "cockpit-eph-test-cache");
-        reset_own_ephemeral_paths_for_test();
-        set_own_ephemeral_paths_for_test(own.clone());
-
-        let first = own_ephemeral_paths().expect("first owned path");
-        let second = own_ephemeral_paths().expect("second owned path");
-
-        assert_eq!(first.socket, own.socket);
-        assert_eq!(first.socket, second.socket);
-        assert_eq!(first.pid_file, own.pid_file);
-        assert_eq!(first.pid_file, second.pid_file);
-        reset_own_ephemeral_paths_for_test();
-    }
-
-    #[test]
-    fn always_ephemeral_allocates_fresh_paths() {
-        let root = tempfile::tempdir().expect("daemon path tempdir");
-        let first = temp_ephemeral_paths(root.path(), "cockpit-eph-test-always-one");
-        let second = temp_ephemeral_paths(root.path(), "cockpit-eph-test-always-two");
-
-        assert_ne!(first.socket, second.socket);
-        assert_ne!(first.pid_file, second.pid_file);
-    }
-
-    #[tokio::test]
-    async fn lifecycle_guard_is_retained_only_after_endpoint_acceptance() {
-        struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-        impl Drop for DropSpy {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-
-        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut retained = Vec::new();
-        let (accepted, acceptance) = tokio::sync::oneshot::channel();
-        accepted.send(()).unwrap();
-        retain_guard_after_acceptance(
-            Some(DropSpy(std::sync::Arc::clone(&drops))),
-            acceptance,
-            &mut retained,
-        )
-        .await;
-        assert_eq!(retained.len(), 1);
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
-        drop(retained);
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn cancelled_lifecycle_acceptance_reaps_unclaimed_guard() {
-        struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-        impl Drop for DropSpy {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-
-        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut retained = Vec::new();
-        let (accepted, acceptance) = tokio::sync::oneshot::channel::<()>();
-        drop(accepted);
-        retain_guard_after_acceptance(
-            Some(DropSpy(std::sync::Arc::clone(&drops))),
-            acceptance,
-            &mut retained,
-        )
-        .await;
-        assert!(retained.is_empty());
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
-        assert_eq!(
-            mode_for_intent(cockpit_client::LifecycleIntent::AttachOrAutoPromote),
-            LifecycleMode::AttachOrAutoPromote
-        );
-        assert_eq!(
-            mode_for_intent(cockpit_client::LifecycleIntent::EnsurePersistent),
-            LifecycleMode::AttachOrAutoPromote
-        );
-        assert_eq!(
-            mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
-            LifecycleMode::AttachOrEphemeral
-        );
-        assert_eq!(
-            mode_for_intent(cockpit_client::LifecycleIntent::AlwaysEphemeral),
-            LifecycleMode::AlwaysEphemeral
-        );
-        assert_eq!(
-            mode_for_intent(cockpit_client::LifecycleIntent::AttachOwnEphemeral),
-            LifecycleMode::AttachOwnEphemeral
-        );
-    }
-}
+#[cfg(all(test, unix))]
+#[path = "client_tests.rs"]
+mod tests;

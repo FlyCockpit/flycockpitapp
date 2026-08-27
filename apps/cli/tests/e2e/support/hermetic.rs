@@ -882,6 +882,32 @@ impl HermeticCockpit {
         );
     }
 
+    /// Attach and policy broadcasts can still land after the ready composer
+    /// or settings chrome first appear. No-op input comparisons need the
+    /// visible grid to stay unchanged across redraws for a quiet interval,
+    /// not merely two adjacent frames.
+    pub fn settle_visible_state(&mut self, timeout: Duration) {
+        const QUIET: Duration = Duration::from_millis(400);
+        let deadline = Instant::now() + timeout;
+        let mut prev = self.snapshot().visible_state();
+        let mut stable_since = Instant::now();
+        loop {
+            self.checkpoint_input_with_redraw();
+            let now = self.snapshot().visible_state();
+            if now == prev {
+                if Instant::now().saturating_duration_since(stable_since) >= QUIET {
+                    return;
+                }
+            } else {
+                prev = now;
+                stable_since = Instant::now();
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for visible state to settle");
+            }
+        }
+    }
+
     pub fn pty_size(&self) -> Option<(u16, u16)> {
         self.pty.as_ref().map(|pty| (pty.cols, pty.rows))
     }

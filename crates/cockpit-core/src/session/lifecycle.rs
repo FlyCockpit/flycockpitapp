@@ -320,7 +320,14 @@ impl Session {
         match self.db.blocking_write_for_sync_maintenance(move |conn| {
             crate::db::Db::insert_session_row_conn(conn, &row_for_db)
         }) {
-            Ok(_) => {}
+            Ok(persisted) => {
+                if let Some(short_id) = persisted.short_id {
+                    *self
+                        .short_id
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = short_id;
+                }
+            }
             Err(e) => {
                 // Restore the pending row so a transient failure can retry on
                 // the next user message rather than silently losing the session.
@@ -490,7 +497,7 @@ impl Session {
             redaction_key_resolver: resolver,
             allow_unjournaled_inference: std::sync::atomic::AtomicBool::new(false),
             unjournaled_inference_reason: Mutex::new(None),
-            short_id,
+            short_id: Mutex::new(short_id),
             parent_session_id: row.parent_session_id,
             fork_point_turn_id: row.fork_point_turn_id,
             btw_parent_session_id: row.btw_parent_session_id,

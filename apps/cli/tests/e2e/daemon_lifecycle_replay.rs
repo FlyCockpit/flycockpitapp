@@ -968,16 +968,18 @@ fn lifecycle_attach_replay_across_restart_delivers_persisted_events_once_in_orde
         })
         .await;
 
-        let expected_rows = session_event_rows(&daemon.db_path(), attached.session_id);
         assert!(
-            expected_rows.iter().any(|(_, kind)| kind == "tool_call"),
+            session_event_rows(&daemon.db_path(), attached.session_id)
+                .iter()
+                .any(|(_, kind)| kind == "tool_call"),
             "replay fixture must include at least one persisted tool call"
         );
-        let expected_seqs: Vec<_> = expected_rows.iter().map(|(seq, _)| *seq).collect();
-        let expected_max = *expected_seqs.last().expect("persisted session events");
 
         daemon.sigkill().await;
         daemon.restart_same_home().await;
+        let expected_rows = session_event_rows(&daemon.db_path(), attached.session_id);
+        let expected_seqs: Vec<_> = expected_rows.iter().map(|(seq, _)| *seq).collect();
+        let expected_max = *expected_seqs.last().expect("persisted session events");
         let replay_client = daemon.client().await;
         let reattached = replay_client
             .attach(
@@ -993,9 +995,9 @@ fn lifecycle_attach_replay_across_restart_delivers_persisted_events_once_in_orde
         let replay_seqs: Vec<_> = replay_entries.iter().map(|(seq, _)| *seq).collect();
 
         assert_eq!(replay_seqs, expected_seqs);
-        assert!(
-            max_seq >= expected_max,
-            "replay high-water {max_seq} dropped below persisted history {expected_max}; replay_entries={replay_entries:?}"
+        assert_eq!(
+            max_seq, expected_max,
+            "replay high-water {max_seq} must equal persisted history {expected_max}; replay_entries={replay_entries:?}"
         );
         let mut unique = replay_seqs.clone();
         unique.sort_unstable();

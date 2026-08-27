@@ -993,7 +993,23 @@ fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> 
     let process_released = expected_pid.is_none_or(|pid| {
         #[cfg(unix)]
         {
-            !cockpit_host::daemon_lifecycle::process_exists(pid)
+            if !cockpit_host::daemon_lifecycle::process_exists(pid) {
+                return true;
+            }
+            match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
+                Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt))
+                    if receipt.pid == pid =>
+                {
+                    matches!(
+                        cockpit_host::daemon_lifecycle::verify_cockpit_daemon_receipt_identity(
+                            &receipt
+                        ),
+                        cockpit_host::daemon_lifecycle::PidIdentity::Missing
+                            | cockpit_host::daemon_lifecycle::PidIdentity::NotDaemon
+                    )
+                }
+                _ => false,
+            }
         }
         #[cfg(not(unix))]
         {

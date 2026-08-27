@@ -42,37 +42,39 @@ fn passive_same_generation_terminal_result_corrects_default_and_divergence() {
     assert!(app.launch.active_model_diverged);
     assert!(app.config_drift.is_some());
 
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id: uuid::Uuid::new_v4(),
-        provider: active.provider.clone(),
-        model: active.model.clone(),
-        reasoning_effort: active
-            .reasoning_effort
-            .as_ref()
-            .map(|effort| effort.value.clone()),
-        thinking_mode: active.thinking_mode,
-        prompt_cache_retention: active.prompt_cache_retention,
-        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
-                selection: active.clone(),
-                default_selection: Some(active.clone()),
-                diverged: false,
-                generation: 4,
-            }),
-            default_update: cockpit_proto::DefaultModelUpdateOutcome::Verified {
-                selection: cockpit_config::providers::ActiveModelRef {
-                    provider: "provider-b".into(),
-                    model: "model-b".into(),
-                    reasoning_effort: None,
-                    thinking_mode: None,
-                    prompt_cache_retention: None,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: active.provider.clone(),
+            model: active.model.clone(),
+            reasoning_effort: active
+                .reasoning_effort
+                .as_ref()
+                .map(|effort| effort.value.clone()),
+            thinking_mode: active.thinking_mode,
+            prompt_cache_retention: active.prompt_cache_retention,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: active.clone(),
+                    default_selection: Some(active.clone()),
+                    diverged: false,
+                    generation: 4,
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::Verified {
+                    selection: cockpit_config::providers::ActiveModelRef {
+                        provider: "provider-b".into(),
+                        model: "model-b".into(),
+                        reasoning_effort: None,
+                        thinking_mode: None,
+                        prompt_cache_retention: None,
+                    },
+                    generation: 1,
+                    scope_label: "user".into(),
+                    unchanged: false,
                 },
-                generation: 1,
-                scope_label: "user".into(),
-                unchanged: false,
             },
         },
-    });
+    );
 
     assert_eq!(app.active_model_selection, Some(active.clone()));
     assert_eq!(
@@ -86,23 +88,25 @@ fn passive_same_generation_terminal_result_corrects_default_and_divergence() {
     assert!(app.pending_model_selection.is_none());
 
     let older = selection("p", "older-event");
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id: uuid::Uuid::new_v4(),
-        provider: older.provider.clone(),
-        model: older.model.clone(),
-        reasoning_effort: None,
-        thinking_mode: None,
-        prompt_cache_retention: None,
-        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
-                selection: older.clone(),
-                default_selection: Some(older),
-                diverged: false,
-                generation: 3,
-            }),
-            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: older.provider.clone(),
+            model: older.model.clone(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: older.clone(),
+                    default_selection: Some(older),
+                    diverged: false,
+                    generation: 3,
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+            },
         },
-    });
+    );
     assert_eq!(app.active_model_selection, Some(active));
     assert_eq!(app.active_model_state_generation, 4);
 }
@@ -417,33 +421,35 @@ fn picker_make_default_sends_correlated_request_without_local_write() {
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id,
-        provider: "p".into(),
-        model: "a".into(),
-        reasoning_effort: None,
-        thinking_mode: None,
-        prompt_cache_retention: None,
-        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
-                selection: verified.clone(),
-                default_selection: Some(verified.clone()),
-                diverged: false,
-                generation: app
-                    .pending_model_selection
-                    .as_ref()
-                    .map(|p| p.minimum_generation)
-                    .unwrap_or(1)
-                    .max(1),
-            }),
-            default_update: cockpit_proto::DefaultModelUpdateOutcome::Verified {
-                selection: verified,
-                generation: 1,
-                scope_label: "user".into(),
-                unchanged: false,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider: "p".into(),
+            model: "a".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: verified.clone(),
+                    default_selection: Some(verified.clone()),
+                    diverged: false,
+                    generation: app
+                        .pending_model_selection
+                        .as_ref()
+                        .map(|p| p.minimum_generation)
+                        .unwrap_or(1)
+                        .max(1),
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::Verified {
+                    selection: verified,
+                    generation: 1,
+                    scope_label: "user".into(),
+                    unchanged: false,
+                },
             },
         },
-    });
+    );
     assert!(
         matches!(
             app.history.iter().rev().find_map(|entry| match entry {
@@ -540,18 +546,20 @@ fn chrome_active_model_unchanged_on_rejected_switch() {
         .as_mut()
         .unwrap()
         .queued_submission = Some(queued);
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id,
-        provider: "p".to_string(),
-        model: "a".to_string(),
-        reasoning_effort: Some("high".to_string()),
-        thinking_mode: Some(cockpit_config::providers::ThinkingMode::High),
-        prompt_cache_retention: Some(cockpit_config::providers::PromptCacheRetention::Extended),
-        outcome: cockpit_proto::ModelSelectionOutcome::Rejected {
-            user_message: "provider rejected the selection".to_string(),
-            diagnostic_code: "model_switch_rejected".to_string(),
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider: "p".to_string(),
+            model: "a".to_string(),
+            reasoning_effort: Some("high".to_string()),
+            thinking_mode: Some(cockpit_config::providers::ThinkingMode::High),
+            prompt_cache_retention: Some(cockpit_config::providers::PromptCacheRetention::Extended),
+            outcome: cockpit_proto::ModelSelectionOutcome::Rejected {
+                user_message: "provider rejected the selection".to_string(),
+                diagnostic_code: "model_switch_rejected".to_string(),
+            },
         },
-    });
+    );
     assert!(matches!(&app.overlay, Overlay::ModelPicker(picker)
             if picker.error_text() == Some("provider rejected the selection")
                 && picker.draft_active_model() == Some(&requested)));
@@ -660,9 +668,11 @@ fn terminal_daemon_link_preserves_full_pending_selection_and_exact_submission() 
             ))
     );
 
-    app.apply_event(cockpit_client::presentation::TurnEvent::DaemonLinkTerminal {
-        error: "protocol link ended".to_string(),
-    });
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::DaemonLinkTerminal {
+            error: "protocol link ended".to_string(),
+        },
+    );
 
     assert!(app.pending_model_selection.is_none());
     assert!(
@@ -986,23 +996,25 @@ fn quick_model_change_waits_for_terminal_confirmation() {
     );
 
     let confirmed = selection("p", "a");
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id,
-        provider: confirmed.provider.clone(),
-        model: confirmed.model.clone(),
-        reasoning_effort: None,
-        thinking_mode: None,
-        prompt_cache_retention: None,
-        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
-                selection: confirmed,
-                default_selection: None,
-                diverged: true,
-                generation: 1,
-            }),
-            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider: confirmed.provider.clone(),
+            model: confirmed.model.clone(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: confirmed,
+                    default_selection: None,
+                    diverged: true,
+                    generation: 1,
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+            },
         },
-    });
+    );
 
     assert!(app.pending_model_selection.is_none());
     assert!(
@@ -1276,23 +1288,25 @@ fn first_send_waits_for_confirmed_model_then_releases_exact_draft() {
     );
 
     let confirmed = selection("p", "a");
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id,
-        provider: confirmed.provider.clone(),
-        model: confirmed.model.clone(),
-        reasoning_effort: None,
-        thinking_mode: None,
-        prompt_cache_retention: None,
-        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
-                selection: confirmed,
-                default_selection: None,
-                diverged: true,
-                generation: 1,
-            }),
-            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider: confirmed.provider.clone(),
+            model: confirmed.model.clone(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: confirmed,
+                    default_selection: None,
+                    diverged: true,
+                    generation: 1,
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+            },
         },
-    });
+    );
 
     let submission = input_rx
         .try_recv()
@@ -1339,26 +1353,28 @@ fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
         queued,
     );
 
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id,
-        provider: requested.provider.clone(),
-        model: requested.model.clone(),
-        reasoning_effort: requested
-            .reasoning_effort
-            .as_ref()
-            .map(|effort| effort.value.clone()),
-        thinking_mode: requested.thinking_mode,
-        prompt_cache_retention: requested.prompt_cache_retention,
-        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
-                selection: requested.clone(),
-                default_selection: Some(requested),
-                diverged: false,
-                generation: 1,
-            }),
-            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider: requested.provider.clone(),
+            model: requested.model.clone(),
+            reasoning_effort: requested
+                .reasoning_effort
+                .as_ref()
+                .map(|effort| effort.value.clone()),
+            thinking_mode: requested.thinking_mode,
+            prompt_cache_retention: requested.prompt_cache_retention,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: requested.clone(),
+                    default_selection: Some(requested),
+                    diverged: false,
+                    generation: 1,
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+            },
         },
-    });
+    );
 
     assert!(app.pending_model_selection.is_none());
     assert!(app.composer.is_empty());
@@ -1705,14 +1721,18 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
             app.adopt_runner(Ok(attached_runner.take().unwrap()));
         }
         ModelEpochPath::SameRunnerReconnect => {
-            app.apply_event(cockpit_client::presentation::TurnEvent::DaemonLinkReconnected {
-                active_model_state: Some(attached_state.clone()),
-            });
+            app.apply_event(
+                cockpit_client::presentation::TurnEvent::DaemonLinkReconnected {
+                    active_model_state: Some(attached_state.clone()),
+                },
+            );
         }
         ModelEpochPath::EventStreamLagResync => {
-            app.apply_event(cockpit_client::presentation::TurnEvent::DaemonLinkResynced {
-                active_model_state: Some(attached_state.clone()),
-            });
+            app.apply_event(
+                cockpit_client::presentation::TurnEvent::DaemonLinkResynced {
+                    active_model_state: Some(attached_state.clone()),
+                },
+            );
         }
         ModelEpochPath::SessionSwitch => {
             // The production session-switch response is authoritative before
@@ -1850,26 +1870,28 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
     );
     control_rx.try_recv().expect("follow-up control delivered");
 
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id,
-        provider: requested.provider.clone(),
-        model: requested.model.clone(),
-        reasoning_effort: requested
-            .reasoning_effort
-            .as_ref()
-            .map(|effort| effort.value.clone()),
-        thinking_mode: requested.thinking_mode,
-        prompt_cache_retention: requested.prompt_cache_retention,
-        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
-                selection: requested.clone(),
-                default_selection: Some(requested),
-                diverged: false,
-                generation: 1,
-            }),
-            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider: requested.provider.clone(),
+            model: requested.model.clone(),
+            reasoning_effort: requested
+                .reasoning_effort
+                .as_ref()
+                .map(|effort| effort.value.clone()),
+            thinking_mode: requested.thinking_mode,
+            prompt_cache_retention: requested.prompt_cache_retention,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: requested.clone(),
+                    default_selection: Some(requested),
+                    diverged: false,
+                    generation: 1,
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+            },
         },
-    });
+    );
 
     let delivered = input_rx
         .try_recv()
@@ -2033,26 +2055,28 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         .try_recv()
         .expect("generation-one selection request delivered");
     let selection_id = app.pending_model_selection.as_ref().unwrap().selection_id;
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id,
-        provider: requested.provider.clone(),
-        model: requested.model.clone(),
-        reasoning_effort: requested
-            .reasoning_effort
-            .as_ref()
-            .map(|effort| effort.value.clone()),
-        thinking_mode: requested.thinking_mode,
-        prompt_cache_retention: requested.prompt_cache_retention,
-        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
-                selection: requested.clone(),
-                default_selection: Some(requested),
-                diverged: false,
-                generation: 1,
-            }),
-            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider: requested.provider.clone(),
+            model: requested.model.clone(),
+            reasoning_effort: requested
+                .reasoning_effort
+                .as_ref()
+                .map(|effort| effort.value.clone()),
+            thinking_mode: requested.thinking_mode,
+            prompt_cache_retention: requested.prompt_cache_retention,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: requested.clone(),
+                    default_selection: Some(requested),
+                    diverged: false,
+                    generation: 1,
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+            },
         },
-    });
+    );
     assert!(
         input_rx.try_recv().is_err(),
         "the replacement session must not receive the old exact payload"
@@ -2117,28 +2141,30 @@ fn picker_unchanged_verified_default_reports_already_set_without_claiming_a_writ
         .map(|pending| pending.minimum_generation)
         .unwrap_or(1)
         .max(1);
-    app.apply_event(cockpit_client::presentation::TurnEvent::ModelSelectionResult {
-        selection_id,
-        provider: "p".into(),
-        model: "a".into(),
-        reasoning_effort: None,
-        thinking_mode: None,
-        prompt_cache_retention: None,
-        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
-                selection: verified.clone(),
-                default_selection: Some(verified.clone()),
-                diverged: false,
-                generation: minimum_generation,
-            }),
-            default_update: cockpit_proto::DefaultModelUpdateOutcome::Verified {
-                selection: verified,
-                generation: 1,
-                scope_label: "user".into(),
-                unchanged: true,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider: "p".into(),
+            model: "a".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: verified.clone(),
+                    default_selection: Some(verified.clone()),
+                    diverged: false,
+                    generation: minimum_generation,
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::Verified {
+                    selection: verified,
+                    generation: 1,
+                    scope_label: "user".into(),
+                    unchanged: true,
+                },
             },
         },
-    });
+    );
 
     assert!(
         app.history.iter().any(|entry| matches!(
@@ -2210,18 +2236,19 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
     app.pending_default_model_update_id = Some(mine);
 
     // A late result for a different operation is ignored entirely.
-    app.apply_event(cockpit_client::presentation::TurnEvent::DefaultModelUpdateResult {
-        default_update_id: uuid::Uuid::new_v4(),
-        outcome: cockpit_proto::DefaultModelStandaloneOutcome::Applied {
-            selection: Some(selection("other", "model")),
-            generation: 1,
-            authority_revision:
-                "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
-                    .into(),
-            scope_label: "user".into(),
-            unchanged: false,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::DefaultModelUpdateResult {
+            default_update_id: uuid::Uuid::new_v4(),
+            outcome: cockpit_proto::DefaultModelStandaloneOutcome::Applied {
+                selection: Some(selection("other", "model")),
+                generation: 1,
+                authority_revision:
+                    "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c".into(),
+                scope_label: "user".into(),
+                unchanged: false,
+            },
         },
-    });
+    );
     assert_eq!(app.pending_default_model_update_id, Some(mine));
     assert!(
         !app.history.iter().any(|entry| matches!(
@@ -2232,18 +2259,19 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
     );
     assert!(app.pending_model_selection.is_none());
 
-    app.apply_event(cockpit_client::presentation::TurnEvent::DefaultModelUpdateResult {
-        default_update_id: mine,
-        outcome: cockpit_proto::DefaultModelStandaloneOutcome::Applied {
-            selection: Some(selection("p", "a")),
-            generation: 2,
-            authority_revision:
-                "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
-                    .into(),
-            scope_label: "project".into(),
-            unchanged: false,
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::DefaultModelUpdateResult {
+            default_update_id: mine,
+            outcome: cockpit_proto::DefaultModelStandaloneOutcome::Applied {
+                selection: Some(selection("p", "a")),
+                generation: 2,
+                authority_revision:
+                    "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c".into(),
+                scope_label: "project".into(),
+                unchanged: false,
+            },
         },
-    });
+    );
     assert_eq!(app.pending_default_model_update_id, None);
     assert!(
         app.history.iter().any(|entry| matches!(
@@ -2263,13 +2291,16 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
     // A rejection claims no change and names only a scope.
     let second = uuid::Uuid::new_v4();
     app.pending_default_model_update_id = Some(second);
-    app.apply_event(cockpit_client::presentation::TurnEvent::DefaultModelUpdateResult {
-        default_update_id: second,
-        outcome: cockpit_proto::DefaultModelStandaloneOutcome::Rejected {
-            user_message: "the highest-precedence config layer (project) is not writable".into(),
-            diagnostic_code: "effective_default_target_unwritable".into(),
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::DefaultModelUpdateResult {
+            default_update_id: second,
+            outcome: cockpit_proto::DefaultModelStandaloneOutcome::Rejected {
+                user_message: "the highest-precedence config layer (project) is not writable"
+                    .into(),
+                diagnostic_code: "effective_default_target_unwritable".into(),
+            },
         },
-    });
+    );
     assert!(
         app.history.iter().any(|entry| matches!(
             entry,

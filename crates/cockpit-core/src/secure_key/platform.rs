@@ -230,11 +230,14 @@ fn run_keyring_construct(
     let outcome = construct();
     match &outcome {
         Ok(()) => {
-            // Keep a successful first construct registered so later KEK use
-            // does not construct the platform store a second time. Restore a
-            // previously registered actor store if one existed.
+            // The probe thread is short-lived. Never leave a Secret Service
+            // store it constructed as the process default — zbus connections
+            // do not survive that thread's exit. The actor reconstructs on
+            // `cockpit-keyring-io`. Restore any store the actor already owned.
             if let Some(previous) = previous {
                 keyring_core::set_default_store(previous);
+            } else {
+                unset_default_platform_store();
             }
         }
         Err(_) => {

@@ -276,8 +276,9 @@ pub struct Session {
     active_sandbox_escalate_eligible: AtomicBool,
     /// 6-char human-display id, unique within `project_id`
     /// (GOALS §17b). Populated at create-time; backfilled lazily for
-    /// pre-§17 rows on [`Session::resume`].
-    pub short_id: String,
+    /// pre-§17 rows on [`Session::resume`]. Insert collision retry can
+    /// replace the in-memory value — read through [`Self::short_id`].
+    short_id: Mutex<String>,
     /// Parent session in the fork tree (GOALS §17e). `None` = root.
     // Fork-tree lineage (GOALS §17e); not yet read by any consumer.
     #[allow(dead_code)]
@@ -448,6 +449,15 @@ pub(crate) fn test_redaction_key_resolver()
 }
 
 impl Session {
+    /// Durable 6-char display id. Collision retry at persist can replace the
+    /// value assigned at `create_deferred`.
+    pub fn short_id(&self) -> String {
+        self.short_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub(crate) fn set_external_journal(
         &self,
         journal: Option<Arc<crate::external_journal::ExternalJournal>>,
@@ -1444,13 +1454,13 @@ mod tests {
         )
         .unwrap();
         let id = s.id;
-        let short = s.short_id.clone();
+        let short = s.short_id();
         drop(s);
         let s2 = Session::resume_for_test(db, id, crate::session::test_redaction_key_resolver())
             .unwrap()
             .unwrap();
         assert_eq!(s2.id, id);
-        assert_eq!(s2.short_id, short);
+        assert_eq!(s2.short_id(), short);
         assert!(s2.parent_session_id.is_none());
         assert!(s2.title().is_none());
         assert!(!s2.user_renamed());
@@ -1493,7 +1503,7 @@ mod tests {
         assert_eq!(fork.active_provider().as_deref(), Some("anthropic"));
         assert_eq!(fork.active_model().as_deref(), Some("opus-4-7"));
         assert_ne!(fork.id, parent.id);
-        assert_ne!(fork.short_id, parent.short_id);
+        assert_ne!(fork.short_id(), parent.short_id());
     }
 
     #[tokio::test]
@@ -2367,7 +2377,7 @@ mod tests {
         )
         .unwrap();
         // Id + short_id exist immediately (for the startup graphic).
-        assert!(!s.short_id.is_empty());
+        assert!(!s.short_id().is_empty());
         assert!(!s.is_persisted());
         // No DB row yet: not fetchable, not listed.
         assert!(db.get_session(s.id).await.unwrap().is_none());
@@ -2380,12 +2390,41 @@ mod tests {
         );
         assert!(s.is_persisted());
         let row = db.get_session(s.id).await.unwrap().expect("row now exists");
-        assert_eq!(row.short_id.as_deref(), Some(s.short_id.as_str()));
+        assert_eq!(row.short_id.as_deref(), Some(s.short_id().as_str()));
         assert_eq!(db.list_sessions(true, 100).await.unwrap().len(), 1);
 
         // Idempotent: a second flush is a no-op (returns `false`).
         assert!(!s.persist_if_needed().unwrap());
         assert_eq!(db.list_sessions(true, 100).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persist_if_needed_adopts_collision_retry_short_id() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create_deferred_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let claimed = s.short_id();
+        let mut competitor = db
+            .new_session_row(&s.project_id, "/x", "a")
+            .await
+            .unwrap();
+        competitor.short_id = Some(claimed.clone());
+        let inserted = db.insert_session_row(&competitor).await.unwrap();
+        assert_eq!(inserted.short_id.as_deref(), Some(claimed.as_str()));
+
+        assert!(s.persist_if_needed().unwrap());
+        assert_ne!(
+            s.short_id(),
+            claimed,
+            "Attached must report the persisted id"
+        );
+        let row = db.get_session(s.id).await.unwrap().expect("row exists");
+        assert_eq!(row.short_id.as_deref(), Some(s.short_id().as_str()));
     }
 
     #[tokio::test]

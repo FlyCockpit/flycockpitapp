@@ -483,7 +483,7 @@ impl Db {
     }
 
     pub async fn park_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             // A real QuestionTool interrupt can be bound to a pending
             // AgentTree decision.  Parking is still part of the original
             // continuation protocol, so make that one reversible projection
@@ -576,7 +576,7 @@ impl Db {
         session_id: Uuid,
         interrupt_id: Uuid,
     ) -> Result<bool> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let linked_decision: Option<(String, String)> = conn
                 .query_row(
                     "SELECT n.decision_request_id, n.session_id
@@ -714,7 +714,7 @@ impl Db {
 
     pub async fn complete_executing_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
         let now = Utc::now().timestamp();
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             // A linked QuestionTool row is protected by the decision-owned
             // projection trigger. Its decision was already terminal before
             // the parked continuation could be replayed, so install the

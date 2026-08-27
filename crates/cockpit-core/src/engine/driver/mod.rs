@@ -11806,7 +11806,7 @@ impl Driver {
             env_overlay: self.stack[0].agent.env_overlay.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
-            session_short_id: self.session.short_id.clone(),
+            session_short_id: self.session.short_id(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,

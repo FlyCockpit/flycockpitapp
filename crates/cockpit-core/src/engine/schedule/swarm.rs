@@ -712,7 +712,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         env_overlay: ctx.agent.env_overlay.clone(),
         cwd: ctx.cwd.clone(),
         config: pinned.clone(),
-        session_short_id: ctx.session.short_id.clone(),
+        session_short_id: ctx.session.short_id(),
         // Inherit the parent agent's identity prefix so a `spawn` → bee/scout/goal
         // worker in an assistant session keeps the SOUL/USER identity.
         assistant_identity_prefix: ctx.agent.assistant_identity_prefix.clone(),

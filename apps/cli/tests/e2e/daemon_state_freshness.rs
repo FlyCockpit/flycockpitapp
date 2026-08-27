@@ -67,6 +67,25 @@ async fn daemon_trust_read_through() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ephemeral_run_seeds_trust_in_never_trusted_home() {
+    let provider = text_provider().await;
+    let home = IsolatedHome::new();
+    home.write_local_provider_config(&provider.base_url());
+    let output = home
+        .cockpit()
+        .args(["--no-sandbox", "run", "--ephemeral", "--json", "hello"])
+        .output()
+        .expect("run --ephemeral in a never-trusted home");
+    assert_success("run --ephemeral without prior trust set", &output, &home);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("session_attached") || stdout.contains("assistant"),
+        "ephemeral run must complete a turn: {}",
+        output_text(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ephemeral_session_resumes_on_shared_daemon() {
     // Keep the provider alive for the daemon lifetime; dropping it closes the listener.
     let provider = text_provider().await;

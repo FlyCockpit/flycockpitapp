@@ -86,6 +86,10 @@ pub fn keyring_available(probe: &KeyringProbeResult) -> bool {
     probe.state.is_available()
 }
 
+fn keyring_probe_failed(probe: &KeyringProbeResult) -> bool {
+    matches!(probe.state, cockpit_proto::FeatureCapabilityState::Failed)
+}
+
 /// Durable KEK migrate used by Settings and the daemon request.
 ///
 /// Opens the current vault from the authority row, writes the destination
@@ -195,6 +199,14 @@ pub fn resolve_secret_store(
 ) -> Result<SecretVaultPlacement, KekUnavailable> {
     match authority {
         None if keyring_available(keyring_probe) => Ok(SecretVaultPlacement::Keyring),
+        None if keyring_probe_failed(keyring_probe) => Err(KekUnavailable {
+            reason: keyring_probe.reason.clone(),
+            fix_command: keyring_probe
+                .fix_command
+                .clone()
+                .or_else(|| Some(DEFAULT_FIX_COMMAND.to_string())),
+            intent: SecretStoreIntent::Unconfigured,
+        }),
         None => Ok(SecretVaultPlacement::Database),
         Some(row) => match row.active_placement {
             SecretVaultPlacement::Database => Ok(SecretVaultPlacement::Database),

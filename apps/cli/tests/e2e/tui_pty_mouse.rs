@@ -13,6 +13,7 @@ fn tui_pty_mouse_protocol_coordinates() {
     assert!(composer_before, "ready composer required before /settings");
 
     session.open_settings();
+    session.settle_visible_state(Duration::from_secs(8));
     let close = session
         .snapshot()
         .find_text("[Close settings]")
@@ -33,6 +34,7 @@ fn tui_pty_mouse_protocol_coordinates() {
     let complete_cases = complete_noop_sequences(close);
     for (label, bytes) in complete_cases {
         session.open_settings();
+        session.settle_visible_state(Duration::from_secs(8));
         let before = session.snapshot();
         session.write_bytes(&bytes);
         session.checkpoint_input_with_redraw();
@@ -47,6 +49,7 @@ fn tui_pty_mouse_protocol_coordinates() {
     // hover affordances. It must remain non-activating, however, so moving
     // across the close target cannot dismiss the settings dialog.
     session.open_settings();
+    session.settle_visible_state(Duration::from_secs(8));
     session.write_bytes(&sgr_motion(close.sgr_x(), close.sgr_y()));
     session.checkpoint_input_with_redraw();
     assert!(
@@ -62,6 +65,7 @@ fn tui_pty_mouse_protocol_coordinates() {
     for (label, bytes) in incomplete {
         let mut isolated = HermeticCockpit::launch_ready(HermeticProfile::Default);
         isolated.open_settings();
+        isolated.settle_visible_state(Duration::from_secs(8));
         let before = isolated.snapshot();
         isolated.write_bytes(bytes);
         isolated.checkpoint_input_with_redraw();

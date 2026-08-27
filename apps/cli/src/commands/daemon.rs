@@ -71,7 +71,9 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 )
                 .await
                 {
-                    bail!("timed out waiting for daemon shutdown to release its pid and socket");
+                    bail!(
+                        "timed out waiting for the previous daemon process to exit and release its pid and socket"
+                    );
                 }
                 println!("daemon: stopped");
                 return Ok(());
@@ -126,7 +128,9 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 )
                 .await;
                 if !released {
-                    bail!("timed out waiting for daemon restart to release its pid and socket");
+                    bail!(
+                        "timed out waiting for the previous daemon process to exit and release its pid and socket"
+                    );
                 }
             }
 

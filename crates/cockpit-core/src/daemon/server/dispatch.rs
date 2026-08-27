@@ -24160,7 +24160,7 @@ async fn run_docs_ask_pipeline(
         env_overlay: Arc::new(std::sync::RwLock::new(Default::default())),
         cwd: cwd.clone(),
         config: config.clone(),
-        session_short_id: session.short_id.clone(),
+        session_short_id: session.short_id(),
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,

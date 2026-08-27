@@ -1,5 +1,7 @@
 //! Platform-agnostic native item adapter used by the secure-key actor.
 
+use zeroize::Zeroizing;
+
 use super::error::SecureKeyError;
 use super::key_material::TempSecret;
 
@@ -57,7 +59,7 @@ impl NativeKeyStore for KeyringNativeStore {
     ) -> Result<(), SecureKeyError> {
         let service = service.to_owned();
         let account = account.to_owned();
-        let secret = secret.to_vec();
+        let secret = Zeroizing::new(secret.to_vec());
         with_keyring_off_runtime(move || {
             let entry = keyring_core::Entry::new(&service, &account)
                 .map_err(super::error::map_keyring_error)?;

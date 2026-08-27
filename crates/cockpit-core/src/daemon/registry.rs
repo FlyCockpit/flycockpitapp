@@ -1667,13 +1667,12 @@ impl SessionRegistry {
         let extended_cfg = extended_cfg.clone();
 
         // Recovery of a pre-selection session is a two-phase operation. The
-        // full selection is visible in memory while the worker is validated,
-        // but the durable row remains untouched until every fallible worker
-        // construction step has succeeded. The commit immediately precedes
-        // `session_worker::spawn`, which is synchronous and infallible; any
-        // future fallible construction must remain above that commit. Existing
-        // selections are never overwritten by Attach; intentional changes go
-        // through SetActiveModel.
+        // full selection is visible in memory while the worker is validated.
+        // The deferred sessions row is flushed after that commit and immediately
+        // precedes `session_worker::spawn`, which is synchronous and infallible;
+        // attach always writes a durable parent row before agent-tree dependents.
+        // Existing selections are never overwritten by Attach; intentional
+        // changes go through SetActiveModel.
         let staged_recovery = if session.active_model_ref().is_none() {
             let active = recovery_model
                 .or_else(|| providers_cfg.active_model.clone())

@@ -1691,7 +1691,7 @@ async fn attach_agent_tree_profile_utility_models(
         .reconstruct()?;
     let credential_store = session.provider_credential_store(providers).ok();
     for binding in snapshot.bindings {
-        if !binding.hard_capability_verified {
+        if !binding.hard_capability_verified || !binding.is_default {
             continue;
         }
         let provider_id = &binding.selected_provider_alias.provider_id;

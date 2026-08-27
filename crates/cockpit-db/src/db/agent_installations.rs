@@ -1341,6 +1341,12 @@ pub fn bind_agent_model_conn(
     if !binding.hard_capability_verified {
         return Ok(BindAgentOutcome::Incompatible);
     }
+    // This legacy single-choice mutation can only replace a slot with its
+    // default. Alternate models are installed atomically through rebind so a
+    // slot is never left live without a default.
+    if !binding.is_default {
+        return Ok(BindAgentOutcome::Incompatible);
+    }
     validate_binding(binding)?;
     ensure!(
         !idempotency_key.is_empty(),
@@ -1396,10 +1402,12 @@ pub fn bind_agent_model_conn(
     } else if expected_binding_revision.is_some() {
         return Ok(BindAgentOutcome::Conflict);
     }
-    let next_revision = current.as_ref().map_or(1, |row| row.binding_revision + 1);
-    if let Some(current) = current {
-        conn.execute("UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE binding_id=?2 AND retired_at_unix_ms IS NULL", params![now_unix_ms, current.binding_id.to_string()]).context("retiring replaced agent binding")?;
-    }
+    let next_revision = next_binding_revision(conn, installation_id, &binding.slot_id)?;
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE installation_id=?2 AND definition_digest=?3 AND slot_id=?4 AND retired_at_unix_ms IS NULL",
+        params![now_unix_ms, installation_id.to_string(), definition_digest, binding.slot_id],
+    )
+    .context("retiring replaced agent binding set")?;
     let id = Uuid::now_v7();
     conn.execute(
         "INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11)",
@@ -1455,6 +1463,18 @@ pub fn rebind_agent_conn(
     ensure!(
         keys.iter().any(|(slot, _)| slot == "primary"),
         "rebind request must provide the primary model slot"
+    );
+    let mut defaults_by_slot: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for binding in &input.bindings {
+        let count = defaults_by_slot.entry(&binding.slot_id).or_default();
+        if binding.is_default {
+            *count += 1;
+        }
+    }
+    ensure!(
+        defaults_by_slot.values().all(|count| *count == 1),
+        "rebind request must provide exactly one default model per slot"
     );
     conn.execute("UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE installation_id=?2 AND retired_at_unix_ms IS NULL", params![input.now_unix_ms,input.installation_id.to_string()]).context("retiring prior agent bindings")?;
     let mut slot_revisions: std::collections::BTreeMap<String, u64> =
@@ -2181,6 +2201,15 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
         }),
         "snapshot binding evidence must have distinct hard-compatible (slot, model) rows and exactly one default per live slot"
     );
+    let bound_slots = value
+        .bindings
+        .iter()
+        .map(|binding| binding.slot_id.clone())
+        .collect::<HashSet<_>>();
+    ensure!(
+        bound_slots == defaults,
+        "snapshot binding evidence must contain exactly one default for every live slot"
+    );
     validate_question_policy(&value.question_policy, &value.bindings)?;
     ensure!(
         value
@@ -2644,7 +2673,7 @@ fn binding_receipt_by_key(
     idempotency_key: &str,
 ) -> Result<Option<(String, AgentBindingRow)>> {
     conn.query_row(
-        "SELECT r.request_fingerprint,b.binding_id,b.installation_id,b.definition_digest,b.slot_id,b.provider_profile_handle,b.model_id,b.provenance_payload,b.provenance_digest,b.hard_capability_verified,b.binding_revision,b.retired_at_unix_ms,b.created_at_unix_ms FROM agent_binding_receipts r JOIN agent_model_bindings b ON b.binding_id=r.binding_id WHERE r.installation_id=?1 AND r.definition_digest=?2 AND r.slot_id=?3 AND r.idempotency_key=?4",
+        "SELECT r.request_fingerprint,b.binding_id,b.installation_id,b.definition_digest,b.slot_id,b.provider_profile_handle,b.model_id,b.provenance_payload,b.provenance_digest,b.hard_capability_verified,b.binding_revision,b.is_default,b.retired_at_unix_ms,b.created_at_unix_ms FROM agent_binding_receipts r JOIN agent_model_bindings b ON b.binding_id=r.binding_id WHERE r.installation_id=?1 AND r.definition_digest=?2 AND r.slot_id=?3 AND r.idempotency_key=?4",
         params![installation_id.to_string(), definition_digest, slot_id, idempotency_key],
         |row| Ok((row.get(0)?, decode_binding_offset(row, 1)?)),
     )

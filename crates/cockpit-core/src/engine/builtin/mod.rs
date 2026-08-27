@@ -1750,6 +1750,12 @@ fn local_definition_for_spawn(
     args: &SpawnArgs,
 ) -> Result<Option<crate::agents::AgentDef>> {
     if let Some(parent) = &args.parent_vnext_grant {
+        if let Some(definition) = args
+            .vnext_local_installation_resolver
+            .package_definition_for_parent_launch_target(parent, name)
+        {
+            return Ok(Some(definition));
+        }
         return args
             .vnext_local_installation_resolver
             .definition_for_parent_launch_target(parent, name)
@@ -2782,7 +2788,7 @@ fn vnext_reachable_subagents(
             AllowedChild::PortableRef { portable_agent_ref }
                 if portable_agent_ref == crate::agents::SELF_CHILD_REF =>
             {
-                resolved.push(parent.name.clone());
+                resolved.push(crate::agents::SELF_CHILD_REF.to_string());
             }
             AllowedChild::PortableRef { portable_agent_ref } => {
                 if let Some(private) =
@@ -2872,6 +2878,12 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Resul
 /// parent-named selector names one of the slot's allowed models. Naming
 /// anything else is a structured refusal (never a silent session-model inherit).
 fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Arc<Model>> {
+    // Root construction receives the daemon-prepared primary binding as
+    // `args.model`; authored provider ids are not credential-owning routes and
+    // must never replace that pinned model here.
+    if !args.delegated {
+        return Ok(args.model.clone());
+    }
     let vnext = def
         .vnext
         .as_ref()

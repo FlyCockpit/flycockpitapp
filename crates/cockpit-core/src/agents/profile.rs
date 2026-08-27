@@ -270,6 +270,9 @@ pub struct ResolvedModelSlotChoice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModelSlot {
     pub slot_id: String,
+    /// Every live, currently hard-compatible binding in this slot. The
+    /// default is also present here and is identified by `is_default`.
+    pub choices: Vec<ResolvedModelSlotChoice>,
     pub choice: ResolvedModelSlotChoice,
     /// Matching recommendations stay in author order, then alias order;
     /// unmatched records remain visible in their original author order.
@@ -409,10 +412,11 @@ impl ResolvedAgentProfile {
             bindings: self
                 .slots
                 .values()
-                .map(|slot| AgentBindingRevision {
-                    slot_id: slot.slot_id.clone(),
-                    model_id: slot.choice.binding.model_id.clone(),
-                    binding_revision: slot.choice.binding.binding_revision,
+                .flat_map(|slot| slot.choices.iter())
+                .map(|choice| AgentBindingRevision {
+                    slot_id: choice.binding.slot_id.clone(),
+                    model_id: choice.binding.model_id.clone(),
+                    binding_revision: choice.binding.binding_revision,
                 })
                 .collect(),
         };
@@ -420,10 +424,11 @@ impl ResolvedAgentProfile {
         let expected_bindings = self
             .slots
             .values()
-            .map(|slot| AgentBindingExpectation {
-                slot_id: slot.slot_id.clone(),
-                model_id: slot.choice.binding.model_id.clone(),
-                expected_binding_revision: slot.choice.binding.binding_revision,
+            .flat_map(|slot| slot.choices.iter())
+            .map(|choice| AgentBindingExpectation {
+                slot_id: choice.binding.slot_id.clone(),
+                model_id: choice.binding.model_id.clone(),
+                expected_binding_revision: choice.binding.binding_revision,
             })
             .collect();
         db.prepare_agent_session(PrepareAgentSessionInput {
@@ -566,7 +571,11 @@ pub fn resolve_agent_profile(
     let offerings = offerings_by_route(&input.offerings)?;
     let mut slots = BTreeMap::new();
     for (slot_id, slot) in &vnext.model_slots {
-        let explicit_binding = bindings.get(slot_id).cloned();
+        let explicit_bindings = bindings.get(slot_id).cloned().unwrap_or_default();
+        let explicit_binding = explicit_bindings
+            .iter()
+            .find(|binding| binding.is_default)
+            .cloned();
         // A durable user binding always wins. The host default is only a
         // missing-slot recovery path for an opt-in utility slot.
         let fallback = explicit_binding
@@ -624,16 +633,66 @@ pub fn resolve_agent_profile(
             offering.model_id == binding.model_id,
             "slot `{slot_id}` binding model does not match its selected provider offering"
         );
+        let mut choices = Vec::new();
+        for live_binding in if explicit_bindings.is_empty() {
+            vec![binding.clone()]
+        } else {
+            explicit_bindings
+        } {
+            ensure!(
+                live_binding.hard_capability_verified,
+                "slot `{slot_id}` has an unverified live binding"
+            );
+            let live_offering = offerings
+                .get(&(
+                    live_binding.provider_profile_handle.clone(),
+                    live_binding.model_id.clone(),
+                ))
+                .cloned()
+                .or_else(|| {
+                    fallback
+                        .filter(|fallback| fallback.binding.binding_id == live_binding.binding_id)
+                        .map(|fallback| fallback.offering.clone())
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("slot `{slot_id}` references an unavailable provider profile")
+                })?;
+            ensure!(
+                offering_is_compatible(slot, &live_offering, input.providers),
+                "slot `{slot_id}` binding no longer satisfies hard model requirements"
+            );
+            if !slot.models.is_empty() {
+                ensure!(
+                    slot.models
+                        .iter()
+                        .any(|allowed| allowed.provider_id == live_offering.provider_id
+                            && allowed.model_id == live_offering.model_id),
+                    "slot `{slot_id}` contains a binding outside its authored allowed model set"
+                );
+            }
+            let live_recommendations =
+                resolve_recommendations(slot_id, &slot.suggested_models, &live_offering);
+            let exact_recommendation_id = live_recommendations
+                .iter()
+                .find(|recommendation| recommendation.author_suggested)
+                .map(|recommendation| recommendation.recommendation_id.clone());
+            choices.push(ResolvedModelSlotChoice {
+                offering: live_offering,
+                binding: live_binding,
+                author_suggested: exact_recommendation_id.is_some(),
+                exact_recommendation_id,
+            });
+        }
+        let choice = choices
+            .iter()
+            .find(|choice| choice.binding.is_default)
+            .cloned()
+            .context("resolved slot lost its default binding")?;
         ensure!(
             offering_is_compatible(slot, &offering, input.providers),
             "slot `{slot_id}` binding no longer satisfies hard model requirements"
         );
         let recommendations = resolve_recommendations(slot_id, &slot.suggested_models, &offering);
-        let exact_recommendation_id = recommendations
-            .iter()
-            .find(|recommendation| recommendation.author_suggested)
-            .map(|recommendation| recommendation.recommendation_id.clone());
-        let author_suggested = exact_recommendation_id.is_some();
         let remaining_compatible_offerings =
             ranked_compatible_offerings(slot, &input.offerings, input.providers)
                 .into_iter()
@@ -644,12 +703,8 @@ pub fn resolve_agent_profile(
             slot_id.clone(),
             ResolvedModelSlot {
                 slot_id: slot_id.clone(),
-                choice: ResolvedModelSlotChoice {
-                    offering,
-                    binding,
-                    author_suggested,
-                    exact_recommendation_id,
-                },
+                choices,
+                choice,
                 recommendations,
                 remaining_compatible_offerings,
             },
@@ -729,7 +784,7 @@ fn bindings_by_slot(
     bindings: &[AgentBindingRow],
     installation_id: Uuid,
     definition_digest: &str,
-) -> Result<BTreeMap<String, AgentBindingRow>> {
+) -> Result<BTreeMap<String, Vec<AgentBindingRow>>> {
     let mut grouped: BTreeMap<String, Vec<AgentBindingRow>> = BTreeMap::new();
     for binding in bindings {
         ensure!(
@@ -749,16 +804,14 @@ fn bindings_by_slot(
             .or_default()
             .push(binding.clone());
     }
-    let mut by_slot = BTreeMap::new();
-    for (slot_id, rows) in grouped {
+    for (slot_id, rows) in &grouped {
         let defaults: Vec<_> = rows.iter().filter(|row| row.is_default).collect();
         ensure!(
             defaults.len() == 1,
             "slot `{slot_id}` must have exactly one default live binding"
         );
-        by_slot.insert(slot_id, defaults[0].clone());
     }
-    Ok(by_slot)
+    Ok(grouped)
 }
 
 fn offerings_by_route(
@@ -877,7 +930,14 @@ pub fn ranked_compatible_offerings(
 ) -> Vec<AgentProfileModelOffering> {
     let mut compatible: Vec<_> = offerings
         .iter()
-        .filter(|offering| offering_is_compatible(slot, offering, providers))
+        .filter(|offering| {
+            offering_is_compatible(slot, offering, providers)
+                && (slot.models.is_empty()
+                    || slot.models.iter().any(|allowed| {
+                        allowed.provider_id == offering.provider_id
+                            && allowed.model_id == offering.model_id
+                    }))
+        })
         .cloned()
         .collect();
     compatible.sort_by(|left, right| {
@@ -977,9 +1037,13 @@ fn resolve_children(
                 *installation_id
             }
             AllowedChild::PortableRef { portable_agent_ref } => {
-                let installation_id = catalog.portable_child(selected, portable_agent_ref)?;
-                validate_child(selected, catalog.selected(installation_id)?, host)?;
-                installation_id
+                if portable_agent_ref == super::SELF_CHILD_REF {
+                    selected.installation.installation_id
+                } else {
+                    let installation_id = catalog.portable_child(selected, portable_agent_ref)?;
+                    validate_child(selected, catalog.selected(installation_id)?, host)?;
+                    installation_id
+                }
             }
         };
         ensure!(
@@ -1108,18 +1172,18 @@ fn snapshot_for(
     let bindings = slots
         .values()
         .flat_map(|slot| {
-            std::iter::once(RedactedBindingEvidence {
+            slot.choices.iter().map(|choice| RedactedBindingEvidence {
                 slot_id: slot.slot_id.clone(),
-                binding_revision: slot.choice.binding.binding_revision,
-                provider_profile_handle: slot.choice.offering.provider_profile_handle.clone(),
-                model_id: slot.choice.offering.model_id.clone(),
+                binding_revision: choice.binding.binding_revision,
+                provider_profile_handle: choice.offering.provider_profile_handle.clone(),
+                model_id: choice.offering.model_id.clone(),
                 selected_provider_alias: SnapshotProviderAlias {
-                    provider_id: slot.choice.offering.provider_id.clone(),
-                    model_id: slot.choice.offering.model_id.clone(),
+                    provider_id: choice.offering.provider_id.clone(),
+                    model_id: choice.offering.model_id.clone(),
                 },
-                provenance_digest: slot.choice.binding.provenance_digest.clone(),
+                provenance_digest: choice.binding.provenance_digest.clone(),
                 hard_capability_verified: true,
-                is_default: slot.choice.binding.is_default,
+                is_default: choice.binding.is_default,
             })
         })
         .collect();

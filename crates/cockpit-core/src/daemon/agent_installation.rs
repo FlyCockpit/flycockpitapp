@@ -2985,7 +2985,7 @@ impl AgentInstallationService {
             .rsplit('/')
             .next()
             .context("invalid installed agent id")?;
-        let target = owned_path(
+        let target = existing_owned_definition_path(
             &self.daemon_agents_dir,
             workspace_root.as_deref(),
             request.scope,
@@ -2993,16 +2993,8 @@ impl AgentInstallationService {
         )?;
         ensure_no_reparse_components(target.parent().context("owned target missing parent")?)?;
         reject_reparse_leaf(&target)?;
-        let definition = crate::agents::parse_agent(
-            std::str::from_utf8(&read_owned_file(
-                &target,
-                "reading daemon-owned agent definition",
-            )?)
-            .context("daemon-owned agent definition is not UTF-8")?,
-            name,
-            target.clone(),
-        )
-        .context("loading daemon-owned agent definition")?;
+        let definition = crate::agents::load_owned_definition(&target, name)
+            .context("loading daemon-owned agent definition")?;
         let vnext = definition
             .vnext
             .as_ref()
@@ -3355,7 +3347,7 @@ impl AgentInstallationService {
             Some(name) => name,
             None => return Ok(SessionSetupCandidateProjection::unavailable(row, selected)),
         };
-        let (bytes, diagnostic_path) = match row.installation.scope {
+        let definition = match row.installation.scope {
             AgentInstallationScope::WorkspaceShared => {
                 // A workspace-shared definition is a PROJECT source. When the
                 // current trust policy does not project project sources (e.g.
@@ -3371,7 +3363,19 @@ impl AgentInstallationService {
                     return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
                 };
                 match workspace_root.read_workspace_shared_definition(name) {
-                    Ok(bytes) => (bytes, PathBuf::from("<attached-workspace-agent>")),
+                    Ok(bytes) => match std::str::from_utf8(&bytes).ok().and_then(|text| {
+                        crate::agents::parse_agent(
+                            text,
+                            name,
+                            PathBuf::from("<attached-workspace-agent>"),
+                        )
+                        .ok()
+                    }) {
+                        Some(definition) => definition,
+                        None => {
+                            return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
+                        }
+                    },
                     Err(_) => {
                         return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
                     }
@@ -3393,27 +3397,13 @@ impl AgentInstallationService {
                         return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
                     }
                 };
-                let bytes = match read_owned_file(&path, "reading installed agent setup") {
-                    Ok(bytes) => bytes,
+                match crate::agents::load_owned_definition(&path, name) {
+                    Ok(definition) => definition,
                     Err(_) => {
                         return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
                     }
-                };
-                (bytes, path)
+                }
             }
-        };
-        let definition = match (|| {
-            let name = row
-                .installation
-                .source_agent_id
-                .rsplit('/')
-                .next()
-                .context("installed agent id has no filename")?;
-            let text = std::str::from_utf8(&bytes).context("installed agent setup is not UTF-8")?;
-            crate::agents::parse_agent(text, name, diagnostic_path)
-        })() {
-            Ok(definition) => definition,
-            Err(_) => return Ok(SessionSetupCandidateProjection::unavailable(row, selected)),
         };
         let observed_digest = match definition.vnext_digest_bytes() {
             Ok(bytes) => sha256_hex(&bytes),
@@ -3428,8 +3418,9 @@ impl AgentInstallationService {
         let current_bindings = row
             .bindings
             .iter()
+            .filter(|binding| binding.is_default)
             .cloned()
-            .map(|binding| (binding.slot_id, binding.model_id))
+            .map(|binding| (binding.slot_id.clone(), binding))
             .collect::<std::collections::BTreeMap<_, _>>();
         // Shared definition records intentionally omit private binding state
         // from generic install/list RPCs. This attached, owner-local session
@@ -3439,14 +3430,14 @@ impl AgentInstallationService {
             .model_slots
             .iter()
             .map(|(slot_id, slot)| match current_bindings.get(slot_id) {
-                Some(model_id) => AgentInstallationSlotStatusV1 {
+                Some(binding) => AgentInstallationSlotStatusV1 {
                     slot_id: slot_id.clone(),
                     state: if rebind_required {
                         AgentInstallationSlotBindingStateV1::RebindRequired
                     } else {
                         AgentInstallationSlotBindingStateV1::Bound
                     },
-                    model_id: model_id.clone(),
+                    model_id: binding.model_id.clone(),
                 },
                 None => AgentInstallationSlotStatusV1 {
                     slot_id: slot_id.clone(),
@@ -3478,14 +3469,20 @@ impl AgentInstallationService {
                 let ranked =
                     crate::agents::ranked_compatible_offerings(slot, &offerings, providers);
                 let (choices, unmatched_recommendations) = binding_choices(slot_id, slot, &ranked);
-                let default_choice_id = slot.default_model().and_then(|default| {
-                    choices
+                let default_choice_id = current_bindings.get(slot_id).and_then(|binding| {
+                    ranked
                         .iter()
-                        .find(|choice| {
-                            choice.provider_id == default.provider_id
-                                && choice.model_id == default.model_id
+                        .position(|offering| {
+                            offering.provider_profile_handle == binding.provider_profile_handle
+                                && offering.model_id == binding.model_id
                         })
-                        .map(|choice| choice.choice_id.clone())
+                        .and_then(|index| {
+                            let offering_id = format!("offering-{index}");
+                            choices
+                                .iter()
+                                .find(|choice| choice.offering_id == offering_id)
+                                .map(|choice| choice.choice_id.clone())
+                        })
                 });
                 SessionSetupModelSlotV1 {
                     slot_id: slot_id.clone(),
@@ -4495,6 +4492,7 @@ impl AgentInstallationService {
                 .current_agent_bindings(row.installation_id, row.source_digest.clone())
                 .await?
                 .into_iter()
+                .filter(|binding| binding.is_default)
                 .map(|binding| (binding.slot_id, binding.model_id))
                 .collect::<std::collections::BTreeMap<_, _>>();
             let name = row
@@ -4502,7 +4500,7 @@ impl AgentInstallationService {
                 .rsplit('/')
                 .next()
                 .context("installed agent id has no filename")?;
-            let path = owned_path(
+            let path = existing_owned_definition_path(
                 &self.daemon_agents_dir,
                 workspace_root,
                 match row.scope {
@@ -4514,11 +4512,7 @@ impl AgentInstallationService {
                 },
                 name,
             )?;
-            let definition = crate::agents::parse_agent(
-                std::str::from_utf8(&read_owned_file(&path, "reading installed agent status")?)?,
-                name,
-                path,
-            )?;
+            let definition = crate::agents::load_owned_definition(&path, name)?;
             let observed_digest = sha256_hex(&definition.vnext_digest_bytes()?);
             let observation = self.db.agent_observation(row.installation_id).await?;
             let rebind_required = observation.is_none_or(|observation| {
@@ -4701,6 +4695,29 @@ fn owned_path(
             .join(".cockpit/agents")
             .join(format!("{name}.md")),
     })
+}
+
+fn existing_owned_definition_path(
+    global: &Path,
+    workspace: Option<&Path>,
+    scope: AgentInstallationScopeWire,
+    name: &str,
+) -> Result<PathBuf> {
+    let flat = owned_path(global, workspace, scope, name)?;
+    if std::fs::symlink_metadata(&flat)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    {
+        return Ok(flat);
+    }
+    let package = flat.with_file_name(name);
+    if std::fs::symlink_metadata(&package)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        && std::fs::symlink_metadata(package.join("agent.md"))
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    {
+        return Ok(package);
+    }
+    Ok(flat)
 }
 fn stage_path(target: &Path, operation: Uuid) -> Result<PathBuf> {
     let filename = target
@@ -5836,7 +5853,7 @@ fn setup_definition_path(
         AgentInstallationScope::WorkspacePrivate => AgentInstallationScopeWire::WorkspacePrivate,
         AgentInstallationScope::WorkspaceShared => AgentInstallationScopeWire::WorkspaceShared,
     };
-    owned_path(daemon_agents_dir, workspace_root, scope, name)
+    existing_owned_definition_path(daemon_agents_dir, workspace_root, scope, name)
 }
 
 fn unavailable_setup_candidate(
@@ -10228,12 +10245,12 @@ mod tests {
             slot_id: "primary".into(),
             choices: Vec::new(),
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
-                default_choice_id: None,
                 recommendation_id: "requires-tools".into(),
                 canonical_upstream_identity: "upstream/tools".into(),
                 author_label: None,
                 rationale: None,
             }],
+            default_choice_id: None,
             unavailable_reason: Some(SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel),
         };
         let encoded = serde_json::to_value(&slot).expect("slot serializes");

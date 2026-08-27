@@ -829,7 +829,7 @@ fn prepare_mutation_plan_sync(
             } else if crate::agents::resolve(root, name)
                 .map_err(bad_config)?
                 .is_some()
-                || nofollow_read(&project_agent_path(root, name)?)?.is_some()
+                || current_definition_bytes(root, name)?.is_some()
             {
                 return Err(conflict(
                     "agent name already resolves in a configuration layer",
@@ -844,7 +844,10 @@ fn prepare_mutation_plan_sync(
                 action,
                 Some(name.clone()),
                 target_projection_identity(root, name, vault)?,
-                projection_identity(vault, Some(markdown.as_bytes())),
+                projection_identity(
+                    vault,
+                    Some(&intended_definition_bytes(root, name, markdown)?),
+                ),
                 1,
                 false,
             )
@@ -857,7 +860,11 @@ fn prepare_mutation_plan_sync(
             let current = snapshot_sync(root, name)?;
             ensure_revision(&current.revision, expected_revision)?;
             if current.source_layer != AgentSourceLayer::Workspace
-                || nofollow_read(&project_agent_path(root, name)?)?.is_none()
+                || (!project_agent_path(root, name)?.is_file()
+                    && !project_agent_path(root, name)?
+                        .with_file_name(name)
+                        .join("agent.md")
+                        .is_file())
             {
                 return Err(conflict("custom agent is not owned by the workspace layer"));
             }
@@ -978,11 +985,40 @@ fn target_projection_identity(
     name: &str,
     vault: &crate::secure_key::SecretVault,
 ) -> Result<String, ErrorPayload> {
-    let target = project_agent_path(root, name)?;
     Ok(projection_identity(
         vault,
-        nofollow_read(&target)?.as_deref(),
+        current_definition_bytes(root, name)?.as_deref(),
     ))
+}
+
+fn current_definition_bytes(root: &Path, name: &str) -> Result<Option<Vec<u8>>, ErrorPayload> {
+    let flat = project_agent_path(root, name)?;
+    if let Some(bytes) = nofollow_read(&flat)? {
+        return Ok(Some(bytes));
+    }
+    let package = flat.with_file_name(name);
+    if package.join("agent.md").is_file() {
+        let def = crate::agents::load_owned_definition(&package, name).map_err(bad_config)?;
+        return def.vnext_digest_bytes().map(Some).map_err(bad_config);
+    }
+    Ok(None)
+}
+
+fn intended_definition_bytes(
+    root: &Path,
+    name: &str,
+    markdown: &str,
+) -> Result<Vec<u8>, ErrorPayload> {
+    let package = project_agent_path(root, name)?.with_file_name(name);
+    if package.join("agent.md").is_file() {
+        let def = crate::agents::load_owned_definition(&package, name).map_err(bad_config)?;
+        let mut files = def
+            .package_files
+            .ok_or_else(|| bad_config(anyhow::anyhow!("package load lost package files")))?;
+        files.insert("agent.md".to_string(), markdown.as_bytes().to_vec());
+        return Ok(crate::agents::package_digest_preimage(&files));
+    }
+    Ok(markdown.as_bytes().to_vec())
 }
 
 fn reset_all_target_projection_identity(
@@ -1017,10 +1053,8 @@ fn projection_matches_plan(
     vault: &crate::secure_key::SecretVault,
 ) -> Result<bool, ErrorPayload> {
     if let Some(name) = plan.agent_name.as_deref() {
-        let target = project_agent_path(root, name)?;
         return Ok(
-            projection_identity(vault, nofollow_read(&target)?.as_deref())
-                == plan.intended_projection_identity,
+            target_projection_identity(root, name, vault)? == plan.intended_projection_identity
         );
     }
     Ok(reset_all_target_projection_identity(root, vault)? == plan.intended_projection_identity)

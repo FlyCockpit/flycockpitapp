@@ -87,6 +87,7 @@ pub struct LocalInstallationResolver {
     /// installation.  A UUID reference selects this snapshot directly; it is
     /// never re-resolved by a user-controlled display name or checkout path.
     definitions: std::sync::Arc<BTreeMap<Uuid, crate::agents::AgentDef>>,
+    package_definitions: std::sync::Arc<BTreeMap<(String, String), crate::agents::AgentDef>>,
 }
 
 impl LocalInstallationResolver {
@@ -99,6 +100,7 @@ impl LocalInstallationResolver {
         Self {
             bindings: std::sync::Arc::new(BTreeMap::new()),
             definitions: std::sync::Arc::new(BTreeMap::new()),
+            package_definitions: std::sync::Arc::new(BTreeMap::new()),
         }
     }
 
@@ -115,6 +117,7 @@ impl LocalInstallationResolver {
         Ok(Self {
             bindings: std::sync::Arc::new(bindings),
             definitions: std::sync::Arc::new(BTreeMap::new()),
+            package_definitions: std::sync::Arc::new(BTreeMap::new()),
         })
     }
 
@@ -124,15 +127,73 @@ impl LocalInstallationResolver {
         definitions: BTreeMap<Uuid, crate::agents::AgentDef>,
     ) -> Result<Self> {
         let mut bindings = BTreeMap::new();
+        let mut package_definitions = BTreeMap::new();
         for (installation_id, definition) in &definitions {
             let identity = LocalInstallationIdentity::from_definition(definition)?;
             if bindings.insert(*installation_id, identity).is_some() {
                 bail!("duplicate daemon-local installation UUID `{installation_id}`");
             }
+            let parent_id = definition
+                .vnext
+                .as_ref()
+                .expect("identity validated vNext")
+                .agent_id
+                .clone();
+            package_definitions.insert(
+                (parent_id.clone(), SELF_CHILD_REF.to_string()),
+                definition.clone(),
+            );
+            for (name, child) in &definition.private_subagents {
+                package_definitions.insert((parent_id.clone(), name.clone()), child.clone());
+                if let Some(child_vnext) = &child.vnext {
+                    package_definitions
+                        .entry((parent_id.clone(), child_vnext.agent_id.clone()))
+                        .or_insert_with(|| child.clone());
+                }
+            }
         }
         let mut resolver = Self::from_bindings(bindings)?;
         resolver.definitions = std::sync::Arc::new(definitions);
+        resolver.package_definitions = std::sync::Arc::new(package_definitions);
         Ok(resolver)
+    }
+
+    /// Resolve package-private and `self` children in the authenticated parent
+    /// snapshot before any global/workspace discovery.
+    pub fn package_definition_for_parent_launch_target(
+        &self,
+        parent: &EffectiveVnextGrant,
+        launch_target: &str,
+    ) -> Option<crate::agents::AgentDef> {
+        let delegation = parent.delegation.as_ref()?;
+        let permitted = delegation
+            .allowed_children
+            .iter()
+            .any(|reference| match reference {
+                AllowedChild::PortableRef { portable_agent_ref } => {
+                    portable_agent_ref == launch_target
+                        || portable_agent_ref == SELF_CHILD_REF && launch_target == parent.agent_id
+                        || delegation
+                            .package_children
+                            .get(portable_agent_ref)
+                            .is_some_and(|id| id == launch_target)
+                }
+                AllowedChild::LocalInstallation { .. } => false,
+            });
+        permitted
+            .then(|| {
+                delegation
+                    .package_definitions
+                    .0
+                    .get(launch_target)
+                    .cloned()
+                    .or_else(|| {
+                        self.package_definitions
+                            .get(&(parent.agent_id.clone(), launch_target.to_string()))
+                            .cloned()
+                    })
+            })
+            .flatten()
     }
 
     pub fn resolve(&self, installation_id: Uuid) -> Result<&LocalInstallationIdentity> {
@@ -522,6 +583,7 @@ impl VnextAgentDef {
                 targets,
                 default_child: self.delegation.default_child.clone(),
                 package_children: BTreeMap::new(),
+                package_definitions: PackageDefinitionSnapshot::default(),
             })
         };
         let questions =
@@ -806,7 +868,31 @@ pub struct EffectiveDelegationGrant {
     /// Package-private child name → portable agent_id. Private defs win over
     /// a same-named global agent for this parent only.
     pub package_children: BTreeMap<String, String>,
+    /// Immutable definitions captured with the parent package. The identity
+    /// index above is not itself sufficient launch authority.
+    pub package_definitions: PackageDefinitionSnapshot,
 }
+
+#[derive(Clone, Default)]
+pub struct PackageDefinitionSnapshot(pub std::sync::Arc<BTreeMap<String, crate::agents::AgentDef>>);
+
+impl std::fmt::Debug for PackageDefinitionSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+impl PartialEq for PackageDefinitionSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().all(|(name, def)| {
+                other.0.get(name).is_some_and(|other_def| {
+                    def.vnext_digest_bytes().ok() == other_def.vnext_digest_bytes().ok()
+                })
+            })
+    }
+}
+impl Eq for PackageDefinitionSnapshot {}
 
 impl EffectiveDelegationGrant {
     fn permits_package_child(&self, child_ref: &AllowedChild) -> bool {

@@ -196,27 +196,83 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
         sandbox,
         verification,
         question,
-        model: cockpit_proto::AgentModelControlV1 {
-            effective: ctx.effective.as_ref().and_then(|o| {
-                o.model
+        model: {
+            let allowed = ctx
+                .profile
+                .as_ref()
+                .map(|profile| {
+                    profile
+                        .bindings
+                        .iter()
+                        .filter(|binding| binding.slot_id == "primary")
+                        .map(|binding| cockpit_proto::AgentModelRefV1 {
+                            provider_id: binding.selected_provider_alias.provider_id.clone(),
+                            model_id: binding.model_id.clone(),
+                            is_default: binding.is_default,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let effective = ctx
+                .effective
+                .as_ref()
+                .and_then(|o| o.model.as_ref())
+                .map(|binding| {
+                    ctx.profile
+                        .as_ref()
+                        .and_then(|profile| {
+                            profile.bindings.iter().find(|candidate| {
+                                candidate.provider_profile_handle == binding.provider
+                                    && candidate.model_id == binding.model
+                            })
+                        })
+                        .map(|candidate| cockpit_proto::AgentModelRefV1 {
+                            provider_id: candidate.selected_provider_alias.provider_id.clone(),
+                            model_id: candidate.model_id.clone(),
+                            is_default: candidate.is_default,
+                        })
+                        .unwrap_or(cockpit_proto::AgentModelRefV1 {
+                            provider_id: binding.provider.clone(),
+                            model_id: binding.model.clone(),
+                            is_default: false,
+                        })
+                })
+                .or_else(|| {
+                    allowed
+                        .iter()
+                        .find(|candidate| candidate.is_default)
+                        .cloned()
+                });
+            cockpit_proto::AgentModelControlV1 {
+                effective,
+                allowed,
+                pending: ctx
+                    .pending
                     .as_ref()
-                    .map(|binding| cockpit_proto::AgentModelRefV1 {
-                        provider_id: binding.provider.clone(),
-                        model_id: binding.model.clone(),
-                        is_default: false,
-                    })
-            }),
-            allowed: Vec::new(),
-            pending: ctx.pending.as_ref().and_then(|o| {
-                o.model
-                    .as_ref()
-                    .map(|binding| cockpit_proto::AgentModelRefV1 {
-                        provider_id: binding.provider.clone(),
-                        model_id: binding.model.clone(),
-                        is_default: false,
-                    })
-            }),
-            locked_reason: terminal_lock,
+                    .and_then(|o| o.model.as_ref())
+                    .map(|binding| {
+                        ctx.profile
+                            .as_ref()
+                            .and_then(|profile| {
+                                profile.bindings.iter().find(|candidate| {
+                                    candidate.slot_id == "primary"
+                                        && candidate.provider_profile_handle == binding.provider
+                                        && candidate.model_id == binding.model
+                                })
+                            })
+                            .map(|candidate| cockpit_proto::AgentModelRefV1 {
+                                provider_id: candidate.selected_provider_alias.provider_id.clone(),
+                                model_id: candidate.model_id.clone(),
+                                is_default: candidate.is_default,
+                            })
+                            .unwrap_or(cockpit_proto::AgentModelRefV1 {
+                                provider_id: "unavailable".to_string(),
+                                model_id: binding.model.clone(),
+                                is_default: false,
+                            })
+                    }),
+                locked_reason: terminal_lock,
+            }
         },
     }
 }
@@ -228,10 +284,14 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
 pub fn resolve_node_model_override(
     snapshot: &SessionSetupSnapshotV1,
     installation_id: Option<&str>,
+    profile: Option<&RedactedAgentProfileSnapshot>,
     slot_id: &str,
     choice_id: &str,
     providers: &ProvidersConfig,
 ) -> Result<StoredModelBinding, AgentSessionOverrideStatusV1> {
+    if slot_id != "primary" {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
     let Some(installation_id) = installation_id.filter(|id| !id.is_empty()) else {
         return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
     };
@@ -260,6 +320,15 @@ pub fn resolve_node_model_override(
     else {
         return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
     };
+    if let Some(profile) = profile
+        && !profile.bindings.iter().any(|binding| {
+            binding.slot_id == slot_id
+                && binding.model_id == choice.model_id
+                && binding.provider_profile_handle == provider
+        })
+    {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
     Ok(StoredModelBinding {
         slot_id: slot_id.to_string(),
         provider,
@@ -1007,6 +1076,7 @@ mod tests {
         let binding = resolve_node_model_override(
             &snapshot,
             Some("inst-a"),
+            None,
             "primary",
             "choice-local-offering-0",
             &providers,
@@ -1053,6 +1123,7 @@ mod tests {
         let child = resolve_node_model_override(
             &snapshot,
             Some("inst-child"),
+            None,
             "primary",
             "child-choice",
             &providers,
@@ -1065,6 +1136,7 @@ mod tests {
             resolve_node_model_override(
                 &snapshot,
                 Some("inst-child"),
+                None,
                 "primary",
                 "root-choice",
                 &providers,
@@ -1076,6 +1148,7 @@ mod tests {
             resolve_node_model_override(
                 &snapshot,
                 Some("inst-root"),
+                None,
                 "primary",
                 "child-choice",
                 &providers,
@@ -1116,6 +1189,7 @@ mod tests {
         let binding = resolve_node_model_override(
             &snapshot,
             Some("inst-a"),
+            None,
             "primary",
             "a-choice",
             &providers,
@@ -1148,6 +1222,7 @@ mod tests {
         assert_eq!(
             resolve_node_model_override(
                 &snapshot,
+                None,
                 None,
                 "primary",
                 "choice-local-offering-0",

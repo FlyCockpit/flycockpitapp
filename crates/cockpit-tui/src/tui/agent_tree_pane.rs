@@ -88,6 +88,7 @@ struct OverrideView {
     installation_id: Option<String>,
     override_revision: u64,
     terminal: bool,
+    model: cockpit_proto::AgentModelControlV1,
     title: String,
     effective_rows: Vec<OverrideRow>,
     model_rows: Vec<OverrideRow>,
@@ -180,6 +181,7 @@ impl AgentTreePane {
             installation_id: snapshot.installation_id.clone(),
             override_revision: snapshot.override_revision,
             terminal: snapshot.terminal,
+            model: snapshot.model.clone(),
             title: format!("Overrides — {}", short_id(agent_instance_id)),
             effective_rows: build_override_rows(&snapshot),
             model_rows: previous_model_rows,
@@ -208,7 +210,9 @@ impl AgentTreePane {
                 .find(|candidate| &candidate.installation.installation_id == installation_id)
         });
         view.model_rows = candidate
-            .map(|candidate| build_model_rows(&candidate.slots, view.terminal))
+            .map(|candidate| {
+                build_model_rows_with_control(&candidate.slots, view.terminal, Some(&view.model))
+            })
             .unwrap_or_default();
         view.recompute_rows();
     }
@@ -748,6 +752,14 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
 /// carried in the effective-settings DTO, so choices are tagged by the daemon's
 /// author-suggested flag rather than a live "current" marker.
 fn build_model_rows(slots: &[SessionSetupModelSlotV1], terminal: bool) -> Vec<OverrideRow> {
+    build_model_rows_with_control(slots, terminal, None)
+}
+
+fn build_model_rows_with_control(
+    slots: &[SessionSetupModelSlotV1],
+    terminal: bool,
+    control: Option<&cockpit_proto::AgentModelControlV1>,
+) -> Vec<OverrideRow> {
     let mut rows = Vec::new();
     if slots.is_empty() {
         return rows;
@@ -764,6 +776,14 @@ fn build_model_rows(slots: &[SessionSetupModelSlotV1], terminal: bool) -> Vec<Ov
             continue;
         }
         for choice in &slot.choices {
+            let allowed = control.is_none_or(|control| {
+                control.allowed.iter().any(|model| {
+                    model.provider_id == choice.provider_id && model.model_id == choice.model_id
+                })
+            });
+            if !allowed {
+                continue;
+            }
             let suggested = if choice.author_suggested {
                 " (suggested)"
             } else {
@@ -774,8 +794,21 @@ fn build_model_rows(slots: &[SessionSetupModelSlotV1], terminal: bool) -> Vec<Ov
                 .as_deref()
                 .map(|label| format!(" — {label}"))
                 .unwrap_or_default();
+            let marker = control
+                .and_then(|control| {
+                    control.allowed.iter().find(|model| {
+                        model.provider_id == choice.provider_id && model.model_id == choice.model_id
+                    })
+                })
+                .map_or("", |model| if model.is_default { " (default)" } else { "" });
+            let current = control
+                .and_then(|control| control.effective.as_ref())
+                .is_some_and(|model| {
+                    model.provider_id == choice.provider_id && model.model_id == choice.model_id
+                });
+            let arrow = if current { "✓" } else { "→" };
             let text = format!(
-                "    → {}/{}{label}{suggested}",
+                "    {arrow} {}/{}{label}{suggested}{marker}",
                 choice.provider_id, choice.model_id
             );
             if terminal {

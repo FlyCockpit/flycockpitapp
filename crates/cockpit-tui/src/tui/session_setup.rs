@@ -311,7 +311,11 @@ fn slot_rows(slot: &SessionSetupModelSlotV1, out: &mut Vec<DisplayRow>) {
     // first, then other hard-compatible offerings. Render in that exact order;
     // never reorder or fuzzy-match here.
     for choice in &slot.choices {
-        out.push(choice_row(choice));
+        let mut row = choice_row(choice);
+        if slot.default_choice_id.as_deref() == Some(choice.choice_id.as_str()) {
+            row.text.push_str(" (default)");
+        }
+        out.push(row);
     }
     // Visibly unmatched recommendations are retained rather than fuzzy-matched.
     for rec in &slot.unmatched_recommendations {
@@ -468,12 +472,12 @@ mod tests {
                 choice("local", "compatible", false, false),
             ],
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
-                default_choice_id: None,
                 recommendation_id: "missing".to_string(),
                 canonical_upstream_identity: "author/missing".to_string(),
                 author_label: None,
                 rationale: None,
             }],
+            default_choice_id: None,
             unavailable_reason: None,
         };
         let snap = snapshot(vec![candidate(

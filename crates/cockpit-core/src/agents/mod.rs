@@ -1082,6 +1082,7 @@ impl AgentDef {
             .ok_or_else(|| anyhow::anyhow!("vNext grant requires a schemaVersion 2 definition"))?;
         let mut grant = vnext.resolve_grant(host)?;
         if let Some(delegation) = &mut grant.delegation {
+            let mut package_definitions = BTreeMap::new();
             for (name, child) in &self.private_subagents {
                 if let Some(child_vnext) = &child.vnext {
                     if delegation
@@ -1097,8 +1098,21 @@ impl AgentDef {
                             .entry(child_vnext.agent_id.clone())
                             .or_insert_with(|| child_vnext.agent_id.clone());
                     }
+                    package_definitions.insert(name.clone(), child.clone());
+                    package_definitions
+                        .entry(child_vnext.agent_id.clone())
+                        .or_insert_with(|| child.clone());
                 }
             }
+            if delegation
+                .allowed_children
+                .iter()
+                .any(AllowedChild::is_self)
+            {
+                package_definitions.insert(SELF_CHILD_REF.to_string(), self.clone());
+            }
+            delegation.package_definitions =
+                vnext::PackageDefinitionSnapshot(std::sync::Arc::new(package_definitions));
         }
         Ok(grant)
     }
@@ -1452,7 +1466,7 @@ fn parse_agent_with_scope(
 /// Canonical whole-tree digest preimage: each file is length-prefixed path
 /// then length-prefixed contents, in sorted relative-path order. Changing any
 /// file, adding one, or renaming one changes the preimage.
-fn package_digest_preimage(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+pub(crate) fn package_digest_preimage(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let mut out = Vec::new();
     for (path, content) in files {
         let path_bytes = path.as_bytes();
@@ -1659,6 +1673,35 @@ fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
         return load_package(&agent_dir, name);
     }
     load_legacy_prompt_override_dir(dir, name, &agent_dir)
+}
+
+/// Load one daemon-owned definition without rediscovering layers. Both the
+/// historical flat file and the package directory are accepted; callers must
+/// already have authorized the path's parent.
+pub(crate) fn load_owned_definition(path: &Path, name: &str) -> Result<AgentDef> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("statting owned agent definition {}", path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "owned agent definition may not be a symlink"
+    );
+    if metadata.is_dir() {
+        let parent = path.parent().context("owned agent package has no parent")?;
+        return load_from_dir(parent, name);
+    }
+    ensure!(
+        metadata.is_file(),
+        "owned agent definition is not a regular file"
+    );
+    let bytes = cockpit_host::private_fs::read_private_file(path, "owned agent definition")
+        .with_context(|| format!("reading owned agent definition {}", path.display()))?
+        .context("owned agent definition disappeared while reading")?;
+    ensure!(
+        bytes.len() <= MAX_MARKDOWN_BYTES as usize,
+        "owned agent definition exceeds the per-file limit"
+    );
+    let text = std::str::from_utf8(&bytes).context("owned agent definition is not UTF-8")?;
+    parse_agent(text, name, path.to_path_buf())
 }
 
 fn load_package(agent_dir: &Path, name: &str) -> Result<AgentDef> {

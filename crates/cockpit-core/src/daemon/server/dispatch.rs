@@ -23152,6 +23152,7 @@ async fn resolve_model_override_field(
     att: &AttachedSession,
     session_id: Uuid,
     installation_id: Option<&str>,
+    profile: Option<&crate::db::agent_installations::RedactedAgentProfileSnapshot>,
     slot_id: &str,
     choice_id: &str,
 ) -> std::result::Result<
@@ -23173,6 +23174,7 @@ async fn resolve_model_override_field(
         crate::daemon::agent_session_override::resolve_node_model_override(
             &snapshot,
             installation_id,
+            profile,
             slot_id,
             choice_id,
             &providers,
@@ -23233,6 +23235,7 @@ pub(super) async fn apply_agent_session_override(
                 att,
                 session_id,
                 node_ctx.installation_id.as_deref(),
+                node_ctx.profile.as_ref(),
                 slot_id,
                 choice_id,
             )

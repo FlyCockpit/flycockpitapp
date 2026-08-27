@@ -647,6 +647,7 @@ async fn grant_rejection_unknown_agent_lists_reachable_agents() {
         assistant_db: &driver.session.db,
         local_installations: &driver.vnext_local_installation_resolver,
         parent_write_scope: None,
+        child_write_scope: None,
         parent_workspace_lease: None,
         workspace_lease: None,
     })

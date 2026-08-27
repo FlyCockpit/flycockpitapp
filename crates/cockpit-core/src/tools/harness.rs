@@ -455,6 +455,45 @@ impl Tool for HarnessInvokeTool {
         )
         .await?;
 
+        let daemon_state_dir = cockpit_config::config::resolve::cockpit_state_dir().ok();
+        // Isolated harnesses always get a distinct nested managed worktree.
+        // Reusing the child's lease UUID/root would make `git worktree add`
+        // target an occupied path and would collapse the harness isolation
+        // boundary into its caller's workspace.
+        let mut issued_workspace_lease = None;
+        // Preserve the documented non-git fallback: only a git-backed
+        // isolated run needs a managed-worktree lease.  `run_harness` keeps
+        // its existing direct-mode fallback for ordinary directories.
+        let workspace_lease_id = if policy == WritePolicy::Isolated
+            && crate::git::find_worktree_root(&cwd).is_some()
+        {
+            let owner = ctx.agent_instance_id.ok_or_else(|| {
+                invalid_input("isolated harness workspace issuance requires a durable agent owner")
+            })?;
+            let state_dir = daemon_state_dir.as_deref().ok_or_else(|| {
+                invalid_input(
+                    "isolated harness workspace issuance requires the daemon state directory",
+                )
+            })?;
+            let lease = crate::workspace_lease::issue_managed_worktree_lease_for_harness(
+                &ctx.session.db,
+                ctx.session.id,
+                owner,
+                &cwd,
+                state_dir,
+            )
+            .await
+            .map_err(|error| {
+                invalid_input(format!(
+                    "isolated harness workspace lease issuance failed: {error:#}"
+                ))
+            })?;
+            let id = lease.id;
+            issued_workspace_lease = Some(lease);
+            id
+        } else {
+            ctx.workspace_lease.as_ref().map(|lease| lease.id)
+        };
         let result = run_harness(RunContext {
             harness_name: &harness_name,
             cfg: hc,
@@ -468,13 +507,20 @@ impl Tool for HarnessInvokeTool {
             providers: &providers,
             shutdown_gate: Some(ctx.shutdown_gate.clone()),
             env_overlay: Some(&env_overlay),
-            daemon_state_dir: None,
-            workspace_lease_id: None,
+            daemon_state_dir: daemon_state_dir.as_deref(),
+            workspace_lease_id,
         })
         .await;
 
         match result {
             Ok(run) => {
+                if let Some(lease) = issued_workspace_lease.as_ref() {
+                    crate::workspace_lease::grace_retain_completed_harness_lease(
+                        &ctx.session.db,
+                        lease,
+                    )
+                    .await;
+                }
                 let text = format!(
                     "using external harness `{}`\n\n{}",
                     harness_selector(&harness_name),
@@ -489,7 +535,13 @@ impl Tool for HarnessInvokeTool {
             // Preflight / spawn / worktree failures: actionable errors. These
             // are environmental, not bad input, so they bubble as a normal
             // (execution) error string the dispatcher surfaces.
-            Err(msg) => Err(anyhow::anyhow!(msg)),
+            Err(msg) => {
+                if let Some(lease) = issued_workspace_lease.as_ref() {
+                    crate::workspace_lease::mark_harness_lease_uncertain(&ctx.session.db, lease)
+                        .await;
+                }
+                Err(anyhow::anyhow!(msg))
+            }
         }
     }
 }

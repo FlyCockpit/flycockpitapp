@@ -102,31 +102,90 @@ pub fn sandbox_policy(
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
 ) -> SandboxPolicy {
+    sandbox_policy_with_visibility_restriction(
+        cwd,
+        tmp_dir,
+        session_env,
+        extra_paths,
+        write_scope,
+        false,
+        true,
+    )
+}
+
+/// Policy view for a typed workspace lease. Unlike the normal session policy,
+/// user-configured PATH/profile and tool allowlists cannot add filesystem
+/// access outside the lease visibility root.
+pub fn sandbox_policy_for_workspace_lease(
+    cwd: &std::path::Path,
+    tmp_dir: Option<&std::path::Path>,
+    session_env: &std::collections::HashMap<String, String>,
+    extra_paths: &[ExtraSandboxPath],
+    write_scope: Option<&std::path::Path>,
+) -> SandboxPolicy {
+    sandbox_policy_with_visibility_restriction(
+        cwd,
+        tmp_dir,
+        session_env,
+        extra_paths,
+        write_scope,
+        true,
+        true,
+    )
+}
+
+fn sandbox_policy_with_visibility_restriction(
+    cwd: &std::path::Path,
+    tmp_dir: Option<&std::path::Path>,
+    session_env: &std::collections::HashMap<String, String>,
+    extra_paths: &[ExtraSandboxPath],
+    write_scope: Option<&std::path::Path>,
+    restrict_to_visibility: bool,
+    workspace_write_allowed: bool,
+) -> SandboxPolicy {
     let mut allow_read_roots = Vec::new();
     let mut allow_write_roots = Vec::new();
     push_unique_path(&mut allow_read_roots, cwd.to_path_buf());
-    if let Some(scope) = write_scope {
-        if cockpit_host::path_containment::contained_under(cwd, scope) {
-            push_unique_path(&mut allow_write_roots, scope.to_path_buf());
+    if workspace_write_allowed {
+        if let Some(scope) = write_scope {
+            if cockpit_host::path_containment::contained_under(cwd, scope) {
+                push_unique_path(&mut allow_write_roots, scope.to_path_buf());
+            }
+        } else {
+            push_unique_path(&mut allow_write_roots, cwd.to_path_buf());
         }
-    } else {
-        push_unique_path(&mut allow_write_roots, cwd.to_path_buf());
     }
 
     for path in crate::env_snapshot::user_runtime_read_paths_from_path(
         session_env.get("PATH").map(String::as_str),
     ) {
-        push_unique_path(&mut allow_read_roots, path);
+        if !restrict_to_visibility || is_narrow_runtime_read_exception(&path) {
+            push_unique_path(&mut allow_read_roots, path);
+        }
     }
 
     for extra in extra_paths {
-        push_unique_path(&mut allow_read_roots, extra.path.clone());
-        if matches!(extra.access, SandboxPathAccess::ReadWrite) {
+        let inside_visibility = cockpit_host::path_containment::contained_under(cwd, &extra.path);
+        let safe_read_exception = matches!(extra.access, SandboxPathAccess::Read)
+            && is_narrow_runtime_read_exception(&extra.path);
+        if !restrict_to_visibility || inside_visibility || safe_read_exception {
+            push_unique_path(&mut allow_read_roots, extra.path.clone());
+        }
+        if workspace_write_allowed
+            && matches!(extra.access, SandboxPathAccess::ReadWrite)
+            && (!restrict_to_visibility || inside_visibility)
+        {
             push_unique_path(&mut allow_write_roots, extra.path.clone());
         }
     }
 
-    if let Some(tmp) = tmp_dir {
+    if workspace_write_allowed
+        && let Some(tmp) = tmp_dir
+        && (!restrict_to_visibility || cockpit_host::path_containment::contained_under(cwd, tmp))
+    {
+        // A leased shell may only use lease-local scratch. The normal
+        // per-session tmp directory is deliberately not an implicit escape
+        // hatch into another workspace's shared state.
         push_unique_path(&mut allow_read_roots, tmp.to_path_buf());
         push_unique_path(&mut allow_write_roots, tmp.to_path_buf());
     }
@@ -136,6 +195,22 @@ pub fn sandbox_policy(
         allow_write_roots,
         network_allowed: true,
     }
+}
+
+/// A leased shell gets no user/profile/toolchain directory escape hatch. The
+/// only outside reads are fixed system runtime roots needed to exec the shell
+/// itself; `/usr/local`, home directories and PATH/profile-provided roots are
+/// deliberately not exceptions.
+fn is_narrow_runtime_read_exception(path: &std::path::Path) -> bool {
+    matches!(
+        path,
+        path if path == std::path::Path::new("/bin")
+            || path == std::path::Path::new("/usr/bin")
+            || path == std::path::Path::new("/lib")
+            || path == std::path::Path::new("/lib64")
+            || path == std::path::Path::new("/usr/lib")
+            || path == std::path::Path::new("/usr/lib64")
+    )
 }
 
 fn push_unique_path(paths: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
@@ -223,6 +298,8 @@ pub async fn build_sandboxed_command(
         session_env,
         extra_paths,
         write_scope,
+        false,
+        true,
     )
     .await
 }
@@ -241,13 +318,42 @@ pub async fn build_sandboxed_command_with_visibility_root(
     session_env: &std::collections::HashMap<String, String>,
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
+    restrict_to_visibility: bool,
+    workspace_write_allowed: bool,
 ) -> Result<tokio::process::Command> {
-    let policy = sandbox_policy(
+    // Session scratch is shared state and may sit outside a child lease. A
+    // writable leased shell instead receives a dedicated scratch directory
+    // below its visibility root; read/execute-only leases receive none.
+    let lease_scratch = if restrict_to_visibility && workspace_write_allowed {
+        let scratch_root = write_scope
+            .filter(|scope| cockpit_host::path_containment::contained_under(visibility_root, scope))
+            .unwrap_or(visibility_root);
+        let path = scratch_root.join(".cockpit-tmp");
+        std::fs::create_dir_all(&path)
+            .map_err(|error| anyhow::anyhow!("creating lease-local shell scratch: {error}"))?;
+        Some(path)
+    } else {
+        None
+    };
+    let tmp_dir = if restrict_to_visibility {
+        lease_scratch.as_deref()
+    } else {
+        tmp_dir
+    };
+    let policy = sandbox_policy_with_visibility_restriction(
         visibility_root,
         tmp_dir,
         session_env,
         extra_paths,
-        write_scope,
+        if restrict_to_visibility && !workspace_write_allowed {
+            // A read/execute-only lease must not regain cwd writes merely
+            // because a shell command has no explicit write scope.
+            Some(std::path::Path::new("/__cockpit-deny-writes__"))
+        } else {
+            write_scope
+        },
+        restrict_to_visibility,
+        workspace_write_allowed,
     );
     let mut sandbox = zerobox::Sandbox::command("sh")
         .arg("-c")
@@ -281,7 +387,11 @@ pub async fn build_sandboxed_command_with_visibility_root(
         sandbox = sandbox.allow_write(path.clone());
     }
 
-    if let Some(tmp) = tmp_dir {
+    if workspace_write_allowed
+        && let Some(tmp) = tmp_dir
+        && (!restrict_to_visibility
+            || cockpit_host::path_containment::contained_under(visibility_root, tmp))
+    {
         sandbox = sandbox
             // Point the temp-dir env vars at the one writable scratch area.
             // Without this, `mktemp` / `tempfile` / `std::env::temp_dir()`
@@ -811,6 +921,38 @@ mod tests {
         assert!(scoped.allow_read_roots.contains(&cwd.path().to_path_buf()));
         assert!(!scoped.allow_write_roots.contains(&cwd.path().to_path_buf()));
         assert!(scoped.allow_write_roots.contains(&scope));
+    }
+
+    #[test]
+    fn leased_policy_does_not_admit_shared_session_tmp() {
+        let lease_root = tempfile::tempdir().unwrap();
+        let shared_tmp = tempfile::tempdir().unwrap();
+        let policy = sandbox_policy_for_workspace_lease(
+            lease_root.path(),
+            Some(shared_tmp.path()),
+            &std::collections::HashMap::new(),
+            &[],
+            None,
+        );
+        assert!(
+            policy
+                .allow_read_roots
+                .contains(&lease_root.path().to_path_buf())
+        );
+        assert!(
+            policy
+                .allow_write_roots
+                .contains(&lease_root.path().to_path_buf())
+        );
+        assert!(
+            !policy
+                .allow_read_roots
+                .contains(&shared_tmp.path().to_path_buf())
+                && !policy
+                    .allow_write_roots
+                    .contains(&shared_tmp.path().to_path_buf()),
+            "a shared session temp dir must not escape a workspace lease"
+        );
     }
 
     /// The scratch dir is wired into `TMPDIR`/`TMP`/`TEMP` on the confined

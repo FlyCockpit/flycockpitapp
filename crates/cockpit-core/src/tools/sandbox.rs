@@ -101,6 +101,46 @@ pub async fn check_native_access(
     path: &Path,
     required: SandboxPathAccess,
 ) -> Result<PathBuf> {
+    // A workspace lease is a hard filesystem boundary, not an additional
+    // source of approval.  In particular, a stale lease, a read-only lease
+    // used for a write, or a path outside its visibility root must never fall
+    // through to the ambient `approve_path` flow.
+    if let Some(lease) = ctx.workspace_lease.as_deref() {
+        if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+            return Err(invalid_input(format!(
+                "`{}` is denied because workspace lease `{}` is expired or revoked",
+                path.display(),
+                lease.id
+            )));
+        }
+        let permitted = match required {
+            SandboxPathAccess::Read => lease.allows_read(),
+            SandboxPathAccess::ReadWrite => lease.allows_write(),
+        };
+        if !permitted {
+            return Err(invalid_input(format!(
+                "`{}` is denied by workspace lease `{}` operation authority",
+                path.display(),
+                lease.id
+            )));
+        }
+        let effective = effective_native_path(path).map_err(|err| {
+            invalid_input(format!(
+                "`{}` cannot be proven inside workspace lease `{}`: {err}",
+                path.display(),
+                lease.id
+            ))
+        })?;
+        if !lease.covers_path(&effective) {
+            return Err(invalid_input(format!(
+                "`{}` is outside workspace lease visibility `{}`",
+                effective.display(),
+                lease.visibility_root.display()
+            )));
+        }
+        return Ok(effective);
+    }
+
     let effective = match effective_native_path(path) {
         Ok(path) => path,
         Err(err) => {

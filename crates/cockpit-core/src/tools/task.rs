@@ -170,7 +170,7 @@ impl TaskTool {
                 },
                 "workspace_lease": {
                     "type": "string",
-                    "description": "Live host-issued workspace lease UUID. Intersected with the parent grant; cannot widen cwd, visibility, tools, model, depth, or concurrency."
+                    "description": "Requested containment kind (`same_root`, `subdirectory`, or `managed_worktree`) or a live host-issued lease UUID. Kinds are issued by the daemon after grant intersection; this argument cannot mint or widen authority."
                 },
                 "grant_tools": {
                     "type": "array",
@@ -233,7 +233,7 @@ impl TaskTool {
                 },
                 "workspace_lease": {
                     "type": "string",
-                    "description": "Live host-issued workspace lease UUID; intersected with the parent grant"
+                    "description": "Requested containment kind or a live host-issued lease UUID; the daemon issues and intersects kinds with the parent grant"
                 },
                 "remaining_depth": {
                     "type": "integer",

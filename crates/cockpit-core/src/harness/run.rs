@@ -716,7 +716,9 @@ impl Worktree {
         };
         let repo = crate::git::resolve_git_path(&repo)?;
         let head = crate::git::head_sha(&repo)?;
-        let lease_id = workspace_lease_id.unwrap_or_else(uuid::Uuid::new_v4);
+        let lease_id = workspace_lease_id.context(
+            "isolated harness worktree requires a durable host-issued workspace lease id",
+        )?;
         let state_dir = match daemon_state_dir {
             Some(dir) => dir.to_path_buf(),
             None => cockpit_config::config::resolve::cockpit_state_dir()

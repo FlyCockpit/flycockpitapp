@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use crate::agents::{DelegationTarget, EffectiveVnextGrant, ExecutionKind};
 use crate::db::workspace_lease_artifacts::{
-    LeaseCasOutcome, WorkspaceDigest, WorkspaceLeaseKind as DbLeaseKind, WorkspaceLeaseRow,
-    WorkspaceLeaseState, WorkspaceLeaseTerminalReason,
+    LeaseCasOutcome, NewWorkspaceLease, WorkspaceDigest, WorkspaceLeaseKind as DbLeaseKind,
+    WorkspaceLeaseRow, WorkspaceLeaseState, WorkspaceLeaseTerminalReason,
 };
 
 /// Runtime workspace-lease kind. Kept in lockstep with the SQL CHECK and
@@ -84,6 +84,29 @@ pub struct WorkspaceLeaseOps {
 }
 
 impl WorkspaceLeaseOps {
+    const READ: u8 = 0b0001;
+    const WRITE: u8 = 0b0010;
+    const EXECUTE: u8 = 0b0100;
+    const COMPUTER: u8 = 0b1000;
+
+    pub fn to_bits(self) -> u8 {
+        (if self.read { Self::READ } else { 0 })
+            | (if self.write { Self::WRITE } else { 0 })
+            | (if self.execute { Self::EXECUTE } else { 0 })
+            | (if self.computer { Self::COMPUTER } else { 0 })
+    }
+
+    pub fn from_bits(bits: u8) -> Result<Self> {
+        if bits > 0b1111 {
+            bail!("workspace lease allowed_ops is outside the closed bit set");
+        }
+        Ok(Self {
+            read: bits & Self::READ != 0,
+            write: bits & Self::WRITE != 0,
+            execute: bits & Self::EXECUTE != 0,
+            computer: bits & Self::COMPUTER != 0,
+        })
+    }
     pub fn none() -> Self {
         Self {
             read: false,
@@ -148,6 +171,7 @@ pub struct WorkspaceLease {
     pub base_sha_digest: WorkspaceDigest,
     pub base_ref_digest: WorkspaceDigest,
     pub managed_path: PathBuf,
+    pub private_ref_digest: WorkspaceDigest,
     pub allowed_ops: WorkspaceLeaseOps,
     pub expires_at_unix_ms: i64,
     pub state: WorkspaceLeaseState,
@@ -155,7 +179,7 @@ pub struct WorkspaceLease {
 }
 
 impl WorkspaceLease {
-    pub fn from_row(row: &WorkspaceLeaseRow, allowed_ops: WorkspaceLeaseOps) -> Result<Self> {
+    pub fn from_row(row: &WorkspaceLeaseRow) -> Result<Self> {
         let kind = WorkspaceLeaseKind::from_db(row.kind);
         let canonical_root = PathBuf::from(&row.canonical_root);
         let managed_path = PathBuf::from(&row.managed_path);
@@ -183,7 +207,8 @@ impl WorkspaceLease {
             base_sha_digest: row.base_sha_digest.clone(),
             base_ref_digest: row.base_ref_digest.clone(),
             managed_path,
-            allowed_ops: allowed_ops.confined_to_kind(kind),
+            private_ref_digest: row.private_ref_digest.clone(),
+            allowed_ops: WorkspaceLeaseOps::from_bits(row.allowed_ops)?.confined_to_kind(kind),
             expires_at_unix_ms: row.expires_at_unix_ms,
             state: row.state,
             revision: row.revision,
@@ -210,6 +235,7 @@ impl WorkspaceLease {
             canonical_root: visibility_root.clone(),
             kind,
             managed_path: visibility_root.clone(),
+            private_ref_digest: WorkspaceDigest::of(b"ephemeral"),
             visibility_root,
             base_sha_digest: WorkspaceDigest::of(b"ephemeral"),
             base_ref_digest: WorkspaceDigest::of(b"ephemeral"),
@@ -270,10 +296,11 @@ impl WorkspaceLease {
         }
     }
 
-    /// Durable identity check used at crash recovery. A missing path or a
-    /// managed worktree that is no longer a git directory is a mismatch; the
-    /// host marks the lease uncertain rather than deleting it. HEAD movement
-    /// from in-lease work is not a mismatch.
+    /// Durable identity check used at crash recovery. This verifies the
+    /// recorded repository identity, base receipts, and private branch rather
+    /// than accepting any Git worktree that happens to occupy the path. HEAD
+    /// movement from in-lease work is allowed, but a replacement becomes
+    /// uncertain and is never cleaned automatically.
     pub fn identity_matches_disk(&self) -> bool {
         let Ok(root) = cockpit_host::path_containment::effective_path(&self.visibility_root) else {
             return false;
@@ -281,8 +308,56 @@ impl WorkspaceLease {
         if !root.is_dir() {
             return false;
         }
+        let Some(worktree_root) = crate::git::find_worktree_root(&root) else {
+            return false;
+        };
+        let Ok(worktree_root) = cockpit_host::path_containment::effective_path(&worktree_root)
+        else {
+            return false;
+        };
+        if worktree_root != root {
+            return false;
+        }
+        let Ok(repository_id) = canonical_repository_identity(&root) else {
+            return false;
+        };
+        if repository_id != self.canonical_repository_id {
+            return false;
+        }
+        // The receipt hashes deliberately avoid persisting raw refs/SHAs.
+        // Recompute against Git's complete durable object/ref lists to prove
+        // that the recorded base still belongs to this repository.
+        let Ok(commits) = crate::git::run_git_checked(&root, &["rev-list", "--all"]) else {
+            return false;
+        };
+        if !commits
+            .lines()
+            .any(|sha| WorkspaceDigest::of(sha.trim()) == self.base_sha_digest)
+        {
+            return false;
+        }
+        let Ok(refs) = crate::git::run_git_checked(&root, &["for-each-ref", "--format=%(refname)"])
+        else {
+            return false;
+        };
+        if !refs
+            .lines()
+            .any(|reference| WorkspaceDigest::of(reference.trim()) == self.base_ref_digest)
+            && !commits
+                .lines()
+                .any(|sha| WorkspaceDigest::of(sha.trim()) == self.base_ref_digest)
+        {
+            return false;
+        }
         if self.kind == WorkspaceLeaseKind::ManagedWorktree {
-            return crate::git::find_worktree_root(&root).is_some();
+            let expected_branch = format!("cockpit-lease/{}", self.id);
+            let Ok(branch) =
+                crate::git::run_git_checked(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
+            else {
+                return false;
+            };
+            return branch.trim() == expected_branch
+                && WorkspaceDigest::of(&expected_branch) == self.private_ref_digest;
         }
         true
     }
@@ -293,23 +368,284 @@ pub fn managed_worktree_path(state_dir: &Path, lease_id: Uuid) -> PathBuf {
     state_dir.join("worktrees").join(lease_id.to_string())
 }
 
-/// True when `path` is a host-managed worktree directory
-/// (`.../worktrees/<lease-uuid>`), so child cwd resolution may leave the
-/// primary repository.
-pub fn is_managed_worktree_path(path: &Path) -> bool {
+/// Issue a task workspace lease at the daemon boundary.
+///
+/// `task` may describe a desired containment kind, but it never supplies an
+/// authority token.  This function is the only producer for those requests:
+/// it derives the repository, root write-scope binding, receipts, operations,
+/// expiry, and (for managed worktrees) destination from daemon state and the
+/// already-live parent grant.  Callers must still run the normal child
+/// definition/model/tool/depth/concurrency preflight before starting a child;
+/// the resulting token is deliberately only an input to that intersection.
+///
+/// A managed destination is recorded before `git worktree add`.  A command
+/// error is therefore uncertain rather than a reason to delete a possibly
+/// created user-visible worktree.
+pub async fn issue_task_workspace_lease(
+    db: &crate::db::Db,
+    session_id: Uuid,
+    owner_agent_instance_id: Uuid,
+    parent_grant: &EffectiveVnextGrant,
+    parent_cwd: &Path,
+    requested_child_cwd: Option<&Path>,
+    kind: WorkspaceLeaseKind,
+) -> Result<WorkspaceLease> {
+    let delegation = parent_grant
+        .delegation
+        .as_ref()
+        .context("parent effective vNext grant has no delegation authority")?;
+    if !delegation.targets.contains(&kind.as_delegation_target()) {
+        bail!(
+            "parent grant does not permit workspace lease kind `{}`",
+            kind.as_str()
+        );
+    }
+
+    let parent_cwd = cockpit_host::path_containment::effective_path(parent_cwd)
+        .context("resolving parent cwd for workspace lease issuance")?;
+    let repository = crate::git::find_worktree_root(&parent_cwd)
+        .context("task workspace lease requires a git worktree")?;
+    let repository = crate::git::resolve_git_path(&repository)?;
+    let write_scope_lease_id = db
+        .list_write_scope_leases_for_session(session_id)
+        .await?
+        .into_iter()
+        .find(|lease| lease.parent_lease_id.is_none() && lease.state == "active")
+        .map(|lease| lease.lease_id)
+        .context("task workspace lease requires the daemon root write scope")?;
+
+    let lease_id = Uuid::new_v4();
+    let (canonical_root, managed_path) = match kind {
+        WorkspaceLeaseKind::SameRoot => (parent_cwd.clone(), parent_cwd.clone()),
+        WorkspaceLeaseKind::Subdirectory => {
+            let child =
+                requested_child_cwd.context("subdirectory workspace lease requires a child cwd")?;
+            let child = cockpit_host::path_containment::effective_path(child)
+                .context("resolving subdirectory workspace lease cwd")?;
+            if child == parent_cwd
+                || !cockpit_host::path_containment::contained_under(&parent_cwd, &child)
+            {
+                bail!("subdirectory workspace lease must be a strict child of the parent cwd");
+            }
+            (child.clone(), child)
+        }
+        WorkspaceLeaseKind::ManagedWorktree => {
+            let state_dir = cockpit_config::config::resolve::cockpit_state_dir()
+                .context("resolving daemon state directory for managed task worktree")?;
+            let worktrees = state_dir.join("worktrees");
+            std::fs::create_dir_all(&worktrees)
+                .with_context(|| format!("creating `{}`", worktrees.display()))?;
+            let worktrees = cockpit_host::path_containment::effective_path(&worktrees)
+                .with_context(|| format!("resolving `{}`", worktrees.display()))?;
+            let path = worktrees.join(lease_id.to_string());
+            crate::git::assert_worktree_destination_under(&worktrees, &path)?;
+            (path.clone(), path)
+        }
+    };
+
+    let head = crate::git::head_sha(&repository)?;
+    let reference = crate::git::run_git(&repository, &["symbolic-ref", "--quiet", "HEAD"])
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| output.stdout)
+        .unwrap_or_else(|| head.clone());
+    let private_ref = format!("cockpit-lease/{lease_id}");
+    let now = now_unix_ms();
+    let row = db
+        .create_host_workspace_lease(
+            NewWorkspaceLease {
+                session_id,
+                agent_instance_id: owner_agent_instance_id,
+                write_scope_lease_id,
+                canonical_repository_id: canonical_repository_identity(&repository)?,
+                canonical_root: canonical_root.display().to_string(),
+                kind: kind.to_db(),
+                allowed_ops: WorkspaceLeaseOps::for_computer()
+                    .confined_to_kind(kind)
+                    .to_bits(),
+                base_sha_digest: WorkspaceDigest::of(head.clone()),
+                base_ref_digest: WorkspaceDigest::of(reference),
+                managed_path: managed_path.display().to_string(),
+                private_ref_digest: WorkspaceDigest::of(&private_ref),
+                expires_at_unix_ms: now.saturating_add(24 * 60 * 60 * 1000),
+            },
+            lease_id,
+            now,
+        )
+        .await
+        .context("persisting host-issued task workspace lease")?;
+    let lease = WorkspaceLease::from_row(&row)?;
+
+    if kind == WorkspaceLeaseKind::ManagedWorktree {
+        let branch = format!("cockpit-lease/{lease_id}");
+        if let Err(error) = crate::git::worktree_add(&repository, &managed_path, &branch, &head) {
+            mark_harness_lease_uncertain(db, &lease).await;
+            return Err(error).context("allocating persisted managed task worktree");
+        }
+    }
+    Ok(lease)
+}
+
+/// Host-only issuance for an isolated external harness.  The caller has
+/// already selected the harness under the normal approval and tool-surface
+/// gates; no model argument supplies any of this provenance.  We persist the
+/// lease *before* `git worktree add`, so crash recovery can retain and inspect
+/// an incomplete directory rather than treating it as disposable scratch.
+///
+/// The durable row is owned by the current agent-tree executor but binds to
+/// the daemon-owned root write-scope lease.  Session roots intentionally have
+/// no agent owner, so ordinary agent-owned lease creation cannot represent
+/// this host operation.  The DB's dedicated host method verifies that exact
+/// root authority is still active in this session.
+pub async fn issue_managed_worktree_lease_for_harness(
+    db: &crate::db::Db,
+    session_id: Uuid,
+    owner_agent_instance_id: Uuid,
+    cwd: &Path,
+    daemon_state_dir: &Path,
+) -> Result<WorkspaceLease> {
+    let repository = crate::git::find_worktree_root(cwd)
+        .context("isolated harness workspace lease requires a git worktree")?;
+    let repository = crate::git::resolve_git_path(&repository)?;
+    let write_scope_lease_id = db
+        .list_write_scope_leases_for_session(session_id)
+        .await?
+        .into_iter()
+        .find(|lease| lease.parent_lease_id.is_none() && lease.state == "active")
+        .map(|lease| lease.lease_id)
+        .context("isolated harness workspace lease requires the daemon root write scope")?;
+
+    // It is safe to create the daemon-owned container before persistence; the
+    // leased directory itself is not created until `Worktree::create` runs.
+    let worktrees = daemon_state_dir.join("worktrees");
+    std::fs::create_dir_all(&worktrees)
+        .with_context(|| format!("creating `{}`", worktrees.display()))?;
+    let worktrees = cockpit_host::path_containment::effective_path(&worktrees)
+        .with_context(|| format!("resolving `{}`", worktrees.display()))?;
+    let lease_id = Uuid::new_v4();
+    let managed_path = worktrees.join(lease_id.to_string());
+    crate::git::assert_worktree_destination_under(&worktrees, &managed_path)?;
+
+    let head = crate::git::head_sha(&repository)?;
+    let reference = crate::git::run_git(&repository, &["symbolic-ref", "--quiet", "HEAD"])
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| output.stdout)
+        .unwrap_or_else(|| head.clone());
+    let private_ref = format!("cockpit-lease/{lease_id}");
+    let row = db
+        .create_host_workspace_lease(
+            NewWorkspaceLease {
+                session_id,
+                agent_instance_id: owner_agent_instance_id,
+                write_scope_lease_id,
+                canonical_repository_id: canonical_repository_identity(&repository)?,
+                canonical_root: managed_path.display().to_string(),
+                kind: DbLeaseKind::ManagedWorktree,
+                allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
+                base_sha_digest: WorkspaceDigest::of(head),
+                base_ref_digest: WorkspaceDigest::of(reference),
+                managed_path: managed_path.display().to_string(),
+                private_ref_digest: WorkspaceDigest::of(private_ref),
+                expires_at_unix_ms: now_unix_ms().saturating_add(24 * 60 * 60 * 1000),
+            },
+            lease_id,
+            now_unix_ms(),
+        )
+        .await
+        .context("persisting host-managed harness workspace lease")?;
+    WorkspaceLease::from_row(&row)
+}
+
+/// A worktree creation/spawn failure is ambiguous: git may have created the
+/// directory or registered it before reporting an error.  Retain it and make
+/// that ambiguity durable for recovery instead of removing a path.
+pub async fn mark_harness_lease_uncertain(db: &crate::db::Db, lease: &WorkspaceLease) {
+    if let Err(error) = db
+        .mark_workspace_lease_uncertain(
+            lease.session_id,
+            lease.owner_agent_instance_id,
+            lease.id,
+            lease.revision,
+            WorkspaceLeaseTerminalReason::RestartUncertain,
+            now_unix_ms(),
+        )
+        .await
+    {
+        tracing::warn!(error = %error, lease = %lease.id, "marking failed managed harness lease uncertain failed");
+    }
+}
+
+/// Normal harness completion retains the worktree for the grace window.  A
+/// pin is a durable lifecycle observation without falsely labelling a
+/// successfully completed lease as an expiry.
+pub async fn grace_retain_completed_harness_lease(db: &crate::db::Db, lease: &WorkspaceLease) {
+    if let Err(error) = db
+        .grace_retain_workspace_lease(
+            lease.session_id,
+            lease.owner_agent_instance_id,
+            lease.id,
+            lease.revision,
+            now_unix_ms(),
+        )
+        .await
+    {
+        tracing::warn!(error = %error, lease = %lease.id, "grace-retaining managed harness lease failed");
+    }
+}
+
+/// Canonical identity shared by every linked Git worktree in one repository.
+/// `--git-common-dir` avoids treating a replacement worktree with a matching
+/// filename as the recorded repository merely because it is itself a Git repo.
+fn canonical_repository_identity(root: &Path) -> Result<String> {
+    let common = crate::git::run_git_checked(root, &["rev-parse", "--git-common-dir"])?;
+    let common = common.trim();
+    let common = Path::new(common);
+    let common = if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        root.join(common)
+    };
+    let common = cockpit_host::path_containment::effective_path(&common)
+        .context("resolving canonical Git common directory")?;
+    Ok(WorkspaceDigest::of(common.to_string_lossy().as_bytes())
+        .as_str()
+        .to_string())
+}
+
+/// The only authority to leave the primary workspace boundary. A UUID-shaped
+/// directory is never trusted: the caller must carry an owner-scoped, live
+/// durable lease whose canonical managed root exactly names the requested cwd.
+pub fn authorizes_managed_worktree_cwd(lease: Option<&WorkspaceLease>, path: &Path) -> bool {
+    let Some(lease) = lease else {
+        return false;
+    };
+    if lease.id.is_nil()
+        || lease.kind != WorkspaceLeaseKind::ManagedWorktree
+        || !lease.is_live(now_unix_ms())
+    {
+        return false;
+    }
     let Ok(path) = cockpit_host::path_containment::effective_path(path) else {
         return false;
     };
-    let mut components = path.components().peekable();
-    while let Some(component) = components.next() {
-        if component.as_os_str() == "worktrees"
-            && let Some(id) = components.peek()
-            && Uuid::parse_str(&id.as_os_str().to_string_lossy()).is_ok()
-        {
-            return true;
-        }
-    }
-    false
+    let Ok(visibility) = cockpit_host::path_containment::effective_path(&lease.visibility_root)
+    else {
+        return false;
+    };
+    let Ok(managed) = cockpit_host::path_containment::effective_path(&lease.managed_path) else {
+        return false;
+    };
+    let lease_directory = lease.id.to_string();
+    path == visibility
+        && visibility == managed
+        && managed
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(&lease_directory))
+        && managed
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "worktrees")
 }
 
 pub fn now_unix_ms() -> i64 {
@@ -414,9 +750,31 @@ pub async fn load_lease_from_task_argument(
         .await
         .map_err(|error| format!("loading workspace lease `{id}`: {error:#}"))?
         .ok_or_else(|| format!("workspace lease `{id}` is not live and owned by this agent"))?;
-    WorkspaceLease::from_row(&row, WorkspaceLeaseOps::for_coding())
+    WorkspaceLease::from_row(&row)
         .map(Some)
         .map_err(|error| format!("loading workspace lease `{id}`: {error:#}"))
+}
+
+/// A leased parent cannot shed its confinement by omitting `workspace_lease`.
+/// A child either selects an owner-scoped descendant lease or inherits the
+/// parent's typed token; both paths are revalidated at every native boundary.
+pub fn inherit_or_select_lease(
+    parent: Option<&WorkspaceLease>,
+    selected: Option<WorkspaceLease>,
+) -> std::result::Result<Option<WorkspaceLease>, String> {
+    if let Some(selected) = selected {
+        return Ok(Some(selected));
+    }
+    let Some(parent) = parent else {
+        return Ok(None);
+    };
+    if !parent.is_live(now_unix_ms()) {
+        return Err(format!(
+            "parent workspace lease `{}` is expired, revoked, or unavailable",
+            parent.id
+        ));
+    }
+    Ok(Some(parent.clone()))
 }
 
 /// Result of intersecting a selected lease with the parent's live grant.
@@ -426,6 +784,28 @@ pub struct LeaseIntersection {
     pub child_cwd: PathBuf,
     pub write_scope: Option<PathBuf>,
     pub allowed_ops: WorkspaceLeaseOps,
+}
+
+/// Materialize the write boundary that a lease leaves to a child after the
+/// structural intersection has been admitted. Omitting `write_scope` means
+/// inheritance, not an ambient cwd grant.
+pub fn effective_write_scope_for_lease(
+    requested: Option<PathBuf>,
+    parent_scope: Option<&Path>,
+    lease: &WorkspaceLease,
+) -> Option<PathBuf> {
+    requested.or_else(|| {
+        parent_scope.map_or_else(
+            || lease.visibility_root.clone(),
+            |parent| {
+                if cockpit_host::path_containment::contained_under(parent, &lease.visibility_root) {
+                    lease.visibility_root.clone()
+                } else {
+                    parent.to_path_buf()
+                }
+            },
+        )
+    })
 }
 
 /// Intersect a selected workspace lease with the parent's live grant, the
@@ -544,7 +924,7 @@ pub fn intersect_lease_with_parent_grant(
         }
     }
 
-    if let Some(scope) = requested_write_scope {
+    let effective_write_scope = if let Some(scope) = requested_write_scope {
         let scope = cockpit_host::path_containment::effective_path(scope)
             .map_err(|err| format!("write_scope `{}` does not resolve: {err}", scope.display()))?;
         if !selected.covers_path(&scope) {
@@ -569,6 +949,7 @@ pub fn intersect_lease_with_parent_grant(
                 );
             }
         }
+        Some(scope)
     } else if let Some(parent_scope) = parent_write_scope {
         let parent_scope =
             cockpit_host::path_containment::effective_path(parent_scope).map_err(|err| {
@@ -586,7 +967,21 @@ pub fn intersect_lease_with_parent_grant(
                     .into(),
             );
         }
-    }
+        // An omitted child scope inherits only the overlap with the lease
+        // visibility, never the caller's original wider scope.
+        Some(
+            if cockpit_host::path_containment::contained_under(&parent_scope, &visibility) {
+                visibility.clone()
+            } else {
+                parent_scope
+            },
+        )
+    } else {
+        // A lease is itself the default writable boundary.  Preserve that
+        // concrete scope in ToolCtx so later native and shell gates do not
+        // accidentally fall back to their ambient cwd semantics.
+        Some(visibility.clone())
+    };
 
     let mut ops = selected.allowed_ops.confined_to_kind(selected.kind);
     if child_kind == ExecutionKind::Computer {
@@ -608,7 +1003,7 @@ pub fn intersect_lease_with_parent_grant(
             ..selected.clone()
         },
         child_cwd,
-        write_scope: requested_write_scope.map(Path::to_path_buf),
+        write_scope: effective_write_scope,
         allowed_ops: ops,
     })
 }
@@ -639,7 +1034,7 @@ pub async fn recover_session_workspace_leases(
         .context("listing workspace leases for crash recovery")?;
     let mut recovered = Vec::with_capacity(rows.len());
     for row in rows {
-        let lease = WorkspaceLease::from_row(&row, WorkspaceLeaseOps::for_coding())?;
+        let lease = WorkspaceLease::from_row(&row)?;
         if lease.identity_matches_disk() {
             recovered.push(row);
             continue;
@@ -676,7 +1071,7 @@ mod tests {
         AllowedChild, DelegationPolicy, ExecutionKind, ModelCapability, ModelLocality, ModelSlot,
         ProhibitedQuestionClass, VerificationBudget, VnextAgentDef, VnextHostPolicy,
     };
-    use crate::db::workspace_lease_artifacts::{NewWorkspaceLease, WorkspaceLeaseKind as DbKind};
+    use crate::db::workspace_lease_artifacts::WorkspaceLeaseKind as DbKind;
     use crate::db::write_scope_leases::WriteScopeLeaseRow;
     use crate::db::{Db, agent_tree_decisions::NewAgentInstance};
     use std::collections::BTreeSet;
@@ -1182,6 +1577,7 @@ mod tests {
                     canonical_repository_id: "repo-id".into(),
                     canonical_root: repo.to_string_lossy().into_owned(),
                     kind: DbKind::SameRoot,
+                    allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
                     base_sha_digest: WorkspaceDigest::of(b"head"),
                     base_ref_digest: WorkspaceDigest::of(b"ref"),
                     managed_path: repo.to_string_lossy().into_owned(),
@@ -1193,8 +1589,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.kind, DbKind::SameRoot);
-        let runtime = WorkspaceLease::from_row(&row, WorkspaceLeaseOps::for_coding()).unwrap();
+        let runtime = WorkspaceLease::from_row(&row).unwrap();
         assert_eq!(runtime.kind, WorkspaceLeaseKind::SameRoot);
+        assert_eq!(runtime.allowed_ops, WorkspaceLeaseOps::for_coding());
         assert!(runtime.is_live(4));
 
         std::fs::remove_dir_all(&repo).unwrap();
@@ -1210,14 +1607,26 @@ mod tests {
     }
 
     #[test]
-    fn is_managed_worktree_path_requires_worktrees_uuid_segment() {
+    fn managed_worktree_escape_requires_the_live_typed_lease() {
         let tmp = tempfile::tempdir().unwrap();
         let id = Uuid::new_v4();
         let real = managed_worktree_path(tmp.path(), id);
         std::fs::create_dir_all(&real).unwrap();
-        assert!(is_managed_worktree_path(&real));
-        assert!(!is_managed_worktree_path(tmp.path()));
-        assert!(!is_managed_worktree_path(
+        let lease = WorkspaceLease {
+            id,
+            managed_path: real.clone(),
+            ..WorkspaceLease::ephemeral(
+                WorkspaceLeaseKind::ManagedWorktree,
+                real.clone(),
+                WorkspaceLeaseOps::for_coding(),
+                future_expiry(),
+            )
+        };
+        assert!(authorizes_managed_worktree_cwd(Some(&lease), &real));
+        assert!(!authorizes_managed_worktree_cwd(None, &real));
+        assert!(!authorizes_managed_worktree_cwd(Some(&lease), tmp.path()));
+        assert!(!authorizes_managed_worktree_cwd(
+            Some(&lease),
             &tmp.path().join("worktrees").join("not-a-uuid")
         ));
     }

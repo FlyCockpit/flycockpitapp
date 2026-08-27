@@ -5060,6 +5060,8 @@ CREATE TABLE workspace_leases (
     canonical_repository_id   TEXT NOT NULL,
     canonical_root            TEXT NOT NULL,
     kind                      TEXT NOT NULL CHECK (kind IN ('same_root', 'subdirectory', 'managed_worktree')),
+    allowed_ops               INTEGER NOT NULL CHECK (allowed_ops BETWEEN 0 AND 15),
+    host_issued               INTEGER NOT NULL DEFAULT 0 CHECK (host_issued IN (0, 1)),
     base_sha_digest           TEXT NOT NULL CHECK (length(base_sha_digest) = 64 AND base_sha_digest NOT GLOB '*[^0-9a-f]*'),
     base_ref_digest           TEXT NOT NULL CHECK (length(base_ref_digest) = 64 AND base_ref_digest NOT GLOB '*[^0-9a-f]*'),
     managed_path              TEXT NOT NULL,
@@ -5092,9 +5094,12 @@ CREATE TABLE workspace_leases (
 
 CREATE INDEX idx_workspace_leases_session_owner_state
     ON workspace_leases (session_id, agent_instance_id, state, expires_at_unix_ms);
-CREATE UNIQUE INDEX uq_workspace_leases_live_root
-    ON workspace_leases (session_id, canonical_repository_id, canonical_root)
-    WHERE state IN ('active', 'grace', 'uncertain');
+-- Same-root and subtree leases are shareable delegated authority, not an
+-- exclusive host resource. Only an exact active managed destination is
+-- exclusive; its UUID path is daemon-created and cannot be reused.
+CREATE UNIQUE INDEX uq_workspace_leases_live_managed_path
+    ON workspace_leases (session_id, managed_path)
+    WHERE kind = 'managed_worktree' AND state IN ('active', 'grace', 'uncertain');
 
 -- The lifecycle is storage-enforced so a maintenance caller cannot resurrect
 -- an ambiguous worktree or silently skip grace. Every mutation is a CAS
@@ -5136,6 +5141,8 @@ WHEN NEW.workspace_lease_id <> OLD.workspace_lease_id
   OR NEW.canonical_repository_id <> OLD.canonical_repository_id
   OR NEW.canonical_root <> OLD.canonical_root
   OR NEW.kind <> OLD.kind
+  OR NEW.allowed_ops <> OLD.allowed_ops
+  OR NEW.host_issued <> OLD.host_issued
   OR NEW.base_sha_digest <> OLD.base_sha_digest
   OR NEW.base_ref_digest <> OLD.base_ref_digest
   OR NEW.managed_path <> OLD.managed_path

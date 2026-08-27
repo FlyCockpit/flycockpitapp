@@ -248,6 +248,12 @@ pub struct WorkspaceLeaseRow {
     pub canonical_repository_id: String,
     pub canonical_root: String,
     pub kind: WorkspaceLeaseKind,
+    /// Closed four-bit authority set: read=1, write=2, execute=4, computer=8.
+    /// The initial-schema CHECK and this decoder keep persisted values closed.
+    pub allowed_ops: u8,
+    /// Only the daemon host may bind this row to the daemon-owned root write
+    /// scope. Ordinary agent-owned rows must retain their stricter scope proof.
+    pub host_issued: bool,
     pub base_sha_digest: WorkspaceDigest,
     pub base_ref_digest: WorkspaceDigest,
     pub managed_path: String,
@@ -309,6 +315,8 @@ pub struct NewWorkspaceLease {
     pub canonical_repository_id: String,
     pub canonical_root: String,
     pub kind: WorkspaceLeaseKind,
+    /// Closed four-bit authority set: read=1, write=2, execute=4, computer=8.
+    pub allowed_ops: u8,
     pub base_sha_digest: WorkspaceDigest,
     pub base_ref_digest: WorkspaceDigest,
     pub managed_path: String,
@@ -359,7 +367,7 @@ pub enum ArtifactCasOutcome {
     RevisionConflict,
 }
 
-const LEASE_COLS: &str = "workspace_lease_id, session_id, agent_instance_id, write_scope_lease_id, canonical_repository_id, canonical_root, kind, base_sha_digest, base_ref_digest, managed_path, private_ref_digest, state, expires_at_unix_ms, revision, terminal_reason, uncertain_reason, pinned_at_unix_ms, pinned_by_agent_instance_id, created_at_unix_ms, updated_at_unix_ms";
+const LEASE_COLS: &str = "workspace_lease_id, session_id, agent_instance_id, write_scope_lease_id, canonical_repository_id, canonical_root, kind, allowed_ops, host_issued, base_sha_digest, base_ref_digest, managed_path, private_ref_digest, state, expires_at_unix_ms, revision, terminal_reason, uncertain_reason, pinned_at_unix_ms, pinned_by_agent_instance_id, created_at_unix_ms, updated_at_unix_ms";
 const ARTIFACT_COLS: &str = "artifact_id, source_workspace_lease_id, session_id, agent_instance_id, base_head_digest, base_ref_digest, base_index_digest, touched_manifest_digest, untracked_manifest_digest, ordered_patch_digest, validation_receipt_digest, parent_result_json, state, revision, created_at_unix_ms, updated_at_unix_ms";
 
 fn uuid(raw: String, index: usize) -> rusqlite::Result<Uuid> {
@@ -383,9 +391,23 @@ fn bounded_identity(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 fn map_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceLeaseRow> {
-    let terminal: Option<String> = row.get(14)?;
-    let uncertain: Option<String> = row.get(15)?;
-    let pinned: Option<String> = row.get(17)?;
+    let allowed_ops: i64 = row.get(7)?;
+    if !(0..=15).contains(&allowed_ops) {
+        return Err(invalid_persisted_error(
+            7,
+            anyhow::anyhow!("workspace lease allowed_ops is outside the closed bit set"),
+        ));
+    }
+    let host_issued: i64 = row.get(8)?;
+    if !(0..=1).contains(&host_issued) {
+        return Err(invalid_persisted_error(
+            8,
+            anyhow::anyhow!("workspace lease host_issued is outside the closed bit set"),
+        ));
+    }
+    let terminal: Option<String> = row.get(16)?;
+    let uncertain: Option<String> = row.get(17)?;
+    let pinned: Option<String> = row.get(19)?;
     Ok(WorkspaceLeaseRow {
         workspace_lease_id: uuid(row.get(0)?, 0)?,
         session_id: uuid(row.get(1)?, 1)?,
@@ -394,23 +416,25 @@ fn map_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceLeaseRow> {
         canonical_repository_id: row.get(4)?,
         canonical_root: row.get(5)?,
         kind: WorkspaceLeaseKind::parse(&row.get::<_, String>(6)?).map_err(to_sql)?,
-        base_sha_digest: digest(row.get(7)?, 7)?,
-        base_ref_digest: digest(row.get(8)?, 8)?,
-        managed_path: row.get(9)?,
-        private_ref_digest: digest(row.get(10)?, 10)?,
-        state: WorkspaceLeaseState::parse(&row.get::<_, String>(11)?).map_err(to_sql)?,
-        expires_at_unix_ms: row.get(12)?,
-        revision: row.get(13)?,
+        allowed_ops: allowed_ops as u8,
+        host_issued: host_issued == 1,
+        base_sha_digest: digest(row.get(9)?, 9)?,
+        base_ref_digest: digest(row.get(10)?, 10)?,
+        managed_path: row.get(11)?,
+        private_ref_digest: digest(row.get(12)?, 12)?,
+        state: WorkspaceLeaseState::parse(&row.get::<_, String>(13)?).map_err(to_sql)?,
+        expires_at_unix_ms: row.get(14)?,
+        revision: row.get(15)?,
         terminal_reason: terminal
             .map(|v| WorkspaceLeaseTerminalReason::parse(&v).map_err(to_sql))
             .transpose()?,
         uncertain_reason: uncertain
             .map(|v| WorkspaceLeaseTerminalReason::parse(&v).map_err(to_sql))
             .transpose()?,
-        pinned_at_unix_ms: row.get(16)?,
-        pinned_by_agent_instance_id: pinned.map(|v| uuid(v, 17)).transpose()?,
-        created_at_unix_ms: row.get(18)?,
-        updated_at_unix_ms: row.get(19)?,
+        pinned_at_unix_ms: row.get(18)?,
+        pinned_by_agent_instance_id: pinned.map(|v| uuid(v, 19)).transpose()?,
+        created_at_unix_ms: row.get(20)?,
+        updated_at_unix_ms: row.get(21)?,
     })
 }
 fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskArtifactRow> {
@@ -493,6 +517,23 @@ fn scope_is_owned_active(
     )
 }
 
+/// The daemon's root write-scope lease is deliberately owned by the host,
+/// rather than by each agent-tree row.  A host-issued workspace lease may bind
+/// to that root authority, but a model-facing consumer still has to name an
+/// owner-scoped workspace-lease row.  Keep this narrower than
+/// `scope_is_owned_active`: it proves the supplied durable write authority is
+/// live for this session without pretending the agent owns the host root.
+fn scope_is_host_active(conn: &Connection, session: Uuid, scope: Uuid) -> Result<bool> {
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT state FROM write_scope_leases WHERE lease_id=?1 AND session_id=?2",
+            params![scope.to_string(), session.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(state.as_deref() == Some("active"))
+}
+
 impl Db {
     /// Creates a lease only when the host-authorized agent still owns active
     /// write scope. This is deliberately an atomic proof + insert.
@@ -504,14 +545,50 @@ impl Db {
         bounded_identity(&input.canonical_repository_id, "repository identity")?;
         bounded_identity(&input.canonical_root, "canonical root")?;
         bounded_identity(&input.managed_path, "managed path")?;
+        if input.allowed_ops > 15 {
+            bail!("workspace lease allowed_ops is outside the closed bit set");
+        }
         if input.expires_at_unix_ms <= now {
             bail!("workspace lease expiry must be in the future");
         }
         let id = Uuid::new_v4();
         self.transaction(move |conn| {
             if !scope_is_owned_active(conn,input.session_id,input.agent_instance_id,input.write_scope_lease_id,&input.canonical_root,None)? { bail!("write scope is not active at this workspace root and owned by this agent"); }
-            conn.execute("INSERT INTO workspace_leases (workspace_lease_id,session_id,agent_instance_id,write_scope_lease_id,canonical_repository_id,canonical_root,kind,base_sha_digest,base_ref_digest,managed_path,private_ref_digest,state,expires_at_unix_ms,revision,terminal_reason,uncertain_reason,pinned_at_unix_ms,pinned_by_agent_instance_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'active',?12,0,NULL,NULL,NULL,NULL,?13,?13)", params![id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.write_scope_lease_id.to_string(),input.canonical_repository_id,input.canonical_root,input.kind.as_str(),input.base_sha_digest.as_str(),input.base_ref_digest.as_str(),input.managed_path,input.private_ref_digest.as_str(),input.expires_at_unix_ms,now]).context("inserting workspace lease")?;
+            conn.execute("INSERT INTO workspace_leases (workspace_lease_id,session_id,agent_instance_id,write_scope_lease_id,canonical_repository_id,canonical_root,kind,allowed_ops,host_issued,base_sha_digest,base_ref_digest,managed_path,private_ref_digest,state,expires_at_unix_ms,revision,terminal_reason,uncertain_reason,pinned_at_unix_ms,pinned_by_agent_instance_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,'active',?13,0,NULL,NULL,NULL,NULL,?14,?14)", params![id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.write_scope_lease_id.to_string(),input.canonical_repository_id,input.canonical_root,input.kind.as_str(),i64::from(input.allowed_ops),input.base_sha_digest.as_str(),input.base_ref_digest.as_str(),input.managed_path,input.private_ref_digest.as_str(),input.expires_at_unix_ms,now]).context("inserting workspace lease")?;
             lease_for_owner(conn,input.session_id,input.agent_instance_id,id)?.context("created workspace lease missing")
+        }).await
+    }
+
+    /// Insert a workspace lease at the daemon host boundary.
+    ///
+    /// The root write scope is daemon-owned (`owner_id = session-root`) and
+    /// therefore cannot satisfy the per-agent proof required by
+    /// [`Self::create_workspace_lease`].  This is the sole alternative for
+    /// host lifecycle code which has already authenticated an agent-tree owner
+    /// and selected a lease kind under its effective grant.  The row remains
+    /// owner-scoped on every model/tool read, and is still bound to a live
+    /// write-scope lease in the same session.
+    pub async fn create_host_workspace_lease(
+        &self,
+        input: NewWorkspaceLease,
+        id: Uuid,
+        now: i64,
+    ) -> Result<WorkspaceLeaseRow> {
+        bounded_identity(&input.canonical_repository_id, "repository identity")?;
+        bounded_identity(&input.canonical_root, "canonical root")?;
+        bounded_identity(&input.managed_path, "managed path")?;
+        if input.allowed_ops > 15 {
+            bail!("workspace lease allowed_ops is outside the closed bit set");
+        }
+        if input.expires_at_unix_ms <= now {
+            bail!("workspace lease expiry must be in the future");
+        }
+        self.transaction(move |conn| {
+            if !scope_is_host_active(conn, input.session_id, input.write_scope_lease_id)? {
+                bail!("host write scope is not active for this workspace lease session");
+            }
+            conn.execute("INSERT INTO workspace_leases (workspace_lease_id,session_id,agent_instance_id,write_scope_lease_id,canonical_repository_id,canonical_root,kind,allowed_ops,host_issued,base_sha_digest,base_ref_digest,managed_path,private_ref_digest,state,expires_at_unix_ms,revision,terminal_reason,uncertain_reason,pinned_at_unix_ms,pinned_by_agent_instance_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11,?12,'active',?13,0,NULL,NULL,NULL,NULL,?14,?14)", params![id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.write_scope_lease_id.to_string(),input.canonical_repository_id,input.canonical_root,input.kind.as_str(),i64::from(input.allowed_ops),input.base_sha_digest.as_str(),input.base_ref_digest.as_str(),input.managed_path,input.private_ref_digest.as_str(),input.expires_at_unix_ms,now]).context("inserting host workspace lease")?;
+            lease_for_owner(conn,input.session_id,input.agent_instance_id,id)?.context("created host workspace lease missing")
         }).await
     }
     pub async fn workspace_lease(
@@ -538,14 +615,18 @@ impl Db {
             };
             Ok((row.state == WorkspaceLeaseState::Active
                 && row.expires_at_unix_ms > now
-                && scope_is_owned_active(
-                    c,
-                    session,
-                    agent,
-                    row.write_scope_lease_id,
-                    &row.canonical_root,
-                    None,
-                )?)
+                && (if row.host_issued {
+                    scope_is_host_active(c, session, row.write_scope_lease_id)?
+                } else {
+                    scope_is_owned_active(
+                        c,
+                        session,
+                        agent,
+                        row.write_scope_lease_id,
+                        &row.canonical_root,
+                        None,
+                    )?
+                }))
             .then_some(row))
         })
         .await
@@ -584,6 +665,36 @@ impl Db {
             now,
             false,
         )
+        .await
+    }
+    /// Normal completion stops a lease from looking live forever while
+    /// retaining its workspace for the grace/pin/explicit-clean lifecycle.
+    pub async fn grace_retain_workspace_lease(
+        &self,
+        session: Uuid,
+        agent: Uuid,
+        id: Uuid,
+        expected_revision: i64,
+        now: i64,
+    ) -> Result<LeaseCasOutcome> {
+        self.transaction(move |c| {
+            let Some(current) = lease_for_owner(c, session, agent, id)? else {
+                return Ok(LeaseCasOutcome::RevisionConflict);
+            };
+            if current.state.is_terminal() {
+                return Ok(LeaseCasOutcome::AlreadyTerminal(current));
+            }
+            if current.state != WorkspaceLeaseState::Active || current.revision != expected_revision {
+                return Ok(LeaseCasOutcome::RevisionConflict);
+            }
+            c.execute(
+                "UPDATE workspace_leases SET state='grace', expires_at_unix_ms=?1, uncertain_reason='expired', revision=revision+1, updated_at_unix_ms=?1 WHERE workspace_lease_id=?2 AND revision=?3 AND state='active'",
+                params![now, id.to_string(), expected_revision],
+            )?;
+            Ok(LeaseCasOutcome::Transitioned(
+                lease_for_owner(c, session, agent, id)?.context("grace-retained lease missing")?,
+            ))
+        })
         .await
     }
     /// Marks any live lease uncertain when restart identity proof fails. It
@@ -936,6 +1047,7 @@ mod tests {
             canonical_repository_id: "repo-id".into(),
             canonical_root: "/repo/work".into(),
             kind: WorkspaceLeaseKind::ManagedWorktree,
+            allowed_ops: 0b0111,
             base_sha_digest: d("head"),
             base_ref_digest: d("ref"),
             managed_path: "agents/one".into(),
@@ -958,6 +1070,32 @@ mod tests {
             parent_result: RedactedArtifactResult::new(ArtifactResultClass::Produced, d("result")),
         }
     }
+
+    #[tokio::test]
+    async fn host_issued_workspace_lease_is_owner_scoped_and_tool_live() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, owner_id, scope) = owner(&db, 10).await;
+        let id = Uuid::new_v4();
+        let lease = db
+            .create_host_workspace_lease(lease_input(session, owner_id, scope, 100), id, 10)
+            .await
+            .unwrap();
+        assert_eq!(lease.workspace_lease_id, id);
+        assert!(lease.host_issued);
+        assert!(
+            db.workspace_lease_for_tools(session, owner_id, id, 11)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.workspace_lease_for_tools(session, Uuid::new_v4(), id, 11)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn workspace_lease_artifact_db_lifecycle_expiry_pin_and_receipt_are_exactly_once() {
         let db = Db::open_in_memory().unwrap();
@@ -966,6 +1104,10 @@ mod tests {
             .create_workspace_lease(lease_input(s, a, scope, 200), 100)
             .await
             .unwrap();
+        assert_eq!(
+            lease.allowed_ops, 0b0111,
+            "allowed operations round-trip exactly"
+        );
         assert!(
             db.workspace_lease_for_tools(s, a, lease.workspace_lease_id, 199)
                 .await

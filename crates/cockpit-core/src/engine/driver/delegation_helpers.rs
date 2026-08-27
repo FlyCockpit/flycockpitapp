@@ -497,6 +497,9 @@ pub(super) struct GrantRejectionInput<'a> {
     pub assistant_db: &'a crate::db::Db,
     pub local_installations: &'a crate::agents::LocalInstallationResolver,
     pub parent_write_scope: Option<&'a std::path::Path>,
+    /// Resolved before authority admission so a requested scope cannot evade
+    /// the lease intersection by being checked only after the child starts.
+    pub child_write_scope: Option<&'a std::path::Path>,
     pub parent_workspace_lease: Option<&'a crate::workspace_lease::WorkspaceLease>,
     pub workspace_lease: Option<&'a crate::workspace_lease::WorkspaceLease>,
 }
@@ -513,6 +516,7 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
         assistant_db,
         local_installations,
         parent_write_scope,
+        child_write_scope,
         parent_workspace_lease,
         workspace_lease,
     } = input;
@@ -637,6 +641,12 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
                     parent.agent_id, child.agent_id
                 ));
             }
+            if parent_workspace_lease.is_some() && workspace_lease.is_none() {
+                return Some(format!(
+                    "Error: vNext caller `{}` is workspace-leased; the child must inherit or select a live workspace lease",
+                    parent.agent_id
+                ));
+            }
             if !parent.permits_target_with_lease(parent_cwd, cwd, workspace_lease) {
                 return Some(format!(
                     "Error: vNext caller `{}` does not permit child cwd `{}` under its effective delegation targets",
@@ -652,7 +662,7 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
                     parent_workspace_lease,
                     child.execution_kind,
                     cwd,
-                    None,
+                    child_write_scope,
                     lease,
                     crate::workspace_lease::now_unix_ms(),
                 ) {

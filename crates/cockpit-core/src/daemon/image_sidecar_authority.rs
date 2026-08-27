@@ -9,8 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cockpit_db::db::image_sidecar::ImageSidecarGrantRow;
 use cockpit_proto::image_sidecar_authority::{
-    ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1, ImageSidecarGrantScopeV1,
-    ImageSidecarGrantV1, ImageSidecarModelOptionV1, ImageSidecarResolutionV1,
+    ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
+    ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
+    ImageSidecarModelOptionV1, ImageSidecarResolutionV1,
 };
 use cockpit_proto::{ErrorCode, ErrorPayload, Response};
 
@@ -24,6 +25,8 @@ pub async fn snapshot(
     config_generation: u64,
     selection_id: String,
     session_id: String,
+    attached_project_root: std::path::PathBuf,
+    approval_mode: cockpit_config::config::extended::ApprovalMode,
     expected_daemon_instance_id: Option<String>,
     expected_session_id: Option<String>,
 ) -> Result<Response, ErrorPayload> {
@@ -33,8 +36,9 @@ pub async fn snapshot(
     // the daemon's current identity even when the caller's last projection
     // belonged to an older boot. Mutations below reject that mismatch.
     let _ = (expected_daemon_instance_id, expected_session_id);
-    let project_id = canonical_project_id(&project_root)?;
-    let (models, resolution) = configured_projection(ctx, &project_id, config_generation).await?;
+    let project_id = bound_project_id(&project_root, &attached_project_root)?;
+    let (models, resolution, cap) =
+        configured_projection(ctx, &project_id, config_generation).await?;
     let snapshot = ctx
         .db
         .image_sidecar_snapshot(project_id.clone())
@@ -49,6 +53,36 @@ pub async fn snapshot(
             config_generation,
             selection_id,
             entity_version: snapshot.entity_version,
+            approval_mode: match approval_mode {
+                cockpit_config::config::extended::ApprovalMode::Yolo => {
+                    ImageSidecarApprovalModeV1::Yolo
+                }
+                cockpit_config::config::extended::ApprovalMode::Manual
+                | cockpit_config::config::extended::ApprovalMode::Auto => {
+                    ImageSidecarApprovalModeV1::Ask
+                }
+            },
+            central_invocation_cap: cap.value,
+            central_invocation_cap_source: match cap.provenance {
+                crate::image_sidecar::SidecarInvocationCapProvenance::CompiledCeiling => {
+                    ImageSidecarInvocationCapSourceV1::CompiledCeiling
+                }
+                crate::image_sidecar::SidecarInvocationCapProvenance::Configured => {
+                    ImageSidecarInvocationCapSourceV1::Configured
+                }
+                crate::image_sidecar::SidecarInvocationCapProvenance::Profile => {
+                    ImageSidecarInvocationCapSourceV1::Profile
+                }
+                crate::image_sidecar::SidecarInvocationCapProvenance::Adapter => {
+                    ImageSidecarInvocationCapSourceV1::Adapter
+                }
+                crate::image_sidecar::SidecarInvocationCapProvenance::Request => {
+                    ImageSidecarInvocationCapSourceV1::Request
+                }
+            },
+            central_invocation_cap_hard_ceiling:
+                cockpit_config::config::media_budget::MediaResourceLimits::hard_ceilings()
+                    .sidecar_invocations_per_session,
             pipeline_available: false,
             health_reason: PIPELINE_UNAVAILABLE.into(),
             models,
@@ -70,10 +104,12 @@ pub async fn create_grant(
     session_id: Option<String>,
     invocation_id: Option<String>,
     authority_session_id: String,
+    attached_project_root: std::path::PathBuf,
     expected_daemon_instance_id: Option<String>,
     expected_session_id: Option<String>,
 ) -> Result<Response, ErrorPayload> {
     ensure_current_generation(config_generation)?;
+    let _project_id = bound_project_id(&project_root, &attached_project_root)?;
     ensure_identity(
         crate::daemon::server::inventory::daemon_instance_id(),
         &authority_session_id,
@@ -104,7 +140,14 @@ async fn configured_projection(
     ctx: &DaemonContext,
     project_root: &str,
     config_generation: u64,
-) -> Result<(Vec<ImageSidecarModelOptionV1>, ImageSidecarResolutionV1), ErrorPayload> {
+) -> Result<
+    (
+        Vec<ImageSidecarModelOptionV1>,
+        ImageSidecarResolutionV1,
+        crate::image_sidecar::SidecarInvocationCap,
+    ),
+    ErrorPayload,
+> {
     let cwd = std::path::PathBuf::from(project_root);
     let trust = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
@@ -176,6 +219,9 @@ async fn configured_projection(
             )
         })
         .unwrap_or((None, None, None, false));
+    let cap = crate::image_sidecar::SidecarInvocationCap::from_media_policy(
+        extended.media_resources.as_ref(),
+    );
     Ok((
         models,
         ImageSidecarResolutionV1 {
@@ -190,6 +236,7 @@ async fn configured_projection(
             },
             grant_candidate_id: None,
         },
+        cap,
     ))
 }
 
@@ -201,6 +248,7 @@ pub async fn revoke_grant(
     grant_id: String,
     expected_version: u64,
     session_id: String,
+    attached_project_root: std::path::PathBuf,
     expected_daemon_instance_id: Option<String>,
     expected_session_id: Option<String>,
 ) -> Result<Response, ErrorPayload> {
@@ -212,7 +260,7 @@ pub async fn revoke_grant(
         expected_daemon_instance_id.as_deref(),
         expected_session_id.as_deref(),
     )?;
-    let project_id = canonical_project_id(&project_root)?;
+    let project_id = bound_project_id(&project_root, &attached_project_root)?;
     let Some((grant, entity_version)) = ctx
         .db
         .revoke_image_sidecar_grant(project_id, grant_id, expected_version, now_ms()?)
@@ -273,6 +321,30 @@ fn canonical_project_id(project_root: &str) -> Result<String, ErrorPayload> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+fn bound_project_id(
+    requested_project_root: &str,
+    attached_project_root: &std::path::Path,
+) -> Result<String, ErrorPayload> {
+    let requested = canonical_project_id(requested_project_root)?;
+    let attached =
+        crate::daemon::fs_api::canonical_project_root(&attached_project_root.to_string_lossy())?
+            .to_string_lossy()
+            .into_owned();
+    ensure_attached_project(&requested, &attached)?;
+    Ok(attached)
+}
+
+fn ensure_attached_project(requested: &str, attached: &str) -> Result<(), ErrorPayload> {
+    if requested == attached {
+        Ok(())
+    } else {
+        Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "image-sidecar authority project does not match attached session; reload before continuing".into(),
+        })
+    }
+}
+
 fn now_ms() -> Result<i64, ErrorPayload> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -329,7 +401,7 @@ fn internal(error: anyhow::Error) -> ErrorPayload {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_destination_origin;
+    use super::{ensure_attached_project, safe_destination_origin};
 
     #[test]
     fn authority_projection_never_echoes_bearer_url_components() {
@@ -338,5 +410,12 @@ mod tests {
             "https://example.test"
         );
         assert_eq!(safe_destination_origin("not a URL"), "invalid_destination");
+    }
+
+    #[test]
+    fn authority_rejects_a_project_other_than_the_attached_session() {
+        let error = ensure_attached_project("/project/a", "/project/b").unwrap_err();
+        assert_eq!(error.code, cockpit_proto::ErrorCode::Conflict);
+        assert!(error.message.contains("does not match attached session"));
     }
 }

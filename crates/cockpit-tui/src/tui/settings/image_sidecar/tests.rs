@@ -58,15 +58,19 @@ fn render_page_lines(
 
 fn sample_trace(mode: SidecarModeChoice) -> SidecarEffectiveTrace {
     SidecarEffectiveTrace {
-        primary_provider: "openai".into(),
-        primary_model: "gpt-4o".into(),
-        primary_trust: "trusted".into(),
+        primary: Some(SidecarPrimaryTrace {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            trust: "trusted".into(),
+            location: "public_cloud".into(),
+            credential_fingerprint: "abcd".repeat(8),
+        }),
         matched_source: "trust_class_default".into(),
         sidecar_provider: Some("openai".into()),
         sidecar_model: Some("gpt-4o".into()),
-        origin: strip_query_and_fragment("https://api.openai.com/v1?sig=secret"),
-        location: "public_cloud".into(),
-        credential_fingerprint: "abcd".repeat(8),
+        origin: Some(strip_query_and_fragment(
+            "https://api.openai.com/v1?sig=secret",
+        )),
         capability_source: "configured".into(),
         capability_freshness: "fresh".into(),
         config_generation: 1,
@@ -124,6 +128,44 @@ fn sample_invocation() -> InvocationView {
             unicode_scalar_len: 12,
             utf8_byte_len: 12,
         }),
+    }
+}
+
+fn authority_snapshot(
+    daemon_instance_id: &str,
+    project_id: &str,
+    session_id: &str,
+    selection_id: &str,
+    config_generation: u64,
+    cap: u64,
+    source: cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1,
+    approval_mode: cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1,
+) -> cockpit_proto::image_sidecar_authority::ImageSidecarAuthoritySnapshotV1 {
+    cockpit_proto::image_sidecar_authority::ImageSidecarAuthoritySnapshotV1 {
+        schema_version: 1,
+        daemon_instance_id: daemon_instance_id.into(),
+        session_id: session_id.into(),
+        project_id: project_id.into(),
+        config_generation,
+        selection_id: selection_id.into(),
+        entity_version: 1,
+        approval_mode,
+        central_invocation_cap: cap,
+        central_invocation_cap_source: source,
+        central_invocation_cap_hard_ceiling: 128,
+        pipeline_available: false,
+        health_reason: PIPELINE_UNAVAILABLE_REASON.into(),
+        models: Vec::new(),
+        resolution: cockpit_proto::image_sidecar_authority::ImageSidecarResolutionV1 {
+            provider: None,
+            model: None,
+            origin: None,
+            available: false,
+            reason: PIPELINE_UNAVAILABLE_REASON.into(),
+            grant_candidate_id: None,
+        },
+        grants: Vec::new(),
+        invocations: Vec::new(),
     }
 }
 
@@ -270,6 +312,139 @@ fn sidecar_releases_only_the_matching_rejected_config_save() {
     assert!(!session.busy);
     assert_eq!(session.conflict.as_deref(), Some("conflict"));
     assert!(session.save_base_revision.is_none());
+    assert_eq!(
+        session.reload_required_base_revision.as_deref(),
+        Some("safe-revision")
+    );
+    assert!(session.requires_reload_before_reapply());
+    session.reconcile_reloaded_revision(Some("safe-revision"));
+    assert!(session.requires_reload_before_reapply());
+    session.reconcile_reloaded_revision(Some("current-revision"));
+    assert!(!session.requires_reload_before_reapply());
+    assert!(session.conflict.is_none());
+
+    let mut page = page_with(SidecarPageKind::ModeEditor);
+    page.session.form.local_edits_preserved = true;
+    page.session.reload_required_before_reapply = true;
+    let save = page
+        .named_actions()
+        .into_iter()
+        .find(|(action, _, _)| matches!(action, SidecarAction::SaveSelection))
+        .expect("mode editor exposes Save changes");
+    assert!(!save.1);
+    assert_eq!(save.2, Some(REASON_RELOAD_REQUIRED));
+}
+
+#[test]
+fn sidecar_snapshot_rehydrates_generation_policy_and_yolo_after_identity_rebind() {
+    let mut dialog = test_dialog();
+    let mut page = page_with(SidecarPageKind::Overview);
+    page.session.reducer.config_generation = 3;
+    let initial = authority_snapshot(
+        "local",
+        "project",
+        "session",
+        "selection",
+        3,
+        19,
+        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Profile,
+        cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Yolo,
+    );
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(
+            initial,
+        ))),
+    );
+    assert_eq!(page.session.reducer.config_generation, 3);
+    assert_eq!(page.session.policy.value, 19);
+    assert_eq!(
+        page.session.policy.source,
+        SidecarInvocationCapProvenance::Profile
+    );
+    assert_eq!(page.session.approval_mode, ApprovalMode::Yolo);
+    assert!(!page.session.first_use().prompt);
+    assert_eq!(
+        page.session.first_use().yolo_label,
+        Some("agent_discretion")
+    );
+
+    let rebound = authority_snapshot(
+        "new-daemon",
+        "new-project",
+        "new-session",
+        "new-selection",
+        7,
+        11,
+        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Adapter,
+        cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Ask,
+    );
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(
+            rebound,
+        ))),
+    );
+    assert_eq!(page.session.reducer.config_generation, 7);
+    assert_eq!(page.session.policy.value, 11);
+    assert_eq!(
+        page.session.policy.source,
+        SidecarInvocationCapProvenance::Adapter
+    );
+    assert_eq!(page.session.approval_mode, ApprovalMode::Ask);
+    assert!(page.session.first_use().prompt);
+    assert!(!page.session.reducer.stale);
+}
+
+#[test]
+fn sidecar_unavailable_primary_trace_is_not_rendered_as_untrusted() {
+    let dialog = test_dialog();
+    let mut page = page_with(SidecarPageKind::ResolverDetail);
+    page.session.reducer.resolution.as_mut().unwrap().primary = None;
+    let rendered = render_page_lines(&page, &dialog, 100, 30).join("\n");
+    assert!(rendered.contains("Primary resolver details unavailable."));
+    assert!(!rendered.contains("Trust class: untrusted"));
+    assert!(!rendered.contains("primary=: trust="));
+}
+
+#[test]
+fn sidecar_grant_mutation_gap_invalidates_and_rehydrates_without_applying_it() {
+    let mut dialog = test_dialog();
+    let mut page = page_with(SidecarPageKind::GrantList);
+    page.session.reducer.entity_version = 1;
+    page.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
+    let mutation = cockpit_proto::image_sidecar_authority::ImageSidecarGrantMutationV1 {
+        schema_version: 1,
+        daemon_instance_id: "local".into(),
+        session_id: "session".into(),
+        config_generation: 1,
+        selection_id: "selection".into(),
+        entity_version: 3,
+        grant: cockpit_proto::image_sidecar_authority::ImageSidecarGrantV1 {
+            grant_id: "gap-grant".into(),
+            version: 1,
+            project_id: "project".into(),
+            destination: "https://api.openai.com".into(),
+            purpose: "ask_image".into(),
+            scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project,
+            session_id: None,
+            invocation_id: None,
+            created_at_unix_ms: 1,
+            last_used_at_unix_ms: None,
+            revoked_at_unix_ms: None,
+            consumed_at_unix_ms: None,
+        },
+    };
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarGrantMutated(
+            mutation,
+        ))),
+    );
+    assert!(page.session.reducer.stale);
+    assert_eq!(page.session.reducer.entity_version, 1);
+    assert!(page.session.reducer.grants.is_empty());
+    assert!(!page.session.authoritative_mutations);
 }
 
 #[test]
@@ -818,7 +993,7 @@ fn image_sidecar_settings_a11y_and_layout_snapshots() {
     }
 
     page.session
-        .rebind_identity("d2".into(), "p2".into(), "s2".into(), "sel2".into());
+        .rebind_identity("d2".into(), "p2".into(), "s2".into(), "sel2".into(), 7);
     assert!(page.session.reducer.grants.is_empty());
     assert!(page.session.confirm_revoke.borrow().is_none());
     assert!(page.session.error.is_none());
@@ -829,6 +1004,7 @@ fn image_sidecar_settings_a11y_and_layout_snapshots() {
     assert_eq!(page.session.form.override_pair, None);
     assert!(!page.session.save_pending);
     assert!(!page.session.health_refresh_pending);
+    assert_eq!(page.session.reducer.config_generation, 7);
     assert_eq!(
         page.session.reducer.apply(SidecarEvent {
             daemon_instance: "local".into(),
@@ -1122,7 +1298,7 @@ fn image_sidecar_settings_state_action_registry() {
     });
     grants
         .session
-        .rebind_identity("d".into(), "p".into(), "s".into(), "sel".into());
+        .rebind_identity("d".into(), "p".into(), "s".into(), "sel".into(), 1);
     assert!(grants.session.confirm_revoke.borrow().is_none());
 
     *grants.session.confirm_revoke.borrow_mut() = Some(PendingRevoke {

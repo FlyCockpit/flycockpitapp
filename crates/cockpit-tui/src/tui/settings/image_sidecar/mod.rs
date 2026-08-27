@@ -46,6 +46,7 @@ const REASON_REVOKE_CONFIRMATION_STALE: &str = "revoke_confirmation_stale";
 const REASON_YOLO_NO_GRANT: &str = "yolo_no_standing_grant";
 const REASON_SAVE_PENDING: &str = "save_pending";
 const REASON_NO_PENDING_CHANGES: &str = "no_pending_changes";
+const REASON_RELOAD_REQUIRED: &str = "reload_required_before_reapply";
 const REASON_FORBIDDEN_SIDECAR_ADMIN: &str = "forbidden_requires_sidecar_admin";
 const REASON_AUTHORITATIVE_UNAVAILABLE: &str = "authoritative_sidecar_operation_unavailable";
 const REASON_INVOCATION_NOT_FOUND: &str = "invocation_not_found";
@@ -165,16 +166,23 @@ pub(crate) fn filter_selectable_sidecar_models(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidecarPrimaryTrace {
+    pub provider: String,
+    pub model: String,
+    pub trust: String,
+    pub location: String,
+    pub credential_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SidecarEffectiveTrace {
-    pub primary_provider: String,
-    pub primary_model: String,
-    pub primary_trust: String,
+    /// Missing means the daemon resolver did not produce a primary identity.
+    /// It is deliberately not rendered as an untrusted primary.
+    pub primary: Option<SidecarPrimaryTrace>,
     pub matched_source: String,
     pub sidecar_provider: Option<String>,
     pub sidecar_model: Option<String>,
-    pub origin: String,
-    pub location: String,
-    pub credential_fingerprint: String,
+    pub origin: Option<String>,
     pub capability_source: String,
     pub capability_freshness: String,
     pub config_generation: u64,
@@ -782,8 +790,15 @@ impl SidecarReducer {
         project_id: String,
         session_id: String,
         selection_id: String,
+        config_generation: u64,
     ) {
-        *self = Self::new(daemon_instance, project_id, session_id, selection_id, 0);
+        *self = Self::new(
+            daemon_instance,
+            project_id,
+            session_id,
+            selection_id,
+            config_generation,
+        );
     }
 }
 
@@ -939,6 +954,10 @@ pub(super) struct SidecarSession {
     /// accepts only a different daemon-issued revision; a stale or failed
     /// request never clears the local authority fence.
     pub save_base_revision: Option<String>,
+    /// A rejected CAS draft may be preserved, but cannot be resubmitted until
+    /// the settings layer has been reloaded at a different daemon revision.
+    pub reload_required_base_revision: Option<String>,
+    pub reload_required_before_reapply: bool,
     pub health_refresh_pending: bool,
     pub remediation: Option<SidecarRemediation>,
     /// The daemon-issued settings snapshot enables only the config CAS path.
@@ -978,6 +997,8 @@ impl SidecarSession {
             save_pending: false,
             save_operation_id: None,
             save_base_revision: None,
+            reload_required_base_revision: None,
+            reload_required_before_reapply: false,
             health_refresh_pending: false,
             remediation: None,
             authoritative_mutations: false,
@@ -1070,9 +1091,15 @@ impl SidecarSession {
         project_id: String,
         session_id: String,
         selection_id: String,
+        config_generation: u64,
     ) {
-        self.reducer
-            .rebind(daemon_instance, project_id, session_id, selection_id);
+        self.reducer.rebind(
+            daemon_instance,
+            project_id,
+            session_id,
+            selection_id,
+            config_generation,
+        );
         // An identity transition invalidates every daemon-owned projection and
         // mutation authority. Do not carry policy, principal, or model/form
         // state into the new identity: a fresh authoritative snapshot must
@@ -1098,6 +1125,8 @@ impl SidecarSession {
         self.save_pending = false;
         self.save_operation_id = None;
         self.save_base_revision = None;
+        self.reload_required_base_revision = None;
+        self.reload_required_before_reapply = false;
         self.health_refresh_pending = false;
         self.remediation = None;
     }
@@ -1139,11 +1168,32 @@ impl SidecarSession {
         }
         self.save_pending = false;
         self.save_operation_id = None;
-        self.save_base_revision = None;
+        self.reload_required_base_revision = self.save_base_revision.take();
+        self.reload_required_before_reapply = true;
         self.busy = false;
         self.conflict = Some(message.into());
         self.error = Some(message.into());
         true
+    }
+
+    fn reconcile_reloaded_revision(&mut self, revision: Option<&str>) {
+        if !self.reload_required_before_reapply {
+            return;
+        }
+        let reloaded = match self.reload_required_base_revision.as_deref() {
+            Some(rejected_base) => revision.is_some_and(|revision| revision != rejected_base),
+            None => revision.is_some(),
+        };
+        if reloaded {
+            self.reload_required_base_revision = None;
+            self.reload_required_before_reapply = false;
+            self.conflict = None;
+            self.error = None;
+        }
+    }
+
+    fn requires_reload_before_reapply(&self) -> bool {
+        self.reload_required_before_reapply
     }
 
     fn authority_request_identity(&self) -> (Option<String>, Option<String>) {
@@ -1745,6 +1795,8 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
             ));
             let save_reason = if !can_mutate {
                 mutate_reason
+            } else if page.session.requires_reload_before_reapply() {
+                Some(REASON_RELOAD_REQUIRED)
             } else if page.session.save_pending || page.session.busy {
                 Some(REASON_SAVE_PENDING)
             } else if !page.session.form.local_edits_preserved {
@@ -1757,6 +1809,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                 Some((
                     SidecarAction::SaveCentralPolicy,
                     can_mutate
+                        && !page.session.requires_reload_before_reapply()
                         && !page.session.save_pending
                         && !page.session.busy
                         && page.session.form.local_edits_preserved,
@@ -1767,20 +1820,33 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
         }
         SidecarPageKind::ResolverDetail => {
             if let Some(trace) = &page.session.reducer.resolution {
-                rows.push((
-                    format!(
-                        "primary={}:{} trust={}",
-                        trace.primary_provider, trace.primary_model, trace.primary_trust
-                    ),
-                    None,
-                ));
-                for line in TrustDisclosure::for_trust(trace.primary_trust == "trusted").lines() {
-                    rows.push((line, None));
+                if let Some(primary) = &trace.primary {
+                    rows.push((
+                        format!(
+                            "primary={}:{} trust={}",
+                            primary.provider, primary.model, primary.trust
+                        ),
+                        None,
+                    ));
+                    for line in TrustDisclosure::for_trust(primary.trust == "trusted").lines() {
+                        rows.push((line, None));
+                    }
+                    rows.push((format!("location={}", primary.location), None));
+                    rows.push((
+                        format!("credential_fingerprint={}", primary.credential_fingerprint),
+                        None,
+                    ));
+                } else {
+                    rows.push(("Primary resolver details unavailable.".into(), None));
                 }
                 rows.push((
                     format!(
                         "Egress authority: destination={} scopes=once/session/project",
-                        sanitized_display_origin(&trace.origin)
+                        trace
+                            .origin
+                            .as_deref()
+                            .map(sanitized_display_origin)
+                            .unwrap_or_else(|| "unavailable".into())
                     ),
                     None,
                 ));
@@ -1794,12 +1860,14 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     None,
                 ));
                 rows.push((
-                    format!("origin={}", sanitized_display_origin(&trace.origin)),
-                    None,
-                ));
-                rows.push((format!("location={}", trace.location), None));
-                rows.push((
-                    format!("credential_fingerprint={}", trace.credential_fingerprint),
+                    format!(
+                        "origin={}",
+                        trace
+                            .origin
+                            .as_deref()
+                            .map(sanitized_display_origin)
+                            .unwrap_or_else(|| "unavailable".into())
+                    ),
                     None,
                 ));
                 rows.push((
@@ -2072,6 +2140,8 @@ fn selection_save_row(
 ) -> (String, SidecarBinding) {
     let reason = if !can_mutate {
         mutate_reason
+    } else if page.session.requires_reload_before_reapply() {
+        Some(REASON_RELOAD_REQUIRED)
     } else if page.session.save_pending || page.session.busy {
         Some(REASON_SAVE_PENDING)
     } else if !page.session.form.local_edits_preserved {
@@ -2254,6 +2324,7 @@ impl SettingsPage for SidecarPage {
             SidecarAction::SaveSelection | SidecarAction::SaveCentralPolicy => {
                 if self.session.authoritative_mutations
                     && self.session.principal.can_mutate()
+                    && !self.session.requires_reload_before_reapply()
                     && !self.session.save_pending
                     && self.session.form.local_edits_preserved
                 {
@@ -2289,6 +2360,8 @@ impl SettingsPage for SidecarPage {
                     self.session.error = Some(
                         if self.session.save_pending || self.session.busy {
                             REASON_SAVE_PENDING
+                        } else if self.session.requires_reload_before_reapply() {
+                            REASON_RELOAD_REQUIRED
                         } else if !self.session.form.local_edits_preserved {
                             REASON_NO_PENDING_CHANGES
                         } else {
@@ -2307,8 +2380,6 @@ impl SettingsPage for SidecarPage {
                     // The reload changes only the CAS base/revision in
                     // SettingsCx; the user can then explicitly reapply it.
                     cx.reload_extended();
-                    self.session.conflict = None;
-                    self.session.error = None;
                 }
                 Nav::Stay
             }
@@ -2547,9 +2618,11 @@ impl SettingsPage for SidecarPage {
 impl SidecarPage {
     pub(super) fn apply_authoritative_settings_completion(
         &mut self,
-        cx: &SettingsCx,
+        cx: &mut SettingsCx,
         completion: Option<Result<cockpit_proto::Response, String>>,
     ) {
+        self.session
+            .reconcile_reloaded_revision(cx.extended_revision.as_deref());
         if let Some(operation_id) = self.session.save_operation_id.as_deref()
             && let Some(error) = cx.extended_save_rejection(operation_id)
         {
@@ -2592,16 +2665,12 @@ impl SidecarPage {
                         snapshot.project_id.clone(),
                         snapshot.session_id.clone(),
                         snapshot.selection_id.clone(),
+                        snapshot.config_generation,
                     );
                     self.session.principal =
                         SidecarPrincipal::from_session(&cx.image_generation_session_snapshot());
                     self.session.form =
                         SidecarFormState::from_authoritative_config(&cx.extended.image_sidecar);
-                    self.session.form.central_cap = cx
-                        .extended
-                        .media_resources
-                        .limits()
-                        .sidecar_invocations_per_session;
                 }
                 if snapshot.entity_version < self.session.reducer.entity_version {
                     // A concurrent snapshot for this same page completed after
@@ -2623,6 +2692,32 @@ impl SidecarPage {
                     return;
                 }
                 self.session.reducer.entity_version = snapshot.entity_version;
+                // Snapshot policy is daemon authority. In particular, a
+                // rebind must not retain the reducer's zero generation or a
+                // local default policy before mutation authority is enabled.
+                self.session.reducer.config_generation = snapshot.config_generation;
+                self.session.approval_mode = match snapshot.approval_mode {
+                    cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Ask => {
+                        ApprovalMode::Ask
+                    }
+                    cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Yolo => {
+                        ApprovalMode::Yolo
+                    }
+                };
+                self.session.policy = CentralPolicyView {
+                    value: snapshot.central_invocation_cap,
+                    source: match snapshot.central_invocation_cap_source {
+                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::CompiledCeiling => SidecarInvocationCapProvenance::CompiledCeiling,
+                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Configured => SidecarInvocationCapProvenance::Configured,
+                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Profile => SidecarInvocationCapProvenance::Profile,
+                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Adapter => SidecarInvocationCapProvenance::Adapter,
+                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Request => SidecarInvocationCapProvenance::Request,
+                    },
+                    hard_ceiling: snapshot.central_invocation_cap_hard_ceiling,
+                };
+                if identity_changed || !self.session.form.local_edits_preserved {
+                    self.session.form.central_cap = snapshot.central_invocation_cap;
+                }
                 self.session.form.models = snapshot
                     .models
                     .into_iter()
@@ -2636,15 +2731,11 @@ impl SidecarPage {
                     .collect();
                 self.session.reducer.grant_candidate_id = snapshot.resolution.grant_candidate_id;
                 self.session.reducer.resolution = Some(SidecarEffectiveTrace {
-                    primary_provider: String::new(),
-                    primary_model: String::new(),
-                    primary_trust: String::new(),
+                    primary: None,
                     matched_source: "daemon".into(),
                     sidecar_provider: snapshot.resolution.provider,
                     sidecar_model: snapshot.resolution.model,
-                    origin: snapshot.resolution.origin.unwrap_or_default(),
-                    location: String::new(),
-                    credential_fingerprint: String::new(),
+                    origin: snapshot.resolution.origin,
                     capability_source: "daemon".into(),
                     capability_freshness: "current".into(),
                     config_generation: snapshot.config_generation,
@@ -2677,11 +2768,24 @@ impl SidecarPage {
                     || mutation.session_id != self.session.reducer.session_id
                     || mutation.config_generation != self.session.reducer.config_generation
                     || mutation.selection_id != self.session.reducer.selection_id
-                    || mutation.entity_version <= self.session.reducer.entity_version
+                    || mutation.entity_version
+                        != self.session.reducer.entity_version.saturating_add(1)
                 {
                     self.session.reducer.mark_stale();
                     self.session.authoritative_mutations = false;
                     self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                    let (expected_daemon_instance_id, expected_session_id) =
+                        self.session.authority_request_identity();
+                    self.queue_authority_request(
+                        cx,
+                        cockpit_proto::Request::GetImageSidecarAuthoritySnapshot {
+                            project_root: self.session.reducer.project_id.clone(),
+                            config_generation: self.session.reducer.config_generation,
+                            selection_id: self.session.reducer.selection_id.clone(),
+                            expected_daemon_instance_id,
+                            expected_session_id,
+                        },
+                    );
                     return;
                 }
                 let grant = grant_view_from_authority(mutation.grant);

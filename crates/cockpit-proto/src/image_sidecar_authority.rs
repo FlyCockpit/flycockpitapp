@@ -6,6 +6,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The effective approval posture for a sidecar invocation. This deliberately
+/// projects the session's broader approval mode into the two sidecar-relevant
+/// choices, rather than asking a settings client to infer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSidecarApprovalModeV1 {
+    Ask,
+    Yolo,
+}
+
+/// Provenance of the effective central sidecar-invocation cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSidecarInvocationCapSourceV1 {
+    CompiledCeiling,
+    Configured,
+    Profile,
+    Adapter,
+    Request,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageSidecarGrantScopeV1 {
@@ -91,6 +112,14 @@ pub struct ImageSidecarAuthoritySnapshotV1 {
     pub config_generation: u64,
     pub selection_id: String,
     pub entity_version: u64,
+    /// Effective session mode, projected by the daemon. `yolo` means no
+    /// prompt and no standing-grant creation UI.
+    pub approval_mode: ImageSidecarApprovalModeV1,
+    /// The effective central policy value. Sidecar settings never invent a
+    /// local fallback for this limit.
+    pub central_invocation_cap: u64,
+    pub central_invocation_cap_source: ImageSidecarInvocationCapSourceV1,
+    pub central_invocation_cap_hard_ceiling: u64,
     pub pipeline_available: bool,
     pub health_reason: String,
     pub models: Vec<ImageSidecarModelOptionV1>,

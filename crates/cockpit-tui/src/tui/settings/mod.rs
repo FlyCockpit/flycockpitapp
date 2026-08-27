@@ -6170,7 +6170,7 @@ impl SettingsDialog {
                         .map_or("", |page| page.session.reducer.session_id.as_str()),
                 );
                 if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
-                    page.apply_authoritative_settings_completion(&self.cx, sidecar_completion);
+                    page.apply_authoritative_settings_completion(&mut self.cx, sidecar_completion);
                 }
                 if let Some((navigation, config)) = self.cx.completed_provider_navigation.take() {
                     let requested_provider_id = match &navigation {

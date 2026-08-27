@@ -110,6 +110,7 @@ pub struct CanonicalSendUserMessageV2 {
 /// acceptance; it is replay-neutral and stays outside FCM2. `run_invocation_options`
 /// is local/CLI-oriented only and is never carried by the remote envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalOwnerDirectSendUserMessageV2 {
     pub operation_id: Uuid,
     pub session_locator: String,
@@ -128,6 +129,7 @@ pub struct LocalOwnerDirectSendUserMessageV2 {
 /// `RemoteOperationIdentityV1`), not here; this envelope carries no
 /// `operation_id` and no `run_invocation_options`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedRemoteOperationEnvelopeV2 {
     pub session_locator: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -26,6 +26,7 @@ fn render(entry: &HistoryEntry) -> crate::tui::history::Rendered {
         crate::tui::history::MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &std::collections::HashSet::new(),
         0,
         None,

@@ -618,6 +618,7 @@ fn history_render_signature(
     md: crate::tui::history::MarkdownOpts,
     diff_style: cockpit_config::extended::DiffStyle,
     emojis: bool,
+    file_icons: bool,
     elided: &std::collections::HashSet<String>,
     preflight_dots_ms: u128,
     pin: Option<crate::tui::history::PinControl>,
@@ -630,6 +631,7 @@ fn history_render_signature(
     md.user.hash(&mut hasher);
     diff_style_id(diff_style).hash(&mut hasher);
     emojis.hash(&mut hasher);
+    file_icons.hash(&mut hasher);
 
     if let HistoryEntry::User {
         preflight_pending: true,
@@ -2667,6 +2669,7 @@ impl App {
                     self.markdown_opts,
                     self.diff_style,
                     self.use_emojis,
+                    self.file_icons,
                     &self.elided_event_ids,
                     preflight_dots_ms,
                     pin,
@@ -2685,6 +2688,7 @@ impl App {
                             self.markdown_opts,
                             self.diff_style,
                             self.use_emojis,
+                            self.file_icons,
                             &self.elided_event_ids,
                             // Same continuously-advancing clock the busy/Thinking spinner
                             // reads, so a preflight-pending row's `Preflight...` dots animate
@@ -4028,6 +4032,7 @@ impl App {
                 self.markdown_opts,
                 self.diff_style,
                 self.use_emojis,
+                self.file_icons,
                 &self.elided_event_ids,
                 self.started_at.elapsed().as_millis(),
                 None,
@@ -6858,6 +6863,7 @@ mod render_history_spacing_tests {
                 app.markdown_opts,
                 app.diff_style,
                 app.use_emojis,
+                app.file_icons,
                 &app.elided_event_ids,
                 preflight_dots_ms,
                 pin,

@@ -467,11 +467,11 @@ pub const TOOLCALL_RESULT_VISIBLE: usize = 20;
 /// the reasoning scrolls internally.
 pub const THINKING_VISIBLE: usize = 20;
 
-/// Display columns reserved for the tool glyph (emoji + separator) in a
-/// tool-call row when emojis are on. All glyphs are width-2 emoji, so a
-/// fixed-width column keeps every `tool:` label starting at the same
-/// column regardless of which glyph is on the row — even if a future
-/// glyph's display width differs.
+/// Display columns reserved for the tool glyph (emoji or Nerd Font
+/// file-type icon + separator) in a tool-call row. Emoji glyphs are
+/// width 2; Nerd Font file icons are width 1. Double-width glyphs are
+/// excluded from the file-icon table so this column stays 3 cells
+/// (icon + padding) and every `tool:` label starts at the same column.
 const TOOL_GLYPH_COLUMN: usize = 3;
 
 /// Light grey for the tool-box sidebar.
@@ -799,6 +799,7 @@ pub fn render_entry(
     md: MarkdownOpts,
     diff_style: cockpit_config::extended::DiffStyle,
     emojis: bool,
+    file_icons: bool,
     elided: &HashSet<String>,
     preflight_dots_ms: u128,
     pin: Option<PinControl>,
@@ -1012,8 +1013,16 @@ pub fn render_entry(
             old,
             new,
         } => {
-            let lines =
-                crate::tui::diff::render_diff(tool, path, old, new, diff_style, width, emojis);
+            let lines = crate::tui::diff::render_diff(
+                tool,
+                path,
+                old,
+                new,
+                diff_style,
+                width,
+                emojis,
+                file_icons,
+            );
             let continuations = vec![false; lines.len()];
             Rendered {
                 lines,
@@ -1031,7 +1040,7 @@ pub fn render_entry(
             calls,
             view_offset,
             follow,
-        } => render_toolbox(calls, *view_offset, *follow, width, emojis, elided),
+        } => render_toolbox(calls, *view_offset, *follow, width, emojis, file_icons, elided),
         HistoryEntry::ToolLine {
             tool,
             summary,
@@ -1040,13 +1049,15 @@ pub fn render_entry(
         } => {
             // Standalone styled one-liner, indented to align with box
             // content (the box's sidebar+space is 2 cells wide).
-            let avail = tool_summary_budget(tool, width as usize, 2, emojis);
+            let avail = tool_summary_budget(tool, width as usize, 2, emojis, file_icons, summary);
             let mut spans = vec![Span::raw("  ".to_string())];
             spans.extend(tool_line_spans(
                 tool,
                 &truncate(summary, avail),
                 *state,
                 emojis,
+                file_icons,
+                summary,
             ));
             Rendered {
                 lines: vec![Line::from(spans)],
@@ -1147,6 +1158,7 @@ pub fn render_entry(
             true,
             width,
             emojis,
+            file_icons,
             elided,
         ),
         HistoryEntry::Agent {
@@ -3103,23 +3115,49 @@ fn mcp_child_presentation(
 /// `(glyph, label)` for a tool's rendered line. `glyph` is an emoji
 /// padded to a fixed display-column width ([`TOOL_GLYPH_COLUMN`]) when
 /// `emojis` is on, empty otherwise; `label` is the verb shown bold
-/// before the `:`.
+/// before the `:`. File-type icons are off here — callers that have a
+/// path use [`tool_glyph_label_for`].
 pub fn tool_glyph_label(tool: &str, emojis: bool) -> (String, String) {
-    let presentation = resolve_tool_presentation(tool, &serde_json::Value::Null, None);
-    format_tool_glyph_label(&presentation, emojis)
+    tool_glyph_label_for(tool, emojis, false, None)
 }
 
-fn tool_call_glyph_label(call: &ToolCall, emojis: bool) -> (String, String) {
+/// Like [`tool_glyph_label`], but when `file_icons` is on and `path` is
+/// a write/edit (or plan) tool, the glyph column uses the Nerd Font
+/// file-type icon derived from `path` instead of the presentation glyph.
+/// Never re-resolves presentation from args (`Value::Null`).
+pub(crate) fn tool_glyph_label_for(
+    tool: &str,
+    emojis: bool,
+    file_icons: bool,
+    path: Option<&str>,
+) -> (String, String) {
+    let presentation = resolve_tool_presentation(tool, &serde_json::Value::Null, None);
+    let file_icon = path
+        .filter(|_| file_icons)
+        .and_then(|path| crate::tui::file_icons::glyph_for_tool_path(tool, path));
+    format_tool_glyph_label(&presentation, emojis, file_icon)
+}
+
+fn tool_call_glyph_label(call: &ToolCall, emojis: bool, file_icons: bool) -> (String, String) {
     let presentation = resolve_tool_presentation(
         &call.tool,
         &serde_json::Value::Null,
         call.mcp_child.as_ref(),
     );
-    format_tool_glyph_label(&presentation, emojis)
+    // Derive the file-type icon from the already-rendered summary path;
+    // do not re-resolve presentation (that path uses `Value::Null` args).
+    let file_icon = file_icons
+        .then(|| crate::tui::file_icons::glyph_for_tool_path(&call.tool, &call.summary))
+        .flatten();
+    format_tool_glyph_label(&presentation, emojis, file_icon)
 }
 
-fn format_tool_glyph_label(presentation: &ToolPresentation, emojis: bool) -> (String, String) {
-    let glyph = presentation.glyph.unwrap_or("");
+fn format_tool_glyph_label(
+    presentation: &ToolPresentation,
+    emojis: bool,
+    file_icon: Option<&'static str>,
+) -> (String, String) {
+    let glyph = file_icon.unwrap_or(presentation.glyph.unwrap_or(""));
     let label = if emojis {
         if presentation.label == "unlock" {
             &presentation.label
@@ -3134,10 +3172,12 @@ fn format_tool_glyph_label(presentation: &ToolPresentation, emojis: bool) -> (St
     } else {
         &presentation.label
     };
-    let glyph = if emojis && !glyph.is_empty() {
+    let show_glyph = file_icon.is_some() || (emojis && !glyph.is_empty());
+    let glyph = if show_glyph && !glyph.is_empty() {
         // Pad to a fixed display width so every label lines up at the
         // same column, rather than relying on each glyph being exactly
-        // one column short of `TOOL_GLYPH_COLUMN`.
+        // one column short of `TOOL_GLYPH_COLUMN`. Nerd Font file icons
+        // are single-cell; emoji glyphs are width 2.
         let pad = TOOL_GLYPH_COLUMN.saturating_sub(glyph.width()).max(1);
         format!("{glyph}{}", " ".repeat(pad))
     } else {
@@ -3185,9 +3225,10 @@ fn tool_call_spans(
     call: &ToolCall,
     text: &str,
     emojis: bool,
+    file_icons: bool,
     progress_width: Option<usize>,
 ) -> Vec<Span<'static>> {
-    let (glyph, label) = tool_call_glyph_label(call, emojis);
+    let (glyph, label) = tool_call_glyph_label(call, emojis, file_icons);
     let style = tool_state_style(call.state);
     let mut spans = Vec::new();
     if !glyph.is_empty() {
@@ -3217,8 +3258,10 @@ fn tool_line_spans(
     text: &str,
     state: ToolCallState,
     emojis: bool,
+    file_icons: bool,
+    path: &str,
 ) -> Vec<Span<'static>> {
-    let (glyph, label) = tool_glyph_label(tool, emojis);
+    let (glyph, label) = tool_glyph_label_for(tool, emojis, file_icons, Some(path));
     let style = tool_state_style(state);
     let mut spans = Vec::new();
     if !glyph.is_empty() {
@@ -3240,14 +3283,27 @@ fn tool_line_spans(
 
 /// Display columns available for a collapsed summary after the left
 /// `indent`, the glyph, the bold `label`, and the `": "` separator.
-fn tool_summary_budget(tool: &str, width: usize, indent: usize, emojis: bool) -> usize {
-    let (glyph, label) = tool_glyph_label(tool, emojis);
+fn tool_summary_budget(
+    tool: &str,
+    width: usize,
+    indent: usize,
+    emojis: bool,
+    file_icons: bool,
+    path: &str,
+) -> usize {
+    let (glyph, label) = tool_glyph_label_for(tool, emojis, file_icons, Some(path));
     let prefix = indent + glyph.width() + label.width() + 2;
     width.saturating_sub(prefix).max(8)
 }
 
-fn tool_call_summary_budget(call: &ToolCall, width: usize, indent: usize, emojis: bool) -> usize {
-    let (glyph, label) = tool_call_glyph_label(call, emojis);
+fn tool_call_summary_budget(
+    call: &ToolCall,
+    width: usize,
+    indent: usize,
+    emojis: bool,
+    file_icons: bool,
+) -> usize {
+    let (glyph, label) = tool_call_glyph_label(call, emojis, file_icons);
     let prefix = indent + glyph.width() + label.width() + 2;
     let available = width.saturating_sub(prefix);
     if let Some(suffix) = tool_progress_suffix(call, available) {
@@ -3262,8 +3318,9 @@ fn tool_call_progress_available(
     width: usize,
     indent: usize,
     emojis: bool,
+    file_icons: bool,
 ) -> usize {
-    let (glyph, label) = tool_call_glyph_label(call, emojis);
+    let (glyph, label) = tool_call_glyph_label(call, emojis, file_icons);
     let prefix = indent + glyph.width() + label.width() + 2;
     width.saturating_sub(prefix)
 }
@@ -3460,6 +3517,7 @@ fn render_toolbox(
     follow: bool,
     width: u16,
     emojis: bool,
+    file_icons: bool,
     elided: &HashSet<String>,
 ) -> Rendered {
     let mut content: Vec<Vec<Span<'static>>> = Vec::new();
@@ -3492,8 +3550,9 @@ fn render_toolbox(
         } else {
             call.summary.clone()
         };
-        let progress_width = tool_call_progress_available(call, width as usize, indent, emojis);
-        let budget = tool_call_summary_budget(call, width as usize, indent, emojis);
+        let progress_width =
+            tool_call_progress_available(call, width as usize, indent, emojis, file_icons);
+        let budget = tool_call_summary_budget(call, width as usize, indent, emojis, file_icons);
         let mut spans = Vec::new();
         if is_child {
             spans.push(Span::raw("  ".to_string()));
@@ -3502,6 +3561,7 @@ fn render_toolbox(
             call,
             &truncate(&summary, budget),
             emojis,
+            file_icons,
             Some(progress_width),
         ));
         if elided.contains(&call.call_id) {
@@ -3535,15 +3595,22 @@ fn render_toolbox(
             let input_lines: Vec<&str> = call.full_input.split('\n').collect();
             let first = input_lines.first().copied().unwrap_or("");
             let child_indent = if call.mcp_child.is_some() { 2 } else { 0 };
-            let progress_width =
-                tool_call_progress_available(call, call_body_width, child_indent, emojis);
-            let budget = tool_call_summary_budget(call, call_body_width, child_indent, emojis);
+            let progress_width = tool_call_progress_available(
+                call,
+                call_body_width,
+                child_indent,
+                emojis,
+                file_icons,
+            );
+            let budget =
+                tool_call_summary_budget(call, call_body_width, child_indent, emojis, file_icons);
             let first_text = if tool_progress_suffix(call, progress_width).is_some() {
                 truncate(first, budget)
             } else {
                 first.to_string()
             };
-            let mut first_spans = tool_call_spans(call, &first_text, emojis, Some(progress_width));
+            let mut first_spans =
+                tool_call_spans(call, &first_text, emojis, file_icons, Some(progress_width));
             if child_indent > 0 {
                 first_spans.insert(0, Span::raw(" ".repeat(child_indent)));
             }
@@ -3553,7 +3620,7 @@ fn render_toolbox(
                     Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
                 ));
             }
-            let (glyph, label) = tool_call_glyph_label(call, emojis);
+            let (glyph, label) = tool_call_glyph_label(call, emojis, file_icons);
             let label_indent = child_indent + glyph.width() + label.width() + 2;
             let input_style = tool_state_style(call.state);
             push_wrapped_toolbox_input_row(

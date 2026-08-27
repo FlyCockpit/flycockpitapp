@@ -67,12 +67,13 @@ pub fn render_diff(
     style: DiffStyle,
     width: u16,
     emojis: bool,
+    file_icons: bool,
 ) -> Vec<Line<'static>> {
     let diff = TextDiff::from_lines(old, new);
     let (added, removed) = count_changes(&diff);
     let style = effective_style(tool, style);
 
-    let mut out = vec![header_line(tool, path, added, removed, emojis)];
+    let mut out = vec![header_line(tool, path, added, removed, emojis, file_icons)];
     match style {
         DiffStyle::Hidden => {}
         DiffStyle::Inline => {
@@ -130,8 +131,10 @@ fn header_line(
     added: usize,
     removed: usize,
     emojis: bool,
+    file_icons: bool,
 ) -> Line<'static> {
-    let (glyph, label) = crate::tui::history::tool_glyph_label(tool, emojis);
+    let (glyph, label) =
+        crate::tui::history::tool_glyph_label_for(tool, emojis, file_icons, Some(path));
     let mut spans = vec![Span::raw(LEFT_INDENT.to_string())];
     if !glyph.is_empty() {
         spans.push(Span::raw(glyph));
@@ -459,6 +462,7 @@ mod tests {
             DiffStyle::Hidden,
             120,
             false,
+            false,
         );
         assert_eq!(lines.len(), 1);
         let s = &lines_to_strings(&lines)[0];
@@ -475,6 +479,7 @@ mod tests {
             "alpha\nBETA\ngamma\n",
             DiffStyle::Inline,
             120,
+            false,
             false,
         );
         let rendered = lines_to_strings(&lines);
@@ -494,6 +499,7 @@ mod tests {
             "alpha\nBETA\ngamma\n",
             DiffStyle::Inline,
             40,
+            false,
             false,
         );
         let rendered = lines_to_strings(&lines);
@@ -549,6 +555,7 @@ mod tests {
             DiffStyle::SideBySide,
             40,
             false,
+            false,
         );
         // Narrow mode should look like the inline render (uses `- ` /
         // `+ ` prefixes rather than the side-by-side `│` separator).
@@ -567,6 +574,7 @@ mod tests {
             "alpha\nBETA\n",
             DiffStyle::SideBySide,
             120,
+            false,
             false,
         );
         let rendered = lines_to_strings(&wide).join("\n");
@@ -595,6 +603,7 @@ mod tests {
                 "alpha\nbeta\n",
                 DiffStyle::SideBySide,
                 120,
+                false,
                 false,
             );
             let rendered = lines_to_strings(&lines).join("\n");

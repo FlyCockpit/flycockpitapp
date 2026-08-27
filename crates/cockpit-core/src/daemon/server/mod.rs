@@ -3764,22 +3764,16 @@ pub(crate) async fn boot_with_db(
         .await
         .context("reconciling delegation sidecar cleanup intents")?;
     if let Some(storage) = &ctx.media_storage_recovery {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
         storage
-            .reconcile_abandoned_component_leases(chrono::Utc::now().timestamp_millis())
+            .reconcile_abandoned_component_leases(now_unix_ms)
             .await
             .context("reconciling abandoned media component leases")?;
-        storage
-            .reconcile_media_uploads(chrono::Utc::now().timestamp_millis())
+        // Boot is recovery-only: crash-resume the same three calls the periodic
+        // tick owns for long-lived daemons. Abandoned leases stay boot-only.
+        run_media_retention_sweep(storage, now_unix_ms)
             .await
-            .context("reconciling authenticated media uploads")?;
-        storage
-            .begin_due_retention(chrono::Utc::now().timestamp_millis())
-            .await
-            .context("starting due media retention")?;
-        storage
-            .reconcile_media_cleanup_intents(chrono::Utc::now().timestamp_millis())
-            .await
-            .context("reconciling media cleanup intents")?;
+            .context("media retention recovery")?;
     }
     timer.phase("media_upload_reconcile");
     // Shared host-capability probes run once here. The TUI in-process doctor
@@ -4344,6 +4338,7 @@ fn retention_config() -> RetentionConfig {
 
 fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
     if outcome.sessions_expired > 0
+        || outcome.sessions_expiry_skipped_media_barrier > 0
         || outcome.payload_rows_deleted > 0
         || outcome.local_authority_rows_purged > 0
         || outcome.vacuumed
@@ -4351,6 +4346,7 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
         tracing::info!(
             sessions_expired = outcome.sessions_expired,
             session_cascade_rows_deleted = outcome.session_cascade_rows_deleted,
+            sessions_expiry_skipped_media_barrier = outcome.sessions_expiry_skipped_media_barrier,
             payload_rows_deleted = outcome.payload_rows_deleted,
             transcript_rows_deleted = outcome.transcript_rows_deleted,
             raw_wire_rows_deleted_or_redacted = outcome.raw_wire_rows_deleted_or_redacted,
@@ -4369,12 +4365,51 @@ async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
     }
 }
 
+/// Media cleanup intents and due retention, then (on the caller) session expiry.
+/// Failures here are returned so boot can fail closed and the periodic tick can
+/// log and retry.
+async fn run_media_retention_sweep(
+    storage: &crate::media_storage::MediaStorageRecovery,
+    now_unix_ms: i64,
+) -> Result<()> {
+    storage
+        .reconcile_media_uploads(now_unix_ms)
+        .await
+        .context("reconciling authenticated media uploads")?;
+    storage
+        .begin_due_retention(now_unix_ms)
+        .await
+        .context("starting due media retention")?;
+    storage
+        .reconcile_media_cleanup_intents(now_unix_ms)
+        .await
+        .context("reconciling media cleanup intents")?;
+    Ok(())
+}
+
+async fn run_media_retention_periodic(ctx: &DaemonContext, now_unix_ms: i64) {
+    let Some(storage) = ctx.media_storage_recovery.as_ref() else {
+        return;
+    };
+    if let Err(error) = run_media_retention_sweep(storage, now_unix_ms).await {
+        tracing::warn!(error = %error, "media retention tick failed");
+    }
+}
+
 #[cfg(any(unix, test))]
 async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
-    run_retention_tick_db(ctx.db.clone(), cfg).await;
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    run_retention_tick_at(&ctx, cfg, now_unix_ms).await;
     if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
         tracing::warn!(message = %error.message, "editor lease maintenance failed");
     }
+}
+
+/// Injected-clock retention tick: media sweep first, then session payload expiry.
+#[cfg(any(unix, test))]
+async fn run_retention_tick_at(ctx: &DaemonContext, cfg: RetentionConfig, now_unix_ms: i64) {
+    run_media_retention_periodic(ctx, now_unix_ms).await;
+    run_retention_pass(ctx.db.clone(), cfg, now_unix_ms.div_euclid(1000)).await;
 }
 
 #[cfg(any(unix, test))]

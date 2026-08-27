@@ -14565,8 +14565,7 @@ async fn handle_serialized_request_impl(
         }
         Request::GetMediaAttachmentPreview(request) => {
             use cockpit_db::media_attachments::{
-                GetMediaAttachmentStatusV1, MediaAttachmentPreviewV1,
-                MediaAttachmentStatusDetailV1, MediaComponentLeaseKind,
+                GetMediaAttachmentStatusV1, MediaAttachmentStatusDetailV1, MediaComponentLeaseKind,
             };
             use sha2::{Digest as _, Sha256};
             let unavailable = || ErrorPayload {
@@ -14663,15 +14662,7 @@ async fn handle_serialized_request_impl(
             if body.len() as u64 != preview.byte_length || !body.starts_with(b"\x89PNG\r\n\x1a\n") {
                 return Err(unavailable());
             }
-            Ok(Response::MediaAttachmentPreview(MediaAttachmentPreviewV1 {
-                schema_version: 1,
-                kind: "mediaAttachmentPreview".into(),
-                content_type: "image/png".into(),
-                cache_control: "no-store, private".into(),
-                x_content_type_options: "nosniff".into(),
-                content_length: body.len() as u64,
-                body,
-            }))
+            encode_media_attachment_preview(body)
         }
         Request::BeginMediaUpload(request) => {
             use cockpit_db::media_attachments::{
@@ -26081,6 +26072,36 @@ fn history_entry_seq(entry: &proto::HistoryEntry) -> i64 {
         | proto::HistoryEntry::CompactBoundary { seq, .. }
         | proto::HistoryEntry::Subagent { seq, .. } => *seq,
     }
+}
+
+/// Encode preview bytes as standard base64 and fail closed if the encoded
+/// NDJSON envelope would exceed the control-frame cap. Call this before write.
+pub(super) fn encode_media_attachment_preview(
+    body: Vec<u8>,
+) -> std::result::Result<Response, ErrorPayload> {
+    use base64::Engine as _;
+    use cockpit_db::media_attachments::{MEDIA_PREVIEW_EXCEEDS_FRAME, MediaAttachmentPreviewV1};
+    let exceeds = || ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: MEDIA_PREVIEW_EXCEEDS_FRAME.into(),
+    };
+    let body_base64 = base64::engine::general_purpose::STANDARD.encode(&body);
+    let preview = MediaAttachmentPreviewV1 {
+        schema_version: 1,
+        kind: "mediaAttachmentPreview".into(),
+        content_type: "image/png".into(),
+        cache_control: "no-store, private".into(),
+        x_content_type_options: "nosniff".into(),
+        content_length: body.len() as u64,
+        body_base64,
+    };
+    let response = Response::MediaAttachmentPreview(preview);
+    let encoded = serde_json::to_vec(&proto::Envelope::response(Uuid::nil(), response.clone()))
+        .map_err(|_| exceeds())?;
+    if encoded.len() > proto::MAX_NDJSON_FRAME_BYTES {
+        return Err(exceeds());
+    }
+    Ok(response)
 }
 
 pub(super) fn paused_work_to_proto(

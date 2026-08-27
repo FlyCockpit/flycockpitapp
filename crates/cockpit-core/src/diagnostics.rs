@@ -638,6 +638,22 @@ async fn database_lines(
             return (lines, true);
         }
     }
+    match db.sessions_expiry_skipped_media_barrier().await {
+        Ok(skipped) => lines.push(format!(
+            "{}: {}",
+            crate::db::retention::SESSIONS_EXPIRY_SKIPPED_MEDIA_BARRIER_KEY,
+            skipped
+        )),
+        Err(error) => {
+            lines.push(format!(
+                "{}: FAILED ({})",
+                crate::db::retention::SESSIONS_EXPIRY_SKIPPED_MEDIA_BARRIER_KEY,
+                one_line(&format!("{error:#}"))
+            ));
+            append_database_failure_guidance(&mut lines, &extended.retention);
+            return (lines, true);
+        }
+    }
     lines.push(
         "export: use `cockpit export <session>`; exports are assembled by the daemon and redacted by default"
             .to_string(),

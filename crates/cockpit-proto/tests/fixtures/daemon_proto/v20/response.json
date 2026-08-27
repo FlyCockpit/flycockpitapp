@@ -1812,7 +1812,7 @@
       "cacheControl": "private, no-store",
       "xContentTypeOptions": "nosniff",
       "contentLength": 3,
-      "body": [1, 2, 3]
+      "bodyBase64": "AQID"
     },
     "response": "media_attachment_preview"
   },

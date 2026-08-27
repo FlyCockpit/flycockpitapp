@@ -855,8 +855,21 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
     })
 }
 
-/// Delete a session, first recording an external side-effect tombstone.
-///
+/// Fail-closed message when session deletion is blocked on non-terminal media.
+/// Retention expiry matches this exact string so a blocked session is skipped
+/// instead of aborting the whole pass.
+pub const SESSION_MEDIA_CLEANUP_BARRIER: &str =
+    "session media cleanup must complete before session deletion";
+
+/// True when `delete_session_conn` refused because owned media is not yet at a
+/// deletion-evidenced terminal. Walks the anyhow chain so a wrapping context
+/// does not hide the barrier.
+pub fn is_session_media_cleanup_barrier(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == SESSION_MEDIA_CLEANUP_BARRIER)
+}
+
 /// Session deletion cannot delete unresolved external operations: a provider
 /// may already have accepted work on this session's behalf, and the record has
 /// to survive so late evidence still resolves it exactly once. The tombstone
@@ -899,10 +912,7 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
             )
             .context("checking session media deletion barrier")?;
     }
-    anyhow::ensure!(
-        unsafe_media == 0,
-        "session media cleanup must complete before session deletion"
-    );
+    anyhow::ensure!(unsafe_media == 0, SESSION_MEDIA_CLEANUP_BARRIER);
     // Capture every delegation sidecar path before the session cascade removes
     // its owning payload row. Keeping this at the universal delete boundary
     // covers local, remote-ledgered, retention, and recovery callers alike.

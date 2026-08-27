@@ -4292,12 +4292,18 @@ macro_rules! command {
             (Request::RetainHttpsMedia(..), "retain_https_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview", public_read, none, false, read_only, none, serialized, none, "-", []);
-            (Request::BeginMediaUpload(..), "begin_media_upload", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
-            (Request::AppendMediaUploadChunk(..), "append_media_upload_chunk", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
-            (Request::CancelMediaUpload(..), "cancel_media_upload", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
-            (Request::DiscardUnreferencedMediaAttachment(..), "discard_unreferenced_media_attachment", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
+            // TODO(#74 remote/web): ListSessionMediaDraftsV1 web-client wiring is
+            // deferred with RemoteMediaDomainJoinV1. Local TUI reconnect can reuse
+            // the same daemon handler later.
+            // Local CLI/TUI mutations: attached session writer/owner, not public_read.
+            // TODO(#74 remote): RemoteMediaDomainJoinV1 local-vs-remote domain split —
+            // remote FCOR ingress must not share this local idempotency table.
+            (Request::BeginMediaUpload(..), "begin_media_upload", session_writer, attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
+            (Request::AppendMediaUploadChunk(..), "append_media_upload_chunk", session_writer, attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
+            (Request::CancelMediaUpload(..), "cancel_media_upload", session_writer, attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
+            (Request::DiscardUnreferencedMediaAttachment(..), "discard_unreferenced_media_attachment", session_writer, attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
             (Request::GetMediaUploadStatus(..), "get_media_upload_status", public_read, none, false, read_only, none, serialized, none, "-", []);
-            (Request::FinalizeMediaUpload(..), "finalize_media_upload", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
+            (Request::FinalizeMediaUpload(..), "finalize_media_upload", session_writer, attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
             (Request::StopDaemon { grace_secs }, "stop_daemon", owner_only, none, true, local_only, none, serialized, none, "grace_secs:Option<u64>", [grace_secs: Option<u64> => param]);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetHostCapabilities, "get_host_capabilities", public_read, none, false, read_only, none, concurrent, none, "-", []);

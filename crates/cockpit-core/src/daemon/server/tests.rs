@@ -8,6 +8,7 @@ use super::*;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::session::Session;
+use base64::Engine as _;
 #[cfg(feature = "remote")]
 use std::collections::HashSet;
 use std::collections::{BTreeSet, HashMap};
@@ -5436,8 +5437,11 @@ async fn media_upload_production_dispatch_cancel_finalize_and_status() {
     assert_eq!(preview.content_type, "image/png");
     assert_eq!(preview.cache_control, "no-store, private");
     assert_eq!(preview.x_content_type_options, "nosniff");
-    assert_eq!(preview.content_length, preview.body.len() as u64);
-    assert!(preview.body.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(&preview.body_base64)
+        .expect("preview body_base64");
+    assert_eq!(preview.content_length, body.len() as u64);
+    assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
 }
 
 #[cfg(unix)]
@@ -14722,6 +14726,169 @@ async fn retention_tick_runs_one_pass_without_sleep() {
     assert_eq!(rows, 0);
 }
 
+#[test]
+fn media_preview_encode_fails_closed_before_write_when_oversize() {
+    let oversize = vec![0_u8; proto::MAX_NDJSON_FRAME_BYTES];
+    let error = encode_media_attachment_preview(oversize).expect_err("oversize preview");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert_eq!(
+        error.message,
+        cockpit_db::media_attachments::MEDIA_PREVIEW_EXCEEDS_FRAME
+    );
+    let small = encode_media_attachment_preview(b"\x89PNG\r\n\x1a\n".to_vec()).unwrap();
+    let Response::MediaAttachmentPreview(preview) = small else {
+        panic!("expected preview");
+    };
+    let json = serde_json::to_value(&preview).unwrap();
+    assert!(json["bodyBase64"].is_string());
+    assert!(json.get("body").is_none());
+}
+
+fn quarantined_media_record(
+    session_id: Uuid,
+    source_kind: crate::db::media_attachments::MediaSourceKind,
+    draft_expires_at_unix_ms: Option<i64>,
+    first_referenced_at_unix_ms: Option<i64>,
+) -> crate::db::media_attachments::MediaAttachmentRecord {
+    use crate::db::media_attachments::{MediaAttachmentRecord, MediaAvailability, MediaKind};
+    MediaAttachmentRecord {
+        attachment_id: Uuid::now_v7(),
+        session_id,
+        canonical_project_digest: "11".repeat(32),
+        media_kind: MediaKind::Image,
+        source_kind,
+        canonical_container: "png".into(),
+        canonical_mime: "image/png".into(),
+        availability: MediaAvailability::Quarantined,
+        attachment_version: 1,
+        availability_generation: 1,
+        reference_generation: 1,
+        captured_capability_generation: 1,
+        source_identity_digest: "22".repeat(32),
+        source_byte_length: 1,
+        source_sha256: "33".repeat(32),
+        selected_video_stream: None,
+        selected_audio_stream: None,
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 1,
+        draft_expires_at_unix_ms,
+        first_referenced_at_unix_ms,
+    }
+}
+
+async fn count_open_media_cleanup_intents(db: &Db) -> i64 {
+    db.read(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM media_attachment_cleanup_intents WHERE completed_at_unix_ms IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .context("counting open media cleanup intents")
+    })
+    .await
+    .unwrap()
+}
+
+async fn media_availability(db: &Db, attachment_id: Uuid) -> String {
+    db.read(move |conn| {
+        conn.query_row(
+            "SELECT availability FROM media_attachments WHERE attachment_id=?1",
+            [attachment_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("reading media availability")
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn media_retention_periodic_tick() {
+    use crate::db::media_attachments::MediaSourceKind;
+    const DRAFT_TTL_MS: i64 = 86_400_000;
+    const COMPLETED_SESSION_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = test_ctx();
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db.clone(),
+            &temp.path().join("media"),
+        )
+        .unwrap(),
+    ));
+
+    let draft_session = db.create_session("p", "/x", "Build").await.unwrap();
+    let ended_session = db.create_session("p", "/x", "Build").await.unwrap();
+    let ended_id = ended_session.session_id;
+    db.write(move |conn| {
+        conn.execute(
+            "UPDATE sessions SET started_at_unix_ms = 1, ended_at_unix_ms = 1, last_active_at_unix_ms = 1 WHERE session_id = ?1",
+            [ended_id.to_string()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let draft = quarantined_media_record(
+        draft_session.session_id,
+        MediaSourceKind::AuthenticatedSessionUpload,
+        Some(DRAFT_TTL_MS),
+        None,
+    );
+    let retained = quarantined_media_record(
+        ended_session.session_id,
+        MediaSourceKind::RetainedHttps,
+        None,
+        Some(1),
+    );
+    let draft_id = draft.attachment_id;
+    let retained_id = retained.attachment_id;
+    db.transaction(move |conn| {
+        crate::db::Db::insert_media_attachment_conn(conn, &draft)?;
+        crate::db::Db::insert_media_attachment_conn(conn, &retained)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // Recovery at T0 must not start due retention. Distinguishes boot recovery
+    // from the later periodic tick that advances an injected clock.
+    let storage = ctx.media_storage_recovery.as_ref().unwrap();
+    run_media_retention_sweep(storage, 10_000)
+        .await
+        .expect("boot recovery sweep");
+    assert_eq!(count_open_media_cleanup_intents(&db).await, 0);
+    assert_eq!(media_availability(&db, draft_id).await, "quarantined");
+    assert_eq!(media_availability(&db, retained_id).await, "quarantined");
+
+    let cfg = RetentionConfig {
+        transcript_window_days: 0,
+        raw_wire_window_days: 0,
+        terminal_evidence_window_days: 0,
+        session_window_days: 0,
+        vacuum_interval_days: 0,
+        ..RetentionConfig::default()
+    };
+
+    run_retention_tick_at(&ctx, cfg, DRAFT_TTL_MS + 10).await;
+    assert_eq!(count_open_media_cleanup_intents(&db).await, 0);
+    assert_eq!(
+        media_availability(&db, draft_id).await,
+        "retained_copy_deleted"
+    );
+    assert_eq!(media_availability(&db, retained_id).await, "quarantined");
+
+    run_retention_tick_at(&ctx, cfg, COMPLETED_SESSION_RETENTION_MS + 10).await;
+    assert_eq!(count_open_media_cleanup_intents(&db).await, 0);
+    assert_eq!(
+        media_availability(&db, retained_id).await,
+        "retained_copy_deleted"
+    );
+}
+
 async fn attached_state(
     ctx: &Arc<DaemonContext>,
     project_root: &std::path::Path,
@@ -17004,10 +17171,15 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "register_local_path_media" | "retain_https_media" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
-        "admit_image_ingress" | "discard_image_ingress_draft" => {
-            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
-        }
-        "resolve_agent_decision" | "apply_agent_session_override" => {
+        "admit_image_ingress"
+        | "discard_image_ingress_draft"
+        | "begin_media_upload"
+        | "append_media_upload_chunk"
+        | "cancel_media_upload"
+        | "finalize_media_upload"
+        | "discard_unreferenced_media_attachment"
+        | "resolve_agent_decision"
+        | "apply_agent_session_override" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
@@ -17396,6 +17568,11 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("register_local_path_media"),
         authz_session_writer("admit_image_ingress"),
         authz_session_writer("discard_image_ingress_draft"),
+        authz_session_writer("begin_media_upload"),
+        authz_session_writer("append_media_upload_chunk"),
+        authz_session_writer("cancel_media_upload"),
+        authz_session_writer("finalize_media_upload"),
+        authz_session_writer("discard_unreferenced_media_attachment"),
         authz_session_writer("resolve_agent_decision"),
         authz_session_writer("apply_agent_session_override"),
         authz_owner_only("retain_https_media"),
@@ -18259,6 +18436,11 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "refresh_env"
             | "refresh_config"
             | "refresh_host_capabilities"
+            | "begin_media_upload"
+            | "append_media_upload_chunk"
+            | "cancel_media_upload"
+            | "finalize_media_upload"
+            | "discard_unreferenced_media_attachment"
     )
         // Both kinds gate on `require_attached` before doing any work, in every
         // build profile — the prelude must attach wherever the level can attach
@@ -18276,6 +18458,82 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             "read_agent_tree" | "read_agent_attention" | "get_agent_effective_settings"
         ) && level.can_attach())
         || (kind == "lsp_control" && level.can_write())
+}
+
+#[cfg(unix)]
+fn authz_media_mutation_request(kind: &str) -> Request {
+    use cockpit_db::media_attachments::{
+        AppendMediaUploadChunkV1, LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+        LocalMediaMutationV1, RequestedLocalPathMediaKind,
+    };
+    let digest = "22".repeat(32);
+    let mutation = |payload: LocalMediaMutationPayloadV1| LocalMediaMutationV1 {
+        schema_version: 1,
+        kind: "localMediaMutation".into(),
+        local_operation_id: Uuid::now_v7(),
+        actor_principal_digest: "11".repeat(32),
+        actor_role: LocalMediaActorRoleV1::Owner,
+        payload,
+    };
+    match kind {
+        "begin_media_upload" => {
+            Request::BeginMediaUpload(mutation(LocalMediaMutationPayloadV1::Begin {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest,
+                client_draft_id: Uuid::now_v7(),
+                media_kind: RequestedLocalPathMediaKind::Image,
+                declared_total_bytes: 1,
+                reservation_digest: "33".repeat(32),
+            }))
+        }
+        "append_media_upload_chunk" => Request::AppendMediaUploadChunk(AppendMediaUploadChunkV1 {
+            mutation: mutation(LocalMediaMutationPayloadV1::Append {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest,
+                client_draft_id: Uuid::now_v7(),
+                upload_id: Uuid::now_v7(),
+                upload_generation: 1,
+                chunk_index: 0,
+                chunk_length: 1,
+                chunk_sha256: "33".repeat(32),
+            }),
+            data_base64: "AA==".into(),
+        }),
+        "cancel_media_upload" => {
+            Request::CancelMediaUpload(mutation(LocalMediaMutationPayloadV1::Cancel {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest,
+                client_draft_id: Uuid::now_v7(),
+                upload_id: Uuid::now_v7(),
+                upload_generation: 1,
+            }))
+        }
+        "finalize_media_upload" => {
+            Request::FinalizeMediaUpload(mutation(LocalMediaMutationPayloadV1::Finalize {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest,
+                client_draft_id: Uuid::now_v7(),
+                upload_id: Uuid::now_v7(),
+                upload_generation: 1,
+                chunk_count: 1,
+                total_bytes: 1,
+                object_sha256: "33".repeat(32),
+            }))
+        }
+        "discard_unreferenced_media_attachment" => Request::DiscardUnreferencedMediaAttachment(
+            mutation(LocalMediaMutationPayloadV1::Discard {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest,
+                attachment_id: Uuid::now_v7(),
+                attachment_version: 1,
+                availability_generation: 1,
+                reference_generation: 1,
+                origin_admission_id: None,
+                origin_upload: None,
+            }),
+        ),
+        other => panic!("unhandled media mutation authz kind {other}"),
+    }
 }
 
 #[cfg(unix)]
@@ -18985,6 +19243,12 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 mode: crate::config::extended::LlmMode::Normal,
             },
         },
+        "begin_media_upload"
+        | "append_media_upload_chunk"
+        | "cancel_media_upload"
+        | "finalize_media_upload"
+        | "discard_unreferenced_media_attachment" => authz_media_mutation_request(kind),
+
         "retain_https_media" => {
             Request::RetainHttpsMedia(cockpit_db::media_attachments::RetainHttpsMediaV1 {
                 schema_version: 1,
@@ -19953,8 +20217,11 @@ impl ReadonlyDispatchCaseKind {
                     panic!("expected MediaAttachmentPreview, got {response:?}");
                 };
                 assert_eq!(preview.content_type, "image/png");
-                assert_eq!(preview.content_length, preview.body.len() as u64);
-                assert!(preview.body.starts_with(b"\x89PNG\r\n\x1a\n"));
+                let body = base64::engine::general_purpose::STANDARD
+                    .decode(&preview.body_base64)
+                    .expect("preview body_base64");
+                assert_eq!(preview.content_length, body.len() as u64);
+                assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
             }
         }
     }

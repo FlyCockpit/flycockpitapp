@@ -1096,6 +1096,26 @@ fn materialize_tool_by_name(
 /// order is fixed so identical inputs produce a byte-identical block.
 ///
 /// The layered config is loaded once here and reused for the user name.
+fn mcp_resolver_for(
+    args: &SpawnArgs,
+    def: &crate::agents::AgentDef,
+) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
+    crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
+        args.cwd.clone(),
+        args.config.snapshot().generation,
+        def,
+    )
+}
+
+fn mcp_resolver_for_cwd(
+    args: &SpawnArgs,
+) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
+    crate::mcp::resolver::EffectiveCatalogResolver::with_config_generation(
+        args.cwd.clone(),
+        args.config.snapshot().generation,
+    )
+}
+
 fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) -> String {
     let cfg = load_extended_config(cwd);
     compose_system_prompt_with(role_prompt, session_short_id, cwd, &cfg)
@@ -2342,6 +2362,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             env_overlay: args.env_overlay.clone(),
             definition: Some(Arc::new(def.clone())),
             assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+            mcp_resolver: mcp_resolver_for(args, def),
         });
     }
 
@@ -2489,6 +2510,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def.clone())),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for(args, def),
     })
 }
 
@@ -3279,6 +3301,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3350,6 +3373,7 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3477,6 +3501,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3546,6 +3571,7 @@ pub fn goal_control(
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3606,6 +3632,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3665,6 +3692,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3740,6 +3768,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 

@@ -961,6 +961,7 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         definition: None,
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     let mut driver2 =
         Driver::with_max_schedules(s2.clone(), locks, redact, s2.project_root.clone(), agent, 1);

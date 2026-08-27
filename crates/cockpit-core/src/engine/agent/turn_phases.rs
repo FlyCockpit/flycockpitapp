@@ -2287,10 +2287,12 @@ pub(crate) async fn run_turn(
         lsp,
         resource_scheduler,
         config: config.clone(),
-        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::with_config_generation(
-            cwd.clone(),
-            config.snapshot().generation,
-        ),
+        mcp_resolver: {
+            agent
+                .mcp_resolver
+                .observe_config_generation(config.snapshot().generation);
+            agent.mcp_resolver.clone()
+        },
     };
 
     // Per-call dispatch repair pipeline (fixed order, idempotent — a reorder
@@ -2487,6 +2489,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         }
     }
 

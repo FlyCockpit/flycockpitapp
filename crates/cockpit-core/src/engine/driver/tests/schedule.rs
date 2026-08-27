@@ -475,6 +475,7 @@ fn schedule_journaling_driver(
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         definition: None,
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     let mut driver = Driver::with_max_schedules(session, locks, table, root, agent, 8);
     // Install the from-disk trusted config so the frame `record_schedule_tool_call`

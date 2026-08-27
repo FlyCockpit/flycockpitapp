@@ -306,6 +306,26 @@ pub struct McpConfig {
 const RETIRED_SEALED_BINDING_FIELDS: &[&str] =
     &["sealed_values", "sealedValues", "sealed_env", "sealedEnv"];
 
+/// Error text when a layer tries to define the reserved `cockpit` server.
+pub const RESERVED_BUILTIN_SERVER_PARSE_ERROR: &str =
+    "`cockpit` is a reserved MCP server id and cannot be defined, shadowed, or unbound";
+
+pub fn parse_error_is_reserved_builtin(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("reserved MCP server id"))
+}
+
+fn reject_reserved_builtin_server(value: &serde_json::Value) -> Result<()> {
+    let Some(servers) = value.get("servers").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    if servers.contains_key(crate::mcp::builtin::BUILTIN_SERVER_ID) {
+        anyhow::bail!("{RESERVED_BUILTIN_SERVER_PARSE_ERROR}");
+    }
+    Ok(())
+}
+
 fn reject_retired_sealed_bindings_in_mcp_value(value: &serde_json::Value) -> Result<()> {
     let Some(root) = value.as_object() else {
         return Ok(());
@@ -366,6 +386,7 @@ impl McpConfig {
         }
         let value: serde_json::Value = serde_json::from_str(raw).context("parsing mcp.json")?;
         reject_retired_sealed_bindings_in_mcp_value(&value)?;
+        reject_reserved_builtin_server(&value)?;
         serde_json::from_value(value).context("parsing mcp.json")
     }
 
@@ -907,6 +928,22 @@ mod tests {
     fn empty_doc_is_default() {
         assert!(McpConfig::parse("").unwrap().servers.is_empty());
         assert!(McpConfig::parse("{}").unwrap().servers.is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_reserved_cockpit_server() {
+        let err = McpConfig::parse(
+            r#"{ "servers": { "cockpit": { "transport": "streamable", "endpoint": "https://x/mcp" } } }"#,
+        )
+        .expect_err("cockpit is reserved");
+        assert!(
+            parse_error_is_reserved_builtin(&err),
+            "expected reserved-name parse error, got {err:#}"
+        );
+        assert!(
+            err.to_string().contains("reserved MCP server id"),
+            "{err:#}"
+        );
     }
 
     #[test]

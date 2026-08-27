@@ -71,6 +71,7 @@ fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempD
         env_overlay: old.env_overlay.clone(),
         definition: old.definition.clone(),
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     (driver, tmp)
 }

@@ -475,6 +475,7 @@ fn test_driver_with_url_and_grant(
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         definition: None,
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     let driver = Driver::with_max_schedules(session, locks, redact, root, agent, max_schedules);
     (driver, tmp)
@@ -658,6 +659,7 @@ fn learn_driver(
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         definition: None,
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(
@@ -1680,6 +1682,7 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         env_overlay: old.env_overlay.clone(),
         definition: old.definition.clone(),
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     (driver, tmp)
 }

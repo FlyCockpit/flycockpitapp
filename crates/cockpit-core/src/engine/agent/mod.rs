@@ -251,6 +251,10 @@ pub struct Agent {
     /// fresh build for that candidate model (identity prefix + role body). `None`
     /// for non-assistant sessions.
     pub assistant_identity_prefix: Option<String>,
+    /// Source-tagged MCP catalog frozen at agent construction. Global and
+    /// workspace layers still refresh on file/generation change; the agent
+    /// package layer stays pinned until the agent is rebuilt.
+    pub mcp_resolver: std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 
 pub(crate) async fn turn_toolbox(

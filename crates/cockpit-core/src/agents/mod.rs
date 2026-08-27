@@ -1981,6 +1981,21 @@ fn load_package_from_files(
     base.prompt_overrides = overrides;
     base.package_files = Some(files);
     base.private_subagents = private_subagents;
+    if let Some(bytes) = base
+        .package_files
+        .as_ref()
+        .and_then(|files| files.get(PACKAGE_MCP_FILE))
+    {
+        let text = std::str::from_utf8(bytes).map_err(|e| {
+            anyhow::anyhow!("agent package `{name}` ({PACKAGE_MCP_FILE}) is not UTF-8: {e}")
+        })?;
+        crate::mcp::config::McpConfig::parse(text).with_context(|| {
+            format!(
+                "agent package `{name}` ({}) {PACKAGE_MCP_FILE}",
+                agent_dir.display()
+            )
+        })?;
+    }
     validate_invariants(&base)?;
     Ok(base)
 }

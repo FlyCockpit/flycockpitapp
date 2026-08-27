@@ -1609,11 +1609,23 @@ impl App {
                 }) => {
                     self.apply_pin_state(session_id, count, pinned_seqs);
                 }
+                Ok(AsyncActionPayload::PinStateRefreshFailed { session_id, error }) => {
+                    tracing::debug!(error = %error, "pin state refresh failed");
+                    self.note_pin_state_refresh_failed(session_id);
+                }
                 Ok(_) => {
                     tracing::debug!("pin state refresh returned unexpected payload");
                 }
                 Err(e) => {
-                    tracing::debug!(error = %e, "pin state refresh failed");
+                    // Reached only on infra-level failure (task cancellation),
+                    // not on an RPC error — those now arrive as
+                    // `PinStateRefreshFailed`. No session identity is available,
+                    // so we only log. A cancellation always has a replacement
+                    // refresh in flight (`Replace` policy) that re-stamps; a raw
+                    // task panic (abnormal — `load_pin_state` returns `Result`)
+                    // would leave the eager stamp set until the next session
+                    // switch clears it.
+                    tracing::debug!(error = %e, "pin state refresh action failed");
                 }
             },
             AsyncActionKind::Internal("pins.toggle") => match result.payload {

@@ -29,9 +29,9 @@ use crate::audio_transcription::response::{
     decode_diarized, decode_gpt_transcribe, decode_whisper_segments, decode_whisper_words,
 };
 use crate::audio_transcription::result::{
-    DiarizationV1, DiarizedSegmentV1, NormalizedTranscriptionResultV1, TimestampsKind,
-    TimestampsV1, TranscriptSegmentV1, TranscriptWordV1, TranscriptionContentV1,
-    TranscriptionProvenanceV1, decimal_seconds_to_microseconds, map_provider_speakers,
+    DiarizationV1, DiarizedSegmentV1, NormalizedTranscriptionResultV1,
+    SEGMENT_PROJECTION_MAX_ITEMS, TimestampsKind, TimestampsV1, TranscriptSegmentV1,
+    TranscriptWordV1, TranscriptionContentV1, TranscriptionProvenanceV1, map_provider_speakers,
     project_text, requested_to_applied, validate_content_timestamps,
 };
 use crate::audio_transcription::whisper_preflight::{
@@ -80,8 +80,6 @@ fn schema() -> Value {
         "type": "object",
         "properties": {
             "source": source_schema(),
-            "start": { "type": "number", "minimum": 0, "multipleOf": 0.001 },
-            "end": { "type": "number", "exclusiveMinimum": 0, "multipleOf": 0.001 },
             "prompt": { "type": "string" },
             "keywords": {
                 "type": "array",
@@ -163,27 +161,6 @@ fn parse_source(args: &Value) -> Result<SourceArg> {
         (None, None, Some(url)) => Ok(SourceArg::Url(url.to_string())),
         _ => Err(invalid_input(
             "source must be exactly one of attachment_id, path, or url",
-        )),
-    }
-}
-
-fn parse_interval_us(args: &Value) -> Result<(u64, u64)> {
-    let start = args.get("start").and_then(Value::as_f64);
-    let end = args.get("end").and_then(Value::as_f64);
-    match (start, end) {
-        (None, None) => Ok((0, 0)),
-        (Some(start), Some(end)) => {
-            let start_us = decimal_seconds_to_microseconds(start)
-                .ok_or_else(|| invalid_input("start is not a valid media timestamp"))?;
-            let end_us = decimal_seconds_to_microseconds(end)
-                .ok_or_else(|| invalid_input("end is not a valid media timestamp"))?;
-            if end_us <= start_us {
-                return Err(invalid_input("end must be greater than start"));
-            }
-            Ok((start_us, end_us))
-        }
-        _ => Err(invalid_input(
-            "start and end must both be supplied or both omitted",
         )),
     }
 }
@@ -279,7 +256,7 @@ fn normalize_body(
 ) -> Result<NormalizedTranscriptionResultV1> {
     let requested_kind = caller_timestamps_to_kind(timestamps);
     let applied_languages: Vec<_> = languages.iter().map(requested_to_applied).collect();
-    let (text, content, detected, usage) = match model {
+    let (text, mut content, detected, usage) = match model {
         TranscriptionModel::GptTranscribe => {
             let decoded = decode_gpt_transcribe(body)?;
             (
@@ -367,7 +344,26 @@ fn normalize_body(
             )
         }
     };
-    let projected = project_text(&text);
+    let mut projected = project_text(&text);
+    match &mut content {
+        TranscriptionContentV1::Segments { items } => {
+            projected.omitted_segments =
+                items.len().saturating_sub(SEGMENT_PROJECTION_MAX_ITEMS) as u64;
+            items.truncate(SEGMENT_PROJECTION_MAX_ITEMS);
+        }
+        TranscriptionContentV1::Words { items } => {
+            projected.omitted_words =
+                items.len().saturating_sub(SEGMENT_PROJECTION_MAX_ITEMS) as u64;
+            items.truncate(SEGMENT_PROJECTION_MAX_ITEMS);
+        }
+        TranscriptionContentV1::Diarized { items, .. } => {
+            projected.omitted_segments =
+                items.len().saturating_sub(SEGMENT_PROJECTION_MAX_ITEMS) as u64;
+            items.truncate(SEGMENT_PROJECTION_MAX_ITEMS);
+        }
+        TranscriptionContentV1::Plain { .. } => {}
+    }
+    projected.complete &= projected.omitted_segments == 0 && projected.omitted_words == 0;
     let timestamps_pair = TimestampsV1 {
         requested: requested_kind,
         applied: requested_kind,
@@ -421,6 +417,10 @@ impl Tool for TranscribeAudioTool {
         ToolEffect::Mutating
     }
 
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> Value {
         schema()
     }
@@ -433,6 +433,11 @@ impl Tool for TranscribeAudioTool {
             .get("diarization")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        if diarization {
+            bail!(
+                "media_attachment_authority_unavailable: diarization requires trusted derivative duration metadata"
+            );
+        }
         let model = TranscriptionModel::select(caller_timestamps_to_kind(timestamps), diarization)
             .map_err(|error| invalid_input(error.to_string()))?;
 
@@ -517,10 +522,14 @@ impl Tool for TranscribeAudioTool {
         let session_hex =
             crate::tool_media_authority::revalidator::hex::encode(ctx.session.id.as_bytes());
         let source = parse_source(&args)?;
-        let (interval_start_us, interval_end_us) = parse_interval_us(&args)?;
+        // Interval clipping must be performed by the media authority so the
+        // approved checksum is exactly the bytes sent. Until that authority
+        // surface exists, the closed schema accepts whole admitted derivatives
+        // only; it must never authorize an interval and upload the full source.
+        let (interval_start_us, interval_end_us) = (0, 0);
         let handle = admit_source(authority, &session_hex, &source)?;
         let audio = authority
-            .read_bytes(&handle)
+            .read_bytes(&handle, MAX_FILE_BYTES)
             .map_err(|error| anyhow::anyhow!("media_attachment_authority_unavailable: {error}"))?;
         let file_bytes = audio.len() as u64;
         if file_bytes < MIN_FILE_BYTES {
@@ -532,8 +541,16 @@ impl Tool for TranscribeAudioTool {
 
         let (attachment_id, attachment_checksum, attachment_version) =
             handle_identity(&handle, &audio);
+        if let AdmittedHandle::Attachment(attachment) = &handle {
+            let actual = Sha256::digest(&audio);
+            if actual.as_slice() != attachment.checksum() {
+                bail!(
+                    "media_attachment_authority_unavailable: admitted attachment checksum changed"
+                );
+            }
+        }
 
-        let Some(dispatch) = ctx.transcription_dispatch.as_ref() else {
+        let Some(dispatch) = ctx.transcription_dispatch.clone() else {
             bail!(
                 "transcription_egress_unavailable: no journaled transcription transport is wired for this session"
             );
@@ -547,6 +564,7 @@ impl Tool for TranscribeAudioTool {
         let origin = identity.origin.clone();
         let resolved_location = identity.resolved_location.clone();
         let credential_fingerprint = identity.credential_fingerprint.clone();
+        let endpoint_config_generation = identity.endpoint_config_generation;
         let request = MediaEgressTranscriptionRequest {
             provider_id: provider_id.clone(),
             model_id: model.as_str().to_string(),
@@ -607,22 +625,33 @@ impl Tool for TranscribeAudioTool {
                 boundary,
             ),
         };
-        let mut boundaries = std::iter::from_fn(|| Some(Uuid::new_v4().as_u128()));
         let now_wall_ms = chrono::Utc::now().timestamp_millis();
-        let handoff = dispatch
-            .dispatch(
-                &owner,
-                &idempotency_key,
-                source_digest,
-                duration_ms,
-                now_wall_ms,
-                &audio,
-                &mut boundaries,
-                build,
-                ctx.cancel.is_cancelled(),
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("transcription_unavailable: {error}"))?;
+        let cancel = ctx.cancel.clone();
+        // The owned task is the durable outcome recorder. If the outer tool
+        // dispatcher reaches its cancellation/timeout grace and drops this
+        // await, Tokio detaches the task; it continues the journal terminal
+        // transition instead of stranding a possibly submitted operation.
+        let handoff = tokio::spawn(async move {
+            let mut boundaries = std::iter::from_fn(|| Some(Uuid::new_v4().as_u128()));
+            dispatch
+                .dispatch(
+                    &owner,
+                    &idempotency_key,
+                    source_digest,
+                    duration_ms,
+                    now_wall_ms,
+                    audio.as_slice(),
+                    &mut boundaries,
+                    build,
+                    &cancel,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("transcription_unavailable: dispatch task failed: {error}")
+        })?
+        .map_err(|error| anyhow::anyhow!("transcription_unavailable: {error}"))?;
 
         match handoff {
             TranscriptionHandoff::Succeeded { operation_id, body } => {
@@ -636,7 +665,7 @@ impl Tool for TranscribeAudioTool {
                     canonical_project_digest: sha256_hex(ctx.session.project_id.as_bytes()),
                     provider_id,
                     endpoint_identity_digest: sha256_hex(origin.as_bytes()),
-                    endpoint_config_generation: 1,
+                    endpoint_config_generation,
                     model_id: model.as_str().to_string(),
                     credential_fingerprint_digest: credential_fingerprint.as_str().to_string(),
                     transcription_request_digest: request_digest.as_str().to_string(),
@@ -661,6 +690,9 @@ impl Tool for TranscribeAudioTool {
                 bail!(
                     "transcription_cancelled: the provider completed after cancel; content was discarded"
                 )
+            }
+            TranscriptionHandoff::AlreadyCompleted { .. } => {
+                bail!("transcription_already_completed: provider content is not replayable")
             }
             TranscriptionHandoff::Failed { reason, .. } => {
                 bail!("{reason}")
@@ -711,11 +743,22 @@ mod tests {
                 .map(|(att, _)| att.clone()))
         }
 
-        fn read_bytes(&self, attachment: &AdmittedAttachment) -> Result<Vec<u8>, AdmissionDenial> {
-            self.attachments
+        fn read_bytes(
+            &self,
+            attachment: &AdmittedAttachment,
+            max_bytes: u64,
+        ) -> Result<Vec<u8>, AdmissionDenial> {
+            let bytes = self
+                .attachments
                 .get(&attachment.attachment_id())
                 .map(|(_, bytes)| bytes.clone())
-                .ok_or(AdmissionDenial::AttachmentNotFound)
+                .ok_or(AdmissionDenial::AttachmentNotFound)?;
+            if bytes.len() as u64 > max_bytes {
+                return Err(AdmissionDenial::Internal(
+                    "media source exceeds byte limit".into(),
+                ));
+            }
+            Ok(bytes)
         }
     }
 
@@ -725,9 +768,10 @@ mod tests {
             &self,
             _session_id: &str,
             path: &str,
-        ) -> Result<(PathBuf, HandleEvidence), AdmissionDenial> {
+        ) -> Result<(PathBuf, Arc<std::fs::File>, HandleEvidence), AdmissionDenial> {
             Ok((
                 PathBuf::from(path),
+                Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap()),
                 HandleEvidence {
                     metadata_fingerprint: [0x11; 32],
                 },
@@ -839,6 +883,7 @@ mod tests {
                 credential_fingerprint: CredentialFingerprintDigest::from_raw_for_test(
                     "aa".repeat(32),
                 ),
+                endpoint_config_generation: 1,
             },
         )
     }

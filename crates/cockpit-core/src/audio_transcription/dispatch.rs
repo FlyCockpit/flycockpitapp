@@ -41,6 +41,9 @@ pub enum TranscriptionEgressError {
     BodyLimit,
     /// The response could not be interpreted as a transcription response.
     Malformed,
+    /// Request bytes may have reached the provider; retrying could duplicate a
+    /// paid operation. The journal must retain this as submission-unknown.
+    AmbiguousAcceptance,
 }
 
 impl TranscriptionEgressError {
@@ -56,9 +59,20 @@ impl TranscriptionEgressError {
                 "transcription_unavailable: response exceeded size limit"
             }
             TranscriptionEgressError::Malformed => "invalid_output: response was malformed",
+            TranscriptionEgressError::AmbiguousAcceptance => {
+                "transcription_unavailable: provider acceptance is unknown"
+            }
         }
     }
 }
+
+impl std::fmt::Display for TranscriptionEgressError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.redacted_reason())
+    }
+}
+
+impl std::error::Error for TranscriptionEgressError {}
 
 /// A successful transcription HTTP response: the status code and the bounded
 /// response body bytes. The caller decodes the body with the family-selected
@@ -95,7 +109,7 @@ pub trait TranscriptionEgressTransport: Send + Sync {
 /// iterator) it fails `transcription_unavailable` with no body produced.
 pub fn encode_with_boundary_retry(
     audio: &[u8],
-    boundaries: &mut dyn Iterator<Item = u128>,
+    boundaries: &mut (dyn Iterator<Item = u128> + Send),
     build: impl Fn(&str) -> Result<PlannedMultipart>,
 ) -> Result<(String, Vec<u8>)> {
     for _ in 0..MAX_BOUNDARY_ATTEMPTS {
@@ -121,7 +135,7 @@ pub fn encode_with_boundary_retry(
 /// secret-free error; on success returns the bounded response for decoding.
 pub async fn dispatch_multipart(
     audio: &[u8],
-    boundaries: &mut dyn Iterator<Item = u128>,
+    boundaries: &mut (dyn Iterator<Item = u128> + Send),
     build: impl Fn(&str) -> Result<PlannedMultipart>,
     transport: &dyn TranscriptionEgressTransport,
 ) -> Result<TranscriptionHttpResponse> {
@@ -135,7 +149,7 @@ pub async fn dispatch_multipart(
             }
             .redacted_reason()
         ),
-        Err(error) => bail!("{}", error.redacted_reason()),
+        Err(error) => Err(anyhow::Error::new(error)),
     }
 }
 

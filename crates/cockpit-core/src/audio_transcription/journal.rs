@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::dispatch::{TranscriptionEgressTransport, dispatch_multipart};
@@ -29,6 +30,9 @@ pub enum TranscriptionHandoff {
     Cancelled { operation_id: Uuid },
     /// Provider completed after cancellation. Content is discarded.
     CompletedAfterCancel { operation_id: Uuid },
+    /// The idempotency identity already completed, but provider content is not
+    /// retained by the side-effect journal and therefore cannot be replayed.
+    AlreadyCompleted { operation_id: Uuid },
     /// Provider/transport failed after `dispatching`. Journal is terminal
     /// `rejected` or `failed`. The reason is redacted and secret-free.
     Failed { operation_id: Uuid, reason: String },
@@ -40,6 +44,7 @@ impl TranscriptionHandoff {
             Self::Succeeded { operation_id, .. }
             | Self::Cancelled { operation_id }
             | Self::CompletedAfterCancel { operation_id }
+            | Self::AlreadyCompleted { operation_id }
             | Self::Failed { operation_id, .. } => *operation_id,
         }
     }
@@ -49,9 +54,10 @@ impl TranscriptionHandoff {
     pub fn body(&self) -> Option<&[u8]> {
         match self {
             Self::Succeeded { body, .. } => Some(body),
-            Self::Cancelled { .. } | Self::CompletedAfterCancel { .. } | Self::Failed { .. } => {
-                None
-            }
+            Self::Cancelled { .. }
+            | Self::CompletedAfterCancel { .. }
+            | Self::AlreadyCompleted { .. }
+            | Self::Failed { .. } => None,
         }
     }
 }
@@ -124,14 +130,14 @@ pub async fn dispatch_prepared(
     prepared: &PreparedTranscription,
     now_wall_ms: i64,
     audio: &[u8],
-    boundaries: &mut dyn Iterator<Item = u128>,
+    boundaries: &mut (dyn Iterator<Item = u128> + Send),
     build: impl Fn(&str) -> Result<PlannedMultipart>,
     transport: &dyn TranscriptionEgressTransport,
-    already_cancelled: bool,
+    cancel: &CancellationToken,
 ) -> Result<TranscriptionHandoff, ExternalJournalError> {
     let operation_id = prepared.operation_id;
 
-    if already_cancelled || prepared.record.state == ExternalJournalState::Cancelled {
+    if cancel.is_cancelled() || prepared.record.state == ExternalJournalState::Cancelled {
         let record = cancel_or_load(journal, operation_id, now_wall_ms).await?;
         return Ok(handoff_from_terminal(record, None));
     }
@@ -154,8 +160,24 @@ pub async fn dispatch_prepared(
     // now — recovery would otherwise be left with an unresolved dispatching
     // fact. The terminal after send is `completed_after_cancel` when cancel
     // won, and the body is discarded.
-    let send = dispatch_multipart(audio, boundaries, build, transport).await;
-    finish_after_send(journal, &mut ticket, send, now_wall_ms).await
+    let mut send_fut = Box::pin(dispatch_multipart(audio, boundaries, build, transport));
+    let send = tokio::select! {
+        biased;
+        result = &mut send_fut => result,
+        () = cancel.cancelled() => {
+            journal.request_cancellation(operation_id, now_wall_ms).await?;
+            send_fut.await
+        }
+    };
+    let mut finish = Box::pin(finish_after_send(journal, &mut ticket, send, now_wall_ms));
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            journal.request_cancellation(operation_id, now_wall_ms).await?;
+            finish.await
+        }
+        result = &mut finish => result,
+    }
 }
 
 async fn cancel_or_load(
@@ -233,7 +255,18 @@ async fn finish_after_send(
         }
         Err(error) => {
             let reason = error.to_string();
-            let next = if ticket.state() == ExternalJournalState::CancellationRequested
+            let ambiguous = error
+                .downcast_ref::<super::dispatch::TranscriptionEgressError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        super::dispatch::TranscriptionEgressError::Timeout
+                            | super::dispatch::TranscriptionEgressError::AmbiguousAcceptance
+                    )
+                });
+            let next = if ambiguous {
+                ExternalJournalState::SubmissionUnknown
+            } else if ticket.state() == ExternalJournalState::CancellationRequested
                 || journal
                     .get(operation_id)
                     .await?
@@ -257,9 +290,14 @@ fn handoff_from_terminal(
     body: Option<Vec<u8>>,
 ) -> TranscriptionHandoff {
     match record.state {
-        ExternalJournalState::Succeeded => TranscriptionHandoff::Succeeded {
-            operation_id: record.operation_id,
-            body: body.unwrap_or_default(),
+        ExternalJournalState::Succeeded => match body {
+            Some(body) => TranscriptionHandoff::Succeeded {
+                operation_id: record.operation_id,
+                body,
+            },
+            None => TranscriptionHandoff::AlreadyCompleted {
+                operation_id: record.operation_id,
+            },
         },
         ExternalJournalState::CompletedAfterCancel => TranscriptionHandoff::CompletedAfterCancel {
             operation_id: record.operation_id,
@@ -286,6 +324,7 @@ pub struct TranscriptionDestinationIdentity {
     pub origin: String,
     pub resolved_location: String,
     pub credential_fingerprint: super::authorization::CredentialFingerprintDigest,
+    pub endpoint_config_generation: u64,
 }
 
 /// Production (and test) binding of journal + injectable transport.
@@ -296,6 +335,10 @@ pub struct TranscriptionDispatchService {
 }
 
 impl TranscriptionDispatchService {
+    /// Test-only injection seam. Production construction must use
+    /// [`Self::from_http_transport`] so endpoint identity and transport target
+    /// come from one vetted object.
+    #[cfg(test)]
     pub fn new(
         journal: Arc<ExternalJournal>,
         transport: Arc<dyn TranscriptionEgressTransport>,
@@ -305,6 +348,28 @@ impl TranscriptionDispatchService {
             journal,
             transport,
             identity,
+        }
+    }
+
+    pub fn from_http_transport(
+        journal: Arc<ExternalJournal>,
+        transport: super::transport::TranscriptionHttpTransport,
+        provider_id: String,
+        resolved_location: String,
+        credential_fingerprint: super::authorization::CredentialFingerprintDigest,
+        endpoint_config_generation: u64,
+    ) -> Self {
+        let origin = transport.origin().to_string();
+        Self {
+            journal,
+            transport: Arc::new(transport),
+            identity: TranscriptionDestinationIdentity {
+                provider_id,
+                origin,
+                resolved_location,
+                credential_fingerprint,
+                endpoint_config_generation,
+            },
         }
     }
 
@@ -329,9 +394,9 @@ impl TranscriptionDispatchService {
         duration_ms: u64,
         now_wall_ms: i64,
         audio: &[u8],
-        boundaries: &mut dyn Iterator<Item = u128>,
+        boundaries: &mut (dyn Iterator<Item = u128> + Send),
         build: impl Fn(&str) -> Result<PlannedMultipart>,
-        already_cancelled: bool,
+        cancel: &CancellationToken,
     ) -> Result<TranscriptionHandoff, ExternalJournalError> {
         let prepared = prepare_transcription(
             &self.journal,
@@ -350,7 +415,7 @@ impl TranscriptionDispatchService {
             boundaries,
             build,
             self.transport.as_ref(),
-            already_cancelled,
+            cancel,
         )
         .await
     }
@@ -427,6 +492,14 @@ mod tests {
         Digest::of(b"audio-bytes")
     }
 
+    fn cancellation(cancelled: bool) -> CancellationToken {
+        let token = CancellationToken::new();
+        if cancelled {
+            token.cancel();
+        }
+        token
+    }
+
     async fn prepare_one(journal: &ExternalJournal, idem: &str) -> PreparedTranscription {
         prepare_transcription(journal, &owner(), &key(idem), source_digest(), 1_000, T0)
             .await
@@ -456,7 +529,7 @@ mod tests {
             &mut boundaries,
             build_plan(audio.len() as u64),
             &transport,
-            true,
+            &cancellation(true),
         )
         .await
         .expect("handoff");
@@ -488,7 +561,7 @@ mod tests {
                 &mut boundaries,
                 build_plan(audio.len() as u64),
                 transport_for_task.as_ref(),
-                false,
+                &cancellation(false),
             )
             .await
         });
@@ -568,7 +641,7 @@ mod tests {
             &mut boundaries,
             build_plan(audio.len() as u64),
             &transport,
-            false,
+            &cancellation(false),
         )
         .await
         .expect("handoff maps invalid-after-cancel");
@@ -591,7 +664,7 @@ mod tests {
             &mut boundaries,
             build_plan(audio.len() as u64),
             &transport,
-            false,
+            &cancellation(false),
         )
         .await
         .expect("success");
@@ -612,11 +685,14 @@ mod tests {
             &mut [2u128].into_iter(),
             build_plan(audio.len() as u64),
             &transport,
-            false,
+            &cancellation(false),
         )
         .await
         .expect("replay of completed");
-        assert!(matches!(replay, TranscriptionHandoff::Succeeded { .. }));
+        assert!(matches!(
+            replay,
+            TranscriptionHandoff::AlreadyCompleted { .. }
+        ));
         assert_eq!(
             transport.send_count(),
             1,

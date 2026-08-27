@@ -88,7 +88,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     // dispatcher-level drop cannot leave a half-landed external effect that the
     // caller would need to observe (egress is fail-closed until attachment
     // authority admits a source).
-    ToolTimeoutSafety::abandon_safe("transcribe_audio"),
+    ToolTimeoutSafety::honors_cancel("transcribe_audio"),
     ToolTimeoutSafety::abandon_safe("artifact_read"),
     ToolTimeoutSafety::abandon_safe("artifact_search"),
     ToolTimeoutSafety::abandon_safe("unlock"),

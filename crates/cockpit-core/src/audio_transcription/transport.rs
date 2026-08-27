@@ -54,6 +54,10 @@ impl TranscriptionHttpTransport {
     /// The OpenAI Audio transcriptions path. Joined onto a validated origin.
     pub const TRANSCRIPTIONS_PATH: &'static str = "/v1/audio/transcriptions";
 
+    pub fn origin(&self) -> &str {
+        self.origin.as_str()
+    }
+
     /// Bind a vetted HTTPS origin, a caller-supplied bearer credential, and
     /// the public-internet address class. Fails closed on a malformed origin
     /// or credential; never hardcodes a secret.
@@ -67,6 +71,9 @@ impl TranscriptionHttpTransport {
             return Err(ProviderTransportConfigError::EmptyBodyLimit);
         }
         let origin = validate_https_origin(origin)?;
+        if origin.path() != "/" {
+            return Err(ProviderTransportConfigError::ForbiddenOriginComponent);
+        }
         let mut authorization = HeaderValue::from_str(&format!("Bearer {bearer_token}"))
             .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
         authorization.set_sensitive(true);
@@ -94,8 +101,9 @@ impl TranscriptionHttpTransport {
             ProviderTransportError::Connect | ProviderTransportError::Tls => {
                 TranscriptionEgressError::Connect
             }
-            ProviderTransportError::Timeout => TranscriptionEgressError::Timeout,
-            ProviderTransportError::AmbiguousAcceptance => TranscriptionEgressError::Connect,
+            ProviderTransportError::Timeout | ProviderTransportError::AmbiguousAcceptance => {
+                TranscriptionEgressError::AmbiguousAcceptance
+            }
             ProviderTransportError::Status { status, .. } => {
                 TranscriptionEgressError::Status { status }
             }

@@ -984,6 +984,8 @@ struct CurrentTargetIdentity {
     model_or_workflow_digest: String,
     enabled: bool,
     is_default: bool,
+    reference_support: cockpit_config::config::image_generation::ReferenceImageSupport,
+    max_reference_images: u64,
 }
 struct Flight {
     notify: Notify,
@@ -1034,6 +1036,33 @@ fn adapter_kind_str(kind: ImageAdapterKind) -> &'static str {
 }
 
 impl ImageRuntimeRegistry {
+    /// Build an isolated registry for a candidate configuration.  Reload uses
+    /// this to refresh capabilities and construct adapters before replacing the
+    /// live registry, so a failed candidate can never leave new target facts
+    /// paired with old adapters/credentials.
+    pub fn staged_for_config(
+        &self,
+        config: &ImageGenerationConfig,
+        generation: u64,
+        epoch: u64,
+    ) -> Result<Self, RuntimeError> {
+        let staged = Self {
+            inner: Arc::new(Inner {
+                adapters: self.inner.adapters.clone(),
+                cache: Mutex::new(HashMap::new()),
+                current: Mutex::new(HashMap::new()),
+                current_targets: Mutex::new(HashMap::new()),
+                inflight: Mutex::new(HashMap::new()),
+            }),
+            clock: self.clock.clone(),
+            dns: self.dns.clone(),
+            connector: self.connector.clone(),
+            store: self.store.clone(),
+        };
+        staged.apply_config(config, generation, epoch)?;
+        Ok(staged)
+    }
+
     fn secret_lookup(&self, name: &str) -> Option<String> {
         let store = self.store.as_ref()?;
         if let Some(value) = store.named_secret(name) {
@@ -1393,6 +1422,8 @@ impl ImageRuntimeRegistry {
                     model_or_workflow_digest,
                     enabled: target.enabled,
                     is_default: target.is_default,
+                    reference_support: target.reference_support,
+                    max_reference_images: target.max_reference_images,
                 },
             );
         }
@@ -1432,6 +1463,9 @@ impl ImageRuntimeRegistry {
                 model_or_workflow_digest: model_or_workflow_digest.into(),
                 enabled: true,
                 is_default: false,
+                reference_support:
+                    cockpit_config::config::image_generation::ReferenceImageSupport::Unsupported,
+                max_reference_images: 0,
             },
         );
     }
@@ -2136,6 +2170,23 @@ impl ImageRuntimeRegistry {
             value.expires_at =
                 adapter_expiry.min(now.saturating_add(CAPABILITY_DISPATCH_TTL.as_millis() as u64));
             value.provenance = SnapshotProvenance::Live;
+            // Reference egress is a sealed capability, not an adapter's
+            // late-only concern. Carry the configured support and bound into
+            // the runtime snapshot so preflight rejects unsupported/fanout
+            // requests before authorization or reservations.
+            value.constraints.insert(
+                "reference_support".to_string(),
+                match target_current.reference_support {
+                    cockpit_config::config::image_generation::ReferenceImageSupport::Unsupported => "unsupported",
+                    cockpit_config::config::image_generation::ReferenceImageSupport::Optional => "optional",
+                    cockpit_config::config::image_generation::ReferenceImageSupport::Required => "required",
+                }
+                .to_string(),
+            );
+            value.constraints.insert(
+                "max_reference_images".to_string(),
+                target_current.max_reference_images.to_string(),
+            );
         }
         if capability.is_none() && kind == RefreshKind::Health {
             capability = self
@@ -2645,7 +2696,15 @@ pub(crate) mod dispatch_proof_support {
                     retrieved_at: 0,
                     expires_at: CAPABILITY_DISPATCH_TTL.as_millis() as u64,
                     provenance: SnapshotProvenance::Live,
-                    constraints: BTreeMap::new(),
+                    constraints: BTreeMap::from([
+                        ("formats".to_string(), "png".to_string()),
+                        ("max_width".to_string(), "512".to_string()),
+                        ("max_height".to_string(), "512".to_string()),
+                        ("max_attempts".to_string(), "1".to_string()),
+                        ("required_grant".to_string(), "image_generation".to_string()),
+                        ("reference_support".to_string(), "unsupported".to_string()),
+                        ("max_reference_images".to_string(), "0".to_string()),
+                    ]),
                 }),
                 model_or_workflow_digest: Some("digest".into()),
                 unavailable_reason: None,

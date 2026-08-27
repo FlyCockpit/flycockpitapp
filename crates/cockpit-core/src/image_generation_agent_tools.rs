@@ -1412,6 +1412,256 @@ impl Tool for CancelImageGenerationJobTool {
 mod tests {
     use super::*;
 
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use cockpit_config::config::image_generation::{
+        IMAGE_GENERATION_ROUTE_PROFILE_VERSION, ImageAdapterKind, ImageCapabilityEvidence,
+        ImageDimensionDescriptor, ImageDimensionRequestPolicy, ImageEndpoint, ImageFormat,
+        ImageGenerationConfig, ImageGenerationTarget, ImageLocationClass, ImagePrice,
+        ImageTargetIdentity, ReferenceImageSupport,
+    };
+    use cockpit_config::config::media_budget::MediaResourcePolicy;
+    use cockpit_config::config::providers::CapabilityStatus;
+    use cockpit_db::image_spend::{BudgetPolicy, ImageSpendSettings};
+
+    use crate::daemon::principal::ClientPrincipal;
+    use crate::daemon::proto::ResolveResponse;
+    use crate::image_generation_job::{
+        DispatchRevalidationRequest, ImageDispatchProofSource, ImageGenerationAdapter,
+        ImageGenerationAdapterMap, ImageGenerationDispatchService, ImageGenerationDispatcher,
+        ImageGenerationHandoffRequest, ImageGenerationHandoffResult,
+    };
+    use crate::image_generation_runtime::{
+        CredentialIdentityDigest, DispatchProofBinding, ImageRuntimeRegistry, RuntimeError,
+        dispatch_proof_support::{FixedClock, dispatchable_registry},
+    };
+
+    struct ToolImageClock;
+
+    impl crate::media_reservation::MonotonicClock for ToolImageClock {
+        fn now_ms(&self) -> u64 {
+            100
+        }
+    }
+
+    /// Uses the live runtime revalidation implementation for the scheduler half
+    /// of the tool-boundary test. The database prepare transaction still checks
+    /// this binding against the destination sealed by the authorized tool call.
+    struct ToolRegistryProof {
+        registry: ImageRuntimeRegistry,
+        endpoint: ImageEndpoint,
+        credential: CredentialIdentityDigest,
+    }
+
+    impl ImageDispatchProofSource for ToolRegistryProof {
+        fn revalidate<'a>(
+            &'a self,
+            request: DispatchRevalidationRequest<'a>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = std::result::Result<DispatchProofBinding, RuntimeError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.registry
+                    .revalidate_dispatch_binding(
+                        &self.endpoint,
+                        request.target_id,
+                        &self.credential,
+                    )
+                    .await
+            })
+        }
+    }
+
+    /// A scripted adapter for the *worker* half of the integration test. Its
+    /// count proves that a denied Tool::call leaves nothing for the scheduler,
+    /// and that an allowed call reaches one real scheduler handoff.
+    #[derive(Default)]
+    struct CountingToolAdapter {
+        calls: AtomicUsize,
+    }
+
+    impl crate::image_generation_job::image_generation_adapter_sealed::Sealed for CountingToolAdapter {}
+
+    #[async_trait::async_trait]
+    impl ImageGenerationAdapter for CountingToolAdapter {
+        async fn handoff(
+            &self,
+            _request: &ImageGenerationHandoffRequest,
+        ) -> ImageGenerationHandoffResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"tool-boundary-accepted".to_vec(),
+            }
+        }
+    }
+
+    fn tool_generation_endpoint() -> ImageEndpoint {
+        ImageEndpoint {
+            id: "tool-image-endpoint".to_string(),
+            adapter: ImageAdapterKind::OpenaiImages,
+            origin: "https://127.0.0.1".to_string(),
+            path_prefix: None,
+            credential_ref: None,
+            headers: Vec::new(),
+            allow_insecure_transport: false,
+            location: ImageLocationClass::Local,
+            enabled: true,
+            route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+            exclusive_server: false,
+        }
+    }
+
+    fn tool_generation_config(endpoint: ImageEndpoint) -> ImageGenerationConfig {
+        ImageGenerationConfig::new(
+            vec![endpoint],
+            vec![ImageGenerationTarget {
+                id: "tool-image-target".to_string(),
+                display_name: None,
+                endpoint_id: "tool-image-endpoint".to_string(),
+                identity: ImageTargetIdentity::HostedModel {
+                    model: "gpt-image-test".to_string(),
+                },
+                enabled: true,
+                is_default: true,
+                formats: vec![ImageFormat::Png],
+                reference_support: ReferenceImageSupport::Unsupported,
+                max_reference_images: 0,
+                max_samples: 1,
+                max_outputs: 1,
+                dimensions: ImageDimensionDescriptor::ProviderDefault,
+                dimension_policy: ImageDimensionRequestPolicy::ProviderDefault,
+                parameters: Vec::new(),
+                openrouter_routing: None,
+                generation_capability: ImageCapabilityEvidence::new(
+                    CapabilityStatus::Unknown,
+                    None,
+                )
+                .unwrap(),
+                price: ImagePrice::Unknown,
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    async fn generation_tool_ctx(
+        root: &std::path::Path,
+    ) -> (
+        ToolCtx,
+        Arc<ImageGenerationDispatchService>,
+        ToolRegistryProof,
+    ) {
+        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(root);
+        let endpoint = tool_generation_endpoint();
+        let credential = CredentialIdentityDigest::from_sha256([7; 32]);
+        let registry = Arc::new(
+            dispatchable_registry(
+                Arc::new(FixedClock(AtomicU64::new(0))),
+                &endpoint,
+                "tool-image-target",
+                1,
+                1,
+                credential.clone(),
+            )
+            .await,
+        );
+        let proof_registry = dispatchable_registry(
+            Arc::new(FixedClock(AtomicU64::new(0))),
+            &endpoint,
+            "tool-image-target",
+            1,
+            1,
+            credential.clone(),
+        )
+        .await;
+        db.save_image_spend_policy(
+            ctx.session.project_id.clone(),
+            ImageSpendSettings {
+                request: BudgetPolicy::Unlimited,
+                session: BudgetPolicy::Unlimited,
+                project: BudgetPolicy::Unlimited,
+                project_epoch: None,
+            },
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+        let service = Arc::new(ImageGenerationDispatchService::new(
+            db,
+            registry,
+            Uuid::now_v7(),
+            ClientPrincipal::owner(),
+            1,
+            BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS,
+            MediaResourcePolicy::default(),
+            Arc::new(ToolImageClock),
+            None,
+            tool_generation_config(endpoint.clone()),
+            ImageGenerationAdapterMap::new(),
+        ));
+        ctx.image_generation_dispatch = Some(service.clone());
+        (
+            ctx,
+            service,
+            ToolRegistryProof {
+                registry: proof_registry,
+                endpoint,
+                credential,
+            },
+        )
+    }
+
+    fn tool_generation_args(output: &std::path::Path) -> Value {
+        serde_json::json!({
+            "prompt": "a test image",
+            "directory": output.display().to_string(),
+            "base_stem": "tool-image",
+            "targets": [{
+                "target_id": "tool-image-target",
+                "width": 512,
+                "height": 512,
+                "format": "png"
+            }]
+        })
+    }
+
+    async fn reject_next_image_generation_prompt(ctx: &ToolCtx) -> String {
+        let interrupt = loop {
+            let open = ctx
+                .session
+                .db
+                .list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap();
+            if let Some(interrupt) = open
+                .iter()
+                .find(|interrupt| ctx.interrupts.has_waiter(interrupt.interrupt_id))
+            {
+                break interrupt.clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        let response = ResolveResponse::Single {
+            selected_id: "reject".to_string(),
+        };
+        ctx.session
+            .db
+            .resolve_interrupt(interrupt.interrupt_id, &response)
+            .await
+            .unwrap();
+        assert!(ctx.interrupts.resolve(interrupt.interrupt_id, response));
+        interrupt.description
+    }
+
     fn base_projection() -> ImageGenerationPlanProjection {
         ImageGenerationPlanProjection {
             destinations: vec![ProjectionDestination {
@@ -1594,6 +1844,112 @@ mod tests {
         let desc = image_generation_tool_description("list_image_generation_targets").unwrap();
         assert!(desc.to_lowercase().contains("first"));
         assert!(desc.to_lowercase().contains("no secrets"));
+    }
+
+    // This covers the agent-tool boundary through the real service and actual
+    // Approver. Retention/publication is deliberately owned by the separate
+    // accepted-response lifecycle fixture in `image_generation_job`: duplicating
+    // its private artifact-root and response-recovery harness here would turn
+    // this Tool::call test into a second, less authoritative lifecycle harness.
+    #[tokio::test]
+    async fn generate_image_tool_denial_creates_no_job_and_allow_queues_then_handoffs() {
+        let denied_root = tempfile::tempdir().unwrap();
+        let denied_output = denied_root.path().join("denied-output");
+        std::fs::create_dir(&denied_output).unwrap();
+        let (denied_ctx, _denied_service, denied_proof) =
+            generation_tool_ctx(denied_root.path()).await;
+        denied_ctx
+            .session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
+        let (denied, approval_description) = tokio::join!(
+            GenerateImageTool.call(tool_generation_args(&denied_output), &denied_ctx),
+            reject_next_image_generation_prompt(&denied_ctx),
+        );
+        let denied = denied.unwrap();
+        let digest_prefix = approval_description
+            .split("(plan ")
+            .nth(1)
+            .and_then(|suffix| suffix.strip_suffix(")"))
+            .expect("the real image authorization prompt must carry a plan digest prefix");
+        assert_eq!(digest_prefix.len(), 12);
+        assert!(
+            digest_prefix
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+        assert!(
+            denied
+                .content
+                .contains("image generation was declined at the approval prompt"),
+            "manual rejection must remain a refusal: {denied:?}"
+        );
+
+        let denied_adapter = CountingToolAdapter::default();
+        let denied_pass = ImageGenerationDispatcher::new(denied_ctx.session.db.clone())
+            .run_scheduler_pass(
+                &denied_adapter,
+                &denied_proof,
+                Uuid::now_v7(),
+                100,
+                100,
+                100,
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_pass.claimed, 0, "denial must leave no queued job");
+        assert_eq!(denied_adapter.calls.load(Ordering::SeqCst), 0);
+
+        let allowed_root = tempfile::tempdir().unwrap();
+        let allowed_output = allowed_root.path().join("allowed-output");
+        std::fs::create_dir(&allowed_output).unwrap();
+        let (allowed_ctx, allowed_service, allowed_proof) =
+            generation_tool_ctx(allowed_root.path()).await;
+        // The test context's Yolo mode exercises the concrete Approver's
+        // `AuthorizationRequest::ImageGeneration` allow path without a UI
+        // interrupt; the service seals the resulting plan digest before queueing.
+        let allowed = GenerateImageTool
+            .call(tool_generation_args(&allowed_output), &allowed_ctx)
+            .await
+            .unwrap();
+        let job_id = allowed
+            .content
+            .split('`')
+            .nth(1)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("authorized tool result must expose its queued job id");
+        assert!(
+            allowed.content.contains("authorized and queued"),
+            "{allowed:?}"
+        );
+        assert!(matches!(
+            allowed_service
+                .job_status(&allowed_ctx.session, job_id)
+                .await
+                .unwrap(),
+            crate::image_generation_job::GetImageJobStatusOutcome::Status {
+                state,
+                slot_count: 1,
+                cancellation_requested: false,
+                terminal: None,
+            } if state == "queued"
+        ));
+
+        let allowed_adapter = CountingToolAdapter::default();
+        let allowed_pass = ImageGenerationDispatcher::new(allowed_ctx.session.db.clone())
+            .run_scheduler_pass(
+                &allowed_adapter,
+                &allowed_proof,
+                Uuid::now_v7(),
+                100,
+                100,
+                100,
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed_pass.dispatched, 1);
+        assert_eq!(allowed_adapter.calls.load(Ordering::SeqCst), 1);
     }
 
     // ---- Acceptance criterion 3: reference tests ----

@@ -312,10 +312,25 @@ fn build_def() -> AgentDef {
             "harness_invoke",
             "task",
             "mcp",
+            "list_image_generation_targets",
+            "generate_image",
+            "get_image_generation_job",
+            "cancel_image_generation_job",
         ],
         crate::engine::builtin::BUILD_PROMPT,
         Some(crate::engine::builtin::BUILD_PROMPT_NORMAL),
     );
+    // Image generation is an explicit privileged capability of the primary
+    // coding surface. Do not leave it to the generic fallback tiering rule:
+    // ejected definitions and materialization must carry the grant directly.
+    for tool in [
+        "list_image_generation_targets",
+        "generate_image",
+        "get_image_generation_job",
+        "cancel_image_generation_job",
+    ] {
+        def.tool_tiers.insert(tool.to_string(), ToolTier::Enabled);
+    }
     def.tool_descriptions.insert(
         "task".to_string(),
         ToolDescriptionSpec::PerMode {
@@ -856,13 +871,24 @@ mod tests {
                     "harness_invoke",
                     "task",
                     "mcp",
+                    "list_image_generation_targets",
+                    "generate_image",
+                    "get_image_generation_job",
+                    "cancel_image_generation_job",
                 ]
                 .into_iter()
                 .map(String::from)
                 .collect()
             )
         );
-        assert!(build.tool_tiers.is_empty());
+        for tool in [
+            "list_image_generation_targets",
+            "generate_image",
+            "get_image_generation_job",
+            "cancel_image_generation_job",
+        ] {
+            assert_eq!(build.tool_tiers.get(tool), Some(&ToolTier::Enabled));
+        }
     }
 
     #[test]

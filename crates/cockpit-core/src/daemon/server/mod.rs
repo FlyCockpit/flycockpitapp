@@ -2631,6 +2631,7 @@ impl DaemonContext {
                 started_at,
                 image_generation_dispatch_registry.adapter_map(),
                 Arc::new(image_generation_dispatch_registry.clone()),
+                Arc::new(image_generation_dispatch_registry.clone()),
                 shutdown.clone(),
             )
         });

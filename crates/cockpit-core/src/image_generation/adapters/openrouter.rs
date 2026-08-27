@@ -3940,6 +3940,7 @@ mod tests {
             job_id: uuid::Uuid::now_v7(),
             owner_session_id: uuid::Uuid::now_v7(),
             target_id: "fixture-target".into(),
+            dispatch_config_generation: 1,
             slot_id: uuid::Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: uuid::Uuid::now_v7(),

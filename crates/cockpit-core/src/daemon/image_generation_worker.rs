@@ -28,8 +28,8 @@ use uuid::Uuid;
 
 use crate::daemon::shutdown::ShutdownSignal;
 use crate::image_generation_job::{
-    DeferredImageReconciler, ImageDispatchProofSource, ImageGenerationAdapterMap,
-    ImageGenerationDispatcher,
+    DeferredImageReconciler, ImageDispatchProofSource, ImageGenerationAdapter,
+    ImageGenerationAdapterMap, ImageGenerationDispatcher,
 };
 
 /// Injected monotonic + wall clocks. Same posture as `DaemonMediaClock` and the
@@ -137,7 +137,7 @@ pub struct ImageGenerationWorker {
     dispatcher: ImageGenerationDispatcher,
     boot_id: Uuid,
     adapters: ImageGenerationAdapterMap,
-    reconciler: DeferredImageReconciler,
+    reconciler: Arc<dyn ImageGenerationAdapter>,
     proof_source: Arc<dyn ImageDispatchProofSource>,
     clock: Arc<dyn ImageGenerationWorkerClock>,
     sleeper: Arc<dyn ImageGenerationWorkerSleeper>,
@@ -159,13 +159,21 @@ impl ImageGenerationWorker {
             dispatcher: ImageGenerationDispatcher::new(db),
             boot_id,
             adapters,
-            reconciler: DeferredImageReconciler,
+            reconciler: Arc::new(DeferredImageReconciler),
             proof_source,
             clock,
             sleeper,
             config,
             metrics: Arc::new(ImageGenerationWorkerMetrics::new(boot_id)),
         }
+    }
+
+    /// Install the production owner-session recovery router. Test callers keep
+    /// `new`'s explicit dummy only when they intentionally exercise a no-op
+    /// recovery surface.
+    pub fn with_reconciler(mut self, reconciler: Arc<dyn ImageGenerationAdapter>) -> Self {
+        self.reconciler = reconciler;
+        self
     }
 
     /// Shared handle to the worker's observation counters.
@@ -250,7 +258,7 @@ impl ImageGenerationWorker {
         match self
             .dispatcher
             .run_reconciliation_pass(
-                &self.reconciler,
+                self.reconciler.as_ref(),
                 self.boot_id,
                 now_unix_ms,
                 now_monotonic_ms,
@@ -274,7 +282,7 @@ impl ImageGenerationWorker {
 
         match self
             .dispatcher
-            .run_provider_cancel_pass(&self.reconciler, self.boot_id, now_unix_ms, limit)
+            .run_provider_cancel_pass(self.reconciler.as_ref(), self.boot_id, now_unix_ms, limit)
             .await
         {
             Ok(count) => {
@@ -365,6 +373,7 @@ pub(crate) fn spawn_image_generation_worker(
     started_at: std::time::Instant,
     adapters: ImageGenerationAdapterMap,
     proof_source: Arc<dyn ImageDispatchProofSource>,
+    recovery_router: Arc<dyn ImageGenerationAdapter>,
     shutdown: ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
     let worker = ImageGenerationWorker::new(
@@ -375,7 +384,8 @@ pub(crate) fn spawn_image_generation_worker(
         Arc::new(ProductionWorkerClock { started_at }),
         Arc::new(TokioWorkerSleeper),
         ImageGenerationWorkerConfig::default(),
-    );
+    )
+    .with_reconciler(recovery_router);
     tokio::spawn(worker.run(shutdown))
 }
 

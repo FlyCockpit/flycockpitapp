@@ -119,6 +119,11 @@ pub struct ImageGenerationHandoffRequest {
     /// have several targets with different endpoint credentials, so this is
     /// part of the dispatch routing identity.
     pub target_id: String,
+    /// Generation observed by the scheduler's live revalidation and sealed in
+    /// the prepared attempt. The owner router checks this under the same gate
+    /// as adapter selection so a reload cannot swap in a different adapter
+    /// between proof and provider handoff.
+    pub dispatch_config_generation: u64,
     pub slot_id: Uuid,
     pub attempt_number: u32,
     pub external_operation_id: Uuid,
@@ -281,6 +286,9 @@ pub trait ImageGenerationAdapter: image_generation_adapter_sealed::Sealed + Send
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationReconcileRequest {
     pub job_id: Uuid,
+    pub owner_session_id: Uuid,
+    pub target_id: String,
+    pub adapter_kind: ImageAdapterKind,
     pub slot_id: Uuid,
     pub attempt_number: u32,
     pub external_operation_id: Uuid,
@@ -297,6 +305,9 @@ pub enum ImageGenerationReconcileResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationCancelRequest {
     pub job_id: Uuid,
+    pub owner_session_id: Uuid,
+    pub target_id: String,
+    pub adapter_kind: ImageAdapterKind,
     pub slot_id: Uuid,
     pub attempt_number: u32,
     pub external_operation_id: Uuid,
@@ -840,6 +851,36 @@ impl ImageGenerationDispatcher {
         Self { db }
     }
 
+    async fn recovery_routing_identity(
+        &self,
+        job_id: Uuid,
+        slot_id: Uuid,
+    ) -> Result<(Uuid, String, ImageAdapterKind)> {
+        self.db
+            .read(move |conn| {
+                let (canonical, digest): (Vec<u8>, String) = conn.query_row(
+                    "SELECT canonical_plan,plan_digest FROM image_generation_plans WHERE job_id=?1",
+                    [job_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let plan = ImageGenerationPlanV1::from_canonical(&canonical, &digest)?;
+                let target = plan
+                    .targets
+                    .iter()
+                    .find(|target| target.slots.iter().any(|slot| slot.slot_id == slot_id))
+                    .context("image generation recovery slot is absent from immutable plan")?;
+                let kind = match target.destination.adapter_kind.as_str() {
+                    "openai_images" => ImageAdapterKind::OpenaiImages,
+                    "openrouter_images" => ImageAdapterKind::OpenrouterImages,
+                    "gemini_images" => ImageAdapterKind::GeminiImages,
+                    "comfyui" => ImageAdapterKind::Comfyui,
+                    _ => anyhow::bail!("image generation recovery adapter kind is invalid"),
+                };
+                Ok((plan.owner_session_id, target.target_id.clone(), kind))
+            })
+            .await
+    }
+
     /// Record a scheduler-pass failure: emit a structured log AND durably bump
     /// the per-tuple failure counter, raising a single `needs_attention` row at
     /// the threshold. This is production-real (no `#[cfg(test)]` gating).
@@ -1028,9 +1069,14 @@ impl ImageGenerationDispatcher {
             let provider_request = provider_request_ref.to_owned();
             let provider_idempotency = provider_idempotency_ref.to_owned();
             let payload_digest = payload_digest_ref.to_owned();
+            let (owner_session_id, target_id, adapter_kind) =
+                self.recovery_routing_identity(job_id, slot_id).await?;
             let result = adapter
                 .reconcile(&ImageGenerationReconcileRequest {
                     job_id,
+                    owner_session_id,
+                    target_id,
+                    adapter_kind,
                     slot_id,
                     attempt_number,
                     external_operation_id,
@@ -1106,9 +1152,14 @@ impl ImageGenerationDispatcher {
             if !claimed {
                 continue;
             }
+            let (owner_session_id, target_id, adapter_kind) =
+                self.recovery_routing_identity(job_id, slot_id).await?;
             let result = adapter
                 .cancel(&ImageGenerationCancelRequest {
                     job_id,
+                    owner_session_id,
+                    target_id,
+                    adapter_kind,
                     slot_id,
                     attempt_number,
                     external_operation_id,
@@ -1120,9 +1171,11 @@ impl ImageGenerationDispatcher {
                 ImageGenerationCancelResult::TooLateOrAccepted { evidence } => {
                     ("too_late_or_accepted", evidence)
                 }
-                ImageGenerationCancelResult::OutcomeUnknown { evidence } => {
-                    ("outcome_unknown", evidence)
-                }
+                // Do not terminalize a durable cancellation claim merely
+                // because its owner/configured adapter is temporarily absent
+                // or the provider outcome is unknown. Let the claim expire
+                // and retry through the real owner-session router.
+                ImageGenerationCancelResult::OutcomeUnknown { .. } => continue,
             };
             ensure!(
                 !evidence.is_empty() && evidence.len() <= MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES,
@@ -1615,7 +1668,7 @@ impl ImageGenerationDispatcher {
         let (job_id, slot_id, attempt_number, _) = dispatching.identity();
         let (provider_request_identity, provider_idempotency_identity) =
             dispatching.provider_dispatch_identity();
-        let (owner_session_id, target_id, sealed_prompt) = self
+        let (owner_session_id, target_id, sealed_prompt, dispatch_config_generation) = self
             .db
             .read(move |conn| {
                 let (canonical, digest): (Vec<u8>, String) = conn.query_row(
@@ -1629,10 +1682,16 @@ impl ImageGenerationDispatcher {
                     .iter()
                     .find(|target| target.slots.iter().any(|slot| slot.slot_id == slot_id))
                     .context("image generation handoff slot is absent from immutable plan")?;
+                let dispatch_config_generation: i64 = conn.query_row(
+                    "SELECT dispatch_proof_config_generation FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='dispatching'",
+                    params![job_id.to_string(), slot_id.to_string(), i64::from(attempt_number)],
+                    |row| row.get(0),
+                )?;
                 Ok((
                     plan.owner_session_id,
                     target.target_id.clone(),
                     plan.sealed_prompt,
+                    u64::try_from(dispatch_config_generation)?,
                 ))
             })
             .await?;
@@ -1640,6 +1699,7 @@ impl ImageGenerationDispatcher {
             job_id,
             owner_session_id,
             target_id,
+            dispatch_config_generation,
             slot_id,
             attempt_number,
             external_operation_id: dispatching.operation().operation_id,
@@ -1737,9 +1797,13 @@ pub struct ImageGenerationStandingGrant {
     pub scope: crate::approval::store::Scope,
     pub session_id: Uuid,
     pub project_id: String,
-    pub plan_digest: String,
     pub destination_binding_digest: String,
     pub output_path_authority: String,
+    pub reference_egress: bool,
+    pub maximum_fanout: u32,
+    pub maximum_total_outputs: u32,
+    pub maximum_known_cost_usd_micros: Option<u64>,
+    pub unknown_cost_allowed: bool,
 }
 
 impl ImageGenerationJobService {
@@ -1880,16 +1944,20 @@ impl ImageGenerationJobService {
                     };
                     conn.execute(
                         "INSERT OR REPLACE INTO image_generation_grants \
-                         (grant_id,scope,session_id,project_id,plan_digest,destination_binding_digest,output_path_authority,verdict,granted_at_unix_ms,revoked_at_unix_ms) \
-                         VALUES(?1,?2,?3,?4,?5,?6,?7,'allow',?8,NULL)",
+                         (grant_id,scope,session_id,project_id,destination_binding_digest,output_path_authority,reference_egress,maximum_fanout,maximum_total_outputs,maximum_known_cost_usd_micros,unknown_cost_allowed,verdict,granted_at_unix_ms,revoked_at_unix_ms) \
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'allow',?12,NULL)",
                         params![
                             Uuid::now_v7().to_string(),
                             grant.scope.as_str(),
                             session_id,
                             grant.project_id,
-                            grant.plan_digest,
                             grant.destination_binding_digest,
                             grant.output_path_authority,
+                            i64::from(grant.reference_egress),
+                            i64::from(grant.maximum_fanout),
+                            i64::from(grant.maximum_total_outputs),
+                            grant.maximum_known_cost_usd_micros.map(i64::try_from).transpose()?,
+                            i64::from(grant.unknown_cost_allowed),
                             created_at_unix_ms,
                         ],
                     )?;
@@ -2078,7 +2146,7 @@ impl OutputPathAuthorityId {
 
 pub struct ImageGenerationDispatchService {
     db: cockpit_db::Db,
-    registry: std::sync::Arc<ImageRuntimeRegistry>,
+    registry: std::sync::RwLock<std::sync::Arc<ImageRuntimeRegistry>>,
     boot_id: uuid::Uuid,
     principal: ClientPrincipal,
     config_generation: std::sync::atomic::AtomicU64,
@@ -2088,11 +2156,92 @@ pub struct ImageGenerationDispatchService {
         std::sync::RwLock<cockpit_config::config::image_generation::ImageGenerationConfig>,
     media_storage_recovery: Option<std::sync::Arc<crate::media_storage::MediaStorageRecovery>>,
     adapters: std::sync::RwLock<ImageGenerationAdapterMap>,
+    /// A failed reload must never leave the prior credential/configuration
+    /// pair dispatchable. The service stays installed solely so the next valid
+    /// snapshot can repair it without rebuilding session ownership.
+    available: std::sync::atomic::AtomicBool,
     config_gate: tokio::sync::RwLock<()>,
     clock: std::sync::Arc<dyn crate::media_reservation::MonotonicClock>,
 }
 
+/// Owns reference-component leases until a queued job transaction takes them
+/// over. Every error/refusal path after acquisition must release the durable
+/// rows; `Drop` schedules that release for `?` and early-return paths that
+/// cannot await cleanup directly. Successful queueing explicitly disarms it.
+struct UntransferredReferenceLeases {
+    db: cockpit_db::Db,
+    leases: Option<Vec<AcquiredMediaComponentLease>>,
+    now_unix_ms: i64,
+}
+
+impl UntransferredReferenceLeases {
+    fn new(db: cockpit_db::Db, leases: Vec<AcquiredMediaComponentLease>, now_unix_ms: i64) -> Self {
+        Self {
+            db,
+            leases: Some(leases),
+            now_unix_ms,
+        }
+    }
+
+    fn leases(&self) -> &[AcquiredMediaComponentLease] {
+        self.leases.as_deref().unwrap_or_default()
+    }
+
+    fn disarm(&mut self) {
+        self.leases = None;
+    }
+
+    async fn release_now(&mut self) -> Result<()> {
+        let Some(leases) = self.leases.as_ref() else {
+            return Ok(());
+        };
+        ImageGenerationJobService::release_untransferred_reference_leases(
+            self.db.clone(),
+            leases.clone(),
+            self.now_unix_ms,
+        )
+        .await?;
+        // Retain leases until the durable release succeeds. If it fails, Drop
+        // still owns them and can schedule the retry path.
+        self.leases = None;
+        Ok(())
+    }
+}
+
+impl Drop for UntransferredReferenceLeases {
+    fn drop(&mut self) {
+        let Some(leases) = self.leases.take() else {
+            return;
+        };
+        let db = self.db.clone();
+        let now_unix_ms = self.now_unix_ms;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            std::mem::drop(handle.spawn(async move {
+                if let Err(error) =
+                    ImageGenerationJobService::release_untransferred_reference_leases(
+                        db,
+                        leases,
+                        now_unix_ms,
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "image generation reference lease cleanup failed");
+                }
+            }));
+        } else {
+            tracing::error!("image generation reference leases could not be scheduled for cleanup");
+        }
+    }
+}
+
 impl ImageGenerationDispatchService {
+    fn runtime_registry(&self) -> std::sync::Arc<ImageRuntimeRegistry> {
+        self.registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub fn new(
         db: cockpit_db::Db,
         registry: std::sync::Arc<ImageRuntimeRegistry>,
@@ -2108,7 +2257,7 @@ impl ImageGenerationDispatchService {
     ) -> Self {
         Self {
             db,
-            registry,
+            registry: std::sync::RwLock::new(registry),
             boot_id,
             principal,
             config_generation: std::sync::atomic::AtomicU64::new(config_generation),
@@ -2119,17 +2268,18 @@ impl ImageGenerationDispatchService {
             image_config: std::sync::RwLock::new(image_config),
             media_storage_recovery,
             adapters: std::sync::RwLock::new(adapters),
+            available: std::sync::atomic::AtomicBool::new(true),
             config_gate: tokio::sync::RwLock::new(()),
             clock,
         }
     }
 
     /// Atomically advance the service to a newly published session config
-    /// generation. The runtime registry first replaces/removes every target
-    /// and invalidates stale health entries; only then do we publish the new
-    /// generation and threshold visible to preflight. A target removed,
-    /// disabled, or credential-rotated by `ReplaceConfigSnapshot` therefore
-    /// cannot be selected by a subsequent dispatch.
+    /// generation. A fresh runtime registry is configured, refreshed, and
+    /// used to construct its adapters before it replaces the live pair. A
+    /// failed candidate consequently leaves the previous registry/adapters
+    /// coherent and retryable; a successful swap makes removed, disabled, or
+    /// credential-rotated targets unavailable to subsequent dispatches.
     pub async fn reconcile_config(
         &self,
         config: &cockpit_config::config::image_generation::ImageGenerationConfig,
@@ -2138,24 +2288,44 @@ impl ImageGenerationDispatchService {
         refresh_epoch: u64,
     ) -> Result<()> {
         let _gate = self.config_gate.write().await;
-        self.registry
-            .apply_config(config, generation, refresh_epoch)
-            .map_err(anyhow::Error::from)?;
-        self.registry
+        let staged_registry =
+            match self
+                .runtime_registry()
+                .staged_for_config(config, generation, refresh_epoch)
+            {
+                Ok(registry) => std::sync::Arc::new(registry),
+                Err(error) => {
+                    self.available
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Err(error.into());
+                }
+            };
+        staged_registry
             .refresh_configured_targets(config, generation, refresh_epoch)
             .await;
-        let storage = self
-            .media_storage_recovery
-            .as_ref()
-            .context("image generation media storage is unavailable")?
-            .clone();
+        let Some(storage) = self.media_storage_recovery.as_ref().cloned() else {
+            self.available
+                .store(false, std::sync::atomic::Ordering::Release);
+            anyhow::bail!("image generation media storage is unavailable");
+        };
         let adapters =
-            crate::daemon::image_generation_adapters::configured_image_generation_adapters(
+            match crate::daemon::image_generation_adapters::configured_image_generation_adapters(
                 self.db.clone(),
                 storage,
-                self.registry.clone(),
+                staged_registry.clone(),
                 config,
-            )?;
+            ) {
+                Ok(adapters) => adapters,
+                Err(error) => {
+                    self.available
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Err(error);
+                }
+            };
+        *self
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = staged_registry;
         *self
             .image_config
             .write()
@@ -2174,6 +2344,8 @@ impl ImageGenerationDispatchService {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = media_policy;
         self.config_generation
             .store(generation, std::sync::atomic::Ordering::Release);
+        self.available
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -2188,7 +2360,11 @@ impl ImageGenerationDispatchService {
         &self,
         include_disabled: bool,
     ) -> Vec<crate::image_generation_agent_tools::ImageGenerationTargetProjection> {
-        self.registry.list_target_projections(include_disabled)
+        if !self.available.load(std::sync::atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.runtime_registry()
+            .list_target_projections(include_disabled)
     }
 
     /// Revalidate one queued plan through this session's reconciled runtime.
@@ -2199,8 +2375,14 @@ impl ImageGenerationDispatchService {
         &self,
         request: DispatchRevalidationRequest<'_>,
     ) -> std::result::Result<DispatchProofBinding, RuntimeError> {
-        let snapshot = self
-            .registry
+        if !self.available.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::Obsolete,
+                "Refresh after image generation configuration recovery.",
+            ));
+        }
+        let registry = self.runtime_registry();
+        let snapshot = registry
             .current_target_snapshot(request.target_id)
             .ok_or_else(|| {
                 RuntimeError::new(
@@ -2252,7 +2434,7 @@ impl ImageGenerationDispatchService {
                 "Refresh after image generation destination identity changes.",
             ));
         }
-        self.registry
+        registry
             .revalidate_dispatch_binding(&endpoint, request.target_id, credential)
             .await
     }
@@ -2266,6 +2448,20 @@ impl ImageGenerationDispatchService {
         request: &ImageGenerationHandoffRequest,
     ) -> ImageGenerationHandoffResult {
         let _gate = self.config_gate.read().await;
+        if !self.available.load(std::sync::atomic::Ordering::Acquire) {
+            return ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"configured_target_adapter_unavailable".to_vec(),
+            };
+        }
+        if self
+            .config_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != request.dispatch_config_generation
+        {
+            return ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"dispatch_proof_config_generation_obsolete".to_vec(),
+            };
+        }
         let adapter = self
             .adapters
             .read()
@@ -2275,6 +2471,59 @@ impl ImageGenerationDispatchService {
         match adapter {
             Some(adapter) => adapter.handoff(request).await,
             None => ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"configured_target_adapter_unavailable".to_vec(),
+            },
+        }
+    }
+
+    /// Recovery operations use the same owner-scoped, target-specific adapter
+    /// map as a new handoff. A missing/latched service returns OutcomeUnknown:
+    /// it records no invented terminal provider result and remains retryable.
+    pub(crate) async fn reconcile_with_configured_adapter(
+        &self,
+        kind: ImageAdapterKind,
+        request: &ImageGenerationReconcileRequest,
+    ) -> ImageGenerationReconcileResult {
+        let _gate = self.config_gate.read().await;
+        if !self.available.load(std::sync::atomic::Ordering::Acquire) {
+            return ImageGenerationReconcileResult::OutcomeUnknown {
+                evidence: b"configured_target_adapter_unavailable".to_vec(),
+            };
+        }
+        match self
+            .adapters
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_target(kind, &request.target_id)
+            .cloned()
+        {
+            Some(adapter) => adapter.reconcile(request).await,
+            None => ImageGenerationReconcileResult::OutcomeUnknown {
+                evidence: b"configured_target_adapter_unavailable".to_vec(),
+            },
+        }
+    }
+
+    pub(crate) async fn cancel_with_configured_adapter(
+        &self,
+        kind: ImageAdapterKind,
+        request: &ImageGenerationCancelRequest,
+    ) -> ImageGenerationCancelResult {
+        let _gate = self.config_gate.read().await;
+        if !self.available.load(std::sync::atomic::Ordering::Acquire) {
+            return ImageGenerationCancelResult::OutcomeUnknown {
+                evidence: b"configured_target_adapter_unavailable".to_vec(),
+            };
+        }
+        match self
+            .adapters
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_target(kind, &request.target_id)
+            .cloned()
+        {
+            Some(adapter) => adapter.cancel(request).await,
+            None => ImageGenerationCancelResult::OutcomeUnknown {
                 evidence: b"configured_target_adapter_unavailable".to_vec(),
             },
         }
@@ -2363,6 +2612,11 @@ impl ImageGenerationDispatchService {
         // make every later queue operation observe stale configuration.
         let dispatch_config_generation = {
             let _gate = self.config_gate.read().await;
+            if !self.available.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(GenerateImageDispatchOutcome::Refused {
+                    reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+                });
+            }
             self.config_generation
                 .load(std::sync::atomic::Ordering::Acquire)
         };
@@ -2370,7 +2624,7 @@ impl ImageGenerationDispatchService {
         if resolved_args.targets.len() == 1
             && resolved_args.targets[0].target_id == DEFAULT_IMAGE_TARGET_MARKER
         {
-            let Some(target_id) = self.registry.configured_default_target_id() else {
+            let Some(target_id) = self.runtime_registry().configured_default_target_id() else {
                 return Ok(GenerateImageDispatchOutcome::Refused {
                     reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
                 });
@@ -2414,6 +2668,22 @@ impl ImageGenerationDispatchService {
                 reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
             });
         };
+
+        // Resolve the exact format, dimensions, and typed parameters against
+        // the sealed live capability before an approval can be requested. An
+        // incompatible request has no stable executable plan/digest to show a
+        // human, and must never turn into a standing grant.
+        let capability_preflight = match self.preflight_target_capabilities(&resolved_args) {
+            Ok(result) => result,
+            Err(_) => {
+                return Ok(GenerateImageDispatchOutcome::Refused {
+                    reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+                });
+            }
+        };
+        if let Some(alternatives) = capability_preflight {
+            return Ok(GenerateImageDispatchOutcome::Incompatible { alternatives });
+        }
 
         // (2) Hold the output directory as the write authority. Its opened
         // canonical-destination digest is the ONLY output-path fact that reaches
@@ -2480,11 +2750,15 @@ impl ImageGenerationDispatchService {
             .iter()
             .map(|target| target.samples)
             .fold(0_u32, |total, samples| total.saturating_add(samples));
-        // TODO(inc3-tests): real per-target provider cost estimation is a
-        // separate concern (provider cost models are not resolvable at this
-        // seam). Until then the plan carries an unknown cost, which the risk
-        // classifier and budget disposition treat conservatively.
-        let cost_maximum: Option<u64> = None;
+        // Prices are part of the target configuration and include freshness
+        // evidence. Calculate the conservative maximum from the exact target,
+        // output dimensions, sample count, and retry bound. Any stale,
+        // unsupported-unit, missing, or overflowing price remains unknown and
+        // therefore follows the existing fail-closed unknown-cost policy.
+        let target_attempt_costs = self.estimated_target_attempt_costs(&resolved_args);
+        let cost_maximum = target_attempt_costs
+            .as_ref()
+            .and_then(|costs| self.estimated_cost_maximum(&resolved_args, costs));
         let budget_disposition = Self::budget_disposition(&policy.settings, cost_maximum);
         let reference_egress_unmatched = !resolved_args.references.is_empty()
             && destinations
@@ -2555,8 +2829,9 @@ impl ImageGenerationDispatchService {
             .iter()
             .map(|target| target.target_id.clone())
             .collect();
-        let Some(destination_grant_binding_digest) =
-            self.registry.destination_grant_binding_digest(&target_ids)
+        let Some(destination_grant_binding_digest) = self
+            .runtime_registry()
+            .destination_grant_binding_digest(&target_ids)
         else {
             return Ok(GenerateImageDispatchOutcome::Refused {
                 reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
@@ -2609,7 +2884,9 @@ impl ImageGenerationDispatchService {
             .load(std::sync::atomic::Ordering::Acquire)
             != dispatch_config_generation
             || self.resolve_projection_destinations(&resolved_args)? != Some(destinations.clone())
-            || self.registry.destination_grant_binding_digest(&target_ids)
+            || self
+                .runtime_registry()
+                .destination_grant_binding_digest(&target_ids)
                 != Some(destination_grant_binding_digest.clone())
         {
             return Ok(GenerateImageDispatchOutcome::Refused {
@@ -2627,9 +2904,14 @@ impl ImageGenerationDispatchService {
                 scope,
                 session_id: session.id,
                 project_id: session.project_id.clone(),
-                plan_digest: plan_digest.as_str().to_string(),
                 destination_binding_digest: destination_grant_binding_digest,
                 output_path_authority,
+                reference_egress: reference_egress_unmatched,
+                maximum_fanout: fanout,
+                maximum_total_outputs: total_outputs,
+                maximum_known_cost_usd_micros: cost_maximum,
+                unknown_cost_allowed: cost_maximum.is_none()
+                    && matches!(budget_disposition, BudgetDisposition::UnknownCostAllowed),
             }),
             Decision::Allow {
                 scope: crate::approval::store::Scope::Once,
@@ -2648,6 +2930,8 @@ impl ImageGenerationDispatchService {
             &plan_digest,
             held,
             standing_grant,
+            cost_maximum,
+            target_attempt_costs,
         )
         .await
     }
@@ -2804,8 +3088,9 @@ impl ImageGenerationDispatchService {
     ) -> Result<Option<Vec<ProjectionDestination>>> {
         let mut destinations = Vec::with_capacity(args.targets.len());
         for target in &args.targets {
-            let Some((destination, _, _, _)) =
-                self.registry.resolve_dispatch_target(&target.target_id)
+            let Some((destination, _, _, _)) = self
+                .runtime_registry()
+                .resolve_dispatch_target(&target.target_id)
             else {
                 return Ok(None);
             };
@@ -2832,7 +3117,7 @@ impl ImageGenerationDispatchService {
         let mut transport_allowed = true;
         for destination in destinations {
             let Some((_, target_enabled, capability_fresh, insecure_transport_allowed)) = self
-                .registry
+                .runtime_registry()
                 .resolve_dispatch_target(&destination.target_id)
             else {
                 return Ok((false, false, false));
@@ -2842,6 +3127,140 @@ impl ImageGenerationDispatchService {
             transport_allowed &= insecure_transport_allowed;
         }
         Ok((enabled, fresh, transport_allowed))
+    }
+
+    /// Check the part of `resolve_image_generation` that depends solely on the
+    /// current sealed target capabilities. This deliberately runs before the
+    /// Approver; the later full resolver repeats it with owner, lease, spend,
+    /// and output authorities immediately before durable queueing.
+    fn preflight_target_capabilities(
+        &self,
+        args: &GenerateImageDispatchArgs,
+    ) -> Result<Option<Vec<ImageGenerationTargetAlternativeV1>>> {
+        let policy = self
+            .media_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let deadline_seconds = image_generation_media_plans(&policy, 1)?
+            .into_iter()
+            .find(|plan| {
+                plan.dimension
+                    == cockpit_config::config::media_budget::MediaDimension::OperationDeadlineSeconds
+            })
+            .context("image generation media policy omits an operation deadline")?
+            .requested;
+        let now = self.clock.now_ms();
+        let deadline = now
+            .checked_add(deadline_seconds.saturating_mul(1_000))
+            .context("image generation operation deadline overflow")?;
+        let first = args
+            .targets
+            .first()
+            .context("image generation request has no target")?;
+        let request = ImageGenerationRequestV1 {
+            width: first.width,
+            height: first.height,
+            format: first.format.clone(),
+            samples_per_target: first.samples,
+            target_ids: Vec::new(),
+            parameters: Self::to_plan_parameters(&first.parameters),
+            reference_attachment_ids: args
+                .references
+                .iter()
+                .map(|reference| match reference {
+                    ImageReferenceTag::Attachment { attachment_id } => {
+                        Uuid::parse_str(attachment_id)
+                            .context("image generation reference identifier is invalid")
+                    }
+                    // Local paths have not crossed the normal read-authorization
+                    // boundary. Treat them as incompatible here rather than
+                    // allowing a provider adapter to discover them after queue.
+                    ImageReferenceTag::LocalPath { .. } => {
+                        anyhow::bail!("local image reference is not registered")
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let registry = self.runtime_registry();
+        let mut alternatives = Vec::new();
+        for target in &args.targets {
+            let snapshot = registry
+                .current_target_snapshot(&target.target_id)
+                .context("image generation target is no longer dispatchable")?;
+            let runtime =
+                RuntimeTargetAuthorityV1::from_registry_snapshot(&snapshot, now, deadline)?;
+            if let Some(alternative) = runtime.capability_incompatibility(&request) {
+                alternatives.push(alternative);
+            }
+        }
+        Ok((!alternatives.is_empty()).then_some(alternatives))
+    }
+
+    /// Return the known conservative cost of one provider submission for each
+    /// selected target. `None` is intentionally infectious: the configured
+    /// price source has an explicit unknown/stale state and a seconds-priced
+    /// operation has no sealed duration bound in v1.
+    fn estimated_target_attempt_costs(
+        &self,
+        args: &GenerateImageDispatchArgs,
+    ) -> Option<BTreeMap<String, u64>> {
+        use cockpit_config::config::image_generation::{ImageBillableUnit, ImagePrice};
+
+        let config = self
+            .image_config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let now = chrono::Utc::now();
+        args.targets
+            .iter()
+            .map(|requested| {
+                let target = config
+                    .targets()
+                    .iter()
+                    .find(|target| target.id == requested.target_id)?;
+                let ImagePrice::Known {
+                    usd_micros, unit, ..
+                } = target.price.effective_at(now.clone())
+                else {
+                    return None;
+                };
+                let units = match unit {
+                    ImageBillableUnit::Image => 1,
+                    ImageBillableUnit::Megapixel => u64::from(requested.width)
+                        .checked_mul(u64::from(requested.height))?
+                        .div_ceil(1_000_000),
+                    ImageBillableUnit::Second => return None,
+                };
+                Some((requested.target_id.clone(), usd_micros.checked_mul(units)?))
+            })
+            .collect()
+    }
+
+    fn estimated_cost_maximum(
+        &self,
+        args: &GenerateImageDispatchArgs,
+        target_attempt_costs: &BTreeMap<String, u64>,
+    ) -> Option<u64> {
+        let registry = self.runtime_registry();
+        args.targets.iter().try_fold(0_u64, |total, requested| {
+            let attempt_cost = *target_attempt_costs.get(&requested.target_id)?;
+            let max_attempts = u64::from(
+                registry
+                    .current_target_snapshot(&requested.target_id)?
+                    .capability?
+                    .constraints
+                    .get("max_attempts")?
+                    .parse::<u32>()
+                    .ok()?,
+            );
+            total.checked_add(
+                attempt_cost
+                    .checked_mul(u64::from(requested.samples))?
+                    .checked_mul(max_attempts)?,
+            )
+        })
     }
 
     /// Read the exact owned attachment identity/version/checksum before the
@@ -2992,6 +3411,8 @@ impl ImageGenerationDispatchService {
         plan_digest: &PlanDigest,
         held: HeldImageGenerationOutputDirectory,
         standing_grant: Option<ImageGenerationStandingGrant>,
+        cost_maximum: Option<u64>,
+        target_attempt_costs: Option<BTreeMap<String, u64>>,
     ) -> Result<GenerateImageDispatchOutcome> {
         // Immutable request: target + reference ids strictly increasing.
         let mut target_ids: Vec<String> = args
@@ -3095,7 +3516,13 @@ impl ImageGenerationDispatchService {
                 });
             }
         };
-        let references = reference_leases
+        let mut reference_lease_cleanup = UntransferredReferenceLeases::new(
+            self.db.clone(),
+            reference_leases,
+            created_at_unix_ms,
+        );
+        let references = reference_lease_cleanup
+            .leases()
             .iter()
             .map(reference_artifact_from_acquired_media_lease)
             .collect::<Result<Vec<_>>>()?;
@@ -3121,7 +3548,7 @@ impl ImageGenerationDispatchService {
             .target_ids
             .iter()
             .map(|target_id| {
-                self.registry
+                self.runtime_registry()
                     .current_target_snapshot(target_id)
                     .context("image generation target is no longer dispatchable")
             })
@@ -3199,6 +3626,9 @@ impl ImageGenerationDispatchService {
         )?;
         for runtime in runtimes {
             let max_attempts = runtime.max_attempts;
+            let attempt_cost = target_attempt_costs
+                .as_ref()
+                .and_then(|costs| costs.get(&runtime.target_id).copied());
             let mut slot_artifact_ids = Vec::with_capacity(request.samples_per_target as usize);
             let mut spend_attempt_identities = Vec::new();
             for sample in 0..request.samples_per_target {
@@ -3208,10 +3638,7 @@ impl ImageGenerationDispatchService {
                         format!("image-generation:{}:{sample}:{attempt}", Uuid::now_v7());
                     attempt_maxima.push(AttemptMaximum {
                         attempt_id: attempt_id.clone(),
-                        // Provider cost cannot be estimated at this boundary;
-                        // the approval hard gate already requires all scopes to
-                        // be explicitly unlimited for an unknown maximum.
-                        usd_micros: None,
+                        usd_micros: attempt_cost,
                     });
                     spend_attempt_identities.push(attempt_id);
                 }
@@ -3222,7 +3649,7 @@ impl ImageGenerationDispatchService {
                 slot_artifact_ids,
                 max_attempts,
                 attempt_resources: vec![per_attempt_media.clone()],
-                attempt_maximum_usd_micros: vec![None; spend_attempt_identities.len()],
+                attempt_maximum_usd_micros: vec![attempt_cost; spend_attempt_identities.len()],
                 spend_attempt_identities,
             });
         }
@@ -3230,7 +3657,7 @@ impl ImageGenerationDispatchService {
             required: true,
             policy_version: policy.policy_version,
             reservation_id: spend_reservation_id.clone(),
-            maximum_usd_micros: None,
+            maximum_usd_micros: cost_maximum,
             plan_digest: digest_fields(
                 &std::iter::once(spend_reservation_id.as_str())
                     .chain(
@@ -3361,19 +3788,14 @@ impl ImageGenerationDispatchService {
                 request,
                 authority,
                 media_snapshots,
-                reference_leases.clone(),
+                reference_lease_cleanup.leases().to_vec(),
                 standing_grant,
                 created_at_unix_ms,
             )
             .await;
         match creation {
             Err(error) => {
-                ImageGenerationJobService::release_untransferred_reference_leases(
-                    self.db.clone(),
-                    reference_leases,
-                    created_at_unix_ms,
-                )
-                .await?;
+                reference_lease_cleanup.release_now().await?;
                 Self::cancel_unqueued_media(&ledger, &media_claim, now_monotonic_ms).await?;
                 self.db
                     .cancel_image_spend_before_dispatch(spend.reservation_id, created_at_unix_ms)
@@ -3381,15 +3803,11 @@ impl ImageGenerationDispatchService {
                 Err(error)
             }
             Ok(ImageGenerationJobCreation::Queued { job_id }) => {
+                reference_lease_cleanup.disarm();
                 Ok(GenerateImageDispatchOutcome::Queued { job_id })
             }
             Ok(ImageGenerationJobCreation::Incompatible(alternatives)) => {
-                ImageGenerationJobService::release_untransferred_reference_leases(
-                    self.db.clone(),
-                    reference_leases,
-                    created_at_unix_ms,
-                )
-                .await?;
+                reference_lease_cleanup.release_now().await?;
                 Self::cancel_unqueued_media(&ledger, &media_claim, now_monotonic_ms).await?;
                 self.db
                     .cancel_image_spend_before_dispatch(spend.reservation_id, created_at_unix_ms)
@@ -3442,6 +3860,8 @@ pub struct RuntimeTargetAuthorityV1 {
     maximum_width: u32,
     maximum_height: u32,
     allowed_parameters: BTreeMap<String, String>,
+    reference_support: String,
+    maximum_reference_images: u64,
     max_attempts: u32,
     required_grant: String,
 }
@@ -4841,27 +5261,11 @@ pub fn resolve_image_generation(
             continue;
         };
         let compatible = target.runtime.supported_formats.get(&request.format);
-        let parameters_valid = request.parameters.iter().all(|(key, value)| {
-            match (
-                target
-                    .runtime
-                    .allowed_parameters
-                    .get(key)
-                    .map(String::as_str),
-                value,
-            ) {
-                (Some("boolean"), TypedParameterV1::Boolean(_))
-                | (Some("integer"), TypedParameterV1::Integer(_)) => true,
-                (Some("text"), TypedParameterV1::Text(text)) => valid_string(text),
-                _ => false,
-            }
-        });
-        if compatible.is_none()
-            || request.width > target.runtime.maximum_width
-            || request.height > target.runtime.maximum_height
-            || !parameters_valid
-            || target.slot_artifact_ids.len() != request.samples_per_target as usize
-        {
+        if let Some(alternative) = target.runtime.capability_incompatibility(&request) {
+            alternatives.push(alternative);
+            continue;
+        }
+        if target.slot_artifact_ids.len() != request.samples_per_target as usize {
             alternatives.push(ImageGenerationTargetAlternativeV1 {
                 target_id: target_id.clone(),
                 supported_formats: target.runtime.supported_formats.keys().cloned().collect(),
@@ -6221,6 +6625,37 @@ pub(crate) fn plan_image_generation(
 }
 
 impl RuntimeTargetAuthorityV1 {
+    fn capability_incompatibility(
+        &self,
+        request: &ImageGenerationRequestV1,
+    ) -> Option<ImageGenerationTargetAlternativeV1> {
+        let parameters_valid = request.parameters.iter().all(|(key, value)| {
+            match (self.allowed_parameters.get(key).map(String::as_str), value) {
+                (Some("boolean"), TypedParameterV1::Boolean(_))
+                | (Some("integer"), TypedParameterV1::Integer(_)) => true,
+                (Some("text"), TypedParameterV1::Text(text)) => valid_string(text),
+                _ => false,
+            }
+        });
+        (self.supported_formats.get(&request.format).is_none()
+            || request.width > self.maximum_width
+            || request.height > self.maximum_height
+            || (request.reference_attachment_ids.is_empty()
+                && self.reference_support == "required")
+            || (!request.reference_attachment_ids.is_empty()
+                && (self.reference_support == "unsupported"
+                    || request.reference_attachment_ids.len() as u64
+                        > self.maximum_reference_images))
+            || !parameters_valid)
+            .then(|| ImageGenerationTargetAlternativeV1 {
+                target_id: self.target_id.clone(),
+                supported_formats: self.supported_formats.keys().cloned().collect(),
+                maximum_width: self.maximum_width,
+                maximum_height: self.maximum_height,
+                reason: "request is incompatible with sealed target capability".into(),
+            })
+    }
+
     /// Build the sealed runtime authority from a live health snapshot.
     ///
     /// `now` is the caller's monotonic clock reading at authority construction.
@@ -6262,6 +6697,8 @@ impl RuntimeTargetAuthorityV1 {
                     | "parameters"
                     | "max_attempts"
                     | "required_grant"
+                    | "reference_support"
+                    | "max_reference_images"
             )),
             "capability contains an unknown constraint"
         );
@@ -6339,6 +6776,16 @@ impl RuntimeTargetAuthorityV1 {
                     Ok((name.to_owned(), kind.to_owned()))
                 })
                 .collect::<Result<_>>()?,
+            reference_support: capability
+                .constraints
+                .get("reference_support")
+                .context("capability reference support is missing")?
+                .clone(),
+            maximum_reference_images: capability
+                .constraints
+                .get("max_reference_images")
+                .context("capability reference maximum is missing")?
+                .parse()?,
             max_attempts: capability
                 .constraints
                 .get("max_attempts")
@@ -6619,6 +7066,7 @@ mod tests {
             job_id: Uuid::now_v7(),
             owner_session_id: Uuid::now_v7(),
             target_id: "fixture-target".into(),
+            dispatch_config_generation: 1,
             slot_id: Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: Uuid::now_v7(),

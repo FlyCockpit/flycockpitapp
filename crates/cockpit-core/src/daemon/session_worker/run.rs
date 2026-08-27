@@ -10372,8 +10372,8 @@ pub(super) async fn run_worker(
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone();
-                        if let Some(service) = session.image_generation_dispatch()
-                            && let Err(error) = service
+                        if let Some(service) = session.image_generation_dispatch() {
+                            if let Err(error) = service
                                 .reconcile_config(
                                     &refreshed.extended.image_generation,
                                     (*refreshed.extended.media_resources).clone(),
@@ -10381,12 +10381,72 @@ pub(super) async fn run_worker(
                                     result.generation,
                                 )
                                 .await
-                        {
-                            // A half-reconciled runtime is never safe to keep:
-                            // remove dispatch authority rather than retaining
-                            // targets/credentials from the prior snapshot.
-                            tracing::error!(%error, "image generation config reconciliation failed; dispatch disabled");
-                            session.clear_image_generation_dispatch();
+                            {
+                                // The retained object is deliberately latched
+                                // unavailable by reconcile_config. It exists
+                                // only to accept a later valid snapshot; it
+                                // cannot dispatch using the obsolete pair.
+                                tracing::error!(%error, "image generation config reconciliation failed; dispatch latched unavailable");
+                            }
+                        } else {
+                            // Startup can fail before a service exists (for
+                            // example, a transient credential/adapter error).
+                            // A later valid committed snapshot must recreate
+                            // the session authority instead of leaving image
+                            // generation permanently absent for this worker.
+                            struct ReloadImageClock(std::time::Instant);
+                            impl crate::media_reservation::MonotonicClock for ReloadImageClock {
+                                fn now_ms(&self) -> u64 {
+                                    u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+                                }
+                            }
+                            let credential_store =
+                                session.provider_credential_store(&refreshed.providers).ok();
+                            match crate::daemon::image_runtime::install_standard_image_runtime_registry(
+                                &refreshed.extended.image_generation,
+                                result.generation,
+                                result.generation,
+                                credential_store,
+                                Arc::new(crate::daemon::image_runtime::DaemonImageRuntimeClock::new(
+                                    image_generation_started_at,
+                                )),
+                            ) {
+                                Ok(registry) => {
+                                    let registry = Arc::new(registry);
+                                    registry
+                                        .refresh_configured_targets(
+                                            &refreshed.extended.image_generation,
+                                            result.generation,
+                                            result.generation,
+                                        )
+                                        .await;
+                                    let adapters = media_storage_recovery.as_ref().and_then(|storage| {
+                                        crate::daemon::image_generation_adapters::configured_image_generation_adapters(
+                                            session.db.clone(),
+                                            storage.clone(),
+                                            registry.clone(),
+                                            &refreshed.extended.image_generation,
+                                        )
+                                        .ok()
+                                    });
+                                    if let Some(adapters) = adapters {
+                                        let service = Arc::new(crate::image_generation_job::ImageGenerationDispatchService::new(
+                                            session.db.clone(), registry, image_generation_boot_id,
+                                            crate::daemon::principal::ClientPrincipal::owner(), result.generation,
+                                            refreshed.extended.image_generation.base_tier_known_cost_threshold_usd_micros(),
+                                            (*refreshed.extended.media_resources).clone(),
+                                            Arc::new(ReloadImageClock(image_generation_started_at)),
+                                            media_storage_recovery.clone(),
+                                            refreshed.extended.image_generation.clone(), adapters,
+                                        ));
+                                        image_generation_dispatch_registry.install(session.id, &service);
+                                        session.set_image_generation_dispatch(service);
+                                    } else {
+                                        tracing::error!("image generation service recreation failed; dispatch remains unavailable");
+                                    }
+                                }
+                                Err(error) => tracing::error!(%error, "image generation service recreation failed; dispatch remains unavailable"),
+                            }
                         }
                     }
                     send_config_snapshot_event_if_changed(

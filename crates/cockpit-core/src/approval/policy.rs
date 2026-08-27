@@ -1210,13 +1210,13 @@ impl Approver {
     /// lets Manual short-circuit to a standing-grant allow and Auto to a
     /// safe-risk policy allow without a human prompt.
     ///
-    /// Consults the [`GrantStore`] image-generation grant table, keyed by the
-    /// immutable plan digest carried on `facts` (which already encodes the
-    /// destination set, sizes, formats, parameters, fanout, total outputs, and
-    /// the output write-authority digest). Session scope is checked first,
-    /// then project scope (bound to the live session's machine-local
-    /// `project_id`). Fails closed on any lookup error or when no session is
-    /// attached: no grant ever fakes an allow.
+    /// Consults the [`GrantStore`] bounded image-generation capability tuple:
+    /// destination binding, output authority, reference egress, and maximum
+    /// fanout/output/cost. Prompt and output stem deliberately do not enter
+    /// the tuple; a later request matches only if it is no broader. Session
+    /// scope is checked first, then project scope (bound to the live session's
+    /// machine-local `project_id`). Fails closed on any lookup error or when no
+    /// session is attached: no grant ever fakes an allow.
     async fn image_generation_grant_matches(
         &self,
         facts: &ImageGenerationAuthzFacts<'_>,
@@ -1225,13 +1225,18 @@ impl Approver {
             return None;
         };
         self.store
-            .image_generation_grant_scope(
+            .image_generation_grant_scope_bounded(
                 &session.project_id,
-                facts.plan_digest.as_str(),
-                facts.destination_grant_binding_digest,
+                crate::approval::store::ImageGenerationGrantBounds {
+                    destination_binding_digest: facts.destination_grant_binding_digest,
+                    output_path_authority: facts.output_path_authority.as_str(),
+                    reference_egress: facts.reference_egress_unmatched,
+                    fanout: facts.fanout,
+                    total_outputs: facts.total_outputs,
+                    cost_maximum: facts.cost_maximum,
+                },
             )
             .await
-            .is_some()
     }
 
     /// Raise the human image-generation approval prompt (Manual/Auto without a

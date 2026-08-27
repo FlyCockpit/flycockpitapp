@@ -122,16 +122,54 @@ impl ImageGenerationAdapter for DaemonSessionAdapter {
 
     async fn reconcile(
         &self,
-        _: &ImageGenerationReconcileRequest,
+        request: &ImageGenerationReconcileRequest,
     ) -> ImageGenerationReconcileResult {
-        ImageGenerationReconcileResult::OutcomeUnknown {
-            evidence: b"provider_reconciliation_requires_owner_session".to_vec(),
+        if request.adapter_kind != self.kind {
+            return ImageGenerationReconcileResult::OutcomeUnknown {
+                evidence: b"recovery_adapter_kind_mismatch".to_vec(),
+            };
+        }
+        let service = self
+            .services
+            .services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&request.owner_session_id)
+            .and_then(Weak::upgrade);
+        match service {
+            Some(service) => {
+                service
+                    .reconcile_with_configured_adapter(self.kind, request)
+                    .await
+            }
+            None => ImageGenerationReconcileResult::OutcomeUnknown {
+                evidence: b"owner_session_image_adapter_unavailable".to_vec(),
+            },
         }
     }
 
-    async fn cancel(&self, _: &ImageGenerationCancelRequest) -> ImageGenerationCancelResult {
-        ImageGenerationCancelResult::OutcomeUnknown {
-            evidence: b"provider_cancellation_requires_owner_session".to_vec(),
+    async fn cancel(&self, request: &ImageGenerationCancelRequest) -> ImageGenerationCancelResult {
+        if request.adapter_kind != self.kind {
+            return ImageGenerationCancelResult::OutcomeUnknown {
+                evidence: b"recovery_adapter_kind_mismatch".to_vec(),
+            };
+        }
+        let service = self
+            .services
+            .services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&request.owner_session_id)
+            .and_then(Weak::upgrade);
+        match service {
+            Some(service) => {
+                service
+                    .cancel_with_configured_adapter(self.kind, request)
+                    .await
+            }
+            None => ImageGenerationCancelResult::OutcomeUnknown {
+                evidence: b"owner_session_image_adapter_unavailable".to_vec(),
+            },
         }
     }
 }
@@ -166,6 +204,64 @@ impl crate::image_generation_job::ImageDispatchProofSource for DaemonImageDispat
                 })?;
             service.revalidate_dispatch(request).await
         })
+    }
+}
+
+// Recovery cannot use a dummy adapter: its requests are now durably routed by
+// owner session, target, and sealed adapter kind. This registry is the
+// daemon-wide recovery router; it holds no provider credential itself.
+impl image_generation_adapter_sealed::Sealed for DaemonImageDispatchRegistry {}
+
+#[async_trait::async_trait]
+impl ImageGenerationAdapter for DaemonImageDispatchRegistry {
+    async fn handoff(
+        &self,
+        _request: &ImageGenerationHandoffRequest,
+    ) -> ImageGenerationHandoffResult {
+        ImageGenerationHandoffResult::DefinitivelyRejected {
+            evidence: b"recovery_router_cannot_handoff".to_vec(),
+        }
+    }
+
+    async fn reconcile(
+        &self,
+        request: &ImageGenerationReconcileRequest,
+    ) -> ImageGenerationReconcileResult {
+        let service = self
+            .services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&request.owner_session_id)
+            .and_then(Weak::upgrade);
+        match service {
+            Some(service) => {
+                service
+                    .reconcile_with_configured_adapter(request.adapter_kind, request)
+                    .await
+            }
+            None => ImageGenerationReconcileResult::OutcomeUnknown {
+                evidence: b"owner_session_image_adapter_unavailable".to_vec(),
+            },
+        }
+    }
+
+    async fn cancel(&self, request: &ImageGenerationCancelRequest) -> ImageGenerationCancelResult {
+        let service = self
+            .services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&request.owner_session_id)
+            .and_then(Weak::upgrade);
+        match service {
+            Some(service) => {
+                service
+                    .cancel_with_configured_adapter(request.adapter_kind, request)
+                    .await
+            }
+            None => ImageGenerationCancelResult::OutcomeUnknown {
+                evidence: b"owner_session_image_adapter_unavailable".to_vec(),
+            },
+        }
     }
 }
 

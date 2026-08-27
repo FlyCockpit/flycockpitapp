@@ -169,6 +169,7 @@ fn page_with(kind: SidecarPageKind) -> SidecarPage {
         },
     ];
     session.reducer.resolution = Some(sample_trace(SidecarModeChoice::Automatic));
+    session.reducer.grant_candidate_id = Some("daemon-candidate".into());
     session.reducer.health = Some(HealthView {
         available: true,
         capability_source: "configured".into(),
@@ -176,6 +177,28 @@ fn page_with(kind: SidecarPageKind) -> SidecarPage {
         reason: "ok".into(),
     });
     SidecarPage { kind, session }
+}
+
+#[test]
+fn cap_only_save_preserves_configured_models_when_catalog_is_unavailable() {
+    let config = SidecarSelectionConfig {
+        mode: cockpit_core::image_sidecar::SidecarMode::Always,
+        trusted_primary_default: Some(SidecarProviderModel {
+            provider: "configured".into(),
+            model: "vision".into(),
+        }),
+        untrusted_primary_default: Some(SidecarProviderModel {
+            provider: "configured".into(),
+            model: "vision-untrusted".into(),
+        }),
+        per_primary_override: Some(SidecarProviderModel {
+            provider: "configured".into(),
+            model: "override".into(),
+        }),
+    };
+    let mut form = SidecarFormState::from_authoritative_config(&config);
+    form.set_central_cap(7);
+    assert_eq!(form.to_selection_config(), config);
 }
 
 #[test]

@@ -48,6 +48,7 @@ const REASON_SAVE_PENDING: &str = "save_pending";
 const REASON_FORBIDDEN_SIDECAR_ADMIN: &str = "forbidden_requires_sidecar_admin";
 const REASON_AUTHORITATIVE_UNAVAILABLE: &str = "authoritative_sidecar_operation_unavailable";
 const REASON_INVOCATION_NOT_FOUND: &str = "invocation_not_found";
+const PIPELINE_UNAVAILABLE_REASON: &str = "provider_transport_unavailable";
 
 const SIDECAR_NODE_TITLES: &[&str] = &[
     "Mode",
@@ -579,9 +580,13 @@ impl SidecarFormState {
         };
         let selected = |candidate: &Option<SidecarModelRef>| {
             candidate.as_ref().filter(|candidate| {
-                self.selectable_models().iter().any(|model| {
-                    model.provider == candidate.provider && model.model == candidate.model
-                })
+                // A catalog outage must not turn an unrelated cap-only save
+                // into deletion of the daemon-owned defaults. Once a catalog
+                // exists, every retained selection is still checked against it.
+                self.models.is_empty()
+                    || self.selectable_models().iter().any(|model| {
+                        model.provider == candidate.provider && model.model == candidate.model
+                    })
             })
         };
         SidecarSelectionConfig {
@@ -641,6 +646,7 @@ pub(crate) struct SidecarReducer {
     pub invocations: Vec<InvocationView>,
     pub health: Option<HealthView>,
     pub resolution: Option<SidecarEffectiveTrace>,
+    pub grant_candidate_id: Option<String>,
     pub charged_invocation_ids: BTreeSet<String>,
     pub charged_count: u64,
     pub stale: bool,
@@ -665,6 +671,7 @@ impl SidecarReducer {
             invocations: Vec::new(),
             health: None,
             resolution: None,
+            grant_candidate_id: None,
             charged_invocation_ids: BTreeSet::new(),
             charged_count: 0,
             stale: false,
@@ -767,6 +774,7 @@ impl SidecarReducer {
     fn invalidate_projections(&mut self) {
         self.health = None;
         self.resolution = None;
+        self.grant_candidate_id = None;
         self.grants.clear();
         self.invocations.clear();
         self.charged_invocation_ids.clear();
@@ -1094,27 +1102,38 @@ impl SidecarSession {
         self.remediation = None;
     }
 
-    fn complete_config_save(&mut self, revision: Option<&str>) {
+    fn complete_config_save(
+        &mut self,
+        revision: Option<&str>,
+        config_generation: Option<u64>,
+    ) -> bool {
         let Some(expected) = self.save_base_revision.as_deref() else {
-            return;
+            return false;
         };
         let Some(revision) = revision else {
-            return;
+            return false;
         };
         if revision == expected {
-            return;
+            return false;
         }
         self.save_pending = false;
         self.save_base_revision = None;
         self.busy = false;
         self.policy.value = self.form.central_cap;
         self.policy.source = SidecarInvocationCapProvenance::Configured;
+        // A config write advances daemon generation. The prior sidecar
+        // snapshot is no longer mutation authority, even if its selection id
+        // is unchanged; rehydrate before any grant operation.
+        self.reducer.config_generation = config_generation.unwrap_or(0);
+        self.reducer.mark_stale();
+        self.authoritative_snapshot = false;
+        self.authoritative_mutations = false;
+        true
     }
 
-    /// Returns the exact destination that a local grant construction may use.
-    /// Keeping this check in the session makes the state registry and the
-    /// action handler fail closed on the same prerequisites.
-    fn grant_creation_destination(&self) -> Result<String, &'static str> {
+    /// Returns only a daemon-issued candidate identity. The UI never submits a
+    /// destination URL, so bearer paths/query strings cannot cross this path.
+    fn grant_creation_candidate(&self) -> Result<String, &'static str> {
         if self.approval_mode == ApprovalMode::Yolo {
             return Err(REASON_YOLO_NO_GRANT);
         }
@@ -1127,9 +1146,11 @@ impl SidecarSession {
         let Some(resolution) = self.reducer.resolution.as_ref() else {
             return Err(REASON_MISSING_SELECTION);
         };
-        let destination = sanitized_display_origin(&resolution.origin);
-        if !resolution.available || destination.trim().is_empty() {
-            return Err(REASON_DESTINATION_DENIED);
+        if !resolution.available {
+            return Err(match resolution.reason.as_str() {
+                "provider_transport_unavailable" => PIPELINE_UNAVAILABLE_REASON,
+                _ => REASON_DESTINATION_DENIED,
+            });
         }
         if self.form.draft_scope == GrantScope::Once
             && !self.selected_invocation.as_deref().is_some_and(|selected| {
@@ -1143,7 +1164,10 @@ impl SidecarSession {
         {
             return Err(REASON_INVOCATION_NOT_FOUND);
         }
-        Ok(destination)
+        self.reducer
+            .grant_candidate_id
+            .clone()
+            .ok_or(REASON_DESTINATION_DENIED)
     }
 }
 
@@ -1812,7 +1836,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     }
                 }
             }
-            let create = page.session.grant_creation_destination();
+            let create = page.session.grant_creation_candidate();
             rows.push((
                 "[create grant]".into(),
                 Some((SidecarAction::CreateGrant, create.is_ok(), create.err())),
@@ -1887,7 +1911,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                 ));
                 rows.push(("No approval prompt. No standing grant.".into(), None));
             }
-            let create = page.session.grant_creation_destination();
+            let create = page.session.grant_creation_candidate();
             rows.push((
                 "[create grant]".into(),
                 Some((SidecarAction::CreateGrant, create.is_ok(), create.err())),
@@ -2199,21 +2223,35 @@ impl SettingsPage for SidecarPage {
                 if self.kind == SidecarPageKind::GrantList {
                     return self.push_kind(SidecarPageKind::GrantEditor);
                 }
-                let destination = match self.session.grant_creation_destination() {
-                    Ok(destination) => destination,
+                let grant_candidate_id = match self.session.grant_creation_candidate() {
+                    Ok(candidate) => candidate,
                     Err(reason) => {
                         self.session.error = Some(reason.into());
                         return Nav::Stay;
                     }
                 };
-                let scope = match self.session.form.draft_scope {
-                    GrantScope::Once | GrantScope::Session => {
-                        self.session.error = Some(REASON_INVOCATION_NOT_FOUND.into());
-                        return Nav::Stay;
+                let (scope, session_id, invocation_id) = match self.session.form.draft_scope {
+                    GrantScope::Once => {
+                        let Some(invocation_id) = self.session.selected_invocation.clone() else {
+                            self.session.error = Some(REASON_INVOCATION_NOT_FOUND.into());
+                            return Nav::Stay;
+                        };
+                        (
+                            cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Once,
+                            Some(self.session.reducer.session_id.clone()),
+                            Some(invocation_id),
+                        )
                     }
-                    GrantScope::Project => {
-                        cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project
-                    }
+                    GrantScope::Session => (
+                        cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Session,
+                        Some(self.session.reducer.session_id.clone()),
+                        None,
+                    ),
+                    GrantScope::Project => (
+                        cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project,
+                        None,
+                        None,
+                    ),
                 };
                 self.queue_authority_request(
                     cx,
@@ -2221,11 +2259,11 @@ impl SettingsPage for SidecarPage {
                         project_root: self.session.reducer.project_id.clone(),
                         config_generation: self.session.reducer.config_generation,
                         selection_id: self.session.reducer.selection_id.clone(),
-                        destination,
+                        grant_candidate_id,
                         purpose: "ask_image".into(),
                         scope,
-                        session_id: None,
-                        invocation_id: None,
+                        session_id,
+                        invocation_id,
                     },
                 );
                 Nav::Stay
@@ -2396,18 +2434,35 @@ impl SidecarPage {
         cx: &SettingsCx,
         completion: Option<Result<cockpit_proto::Response, String>>,
     ) {
-        self.session
-            .complete_config_save(cx.extended_revision.as_deref());
+        let saved = self.session.complete_config_save(
+            cx.extended_revision.as_deref(),
+            cx.image_sidecar_config_generation(),
+        );
+        if saved && self.session.reducer.config_generation > 0 {
+            self.queue_authority_request(
+                cx,
+                cockpit_proto::Request::GetImageSidecarAuthoritySnapshot {
+                    project_root: self.session.reducer.project_id.clone(),
+                    config_generation: self.session.reducer.config_generation,
+                    selection_id: self.session.reducer.selection_id.clone(),
+                },
+            );
+        }
         let Some(completion) = completion else {
             return;
         };
         match completion {
             Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(snapshot)) => {
+                if snapshot.entity_version < self.session.reducer.entity_version {
+                    // A concurrent snapshot for this same page completed after
+                    // a newer grant mutation. It has no authority to rewind
+                    // the current reducer and must not mark the page stale.
+                    return;
+                }
                 if snapshot.schema_version != 1
                     || snapshot.config_generation != self.session.reducer.config_generation
                     || snapshot.selection_id != self.session.reducer.selection_id
                     || snapshot.project_id != self.session.reducer.project_id
-                    || snapshot.pipeline_available
                 {
                     self.session.reducer.mark_stale();
                     self.session.authoritative_mutations = false;
@@ -2415,6 +2470,36 @@ impl SidecarPage {
                     return;
                 }
                 self.session.reducer.entity_version = snapshot.entity_version;
+                self.session.form.models = snapshot
+                    .models
+                    .into_iter()
+                    .map(|model| SidecarModelOption {
+                        provider: model.provider,
+                        model: model.model,
+                        configured: true,
+                        image_capable: model.image_capable,
+                        fresh: model.fresh,
+                    })
+                    .collect();
+                self.session.reducer.grant_candidate_id = snapshot.resolution.grant_candidate_id;
+                self.session.reducer.resolution = Some(SidecarEffectiveTrace {
+                    primary_provider: String::new(),
+                    primary_model: String::new(),
+                    primary_trust: String::new(),
+                    matched_source: "daemon".into(),
+                    sidecar_provider: snapshot.resolution.provider,
+                    sidecar_model: snapshot.resolution.model,
+                    origin: snapshot.resolution.origin.unwrap_or_default(),
+                    location: String::new(),
+                    credential_fingerprint: String::new(),
+                    capability_source: "daemon".into(),
+                    capability_freshness: "current".into(),
+                    config_generation: snapshot.config_generation,
+                    mode: self.session.form.mode,
+                    available: snapshot.resolution.available,
+                    fallback_outcome: None,
+                    reason: snapshot.resolution.reason,
+                });
                 self.session.reducer.grants = snapshot
                     .grants
                     .into_iter()

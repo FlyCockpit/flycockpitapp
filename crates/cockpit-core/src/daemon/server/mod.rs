@@ -6232,6 +6232,27 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                 && snapshot.project_id.len() <= 4096
                 && snapshot.selection_id.len() <= 128
                 && snapshot.grants.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && snapshot.models.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && snapshot.models.iter().all(|model| {
+                    !model.provider.is_empty()
+                        && !model.model.is_empty()
+                        && model.provider.len() <= 128
+                        && model.model.len() <= 256
+                })
+                && snapshot.resolution.origin.as_deref().is_none_or(|origin| {
+                    crate::image_sidecar::NormalizedEndpointOrigin::parse(origin).is_some_and(
+                        |normalized| {
+                            let canonical = match normalized.port {
+                                Some(port) => {
+                                    format!("{}://{}:{port}", normalized.scheme, normalized.host)
+                                }
+                                None => format!("{}://{}", normalized.scheme, normalized.host),
+                            };
+                            origin == canonical
+                        },
+                    )
+                })
+                && snapshot.resolution.grant_candidate_id.is_none()
                 && snapshot.invocations.is_empty()
                 && !snapshot.pipeline_available
         }

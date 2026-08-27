@@ -49,6 +49,32 @@ pub struct ImageSidecarInvocationV1 {
     pub created_at_unix_ms: i64,
 }
 
+/// A configured model the daemon has freshly classified for sidecar selection.
+/// This is deliberately a projection, not provider catalog discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageSidecarModelOptionV1 {
+    pub provider: String,
+    pub model: String,
+    pub image_capable: bool,
+    pub fresh: bool,
+}
+
+/// A daemon-derived, safe explanation of the current selection. A candidate
+/// is issued only when the live handoff can honor it; callers never submit a
+/// destination URL back to the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageSidecarResolutionV1 {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub origin: Option<String>,
+    pub available: bool,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_candidate_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageSidecarAuthoritySnapshotV1 {
@@ -59,6 +85,8 @@ pub struct ImageSidecarAuthoritySnapshotV1 {
     pub entity_version: u64,
     pub pipeline_available: bool,
     pub health_reason: String,
+    pub models: Vec<ImageSidecarModelOptionV1>,
+    pub resolution: ImageSidecarResolutionV1,
     pub grants: Vec<ImageSidecarGrantV1>,
     pub invocations: Vec<ImageSidecarInvocationV1>,
 }

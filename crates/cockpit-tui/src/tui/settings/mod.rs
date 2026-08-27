@@ -2848,7 +2848,7 @@ pub struct SettingsCx {
     completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
     completed_image_spend: Option<ImageSpendCompletion>,
-    completed_image_sidecar: Option<Result<Response, String>>,
+    completed_image_sidecar: Vec<(SettingsEffectTarget, Result<Response, String>)>,
     pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
     completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
     after_extended_commit: Vec<(SettingsEffectTarget, Request, &'static str)>,
@@ -3380,8 +3380,20 @@ impl SettingsCx {
         );
     }
 
-    pub(crate) fn take_image_sidecar_completion(&mut self) -> Option<Result<Response, String>> {
-        self.completed_image_sidecar.take()
+    pub(crate) fn take_image_sidecar_completion(
+        &mut self,
+        project_root: &str,
+        selection_id: &str,
+    ) -> Option<Result<Response, String>> {
+        let mut matching = None;
+        for (target, response) in self.completed_image_sidecar.drain(..) {
+            if target.owner == project_root && target.revision.as_deref() == Some(selection_id) {
+                matching = Some(response);
+            }
+            // Every other identity belongs to a closed/replaced page. It is
+            // intentionally discarded rather than retained for a later page.
+        }
+        matching
     }
 
     pub(crate) fn image_sidecar_config_generation(&self) -> Option<u64> {
@@ -4021,7 +4033,8 @@ impl SettingsCx {
             }
             PendingSettingsOperation::SidecarAuthority { target } => {
                 if completion.target == target {
-                    self.completed_image_sidecar = Some(completion.response);
+                    self.completed_image_sidecar
+                        .push((target, completion.response));
                 }
             }
             PendingSettingsOperation::Followup { label, target } => {
@@ -6062,7 +6075,14 @@ impl SettingsDialog {
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
             Ok(()) => {
-                let sidecar_completion = self.cx.take_image_sidecar_completion();
+                let sidecar_completion = self.cx.take_image_sidecar_completion(
+                    self.page
+                        .downcast_ref::<image_sidecar::SidecarPage>()
+                        .map_or("", |page| page.session.reducer.project_id.as_str()),
+                    self.page
+                        .downcast_ref::<image_sidecar::SidecarPage>()
+                        .map_or("", |page| page.session.reducer.selection_id.as_str()),
+                );
                 if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
                     page.apply_authoritative_settings_completion(&self.cx, sidecar_completion);
                 }
@@ -6627,7 +6647,7 @@ impl SettingsDialog {
                 completed_provider_mutation_navigation: None,
                 completed_shadow_removal: None,
                 completed_image_spend: None,
-                completed_image_sidecar: None,
+                completed_image_sidecar: Vec::new(),
                 pending_shadow_prompt: None,
                 completed_provider_navigation: None,
                 after_extended_commit: Vec::new(),

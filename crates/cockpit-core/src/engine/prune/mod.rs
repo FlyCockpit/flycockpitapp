@@ -17,8 +17,8 @@
 //! - `/prune` itself never rewrites the assistant `ToolCall` shape.
 //!   Applied `write`/`edit` argument elision is a separate model-history
 //!   projection ([`crate::engine::write_edit_arg_elision`]) that stubs
-//!   large args after a successful call because the tool result carries
-//!   the diff and the durable audit row keeps the original args;
+//!   large args after a successful call because the applied file can be
+//!   re-read and the durable audit row keeps the original args;
 //! - the `ToolResult` keeps its `id` + `call_id` (so the provider's
 //!   tool_use↔tool_result pairing stays valid, and reasoning blocks
 //!   that reference the earlier read still parse);

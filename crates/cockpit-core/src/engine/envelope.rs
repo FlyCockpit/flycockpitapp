@@ -297,6 +297,7 @@ mod tests {
                 })],
             },
             tool_result("c1", "wrote `/a.rs` (1200 bytes, LF)"),
+            assistant_text("newer assistant turn"),
         ];
         assert_eq!(
             crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut history),

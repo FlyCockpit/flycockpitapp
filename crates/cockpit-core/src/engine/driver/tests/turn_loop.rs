@@ -1192,7 +1192,7 @@ fn turn_loop_tool_call_result_feeds_second_inference() {
 }
 
 #[test]
-fn large_settled_write_omits_content_from_the_next_request() {
+fn large_write_elides_only_after_a_newer_assistant_turn_exists() {
     crate::test_env::run_async_with_large_stack(|| async {
         let content = long_write_content();
         let provider = ScriptedProvider::builder()
@@ -1203,6 +1203,15 @@ fn large_settled_write_omits_content_from_the_next_request() {
                 arguments: serde_json::json!({
                     "path": "big.rs",
                     "content": content
+                }),
+            })
+            .turn(Turn::ToolCall {
+                id: "edit-needle".into(),
+                name: "edit".into(),
+                arguments: serde_json::json!({
+                    "path": "big.rs",
+                    "old_string": "UNIQUE_NEEDLE_TO_REPLACE",
+                    "new_string": "REPLACED_NEEDLE"
                 }),
             })
             .turn(Turn::Text("wrote the file.".into()))
@@ -1217,12 +1226,10 @@ fn large_settled_write_omits_content_from_the_next_request() {
             .unwrap();
 
         let events = drain_events(&mut rx);
-        assert_eq!(tool_results(&events).len(), 1);
+        assert_eq!(tool_results(&events).len(), 2);
         assert!(tool_results(&events)[0].2.contains("wrote `"));
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("big.rs")).unwrap(),
-            content
-        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("big.rs")).unwrap();
+        assert!(on_disk.contains("REPLACED_NEEDLE"));
         let rows = driver
             .session
             .db
@@ -1236,10 +1243,22 @@ fn large_settled_write_omits_content_from_the_next_request() {
         );
 
         let posts = provider_posts(&provider);
-        assert_eq!(posts.len(), 2);
+        assert_eq!(posts.len(), 3);
         let first_messages = chat_messages(&posts[0]);
         let second_messages = chat_messages(&posts[1]);
-        let write_calls = assistant_tool_call_messages(second_messages);
+        let third_messages = chat_messages(&posts[2]);
+        let second_write_calls = assistant_tool_call_messages(second_messages);
+        assert_eq!(second_write_calls.len(), 1);
+        assert_eq!(
+            tool_call_arguments(second_write_calls[0])["content"],
+            serde_json::json!(content),
+            "the latest assistant turn is not rewritten"
+        );
+        let write_calls = assistant_tool_call_messages(third_messages);
+        let write_calls: Vec<_> = write_calls
+            .into_iter()
+            .filter(|message| message["tool_calls"][0]["function"]["name"] == "write")
+            .collect();
         assert_eq!(write_calls.len(), 1);
         let args = tool_call_arguments(write_calls[0]);
         assert_eq!(args["path"], serde_json::json!("big.rs"));
@@ -1249,13 +1268,13 @@ fn large_settled_write_omits_content_from_the_next_request() {
                 content.len()
             ))
         );
-        let second_body = serde_json::to_string(&posts[1].body).unwrap();
+        let third_body = serde_json::to_string(&posts[2].body).unwrap();
         assert!(
-            !second_body.contains(&content),
-            "applied write content must not re-enter the next request"
+            !third_body.contains(&content),
+            "applied write content must leave requests after the turn settles"
         );
 
-        let prefix_at = second_messages
+        let prefix_at = third_messages
             .iter()
             .position(|message| {
                 message_role(message) == "assistant" && message.get("tool_calls").is_some()
@@ -1263,7 +1282,7 @@ fn large_settled_write_omits_content_from_the_next_request() {
             .expect("second request includes the settled write call");
         assert_eq!(
             serde_json::to_vec(first_messages).unwrap(),
-            serde_json::to_vec(&second_messages[..prefix_at]).unwrap(),
+            serde_json::to_vec(&third_messages[..prefix_at]).unwrap(),
             "prefix before the elided call must stay byte-stable"
         );
     });

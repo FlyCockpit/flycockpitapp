@@ -2,7 +2,7 @@
 //!
 //! After a `write` or `edit` succeeds, the call arguments (file content,
 //! `old_string`/`new_string`) duplicate information the model already has:
-//! the tool result carries the diff, and the file is on disk. Large args
+//! the file is already on disk and can be read again. Large args
 //! dominate context, so this pass stubs those values out of the **model-bound**
 //! assistant tool-call — in memory only, never the durable audit row.
 //!
@@ -13,9 +13,10 @@
 //! ## Model-recall cost
 //!
 //! A later `edit` `old_string` must match the file. After elision the model
-//! reconstructs that text from the result diff or re-reads the file. The
-//! size floor plus the diff-carrying result are the mitigation: small edits
-//! stay verbatim because recall value exceeds savings.
+//! must re-read the file before reconstructing that text. The size floor is
+//! the mitigation: small edits stay verbatim because recall value exceeds
+//! savings, while the marker explicitly directs the model to re-read large
+//! applied content.
 //!
 //! ## Cache
 //!
@@ -27,12 +28,11 @@
 //! ## Signed-thinking tripwire
 //!
 //! Anthropic 400s if the latest assistant message carries signed reasoning
-//! and any sibling block is rewritten. Elide unsigned settled calls as soon
-//! as the matching successful result is available. Skip the latest assistant
-//! message while it still carries signed reasoning; once a newer assistant
-//! message exists the prior turn is settled and may be rewritten.
+//! and any sibling block is rewritten. The projection therefore never
+//! rewrites the latest assistant message, signed or otherwise. Once a newer
+//! assistant message exists, the prior turn is settled and may be rewritten.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use rig::message::UserContent;
 use serde_json::Value;
@@ -47,13 +47,23 @@ pub const APPLIED_MARKER_PREFIX: &str = "[applied:";
 
 pub fn applied_marker(byte_len: usize) -> String {
     format!(
-        "[applied: {n} bytes — see result diff]",
+        "[applied: {n} bytes — re-read file for current content]",
         n = format_byte_count(byte_len)
     )
 }
 
 pub fn is_applied_marker(value: &str) -> bool {
-    value.starts_with(APPLIED_MARKER_PREFIX)
+    const SUFFIX: &str = " bytes — re-read file for current content]";
+    let Some(count) = value
+        .strip_prefix("[applied: ")
+        .and_then(|rest| rest.strip_suffix(SUFFIX))
+    else {
+        return false;
+    };
+    let Ok(byte_len) = count.replace(',', "").parse::<usize>() else {
+        return false;
+    };
+    applied_marker(byte_len) == value
 }
 
 pub fn elide_applied_write_edit_args(history: &mut [Message]) -> usize {
@@ -64,7 +74,7 @@ pub fn elide_applied_write_edit_args_with_upcoming(
     history: &mut [Message],
     upcoming_result: Option<&Message>,
 ) -> usize {
-    let successful = successful_write_edit_ids(history, upcoming_result);
+    let successful = successful_write_edit_calls(history, upcoming_result);
     if successful.is_empty() {
         return 0;
     }
@@ -78,36 +88,98 @@ pub fn elide_applied_write_edit_args_with_upcoming(
         let Message::Assistant { content, .. } = msg else {
             continue;
         };
-        if last_assistant == Some(idx) && assistant_has_signed_reasoning(content) {
+        // Never rewrite the latest assistant message. Besides protecting
+        // provider-signed reasoning, this is the settled-prior-turn boundary:
+        // a call becomes eligible only after a newer assistant message exists.
+        if last_assistant == Some(idx) {
             continue;
         }
         for part in content.iter_mut() {
             let AssistantContent::ToolCall(tc) = part else {
                 continue;
             };
-            if !successful.contains(tc.id.as_str()) {
+            let Some(applied_tool) = successful.get(tc.id.as_str()) else {
                 continue;
-            }
-            changed += elide_tool_call(tc);
+            };
+            changed += elide_tool_call(tc, applied_tool);
         }
     }
     changed
 }
 
-/// Project `write`/`edit` args to the same stubbed form used in history so
-/// [`crate::approval::store::GrantStore::loop_signature`] agrees on both the
-/// current call (still full) and a historical call (already elided).
-pub fn args_for_loop_hash(tool: &str, args: &Value) -> Value {
-    if !matches!(tool, "write" | "edit") {
-        return args.clone();
-    }
-    let mut projected = args.clone();
-    stub_large_string_fields(&mut projected);
-    projected
+/// Apply the live model-history projection using durable canonical tool-call
+/// rows as the authority for any argument/name repair that could not safely
+/// rewrite a provider-signed latest assistant turn at dispatch time.
+pub async fn project_live_history(
+    session: &crate::session::Session,
+    agent_name: &str,
+    history: &mut [Message],
+    upcoming_result: Option<&Message>,
+) -> anyhow::Result<usize> {
+    let rows = session.db.list_tool_calls_for_session(session.id).await?;
+    reconcile_settled_calls(history, upcoming_result, agent_name, &rows)?;
+    Ok(elide_applied_write_edit_args_with_upcoming(
+        history,
+        upcoming_result,
+    ))
 }
 
-fn elide_tool_call(tc: &mut ToolCall) -> usize {
-    if !matches!(tc.function.name.as_str(), "write" | "edit") {
+fn reconcile_settled_calls(
+    history: &mut [Message],
+    upcoming_result: Option<&Message>,
+    agent_name: &str,
+    rows: &[cockpit_db::db::tool_calls::ToolCallEvent],
+) -> anyhow::Result<()> {
+    let successful = successful_write_edit_calls(history, upcoming_result);
+    let Some(last_assistant) = history
+        .iter()
+        .rposition(|msg| matches!(msg, Message::Assistant { .. }))
+    else {
+        return Ok(());
+    };
+    let canonical: HashMap<&str, _> = rows
+        .iter()
+        .filter(|row| row.agent == agent_name && matches!(row.tool.as_str(), "write" | "edit"))
+        .map(|row| (row.call_id.as_str(), row))
+        .collect();
+
+    for (idx, msg) in history.iter_mut().enumerate() {
+        if idx == last_assistant {
+            continue;
+        }
+        let Message::Assistant { content, .. } = msg else {
+            continue;
+        };
+        for part in content {
+            let AssistantContent::ToolCall(tc) = part else {
+                continue;
+            };
+            let Some(applied_tool) = successful.get(tc.id.as_str()) else {
+                continue;
+            };
+            if tc.function.arguments.as_object().is_some_and(|args| {
+                args.values()
+                    .any(|value| value.as_str().is_some_and(is_applied_marker))
+            }) {
+                continue;
+            }
+            let row = canonical.get(tc.id.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing canonical audit row for settled applied {} call {} owned by agent {}",
+                    applied_tool,
+                    tc.id,
+                    agent_name
+                )
+            })?;
+            tc.function.name.clone_from(&row.tool);
+            tc.function.arguments.clone_from(&row.wire_input_json);
+        }
+    }
+    Ok(())
+}
+
+fn elide_tool_call(tc: &mut ToolCall, applied_tool: &str) -> usize {
+    if !matches!(applied_tool, "write" | "edit") {
         return 0;
     }
     if stub_large_string_fields(&mut tc.function.arguments) > 0 {
@@ -148,11 +220,11 @@ fn stub_large_string_fields(args: &mut Value) -> usize {
     changed
 }
 
-fn successful_write_edit_ids(
+fn successful_write_edit_calls(
     history: &[Message],
     upcoming_result: Option<&Message>,
-) -> HashSet<String> {
-    let mut out = HashSet::new();
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
     for msg in history {
         collect_successful_write_edit_ids(msg, &mut out);
     }
@@ -162,7 +234,7 @@ fn successful_write_edit_ids(
     out
 }
 
-fn collect_successful_write_edit_ids(msg: &Message, out: &mut HashSet<String>) {
+fn collect_successful_write_edit_ids(msg: &Message, out: &mut HashMap<String, String>) {
     let Message::User { content } = msg else {
         return;
     };
@@ -175,12 +247,13 @@ fn collect_successful_write_edit_ids(msg: &Message, out: &mut HashSet<String>) {
         }
         let body = tool_result_text(&tr.content);
         if result_indicates_applied(&tr.name, &body) {
-            out.insert(tr.call.to_string());
+            out.insert(tr.call.to_string(), tr.name.clone());
         }
     }
 }
 
 fn result_indicates_applied(tool: &str, body: &str) -> bool {
+    let body = strip_repair_notes(body);
     if body.starts_with("Error:") {
         return false;
     }
@@ -189,6 +262,16 @@ fn result_indicates_applied(tool: &str, body: &str) -> bool {
         "edit" => body.starts_with("edited `"),
         _ => false,
     }
+}
+
+fn strip_repair_notes(mut body: &str) -> &str {
+    while let Some(rest) = body.strip_prefix("<repair_note>") {
+        let Some((_, after)) = rest.split_once("</repair_note>") else {
+            break;
+        };
+        body = after.strip_prefix('\n').unwrap_or(after);
+    }
+    body
 }
 
 fn tool_result_text(content: &[rig::message::ToolResultContent]) -> String {
@@ -200,24 +283,6 @@ fn tool_result_text(content: &[rig::message::ToolResultContent]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
-}
-
-fn assistant_has_signed_reasoning(content: &[AssistantContent]) -> bool {
-    content.iter().any(|part| {
-        matches!(
-            part,
-            AssistantContent::Reasoning(reasoning)
-                if reasoning.content.iter().any(|item| {
-                    matches!(
-                        item,
-                        rig::message::ReasoningContent::Text {
-                            signature: Some(signature),
-                            ..
-                        } if !signature.is_empty()
-                    )
-                })
-        )
-    })
 }
 
 fn format_byte_count(n: usize) -> String {
@@ -332,14 +397,45 @@ mod tests {
             .collect()
     }
 
+    fn settle_prior_turn(history: &mut Vec<Message>) {
+        history.push(Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::text("newer assistant turn")],
+        });
+    }
+
     #[test]
     fn applied_marker_uses_distinct_prefix_and_thousands_separators() {
         let marker = applied_marker(41_213);
-        assert_eq!(marker, "[applied: 41,213 bytes — see result diff]");
+        assert_eq!(
+            marker,
+            "[applied: 41,213 bytes — re-read file for current content]"
+        );
         assert!(is_applied_marker(&marker));
         assert!(!marker.starts_with("[elided:"));
         assert!(!crate::engine::prune::Elision::is_marker(&marker));
         assert!(!crate::engine::prune::Elision::contains_marker(&marker));
+    }
+
+    #[test]
+    fn content_that_only_starts_like_a_marker_is_still_elided() {
+        let content = format!("[applied: user-authored text]\n{}", long_payload());
+        assert!(!is_applied_marker(&content));
+        let mut history = vec![
+            assistant_call(
+                "w1",
+                "write",
+                json!({ "path": "src/lib.rs", "content": content.clone() }),
+            ),
+            write_result("w1", "wrote `src/lib.rs` (1200 bytes, LF)"),
+        ];
+        settle_prior_turn(&mut history);
+
+        assert_eq!(elide_applied_write_edit_args(&mut history), 1);
+        assert_eq!(
+            first_call_args(&history[0])["content"],
+            json!(applied_marker(content.len()))
+        );
     }
 
     #[test]
@@ -353,6 +449,7 @@ mod tests {
             ),
             write_result("w1", "wrote `src/lib.rs` (1200 bytes, LF)"),
         ];
+        settle_prior_turn(&mut history);
 
         assert_eq!(elide_applied_write_edit_args(&mut history), 1);
         let args = first_call_args(&history[0]);
@@ -382,6 +479,7 @@ mod tests {
             ),
             edit_result("e1", "edited `src/main.rs` (exact; 800 bytes)"),
         ];
+        settle_prior_turn(&mut history);
 
         assert_eq!(elide_applied_write_edit_args(&mut history), 1);
         let args = first_call_args(&history[0]);
@@ -432,6 +530,7 @@ mod tests {
             ),
             write_result("w1", "wrote `long/path` (1200 bytes, LF)"),
         ];
+        settle_prior_turn(&mut history);
 
         assert_eq!(elide_applied_write_edit_args(&mut history), 1);
         let args = first_call_args(&history[0]);
@@ -493,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn upcoming_successful_result_settles_the_call() {
+    fn upcoming_successful_result_requires_a_newer_assistant() {
         let content = long_payload();
         let mut history = vec![assistant_call(
             "w1",
@@ -502,6 +601,13 @@ mod tests {
         )];
         let upcoming = write_result("w1", "wrote `src/lib.rs` (1200 bytes, LF)");
 
+        assert_eq!(
+            elide_applied_write_edit_args_with_upcoming(&mut history, Some(&upcoming)),
+            0
+        );
+        assert_eq!(first_call_args(&history[0])["content"], json!(content));
+
+        settle_prior_turn(&mut history);
         assert_eq!(
             elide_applied_write_edit_args_with_upcoming(&mut history, Some(&upcoming)),
             1
@@ -541,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_latest_assistant_is_elided_once_the_result_exists() {
+    fn unsigned_latest_assistant_is_untouched_until_a_newer_assistant_exists() {
         let content = long_payload();
         let mut history = vec![
             assistant_call(
@@ -552,6 +658,10 @@ mod tests {
             write_result("w1", "wrote `src/lib.rs` (1200 bytes, LF)"),
         ];
 
+        assert_eq!(elide_applied_write_edit_args(&mut history), 0);
+        assert_eq!(first_call_args(&history[0])["content"], json!(content));
+
+        settle_prior_turn(&mut history);
         assert_eq!(elide_applied_write_edit_args(&mut history), 1);
         assert_eq!(
             first_call_args(&history[0])["content"],
@@ -571,27 +681,36 @@ mod tests {
     }
 
     #[test]
-    fn loop_hash_projection_is_idempotent_with_elided_history_args() {
-        let content = long_payload();
-        let full = json!({ "path": "src/x.rs", "content": content });
-        let mut history = vec![
-            assistant_call("w1", "write", full.clone()),
-            write_result("w1", "wrote `src/x.rs` (1200 bytes, LF)"),
-        ];
-        assert_eq!(elide_applied_write_edit_args(&mut history), 1);
-        let elided = first_call_args(&history[0]);
-
-        let from_full = args_for_loop_hash("write", &full);
-        let from_elided = args_for_loop_hash("write", &elided);
-        assert_eq!(from_full, from_elided);
-        assert_eq!(
-            crate::approval::store::GrantStore::loop_signature("write", &from_full),
-            crate::approval::store::GrantStore::loop_signature("write", &from_elided)
-        );
+    fn same_length_write_contents_keep_distinct_loop_signatures() {
+        let first = json!({ "path": "src/x.rs", "content": "a".repeat(1024) });
+        let second = json!({ "path": "src/x.rs", "content": "b".repeat(1024) });
         assert_ne!(
-            crate::approval::store::GrantStore::loop_signature("write", &full),
-            crate::approval::store::GrantStore::loop_signature("write", &elided),
-            "hashing unprojected full args against already-elided history would miss the loop"
+            crate::approval::store::GrantStore::loop_signature("write", &first),
+            crate::approval::store::GrantStore::loop_signature("write", &second),
+            "loop identity must retain exact canonical argument content"
+        );
+    }
+
+    #[test]
+    fn repair_note_prefix_does_not_hide_a_successful_result() {
+        let content = long_payload();
+        let mut history = vec![
+            assistant_call(
+                "w1",
+                "Write",
+                json!({ "path": "src/lib.rs", "content": content.clone() }),
+            ),
+            write_result(
+                "w1",
+                "<repair_note>Use canonical tool spelling.</repair_note>\nwrote `src/lib.rs` (1200 bytes, LF)",
+            ),
+        ];
+        settle_prior_turn(&mut history);
+
+        assert_eq!(elide_applied_write_edit_args(&mut history), 1);
+        assert_eq!(
+            first_call_args(&history[0])["content"],
+            json!(applied_marker(content.len()))
         );
     }
 
@@ -626,6 +745,7 @@ mod tests {
             ),
             edit_result("e1", "edited `src/main.rs` (exact; 10 bytes)"),
         ];
+        settle_prior_turn(&mut history);
 
         assert_eq!(elide_applied_write_edit_args(&mut history), 1);
         let args = first_call_args(&history[0]);

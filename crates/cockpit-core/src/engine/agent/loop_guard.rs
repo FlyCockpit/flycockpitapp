@@ -81,10 +81,7 @@ pub(super) fn collapse_loop_run(history: &mut Vec<Message>, args: &Value, tool: 
     use crate::engine::message::AssistantContent;
     use rig::message::{ToolResultContent, UserContent};
 
-    let signature = crate::approval::store::GrantStore::loop_signature(
-        tool,
-        &crate::engine::write_edit_arg_elision::args_for_loop_hash(tool, args),
-    );
+    let signature = crate::approval::store::GrantStore::loop_signature(tool, args);
 
     // The trailing message is the current assistant tool-call turn; the prior
     // collapse pairs sit before it. Remove pairs while the tail (just under the
@@ -118,10 +115,7 @@ pub(super) fn collapse_loop_run(history: &mut Vec<Message>, args: &Value, tool: 
                 AssistantContent::ToolCall(tc) => {
                     crate::approval::store::GrantStore::loop_signature(
                         &tc.function.name,
-                        &crate::engine::write_edit_arg_elision::args_for_loop_hash(
-                            &tc.function.name,
-                            &tc.function.arguments,
-                        ),
+                        &tc.function.arguments,
                     ) == signature
                 }
                 _ => false,
@@ -243,52 +237,6 @@ mod loop_collapse_tests {
         assert!(
             !msg.contains("properties") && !msg.contains("\"type\""),
             "no schema leaks into the message: {msg}"
-        );
-    }
-
-    fn long_write_content() -> String {
-        let mut s = String::new();
-        while crate::tokens::count(&s) < 140 {
-            s.push_str(
-                "fn example() { let value = expensive_computation(); println!(\"{value}\"); }\n",
-            );
-        }
-        s
-    }
-
-    /// Applied write/edit elision rewrites historical args in place. Collapse
-    /// hashing must project both the current (still-full) args and the
-    /// already-elided historical args or the contiguous reject run would
-    /// fail to match.
-    #[tokio::test]
-    async fn collapse_matches_when_historical_write_args_were_elided() {
-        let content = long_write_content();
-        let full = serde_json::json!({ "path": "src/x.rs", "content": content });
-        let elided = crate::engine::write_edit_arg_elision::args_for_loop_hash("write", &full);
-        assert_ne!(
-            elided, full,
-            "large write args must stub for the hash projection"
-        );
-
-        let available = ["write", "read"];
-        let mut history: Vec<Message> = Vec::new();
-
-        let historical = call("write", elided);
-        drive_rejected_attempt(&mut history, &historical, 2, &available);
-        assert_eq!(collapse_messages(&history).len(), 1);
-
-        let current = call("write", full.clone());
-        drive_rejected_attempt(&mut history, &current, 3, &available);
-        let collapses = collapse_messages(&history);
-        assert_eq!(
-            collapses.len(),
-            1,
-            "elided historical write args must still collapse with the live full args, got: {history:?}"
-        );
-        assert!(
-            collapses[0].contains("called 3 times"),
-            "count updated in place: {}",
-            collapses[0]
         );
     }
 

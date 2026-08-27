@@ -71,10 +71,7 @@ pub(crate) async fn authorize_monty_native_call(
     }
 
     if let Some(approver) = ctx.approver.as_ref() {
-        let signature = crate::approval::store::GrantStore::loop_signature(
-            tool.name(),
-            &crate::engine::write_edit_arg_elision::args_for_loop_hash(tool.name(), args),
-        );
+        let signature = crate::approval::store::GrantStore::loop_signature(tool.name(), args);
         let consecutive = ctx.session.bump_consecutive_call(&signature);
         let threshold = ctx.config.extended().loop_guard.effective_threshold();
         if consecutive >= threshold {
@@ -433,12 +430,8 @@ async fn execute_ordinary_call_unscoped(
     // to the wire-history collapse site (`loop-collapse-structural-
     // dedup.md`) so the synthesized message can state "called N times".
     let mut loop_guard_count: u32 = 0;
-    let call_signature = (repair_outcome.valid && !placeholder_blocked).then(|| {
-        crate::approval::store::GrantStore::loop_signature(
-            resolved_name,
-            &crate::engine::write_edit_arg_elision::args_for_loop_hash(resolved_name, &args),
-        )
-    });
+    let call_signature = (repair_outcome.valid && !placeholder_blocked)
+        .then(|| crate::approval::store::GrantStore::loop_signature(resolved_name, &args));
     let repeated_recoverable_tool_call = if let Some(signature) = call_signature.as_deref() {
         env.session
             .repeated_recoverable_tool_call_message(signature)
@@ -1015,12 +1008,10 @@ async fn execute_ordinary_call_unscoped(
     {
         rewrite_assistant_tool_call(history, &tc.id, canonical);
     }
-    if let Some(signature) = repair_outcome.valid.then(|| {
-        crate::approval::store::GrantStore::loop_signature(
-            resolved_name,
-            &crate::engine::write_edit_arg_elision::args_for_loop_hash(resolved_name, &args),
-        )
-    }) {
+    if let Some(signature) = repair_outcome
+        .valid
+        .then(|| crate::approval::store::GrantStore::loop_signature(resolved_name, &args))
+    {
         if let Some(RepeatGuard { message }) = repeat_guard.clone() {
             env.session
                 .remember_recoverable_tool_call(signature, message);
@@ -1662,11 +1653,17 @@ async fn execute_ordinary_call_unscoped(
         resolved_name,
         wire_output,
     ));
-    // Model-visible write/edit args: stub large applied fields now that the
-    // matching result is in history. Durable rows above already stored the
-    // full `wire_input_json`. Signed-thinking latest assistant messages are
-    // left intact until a later turn settles them.
-    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(history);
+    // Model-visible write/edit args: stub large applied fields from prior
+    // assistant turns now that their matching results are in history. Durable
+    // rows above already stored the full `wire_input_json`. The latest
+    // assistant message is always left intact until a later turn settles it.
+    crate::engine::write_edit_arg_elision::project_live_history(
+        env.session,
+        &env.agent.name,
+        history,
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -4513,8 +4510,21 @@ mod tests {
         panic!("write tool call not found in history: {history:?}");
     }
 
+    fn first_tool_call(history: &[Message]) -> &ToolCall {
+        history
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant { content, .. } => content.iter().find_map(|part| match part {
+                    AssistantContent::ToolCall(call) => Some(call),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("tool call in history")
+    }
+
     #[tokio::test]
-    async fn write_arg_elision_live_projection_is_byte_identical_to_rehydrate() {
+    async fn settled_write_arg_elision_is_byte_identical_live_and_on_rehydrate() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(crate::tools::write::WriteTool));
         let agent = test_agent(tools.clone());
@@ -4551,13 +4561,9 @@ mod tests {
         .await
         .unwrap();
 
-        let live_args = write_call_args(&live_history);
-        assert_eq!(live_args["path"], serde_json::json!("big.rs"));
         assert_eq!(
-            live_args["content"],
-            serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(
-                content.len()
-            ))
+            write_call_args(&live_history)["content"],
+            serde_json::json!(content)
         );
 
         let rows = session
@@ -4575,6 +4581,39 @@ mod tests {
             rows[0].original_input_json["content"],
             serde_json::json!(content)
         );
+
+        live_history.push(Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::text("newer assistant turn")],
+        });
+        assert_eq!(
+            crate::engine::write_edit_arg_elision::project_live_history(
+                &session,
+                "Build",
+                &mut live_history,
+                None
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let live_args = write_call_args(&live_history);
+        assert_eq!(live_args["path"], serde_json::json!("big.rs"));
+        assert_eq!(
+            live_args["content"],
+            serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(
+                content.len()
+            ))
+        );
+        session
+            .record_event(
+                crate::db::session_log::SessionEventKind::AssistantMessage,
+                Some("Build"),
+                Some("next-inference"),
+                &serde_json::json!({ "text": "newer assistant turn" }),
+            )
+            .await
+            .unwrap();
 
         let replayed =
             crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
@@ -4603,7 +4642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_reasoning_write_is_untouched_until_a_newer_assistant_exists() {
+    async fn signed_name_repaired_write_reconciles_after_a_newer_assistant_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(crate::tools::write::WriteTool));
         let agent = test_agent(tools.clone());
@@ -4625,19 +4664,30 @@ mod tests {
         };
         let content = long_write_content();
         let args = serde_json::json!({ "path": "signed.rs", "content": content });
-        let call = tool_call("write", args.clone());
+        let call = tool_call("Write", args.clone());
         let mut history = Vec::new();
         push_signed_assistant_call(&mut history, &call);
 
-        execute_ordinary_call(&env, &mut history, &call, "write", Recovery::Clean, None)
-            .await
-            .unwrap();
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "write",
+            Recovery::NameRepair {
+                stage: "case_fold",
+                original: "Write".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
-            write_call_args(&history)["content"],
+            first_tool_call(&history).function.arguments["content"],
             serde_json::json!(content),
             "signed latest assistant must not be rewritten"
         );
+        assert_eq!(first_tool_call(&history).function.name, "Write");
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("signed.rs")).unwrap(),
             content
@@ -4648,9 +4698,17 @@ mod tests {
             content: vec![AssistantContent::text("next turn")],
         });
         assert_eq!(
-            crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut history),
+            crate::engine::write_edit_arg_elision::project_live_history(
+                &session,
+                "Build",
+                &mut history,
+                None,
+            )
+            .await
+            .unwrap(),
             1
         );
+        assert_eq!(first_tool_call(&history).function.name, "write");
         assert_eq!(
             write_call_args(&history)["content"],
             serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(

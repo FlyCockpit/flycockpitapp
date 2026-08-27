@@ -8409,6 +8409,20 @@ pub(crate) async fn run_noninteractive_resumable(
             };
             match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    let projection =
+                        crate::engine::write_edit_arg_elision::project_live_history(
+                            &session,
+                            &agent.name,
+                            &mut history,
+                            None,
+                        )
+                        .await;
+                    if let Err(error) = projection {
+                        let _ = request.respond_to.send(Err(format!(
+                            "warm noninteractive history projection failed: {error:#}"
+                        )));
+                        continue 'turns;
+                    }
                     let response = agent
                         .model
                         .text_completion_with_live_context(
@@ -8520,6 +8534,20 @@ pub(crate) async fn run_noninteractive_resumable(
             };
             match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    let projection =
+                        crate::engine::write_edit_arg_elision::project_live_history(
+                            &session,
+                            &agent.name,
+                            &mut history,
+                            None,
+                        )
+                        .await;
+                    if let Err(error) = projection {
+                        let _ = request.respond_to.send(Err(format!(
+                            "warm noninteractive history projection failed: {error:#}"
+                        )));
+                        continue 'turns;
+                    }
                     let response = agent
                         .model
                         .text_completion_with_live_context(
@@ -8752,6 +8780,20 @@ pub(crate) async fn run_noninteractive_resumable(
         while let Ok(request) = agent_tree_resolver_rx.try_recv() {
             match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    let projection =
+                        crate::engine::write_edit_arg_elision::project_live_history(
+                            &session,
+                            &agent.name,
+                            &mut history,
+                            None,
+                        )
+                        .await;
+                    if let Err(error) = projection {
+                        let _ = request.respond_to.send(Err(format!(
+                            "warm noninteractive history projection failed: {error:#}"
+                        )));
+                        continue 'turns;
+                    }
                     let response = agent
                         .model
                         .text_completion_with_live_context(

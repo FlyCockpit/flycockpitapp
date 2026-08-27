@@ -1854,4 +1854,53 @@ mod tests {
                 .any(|line| line.to_string().contains("Session setup"))
         );
     }
+
+    #[test]
+    fn modes_session_setup_keyboard_reaches_every_section() {
+        let mut snap = snapshot(vec![]);
+        snap.resolved_agent = Some("Build".into());
+        snap.available_agents = vec!["Build".into(), "Plan".into()];
+        snap.tools = vec![
+            tool("read", "enabled", false),
+            tool("question", "enabled", true),
+        ];
+        snap.mcps = vec![SessionSetupMcpV1 {
+            name: "docs".into(),
+            scope: "global".into(),
+            enabled: true,
+            shadowed_by: None,
+            profile: Some("default".into()),
+        }];
+        let mut pane = SessionSetupPane::loading_inline(false);
+        pane.apply_snapshot(snap);
+        assert!(
+            pane.rows
+                .iter()
+                .any(|row| matches!(row.payload, RowPayload::Agent))
+        );
+        assert!(
+            pane.rows
+                .iter()
+                .any(|row| matches!(row.payload, RowPayload::Model))
+        );
+        assert!(
+            pane.rows
+                .iter()
+                .any(|row| matches!(row.payload, RowPayload::Tool { .. }))
+        );
+        assert!(
+            pane.rows
+                .iter()
+                .any(|row| matches!(row.payload, RowPayload::AddMcp))
+        );
+        pane.move_selection(true);
+        pane.move_selection(true);
+        assert!(pane.list.selected().is_some());
+        let narrow = render_inline_text(&pane, 36, 16);
+        assert!(narrow.contains("Session setup"));
+        assert!(
+            pane.rows.iter().all(|row| row.text.chars().count() < 200),
+            "rows must stay as single lines the panel can scroll"
+        );
+    }
 }

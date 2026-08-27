@@ -580,7 +580,7 @@ pub(crate) async fn attach_send_pump(
 
     let was_processing = is_processing(client, session_id).await?;
     let submitted_message = !prompt.trim().is_empty();
-    // Sole invocation identity: allocated once before first SendUserMessage.
+    // Sole invocation identity: allocated once before the V2 message send.
     let client_submission_id = Uuid::now_v7();
     if submitted_message {
         let use_bulk = cockpit_client::bulk_upload::user_message_needs_bulk(&prompt, None);
@@ -615,11 +615,16 @@ pub(crate) async fn attach_send_pump(
                 })
                 .await
         } else {
-            if !options.image_data.is_empty() {
-                bail!(
-                    "image attachments are unavailable until the typed-media V2 upload path is wired"
-                );
-            }
+            let images = options
+                .image_data
+                .iter()
+                .cloned()
+                .map(cockpit_client::image_upload::SubmissionImage::png)
+                .collect::<Vec<_>>();
+            let attachments =
+                cockpit_client::image_upload::upload_submission_images(client, session_id, &images)
+                    .await
+                    .map_err(classify_v2_image_upload_error)?;
             client
                 .request(Request::SendUserMessageV2 {
                     ingress: MessageIngressV2::local_direct(
@@ -634,7 +639,7 @@ pub(crate) async fn attach_send_pump(
                             display_text: None,
                             tag_expansions: Vec::new(),
                             forced_skill: None,
-                            attachments: Vec::new(),
+                            attachments,
                         },
                     ),
                 })
@@ -759,11 +764,11 @@ fn resolve_attachment_paths(root: &Path, files: &[PathBuf]) -> Result<Vec<PathBu
 }
 
 fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
-    if paths.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
+    if paths.len() > proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
         return Err(RunUsageError(format!(
             "too many images: {} exceeds {} image limit",
             paths.len(),
-            proto::MAX_IMAGES_PER_USER_MESSAGE
+            proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
         ))
         .into());
     }
@@ -797,6 +802,20 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
         .into());
     }
     Ok(images)
+}
+
+fn classify_v2_image_upload_error(
+    error: cockpit_client::image_upload::ImageUploadError,
+) -> anyhow::Error {
+    match error {
+        cockpit_client::image_upload::ImageUploadError::Usage(message) => {
+            RunUsageError(message).into()
+        }
+        cockpit_client::image_upload::ImageUploadError::Daemon(message)
+        | cockpit_client::image_upload::ImageUploadError::Transport(message) => {
+            anyhow::anyhow!(message)
+        }
+    }
 }
 
 fn exit_run_error(format: OutputFormat, exit_code: i32, code: &str, message: &str) -> ! {
@@ -2339,19 +2358,20 @@ mod tests {
 
     #[test]
     fn attachment_limits_and_daemon_bad_requests_are_usage_errors() {
-        let paths = (0..=proto::MAX_IMAGES_PER_USER_MESSAGE)
+        let paths = (0..=proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS)
             .map(|index| PathBuf::from(format!("unread-image-{index}.png")))
             .collect::<Vec<_>>();
         let error = load_and_validate_images(&paths).unwrap_err();
         assert!(error.downcast_ref::<RunUsageError>().is_some());
         assert!(error.to_string().contains("too many images"));
 
-        let error = map_image_upload_error(cockpit_client::image_upload::ImageUploadError::Usage(
-            "configured upload limit rejected the image".into(),
-        ));
+        let error =
+            classify_v2_image_upload_error(cockpit_client::image_upload::ImageUploadError::Usage(
+                "configured V2 attachment limit rejected the image".into(),
+            ));
         assert!(error.downcast_ref::<RunUsageError>().is_some());
 
-        let error = map_image_upload_error(
+        let error = classify_v2_image_upload_error(
             cockpit_client::image_upload::ImageUploadError::Transport("socket closed".into()),
         );
         assert!(error.downcast_ref::<RunUsageError>().is_none());

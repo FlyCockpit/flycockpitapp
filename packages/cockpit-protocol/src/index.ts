@@ -601,6 +601,35 @@ export const agentDecisionAnswerSchema = z.discriminatedUnion("kind", [
 ]);
 export type AgentDecisionAnswer = z.infer<typeof agentDecisionAnswerSchema>;
 
+const messageAttachmentIdentitySchema = z
+  .object({
+    attachment_id: nonNilUuidSchema,
+    attachment_version: positiveSafeU64NumberSchema,
+    checksum: z.array(z.number().int().min(0).max(255)).length(32),
+    kind: mediaKindSchema,
+  })
+  .strict();
+
+const messageTagExpansionSchema = z
+  .object({
+    tool: z.string().min(1).max(128),
+    path: z.string().max(4096),
+    detail: z.string().max(4096),
+    ok: z.boolean(),
+  })
+  .strict();
+
+const sendUserMessageV2Schema = z
+  .object({
+    client_submission_id: clientSubmissionIdSchema,
+    text: z.string(),
+    display_text: optionalStringSchema,
+    tag_expansions: z.array(messageTagExpansionSchema),
+    forced_skill: optionalStringSchema,
+    attachments: z.array(messageAttachmentIdentitySchema).max(16),
+  })
+  .strict();
+
 const requestParamSchemas = {
   get_app_flag: z.object({ key: z.literal("daemon_autostart_notice") }).strict(),
   get_startup_disclosures: z.object({ project_root: projectRootSchema }).strict(),
@@ -780,16 +809,7 @@ const requestParamSchemas = {
               })
               .strict()
               .optional(),
-            request: z
-              .object({
-                client_submission_id: clientSubmissionIdSchema,
-                text: z.string(),
-                display_text: optionalStringSchema,
-                tag_expansions: z.array(passthroughObjectSchema).optional(),
-                forced_skill: optionalStringSchema,
-                attachments: z.array(passthroughObjectSchema),
-              })
-              .strict(),
+            request: sendUserMessageV2Schema,
           })
           .strict(),
         z
@@ -798,16 +818,7 @@ const requestParamSchemas = {
             session_locator: z.string().min(1),
             expected_model_state_generation: safeU64NumberSchema.optional(),
             expected_model: activeModelRefSchema.optional(),
-            request: z
-              .object({
-                client_submission_id: clientSubmissionIdSchema,
-                text: z.string(),
-                display_text: optionalStringSchema,
-                tag_expansions: z.array(passthroughObjectSchema).optional(),
-                forced_skill: optionalStringSchema,
-                attachments: z.array(passthroughObjectSchema),
-              })
-              .strict(),
+            request: sendUserMessageV2Schema,
           })
           .strict(),
       ]),

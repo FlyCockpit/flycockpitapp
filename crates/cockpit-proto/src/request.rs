@@ -4043,8 +4043,8 @@ macro_rules! command {
         $with_commands! { ($($context),*) [
             (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:Option<SessionEntryMode>|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: Option<SessionEntryMode> => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
-            (Request::SendUserMessageV2 { ingress }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "ingress:MessageIngressV2", [ingress: MessageIngressV2 => legacy_message]);
-            (Request::SendUserMessageBulk { client_submission_id, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
+            (Request::SendUserMessageV2 { ingress }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "ingress:MessageIngressV2", [ingress: MessageIngressV2 => opaque_fcm2]);
+            (Request::SendUserMessageBulk { client_submission_id, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
             #[cfg(feature = "remote")]
             (Request::OperationStatus { operation_id }, "operation_status", public_read, none, false, read_only, none, serialized, none, "operation_id:Uuid", [operation_id: Uuid => param]);
@@ -4564,7 +4564,7 @@ macro_rules! encode_fcor_role {
     ($out:ident, $name:ident, scheduled) => {
         $name.encode_fcor_value_v1(&mut $out)?;
     };
-    ($out:ident, $name:ident, legacy_message) => {
+    ($out:ident, $name:ident, opaque_fcm2) => {
         // Rejection is performed before entering the exhaustive generated
         // encoder. Keeping this role as an omission preserves the one typed
         // command-table source without placing a diverging expression ahead
@@ -4676,7 +4676,6 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Vec<Option<String>>" => "list<option<string>>",
         "Vec<(String,String)>" => "list<tuple<string,string>>",
         "HashMap<String,String>" => "map<string,string>",
-        "Vec<ImageAttachmentRef>" => "list<struct:ImageAttachmentRef:v1>",
         "Vec<TagExpansionMeta>" => "list<struct:TagExpansionMeta:v1>",
         "Option<EnvSnapshotWire>" => "option<struct:EnvSnapshotWire:v1>",
         "Option<RunInvocationOptions>" => "option<struct:RunInvocationOptions:v1>",
@@ -4688,6 +4687,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Option<cockpit_config::config::providers::ActiveModelRef>" => {
             "option<struct:ActiveModelRef:v1>"
         }
+        "MessageIngressV2" => "opaque:fcm2",
         "Option<cockpit_config::config::providers::OnUnlistedModelsFetch>" => {
             "option<enum16:OnUnlistedModelsFetch>"
         }
@@ -5352,7 +5352,7 @@ mod tests {
             for (name, ty, role) in &typed_fields {
                 let ty = ty.replace(' ', "");
                 let valid = match role.split_once('(').map(|(head, _)| head).unwrap_or(role) {
-                    "param" | "legacy_message" => true,
+                    "param" | "opaque_fcm2" => true,
                     "session" => ty == "Uuid" || ty == "Option<Uuid>",
                     "project" => ty == "Option<String>",
                     "project_root" => ty == "String",

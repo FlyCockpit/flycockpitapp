@@ -84,10 +84,12 @@ pub(super) async fn admit_image_ingress(
                 kind: "imageIngressAdmissionReceipt".into(),
                 admission_id: published.admission_id,
                 session_id: published.session_id,
-                image_ref: proto::ImageAttachmentRef {
-                    id: published.attachment_id,
+                attachment: proto::send_user_message_v2::MessageAttachmentIdentity {
+                    attachment_id: published.attachment_id,
+                    attachment_version: published.attachment_version,
+                    checksum: decode_sha256_hex(&published.normalized_sha256)?,
+                    kind: cockpit_db::media_attachments::MediaKind::Image,
                 },
-                attachment_version: published.attachment_version,
                 availability_generation: published.availability_generation,
                 reservation_id: published.reservation_id,
                 normalized_sha256: published.normalized_sha256,
@@ -327,10 +329,12 @@ pub(super) async fn admit_image_ingress(
             kind: "imageIngressAdmissionReceipt".into(),
             admission_id,
             session_id,
-            image_ref: proto::ImageAttachmentRef {
-                id: published.attachment_id,
+            attachment: proto::send_user_message_v2::MessageAttachmentIdentity {
+                attachment_id: published.attachment_id,
+                attachment_version: published.attachment_version,
+                checksum: decode_sha256_hex(&published.normalized_sha256)?,
+                kind: cockpit_db::media_attachments::MediaKind::Image,
             },
-            attachment_version: published.attachment_version,
             availability_generation: published.availability_generation,
             reservation_id: published.reservation_id,
             normalized_sha256: published.normalized_sha256,
@@ -680,11 +684,36 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     crate::intel::hex_lower(&digest)
 }
 
+fn decode_sha256_hex(value: &str) -> std::result::Result<[u8; 32], ErrorPayload> {
+    if !validate_sha256_hex(value) {
+        return Err(internal(
+            "durable media receipt contains an invalid checksum",
+        ));
+    }
+    let mut decoded = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte: u8| -> Option<u8> {
+            match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            }
+        };
+        decoded[index] = (nibble(pair[0])
+            .ok_or_else(|| internal("durable media receipt contains an invalid checksum"))?
+            << 4)
+            | nibble(pair[1])
+                .ok_or_else(|| internal("durable media receipt contains an invalid checksum"))?;
+    }
+    Ok(decoded)
+}
+
+#[cfg(test)]
 pub(super) fn user_message_wire_fingerprint(
     text: &str,
     display_text: Option<&str>,
     tag_expansions: &[proto::TagExpansionMeta],
-    image_refs: &[proto::ImageAttachmentRef],
+    attachment_ids: &[Uuid],
     forced_skill: Option<&str>,
 ) -> String {
     fn part(hasher: &mut Sha256, bytes: &[u8]) {
@@ -709,8 +738,8 @@ pub(super) fn user_message_wire_fingerprint(
         &mut hasher,
         &serde_json::to_vec(tag_expansions).unwrap_or_default(),
     );
-    for image_ref in image_refs {
-        part(&mut hasher, image_ref.id.as_bytes());
+    for attachment_id in attachment_ids {
+        part(&mut hasher, attachment_id.as_bytes());
     }
     optional_part(&mut hasher, forced_skill);
     crate::intel::hex_lower(&hasher.finalize())
@@ -1073,16 +1102,24 @@ pub(super) async fn finish_attachment_upload(
                     "user-message image upload is missing its session",
                 ));
             };
-            let image_ref = proto::ImageAttachmentRef { id: Uuid::new_v4() };
+            let attachment_id = Uuid::now_v7();
+            let checksum: [u8; 32] = Sha256::digest(&bytes).into();
             state.ready_attachments.insert(
-                image_ref.id,
+                attachment_id,
                 ReadyAttachment {
                     session_id,
                     bytes,
                     purpose: upload.purpose,
                 },
             );
-            Ok(Response::AttachmentUploaded { image_ref })
+            Ok(Response::AttachmentUploaded {
+                attachment: proto::send_user_message_v2::MessageAttachmentIdentity {
+                    attachment_id,
+                    attachment_version: 1,
+                    checksum,
+                    kind: cockpit_db::media_attachments::MediaKind::Image,
+                },
+            })
         }
     }
 }
@@ -1283,7 +1320,7 @@ pub(super) async fn finish_attachment_upload_admitted(
                         &state.principal,
                     ),
                     session_id,
-                    project_digest,
+                    project_digest: project_digest.clone(),
                     bytes,
                     policy: &policy,
                     now_unix_ms: wall_ms.try_into().unwrap_or(i64::MAX),
@@ -1291,19 +1328,52 @@ pub(super) async fn finish_attachment_upload_admitted(
                 })
                 .await
                 .map_err(internal)?;
-            let image_ref = proto::ImageAttachmentRef { id: attachment_id };
-            Ok(Response::AttachmentUploaded { image_ref })
+            let (attachment, component_checksum) = ctx
+                .db
+                .read(move |conn| {
+                    let attachment = cockpit_db::Db::media_attachment_for_owner_conn(
+                        conn,
+                        attachment_id,
+                        session_id,
+                        &project_digest,
+                    )?;
+                    let component_checksum = conn
+                        .query_row(
+                            "SELECT sha256 FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind='image_model' AND lifecycle_state='ready'",
+                            rusqlite::params![
+                                attachment_id.to_string(),
+                                attachment.as_ref().map(|record| record.attachment_version.to_string()),
+                            ],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    Ok((attachment, component_checksum))
+                })
+                .await
+                .map_err(internal)?;
+            let attachment =
+                attachment.ok_or_else(|| internal("materialized attachment is unavailable"))?;
+            let component_checksum = component_checksum
+                .ok_or_else(|| internal("materialized image derivative is unavailable"))?;
+            Ok(Response::AttachmentUploaded {
+                attachment: proto::send_user_message_v2::MessageAttachmentIdentity {
+                    attachment_id,
+                    attachment_version: attachment.attachment_version,
+                    checksum: decode_sha256_hex(&component_checksum)?,
+                    kind: attachment.media_kind,
+                },
+            })
         }
     }
 }
 
 #[cfg(test)]
-pub(super) fn consume_image_refs(
+pub(super) fn consume_test_images(
     state: &mut MutableClientState,
     session_id: Uuid,
-    refs: &[proto::ImageAttachmentRef],
+    attachment_ids: &[Uuid],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
-    claim_message_image_refs(state, session_id, Uuid::nil(), refs)
+    read_test_images(state, session_id, Uuid::nil(), attachment_ids)
 }
 
 /// Acquire reusable immutable attachment bytes for one submission.
@@ -1312,18 +1382,18 @@ pub(super) fn consume_image_refs(
 /// idempotency belongs to the worker receipt, while the durable media layer
 /// records a distinct reference per committed consumer.
 #[cfg(test)]
-pub(super) fn claim_message_image_refs(
+pub(super) fn read_test_images(
     state: &mut MutableClientState,
     session_id: Uuid,
     client_submission_id: Uuid,
-    refs: &[proto::ImageAttachmentRef],
+    attachment_ids: &[Uuid],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
-    validate_image_ref_shape(refs)?;
+    validate_test_attachment_shape(attachment_ids)?;
 
     let mut total = 0usize;
-    let mut images = Vec::with_capacity(refs.len());
-    for image_ref in refs {
-        let Some(attachment) = state.ready_attachments.get(&image_ref.id) else {
+    let mut images = Vec::with_capacity(attachment_ids.len());
+    for attachment_id in attachment_ids {
+        let Some(attachment) = state.ready_attachments.get(attachment_id) else {
             return Err(bad_request("media attachment unavailable"));
         };
         validate_message_attachment(attachment, session_id, &mut total)?;
@@ -1333,76 +1403,21 @@ pub(super) fn claim_message_image_refs(
     Ok(images)
 }
 
-pub(super) async fn claim_message_image_refs_admitted(
-    ctx: &DaemonContext,
-    state: &mut MutableClientState,
-    session_id: Uuid,
-    client_submission_id: Uuid,
-    refs: &[proto::ImageAttachmentRef],
-) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
-    validate_image_ref_shape(refs)?;
-    // A text-only message has no attachments to claim, so it must not depend on
-    // the media subsystem being provisioned. Short-circuit before touching the
-    // attachment state or media storage recovery, mirroring the empty-refs guard
-    // on the probe path in `handle_send_user_message`.
-    if refs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let attached =
-        require_attached(state).map_err(|_| bad_request("media attachment unavailable"))?;
-    if attached.handle.session_id != session_id {
-        return Err(bad_request("media attachment unavailable"));
-    }
-    let project = attached
-        .handle
-        .project_root
-        .to_str()
-        .ok_or_else(|| bad_request("media attachment unavailable"))?;
-    let project_digest = crate::intel::hex_lower(&Sha256::digest(project.as_bytes()));
-    let storage = ctx
-        .media_storage_recovery
-        .as_ref()
-        .ok_or_else(|| bad_request("media attachment unavailable"))?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let images = storage
-        .acquire_message_images_bound(crate::media_storage::AcquireMessageImagesInput {
-            attachment_ids: refs.iter().map(|image_ref| image_ref.id).collect(),
-            session_id,
-            project_digest,
-            consumer_id: client_submission_id.to_string(),
-            ledger: &ctx.media_ledger,
-            max_total_bytes: proto::MAX_TOTAL_IMAGE_BYTES as u64,
-            now_unix_ms: now,
-        })
-        .await
-        .map_err(|_| bad_request("media attachment unavailable"))?;
-    Ok(images)
-}
-
-/// Reusable attachments do not transfer ownership during acquisition, so a
-/// rejected submission has no in-memory attachment mutation to roll back.
-pub(super) fn release_message_image_refs(
-    state: &mut MutableClientState,
-    client_submission_id: Uuid,
-    refs: &[proto::ImageAttachmentRef],
-) {
-    let _ = (state, client_submission_id, refs);
-}
-
-fn validate_image_ref_shape(
-    refs: &[proto::ImageAttachmentRef],
+#[cfg(test)]
+fn validate_test_attachment_shape(
+    attachment_ids: &[Uuid],
 ) -> std::result::Result<(), ErrorPayload> {
-    if refs.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
+    if attachment_ids.len() > proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
         return Err(bad_request(format!(
             "too many images: {} exceeds {} image limit",
-            refs.len(),
-            proto::MAX_IMAGES_PER_USER_MESSAGE
+            attachment_ids.len(),
+            proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
         )));
     }
     let mut seen = HashSet::new();
-    for image_ref in refs {
-        if !seen.insert(image_ref.id) {
-            return Err(bad_request("duplicate image ref in user message"));
+    for attachment_id in attachment_ids {
+        if !seen.insert(*attachment_id) {
+            return Err(bad_request("duplicate attachment in user message"));
         }
     }
     Ok(())
@@ -1522,7 +1537,7 @@ mod decode_cleanup_tests {
             .split("pub(super) async fn finish_attachment_upload_admitted")
             .nth(1)
             .and_then(|tail| {
-                tail.split("#[cfg(test)]\npub(super) fn consume_image_refs")
+                tail.split("#[cfg(test)]\npub(super) fn consume_test_images")
                     .next()
             })
             .expect("attachment finish function");

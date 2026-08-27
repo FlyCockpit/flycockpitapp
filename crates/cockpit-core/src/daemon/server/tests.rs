@@ -1804,7 +1804,7 @@ async fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
         expected_version: 0,
     };
     let reachable_mutation = Request::CancelRunInvocation {
-        client_submission_id: Uuid::new_v4(),
+        client_submission_id: Uuid::now_v7(),
     };
     let bulk_chunk = Request::WriteBulkTransferChunk {
         transfer: archive_transfer_ref(b"remote opaque source chunk"),
@@ -2455,7 +2455,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
             conflict_id,
             operation,
             Request::CancelRunInvocation {
-                client_submission_id: Uuid::new_v4(),
+                client_submission_id: Uuid::now_v7(),
             },
         ),
         &mut state,
@@ -2857,7 +2857,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
     let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let mut concurrent = ConcurrentRequestRuntime::new();
 
-    let first_id = Uuid::new_v4();
+    let first_id = Uuid::now_v7();
     handle_envelope(
         Envelope::remote_request(
             first_id,
@@ -3541,7 +3541,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .any(|bytes| bytes == b"resolved_policy")
     );
 
-    let first_id = Uuid::new_v4();
+    let first_id = Uuid::now_v7();
     handle_envelope(
         Envelope::remote_request(
             first_id,
@@ -4154,7 +4154,7 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
             conflict_id,
             operation,
             Request::CancelRunInvocation {
-                client_submission_id: Uuid::new_v4(),
+                client_submission_id: Uuid::now_v7(),
             },
         ),
         &mut state,
@@ -4787,12 +4787,12 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
             Request::SendUserMessageV2 {
                 ingress: MessageIngressV2::local_direct(
                     Uuid::now_v7(),
-                    "session",
+                    session_id.to_string(),
                     None,
                     None,
                     None,
                     crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                        client_submission_id: Uuid::new_v4(),
+                        client_submission_id: Uuid::now_v7(),
                         text: "first turn".into(),
                         display_text: None,
                         tag_expansions: Vec::new(),
@@ -4872,12 +4872,12 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
             Request::SendUserMessageV2 {
                 ingress: MessageIngressV2::local_direct(
                     Uuid::now_v7(),
-                    "session",
+                    session_id.to_string(),
                     None,
                     None,
                     None,
                     crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                        client_submission_id: Uuid::new_v4(),
+                        client_submission_id: Uuid::now_v7(),
                         text: "second turn".into(),
                         display_text: None,
                         tag_expansions: Vec::new(),
@@ -10956,6 +10956,12 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
         client_submission_id: Uuid,
         operation: RemoteOperationContext,
     ) -> (MutableClientState, [u8; 32]) {
+        let session_id = state
+            .attached
+            .as_ref()
+            .expect("worker request hash requires an attached state")
+            .handle
+            .session_id;
         let ctx = ctx.clone();
         let shared = shared.clone();
         let task = tokio::spawn(async move {
@@ -10964,7 +10970,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
             let request = Request::SendUserMessageV2 {
                 ingress: MessageIngressV2::local_direct(
                     Uuid::now_v7(),
-                    "session",
+                    session_id.to_string(),
                     None,
                     None,
                     None,
@@ -11083,40 +11089,30 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
     // `send_user_message_remote_path_commits_transactional_ledger`.
 }
 
-/// An image-backed EXACT-duplicate remote send short-circuits in dispatch
-/// BEFORE the worker accept path (to avoid re-claiming already-consumed image
-/// refs). It must still reserve the operation through the SAME transactional
-/// ledger, so no remote send returns accepted without a ledger operation row.
+/// Until authenticated remote V2 acceptance is wired to the transactional
+/// ledger, a remote envelope cannot substitute the local-owner adapter. The
+/// rejection happens before worker delivery or any durable operation row.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "remote")]
-async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
-    let mut ctx = test_ctx();
-    let media_dir = tempfile::tempdir().unwrap();
-    let db = ctx.db.clone();
-    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
-        crate::media_storage::MediaStorageRecovery::open_or_create(
-            db,
-            &media_dir.path().join("media"),
-        )
-        .unwrap(),
-    ));
+async fn send_user_message_remote_branch_is_explicitly_fail_closed() {
+    let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();
-    let (mut state, _session_id, mut work_rx) =
+    let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
-    let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let shared = state.shared_snapshot();
     let operation = remote_owner_operation().await;
-    let client_submission_id = Uuid::new_v4();
+    let logical_attachment_id = operation.logical_attachment_id;
+    let operation_id = operation.operation_id;
     let request = Request::SendUserMessageV2 {
         ingress: MessageIngressV2::local_direct(
             Uuid::now_v7(),
-            "session",
+            session_id.to_string(),
             None,
             None,
             None,
             crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                client_submission_id: client_submission_id,
-                text: "image duplicate".to_string(),
+                client_submission_id: Uuid::now_v7(),
+                text: "remote send must fail closed".to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
@@ -11124,58 +11120,35 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
             },
         ),
     };
-    let task_ctx = ctx.clone();
-    let task = tokio::spawn(async move {
-        let mut effects = ClientRequestEffects::default();
-        let result = Box::pin(handle_serialized_request_with_remote_operation(
-            request,
-            &mut state,
-            &shared,
-            &task_ctx,
-            &mut effects,
-            Some(&operation),
-        ))
-        .await;
-        (state, result)
-    });
-    // The image-backed send probes the worker first; force a Duplicate so
-    // dispatch takes the early-return fast path that must still reserve the
-    // ledger.
-    let SessionWork::ProbeUserMessage { respond_to, .. } = work_rx
-        .recv()
-        .await
-        .expect("the image send probes the worker")
-    else {
-        panic!("expected ProbeUserMessage work");
-    };
-    respond_to
-        .send(Ok(UserMessageProbeResult::Duplicate {
-            item: proto::QueueItem {
-                id: client_submission_id,
-                status: proto::QueueItemStatus::Folding,
-                text: "image duplicate".to_string(),
-                display_text: None,
-                target: proto::QueueTarget::default(),
-            },
-            queue: Vec::new(),
-        }))
-        .unwrap();
-    let (_state, result) = task.await.unwrap();
+    let mut effects = ClientRequestEffects::default();
+
+    let error = handle_serialized_request_with_remote_operation(
+        request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .expect_err("remote V2 send is unavailable until its ledger path is wired");
+
+    assert_eq!(error.code, ErrorCode::Authorization);
+    assert!(matches!(
+        work_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
     assert!(
-        matches!(result, Ok(Response::UserMessageQueued { .. })),
-        "the duplicate image send is accepted, got {result:?}"
+        ctx.db
+            .remote_operation_status(
+                &logical_attachment_id.to_string(),
+                &operation_id.to_string(),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "fail-closed remote ingress has no durable side effects"
     );
-    // The dispatch fast path must have reserved+committed the operation ledger.
-    let status = ctx
-        .db
-        .remote_operation_status(
-            &operation.logical_attachment_id.to_string(),
-            &operation.operation_id.to_string(),
-        )
-        .await
-        .unwrap()
-        .expect("an image-duplicate remote send must reserve a committed ledger row");
-    assert_eq!(status.state, "committed");
 }
 
 /// A fresh, well-formed remote-operation identity for the owner-remoted
@@ -14941,12 +14914,12 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
         Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
                 Uuid::now_v7(),
-                "session",
+                session_id.to_string(),
                 None,
                 None,
                 None,
                 crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                    client_submission_id: Uuid::new_v4(),
+                    client_submission_id: Uuid::now_v7(),
                     text: "x".repeat(
                         crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES + 1,
                     ),
@@ -14977,23 +14950,21 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
 }
 
 #[tokio::test]
-async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_boundary_media_uses_legacy_probe()
- {
+async fn send_user_message_v2_inline_boundary_rejects_over_limit_and_dispatches_at_limit() {
     let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
-    let _image_ref = proto::ImageAttachmentRef { id: Uuid::new_v4() };
     let error = handle_request(
         Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
                 Uuid::now_v7(),
-                "session",
+                session_id.to_string(),
                 None,
                 None,
                 None,
                 crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                    client_submission_id: Uuid::new_v4(),
+                    client_submission_id: Uuid::now_v7(),
                     text: "x".repeat(64 * 1024 + 1),
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -15006,14 +14977,14 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
         &ctx,
     )
     .await
-    .expect_err("mixed media cannot create an unrehydratable long event");
+    .expect_err("over-boundary inline V2 text must use bounded bulk ingress");
     assert_eq!(error.code, ErrorCode::BadRequest);
     assert!(
         matches!(
             work_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ),
-        "rejection happens before image probing or worker delivery"
+        "rejection happens before worker delivery"
     );
     assert_eq!(
         user_message_ingress_counts(&ctx, session_id).await,
@@ -15026,12 +14997,12 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
             Request::SendUserMessageV2 {
                 ingress: MessageIngressV2::local_direct(
                     Uuid::now_v7(),
-                    "session",
+                    session_id.to_string(),
                     None,
                     None,
                     None,
                     crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                        client_submission_id: Uuid::new_v4(),
+                        client_submission_id: Uuid::now_v7(),
                         text: "x".repeat(64 * 1024),
                         display_text: None,
                         tag_expansions: Vec::new(),
@@ -15046,23 +15017,31 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
         .await;
         (state, result)
     });
-    let SessionWork::ProbeUserMessage { respond_to, .. } = work_rx
+    let SessionWork::UserMessage {
+        submission,
+        respond_to,
+        ..
+    } = work_rx
         .recv()
         .await
-        .expect("64KiB media submission still follows the existing image probe path")
+        .expect("64KiB V2 submission reaches the worker")
     else {
-        panic!("expected boundary media submission to probe the worker");
+        panic!("expected boundary V2 UserMessage work");
     };
-    respond_to
-        .send(Ok(UserMessageProbeResult::Unknown))
-        .unwrap();
+    assert_eq!(submission.text.len(), 64 * 1024);
+    let item = proto::QueueItem {
+        id: submission.client_submissions[0].id,
+        status: proto::QueueItemStatus::Folding,
+        text: submission.text.clone(),
+        display_text: submission.display_text.clone(),
+        target: proto::QueueTarget::default(),
+    };
+    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (_state, boundary_result) = boundary.await.unwrap();
-    let boundary_error =
-        boundary_result.expect_err("unstaged image still fails its normal attachment validation");
-    assert!(
-        !boundary_error.message.contains("64 KiB artifact threshold"),
-        "the inline boundary is not rejected by the oversized-media rule"
-    );
+    assert!(matches!(
+        boundary_result.expect("inline boundary is accepted"),
+        Response::UserMessageQueued { .. }
+    ));
 }
 
 #[tokio::test]
@@ -15084,7 +15063,7 @@ async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically(
             Request::SendUserMessageBulk {
                 expected_model_state_generation: None,
                 expected_model: None,
-                client_submission_id: Uuid::new_v4(),
+                client_submission_id: Uuid::now_v7(),
                 transfer: source_transfer,
                 display_text: None,
                 display_transfer: Some(display_transfer),
@@ -15175,7 +15154,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, Some(&operation))
         .expect("actor-bound remote request owns its opaque staging");
     let transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
-    let client_submission_id = Uuid::new_v4();
+    let client_submission_id = Uuid::now_v7();
     let expected_operation_id = *operation.operation_id.as_bytes();
     let expected_device_id = *operation.authenticated_device_id.as_bytes();
     let expected_device_generation = operation.authenticated_device_generation;
@@ -15251,7 +15230,7 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
     let display = "durable bulk replay display\n".repeat(3_001);
     assert!(source.len() > 1024 * 1024);
     assert!(display.len() > 64 * 1024);
-    let client_submission_id = Uuid::new_v4();
+    let client_submission_id = Uuid::now_v7();
     let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
         session_id,
         canonical_project_digest: [41; 32],
@@ -15343,7 +15322,7 @@ async fn bulk_user_message_owner_mismatch_is_non_oracular_and_multi_ref_atomic()
             session_id,
             owner: &foreign,
             replay_actor: bulk_user_message_replay_actor_local(&state.principal).unwrap(),
-            client_submission_id: Uuid::new_v4(),
+            client_submission_id: Uuid::now_v7(),
             transfer: &source_transfer,
             display_text: &None,
             display_transfer: &Some(display_transfer.clone()),
@@ -15359,7 +15338,7 @@ async fn bulk_user_message_owner_mismatch_is_non_oracular_and_multi_ref_atomic()
             session_id,
             owner: &foreign,
             replay_actor: bulk_user_message_replay_actor_local(&state.principal).unwrap(),
-            client_submission_id: Uuid::new_v4(),
+            client_submission_id: Uuid::now_v7(),
             transfer: &opaque_user_transfer_ref(source.as_bytes()),
             display_text: &None,
             display_transfer: &Some(opaque_user_transfer_ref(display.as_bytes())),
@@ -15415,7 +15394,7 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
     let (mut state, session_id, _work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let source = "remote bulk replay source\n".repeat(4_000);
-    let client_submission_id = Uuid::new_v4();
+    let client_submission_id = Uuid::now_v7();
     let operation = remote_owner_operation().await;
     let mut remote = remote_principal();
     let ClientPrincipal::Remote(remote_client) = &mut remote else {
@@ -15566,7 +15545,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
     let (state, session_id, _work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let handle = state.attached.as_ref().unwrap().handle.clone();
-    let client_submission_id = Uuid::new_v4();
+    let client_submission_id = Uuid::now_v7();
     let source = "model-fence replay\n".repeat(4_000);
     assert!(source.len() > 64 * 1024);
 
@@ -18336,12 +18315,12 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "send_user_message" => Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
                 Uuid::now_v7(),
-                "session",
+                session_id.to_string(),
                 None,
                 None,
                 None,
                 crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                    client_submission_id: Uuid::new_v4(),
+                    client_submission_id: Uuid::now_v7(),
                     text: "authz".into(),
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -18353,7 +18332,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "send_user_message_bulk" => Request::SendUserMessageBulk {
             expected_model_state_generation: None,
             expected_model: None,
-            client_submission_id: Uuid::new_v4(),
+            client_submission_id: Uuid::now_v7(),
             transfer: opaque_user_transfer_ref("authz bulk ".repeat(6_000).as_bytes()),
             display_text: None,
             display_transfer: None,
@@ -18653,7 +18632,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "read_client_submission_receipt" => Request::ReadClientSubmissionReceipt {
             session_id,
-            client_submission_id: Uuid::new_v4(),
+            client_submission_id: Uuid::now_v7(),
         },
         "read_history_page" => Request::ReadHistoryPage {
             session_id,
@@ -18715,14 +18694,14 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "delete_session" => Request::DeleteSession { session_id },
         "get_run_invocation_status" => Request::GetRunInvocationStatus {
-            client_submission_id: Uuid::new_v4(),
+            client_submission_id: Uuid::now_v7(),
         },
         #[cfg(feature = "remote")]
         "operation_status" => Request::OperationStatus {
             operation_id: Uuid::from_u128(99),
         },
         "cancel_run_invocation" => Request::CancelRunInvocation {
-            client_submission_id: Uuid::new_v4(),
+            client_submission_id: Uuid::now_v7(),
         },
         "get_inventory_bundle" => Request::GetInventoryBundle {
             project_root: root,
@@ -19646,7 +19625,7 @@ impl ReadonlyDispatchCaseKind {
                     &ctx,
                     Request::ReadClientSubmissionReceipt {
                         session_id: session.session_id,
-                        client_submission_id: Uuid::new_v4(),
+                        client_submission_id: Uuid::now_v7(),
                     },
                 )
                 .await
@@ -20139,7 +20118,7 @@ impl ReadonlyDispatchCaseKind {
                     &ctx,
                     Request::ReadClientSubmissionReceipt {
                         session_id: Uuid::new_v4(),
-                        client_submission_id: Uuid::new_v4(),
+                        client_submission_id: Uuid::now_v7(),
                     },
                 )
                 .await
@@ -21021,12 +21000,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "send_user_message" => Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
                 Uuid::now_v7(),
-                "session",
+                session_id.to_string(),
                 None,
                 None,
                 None,
                 crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                    client_submission_id: Uuid::new_v4(),
+                    client_submission_id: Uuid::now_v7(),
                     text: "hello worker".into(),
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -21038,7 +21017,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "send_user_message_bulk" => Request::SendUserMessageBulk {
             expected_model_state_generation: None,
             expected_model: None,
-            client_submission_id: Uuid::new_v4(),
+            client_submission_id: Uuid::now_v7(),
             transfer: bulk_transfer.expect("bulk case staged an owned transfer"),
             display_text: None,
             display_transfer: None,
@@ -21450,7 +21429,7 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
-    let client_submission_id = Uuid::new_v4();
+    let client_submission_id = Uuid::now_v7();
     let error = dispatch_attached_worker_request(
         &ctx,
         tmp.path(),
@@ -21459,7 +21438,7 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
         Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
                 Uuid::now_v7(),
-                "session",
+                session_id.to_string(),
                 None,
                 None,
                 None,
@@ -21564,12 +21543,12 @@ async fn assert_attached_required_malformed(kind: &str) {
         "send_user_message" => Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
                 Uuid::now_v7(),
-                "session",
+                Uuid::nil().to_string(),
                 None,
                 None,
                 None,
                 crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                    client_submission_id: Uuid::new_v4(),
+                    client_submission_id: Uuid::now_v7(),
                     text: "detached".into(),
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -21581,7 +21560,7 @@ async fn assert_attached_required_malformed(kind: &str) {
         "send_user_message_bulk" => Request::SendUserMessageBulk {
             expected_model_state_generation: None,
             expected_model: None,
-            client_submission_id: Uuid::new_v4(),
+            client_submission_id: Uuid::now_v7(),
             transfer: opaque_user_transfer_ref("detached bulk ".repeat(5_000).as_bytes()),
             display_text: None,
             display_transfer: None,
@@ -24766,7 +24745,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::ReadClientSubmissionReceipt {
                 session_id: transcript_session_id,
-                client_submission_id: Uuid::new_v4(),
+                client_submission_id: Uuid::now_v7(),
             },
             kind: "read_client_submission_receipt",
             session_id: Some(transcript_session_id),
@@ -24801,12 +24780,12 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             request: Request::SendUserMessageV2 {
                 ingress: MessageIngressV2::local_direct(
                     Uuid::now_v7(),
-                    "session",
+                    transcript_session_id.to_string(),
                     None,
                     None,
                     None,
                     crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                        client_submission_id: Uuid::new_v4(),
+                        client_submission_id: Uuid::now_v7(),
                         text: "hello".into(),
                         display_text: None,
                         tag_expansions: Vec::new(),
@@ -24824,7 +24803,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             request: Request::SendUserMessageBulk {
                 expected_model_state_generation: None,
                 expected_model: None,
-                client_submission_id: Uuid::new_v4(),
+                client_submission_id: Uuid::now_v7(),
                 transfer: opaque_user_transfer_ref("bulk metadata".repeat(8_193).as_bytes()),
                 display_text: None,
                 display_transfer: None,
@@ -26980,10 +26959,7 @@ async fn finish_attachment_upload_for_test(
     finish_attachment_upload(state, upload_id).await
 }
 
-async fn finish_upload_for(
-    state: &mut MutableClientState,
-    png: &[u8],
-) -> proto::ImageAttachmentRef {
+async fn finish_upload_for(state: &mut MutableClientState, png: &[u8]) -> Uuid {
     let upload_id = begin_upload_for(state, png);
     let data_base64 = base64::engine::general_purpose::STANDARD.encode(png);
     upload_attachment_chunk(state, upload_id, 0, data_base64).unwrap();
@@ -26991,22 +26967,18 @@ async fn finish_upload_for(
         .await
         .unwrap()
     {
-        Response::AttachmentUploaded { image_ref } => image_ref,
+        Response::AttachmentUploaded { attachment } => attachment.attachment_id,
         other => panic!("unexpected response: {other:?}"),
     }
 }
 
-/// Stage a user-message image through the durable *admitted* attachment flow
-/// (`begin_attachment_upload_admitted` -> chunk -> `finish_attachment_upload_admitted`),
-/// which materializes the bytes in `media_storage_recovery` and returns a ref
-/// whose id is the durable attachment id consumed by the admitted
-/// `SendUserMessage` claim path. Requires `ctx.media_storage_recovery` to be
-/// provisioned and the client state to be attached.
+/// Stage a user-message image through the durable admitted attachment flow.
+/// The returned identity is the exact FCM2 attachment tuple consumed by V2.
 async fn finish_upload_admitted_for(
     ctx: &Arc<DaemonContext>,
     state: &mut MutableClientState,
     png: &[u8],
-) -> proto::ImageAttachmentRef {
+) -> crate::proto_crate::send_user_message_v2::MessageAttachmentIdentity {
     let response = begin_attachment_upload_admitted(
         ctx,
         state,
@@ -27026,14 +26998,13 @@ async fn finish_upload_admitted_for(
         .await
         .expect("admitted finish upload")
     {
-        Response::AttachmentUploaded { image_ref } => image_ref,
+        Response::AttachmentUploaded { attachment } => attachment,
         other => panic!("unexpected admitted finish response: {other:?}"),
     }
 }
 
 /// Assert a durable message-image attachment persists in `media_attachments`
-/// so it remains reusable by later submissions — the durable-flow analogue of
-/// the legacy `state.ready_attachments.contains_key` presence check.
+/// so it remains reusable by later submissions.
 async fn assert_durable_attachment_persists(ctx: &Arc<DaemonContext>, attachment_id: Uuid) {
     let count: i64 = ctx
         .db
@@ -27091,7 +27062,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         panic!("expected Attached response");
     };
 
-    let client_submission_id = Uuid::new_v4();
+    let client_submission_id = Uuid::now_v7();
     let text = "must remain removed";
     let origin_principal = state.principal.tag();
     let submission = crate::engine::message::UserSubmission {
@@ -27133,7 +27104,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
                 Uuid::now_v7(),
-                "session",
+                session_id.to_string(),
                 None,
                 None,
                 None,
@@ -27163,7 +27134,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
                 Uuid::now_v7(),
-                "session",
+                session_id.to_string(),
                 None,
                 None,
                 None,
@@ -27200,7 +27171,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
 }
 
 #[test]
-fn image_submission_exact_retry_dedupes_before_reconsuming_ref() {
+fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(crate::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
@@ -27214,8 +27185,8 @@ async fn image_submission_exact_retry_case() {
     let mut ctx = test_ctx();
     let media_dir = tempfile::tempdir().unwrap();
     let db = ctx.db.clone();
-    // The admitted `SendUserMessage` image-claim path requires durable media
-    // storage; provision it so staged refs materialize and remain reusable.
+    // V2 attachment acceptance requires durable media storage; provision it
+    // so staged identities materialize and remain reusable.
     Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
         crate::media_storage::MediaStorageRecovery::open_or_create(
             db,
@@ -27264,11 +27235,12 @@ async fn image_submission_exact_retry_case() {
         panic!("expected Attached response");
     };
     let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
-    let client_submission_id = Uuid::new_v4();
-    let request = |id, text: &str| Request::SendUserMessageV2 {
+    let operation_id = Uuid::now_v7();
+    let client_submission_id = Uuid::now_v7();
+    let request = |operation_id, id, text: &str, attachment| Request::SendUserMessageV2 {
         ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
+            operation_id,
+            session_id.to_string(),
             None,
             None,
             None,
@@ -27283,7 +27255,7 @@ async fn image_submission_exact_retry_case() {
                     ok: true,
                 }],
                 forced_skill: Some("image-skill".to_string()),
-                attachments: Vec::new(),
+                attachments: vec![attachment],
             },
         ),
     };
@@ -27292,7 +27264,12 @@ async fn image_submission_exact_retry_case() {
     // it. Dispatch binds the ref to this UUID before worker delivery, retaining
     // the bytes for an exact retry while preventing every competing UUID.
     let first = handle_request(
-        request(client_submission_id, "inspect this image"),
+        request(
+            operation_id,
+            client_submission_id,
+            "inspect this image",
+            image_ref.clone(),
+        ),
         &mut state,
         &ctx,
     )
@@ -27303,7 +27280,39 @@ async fn image_submission_exact_retry_case() {
     };
     assert_eq!(first.id, client_submission_id);
     // The durable message image is reusable and not consumed by the first send.
-    assert_durable_attachment_persists(&ctx, image_ref.id).await;
+    assert_durable_attachment_persists(&ctx, image_ref.attachment_id).await;
+    let attachment_receipts = ctx
+        .db
+        .message_attachment_receipts(session_id, *client_submission_id.as_bytes())
+        .await
+        .expect("read V2 attachment receipts");
+    assert_eq!(attachment_receipts.len(), 1);
+    assert_eq!(
+        attachment_receipts[0].attachment_id,
+        *image_ref.attachment_id.as_bytes()
+    );
+    assert_eq!(
+        attachment_receipts[0].attachment_version,
+        image_ref.attachment_version
+    );
+    assert_eq!(attachment_receipts[0].checksum, image_ref.checksum);
+    let retained_reference_count: i64 = ctx
+        .db
+        .read({
+            let attachment_id = image_ref.attachment_id;
+            let consumer_id = client_submission_id.to_string();
+            move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND consumer_kind='message' AND consumer_id=?2 AND released_at_unix_ms IS NULL",
+                    rusqlite::params![attachment_id.to_string(), consumer_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            }
+        })
+        .await
+        .expect("read durable media reference");
+    assert_eq!(retained_reference_count, 1);
 
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
@@ -27356,65 +27365,63 @@ async fn image_submission_exact_retry_case() {
     .expect("reconnect to live worker");
 
     let retry = handle_request(
-        request(client_submission_id, "inspect this image"),
+        request(
+            operation_id,
+            client_submission_id,
+            "inspect this image",
+            image_ref.clone(),
+        ),
         &mut state,
         &ctx,
     )
     .await
-    .expect("exact retry with consumed ref is idempotently acknowledged");
+    .expect("exact retry with a durable attachment is idempotently acknowledged");
     let Response::UserMessageQueued { item: retry, .. } = retry else {
         panic!("expected queued retry response");
     };
     assert_eq!(retry.id, client_submission_id);
 
-    // A re-upload gets a fresh ref id and therefore a different wire
-    // fingerprint. It must fall through to byte-based content comparison and
-    // still dedupe when the complete consumed payload is identical.
+    // A re-upload has a different durable attachment identity even when its
+    // pixels match. Rebinding the accepted operation must conflict rather than
+    // falling back to byte-only legacy deduplication.
     let reuploaded_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let reuploaded = handle_request(
-        Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
-                Uuid::now_v7(),
-                "session",
-                None,
-                None,
-                None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                    client_submission_id: client_submission_id,
-                    text: "inspect this image".to_string(),
-                    display_text: Some("message with image".to_string()),
-                    tag_expansions: vec![proto::TagExpansionMeta {
-                        tool: "read".to_string(),
-                        path: "image-test.png".to_string(),
-                        detail: "expanded image context".to_string(),
-                        ok: true,
-                    }],
-                    forced_skill: Some("image-skill".to_string()),
-                    attachments: Vec::new(),
-                },
-            ),
-        },
+        request(
+            operation_id,
+            client_submission_id,
+            "inspect this image",
+            reuploaded_ref.clone(),
+        ),
         &mut state,
         &ctx,
     )
     .await
-    .expect("same bytes under a fresh ref dedupe by content");
-    assert!(matches!(reuploaded, Response::UserMessageQueued { .. }));
+    .expect_err("an accepted operation cannot be rebound to a fresh attachment identity");
+    assert_eq!(reuploaded.code, ErrorCode::Conflict);
     // The re-uploaded bytes materialize a fresh durable attachment that persists.
-    assert_durable_attachment_persists(&ctx, reuploaded_ref.id).await;
+    assert_durable_attachment_persists(&ctx, reuploaded_ref.attachment_id).await;
 
     let conflict = handle_request(
-        request(client_submission_id, "different payload"),
+        request(
+            operation_id,
+            client_submission_id,
+            "different payload",
+            image_ref.clone(),
+        ),
         &mut state,
         &ctx,
     )
     .await
     .expect_err("same UUID with a different fingerprint must conflict");
-    assert_eq!(conflict.code, ErrorCode::BadRequest);
-    assert!(conflict.message.contains("different payload"));
+    assert_eq!(conflict.code, ErrorCode::Conflict);
 
     let reused = handle_request(
-        request(Uuid::new_v4(), "inspect this image"),
+        request(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "inspect this image",
+            image_ref,
+        ),
         &mut state,
         &ctx,
     )
@@ -27452,14 +27459,13 @@ async fn image_submission_exact_retry_case() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
+async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     let mut ctx = test_ctx();
     let media_dir = tempfile::tempdir().unwrap();
     let db = ctx.db.clone();
-    // Production `SendUserMessage` claims image refs through the admitted durable
-    // path (`claim_message_image_refs_admitted`), which requires provisioned
-    // media storage; provision it and stage the ref durably so the claim
-    // resolves instead of failing before the worker receipt.
+    // V2 resolves attachment identities through durable typed-media storage.
+    // Provision it so acceptance and the later worker delivery use the same
+    // retained component.
     Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
         crate::media_storage::MediaStorageRecovery::open_or_create(
             db,
@@ -27468,14 +27474,15 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         .unwrap(),
     ));
     let project = tempfile::tempdir().unwrap();
-    let (mut state, _, mut work_rx) =
+    let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
-    let first_id = Uuid::new_v4();
-    let request = |id| Request::SendUserMessageV2 {
+    let first_operation_id = Uuid::now_v7();
+    let first_id = Uuid::now_v7();
+    let request = |operation_id, id| Request::SendUserMessageV2 {
         ingress: MessageIngressV2::local_direct(
-            Uuid::now_v7(),
-            "session",
+            operation_id,
+            session_id.to_string(),
             None,
             None,
             None,
@@ -27485,25 +27492,17 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
                 display_text: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
-                attachments: Vec::new(),
+                attachments: vec![image_ref.clone()],
             },
         ),
     };
 
     let first_ctx = ctx.clone();
-    let first_request = request(first_id);
+    let first_request = request(first_operation_id, first_id);
     let first = tokio::spawn(async move {
         let result = handle_request(first_request, &mut state, &first_ctx).await;
         (state, result)
     });
-    let SessionWork::ProbeUserMessage { respond_to, .. } =
-        work_rx.recv().await.expect("first request probes worker")
-    else {
-        panic!("expected first ProbeUserMessage work");
-    };
-    respond_to
-        .send(Ok(UserMessageProbeResult::Unknown))
-        .unwrap();
     let SessionWork::UserMessage {
         submission,
         respond_to,
@@ -27522,25 +27521,15 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     assert_eq!(error.code, ErrorCode::Internal);
     // Immutable durable media is never exclusively owned by an ambiguous
     // submission, so the attachment persists and stays reusable — the
-    // durable-flow analogue of the legacy `ready_attachments` presence check.
-    assert_durable_attachment_persists(&ctx, image_ref.id).await;
+    // The durable attachment remains available after an ambiguous outcome.
+    assert_durable_attachment_persists(&ctx, image_ref.attachment_id).await;
 
     let competing_ctx = ctx.clone();
-    let competing_request = request(Uuid::new_v4());
+    let competing_request = request(Uuid::now_v7(), Uuid::now_v7());
     let competing = tokio::spawn(async move {
         let result = handle_request(competing_request, &mut state, &competing_ctx).await;
         (state, result)
     });
-    let SessionWork::ProbeUserMessage { respond_to, .. } = work_rx
-        .recv()
-        .await
-        .expect("competing request probes worker")
-    else {
-        panic!("expected competing ProbeUserMessage work");
-    };
-    respond_to
-        .send(Ok(UserMessageProbeResult::Unknown))
-        .unwrap();
     let SessionWork::UserMessage {
         submission,
         respond_to,
@@ -27569,19 +27558,11 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     ));
 
     let retry_ctx = ctx.clone();
-    let retry_request = request(first_id);
+    let retry_request = request(first_operation_id, first_id);
     let retry = tokio::spawn(async move {
         let result = handle_request(retry_request, &mut state, &retry_ctx).await;
         (state, result)
     });
-    let SessionWork::ProbeUserMessage { respond_to, .. } =
-        work_rx.recv().await.expect("same-UUID retry probes worker")
-    else {
-        panic!("expected retry ProbeUserMessage work");
-    };
-    respond_to
-        .send(Ok(UserMessageProbeResult::ContentCheckRequired))
-        .unwrap();
     let SessionWork::UserMessage {
         submission,
         respond_to,
@@ -27618,14 +27599,14 @@ async fn attachment_upload_reuses_one_version_for_distinct_committed_references(
     let png = sample_png();
     let image_ref = finish_upload_for(&mut state, &png).await;
 
-    let first = claim_message_image_refs(
+    let first = read_test_images(
         &mut state,
         session_id,
         Uuid::new_v4(),
         std::slice::from_ref(&image_ref),
     )
     .expect("first reference");
-    let second = claim_message_image_refs(
+    let second = read_test_images(
         &mut state,
         session_id,
         Uuid::new_v4(),
@@ -27634,17 +27615,17 @@ async fn attachment_upload_reuses_one_version_for_distinct_committed_references(
     .expect("second distinct reference");
     assert_eq!(first, vec![png.clone()]);
     assert_eq!(second, vec![png]);
-    assert!(state.ready_attachments.contains_key(&image_ref.id));
+    assert!(state.ready_attachments.contains_key(&image_ref));
 }
 
 #[tokio::test]
-async fn acquiring_image_ref_does_not_start_or_refresh_transport_ttl() {
+async fn reading_test_attachment_does_not_start_or_refresh_transport_ttl() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
     let image_ref = finish_upload_for(&mut state, &sample_png()).await;
-    let client_submission_id = Uuid::new_v4();
-    let images = claim_message_image_refs(
+    let client_submission_id = Uuid::now_v7();
+    let images = read_test_images(
         &mut state,
         session_id,
         client_submission_id,
@@ -27654,7 +27635,7 @@ async fn acquiring_image_ref_does_not_start_or_refresh_transport_ttl() {
     assert_eq!(images, vec![sample_png()]);
     prune_expired_attachments(&mut state);
     assert!(
-        state.ready_attachments.contains_key(&image_ref.id),
+        state.ready_attachments.contains_key(&image_ref),
         "published attachments do not use the pending-upload transport TTL"
     );
 }
@@ -27671,29 +27652,29 @@ async fn disconnect_drain_preserves_session_owned_published_attachment() {
         .unwrap();
 
     assert!(
-        state.ready_attachments.contains_key(&image_ref.id),
+        state.ready_attachments.contains_key(&image_ref),
         "disconnect cannot exercise durable attachment cleanup authority"
     );
 }
 
 #[tokio::test]
-async fn duplicate_image_refs_are_rejected_without_consuming() {
+async fn duplicate_test_attachment_ids_are_rejected_without_consuming() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
     let image_ref = finish_upload_for(&mut state, &png).await;
 
-    let err = consume_image_refs(
+    let err = consume_test_images(
         &mut state,
         session_id,
         &[image_ref.clone(), image_ref.clone()],
     )
     .expect_err("duplicate refs must fail");
     assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("duplicate image ref"));
+    assert!(err.message.contains("duplicate attachment"));
 
-    let images = consume_image_refs(&mut state, session_id, &[image_ref]).unwrap();
+    let images = consume_test_images(&mut state, session_id, &[image_ref]).unwrap();
     assert_eq!(images, vec![png]);
 }
 
@@ -27706,12 +27687,12 @@ async fn attachment_ref_is_scoped_to_attached_session() {
     let (_, session_b) = attached_state(&ctx, tmp_b.path()).await;
     let image_ref = finish_upload_for(&mut state, &sample_png()).await;
 
-    let err = consume_image_refs(&mut state, session_b, std::slice::from_ref(&image_ref))
+    let err = consume_test_images(&mut state, session_b, std::slice::from_ref(&image_ref))
         .expect_err("wrong session must fail");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("different session"));
 
-    let images = consume_image_refs(&mut state, session_a, &[image_ref]).expect("owner consume");
+    let images = consume_test_images(&mut state, session_a, &[image_ref]).expect("owner consume");
     assert_eq!(images, vec![sample_png()]);
     assert_ne!(session_a, session_b);
 }
@@ -31071,7 +31052,7 @@ async fn serialized_requests_apply_in_receipt_order() {
     ));
 
     let set_id = Uuid::new_v4();
-    let message_id = Uuid::new_v4();
+    let message_id = Uuid::now_v7();
     executor_tx
         .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
             Envelope::request(
@@ -31097,12 +31078,12 @@ async fn serialized_requests_apply_in_receipt_order() {
                 Request::SendUserMessageV2 {
                     ingress: MessageIngressV2::local_direct(
                         Uuid::now_v7(),
-                        "session",
+                        session.session_id.to_string(),
                         None,
                         None,
                         None,
                         crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                            client_submission_id: Uuid::new_v4(),
+                            client_submission_id: Uuid::now_v7(),
                             text: "after model switch".to_string(),
                             display_text: None,
                             tag_expansions: Vec::new(),
@@ -32527,18 +32508,19 @@ async fn btw_concurrent_with_parent_turn() {
         terminal_host: test_terminal_host(),
         negotiated_protocol_version: proto::PROTOCOL_VERSION,
     };
+    let parent_session_id = parent_row.session_id;
     let ctx_for_parent = ctx.clone();
     let parent_request = tokio::spawn(async move {
         handle_request(
             Request::SendUserMessageV2 {
                 ingress: MessageIngressV2::local_direct(
                     Uuid::now_v7(),
-                    "session",
+                    parent_session_id.to_string(),
                     None,
                     None,
                     None,
                     crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                        client_submission_id: Uuid::new_v4(),
+                        client_submission_id: Uuid::now_v7(),
                         text: "parent work".to_string(),
                         display_text: None,
                         tag_expansions: Vec::new(),
@@ -32599,18 +32581,19 @@ async fn btw_concurrent_with_parent_turn() {
         terminal_host: test_terminal_host(),
         negotiated_protocol_version: proto::PROTOCOL_VERSION,
     };
+    let btw_session_id = created.info.session_id;
     let ctx_for_btw = ctx.clone();
     let btw_request = tokio::spawn(async move {
         handle_request(
             Request::SendUserMessageV2 {
                 ingress: MessageIngressV2::local_direct(
                     Uuid::now_v7(),
-                    "session",
+                    btw_session_id.to_string(),
                     None,
                     None,
                     None,
                     crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                        client_submission_id: Uuid::new_v4(),
+                        client_submission_id: Uuid::now_v7(),
                         text: "btw work".to_string(),
                         display_text: None,
                         tag_expansions: Vec::new(),
@@ -33014,12 +32997,12 @@ async fn send_user_message_refused_while_draining() {
         Request::SendUserMessageV2 {
             ingress: MessageIngressV2::local_direct(
                 Uuid::now_v7(),
-                "session",
+                Uuid::nil().to_string(),
                 None,
                 None,
                 None,
                 crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
-                    client_submission_id: Uuid::new_v4(),
+                    client_submission_id: Uuid::now_v7(),
                     text: "hi".into(),
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -34968,7 +34951,7 @@ async fn remote_attempt_readonly_ceiling_denies_write() {
     // it maps to no ceiling capability and is denied even under this fully
     // write-capable ceiling — a scopeless mutation must never bypass the ceiling.
     let cancel_invocation = Request::CancelRunInvocation {
-        client_submission_id: Uuid::new_v4(),
+        client_submission_id: Uuid::now_v7(),
     };
     let err = authorize_request(&cancel_invocation, &state, &ctx)
         .await

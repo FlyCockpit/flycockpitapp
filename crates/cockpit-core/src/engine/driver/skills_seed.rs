@@ -358,7 +358,7 @@ impl Driver {
         )
         .await;
         let (body, hard_fail) = match result {
-            Ok(out) => (out.content, false),
+            Ok(out) => (out.content.model_text().to_owned(), false),
             // An unknown/ambiguous skill surfaces the tool's invalid-input
             // error as the recorded result — clear, never a silent no-op.
             Err(e) => (format!("Error: {e}"), true),

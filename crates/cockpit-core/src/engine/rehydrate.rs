@@ -498,6 +498,15 @@ fn apply_text_artifact_tool_projections(
                 continue;
             };
             if let Some((frame, _)) = projections_by_call.get(result.call.as_str()) {
+                if !result
+                    .content
+                    .iter()
+                    .all(|part| matches!(part, ToolResultContent::Text(_)))
+                {
+                    return Err(anyhow!(
+                        "text artifact projection cannot replace typed tool-result content"
+                    ));
+                }
                 result.content = vec![ToolResultContent::text(frame.clone())];
                 applied.insert(result.call.to_string());
             }
@@ -1830,7 +1839,12 @@ struct PendingTurn {
     /// call, in dispatch order. The two identities remain distinct so a
     /// resumed Responses turn echoes the provider's wire handle without
     /// losing Cockpit's durable call correlation.
-    results: Vec<(ToolCallId, Option<ProviderCallId>, String, String)>,
+    results: Vec<(
+        ToolCallId,
+        Option<ProviderCallId>,
+        String,
+        Vec<ToolResultContent>,
+    )>,
 }
 
 impl PendingTurn {
@@ -1861,13 +1875,13 @@ impl PendingTurn {
         // Each tool result is its own user message (the live wire shape).
         // Provider contract: the results immediately follow the assistant
         // turn that issued the calls.
-        for (call, provider, name, body) in self.results {
+        for (call, provider, name, content) in self.results {
             history.push(Message::User {
                 content: vec![UserContent::ToolResult(ToolResult {
                     call,
                     provider,
                     name,
-                    content: vec![ToolResultContent::text(body)],
+                    content,
                 })],
             });
         }
@@ -2108,12 +2122,23 @@ fn rebuild_history(
                             additional_params: None,
                         };
                         pending.calls.push(call.clone());
-                        pending.results.push((
-                            call.id,
-                            provider,
-                            tc.tool.clone(),
-                            tc.output.clone(),
-                        ));
+                        let result_content = ev
+                            .data
+                            .get("canonical_output")
+                            .and_then(|value| {
+                                serde_json::from_value::<
+                                    Vec<crate::typed_media_result::CanonicalToolResultContent>,
+                                >(value.clone())
+                                .ok()
+                            })
+                            .and_then(|parts| {
+                                crate::engine::tool::CanonicalToolResultContents::new(parts).ok()
+                            })
+                            .and_then(|parts| parts.to_rig_contents().ok())
+                            .unwrap_or_else(|| vec![ToolResultContent::text(tc.output.clone())]);
+                        pending
+                            .results
+                            .push((call.id, provider, tc.tool.clone(), result_content));
                     }
                     None => {
                         if policy.is_strict() {
@@ -2146,9 +2171,12 @@ fn rebuild_history(
                             additional_params: None,
                         };
                         pending.calls.push(call.clone());
-                        pending
-                            .results
-                            .push((call.id, None, tool, ABORTED_CALL_BODY.to_string()));
+                        pending.results.push((
+                            call.id,
+                            None,
+                            tool,
+                            vec![ToolResultContent::text(ABORTED_CALL_BODY.to_string())],
+                        ));
                         heals.push(Recovery::ResumeHeal {
                             kind: "stub_orphan_tool_call",
                             id: call_id.to_string(),
@@ -2328,7 +2356,7 @@ fn rebuild_history(
                         task_call.id.clone(),
                         task_provider.clone(),
                         "task".to_string(),
-                        body,
+                        vec![ToolResultContent::text(body)],
                     ));
                 } else {
                     match report_by_call.get(call_id) {
@@ -2346,7 +2374,7 @@ fn rebuild_history(
                                 task_call.id.clone(),
                                 task_provider.clone(),
                                 "task".to_string(),
-                                report.report.clone(),
+                                vec![ToolResultContent::text(report.report.clone())],
                             ));
                         }
                         None => {
@@ -2362,7 +2390,7 @@ fn rebuild_history(
                                 task_call.id.clone(),
                                 task_provider.clone(),
                                 "task".to_string(),
-                                MISSING_REPORT_BODY.to_string(),
+                                vec![ToolResultContent::text(MISSING_REPORT_BODY.to_string())],
                             ));
                             heals.push(Recovery::ResumeHeal {
                                 kind: "stub_missing_subagent_report",

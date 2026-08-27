@@ -225,6 +225,23 @@ impl Db {
         }).await
     }
 
+    pub async fn canonical_message_for_operation(
+        &self,
+        session_id: Uuid,
+        operation_id: [u8; 16],
+    ) -> Result<Option<Vec<u8>>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT q.canonical_message FROM message_operation_receipts o JOIN message_queue_items q ON q.session_id=o.session_id AND q.client_submission_id=o.client_submission_id WHERE o.session_id=?1 AND o.operation_id=?2",
+                params![session_id.to_string(), operation_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+    }
+
     pub async fn message_receipt_status(
         &self,
         session_id: Uuid,

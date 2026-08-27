@@ -123,9 +123,17 @@ pub(crate) struct HeldMediaComponentLease {
 }
 
 impl HeldMediaComponentLease {
-    #[cfg(test)]
     pub(crate) fn authority(&self) -> &AcquiredMediaComponentLease {
         &self.authority
+    }
+
+    async fn release(self, now_unix_ms: i64) -> Result<()> {
+        let lease_id = self.authority.lease_id;
+        self.db
+            .transaction(move |conn| {
+                cockpit_db::Db::release_media_component_lease_conn(conn, lease_id, now_unix_ms)
+            })
+            .await
     }
 
     async fn block_after_failed_proof(&self, now_unix_ms: i64) -> Result<()> {
@@ -210,6 +218,126 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Resolve a durable tool-result media reference through the real storage
+    /// lease path. Every identity/availability/capability check and the
+    /// no-follow file proof completes before a provider mapping can be built.
+    pub async fn resolve_tool_media_reference(
+        &self,
+        resolver: &crate::typed_media_result::MediaReferenceResolver<'_>,
+        auth: &crate::typed_media_result::MediaReferenceAuthContext,
+        reference: &crate::typed_media_result::MediaReference,
+        route: crate::typed_media_result::MediaRoute,
+        tool_call_id: &str,
+        call_id: Option<&str>,
+        now_unix_ms: i64,
+    ) -> std::result::Result<
+        crate::typed_media_result::ResolvedMediaMapping,
+        crate::typed_media_result::MediaReferenceError,
+    > {
+        use crate::typed_media_result::{
+            LiveAttachmentAvailability, LiveAttachmentSnapshot, MediaReferenceError,
+        };
+        let attachment_id = reference.attachment_id;
+        let session_id = auth.session_id;
+        let project_digest = auth.canonical_project_digest.clone();
+        let component_kind = match reference.media_kind {
+            cockpit_db::media_attachments::MediaKind::Image => "image_model",
+            cockpit_db::media_attachments::MediaKind::Audio => "audio_model",
+            cockpit_db::media_attachments::MediaKind::Video => "video_model",
+        };
+        let (record, has_normalized_derivative) = self
+            .db
+            .read(move |conn| {
+                let record = cockpit_db::Db::media_attachment_for_owner_conn(
+                    conn,
+                    attachment_id,
+                    session_id,
+                    &project_digest,
+                )?;
+                let has_normalized_derivative = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind=?3 AND lifecycle_state='ready')",
+                    params![
+                        attachment_id.to_string(),
+                        record.as_ref().map(|record| record.attachment_version.to_string()),
+                        component_kind,
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                Ok((record, has_normalized_derivative))
+            })
+            .await
+            .map_err(|_| MediaReferenceError::NotFound { attachment_id })?;
+        let record = record.ok_or(MediaReferenceError::NotFound { attachment_id })?;
+        if !record.availability.is_ready()
+            || record.attachment_version != reference.attachment_version
+            || record.media_kind != reference.media_kind
+            || record.canonical_mime != reference.mime_type
+        {
+            return Err(MediaReferenceError::SourceChanged {
+                attachment_id,
+                reference_version: reference.attachment_version,
+                live_version: record.attachment_version,
+            });
+        }
+        let live = LiveAttachmentSnapshot {
+            attachment_id,
+            session_id: record.session_id,
+            canonical_project_digest: record.canonical_project_digest,
+            attachment_version: record.attachment_version,
+            availability: LiveAttachmentAvailability::Ready,
+            has_normalized_derivative,
+            media_kind: record.media_kind,
+            mime_type: record.canonical_mime,
+        };
+        if route == crate::typed_media_result::MediaRoute::Sidecar {
+            return resolver.resolve_with_acquired_lease(
+                reference,
+                &live,
+                None,
+                route,
+                tool_call_id,
+                call_id,
+            );
+        }
+
+        let held = self
+            .acquire_component_lease(AcquireComponentLeaseInput {
+                lease_id: Uuid::now_v7(),
+                attachment_id,
+                attachment_version: record.attachment_version,
+                availability_generation: record.availability_generation,
+                capability_generation: record.captured_capability_generation,
+                kind: MediaComponentLeaseKind::Model,
+                now_unix_ms,
+            })
+            .await
+            .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
+        let mut mapping = match resolver.resolve_with_acquired_lease(
+            reference,
+            &live,
+            Some(held.authority()),
+            route,
+            tool_call_id,
+            call_id,
+        ) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                held.release(now_unix_ms)
+                    .await
+                    .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
+                return Err(error);
+            }
+        };
+        let bytes = held
+            .read_verified(now_unix_ms)
+            .await
+            .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
+        if let Some(resolved) = mapping.bytes.as_mut() {
+            resolved.bytes = bytes;
+        }
+        Ok(mapping)
+    }
+
     pub(crate) async fn image_ingress_draft_discard_receipt(
         &self,
         admission_id: Uuid,

@@ -740,8 +740,6 @@
         "ingress": "local_owner_direct",
         "operation_id": "018f47a2-7b3c-7def-8123-000000000002",
         "session_locator": "session-fixture",
-        "expected_model_state_generation": null,
-        "expected_model": null,
         "run_invocation_options": {
           "max_turns": 3,
           "timeout_ms": 60000

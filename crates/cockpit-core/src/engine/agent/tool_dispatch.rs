@@ -1038,7 +1038,17 @@ async fn execute_ordinary_call_unscoped(
     let recovery = tool_recovery.unwrap_or(recovery);
 
     let (raw_output, hard_fail, fail_kind) = match &result {
-        Ok(ToolOutput { content, .. }) => (content.clone(), false, None),
+        Ok(ToolOutput { content, .. })
+            if content.parts().iter().any(|part| part.is_media_reference()) =>
+        {
+            (
+                "Error: media_reference_unavailable: provider resolution authority is not installed for this tool call"
+                    .to_owned(),
+                true,
+                Some(crate::engine::tool::ToolFailKind::Execution),
+            )
+        }
+        Ok(ToolOutput { content, .. }) => (content.model_text().to_owned(), false, None),
         Err(e) => {
             let msg = format!("Error: {e}");
             (msg, true, Some(crate::engine::tool::classify_failure(e)))
@@ -1107,7 +1117,15 @@ async fn execute_ordinary_call_unscoped(
     }
     let recheck_modified_output = output_str != output_before_recheck;
 
-    let mut artifact_capture = (!hard_fail)
+    let canonical_result_is_text_only = result.as_ref().is_ok_and(|output| {
+        output.content.parts().iter().all(|part| {
+            matches!(
+                part,
+                crate::typed_media_result::CanonicalToolResultContent::Text { .. }
+            )
+        })
+    });
+    let mut artifact_capture = (!hard_fail && canonical_result_is_text_only)
         .then(|| {
             result
                 .as_ref()
@@ -1271,6 +1289,19 @@ async fn execute_ordinary_call_unscoped(
         tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
     }
 
+    let canonical_history_output = result.as_ref().ok().and_then(|output| {
+        (!hard_fail
+            && output.content.has_non_text_content()
+            && output
+                .content
+                .parts()
+                .iter()
+                .all(|part| !part.is_media_reference())
+            && output_str == output.content.model_text())
+        .then(|| serde_json::to_value(output.content.parts()))
+    });
+    let canonical_history_output = canonical_history_output.transpose()?;
+
     // Timeline event (Part B), sourced from / consistent with the
     // `tool_call_events` audit row above. The `call_id` here is the
     // model's per-tool-call id (`tc.id`), which is distinct from the
@@ -1288,6 +1319,9 @@ async fn execute_ordinary_call_unscoped(
         "truncated": truncated,
         "duration_ms": duration_ms,
     });
+    if let Some(canonical_output) = &canonical_history_output {
+        event_data["canonical_output"] = canonical_output.clone();
+    }
     // Name-repair surfacing (§14): when the emitted tool NAME was repaired
     // (rebound or charset-sanitized), `tool` above is the wire/model form;
     // the original malformed name (from `NameRepair.original`) rides here
@@ -1526,6 +1560,20 @@ async fn execute_ordinary_call_unscoped(
             "truncated": truncated,
             "duration_ms": duration_ms,
         });
+        if let Some(canonical_output) = &canonical_history_output {
+            completed_data["canonical_output"] = canonical_output.clone();
+        } else if let Ok(output) = &result
+            && output
+                .content
+                .parts()
+                .iter()
+                .any(|part| part.is_media_reference())
+        {
+            // The provider dispatch failed closed, but the durable/export
+            // event retains the authority-free reference metadata. No bytes,
+            // paths, URLs, or prose placeholder are persisted.
+            completed_data["canonical_output"] = serde_json::to_value(output.content.parts())?;
+        }
         if let Some(code) = exit_code {
             completed_data["exit_code"] = serde_json::json!(code);
         }
@@ -1648,10 +1696,24 @@ async fn execute_ordinary_call_unscoped(
     if loop_guard_reject {
         collapse_loop_run(history, &args, resolved_name);
     }
-    history.push(crate::engine::message::tool_result_message_for(
+    let wire_contents = match &result {
+        Ok(output)
+            if !hard_fail
+                && wire_output == output.content.model_text()
+                && output
+                    .content
+                    .parts()
+                    .iter()
+                    .all(|part| !part.is_media_reference()) =>
+        {
+            output.content.to_rig_contents()?
+        }
+        _ => vec![rig::message::ToolResultContent::text(wire_output)],
+    };
+    history.push(crate::engine::message::tool_result_message_for_contents(
         tc,
         resolved_name,
-        wire_output,
+        wire_contents,
     ));
     Ok(())
 }

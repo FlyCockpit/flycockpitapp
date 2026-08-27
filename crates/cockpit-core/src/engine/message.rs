@@ -1116,12 +1116,28 @@ pub fn tool_result_message_for(
     executed_name: impl Into<String>,
     output: String,
 ) -> Message {
+    tool_result_message_for_contents(
+        tc,
+        executed_name,
+        vec![rig::message::ToolResultContent::text(output)],
+    )
+}
+
+/// Build a typed tool-result history message. JSON remains JSON all the way
+/// through prune/compaction/provider serialization; media bytes may enter
+/// this vector only after the storage-backed resolver has acquired and
+/// verified its component lease.
+pub fn tool_result_message_for_contents(
+    tc: &ToolCall,
+    executed_name: impl Into<String>,
+    content: Vec<rig::message::ToolResultContent>,
+) -> Message {
     Message::User {
         content: vec![UserContent::tool_result_for(
             tc.id.clone(),
             tc.provider.clone(),
             executed_name.into(),
-            vec![rig::message::ToolResultContent::text(output)],
+            content,
         )],
     }
 }

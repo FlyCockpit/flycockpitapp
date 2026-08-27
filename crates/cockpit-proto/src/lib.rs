@@ -1240,7 +1240,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version. v21 cuts `send_user_message` over to the V2
 /// tagged ingress envelope (`SendUserMessageV2 { ingress }`), removing the
-/// legacy `image_refs`/`ImageAttachmentRef` send path. v20 and every older
+/// legacy flat image-only send path. v20 and every older
 /// fixture remain frozen migration evidence, not a compatibility window.
 pub const PROTOCOL_VERSION: u32 = 21;
 
@@ -1315,8 +1315,6 @@ pub const MAX_SINGLE_IMAGE_BYTES: usize =
     cockpit_config::config::media_budget::PASTE_MAX_SINGLE_IMAGE_BYTES;
 pub const MAX_TOTAL_IMAGE_BYTES: usize =
     cockpit_config::config::media_budget::PASTE_MAX_TOTAL_IMAGE_BYTES;
-pub const MAX_IMAGES_PER_USER_MESSAGE: usize =
-    cockpit_config::config::media_budget::PASTE_MAX_IMAGES_PER_REQUEST;
 pub const MAX_IMAGE_DIMENSION_PIXELS: u32 =
     cockpit_config::config::media_budget::PASTE_MAX_EDGE_PIXELS;
 /// One attachment chunk's base64 body. Sized so the encoded chunk frame fits
@@ -1816,11 +1814,6 @@ pub struct GitReviewSourceResult {
     pub has_changes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageAttachmentRef {
-    pub id: Uuid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

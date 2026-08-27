@@ -29,6 +29,7 @@ const ATTACHMENT_SET_DIGEST_DOMAIN: &[u8] = b"flycockpit-message-attachment-set-
 pub use cockpit_db::media_attachments::MediaKind as MessageAttachmentKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageAttachmentIdentity {
     pub attachment_id: Uuid,
     pub attachment_version: u64,
@@ -38,6 +39,7 @@ pub struct MessageAttachmentIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageTagExpansion {
     pub tool: String,
     pub path: String,
@@ -46,6 +48,7 @@ pub struct MessageTagExpansion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SendUserMessageV2 {
     pub client_submission_id: Uuid,
     pub text: String,
@@ -241,6 +244,11 @@ fn validate_ingress(
     ensure!(
         operation_id.get_version_num() == 7 && operation_id.get_variant() == uuid::Variant::RFC4122,
         "operation_id must be RFC UUIDv7"
+    );
+    ensure!(
+        command.client_submission_id.get_version_num() == 7
+            && command.client_submission_id.get_variant() == uuid::Variant::RFC4122,
+        "client_submission_id must be RFC UUIDv7"
     );
     ensure!(!session_locator.is_empty(), "empty session locator");
     ensure!(

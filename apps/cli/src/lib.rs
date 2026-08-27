@@ -127,6 +127,7 @@ pub mod manpages {
 /// protocol without bypassing approval, authorization, or redaction paths.
 pub mod integration {
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use anyhow::{Result, anyhow};
@@ -136,6 +137,7 @@ pub mod integration {
     #[derive(Clone)]
     pub struct DaemonClient {
         inner: cockpit_client::DaemonClient,
+        attached_session: Arc<Mutex<Option<Uuid>>>,
     }
 
     /// Stable subset of the daemon status response needed by harness tests.
@@ -223,6 +225,7 @@ pub mod integration {
         pub async fn connect(socket: &Path) -> Result<Self> {
             Ok(Self {
                 inner: cockpit_client::DaemonClient::connect(socket).await?,
+                attached_session: Arc::new(Mutex::new(None)),
             })
         }
 
@@ -257,26 +260,35 @@ pub mod integration {
                     history,
                     paused_work,
                     ..
-                } => Ok(AttachedSession {
-                    session_id,
-                    history_len: history.len(),
-                    user_row_texts: history
-                        .iter()
-                        .filter_map(|entry| match entry {
-                            crate::daemon::proto::HistoryEntry::User {
-                                text, display_text, ..
-                            } => Some(
-                                display_text
-                                    .as_ref()
-                                    .filter(|value| !value.is_empty())
-                                    .unwrap_or(text)
-                                    .clone(),
-                            ),
-                            _ => None,
-                        })
-                        .collect(),
-                    paused_work_len: paused_work.len(),
-                }),
+                } => {
+                    *self
+                        .attached_session
+                        .lock()
+                        .map_err(|_| anyhow!("attached session state is unavailable"))? =
+                        Some(session_id);
+                    Ok(AttachedSession {
+                        session_id,
+                        history_len: history.len(),
+                        user_row_texts: history
+                            .iter()
+                            .filter_map(|entry| match entry {
+                                crate::daemon::proto::HistoryEntry::User {
+                                    text,
+                                    display_text,
+                                    ..
+                                } => Some(
+                                    display_text
+                                        .as_ref()
+                                        .filter(|value| !value.is_empty())
+                                        .unwrap_or(text)
+                                        .clone(),
+                                ),
+                                _ => None,
+                            })
+                            .collect(),
+                        paused_work_len: paused_work.len(),
+                    })
+                }
                 other => Err(anyhow!("unexpected attach response: {other:?}")),
             }
         }
@@ -292,13 +304,18 @@ pub mod integration {
             display_text: Option<String>,
             tag_expansions: Vec<(String, String, String, bool)>,
         ) -> Result<()> {
+            let session_id = self
+                .attached_session
+                .lock()
+                .map_err(|_| anyhow!("attached session state is unavailable"))?
+                .ok_or_else(|| anyhow!("send_user_message requires an attached session"))?;
             match self
                 .inner
                 .request_ok(crate::daemon::proto::Request::SendUserMessageV2 {
                     ingress:
                         crate::daemon::proto::send_user_message_v2::MessageIngressV2::local_direct(
                             Uuid::now_v7(),
-                            "local-owner",
+                            session_id.to_string(),
                             None,
                             None,
                             None,

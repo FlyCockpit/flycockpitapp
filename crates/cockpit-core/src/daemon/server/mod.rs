@@ -250,7 +250,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             upload_id: _,
             next_offset: _,
         }
-        | proto::Response::AttachmentUploaded { image_ref: _ }
+        | proto::Response::AttachmentUploaded { attachment: _ }
         | proto::Response::NoteRecorded { seq: _ } => {}
         proto::Response::SessionLiveStatus { statuses } => {
             for status in statuses {
@@ -5704,17 +5704,21 @@ async fn handle_envelope(
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
             #[cfg(feature = "remote")]
-            let result = Box::pin(dispatch::handle_serialized_request_with_remote_operation(
-                request,
-                state,
-                shared,
-                ctx,
-                &mut effects,
-                remote_operation.as_ref(),
-            ))
+            let result = Box::pin(
+                dispatch::handle_serialized_request_with_remote_operation_id(
+                    id,
+                    request,
+                    state,
+                    shared,
+                    ctx,
+                    &mut effects,
+                    remote_operation.as_ref(),
+                ),
+            )
             .await;
             #[cfg(not(feature = "remote"))]
-            let result = Box::pin(dispatch::handle_serialized_request(
+            let result = Box::pin(dispatch::handle_serialized_request_with_id(
+                id,
                 request,
                 state,
                 shared,

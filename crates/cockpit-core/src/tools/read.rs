@@ -141,7 +141,8 @@ impl Tool for ReadTool {
                     }
                 };
                 let ToolOutput { content, .. } = &mut output;
-                *content = updated.scrub(content);
+                *content =
+                    crate::engine::tool::CanonicalToolResultContents::text(updated.scrub(content));
             }
             return Ok(output);
         }

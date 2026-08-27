@@ -360,7 +360,7 @@ pub enum PasteImageAdmission {
     Bytes(Vec<u8>),
     Handle {
         draft: crate::tui::composer::ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
     },

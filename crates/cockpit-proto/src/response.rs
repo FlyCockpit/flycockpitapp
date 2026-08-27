@@ -7,8 +7,7 @@ pub struct ImageIngressAdmissionReceiptV1 {
     pub kind: String,
     pub admission_id: Uuid,
     pub session_id: Uuid,
-    pub image_ref: ImageAttachmentRef,
-    pub attachment_version: u64,
+    pub attachment: crate::send_user_message_v2::MessageAttachmentIdentity,
     pub availability_generation: u64,
     pub reservation_id: String,
     pub normalized_sha256: String,
@@ -82,7 +81,7 @@ pub enum Response {
     },
 
     AttachmentUploaded {
-        image_ref: ImageAttachmentRef,
+        attachment: crate::send_user_message_v2::MessageAttachmentIdentity,
     },
 
     TerminalIngress {

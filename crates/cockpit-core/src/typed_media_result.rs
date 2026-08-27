@@ -440,8 +440,11 @@ pub struct LiveAttachmentSnapshot {
     /// Whether a normalized derivative exists (required for audio/video and
     /// for image adjacent-content mapping).
     pub has_normalized_derivative: bool,
-    /// Whether a valid lease is currently held.
-    pub lease_held: bool,
+    /// Test-only seam for the pure branch matrix. Production callers can only
+    /// resolve through [`MediaReferenceResolver::resolve_with_acquired_lease`]
+    /// with storage-issued authority.
+    #[cfg(test)]
+    pub synthetic_lease_authorized: bool,
     pub media_kind: CanonicalMediaKind,
     pub mime_type: String,
 }
@@ -594,6 +597,7 @@ impl<'a> MediaReferenceResolver<'a> {
     ///
     /// Every wrong-session/deleted/changed/unavailable/unnormalized/
     /// capability-unknown branch fails before provider transport.
+    #[cfg(test)]
     pub fn resolve(
         &self,
         reference: &MediaReference,
@@ -601,6 +605,51 @@ impl<'a> MediaReferenceResolver<'a> {
         route: MediaRoute,
         tool_call_id: &str,
         call_id: Option<&str>,
+    ) -> Result<ResolvedMediaMapping, MediaReferenceError> {
+        self.resolve_checked(
+            reference,
+            live,
+            route,
+            tool_call_id,
+            call_id,
+            live.synthetic_lease_authorized,
+        )
+    }
+
+    /// Production resolution requires an authority returned by
+    /// `Db::acquire_media_component_lease_conn`; callers cannot assert lease
+    /// possession with a boolean. The exact attachment/version/session/project
+    /// binding is checked before any provider mapping is returned.
+    pub fn resolve_with_acquired_lease(
+        &self,
+        reference: &MediaReference,
+        live: &LiveAttachmentSnapshot,
+        lease: Option<&cockpit_db::media_attachments::AcquiredMediaComponentLease>,
+        route: MediaRoute,
+        tool_call_id: &str,
+        call_id: Option<&str>,
+    ) -> Result<ResolvedMediaMapping, MediaReferenceError> {
+        let lease_valid = route == MediaRoute::Sidecar
+            || lease.is_some_and(|lease| {
+                lease.attachment_id == reference.attachment_id
+                    && lease.attachment_version == reference.attachment_version
+                    && lease.owner_session_id == self.auth.session_id
+                    && lease.canonical_project_digest == self.auth.canonical_project_digest
+                    && lease.component.sha256 == reference.checksum
+                    && lease.component.byte_length == reference.byte_count
+                    && lease.lease_purpose == "model"
+            });
+        self.resolve_checked(reference, live, route, tool_call_id, call_id, lease_valid)
+    }
+
+    fn resolve_checked(
+        &self,
+        reference: &MediaReference,
+        live: &LiveAttachmentSnapshot,
+        route: MediaRoute,
+        tool_call_id: &str,
+        call_id: Option<&str>,
+        lease_valid: bool,
     ) -> Result<ResolvedMediaMapping, MediaReferenceError> {
         // 1. Session/project authority check
         if live.session_id != self.auth.session_id {
@@ -684,9 +733,10 @@ impl<'a> MediaReferenceResolver<'a> {
             }
             // Image adjacent-content also requires a normalized derivative
             // (the sidecar/adjacent path uses only normalized derivatives).
-            if route == MediaRoute::Primary
-                && !self.capabilities.image_in_tool_result
-                && self.capabilities.image_in_user_content
+            if route == MediaRoute::Sidecar
+                || (route == MediaRoute::Primary
+                    && !self.capabilities.image_in_tool_result
+                    && self.capabilities.image_in_user_content)
             {
                 return Err(MediaReferenceError::NotNormalized {
                     attachment_id: reference.attachment_id,
@@ -695,7 +745,7 @@ impl<'a> MediaReferenceResolver<'a> {
         }
 
         // 5. Lease check (valid lease held until provider body handoff)
-        if route == MediaRoute::Primary && !live.lease_held {
+        if route == MediaRoute::Primary && !lease_valid {
             return Err(MediaReferenceError::NoLease {
                 attachment_id: reference.attachment_id,
             });

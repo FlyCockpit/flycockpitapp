@@ -558,7 +558,7 @@ pub trait Tool: Send + Sync {
 /// the next inference call carries canonical bytes.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
-    pub content: String,
+    pub content: CanonicalToolResultContents,
     /// Optional short-circuit guidance for an immediately repeated call with
     /// the same final semantic input. A tool sets this when its *result* was a
     /// recoverable dead-end the model should not repeat verbatim. The
@@ -603,6 +603,160 @@ pub struct ToolOutput {
     /// persisting it onto the durable event, and the exporter writes it as a
     /// sidecar file.
     pub output_sidecar: Option<ToolOutputSidecar>,
+}
+
+/// Canonical ordered tool-result union carried through the engine. The cached
+/// text projection preserves the existing text-tool ergonomics while the
+/// authoritative `parts` list keeps JSON/media variants typed and exhaustive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalToolResultContents {
+    parts: Vec<crate::typed_media_result::CanonicalToolResultContent>,
+    text_projection: String,
+}
+
+impl CanonicalToolResultContents {
+    pub fn new(
+        parts: Vec<crate::typed_media_result::CanonicalToolResultContent>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!parts.is_empty(), "tool result content must not be empty");
+        for part in &parts {
+            part.validate_no_inline_media()?;
+        }
+        let mut text_projection = String::new();
+        for part in &parts {
+            match part {
+                crate::typed_media_result::CanonicalToolResultContent::Text { text } => {
+                    text_projection.push_str(text);
+                }
+                crate::typed_media_result::CanonicalToolResultContent::Json { value } => {
+                    text_projection.push_str(&serde_json::to_string(value)?);
+                }
+                crate::typed_media_result::CanonicalToolResultContent::MediaReference {
+                    ..
+                } => {}
+            }
+        }
+        Ok(Self {
+            parts,
+            text_projection,
+        })
+    }
+
+    pub fn text(value: impl Into<String>) -> Self {
+        let text_projection = value.into();
+        Self {
+            parts: vec![crate::typed_media_result::CanonicalToolResultContent::text(
+                text_projection.clone(),
+            )],
+            text_projection,
+        }
+    }
+
+    pub fn parts(&self) -> &[crate::typed_media_result::CanonicalToolResultContent] {
+        &self.parts
+    }
+
+    pub fn into_parts(self) -> Vec<crate::typed_media_result::CanonicalToolResultContent> {
+        self.parts
+    }
+
+    pub fn model_text(&self) -> &str {
+        &self.text_projection
+    }
+
+    /// Convert the durable text/JSON variants into Rig's typed history form.
+    /// Media references require the storage-backed late resolver and are
+    /// deliberately rejected here so an unresolved reference can never be
+    /// reduced to prose or silently omitted before provider dispatch.
+    pub fn to_rig_contents(&self) -> anyhow::Result<Vec<rig::message::ToolResultContent>> {
+        self.parts
+            .iter()
+            .map(|part| match part {
+                crate::typed_media_result::CanonicalToolResultContent::Text { text } => {
+                    Ok(rig::message::ToolResultContent::text(text.clone()))
+                }
+                crate::typed_media_result::CanonicalToolResultContent::Json { value } => {
+                    Ok(rig::message::ToolResultContent::Json {
+                        value: value.clone(),
+                    })
+                }
+                crate::typed_media_result::CanonicalToolResultContent::MediaReference {
+                    ..
+                } => anyhow::bail!(
+                    "media_reference_unavailable: storage-backed provider mapping was not resolved"
+                ),
+            })
+            .collect()
+    }
+
+    pub fn has_non_text_content(&self) -> bool {
+        self.parts.iter().any(|part| {
+            !matches!(
+                part,
+                crate::typed_media_result::CanonicalToolResultContent::Text { .. }
+            )
+        })
+    }
+
+    pub fn push_str(&mut self, value: &str) {
+        self.text_projection.push_str(value);
+        match self.parts.last_mut() {
+            Some(crate::typed_media_result::CanonicalToolResultContent::Text { text }) => {
+                text.push_str(value);
+            }
+            _ => self
+                .parts
+                .push(crate::typed_media_result::CanonicalToolResultContent::text(
+                    value,
+                )),
+        }
+    }
+
+    pub fn push(&mut self, value: char) {
+        self.text_projection.push(value);
+        match self.parts.last_mut() {
+            Some(crate::typed_media_result::CanonicalToolResultContent::Text { text }) => {
+                text.push(value);
+            }
+            _ => self
+                .parts
+                .push(crate::typed_media_result::CanonicalToolResultContent::text(
+                    value.to_string(),
+                )),
+        }
+    }
+}
+
+impl std::ops::Deref for CanonicalToolResultContents {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.text_projection
+    }
+}
+
+impl std::fmt::Display for CanonicalToolResultContents {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.text_projection)
+    }
+}
+
+impl PartialEq<str> for CanonicalToolResultContents {
+    fn eq(&self, other: &str) -> bool {
+        self.text_projection == other
+    }
+}
+
+impl PartialEq<&str> for CanonicalToolResultContents {
+    fn eq(&self, other: &&str) -> bool {
+        self.text_projection == *other
+    }
+}
+
+impl PartialEq<String> for CanonicalToolResultContents {
+    fn eq(&self, other: &String) -> bool {
+        self.text_projection == *other
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -761,7 +915,7 @@ impl ContextUsageSnapshot {
 impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
+            content: CanonicalToolResultContents::text(content),
             repeat_guard: None,
             truncated: false,
             text_artifact_capture: None,
@@ -776,7 +930,7 @@ impl ToolOutput {
 
     pub fn truncated_text(content: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
+            content: CanonicalToolResultContents::text(content),
             repeat_guard: None,
             truncated: true,
             text_artifact_capture: None,
@@ -787,6 +941,14 @@ impl ToolOutput {
             exit_code: None,
             output_sidecar: None,
         }
+    }
+
+    pub fn canonical(
+        content: Vec<crate::typed_media_result::CanonicalToolResultContent>,
+    ) -> anyhow::Result<Self> {
+        let mut output = Self::text("");
+        output.content = CanonicalToolResultContents::new(content)?;
+        Ok(output)
     }
 
     pub fn with_text_artifact_capture(mut self, capture: TextArtifactCapture) -> Self {

@@ -1220,6 +1220,9 @@ enum PendingSettingsOperation {
         committed_denylist: Vec<cockpit_proto::CommittedDenylistEntry>,
         warning: Option<String>,
     },
+    SidecarAuthority {
+        target: SettingsEffectTarget,
+    },
     ProviderCatalog {
         project_root: String,
         provider_id: Option<String>,
@@ -1308,6 +1311,7 @@ impl PendingSettingsOperation {
                 revision: Some(expected_revision.clone()),
             },
             Self::ExtendedRefresh { target, .. }
+            | Self::SidecarAuthority { target }
             | Self::ProjectShadowSnapshot { target, .. }
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
@@ -2844,6 +2848,7 @@ pub struct SettingsCx {
     completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
     completed_image_spend: Option<ImageSpendCompletion>,
+    completed_image_sidecar: Option<Result<Response, String>>,
     pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
     completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
     after_extended_commit: Vec<(SettingsEffectTarget, Request, &'static str)>,
@@ -3355,6 +3360,35 @@ impl SettingsCx {
             operation_id,
             PendingSettingsOperation::ProjectShadowSnapshot { target, prompt },
         );
+    }
+
+    pub(crate) fn queue_image_sidecar_authority(
+        &mut self,
+        request: Request,
+        project_root: String,
+        selection_id: String,
+    ) {
+        let target = SettingsEffectTarget {
+            surface: "settings.image-sidecar-authority",
+            owner: project_root,
+            revision: Some(selection_id),
+        };
+        let operation_id = self.enqueue_daemon_effect(target.clone(), request);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SidecarAuthority { target },
+        );
+    }
+
+    pub(crate) fn take_image_sidecar_completion(&mut self) -> Option<Result<Response, String>> {
+        self.completed_image_sidecar.take()
+    }
+
+    pub(crate) fn image_sidecar_config_generation(&self) -> Option<u64> {
+        self.extended_base
+            .get("__cockpit_settings_generation")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|generation| *generation > 0)
     }
 
     fn queue_extended_load(&mut self) {
@@ -3983,6 +4017,11 @@ impl SettingsCx {
                             "settings committed at generation {result_generation}, but refresh did not reconcile; reload before editing again"
                         )
                     })],
+                }
+            }
+            PendingSettingsOperation::SidecarAuthority { target } => {
+                if completion.target == target {
+                    self.completed_image_sidecar = Some(completion.response);
                 }
             }
             PendingSettingsOperation::Followup { label, target } => {
@@ -6023,8 +6062,9 @@ impl SettingsDialog {
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
             Ok(()) => {
+                let sidecar_completion = self.cx.take_image_sidecar_completion();
                 if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
-                    page.apply_authoritative_settings_completion(&self.cx);
+                    page.apply_authoritative_settings_completion(&self.cx, sidecar_completion);
                 }
                 if let Some((navigation, config)) = self.cx.completed_provider_navigation.take() {
                     let requested_provider_id = match &navigation {
@@ -6587,6 +6627,7 @@ impl SettingsDialog {
                 completed_provider_mutation_navigation: None,
                 completed_shadow_removal: None,
                 completed_image_spend: None,
+                completed_image_sidecar: None,
                 pending_shadow_prompt: None,
                 completed_provider_navigation: None,
                 after_extended_commit: Vec::new(),
@@ -7584,17 +7625,40 @@ impl SettingsPage for RootPage {
                             &cx.image_generation_session_snapshot(),
                         ),
                     )),
-                    "Image Sidecar" => Some(image_sidecar::sidecar_overview_page_from_snapshot(
-                        image_sidecar::SidecarPrincipal::from_session(
-                            &cx.image_generation_session_snapshot(),
-                        ),
-                        &cx.extended.image_sidecar,
-                        cx.extended
-                            .media_resources
-                            .limits()
-                            .sidecar_invocations_per_session,
-                        cx.extended_revision.is_some(),
-                    )),
+                    "Image Sidecar" => {
+                        let project_id = cx
+                            .active_project_root
+                            .as_ref()
+                            .map(|root| root.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let selection_id = uuid::Uuid::new_v4().to_string();
+                        let config_generation = cx.image_sidecar_config_generation().unwrap_or(0);
+                        if !project_id.is_empty() && config_generation > 0 {
+                            cx.queue_image_sidecar_authority(
+                                Request::GetImageSidecarAuthoritySnapshot {
+                                    project_root: project_id.clone(),
+                                    config_generation,
+                                    selection_id: selection_id.clone(),
+                                },
+                                project_id.clone(),
+                                selection_id.clone(),
+                            );
+                        }
+                        Some(image_sidecar::sidecar_overview_page_from_snapshot(
+                            image_sidecar::SidecarPrincipal::from_session(
+                                &cx.image_generation_session_snapshot(),
+                            ),
+                            &cx.extended.image_sidecar,
+                            cx.extended
+                                .media_resources
+                                .limits()
+                                .sidecar_invocations_per_session,
+                            cx.extended_revision.is_some() && config_generation > 0,
+                            project_id,
+                            selection_id,
+                            config_generation,
+                        ))
+                    }
                     "Privacy & Safety" => {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Privacy)))

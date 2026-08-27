@@ -983,6 +983,9 @@ impl SidecarSession {
         config: &SidecarSelectionConfig,
         central_cap: u64,
         snapshot_available: bool,
+        project_id: String,
+        selection_id: String,
+        config_generation: u64,
     ) -> Self {
         let mut session = Self::new(principal);
         session.form = SidecarFormState::from_authoritative_config(config);
@@ -993,6 +996,13 @@ impl SidecarSession {
         // read is used as a fallback.
         session.authoritative_snapshot = snapshot_available;
         session.authoritative_mutations = snapshot_available && session.principal.can_mutate();
+        session.reducer = SidecarReducer::new(
+            "local".into(),
+            project_id,
+            "settings".into(),
+            selection_id,
+            config_generation,
+        );
         session
     }
 
@@ -1160,6 +1170,9 @@ pub(super) fn sidecar_overview_page_from_snapshot(
     config: &SidecarSelectionConfig,
     central_cap: u64,
     snapshot_available: bool,
+    project_id: String,
+    selection_id: String,
+    config_generation: u64,
 ) -> PageBox {
     boxed(SidecarPage {
         kind: SidecarPageKind::Overview,
@@ -1168,6 +1181,9 @@ pub(super) fn sidecar_overview_page_from_snapshot(
             config,
             central_cap,
             snapshot_available,
+            project_id,
+            selection_id,
+            config_generation,
         ),
     })
 }
@@ -1462,6 +1478,23 @@ impl SidecarPage {
         // inherit a confirmation that was presented by the grant list.
         self.session.cancel_confirm();
         Nav::Push(sidecar_page(kind, self.session.clone()))
+    }
+
+    fn queue_authority_request(&mut self, cx: &mut SettingsCx, request: cockpit_proto::Request) {
+        if self.session.reducer.config_generation == 0
+            || self.session.reducer.project_id.is_empty()
+            || self.session.reducer.selection_id.is_empty()
+        {
+            self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+            return;
+        }
+        self.session.busy = true;
+        self.session.error = None;
+        cx.queue_image_sidecar_authority(
+            request,
+            self.session.reducer.project_id.clone(),
+            self.session.reducer.selection_id.clone(),
+        );
     }
 }
 
@@ -2148,10 +2181,14 @@ impl SettingsPage for SidecarPage {
                 Nav::Stay
             }
             SidecarAction::RefreshHealth => {
-                // Capability freshness is daemon/provider evidence, not a
-                // local reducer transition. Until the daemon exposes that
-                // projection, do not acknowledge a refresh that never ran.
-                self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                self.queue_authority_request(
+                    cx,
+                    cockpit_proto::Request::GetImageSidecarAuthoritySnapshot {
+                        project_root: self.session.reducer.project_id.clone(),
+                        config_generation: self.session.reducer.config_generation,
+                        selection_id: self.session.reducer.selection_id.clone(),
+                    },
+                );
                 Nav::Stay
             }
             SidecarAction::SelectGrantScope(scope) => {
@@ -2159,13 +2196,38 @@ impl SettingsPage for SidecarPage {
                 Nav::Stay
             }
             SidecarAction::CreateGrant => {
-                // The policy module currently has no daemon-owned grant
-                // ledger.  Do not manufacture a process-local grant that the
-                // sidecar pipeline cannot consult.
                 if self.kind == SidecarPageKind::GrantList {
                     return self.push_kind(SidecarPageKind::GrantEditor);
                 }
-                self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                let destination = match self.session.grant_creation_destination() {
+                    Ok(destination) => destination,
+                    Err(reason) => {
+                        self.session.error = Some(reason.into());
+                        return Nav::Stay;
+                    }
+                };
+                let scope = match self.session.form.draft_scope {
+                    GrantScope::Once | GrantScope::Session => {
+                        self.session.error = Some(REASON_INVOCATION_NOT_FOUND.into());
+                        return Nav::Stay;
+                    }
+                    GrantScope::Project => {
+                        cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project
+                    }
+                };
+                self.queue_authority_request(
+                    cx,
+                    cockpit_proto::Request::CreateImageSidecarGrant {
+                        project_root: self.session.reducer.project_id.clone(),
+                        config_generation: self.session.reducer.config_generation,
+                        selection_id: self.session.reducer.selection_id.clone(),
+                        destination,
+                        purpose: "ask_image".into(),
+                        scope,
+                        session_id: None,
+                        invocation_id: None,
+                    },
+                );
                 Nav::Stay
             }
             SidecarAction::RevokeGrant(id) => {
@@ -2215,7 +2277,16 @@ impl SettingsPage for SidecarPage {
                     self.normalize_cursor();
                     return Nav::Stay;
                 }
-                self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                self.queue_authority_request(
+                    cx,
+                    cockpit_proto::Request::RevokeImageSidecarGrant {
+                        project_root: self.session.reducer.project_id.clone(),
+                        config_generation: self.session.reducer.config_generation,
+                        selection_id: self.session.reducer.selection_id.clone(),
+                        grant_id: pending.grant_id,
+                        expected_version: pending.version,
+                    },
+                );
                 self.normalize_cursor();
                 Nav::Stay
             }
@@ -2320,8 +2391,115 @@ impl SettingsPage for SidecarPage {
 }
 
 impl SidecarPage {
-    pub(super) fn apply_authoritative_settings_completion(&mut self, cx: &SettingsCx) {
+    pub(super) fn apply_authoritative_settings_completion(
+        &mut self,
+        cx: &SettingsCx,
+        completion: Option<Result<cockpit_proto::Response, String>>,
+    ) {
         self.session
             .complete_config_save(cx.extended_revision.as_deref());
+        let Some(completion) = completion else {
+            return;
+        };
+        match completion {
+            Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(snapshot)) => {
+                if snapshot.schema_version != 1
+                    || snapshot.config_generation != self.session.reducer.config_generation
+                    || snapshot.selection_id != self.session.reducer.selection_id
+                    || snapshot.project_id != self.session.reducer.project_id
+                    || snapshot.pipeline_available
+                {
+                    self.session.reducer.mark_stale();
+                    self.session.authoritative_mutations = false;
+                    self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                    return;
+                }
+                self.session.reducer.entity_version = snapshot.entity_version;
+                self.session.reducer.grants = snapshot
+                    .grants
+                    .into_iter()
+                    .map(grant_view_from_authority)
+                    .collect();
+                self.session.reducer.invocations.clear();
+                self.session.reducer.health = Some(HealthView {
+                    available: false,
+                    capability_source: "daemon".into(),
+                    freshness: "current".into(),
+                    reason: snapshot.health_reason,
+                });
+                self.session.reducer.stale = false;
+                self.session.authoritative_snapshot = true;
+                self.session.authoritative_mutations = self.session.principal.can_mutate();
+                self.session.busy = false;
+                self.session.error = None;
+            }
+            Ok(cockpit_proto::Response::ImageSidecarGrantMutated(mutation)) => {
+                if mutation.schema_version != 1
+                    || mutation.config_generation != self.session.reducer.config_generation
+                    || mutation.selection_id != self.session.reducer.selection_id
+                    || mutation.entity_version <= self.session.reducer.entity_version
+                {
+                    self.session.reducer.mark_stale();
+                    self.session.authoritative_mutations = false;
+                    self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                    return;
+                }
+                let grant = grant_view_from_authority(mutation.grant);
+                if let Some(existing) = self
+                    .session
+                    .reducer
+                    .grants
+                    .iter_mut()
+                    .find(|existing| existing.grant_id == grant.grant_id)
+                {
+                    *existing = grant;
+                } else {
+                    self.session.reducer.grants.push(grant);
+                }
+                self.session.reducer.entity_version = mutation.entity_version;
+                self.session.busy = false;
+                self.session.error = None;
+            }
+            Ok(other) => {
+                self.session.busy = false;
+                self.session.error =
+                    Some(format!("unexpected sidecar authority response: {other:?}"));
+            }
+            Err(error) => {
+                self.session.busy = false;
+                self.session.error = Some(error);
+            }
+        }
+    }
+}
+
+fn grant_view_from_authority(
+    grant: cockpit_proto::image_sidecar_authority::ImageSidecarGrantV1,
+) -> GrantView {
+    let scope = match grant.scope {
+        cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Once => GrantScope::Once,
+        cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Session => {
+            GrantScope::Session
+        }
+        cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project => {
+            GrantScope::Project
+        }
+    };
+    GrantView {
+        grant_id: grant.grant_id,
+        version: grant.version,
+        project: grant.project_id,
+        destination: grant.destination,
+        media_class: "image".into(),
+        purpose: grant.purpose,
+        scope,
+        session_binding: grant.session_id,
+        invocation_binding: grant.invocation_id,
+        created_at: grant.created_at_unix_ms.to_string(),
+        last_used_at: grant
+            .last_used_at_unix_ms
+            .map(|timestamp| timestamp.to_string()),
+        revoked: grant.revoked_at_unix_ms.is_some(),
+        consumed: grant.consumed_at_unix_ms.is_some(),
     }
 }

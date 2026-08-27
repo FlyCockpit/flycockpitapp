@@ -8114,6 +8114,62 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+        } => {
+            crate::daemon::image_sidecar_authority::snapshot(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+            )
+            .await
+        }
+
+        Request::CreateImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            destination,
+            purpose,
+            scope,
+            session_id,
+            invocation_id,
+        } => {
+            crate::daemon::image_sidecar_authority::create_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                destination,
+                purpose,
+                scope,
+                session_id,
+                invocation_id,
+            )
+            .await
+        }
+
+        Request::RevokeImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            grant_id,
+            expected_version,
+        } => {
+            crate::daemon::image_sidecar_authority::revoke_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                grant_id,
+                expected_version,
+            )
+            .await
+        }
+
         Request::ApplyExtendedConfigPatch {
             client_operation_id,
             project_root,
@@ -16090,6 +16146,19 @@ async fn handle_concurrent_request_impl(
                 project_root,
                 shared.capability_owner.clone(),
                 snapshot_session_id,
+            )
+            .await
+        }
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+        } => {
+            crate::daemon::image_sidecar_authority::snapshot(
+                &ctx,
+                project_root,
+                config_generation,
+                selection_id,
             )
             .await
         }

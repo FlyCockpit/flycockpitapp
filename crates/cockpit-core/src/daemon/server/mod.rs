@@ -843,6 +843,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // exactly like the sibling `ImageControlRead` above), so there is no
         // secret free text to scrub.
         proto::Response::ImageControlMutated(..) => {}
+        // Image-sidecar authority projections contain only daemon-generated
+        // ids, normalized destinations, closed enums, and timestamps.
+        proto::Response::ImageSidecarAuthoritySnapshot(..)
+        | proto::Response::ImageSidecarGrantMutated(..) => {}
         proto::Response::Unknown => {}
     }
 }
@@ -6222,6 +6226,20 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                             bytes.len() <= proto::MAX_EXTENDED_CONFIG_SOURCE_BYTES
                         })
                 })
+        }
+        proto::Response::ImageSidecarAuthoritySnapshot(snapshot) => {
+            snapshot.schema_version == 1
+                && snapshot.project_id.len() <= 4096
+                && snapshot.selection_id.len() <= 128
+                && snapshot.grants.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && snapshot.invocations.is_empty()
+                && !snapshot.pipeline_available
+        }
+        proto::Response::ImageSidecarGrantMutated(mutation) => {
+            mutation.schema_version == 1
+                && mutation.selection_id.len() <= 128
+                && mutation.grant.grant_id.len() <= 128
+                && mutation.grant.destination.len() <= 2048
         }
         proto::Response::ExtendedConfigSaved { denylist, .. } => {
             let mut result_ids = std::collections::HashSet::new();

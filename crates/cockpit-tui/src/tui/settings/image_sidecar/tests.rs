@@ -129,6 +129,13 @@ fn sample_invocation() -> InvocationView {
 
 fn page_with(kind: SidecarPageKind) -> SidecarPage {
     let mut session = SidecarSession::new(SidecarPrincipal::local_owner());
+    session.reducer = SidecarReducer::new(
+        "local".into(),
+        "project".into(),
+        "session".into(),
+        "selection".into(),
+        1,
+    );
     session.authoritative_mutations = true;
     session.authoritative_snapshot = true;
     session.form.models = vec![
@@ -356,7 +363,18 @@ fn image_sidecar_settings_grant_scope_and_revoke() {
             ConfirmationChoice::Confirm,
         )),
     );
-    assert!(list.session.reducer.grants[0].revoked);
+    assert!(!list.session.reducer.grants[0].revoked);
+    let effect = dialog
+        .take_daemon_effect()
+        .expect("authoritative revoke request");
+    assert!(matches!(
+        effect.work,
+        SettingsDaemonEffectWork::Request(cockpit_proto::Request::RevokeImageSidecarGrant {
+            grant_id,
+            expected_version: 1,
+            ..
+        }) if grant_id == "grant-1"
+    ));
     assert!(list.session.confirm_revoke.borrow().is_none());
 }
 
@@ -857,12 +875,8 @@ fn image_sidecar_settings_create_grant_requires_current_destination_and_once_bin
         &mut test_dialog(),
         SettingsPointerAction::Sidecar(SidecarAction::CreateGrant),
     );
-    assert_eq!(page.session.reducer.grants.len(), 1);
-    assert_eq!(
-        page.session.reducer.grants[0].invocation_binding.as_deref(),
-        Some("inv-1")
-    );
-    assert!(!page.session.reducer.grants[0].destination.is_empty());
+    assert!(page.session.reducer.grants.is_empty());
+    assert!(page.session.error.is_some());
 }
 
 #[test]

@@ -370,6 +370,7 @@ mod tests {
                     max_collection_millis: budgets.3,
                     adjudicator_slot: adjudicator,
                     on_budget_exceeded: on_budget,
+                    ..Default::default()
                 }],
             }),
         };

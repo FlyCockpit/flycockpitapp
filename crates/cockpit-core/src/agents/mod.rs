@@ -60,10 +60,12 @@ pub use vnext::{
     EffectiveVnextGrant, ExecutionKind, LocalInstallationIdentity, LocalInstallationResolver,
     ModelCapability, ModelLocality, ModelRecommendation, ModelSlot, OnBudgetExceeded,
     ProhibitedQuestionClass, ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder,
-    SCHEMA_VERSION, SelectorPredicate, ToolClass, VerificationAction, VerificationBudget,
-    VerificationDispatch, VerificationEstimate, VerificationPolicy, VerificationRule,
-    VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
-    VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
+    GeneratorSpec, MAX_GENERATOR_TURNS, OnAdjudicationFailure, PROFILE_CLEAN_ROOM, PROFILE_PANEL,
+    PROFILE_SELF_CHECK, SCHEMA_VERSION, SelectorPredicate, ToolClass, VerificationAction,
+    VerificationBudget, VerificationDispatch, VerificationEstimate, VerificationMode,
+    VerificationPolicy, VerificationRecipe, VerificationRule, VerificationSelector,
+    VerificationSessionReduction, VerificationSubject, VnextAgentDef, VnextHostPolicy,
+    delegation_kind_permitted, resolve_question_policy,
 };
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;

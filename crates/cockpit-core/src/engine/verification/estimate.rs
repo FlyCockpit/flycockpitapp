@@ -231,6 +231,7 @@ mod tests {
                     max_collection_millis: Some(10),
                     adjudicator_slot: Some("primary".into()),
                     on_budget_exceeded: Some(on_budget),
+                    ..Default::default()
                 }],
             }),
         }

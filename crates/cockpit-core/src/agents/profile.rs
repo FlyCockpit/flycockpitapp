@@ -1313,6 +1313,29 @@ fn snapshot_verification_regions(
                 token_ceiling: budget.map(|budget| budget.max_total_tokens),
                 cost_ceiling_micros: budget.map(|budget| budget.max_estimated_cost_microusd),
                 max_collection_duration_ms: budget.map(|budget| budget.max_collection_millis),
+                mode: if off {
+                    None
+                } else {
+                    Some(match region.rule.resolved_mode() {
+                        crate::agents::VerificationMode::Gate => "gate".to_string(),
+                        crate::agents::VerificationMode::Revise => "revise".to_string(),
+                    })
+                },
+                generator_count: if off {
+                    None
+                } else {
+                    Some(region.rule.generators.len() as u64)
+                },
+                generator_slots: if off {
+                    Vec::new()
+                } else {
+                    region
+                        .rule
+                        .generators
+                        .iter()
+                        .map(|generator| generator.slot.clone())
+                        .collect()
+                },
             })
         })
         .collect()

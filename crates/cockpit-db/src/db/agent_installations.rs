@@ -462,6 +462,14 @@ pub struct RedactedVerificationRegion {
     /// resolver has no clock input, so persisting this as a Unix timestamp
     /// would misrepresent its semantics on reload.
     pub max_collection_duration_ms: Option<u64>,
+    /// Gate/revise mode. Redacted to the lowercase name only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Generator count after redaction. Slot names only, never recipes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generator_slots: Vec<String>,
 }
 
 impl RedactedVerificationRegion {
@@ -2805,6 +2813,9 @@ mod tests {
                 token_ceiling: Some(1),
                 cost_ceiling_micros: Some(1),
                 max_collection_duration_ms: Some(12),
+                mode: None,
+                generator_count: None,
+                generator_slots: Vec::new(),
             }],
             bindings: vec![RedactedBindingEvidence {
                 slot_id: "primary".into(),
@@ -3352,6 +3363,9 @@ mod tests {
                 token_ceiling: Some(1),
                 cost_ceiling_micros: Some(1),
                 max_collection_duration_ms: Some(1),
+                mode: None,
+                generator_count: None,
+                generator_slots: Vec::new(),
             }],
             bindings: vec![RedactedBindingEvidence {
                 slot_id: "primary".into(),
@@ -3560,6 +3574,9 @@ mod tests {
                     token_ceiling: Some(100),
                     cost_ceiling_micros: Some(42),
                     max_collection_duration_ms: Some(999),
+                    mode: None,
+                    generator_count: None,
+                    generator_slots: Vec::new(),
                 },
                 RedactedVerificationRegion {
                     source_rule_id: "source-deny".into(),
@@ -3577,6 +3594,9 @@ mod tests {
                     token_ceiling: None,
                     cost_ceiling_micros: None,
                     max_collection_duration_ms: None,
+                    mode: None,
+                    generator_count: None,
+                    generator_slots: Vec::new(),
                 },
             ],
             bindings: vec![RedactedBindingEvidence {

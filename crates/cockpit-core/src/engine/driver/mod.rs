@@ -8911,6 +8911,10 @@ impl Driver {
         {
             tracing::warn!(error = ?e, agent = %child.agent.name, "suspend_agent on pop failed");
         }
+        if let Some(lease) = child.agent.workspace_lease.as_deref() {
+            crate::workspace_lease::grace_retain_completed_harness_lease(&self.session.db, lease)
+                .await;
+        }
         // The agent now back on top regains its lock set for files whose hash
         // matches the snapshot taken when it was suspended.
         if let Some(parent) = self.stack.last()
@@ -11622,6 +11626,9 @@ impl Driver {
                                                 self.session.id,
                                                 owner,
                                                 parent_grant,
+                                                self.stack.last().and_then(|frame| {
+                                                    frame.agent.workspace_lease.as_deref()
+                                                }),
                                                 &self.cwd,
                                                 requested_child.as_deref(),
                                                 kind,
@@ -11678,6 +11685,11 @@ impl Driver {
                     let child_cwd = match resolved_child_cwd {
                         Ok(child_cwd) => child_cwd,
                         Err(err) => {
+                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                &self.session.db,
+                                [selected_workspace_lease.as_ref()],
+                            )
+                            .await;
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
                                 task_provider_item_id,
@@ -11695,6 +11707,11 @@ impl Driver {
                     ) {
                         Ok(scope) => scope,
                         Err(err) => {
+                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                &self.session.db,
+                                [selected_workspace_lease.as_ref()],
+                            )
+                            .await;
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id, task_provider_item_id, task_function_call_id, "task",
                                 prepend_task_repair_notes(format!("Error: {err}"), &repair_notes),
@@ -11730,6 +11747,11 @@ impl Driver {
                     })
                     .await
                     {
+                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                            &self.session.db,
+                            [selected_workspace_lease.as_ref()],
+                        )
+                        .await;
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id,
@@ -11739,6 +11761,18 @@ impl Driver {
                         );
                         continue;
                     }
+                    let effective_write_scope = selected_workspace_lease.as_ref().map_or(
+                        preflight_write_scope.clone(),
+                        |lease| {
+                            crate::workspace_lease::effective_write_scope_for_lease(
+                                preflight_write_scope,
+                                self.stack
+                                    .last()
+                                    .and_then(|frame| frame.agent.write_scope.as_deref()),
+                                lease,
+                            )
+                        },
+                    );
                     next_prompt = self
                         .run_single_noninteractive_task_backgroundable(
                             SingleNoninteractiveTask {
@@ -11750,7 +11784,7 @@ impl Driver {
                                 resume_handle,
                                 child_cwd,
                                 context,
-                                write_scope,
+                                write_scope: effective_write_scope,
                                 // Persist the daemon-issued opaque token in
                                 // the durable task descriptor.  Do not replay
                                 // the model's kind spelling in background or
@@ -11831,6 +11865,9 @@ impl Driver {
                                                     self.session.id,
                                                     owner,
                                                     parent_grant,
+                                                    self.stack.last().and_then(|frame| {
+                                                        frame.agent.workspace_lease.as_deref()
+                                                    }),
                                                     &self.cwd,
                                                     requested_child.as_deref(),
                                                     kind,
@@ -11871,6 +11908,10 @@ impl Driver {
                                 break;
                             }
                         };
+                        // Retain the allocation before any later admission
+                        // step. A following cwd/scope/definition failure must
+                        // grace every already-issued managed worktree.
+                        child_workspace_leases.push(workspace_lease);
                         let resolved_child = match workspace_lease.as_ref() {
                             Some(lease) if lease.kind == crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree => Ok(ChildCwd {
                                 requested: None,
@@ -11888,9 +11929,13 @@ impl Driver {
                                 break;
                             }
                         }
-                        child_workspace_leases.push(workspace_lease);
                     }
                     if let Some(err) = cwd_error {
+                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                            &self.session.db,
+                            child_workspace_leases.iter().map(Option::as_ref),
+                        )
+                        .await;
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id,
@@ -11907,7 +11952,7 @@ impl Driver {
                         .and_then(|frame| frame.agent.vnext_grant.clone());
                     let mut unknown_agent_error = None;
                     for ((entry, child_cwd), workspace_lease) in entries
-                        .iter()
+                        .iter_mut()
                         .zip(child_cwds.iter())
                         .zip(child_workspace_leases.iter())
                     {
@@ -11953,8 +11998,25 @@ impl Driver {
                             ));
                             break;
                         }
+                        entry.write_scope =
+                            workspace_lease
+                                .as_ref()
+                                .map_or(child_write_scope.clone(), |lease| {
+                                    crate::workspace_lease::effective_write_scope_for_lease(
+                                        child_write_scope.clone(),
+                                        self.stack
+                                            .last()
+                                            .and_then(|frame| frame.agent.write_scope.as_deref()),
+                                        lease,
+                                    )
+                                });
                     }
                     if let Some(err) = unknown_agent_error {
+                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                            &self.session.db,
+                            child_workspace_leases.iter().map(Option::as_ref),
+                        )
+                        .await;
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id,

@@ -1148,7 +1148,20 @@ async fn dispatch_one_timed(
     current_tool_call_id: Option<&str>,
 ) -> (Result<ToolOutput>, u64) {
     let start = Instant::now();
-    let result = dispatch_one(tools, name, args, ctx, current_tool_call_id).await;
+    // Tool contexts are turn snapshots. Consult the durable lease ledger at
+    // every native dispatch boundary so a concurrent expiry/revocation fails
+    // closed before this call can reach a filesystem, shell, or harness tool.
+    let result = if let Some(lease) = ctx.workspace_lease.as_deref() {
+        match lease.revalidate_for_tools(&ctx.session.db).await {
+            Ok(()) => dispatch_one(tools, name, args, ctx, current_tool_call_id).await,
+            Err(error) => Err(crate::engine::tool::invalid_input(format!(
+                "workspace lease `{}` is unavailable at this tool boundary: {error:#}",
+                lease.id
+            ))),
+        }
+    } else {
+        dispatch_one(tools, name, args, ctx, current_tool_call_id).await
+    };
     (result, start.elapsed().as_millis() as u64)
 }
 

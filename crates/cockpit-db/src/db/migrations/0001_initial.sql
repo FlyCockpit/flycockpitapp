@@ -5057,6 +5057,10 @@ CREATE TABLE workspace_leases (
     session_id                TEXT NOT NULL,
     agent_instance_id         TEXT NOT NULL,
     write_scope_lease_id      TEXT NOT NULL,
+    -- A child workspace lease remains live only while this durable parent is
+    -- live.  This is workspace-lease lineage, distinct from write-scope
+    -- transfer lineage, and is intentionally immutable provenance.
+    parent_workspace_lease_id TEXT,
     canonical_repository_id   TEXT NOT NULL,
     canonical_root            TEXT NOT NULL,
     kind                      TEXT NOT NULL CHECK (kind IN ('same_root', 'subdirectory', 'managed_worktree')),
@@ -5080,6 +5084,8 @@ CREATE TABLE workspace_leases (
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_workspace_lease_id, session_id)
+        REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (pinned_by_agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK ((pinned_at_unix_ms IS NULL) = (pinned_by_agent_instance_id IS NULL)),
@@ -5138,6 +5144,7 @@ WHEN NEW.workspace_lease_id <> OLD.workspace_lease_id
   OR NEW.session_id <> OLD.session_id
   OR NEW.agent_instance_id <> OLD.agent_instance_id
   OR NEW.write_scope_lease_id <> OLD.write_scope_lease_id
+  OR NEW.parent_workspace_lease_id IS NOT OLD.parent_workspace_lease_id
   OR NEW.canonical_repository_id <> OLD.canonical_repository_id
   OR NEW.canonical_root <> OLD.canonical_root
   OR NEW.kind <> OLD.kind
@@ -5174,9 +5181,21 @@ WHEN NOT EXISTS (
     SELECT 1 FROM write_scope_leases w
     WHERE w.lease_id = NEW.write_scope_lease_id
       AND w.session_id = NEW.session_id
-      AND w.owner_id = NEW.agent_instance_id
       AND w.state = 'active'
-      AND w.scope_path = NEW.canonical_root
+      AND (
+          -- A daemon-issued lease is bound to the session-root write scope,
+          -- but remains model-facing owner-scoped through workspace_leases.
+          NEW.host_issued = 1
+          AND w.owner_id = 'session-root'
+          AND w.parent_lease_id IS NULL
+          AND w.agent_instance_id IS NULL
+          OR
+          -- Ordinary leases must remain exactly bound to the caller-owned
+          -- scope and root; they cannot borrow the daemon root authority.
+          NEW.host_issued = 0
+          AND w.owner_id = NEW.agent_instance_id
+          AND w.scope_path = NEW.canonical_root
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'workspace lease requires active owned write scope');

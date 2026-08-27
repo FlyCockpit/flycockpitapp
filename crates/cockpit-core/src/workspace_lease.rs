@@ -164,6 +164,7 @@ pub struct WorkspaceLease {
     pub session_id: Uuid,
     pub owner_agent_instance_id: Uuid,
     pub write_scope_lease_id: Uuid,
+    pub parent_workspace_lease_id: Option<Uuid>,
     pub canonical_repository_id: String,
     pub canonical_root: PathBuf,
     pub kind: WorkspaceLeaseKind,
@@ -200,6 +201,7 @@ impl WorkspaceLease {
             session_id: row.session_id,
             owner_agent_instance_id: row.agent_instance_id,
             write_scope_lease_id: row.write_scope_lease_id,
+            parent_workspace_lease_id: row.parent_workspace_lease_id,
             canonical_repository_id: row.canonical_repository_id.clone(),
             canonical_root,
             kind,
@@ -231,6 +233,7 @@ impl WorkspaceLease {
             session_id: Uuid::nil(),
             owner_agent_instance_id: Uuid::nil(),
             write_scope_lease_id: Uuid::nil(),
+            parent_workspace_lease_id: None,
             canonical_repository_id: "ephemeral".into(),
             canonical_root: visibility_root.clone(),
             kind,
@@ -252,6 +255,36 @@ impl WorkspaceLease {
 
     pub fn is_revoked_or_expired(&self, now_ms: i64) -> bool {
         !self.is_live(now_ms)
+    }
+
+    /// Revalidate a durable token immediately before a native effect boundary.
+    /// `ToolCtx` intentionally contains a cheap snapshot for confinement, but
+    /// that snapshot cannot authorize a tool after another actor has expired
+    /// or revoked its durable row. Ephemeral tokens are test/preflight-only;
+    /// production tokens must have both a durable owner and a live ledger row.
+    pub async fn revalidate_for_tools(&self, db: &crate::db::Db) -> Result<()> {
+        if self.id.is_nil() {
+            return Ok(());
+        }
+        let row = db
+            .workspace_lease_for_tools(
+                self.session_id,
+                self.owner_agent_instance_id,
+                self.id,
+                now_unix_ms(),
+            )
+            .await?
+            .context("workspace lease is revoked, expired, or no longer owner-scoped")?;
+        let durable = Self::from_row(&row)?;
+        if durable.canonical_repository_id != self.canonical_repository_id
+            || durable.canonical_root != self.canonical_root
+            || durable.kind != self.kind
+            || durable.visibility_root != self.visibility_root
+            || self.allowed_ops.intersect(durable.allowed_ops) != self.allowed_ops
+        {
+            bail!("workspace lease durable record no longer matches this tool context");
+        }
+        Ok(())
     }
 
     pub fn allows_read(&self) -> bool {
@@ -315,10 +348,23 @@ impl WorkspaceLease {
         else {
             return false;
         };
-        if worktree_root != root {
-            return false;
+        match self.kind {
+            // A same-root or subtree lease deliberately records its visibility
+            // root, which can be below the Git worktree root.  It must still
+            // resolve inside that same worktree, never merely to a similarly
+            // named repository elsewhere.
+            WorkspaceLeaseKind::SameRoot | WorkspaceLeaseKind::Subdirectory
+                if !cockpit_host::path_containment::contained_under(&worktree_root, &root) =>
+            {
+                return false;
+            }
+            // Managed worktrees are host-owned filesystem identities: their
+            // leased root is the worktree root exactly, not an arbitrary
+            // subdirectory within it.
+            WorkspaceLeaseKind::ManagedWorktree if worktree_root != root => return false,
+            _ => {}
         }
-        let Ok(repository_id) = canonical_repository_identity(&root) else {
+        let Ok(repository_id) = canonical_repository_identity(&worktree_root) else {
             return false;
         };
         if repository_id != self.canonical_repository_id {
@@ -327,7 +373,8 @@ impl WorkspaceLease {
         // The receipt hashes deliberately avoid persisting raw refs/SHAs.
         // Recompute against Git's complete durable object/ref lists to prove
         // that the recorded base still belongs to this repository.
-        let Ok(commits) = crate::git::run_git_checked(&root, &["rev-list", "--all"]) else {
+        let Ok(commits) = crate::git::run_git_checked(&worktree_root, &["rev-list", "--all"])
+        else {
             return false;
         };
         if !commits
@@ -336,7 +383,8 @@ impl WorkspaceLease {
         {
             return false;
         }
-        let Ok(refs) = crate::git::run_git_checked(&root, &["for-each-ref", "--format=%(refname)"])
+        let Ok(refs) =
+            crate::git::run_git_checked(&worktree_root, &["for-each-ref", "--format=%(refname)"])
         else {
             return false;
         };
@@ -352,7 +400,7 @@ impl WorkspaceLease {
         if self.kind == WorkspaceLeaseKind::ManagedWorktree {
             let expected_branch = format!("cockpit-lease/{}", self.id);
             let Ok(branch) =
-                crate::git::run_git_checked(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
+                crate::git::run_git_checked(&worktree_root, &["rev-parse", "--abbrev-ref", "HEAD"])
             else {
                 return false;
             };
@@ -386,6 +434,7 @@ pub async fn issue_task_workspace_lease(
     session_id: Uuid,
     owner_agent_instance_id: Uuid,
     parent_grant: &EffectiveVnextGrant,
+    parent_workspace_lease: Option<&WorkspaceLease>,
     parent_cwd: &Path,
     requested_child_cwd: Option<&Path>,
     kind: WorkspaceLeaseKind,
@@ -457,10 +506,26 @@ pub async fn issue_task_workspace_lease(
                 session_id,
                 agent_instance_id: owner_agent_instance_id,
                 write_scope_lease_id,
+                parent_workspace_lease_id: parent_workspace_lease
+                    .map(|lease| lease.id)
+                    .filter(|id| !id.is_nil()),
                 canonical_repository_id: canonical_repository_identity(&repository)?,
                 canonical_root: canonical_root.display().to_string(),
                 kind: kind.to_db(),
-                allowed_ops: WorkspaceLeaseOps::for_computer()
+                // A host-issued child token is never a fresh ambient coding
+                // grant.  It starts at the parent's currently effective
+                // operations and later admission can only intersect further.
+                allowed_ops: parent_workspace_lease
+                    .map(|lease| lease.allowed_ops)
+                    .unwrap_or_else(|| {
+                        if kind == WorkspaceLeaseKind::SameRoot
+                            && parent_grant.computer_delegation_enabled()
+                        {
+                            WorkspaceLeaseOps::for_computer()
+                        } else {
+                            WorkspaceLeaseOps::for_coding()
+                        }
+                    })
                     .confined_to_kind(kind)
                     .to_bits(),
                 base_sha_digest: WorkspaceDigest::of(head.clone()),
@@ -539,6 +604,7 @@ pub async fn issue_managed_worktree_lease_for_harness(
                 session_id,
                 agent_instance_id: owner_agent_instance_id,
                 write_scope_lease_id,
+                parent_workspace_lease_id: None,
                 canonical_repository_id: canonical_repository_identity(&repository)?,
                 canonical_root: managed_path.display().to_string(),
                 kind: DbLeaseKind::ManagedWorktree,
@@ -580,6 +646,12 @@ pub async fn mark_harness_lease_uncertain(db: &crate::db::Db, lease: &WorkspaceL
 /// pin is a durable lifecycle observation without falsely labelling a
 /// successfully completed lease as an expiry.
 pub async fn grace_retain_completed_harness_lease(db: &crate::db::Db, lease: &WorkspaceLease) {
+    // Completion retention is for host-managed directories only. A same-root
+    // or subtree token may be inherited by several still-live children; one
+    // child's terminal result must never revoke that shared parent authority.
+    if lease.id.is_nil() || lease.kind != WorkspaceLeaseKind::ManagedWorktree {
+        return;
+    }
     if let Err(error) = db
         .grace_retain_workspace_lease(
             lease.session_id,
@@ -591,6 +663,40 @@ pub async fn grace_retain_completed_harness_lease(db: &crate::db::Db, lease: &Wo
         .await
     {
         tracing::warn!(error = %error, lease = %lease.id, "grace-retaining managed harness lease failed");
+    }
+}
+
+/// An allocated task lease that fails pure admission is not an active child
+/// authority. Retain any managed directory for inspection, but make the row
+/// non-live so a later request cannot accidentally adopt rejected authority.
+pub async fn grace_retain_rejected_workspace_lease(db: &crate::db::Db, lease: &WorkspaceLease) {
+    if lease.id.is_nil() || lease.kind != WorkspaceLeaseKind::ManagedWorktree {
+        return;
+    }
+    if let Err(error) = db
+        .grace_retain_workspace_lease(
+            lease.session_id,
+            lease.owner_agent_instance_id,
+            lease.id,
+            lease.revision,
+            now_unix_ms(),
+        )
+        .await
+    {
+        tracing::warn!(error = %error, lease = %lease.id, "grace-retaining rejected workspace lease failed");
+    }
+}
+
+/// All-or-nothing batch admission may allocate several managed worktrees
+/// before a later entry is rejected.  Roll every allocation back to grace,
+/// including the entry that failed after issuance, so none remains live and
+/// adoptable merely because an earlier sibling reached preflight first.
+pub async fn grace_retain_rejected_workspace_leases(
+    db: &crate::db::Db,
+    leases: impl IntoIterator<Item = Option<&WorkspaceLease>>,
+) {
+    for lease in leases.into_iter().flatten() {
+        grace_retain_rejected_workspace_lease(db, lease).await;
     }
 }
 
@@ -762,11 +868,8 @@ pub fn inherit_or_select_lease(
     parent: Option<&WorkspaceLease>,
     selected: Option<WorkspaceLease>,
 ) -> std::result::Result<Option<WorkspaceLease>, String> {
-    if let Some(selected) = selected {
-        return Ok(Some(selected));
-    }
     let Some(parent) = parent else {
-        return Ok(None);
+        return Ok(selected);
     };
     if !parent.is_live(now_unix_ms()) {
         return Err(format!(
@@ -774,7 +877,20 @@ pub fn inherit_or_select_lease(
             parent.id
         ));
     }
-    Ok(Some(parent.clone()))
+    match selected {
+        // A child-selected token is still bounded by its caller's live token.
+        // This survives descriptor/recovery reloads and closes the old path
+        // where `grant_rejection` observed an intersection but constructors
+        // received the selected token's wider operation set.
+        Some(mut selected) => {
+            selected.allowed_ops = selected
+                .allowed_ops
+                .intersect(parent.allowed_ops)
+                .confined_to_kind(selected.kind);
+            Ok(Some(selected))
+        }
+        None => Ok(Some(parent.clone())),
+    }
 }
 
 /// Result of intersecting a selected lease with the parent's live grant.
@@ -794,18 +910,35 @@ pub fn effective_write_scope_for_lease(
     parent_scope: Option<&Path>,
     lease: &WorkspaceLease,
 ) -> Option<PathBuf> {
-    requested.or_else(|| {
-        parent_scope.map_or_else(
-            || lease.visibility_root.clone(),
-            |parent| {
-                if cockpit_host::path_containment::contained_under(parent, &lease.visibility_root) {
-                    lease.visibility_root.clone()
-                } else {
-                    parent.to_path_buf()
-                }
-            },
-        )
-    })
+    // This is the materialized value delivered to child constructors. Never
+    // hand a constructor the original wider request after preflight merely
+    // proved an intersection exists; choose the narrowest overlapping scope.
+    let requested = requested.filter(|scope| lease.covers_path(scope));
+    match (requested, parent_scope) {
+        (Some(scope), Some(parent))
+            if cockpit_host::path_containment::contained_under(parent, &scope) =>
+        {
+            Some(scope)
+        }
+        (Some(_), Some(parent))
+            if cockpit_host::path_containment::contained_under(&lease.visibility_root, parent) =>
+        {
+            Some(lease.visibility_root.clone())
+        }
+        (Some(_), Some(_)) => Some(lease.visibility_root.clone()),
+        (Some(scope), None) => Some(scope),
+        (None, Some(parent))
+            if cockpit_host::path_containment::contained_under(parent, &lease.visibility_root) =>
+        {
+            Some(lease.visibility_root.clone())
+        }
+        (None, Some(parent))
+            if cockpit_host::path_containment::contained_under(&lease.visibility_root, parent) =>
+        {
+            Some(parent.to_path_buf())
+        }
+        (None, Some(_)) | (None, None) => Some(lease.visibility_root.clone()),
+    }
 }
 
 /// Intersect a selected workspace lease with the parent's live grant, the
@@ -1446,8 +1579,64 @@ mod tests {
 
     #[test]
     fn nested_declared_grants_succeed_and_minimal_agent_stays_a_leaf() {
-        let orchestrator = parent_grant(vec![DelegationTarget::SameRoot]);
-        assert!(orchestrator.delegation.is_some());
+        // AC3 topology: root orchestrator -> worktree orchestrator ->
+        // implementer/reviewer -> specialist. Each hop carries an explicit
+        // declaration; a similarly capable but undeclared hop is refused.
+        let root = parent_grant(vec![DelegationTarget::ManagedWorktree]);
+        let worktree_orchestrator = parent_grant(vec![DelegationTarget::Subdirectory]);
+        let mut implementer = parent_grant(vec![DelegationTarget::Subdirectory]);
+        let mut reviewer = parent_grant(vec![DelegationTarget::SameRoot]);
+        implementer.agent_id = "acme/implementer".into();
+        reviewer.agent_id = "acme/reviewer".into();
+        assert!(root.permits_child(
+            &AllowedChild::PortableRef {
+                portable_agent_ref: "acme/child".into(),
+            },
+            ExecutionKind::Coding,
+        ));
+        let mut worktree_orchestrator = worktree_orchestrator;
+        worktree_orchestrator
+            .delegation
+            .as_mut()
+            .unwrap()
+            .allowed_children = vec![
+            AllowedChild::PortableRef {
+                portable_agent_ref: "acme/implementer".into(),
+            },
+            AllowedChild::PortableRef {
+                portable_agent_ref: "acme/reviewer".into(),
+            },
+        ];
+        assert!(worktree_orchestrator.permits_child(
+            &AllowedChild::PortableRef {
+                portable_agent_ref: "acme/implementer".into(),
+            },
+            implementer.execution_kind,
+        ));
+        assert!(worktree_orchestrator.permits_child(
+            &AllowedChild::PortableRef {
+                portable_agent_ref: "acme/reviewer".into(),
+            },
+            reviewer.execution_kind,
+        ));
+        for parent in [&mut implementer, &mut reviewer] {
+            parent.delegation.as_mut().unwrap().allowed_children =
+                vec![AllowedChild::PortableRef {
+                    portable_agent_ref: "acme/specialist".into(),
+                }];
+            assert!(parent.permits_child(
+                &AllowedChild::PortableRef {
+                    portable_agent_ref: "acme/specialist".into(),
+                },
+                ExecutionKind::Coding,
+            ));
+        }
+        assert!(!worktree_orchestrator.permits_child(
+            &AllowedChild::PortableRef {
+                portable_agent_ref: "acme/undeclared".into(),
+            },
+            ExecutionKind::Coding,
+        ));
         let leaf = VnextAgentDef {
             schema_version: crate::agents::SCHEMA_VERSION,
             agent_id: "acme/minimal".into(),
@@ -1478,7 +1667,6 @@ mod tests {
             },
             ExecutionKind::Coding
         ));
-        let _ = orchestrator;
     }
 
     #[test]
@@ -1574,6 +1762,7 @@ mod tests {
                     session_id: session.session_id,
                     agent_instance_id: agent.agent_instance_id,
                     write_scope_lease_id: scope,
+                    parent_workspace_lease_id: None,
                     canonical_repository_id: "repo-id".into(),
                     canonical_root: repo.to_string_lossy().into_owned(),
                     kind: DbKind::SameRoot,
@@ -1593,6 +1782,22 @@ mod tests {
         assert_eq!(runtime.kind, WorkspaceLeaseKind::SameRoot);
         assert_eq!(runtime.allowed_ops, WorkspaceLeaseOps::for_coding());
         assert!(runtime.is_live(4));
+        runtime.revalidate_for_tools(&db).await.unwrap();
+        let retained = db
+            .grace_retain_workspace_lease(
+                session.session_id,
+                agent.agent_instance_id,
+                row.workspace_lease_id,
+                row.revision,
+                4,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(retained, LeaseCasOutcome::Transitioned(_)));
+        assert!(
+            runtime.revalidate_for_tools(&db).await.is_err(),
+            "a ToolCtx snapshot must fail closed after durable revocation"
+        );
 
         std::fs::remove_dir_all(&repo).unwrap();
         let recovered = recover_session_workspace_leases(&db, session.session_id, 5)

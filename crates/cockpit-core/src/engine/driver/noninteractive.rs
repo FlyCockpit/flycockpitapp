@@ -1143,6 +1143,7 @@ async fn resolve_recursive_vnext_workspace_lease(
                 session_id,
                 owner,
                 parent_grant,
+                parent_workspace_lease,
                 parent_cwd,
                 requested_child.as_deref(),
                 kind,
@@ -1174,6 +1175,29 @@ fn durable_workspace_lease_id(
     lease
         .filter(|lease| !lease.id.is_nil())
         .map(|lease| lease.id.to_string())
+}
+
+/// A background admission can reject after the foreground already issued an
+/// opaque managed-worktree token.  Re-load only that owner-scoped token and
+/// retire it; a stale/missing token is deliberately a no-op rather than a
+/// reason to widen recovery authority.
+async fn grace_retain_task_workspace_lease(
+    db: &crate::db::Db,
+    session_id: uuid::Uuid,
+    owner_agent_instance_id: Option<uuid::Uuid>,
+    workspace_lease: Option<&str>,
+) {
+    let Ok(lease) = crate::workspace_lease::load_lease_from_task_argument(
+        db,
+        session_id,
+        owner_agent_instance_id,
+        workspace_lease,
+    )
+    .await
+    else {
+        return;
+    };
+    crate::workspace_lease::grace_retain_rejected_workspace_leases(db, [lease.as_ref()]).await;
 }
 
 /// Recursive batches bypass the driver's durable completion queue, but their
@@ -2290,6 +2314,13 @@ impl Driver {
         // routing error having persisted no task delegation, registered no running
         // child, spawned nothing, and dispatched no inference.
         if let Err(err) = self.preflight_single_delegation(&task) {
+            grace_retain_task_workspace_lease(
+                &self.session.db,
+                self.session.id,
+                self.stack.last().and_then(|frame| frame.agent_instance_id),
+                task.workspace_lease.as_deref(),
+            )
+            .await;
             return Ok(
                 crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                     task.task_call_id.clone(),
@@ -2303,6 +2334,13 @@ impl Driver {
         let vnext_admissions = match self.admit_current_vnext_children(1) {
             Ok(permits) => permits,
             Err(err) => {
+                grace_retain_task_workspace_lease(
+                    &self.session.db,
+                    self.session.id,
+                    self.stack.last().and_then(|frame| frame.agent_instance_id),
+                    task.workspace_lease.as_deref(),
+                )
+                .await;
                 return Ok(
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task.task_call_id.clone(),
@@ -2687,7 +2725,7 @@ impl Driver {
             let resolved_write_scope =
                 recovered_workspace_lease
                     .as_ref()
-                    .map_or(resolved_write_scope, |lease| {
+                    .map_or(resolved_write_scope.clone(), |lease| {
                         crate::workspace_lease::effective_write_scope_for_lease(
                             resolved_write_scope,
                             self.stack
@@ -2753,21 +2791,30 @@ impl Driver {
             )
             .await;
             return match outcome {
-                Ok(outcome) => Ok(SingleNoninteractiveCompletion {
-                    child_agent,
-                    task_call_id,
-                    task_provider_item_id,
-                    task_function_call_id,
-                    report: outcome.report,
-                    failed: false,
-                    failure: None,
-                    partial_progress: DelegationPartialProgress::default(),
-                    new_handle: None,
-                    snapshot: NoninteractiveDelegationSnapshot::from_history(outcome.history),
-                    shrink: None,
-                    repair_notes,
-                    child_routing: Some(child_routing),
-                }),
+                Ok(outcome) => {
+                    if let Some(lease) = recovered_workspace_lease.as_ref() {
+                        crate::workspace_lease::grace_retain_completed_harness_lease(
+                            &self.session.db,
+                            lease,
+                        )
+                        .await;
+                    }
+                    Ok(SingleNoninteractiveCompletion {
+                        child_agent,
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        report: outcome.report,
+                        failed: false,
+                        failure: None,
+                        partial_progress: DelegationPartialProgress::default(),
+                        new_handle: None,
+                        snapshot: NoninteractiveDelegationSnapshot::from_history(outcome.history),
+                        shrink: None,
+                        repair_notes,
+                        child_routing: Some(child_routing),
+                    })
+                }
                 Err(error) => {
                     let (message, history, fallback_decision, failure) = error.into_parts();
                     Ok(SingleNoninteractiveCompletion {
@@ -2816,6 +2863,13 @@ impl Driver {
             match resolve_write_scope(write_scope.as_deref(), &child_cwd.resolved, &self.cwd) {
                 Ok(scope) => scope,
                 Err(err) => {
+                    grace_retain_task_workspace_lease(
+                        &self.session.db,
+                        self.session.id,
+                        self.stack.last().and_then(|frame| frame.agent_instance_id),
+                        workspace_lease.as_deref(),
+                    )
+                    .await;
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
@@ -2901,6 +2955,13 @@ impl Driver {
         })
         .await
         {
+            if let Some(lease) = resolved_workspace_lease.as_ref() {
+                crate::workspace_lease::grace_retain_rejected_workspace_lease(
+                    &self.session.db,
+                    lease,
+                )
+                .await;
+            }
             return Ok(SingleNoninteractiveCompletion {
                 child_agent,
                 task_call_id,
@@ -2920,7 +2981,7 @@ impl Driver {
         let resolved_write_scope =
             resolved_workspace_lease
                 .as_ref()
-                .map_or(resolved_write_scope, |lease| {
+                .map_or(resolved_write_scope.clone(), |lease| {
                     crate::workspace_lease::effective_write_scope_for_lease(
                         resolved_write_scope,
                         self.stack
@@ -2950,6 +3011,11 @@ impl Driver {
                     crate::engine::builtin::child_llm_mode_for_model(&docs_args, &docs_model)
                 }
                 Err(e) => {
+                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                        &self.session.db,
+                        [resolved_workspace_lease.as_ref()],
+                    )
+                    .await;
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
@@ -2986,6 +3052,11 @@ impl Driver {
             ) {
                 Ok(surface) => surface.llm_mode,
                 Err(e) => {
+                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                        &self.session.db,
+                        [resolved_workspace_lease.as_ref()],
+                    )
+                    .await;
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
@@ -3030,6 +3101,11 @@ impl Driver {
                 Ok(delivery) => delivery,
                 Err(e) => {
                     tracing::warn!(error = %e, task_call_id, "task delegation payload delivery failed");
+                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                        &self.session.db,
+                        [resolved_workspace_lease.as_ref()],
+                    )
+                    .await;
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
@@ -3145,6 +3221,11 @@ impl Driver {
                     fork_prior_history = history;
                 }
                 Err(e) => {
+                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                        &self.session.db,
+                        [resolved_workspace_lease.as_ref()],
+                    )
+                    .await;
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
@@ -3474,6 +3555,11 @@ impl Driver {
                 }
             }
         };
+
+        if let Some(lease) = resolved_workspace_lease.as_ref() {
+            crate::workspace_lease::grace_retain_completed_harness_lease(&self.session.db, lease)
+                .await;
+        }
 
         Ok(SingleNoninteractiveCompletion {
             child_agent,
@@ -5676,7 +5762,7 @@ impl Driver {
                 let resolved_write_scope =
                     workspace_lease
                         .as_ref()
-                        .map_or(resolved_write_scope, |lease| {
+                        .map_or(resolved_write_scope.clone(), |lease| {
                             crate::workspace_lease::effective_write_scope_for_lease(
                                 resolved_write_scope,
                                 driver
@@ -6031,6 +6117,13 @@ impl Driver {
                         }
                     }
                 };
+                if let Some(lease) = workspace_lease.as_ref() {
+                    crate::workspace_lease::grace_retain_completed_harness_lease(
+                        &driver.session.db,
+                        lease,
+                    )
+                    .await;
+                }
                 (idx, entry, outcome, snapshot, completion_sender)
             };
             runs.push(child_fut);
@@ -8330,8 +8423,8 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         agent_id: agent.name.clone(),
         agent_instance_id: Some(agent_instance_id),
         lock_identity: agent.name.clone(),
-        write_scope: None,
-        workspace_lease: workspace_lease.clone().map(Arc::new),
+        write_scope: agent.write_scope.clone(),
+        workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
         llm_mode: agent.llm_mode,
         locks: locks.clone(),
@@ -9741,6 +9834,11 @@ pub(crate) async fn run_noninteractive_resumable(
                 let child_cwd = match child_cwd {
                     Ok(path) => path,
                     Err(error) => {
+                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                            &session.db,
+                            [live_lease.as_ref()],
+                        )
+                        .await;
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id.clone(),
@@ -9758,6 +9856,11 @@ pub(crate) async fn run_noninteractive_resumable(
                 ) {
                     Ok(scope) => scope,
                     Err(error) => {
+                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                            &session.db,
+                            [live_lease.as_ref()],
+                        )
+                        .await;
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id.clone(),
@@ -9787,6 +9890,11 @@ pub(crate) async fn run_noninteractive_resumable(
                 )
                 .await
                 {
+                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                        &session.db,
+                        [live_lease.as_ref()],
+                    )
+                    .await;
                     next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
                         task_provider_item_id.clone(),
@@ -9796,6 +9904,16 @@ pub(crate) async fn run_noninteractive_resumable(
                     );
                     continue;
                 }
+                let resolved_write_scope =
+                    live_lease
+                        .as_ref()
+                        .map_or(resolved_write_scope.clone(), |lease| {
+                            crate::workspace_lease::effective_write_scope_for_lease(
+                                resolved_write_scope,
+                                agent.write_scope.as_deref(),
+                                lease,
+                            )
+                        });
                 let recovery_model = model.clone();
                 let recovery_granted_tools = granted_tools.clone();
                 let child_args = crate::engine::builtin::SpawnArgs {
@@ -9859,7 +9977,7 @@ pub(crate) async fn run_noninteractive_resumable(
                                     "model": model_selector_json(&recovery_model),
                                     "granted_tools": &recovery_granted_tools,
                                     "cwd": child_cwd.to_string_lossy(),
-                                    "write_scope": &write_scope,
+                                    "write_scope": &resolved_write_scope,
                                     "workspace_lease": durable_workspace_lease_id(live_lease.as_ref()),
                                 }));
                                 let snapshot_json = ready_noninteractive_recovery_snapshot(
@@ -9911,6 +10029,11 @@ pub(crate) async fn run_noninteractive_resumable(
                                         Some(parent_target.clone().with_agent_instance_id(child_agent_instance_id))
                                     }
                                     Ok(_) => {
+                                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                            &session.db,
+                                            [live_lease.as_ref()],
+                                        )
+                                        .await;
                                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                             task_call_id,
                                             task_provider_item_id,
@@ -9924,6 +10047,11 @@ pub(crate) async fn run_noninteractive_resumable(
                                         continue;
                                     }
                                     Err(error) => {
+                                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                            &session.db,
+                                            [live_lease.as_ref()],
+                                        )
+                                        .await;
                                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                             task_call_id,
                                             task_provider_item_id,
@@ -9938,6 +10066,11 @@ pub(crate) async fn run_noninteractive_resumable(
                                     }
                                 },
                                 Some(Err(error)) => {
+                                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                        &session.db,
+                                        [live_lease.as_ref()],
+                                    )
+                                    .await;
                                     next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                         task_call_id,
                                         task_provider_item_id,
@@ -9951,6 +10084,11 @@ pub(crate) async fn run_noninteractive_resumable(
                                     continue;
                                 }
                                 None => {
+                                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                        &session.db,
+                                        [live_lease.as_ref()],
+                                    )
+                                    .await;
                                     next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                         task_call_id,
                                         task_provider_item_id,
@@ -9966,6 +10104,11 @@ pub(crate) async fn run_noninteractive_resumable(
                             }
                             }
                             Err(error) => {
+                                crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                    &session.db,
+                                    [live_lease.as_ref()],
+                                )
+                                .await;
                                 next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                     task_call_id,
                                     task_provider_item_id,
@@ -10016,6 +10159,13 @@ pub(crate) async fn run_noninteractive_resumable(
                     .unwrap_or_else(|error| format!("Error: {error}")),
                     Err(error) => format!("Error: {error:#}"),
                 };
+                if let Some(lease) = live_lease.as_ref() {
+                    crate::workspace_lease::grace_retain_completed_harness_lease(
+                        &session.db,
+                        lease,
+                    )
+                    .await;
+                }
                 let completed_next_prompt =
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id.clone(),
@@ -10112,9 +10262,10 @@ pub(crate) async fn run_noninteractive_resumable(
                 };
                 let parent_grant = agent.vnext_grant.as_ref().expect("guarded above").clone();
                 let mut prepared = Vec::with_capacity(entries.len());
+                let mut issued_workspace_leases = Vec::with_capacity(entries.len());
                 let mut rejection = None;
 
-                for (idx, entry) in entries.into_iter().enumerate() {
+                for (idx, mut entry) in entries.into_iter().enumerate() {
                     // Keep recursive batches on the same host-issuance path
                     // as foreground batches and recursive singles. In
                     // particular, containment kinds are not UUIDs: the host
@@ -10140,6 +10291,7 @@ pub(crate) async fn run_noninteractive_resumable(
                             break;
                         }
                     };
+                    issued_workspace_leases.push(live_lease.clone());
                     let child_cwd = match live_lease.as_ref() {
                         Some(lease)
                             if lease.kind
@@ -10194,6 +10346,17 @@ pub(crate) async fn run_noninteractive_resumable(
                         rejection = Some(format!("batch entry `{}`: {error}", entry.label));
                         break;
                     }
+                    let resolved_write_scope =
+                        live_lease
+                            .as_ref()
+                            .map_or(resolved_write_scope.clone(), |lease| {
+                                crate::workspace_lease::effective_write_scope_for_lease(
+                                    resolved_write_scope,
+                                    agent.write_scope.as_deref(),
+                                    lease,
+                                )
+                            });
+                    entry.write_scope = resolved_write_scope.clone();
                     let child_args = crate::engine::builtin::SpawnArgs {
                         model: agent.model.clone(),
                         params: crate::engine::model::ModelParams {
@@ -10243,6 +10406,11 @@ pub(crate) async fn run_noninteractive_resumable(
                 }
 
                 if let Some(error) = rejection {
+                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                        &session.db,
+                        issued_workspace_leases.iter().map(Option::as_ref),
+                    )
+                    .await;
                     next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
                         task_provider_item_id.clone(),
@@ -10257,6 +10425,11 @@ pub(crate) async fn run_noninteractive_resumable(
                 {
                     Ok(permits) => permits,
                     Err(error) => {
+                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                            &session.db,
+                            issued_workspace_leases.iter().map(Option::as_ref),
+                        )
+                        .await;
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
                                 task_provider_item_id.clone(),
@@ -10578,6 +10751,7 @@ pub(crate) async fn run_noninteractive_resumable(
                                 }
                             }
                         }
+                        let child_workspace_lease = child.workspace_lease.clone();
                         let report = Box::pin(run_noninteractive_resumable(
                             child,
                             Message::user(entry.prompt),
@@ -10606,6 +10780,13 @@ pub(crate) async fn run_noninteractive_resumable(
                         .await
                         .map(|outcome| outcome.report)
                         .unwrap_or_else(|error| format!("Error: {error}"));
+                        if let Some(lease) = child_workspace_lease.as_deref() {
+                            crate::workspace_lease::grace_retain_completed_harness_lease(
+                                &session.db,
+                                lease,
+                            )
+                            .await;
+                        }
                         if let (Some(child_agent_instance_id), Some(parent_agent_instance_id)) = (
                             recursive_child_agent_instance_id,
                             recursive_parent_agent_instance_id,

@@ -1294,7 +1294,7 @@ mod tests {
                 shutdown_gate: None,
                 env_overlay: None,
                 daemon_state_dir: Some(&state),
-                workspace_lease_id: None,
+                workspace_lease_id: Some(uuid::Uuid::new_v4()),
             })
             .await
             .unwrap()
@@ -1695,7 +1695,7 @@ mod tests {
             shutdown_gate: None,
             env_overlay: None,
             daemon_state_dir: Some(&state),
-            workspace_lease_id: None,
+            workspace_lease_id: Some(uuid::Uuid::new_v4()),
         })
         .await
         .unwrap();

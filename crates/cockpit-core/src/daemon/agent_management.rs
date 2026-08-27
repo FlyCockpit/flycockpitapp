@@ -1735,10 +1735,8 @@ pub async fn recover_agent_mutation_journals(
                 ),
             })?;
         if !matches {
-            let credential_mutations: std::collections::BTreeMap<
-                String,
-                AgentCredentialMutation,
-            > = serde_json::from_str(&credential_compensation_json).map_err(internal)?;
+            let credential_mutations: std::collections::BTreeMap<String, AgentCredentialMutation> =
+                serde_json::from_str(&credential_compensation_json).map_err(internal)?;
             compensate_agent_mcp_credentials(ctx, &project_root, &credential_mutations).await?;
             if still_consumed {
                 cancel_agent_mutation_journal(

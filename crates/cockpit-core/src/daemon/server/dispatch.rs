@@ -12349,8 +12349,7 @@ async fn handle_serialized_request_impl(
                 };
                 let durable_expires_at_unix_ms = match &durable_flow {
                     Some(DurableOAuthFlow::Mcp {
-                        expires_at_unix_ms,
-                        ..
+                        expires_at_unix_ms, ..
                     }) => *expires_at_unix_ms,
                     _ => {
                         return Err(bad_request(

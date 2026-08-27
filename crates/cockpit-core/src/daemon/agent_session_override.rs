@@ -629,7 +629,6 @@ mod tests {
         let dto = build_effective_settings(&ctx);
         assert!(dto.terminal);
         assert!(dto.sandbox.allowed.is_empty());
-        assert!(dto.mode.allowed.is_empty());
         assert_eq!(
             dto.sandbox.locked_reason,
             Some(AgentControlLockedReasonV1::Terminal)

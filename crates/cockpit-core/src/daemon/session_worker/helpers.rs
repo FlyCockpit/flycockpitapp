@@ -172,19 +172,28 @@ pub(crate) async fn removed_primary_notice(
     cfg: &crate::config::extended::ExtendedConfig,
 ) -> Option<String> {
     let row = db.get_session(session_id).await.ok().flatten()?;
-    let text = if crate::agents::is_removed_primary(&row.active_agent) {
-        format!(
+    let mut notices = Vec::new();
+    if crate::agents::is_removed_primary(&row.active_agent) {
+        notices.push(format!(
             "Primary agent `{}` was removed; continuing with `{}`.",
             row.active_agent,
             crate::agents::FALLBACK_PRIMARY
-        )
-    } else {
-        let default_primary = cfg.removed_default_primary_agent()?;
-        format!(
+        ));
+    } else if let Some(default_primary) = cfg.removed_default_primary_agent() {
+        notices.push(format!(
             "Default primary agent `{default_primary}` was removed; continuing with `{}`.",
             crate::agents::FALLBACK_PRIMARY
-        )
-    };
+        ));
+    }
+    if cfg.removed_llm_mode().is_some() {
+        notices.push(
+            "llm_mode is no longer used; posture now comes from agent definitions".to_string(),
+        );
+    }
+    let text = notices.join("\n");
+    if text.is_empty() {
+        return None;
+    }
     let already_recorded = db
         .list_session_events(session_id)
         .await

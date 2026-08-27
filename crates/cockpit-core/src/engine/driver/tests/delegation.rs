@@ -53,13 +53,14 @@ fn outcome_tool_result_text(outcome: crate::engine::agent::TurnOutcome) -> Strin
     }
 }
 
-fn write_test_agent(root: &std::path::Path, name: &str, _fork_eligible: bool) {
+fn write_test_agent(root: &std::path::Path, name: &str, fork_eligible: bool) {
     let dir = root.join(".cockpit").join("agents");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join(format!("{name}.md")),
         format!(
-            "---\ndescription: Test agent.\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute a coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\nTest prompt.\n"
+            "---\ndescription: Test agent.\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute a coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: {}\n---\n\nTest prompt.\n",
+            if fork_eligible { "[forkContext]" } else { "[]" }
         ),
     )
     .unwrap();
@@ -118,14 +119,20 @@ async fn fork_rejected_with_explicit_model_selector() {
 }
 
 #[tokio::test]
-async fn fork_rejected_for_non_fork_eligible_agent() {
+async fn fork_rejected_without_fork_context_capability() {
     let (mut driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", false);
     set_active_agent_name(&mut driver, "forker");
+    let mut agent = (*driver.stack[0].agent).clone();
+    agent.posture = crate::agents::PostureResolution::standard();
+    driver.stack[0].agent = std::sync::Arc::new(agent);
 
     let body = fork_refusal_text(&driver, fork_delegate_args("forker", "look")).await;
 
-    assert!(body.contains("is not fork eligible"), "{body}");
+    assert!(
+        body.contains("requires the `forkContext` capability"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -152,14 +159,15 @@ async fn fork_rejected_with_redundant_seed_tags() {
     assert!(body.contains("remove @file/@dir/ and /skill"), "{body}");
 }
 
-#[tokio::test]
-async fn vnext_agent_refuses_retired_fork_eligibility_contract() {
-    let (mut driver, tmp) = test_driver_without_network(8);
+#[test]
+fn vnext_agent_fork_eligibility_comes_from_capability() {
+    let (_driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", true);
-    set_active_agent_name(&mut driver, "forker");
-
-    let body = fork_refusal_text(&driver, fork_delegate_args("forker", "steer")).await;
-    assert!(body.contains("is not fork eligible"), "{body}");
+    let def = crate::agents::resolve(tmp.path(), "forker")
+        .unwrap()
+        .expect("authored def");
+    let posture = crate::agents::PostureResolution::from_def(&def);
+    assert!(crate::engine::tool::Capability::ForkContext.enabled(&posture));
 }
 
 #[tokio::test]
@@ -598,6 +606,7 @@ async fn grant_rejection_unknown_agent_lists_reachable_agents() {
         config: &driver.config,
         parent_agent: "Build",
         parent_vnext_grant: None,
+        parent_posture: None,
         child_agent: "no-such-agent",
         grant: &[],
         assistant_db: &driver.session.db,

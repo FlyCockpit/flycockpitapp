@@ -788,16 +788,14 @@ impl DelegationCustody {
             .unwrap_or_else(|| self.session_redact.enforced().scrub(brief))
     }
 
-    /// Routing diagnostics for this delegation: trust and mode as separate
-    /// fields, the explicit custody filter and its reason, and the per-branch
-    /// custody record.
+    /// Routing diagnostics for this delegation: trust, the explicit custody
+    /// filter and its reason, and the per-branch custody record.
     pub fn routing_diagnostics_json(&self) -> Value {
         let routing = self.route.routing_diagnostics();
         serde_json::json!({
             "provider": routing.provider,
             "model": routing.model,
             "trust": routing.trust,
-            "mode": routing.mode,
             "custody_filter": routing.custody_filter,
             "custody_filter_reason": routing.custody_filter_reason,
             "custody_branches": self.diagnostics,
@@ -1327,8 +1325,7 @@ fn selector_json(
     Value::Object(object)
 }
 
-/// Routing diagnostics. Trust (data custody) and mode (harness posture) are
-/// reported as separate fields so neither can be read as implying the other.
+/// Routing diagnostics for model selection and data custody.
 fn policy_summary(providers: &ProvidersConfig, resolved: &ResolvedModelPolicy) -> String {
     let caps = providers.resolve_effective_model_capabilities(
         &resolved.provider,
@@ -1337,9 +1334,8 @@ fn policy_summary(providers: &ProvidersConfig, resolved: &ResolvedModelPolicy) -
     );
     let diagnostics = resolved.routing_diagnostics();
     format!(
-        "trust={} mode={} custody_filter={} location={} quality_rank={} cost_rank={} capabilities={} context_tokens={}",
+        "trust={} custody_filter={} location={} quality_rank={} cost_rank={} capabilities={} context_tokens={}",
         diagnostics.trust,
-        diagnostics.mode,
         diagnostics.custody_filter.unwrap_or("none"),
         resolved
             .location
@@ -1681,7 +1677,6 @@ mod tests {
         assert!(discovery.contains("minimax:MiniMax-M2"));
         assert!(!discovery.contains("minimax:hidden"));
         assert!(discovery.contains("trust="));
-        assert!(discovery.contains("mode="));
         assert!(
             DelegationModelSelector::from_value(Some(&serde_json::json!("cheap_code"))).is_err()
         );
@@ -2422,7 +2417,6 @@ mod tests {
         let diagnostics = custody.routing_diagnostics_json();
         assert_eq!(diagnostics["trust"], "untrusted");
         assert_eq!(diagnostics["custody_filter"], "untrusted");
-        assert!(diagnostics["mode"].is_string());
         assert!(
             !diagnostics.to_string().contains(REDACTION_TEST_SECRET),
             "diagnostics must never carry payload material"

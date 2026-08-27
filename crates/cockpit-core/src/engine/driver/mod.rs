@@ -11969,6 +11969,7 @@ impl Driver {
                 .map(|grant| Arc::new(grant.host_policy.clone())),
             vnext_local_installation_resolver: self.vnext_local_installation_resolver.clone(),
             parent_vnext_grant: None,
+            parent_posture: None,
             // The foreground frame's recursive-`Swarm` depth (GOALS §24).
             // Background `Swarm` children are spawned off-stack with an
             // explicit advanced depth (see `dispatch_spawn`); on-stack
@@ -12016,6 +12017,7 @@ impl Driver {
                 .stack
                 .last()
                 .and_then(|frame| frame.agent.vnext_grant.clone()),
+            parent_posture: self.stack.last().map(|frame| frame.agent.posture.clone()),
             model_override,
             ..self.spawn_args(interactive)
         }
@@ -12062,6 +12064,7 @@ impl Driver {
                 .stack
                 .last()
                 .and_then(|frame| frame.agent.vnext_grant.clone()),
+            parent_posture: self.stack.last().map(|frame| frame.agent.posture.clone()),
             model_override,
             cwd: child_cwd.to_path_buf(),
             lock_identity: confinement.lock_identity,

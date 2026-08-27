@@ -5061,7 +5061,7 @@ impl Driver {
         if batch_refusal.is_none()
             && has_write_capable_entry
             && !crate::engine::tool::Capability::ScopedParallelWrite
-                .enabled(&self.stack[0].agent.posture)
+                .enabled(&self.stack.last().expect("stack never empty").agent.posture)
         {
             batch_refusal = Some(
                 "parallel write-capable task batches require the `scopedParallelWrite` capability on this agent; use sequential delegation instead"
@@ -7438,6 +7438,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
             vnext_local_installation_resolver: local_installations.clone(),
             parent_vnext_grant: Some(parent_grant),
+            parent_posture: Some(parent_agent.posture.clone()),
             swarm_depth: 0,
             swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
             granted_tools,
@@ -9468,6 +9469,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
                     vnext_local_installation_resolver: local_installations.clone(),
                     parent_vnext_grant: Some(parent_grant),
+                    parent_posture: Some(agent.posture.clone()),
                     swarm_depth: 0,
                     swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
                     granted_tools,
@@ -9822,6 +9824,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
                         vnext_local_installation_resolver: local_installations.clone(),
                         parent_vnext_grant: Some(parent_grant.clone()),
+                        parent_posture: Some(agent.posture.clone()),
                         swarm_depth: 0,
                         swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
                         granted_tools: entry.granted_tools.clone(),

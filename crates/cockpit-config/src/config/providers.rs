@@ -1973,9 +1973,6 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     if existing.backup.is_some() {
         fetched.backup = existing.backup.clone();
     }
-    if existing.mode.is_some() {
-        fetched.mode = existing.mode;
-    }
     if existing.inline_think.is_some() {
         fetched.inline_think = existing.inline_think;
     }

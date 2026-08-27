@@ -2750,11 +2750,17 @@ impl App {
         let quoted = cockpit_core::tags::quote_tracked_tags(&paste_wire, &self.accepted_tags);
         let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
-        let tag_policy = cockpit_core::tags::TagPolicy::new_for_caps(
-            &self.launch.cwd,
-            allow,
-            cockpit_core::tags::TagInlineCaps::STANDARD,
-        );
+        let active_def = self.agent_path.last().and_then(|name| {
+            cockpit_core::agents::resolve(&self.launch.cwd, name)
+                .ok()
+                .flatten()
+        });
+        let tag_caps = active_def
+            .as_ref()
+            .map(cockpit_core::tags::TagInlineCaps::for_def)
+            .unwrap_or(cockpit_core::tags::TagInlineCaps::STANDARD);
+        let tag_policy =
+            cockpit_core::tags::TagPolicy::new_for_caps(&self.launch.cwd, allow, tag_caps);
         let expanded = cockpit_core::tags::expand_tags_with_policy(&quoted, &tag_policy);
         // Attach any buffered `/git` blocks to this message's wire text
         // (GOALS §1l). The displayed user message keeps the original

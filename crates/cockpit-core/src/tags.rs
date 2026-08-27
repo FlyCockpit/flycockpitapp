@@ -68,7 +68,12 @@ impl TagInlineCaps {
     /// the def does not declare a profile — the mode axis no longer selects
     /// caps.
     pub fn for_def(def: &crate::agents::AgentDef) -> Self {
-        match def.context_policy.as_ref().and_then(|p| p.inline_caps) {
+        Self::for_context_policy(def.context_policy.as_ref())
+    }
+
+    /// Resolve caps from an already-resolved agent context policy.
+    pub fn for_context_policy(policy: Option<&crate::agents::ContextPolicy>) -> Self {
+        match policy.and_then(|p| p.inline_caps) {
             Some(crate::agents::InlineCapsProfile::Conservative) => Self {
                 max_bytes: OUTPUT_BYTE_CAP,
                 max_lines: 500,

@@ -1243,9 +1243,10 @@ fn agent_path_in_prefers_dir_form_over_flat() {
 /// `<agents>/<name>/<key>.md`.
 fn write_override_file(agents: &Path, name: &str, key: &str, body: &str) {
     let dir = agents.join(name);
-    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{key}.md"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
     let text = vnext_agent_document("A custom agent.", body);
-    fs::write(dir.join(format!("{key}.md")), text).unwrap();
+    fs::write(path, text).unwrap();
 }
 
 #[test]
@@ -1268,8 +1269,29 @@ fn dir_form_selects_per_model_override() {
         "OPUS BODY"
     );
     assert_eq!(def.resolved_prompt(Some("openai/gpt-5")), "GPT BODY");
+    assert_eq!(def.resolved_prompt_for_model("openai", "gpt-5"), "GPT BODY");
     // No hint → the canonical flat body.
     assert_eq!(def.resolved_prompt(None), "FLAT BODY");
+}
+
+#[test]
+fn dir_form_primary_slot_override_is_used_for_unlisted_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    write_override_file(&agents, "rev", "primary", "PRIMARY BODY");
+    fs::write(
+        agents.join("rev.md"),
+        vnext_agent_document("Flat canonical.", "FLAT BODY"),
+    )
+    .unwrap();
+
+    let def = trusted_resolve(tmp.path(), "rev")
+        .unwrap()
+        .expect("agent resolves");
+    assert_eq!(
+        def.resolved_prompt_for_model("unknown", "model"),
+        "PRIMARY BODY"
+    );
 }
 
 #[test]
@@ -1532,25 +1554,31 @@ Body.
 }
 
 #[test]
-fn bare_string_tool_description_is_rejected() {
+fn bare_string_tool_description_is_accepted() {
     let text = r#"---
 description: A custom builder.
-mode: primary
-tools: [grep]
+schemaVersion: 2
+agentId: authored/builder
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Execute a coding task
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
 tool_descriptions:
   grep: "Search differently."
 ---
 
 Body.
 "#;
-    let err = parse_agent(text, "builder", "x.md".into()).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("tool_descriptions.grep:"), "{msg}");
-    assert!(msg.contains("bare string is no longer accepted"), "{msg}");
+    let def = parse_agent(text, "builder", "x.md".into()).expect("bare string accepted");
     assert_eq!(
-        msg.matches("tool_descriptions.grep:").count(),
-        1,
-        "nested field path must not be duplicated: {msg}"
+        def.tool_descriptions.get("grep"),
+        Some(&ToolDescriptionSpec::Text(
+            "Search differently.".to_string()
+        ))
     );
 }
 
@@ -1770,6 +1798,26 @@ fn agent_def_capabilities_parse_and_validate() {
 }
 
 #[test]
+fn child_posture_intersection_never_widens_parent() {
+    let mut parent = def_with_tools("parent", &["read"]);
+    parent.capabilities = Some(BTreeSet::from([AgentCapability::FollowupSeed]));
+    let mut child = def_with_tools("child", &["read"]);
+    child.capabilities = Some(BTreeSet::from([
+        AgentCapability::FollowupSeed,
+        AgentCapability::SandboxEscalate,
+    ]));
+
+    let effective =
+        PostureResolution::from_def(&child).intersect_parent(&PostureResolution::from_def(&parent));
+    assert!(effective.grants().contains(&AgentCapability::FollowupSeed));
+    assert!(
+        !effective
+            .grants()
+            .contains(&AgentCapability::SandboxEscalate)
+    );
+}
+
+#[test]
 fn agent_def_tool_description_text_round_trips() {
     // A bare string parses as Text and serializes back as a bare string.
     let spec = ToolDescriptionSpec::Text("single canonical text".to_string());
@@ -1779,11 +1827,10 @@ fn agent_def_tool_description_text_round_trips() {
     let back: ToolDescriptionSpec = serde_yaml::from_str(&yaml).expect("deserialize");
     assert_eq!(back, spec);
 
-    // to_override maps Text to all three legacy slots.
+    // to_override maps Text to the canonical terse/verbose representation.
     let ov = spec.to_override();
-    assert_eq!(ov.normal.as_deref(), Some("single canonical text"));
-    assert_eq!(ov.frontier.as_deref(), Some("single canonical text"));
-    assert_eq!(ov.defensive.as_deref(), Some("single canonical text"));
+    assert_eq!(ov.text.as_deref(), Some("single canonical text"));
+    assert_eq!(ov.verbose_text.as_deref(), Some("single canonical text"));
 }
 
 #[test]
@@ -1823,10 +1870,14 @@ fn agent_def_context_policy_bounds() {
 #[test]
 fn agent_def_digest_changes_iff_posture_fields_change() {
     // vnext_digest_bytes hashes the full canonical markdown, so the new
-    // posture fields (emitted by to_markdown) must change the digest iff
-    // they change. Use a legacy (non-vnext) def so to_markdown emits the
-    // frontmatter fields directly.
-    let mut base = def_with_tools("custom", &["read"]);
+    // posture fields must survive canonical v2 serialization and affect the
+    // digest iff they change.
+    let mut base = parse_agent(
+        &vnext_agent_document("A custom agent.", "body"),
+        "custom",
+        "custom.md".into(),
+    )
+    .expect("vNext base def");
     base.capabilities = None;
     base.tool_steering = None;
     base.context_policy = None;
@@ -1869,4 +1920,9 @@ fn agent_def_digest_changes_iff_posture_fields_change() {
         digest_base, digest_reverted,
         "clearing the posture field reproduces the base digest"
     );
+
+    let markdown = with_policy.to_markdown().expect("canonical markdown");
+    let reparsed = parse_agent(&markdown, "custom", "custom.md".into())
+        .expect("canonical vNext posture fields reparse");
+    assert_eq!(reparsed.context_policy, with_policy.context_policy);
 }

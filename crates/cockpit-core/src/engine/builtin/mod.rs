@@ -168,6 +168,10 @@ pub struct SpawnArgs {
     /// built; separating them prevents a parent grant being replayed as a
     /// child's grant.
     pub parent_vnext_grant: Option<crate::agents::EffectiveVnextGrant>,
+    /// Effective posture of the direct parent. Delegated construction
+    /// intersects the child's declared grants with this set so authority can
+    /// never widen down the agent tree.
+    pub parent_posture: Option<crate::agents::PostureResolution>,
     /// Recursive-`Swarm` depth of the agent being spawned (GOALS §24):
     /// levels of Swarm-spawning-Swarm, root = 0. Used to bake the
     /// effective per-task depth into the `spawn` tool description so
@@ -2263,12 +2267,16 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         let model = resolve_agent_model(def, args)?;
         // Posture follows the child's OWN resolved model, not the root frame.
         let tool_steering = crate::agents::ToolSteering::from_def(def);
-        let posture = crate::agents::PostureResolution::from_def(def);
+        let declared_posture = crate::agents::PostureResolution::from_def(def);
+        let posture = args.parent_posture.as_ref().map_or_else(
+            || declared_posture.clone(),
+            |parent| declared_posture.intersect_parent(parent),
+        );
         let mut params = args.params.clone();
         if let Some(temp) = def.temperature {
             params.temperature = Some(temp as f64);
         }
-        let role = def.resolved_prompt(None);
+        let role = def.resolved_prompt_for_model(model.provider_id(), model.model_id_ref());
         return Ok(Agent {
             name: def.name.clone(),
             system: compose_system_prompt_for_model(role, &model, args),
@@ -2401,14 +2409,18 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // The child's posture (tool steering + capability grants) is resolved
     // from its OWN def (issue #75), never inherited from the root frame.
     let tool_steering = crate::agents::ToolSteering::from_def(def);
-    let posture = crate::agents::PostureResolution::from_def(def);
+    let declared_posture = crate::agents::PostureResolution::from_def(def);
+    let posture = args.parent_posture.as_ref().map_or_else(
+        || declared_posture.clone(),
+        |parent| declared_posture.intersect_parent(parent),
+    );
 
     let mut params = args.params.clone();
     if let Some(temp) = def.temperature {
         params.temperature = Some(temp as f64);
     }
 
-    let role = def.resolved_prompt(None);
+    let role = def.resolved_prompt_for_model(model.provider_id(), model.model_id_ref());
     Ok(Agent {
         name: def.name.clone(),
         system: compose_system_prompt_for_model(role, &model, args),
@@ -2765,6 +2777,7 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Resul
 /// but its intent is **delegate-eager**: hand substantive feature work to
 /// `builder` via `task` and direct-write only small single-scope changes.
 pub fn build(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("Build").expect("Build has an embedded definition");
     // Reachable subagents: the bundled set plus any custom subagent the
     // user has added (implementation note discoverability).
     let subs = build_subagents(&args.config, &args.cwd);
@@ -2843,8 +2856,8 @@ pub fn build(args: &SpawnArgs) -> Agent {
     );
 
     let model = args.effective_model();
-    let tool_steering = crate::agents::ToolSteering::from_def(def);
-    let posture = crate::agents::PostureResolution::from_def(def);
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
     let role = BUILD_PROMPT;
     let params = params_with_direct_computer(args, &model);
     Agent {
@@ -2908,17 +2921,20 @@ pub fn history(args: &SpawnArgs) -> Agent {
 /// no grant application. It receives only the caller-authored brief plus
 /// context already materialized in the delegation prompt.
 pub fn deepthink(args: &SpawnArgs) -> Agent {
+    let def =
+        crate::agents::embedded_default("deepthink").expect("deepthink has an embedded definition");
     let model = args.effective_model();
     Agent {
         name: "deepthink".to_string(),
         system: compose_system_prompt_for_effective_model(DEEPTHINK_PROMPT, args),
         role_prompt: DEEPTHINK_PROMPT.to_string(),
         tools: ToolBox::new(),
-        tool_steering: crate::agents::ToolSteering::from_def(def),
-        posture: crate::agents::PostureResolution::from_def(def),
+        tool_steering: crate::agents::ToolSteering::from_def(&def),
+        posture: crate::agents::PostureResolution::from_def(&def),
         model,
         params: args.params.clone(),
         scan_tool_results: false,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3014,6 +3030,7 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
 /// `task`, no MCP, and no docs-only grep/glob. Used by the hidden
 /// `Multireview` primary and by deeper scout recursion.
 pub fn scout(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("scout").expect("scout has an embedded definition");
     let tools = with_recall_tools(
         with_custom_tools(
             with_full_intel(
@@ -3034,8 +3051,8 @@ pub fn scout(args: &SpawnArgs) -> Agent {
     let tools = with_return_tool(tools, "scout");
 
     let model = args.effective_model();
-    let tool_steering = crate::agents::ToolSteering::from_def(def);
-    let posture = crate::agents::PostureResolution::from_def(def);
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
     let role = SCOUT_PROMPT;
     Agent {
         name: "scout".to_string(),
@@ -3068,6 +3085,8 @@ pub fn goal_control(
     role: crate::engine::schedule::authority::SpawnWorkerKind,
     args: &SpawnArgs,
 ) -> Agent {
+    let def = crate::agents::embedded_internal_default("standard")
+        .expect("standard has an internal agent definition");
     use crate::engine::schedule::authority::SpawnWorkerKind;
     let (name, system, tools) = match role {
         SpawnWorkerKind::GoalPlanner => (
@@ -3102,11 +3121,12 @@ pub fn goal_control(
         tools,
         // Scheduler-only goal workers inherit the parent's host-chosen model
         // (no selector), so posture resolves from that model's own config.
-        tool_steering: crate::agents::ToolSteering::from_def(def),
-        posture: crate::agents::PostureResolution::from_def(def),
+        tool_steering: crate::agents::ToolSteering::from_def(&def),
+        posture: crate::agents::PostureResolution::from_def(&def),
         model,
         params: args.params.clone(),
         scan_tool_results: true,
+        context_policy: def.context_policy.clone(),
         lock_identity: name.to_string(),
         write_scope: None,
         delegated: true,
@@ -3127,6 +3147,7 @@ pub fn goal_control(
 /// standalone plan to a fresh `Build` session when the user agrees. It holds no
 /// filesystem write or lock tools.
 pub fn plan(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("Plan").expect("Plan has an embedded definition");
     let base_tools = with_lsp_nav(with_build_family_intel(
         ToolBox::new()
             .with(Arc::new(crate::tools::read::ReadTool))
@@ -3152,8 +3173,8 @@ pub fn plan(args: &SpawnArgs) -> Agent {
     );
 
     let model = args.effective_model();
-    let tool_steering = crate::agents::ToolSteering::from_def(def);
-    let posture = crate::agents::PostureResolution::from_def(def);
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
     let role = PLAN_PROMPT;
     Agent {
         name: "Plan".to_string(),
@@ -3183,6 +3204,8 @@ pub fn plan(args: &SpawnArgs) -> Agent {
 /// Orchestrates `scout` fan-out and isolated harness reviewers, then returns a
 /// single consolidated analysis. No write/lock tools.
 pub fn multireview(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("Multireview")
+        .expect("Multireview has an embedded definition");
     let tools = with_recall_tools(
         with_custom_tools(
             with_full_intel(
@@ -3207,8 +3230,8 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
     );
 
     let model = args.effective_model();
-    let tool_steering = crate::agents::ToolSteering::from_def(def);
-    let posture = crate::agents::PostureResolution::from_def(def);
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
     let role = MULTIREVIEW_PROMPT;
     Agent {
         name: "Multireview".to_string(),
@@ -3248,6 +3271,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
 /// effective depth (`args.swarm_depth`) + ceiling so the model self-limits;
 /// a spawn over the ceiling is refused and the branch does the slice itself.
 pub fn bee(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("bee").expect("bee has an embedded definition");
     let recursive_targets = recursive_targets(&args.config, &["docs"]);
     let recursive_refs: Vec<&str> = recursive_targets.iter().map(String::as_str).collect();
     let base_tools = with_write_tools(with_full_intel(
@@ -3279,8 +3303,8 @@ pub fn bee(args: &SpawnArgs) -> Agent {
     let tools = with_return_tool(tools, "bee");
 
     let model = args.effective_model();
-    let tool_steering = crate::agents::ToolSteering::from_def(def);
-    let posture = crate::agents::PostureResolution::from_def(def);
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
     let role = BEE_PROMPT;
     Agent {
         name: "bee".to_string(),
@@ -3569,6 +3593,7 @@ mod tests {
             vnext_local_installation_resolver:
                 crate::agents::LocalInstallationResolver::no_installations(),
             parent_vnext_grant: None,
+            parent_posture: None,
             swarm_depth: 0,
             swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
             granted_tools: Vec::new(),

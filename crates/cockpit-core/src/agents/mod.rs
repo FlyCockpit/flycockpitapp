@@ -178,9 +178,14 @@ impl PostureResolution {
     /// `Some`, the declared set is authoritative; when `None`, the `standard`
     /// fallback (no capabilities) applies.
     pub fn from_def(def: &AgentDef) -> Self {
-        Self {
-            grants: def.capabilities.clone().unwrap_or_default(),
+        let mut grants = def.capabilities.clone().unwrap_or_default();
+        // `forkEligible` is the temporary parse alias retained for embedded
+        // legacy definitions. Normalize it at the sole posture-construction
+        // seam so it cannot remain a second runtime policy gate.
+        if def.capabilities.is_none() && def.fork_eligible {
+            grants.insert(AgentCapability::ForkContext);
         }
+        Self { grants }
     }
 
     /// The `standard` fallback posture: no capability grants (issue #75,
@@ -203,6 +208,14 @@ impl PostureResolution {
     /// The resolved grant set.
     pub fn grants(&self) -> &BTreeSet<AgentCapability> {
         &self.grants
+    }
+
+    /// Apply the no-widening delegation rule: a child may retain only grants
+    /// that are also present on its direct parent.
+    pub fn intersect_parent(&self, parent: &Self) -> Self {
+        Self {
+            grants: self.grants.intersection(&parent.grants).copied().collect(),
+        }
     }
 
     /// Whether a given [`crate::engine::tool::Capability`] is enabled under
@@ -902,6 +915,41 @@ impl AgentDef {
         &self.prompt
     }
 
+    /// Resolve the most specific prompt body for a concrete model. Exact
+    /// provider/model and bare model-id overrides win; otherwise a matching
+    /// vNext slot override applies, with `primary` as the execution slot used
+    /// by ordinary agent construction.
+    pub fn resolved_prompt_for_model(&self, provider: &str, model: &str) -> &str {
+        let qualified = format!("{provider}/{model}");
+        if let Some(body) = self.prompt_overrides.get(&qualified) {
+            return body;
+        }
+        if let Some(body) = self.prompt_overrides.get(model) {
+            return body;
+        }
+        if let Some(vnext) = &self.vnext {
+            for (slot_id, slot) in &vnext.model_slots {
+                let matches = slot.suggested_models.iter().any(|recommendation| {
+                    recommendation.upstream_identity == qualified
+                        || recommendation.upstream_identity == model
+                        || recommendation
+                            .provider_aliases
+                            .iter()
+                            .any(|alias| alias.provider_id == provider && alias.model_id == model)
+                });
+                if matches && let Some(body) = self.prompt_overrides.get(slot_id) {
+                    return body;
+                }
+            }
+            if vnext.model_slots.contains_key("primary")
+                && let Some(body) = self.prompt_overrides.get("primary")
+            {
+                return body;
+            }
+        }
+        &self.prompt
+    }
+
     /// Serialize back to the on-disk `<name>.md` form: YAML frontmatter
     /// fence + the markdown body. Used by eject so a built-in's default
     /// materializes as a faithful, re-editable file.
@@ -1010,6 +1058,18 @@ impl AgentDef {
         }
         if let Some(verification) = &vnext.verification {
             fm.insert("verification".into(), serde_yaml::to_value(verification)?);
+        }
+        if let Some(capabilities) = &self.capabilities {
+            fm.insert("capabilities".into(), serde_yaml::to_value(capabilities)?);
+        }
+        if let Some(tool_steering) = self.tool_steering {
+            fm.insert("toolSteering".into(), serde_yaml::to_value(tool_steering)?);
+        }
+        if let Some(context_policy) = &self.context_policy {
+            fm.insert(
+                "contextPolicy".into(),
+                serde_yaml::to_value(context_policy)?,
+            );
         }
         // Description remains display metadata, never an authority input.
         fm.insert("description".into(), self.description.clone().into());
@@ -1149,9 +1209,9 @@ fn parse_agent_with_scope(
         fork_eligible: bool,
         #[serde(default)]
         capabilities: Option<BTreeSet<AgentCapability>>,
-        #[serde(default)]
+        #[serde(rename = "toolSteering", default)]
         tool_steering: Option<ToolSteering>,
-        #[serde(default)]
+        #[serde(rename = "contextPolicy", default)]
         context_policy: Option<ContextPolicy>,
     }
 
@@ -1470,22 +1530,41 @@ pub fn load_profile_definition_from_owned_path(
 fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
     let agent_dir = dir.join(name);
 
-    // Read each per-model override file present in the directory. The file
-    // stem (minus `.md`) is the override key (model-slot name or model id).
+    // Read each per-model override file present in the directory. Model IDs
+    // commonly contain `/`, so nested paths such as
+    // `anthropic/claude-opus.md` are reconstructed as the key
+    // `anthropic/claude-opus`. Symlinked directories are not followed.
     let mut overrides: BTreeMap<String, String> = BTreeMap::new();
     let mut first_override_def: Option<AgentDef> = None;
-    let entries = std::fs::read_dir(&agent_dir)
-        .map_err(|e| anyhow::anyhow!("reading agent dir {}: {e}", agent_dir.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+    fn collect_override_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)
+            .map_err(|e| anyhow::anyhow!("reading agent dir {}: {e}", dir.display()))?
+        {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                collect_override_files(&path, files)?;
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("md")
+            {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut override_files = Vec::new();
+    collect_override_files(&agent_dir, &mut override_files)?;
+    override_files.sort();
+    for path in override_files {
+        let relative = path.strip_prefix(&agent_dir)?;
+        let mut key = relative.with_extension("").to_string_lossy().into_owned();
+        if std::path::MAIN_SEPARATOR != '/' {
+            key = key.replace(std::path::MAIN_SEPARATOR, "/");
+        }
+        if key.is_empty() {
             continue;
         }
-        let key = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(k) if !k.is_empty() => k.to_string(),
-            _ => continue,
-        };
         let text = read_agent_markdown(&path)?;
         let parsed = parse_agent(&text, name, path.clone())?;
         overrides.insert(key, parsed.prompt.clone());

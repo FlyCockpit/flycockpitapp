@@ -939,7 +939,6 @@ mod tests {
             .find(|model| model.id == "m")
             .unwrap();
         let model = serde_json::to_value(model_entry).unwrap();
-        assert_eq!(model["mode"], "frontier");
         assert_eq!(model["trust"], "trusted");
         assert_eq!(model["capability_overrides"]["image_input"], "supported");
         assert_eq!(model["subagent_invokable"], false);

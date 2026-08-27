@@ -2971,6 +2971,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         vnext_local_installation_resolver:
             crate::agents::LocalInstallationResolver::no_installations(),
         parent_vnext_grant: None,
+        parent_posture: None,
         swarm_depth: 0,
         swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         granted_tools: Vec::new(),
@@ -3116,6 +3117,42 @@ async fn roster_trim_removed_default_primary_notice_is_one_time() {
             .await
             .is_none(),
         "config-default notice is de-duped once recorded"
+    );
+}
+
+#[tokio::test]
+async fn removed_llm_mode_notice_is_one_time() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let row = db.create_session("proj", "/proj", "Build").await.unwrap();
+    let mut cfg = cfg_with(crate::config::extended::DefaultPrimaryAgent::Build);
+    cfg.removed_llm_mode = Some("defensive".to_string());
+
+    let notice = removed_primary_notice(row.session_id, &db, &cfg)
+        .await
+        .expect("first notice");
+    assert_eq!(
+        notice,
+        "llm_mode is no longer used; posture now comes from agent definitions"
+    );
+
+    db.insert_session_event(
+        row.session_id,
+        crate::db::session_log::SessionEventKind::Notice,
+        None,
+        None,
+        &serde_json::json!({
+            "text": notice,
+            "severity": "info",
+            "source": NoticeSource::DaemonDirect.as_str(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed_primary_notice(row.session_id, &db, &cfg)
+            .await
+            .is_none(),
+        "removed-mode notice is de-duped once recorded"
     );
 }
 

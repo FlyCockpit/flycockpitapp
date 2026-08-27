@@ -369,6 +369,12 @@ pub struct ExtendedConfig {
     #[serde(skip)]
     pub removed_default_primary_agent: Option<String>,
 
+    /// Runtime-only tombstone recording that a loaded layer still contained
+    /// the removed `llm_mode` key. It is never serialized back to config; the
+    /// daemon uses it to surface the migration notice once per session.
+    #[serde(skip)]
+    pub removed_llm_mode: Option<String>,
+
     /// Round-trip utility-model translation (implementation note).
     /// The user's language and the model's language; when both are set and
     /// differ, the inbound prompt is translated into the model's language
@@ -1484,6 +1490,10 @@ impl ExtendedConfig {
     pub fn removed_default_primary_agent(&self) -> Option<&str> {
         self.removed_default_primary_agent.as_deref()
     }
+
+    pub fn removed_llm_mode(&self) -> Option<&str> {
+        self.removed_llm_mode.as_deref()
+    }
 }
 
 impl Default for ExtendedConfig {
@@ -1542,6 +1552,7 @@ impl Default for ExtendedConfig {
             skills: SkillsConfig::default(),
             default_primary_agent: DefaultPrimaryAgent::default(),
             removed_default_primary_agent: None,
+            removed_llm_mode: None,
             translation: TranslationConfig::default(),
             sandbox_escalation_enabled: true,
             default_approval_mode: ApprovalMode::default(),
@@ -2479,15 +2490,19 @@ impl ExtendedConfigDoc {
         parse_field!("dialog", dialog);
         parse_field!("skills", skills);
         if raw.contains_key("llm_mode") {
-            tracing::warn!(
-                path = %self.path.display(),
-                key = "llm_mode",
-                "llm_mode is no longer supported; agent posture now comes from agent definitions"
+            cfg.removed_llm_mode = Some(
+                raw.get("llm_mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<non-string>")
+                    .to_string(),
             );
-            warnings.push(format!(
-                "llm_mode is no longer supported; agent posture now comes from agent definitions (ignored in {})",
-                self.path.display()
-            ));
+            tracing::warn!(
+                key = "llm_mode",
+                "llm_mode is no longer used; posture now comes from agent definitions"
+            );
+            warnings.push(
+                "llm_mode is no longer used; posture now comes from agent definitions".to_string(),
+            );
         }
         if let Some(value) = raw.get("defaultPrimaryAgent") {
             match value.as_str() {

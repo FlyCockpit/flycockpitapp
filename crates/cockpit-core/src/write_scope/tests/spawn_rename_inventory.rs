@@ -144,13 +144,7 @@ fn spawn_gate_refusal_names_write_scope() {
 #[test]
 fn builtin_prompts_require_write_scope_on_spawn() {
     let builtin = core_src().join("engine/builtin");
-    for name in [
-        "bee.md",
-        "bee.normal.md",
-        "bee.frontier.md",
-        "scout.md",
-        "multireview.md",
-    ] {
+    for name in ["bee.md", "scout.md", "multireview.md"] {
         let text = read(builtin.join(name));
         assert!(
             !text.contains("output_dir"),
@@ -181,7 +175,7 @@ fn builtin_prompts_require_write_scope_on_spawn() {
     //
     // So the prompts now carry the directive, and this test pins the directive
     // while forbidding the enforcement claim from coming back.
-    for name in ["bee.md", "bee.normal.md", "bee.frontier.md"] {
+    for name in ["bee.md"] {
         let text = read(builtin.join(name));
         assert!(
             text.contains("write boundary"),
@@ -191,7 +185,7 @@ fn builtin_prompts_require_write_scope_on_spawn() {
             text.contains("never write outside it"),
             "{name} must direct the bee to keep every write inside its write_scope"
         );
-        // Deliberately the full phrase: `bee.md` and `bee.normal.md` legitimately
+        // Deliberately the full phrase: `bee.md` legitimately
         // say "an over-ceiling spawn is refused", which IS enforced by
         // `delegation_helpers::spawn_gate`.
         assert!(

@@ -39,6 +39,9 @@ pub struct SessionSetupModelSlotV1 {
     pub unmatched_recommendations: Vec<AgentInstallationUnmatchedRecommendationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<SessionSetupUnavailableReasonV1>,
+    /// Marks the slot's default model among `choices`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_choice_id: Option<String>,
 }
 
 /// Closed reasons rendered by clients. Missing capability evidence never

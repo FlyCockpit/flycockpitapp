@@ -196,6 +196,24 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
         sandbox,
         verification,
         question,
+        model: cockpit_proto::AgentModelControlV1 {
+            effective: ctx.effective.as_ref().and_then(|o| {
+                o.model.as_ref().map(|binding| cockpit_proto::AgentModelRefV1 {
+                    provider_id: binding.provider.clone(),
+                    model_id: binding.model.clone(),
+                    is_default: false,
+                })
+            }),
+            allowed: Vec::new(),
+            pending: ctx.pending.as_ref().and_then(|o| {
+                o.model.as_ref().map(|binding| cockpit_proto::AgentModelRefV1 {
+                    provider_id: binding.provider.clone(),
+                    model_id: binding.model.clone(),
+                    is_default: false,
+                })
+            }),
+            locked_reason: terminal_lock,
+        },
     }
 }
 
@@ -939,6 +957,7 @@ mod tests {
             slot_id: slot_id.to_string(),
             choices,
             unmatched_recommendations: Vec::new(),
+            default_choice_id: None,
             unavailable_reason: unavailable,
         }
     }

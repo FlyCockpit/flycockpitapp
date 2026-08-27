@@ -3472,11 +3472,21 @@ impl AgentInstallationService {
                         choices: Vec::new(),
                         unmatched_recommendations: Vec::new(),
                         unavailable_reason: Some(SessionSetupUnavailableReasonV1::RebindRequired),
+                        default_choice_id: None,
                     };
                 }
                 let ranked =
                     crate::agents::ranked_compatible_offerings(slot, &offerings, providers);
                 let (choices, unmatched_recommendations) = binding_choices(slot_id, slot, &ranked);
+                let default_choice_id = slot.default_model().and_then(|default| {
+                    choices
+                        .iter()
+                        .find(|choice| {
+                            choice.provider_id == default.provider_id
+                                && choice.model_id == default.model_id
+                        })
+                        .map(|choice| choice.choice_id.clone())
+                });
                 SessionSetupModelSlotV1 {
                     slot_id: slot_id.clone(),
                     unavailable_reason: choices
@@ -3484,6 +3494,7 @@ impl AgentInstallationService {
                         .then_some(SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel),
                     choices,
                     unmatched_recommendations,
+                    default_choice_id,
                 }
             })
             .collect();
@@ -10217,6 +10228,7 @@ mod tests {
             slot_id: "primary".into(),
             choices: Vec::new(),
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
+            default_choice_id: None,
                 recommendation_id: "requires-tools".into(),
                 canonical_upstream_identity: "upstream/tools".into(),
                 author_label: None,

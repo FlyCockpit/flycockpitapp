@@ -44,6 +44,31 @@ pub struct AgentEffectiveSettingsV1 {
     pub sandbox: AgentSandboxControlV1,
     pub verification: AgentVerificationControlV1,
     pub question: AgentQuestionControlV1,
+    /// Model axis: effective/allowed/default for the focused node's slot.
+    #[serde(default)]
+    pub model: AgentModelControlV1,
+}
+
+/// Per-node model control. `allowed` is the slot's models with the default
+/// marked; picking outside the set is a derived-def path for the root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentModelControlV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<AgentModelRefV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<AgentModelRefV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<AgentModelRefV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_reason: Option<AgentControlLockedReasonV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentModelRefV1 {
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
 }
 
 /// Sandbox posture control. `allowed` is the daemon-classified non-escalating
@@ -296,6 +321,7 @@ mod tests {
                 locked_reason: None,
                 pending: None,
             },
+            model: AgentModelControlV1::default(),
         };
         assert_eq!(roundtrip(&snapshot), snapshot);
     }

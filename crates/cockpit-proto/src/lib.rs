@@ -79,9 +79,10 @@ pub use session_setup::{
 pub mod session_override;
 pub use session_override::{
     AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
-    AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
-    AgentSandboxControlV1, AgentSessionOverrideFieldV1, AgentSessionOverrideStatusV1,
-    AgentVerificationControlV1, AgentVerificationReductionV1, AgentVerificationRegionV1,
+    AgentModelControlV1, AgentModelRefV1, AgentQuestionControlV1, AgentQuestionEffectiveV1,
+    AgentQuestionOverrideV1, AgentSandboxControlV1, AgentSessionOverrideFieldV1,
+    AgentSessionOverrideStatusV1, AgentVerificationControlV1, AgentVerificationReductionV1,
+    AgentVerificationRegionV1,
 };
 #[cfg(feature = "remote")]
 pub mod remote_connection_metadata;
@@ -1241,11 +1242,11 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// Current wire schema version. v20 adds the attached-session, daemon-owned
 /// setup inventory. v19's entry-mode attach contract and every older fixture
 /// remain frozen migration evidence, not a compatibility window.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
-/// Oldest wire schema version this binary accepts. v20 is current-only: setup
-/// inventory is an explicit contract with no compatibility shim.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
+/// Oldest wire schema version this binary accepts. Exact-match only until a
+/// compacted v1 ships.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 22;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -4007,8 +4008,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[21];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[22];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -5528,7 +5529,7 @@ mod errorcode_forward_tests {
 /// not support. Keep this separate from the remote-gated supported-version
 /// table: fixture retention must never widen the live compatibility window.
 #[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
+const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
 
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
@@ -7951,8 +7952,8 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 21);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
@@ -7972,8 +7973,8 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 21);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {

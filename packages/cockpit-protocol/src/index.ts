@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 21 as const;
+export const PROTOCOL_VERSION = 22 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
@@ -1784,6 +1784,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                           unavailable_reason: z
                             .enum(["no_hard_compatible_local_model", "rebind_required"])
                             .optional(),
+                          default_choice_id: z.string().min(1).optional(),
                         })
                         .strict(),
                     )

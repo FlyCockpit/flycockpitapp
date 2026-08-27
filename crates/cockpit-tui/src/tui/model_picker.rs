@@ -241,7 +241,7 @@ pub fn ordered_model_choices_from_inventory(
             trust: m.trust,
         })
         .collect();
-    sort_entries(&mut entries, counts);
+    sort_entries(&mut entries, counts, &[]);
     entries
         .into_iter()
         .map(|e| {
@@ -257,10 +257,21 @@ pub fn ordered_model_choices_from_inventory(
         .collect()
 }
 
-fn sort_entries(entries: &mut [Entry], counts: &HashMap<String, u64>) {
+fn sort_entries(
+    entries: &mut [Entry],
+    counts: &HashMap<String, u64>,
+    slot_first: &[(String, String)],
+) {
     entries.sort_by(|a, b| {
-        b.is_favorite
-            .cmp(&a.is_favorite)
+        let a_slot = slot_first
+            .iter()
+            .any(|(provider, model)| provider == &a.provider_id && model == &a.model_id);
+        let b_slot = slot_first
+            .iter()
+            .any(|(provider, model)| provider == &b.provider_id && model == &b.model_id);
+        b_slot
+            .cmp(&a_slot)
+            .then_with(|| b.is_favorite.cmp(&a.is_favorite))
             .then_with(|| {
                 let ca = counts.get(&a.label()).copied().unwrap_or(0);
                 let cb = counts.get(&b.label()).copied().unwrap_or(0);
@@ -321,10 +332,11 @@ impl ModelPickerDialog {
                 entries.push(picker);
             }
         }
-        // Stable order: favorites first, then 30-day usage count desc,
-        // then label asc (the original alphabetical fallback). Favorites
-        // stay pinned above a more-frequent non-favorite.
-        sort_entries(&mut entries, counts);
+        // Slot models first (default marked by the caller), then favorites,
+        // then 30-day usage count desc, then label asc. Favorites stay
+        // pinned above a more-frequent non-favorite once slot models are
+        // placed.
+        sort_entries(&mut entries, counts, &[]);
         let active_model = session_active_model.or_else(|| {
             cfg.active_model
                 .as_ref()
@@ -1257,7 +1269,7 @@ pub fn cycle_active_favorite(
             }
         }
     }
-    sort_entries(&mut entries, counts);
+    sort_entries(&mut entries, counts, &[]);
     if entries.is_empty() {
         return Ok(None);
     }

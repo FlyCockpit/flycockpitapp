@@ -468,6 +468,7 @@ mod tests {
                 choice("local", "compatible", false, false),
             ],
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
+            default_choice_id: None,
                 recommendation_id: "missing".to_string(),
                 canonical_upstream_identity: "author/missing".to_string(),
                 author_label: None,
@@ -513,6 +514,7 @@ mod tests {
             slot_id: "primary".to_string(),
             choices: Vec::new(),
             unmatched_recommendations: Vec::new(),
+            default_choice_id: None,
             unavailable_reason: Some(SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel),
         };
         let snap = snapshot(vec![candidate(
@@ -544,6 +546,7 @@ mod tests {
                 slot_id: "primary".to_string(),
                 choices: vec![choice("local", "first", true, true)],
                 unmatched_recommendations: Vec::new(),
+                default_choice_id: None,
                 unavailable_reason: None,
             }],
             None,
@@ -576,6 +579,7 @@ mod tests {
                 slot_id: "primary".to_string(),
                 choices: vec![choice("local", "first", true, true)],
                 unmatched_recommendations: Vec::new(),
+                default_choice_id: None,
                 unavailable_reason: None,
             }],
             None,

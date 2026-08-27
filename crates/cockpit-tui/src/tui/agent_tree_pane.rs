@@ -1022,6 +1022,7 @@ mod tests {
                 locked_reason: None,
                 pending: None,
             },
+            model: cockpit_proto::AgentModelControlV1::default(),
         }
     }
 
@@ -1151,6 +1152,7 @@ mod tests {
             slot_id: slot_id.to_string(),
             choices,
             unmatched_recommendations: Vec::new(),
+            default_choice_id: None,
             unavailable_reason: unavailable,
         }
     }

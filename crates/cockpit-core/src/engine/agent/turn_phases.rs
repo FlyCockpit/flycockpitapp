@@ -259,9 +259,12 @@ async fn fork_context_refusal(
     model: &Option<crate::engine::model_roles::DelegationModelSelector>,
     noninteractive: bool,
 ) -> Option<String> {
-    if !crate::engine::tool::Capability::ForkContext.enabled(parent.llm_mode) {
+    if !crate::engine::tool::Capability::ForkContext
+        .enabled(&crate::agents::PostureResolution::legacy(parent.llm_mode))
+    {
         return Some(
-            "Error: task context `fork` is only available in frontier LLM mode".to_string(),
+            "Error: task context `fork` requires the `forkContext` capability on this agent"
+                .to_string(),
         );
     }
     if child != parent.name {

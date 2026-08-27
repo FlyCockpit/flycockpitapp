@@ -2748,7 +2748,8 @@ impl Driver {
                 }
             }
         };
-        let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
+        let followup_enabled = crate::engine::tool::Capability::FollowupSeed
+            .enabled(&crate::agents::PostureResolution::legacy(llm_mode));
 
         self.noninteractive_delegations.register_running(
             &task_call_id,
@@ -4979,10 +4980,10 @@ impl Driver {
         if batch_refusal.is_none()
             && has_write_capable_entry
             && !crate::engine::tool::Capability::ScopedParallelWrite
-                .enabled(parent_request_llm_mode)
+                .enabled(&crate::agents::PostureResolution::legacy(parent_request_llm_mode))
         {
             batch_refusal = Some(
-                "parallel write-capable task batches are Frontier-only; use sequential delegation or run in Frontier mode"
+                "parallel write-capable task batches require the `scopedParallelWrite` capability on this agent; use sequential delegation instead"
                     .to_string(),
             );
         }

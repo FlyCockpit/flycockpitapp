@@ -1385,7 +1385,8 @@ fn sandbox_escalation_note(
         || !first_attempt
         || outcome.success
         || !ctx.session.sandbox_escalation_enabled()
-        || !crate::engine::tool::Capability::SandboxEscalate.enabled(ctx.llm_mode)
+        || !crate::engine::tool::Capability::SandboxEscalate
+            .enabled(&crate::agents::PostureResolution::legacy(ctx.llm_mode))
     {
         return None;
     }
@@ -1441,7 +1442,8 @@ fn sandbox_unavailable_refusal(reason: &str, ctx: &ToolCtx, first_attempt: bool)
     );
     if first_attempt
         && ctx.session.sandbox_escalation_enabled()
-        && crate::engine::tool::Capability::SandboxEscalate.enabled(ctx.llm_mode)
+        && crate::engine::tool::Capability::SandboxEscalate
+            .enabled(&crate::agents::PostureResolution::legacy(ctx.llm_mode))
     {
         let call_id = ctx
             .current_tool_call_id

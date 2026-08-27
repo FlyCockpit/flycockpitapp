@@ -516,7 +516,8 @@ async fn toolbox_with_retrieval_if_needed(
     // newly-created one.
     tools = tools.without("artifact_read").without("artifact_search");
     if session.sandbox_escalation_enabled()
-        && crate::engine::tool::Capability::SandboxEscalate.enabled(llm_mode)
+        && crate::engine::tool::Capability::SandboxEscalate
+            .enabled(&crate::agents::PostureResolution::legacy(llm_mode))
     {
         tools = tools.with(Arc::new(crate::tools::escalate::EscalateTool));
     } else {

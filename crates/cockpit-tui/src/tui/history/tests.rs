@@ -2288,18 +2288,29 @@ fn write_edit_lines_show_file_type_icon_from_summary_path() {
     assert!(!bash_emoji.contains(rust_icon), "{bash_emoji:?}");
     assert!(!bash_emoji.is_empty(), "bash still shows its emoji glyph");
 
-    for tool in [
-        "edit",
-        "writeunlock",
-        "editunlock",
-        "plan_write",
-        "plan_edit",
-    ] {
+    for tool in ["edit", "writeunlock", "editunlock"] {
         let call = mk_call(tool, "src/main.rs", ToolCallState::Success);
         let (glyph, _) = tool_call_glyph_label(&call, false, true);
         assert!(
             glyph.starts_with(rust_icon),
             "{tool} should use the rust file icon, got {glyph:?}"
+        );
+    }
+
+    for tool in ["plan_write", "plan_edit"] {
+        let call = mk_call(
+            tool,
+            "Update the release plan with notes about src/main.rs",
+            ToolCallState::Success,
+        );
+        let (glyph, _) = tool_call_glyph_label(&call, false, true);
+        assert!(
+            glyph.starts_with(generic),
+            "{tool} should use the generic plan-document icon, got {glyph:?}"
+        );
+        assert!(
+            !glyph.starts_with(rust_icon),
+            "{tool} must not infer a file type from its summary, got {glyph:?}"
         );
     }
 }

@@ -3127,9 +3127,9 @@ pub fn tool_glyph_label(tool: &str, emojis: bool) -> (String, String) {
     tool_glyph_label_for(tool, emojis, false, None)
 }
 
-/// Like [`tool_glyph_label`], but when `file_icons` is on and `path` is
-/// a write/edit (or plan) tool, the glyph column uses the Nerd Font
-/// file-type icon derived from `path` instead of the presentation glyph.
+/// Like [`tool_glyph_label`], but when `file_icons` is on, real write/edit
+/// tools use a Nerd Font file-type icon derived from `path`; virtual plan
+/// documents use the generic document glyph instead.
 /// Never re-resolves presentation from args (`Value::Null`).
 pub(crate) fn tool_glyph_label_for(
     tool: &str,
@@ -3138,9 +3138,9 @@ pub(crate) fn tool_glyph_label_for(
     path: Option<&str>,
 ) -> (String, String) {
     let presentation = resolve_tool_presentation(tool, &serde_json::Value::Null, None);
-    let file_icon = path
-        .filter(|_| file_icons)
-        .and_then(|path| crate::tui::file_icons::glyph_for_tool_path(tool, path));
+    let file_icon = file_icons
+        .then(|| crate::tui::file_icons::glyph_for_tool(tool, path))
+        .flatten();
     format_tool_glyph_label(&presentation, emojis, file_icon)
 }
 
@@ -3150,10 +3150,11 @@ fn tool_call_glyph_label(call: &ToolCall, emojis: bool, file_icons: bool) -> (St
         &serde_json::Value::Null,
         call.mcp_child.as_ref(),
     );
-    // Derive the file-type icon from the already-rendered summary path;
-    // do not re-resolve presentation (that path uses `Value::Null` args).
+    // Real write/edit calls derive the file-type icon from their rendered path
+    // summary. Virtual plan documents have no path and receive a generic
+    // document glyph without inspecting their arbitrary summary.
     let file_icon = file_icons
-        .then(|| crate::tui::file_icons::glyph_for_tool_path(&call.tool, &call.summary))
+        .then(|| crate::tui::file_icons::glyph_for_tool(&call.tool, Some(&call.summary)))
         .flatten();
     format_tool_glyph_label(&presentation, emojis, file_icon)
 }

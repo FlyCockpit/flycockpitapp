@@ -13,8 +13,12 @@ use cockpit_config::extended::FileIconsSetting;
 /// extensions and extensionless names that are not a special filename.
 pub const GENERIC_FILE_GLYPH: &str = "\u{e612}";
 
+/// Generic document glyph for virtual plan documents. Plans do not have paths,
+/// so their arbitrary summaries must never participate in file-type detection.
+pub const PLAN_DOCUMENT_GLYPH: &str = GENERIC_FILE_GLYPH;
+
 /// Whether `tool` is a write/edit (or plan-document) variant whose glyph
-/// column may be replaced with a file-type icon derived from the path.
+/// column may be replaced with a file/document icon.
 pub fn is_file_icon_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -29,9 +33,15 @@ pub fn is_file_icon_tool(tool: &str) -> bool {
     )
 }
 
-/// Icon for `path` when `tool` is a write/edit variant; `None` otherwise.
-pub fn glyph_for_tool_path(tool: &str, path: &str) -> Option<&'static str> {
-    is_file_icon_tool(tool).then(|| glyph_for_path(path))
+/// Icon for a tool. Real write/edit tools derive their icon from `path`; virtual
+/// plan documents always use [`PLAN_DOCUMENT_GLYPH`] and never inspect a path or
+/// summary.
+pub fn glyph_for_tool(tool: &str, path: Option<&str>) -> Option<&'static str> {
+    match tool {
+        "plan_write" | "plan_edit" => Some(PLAN_DOCUMENT_GLYPH),
+        "write" | "edit" | "writeunlock" | "editunlock" => path.map(glyph_for_path),
+        _ => None,
+    }
 }
 
 /// Nerd Font glyph for `path`. Filename special-cases (Dockerfile,
@@ -462,20 +472,21 @@ mod tests {
 
     #[test]
     fn file_icon_tools_include_write_edit_and_plan_variants() {
-        for tool in [
-            "write",
-            "edit",
-            "writeunlock",
-            "editunlock",
-            "plan_write",
-            "plan_edit",
-        ] {
+        for tool in ["write", "edit", "writeunlock", "editunlock"] {
             assert!(is_file_icon_tool(tool), "{tool}");
-            assert_eq!(glyph_for_tool_path(tool, "src/lib.rs"), Some(ICON_RUST));
+            assert_eq!(glyph_for_tool(tool, Some("src/lib.rs")), Some(ICON_RUST));
+        }
+        for tool in ["plan_write", "plan_edit"] {
+            assert!(is_file_icon_tool(tool), "{tool}");
+            assert_eq!(
+                glyph_for_tool(tool, Some("src/lib.rs")),
+                Some(PLAN_DOCUMENT_GLYPH)
+            );
+            assert_eq!(glyph_for_tool(tool, None), Some(PLAN_DOCUMENT_GLYPH));
         }
         assert!(!is_file_icon_tool("bash"));
         assert!(!is_file_icon_tool("read"));
-        assert!(glyph_for_tool_path("bash", "src/lib.rs").is_none());
+        assert!(glyph_for_tool("bash", Some("src/lib.rs")).is_none());
     }
 
     #[test]

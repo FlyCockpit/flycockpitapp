@@ -203,6 +203,34 @@ pub struct AgentBindSlotSetInput {
     pub now_unix_ms: i64,
 }
 
+/// One package-private child's complete daemon-derived binding material. The
+/// database fills in the child installation/observation generations inside
+/// the same transaction that validates the owning parent generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageChildSlotBindingInput {
+    pub idempotency_key: String,
+    pub request_fingerprint: String,
+    pub bindings: Vec<AgentBindingInput>,
+}
+
+/// Atomic package-child materialization guarded by the reviewed whole-tree
+/// generation of its parent. A stale or unreviewed parent aborts before any
+/// child installation, observation, or binding row can change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializePackageChildInput {
+    pub parent_installation_id: Uuid,
+    pub expected_parent_installation_revision: u64,
+    pub expected_parent_observation_revision: u64,
+    pub expected_parent_definition_digest: String,
+    /// Daemon-authenticated namespace marker tying both a prior child row and
+    /// its replacement to this exact parent installation. Storage treats it
+    /// as opaque and never derives package authority from source names.
+    pub child_source_identity_guard: String,
+    pub child: AgentInstallationInput,
+    pub slot_bindings: Vec<PackageChildSlotBindingInput>,
+    pub now_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebindAgentOutcome {
     Rebound(AgentObservationRow),
@@ -868,6 +896,14 @@ impl Db {
             .await
     }
 
+    pub async fn materialize_package_child(
+        &self,
+        input: MaterializePackageChildInput,
+    ) -> Result<AgentInstallationRow> {
+        self.transaction(move |conn| materialize_package_child_conn(conn, &input))
+            .await
+    }
+
     pub async fn rebind_agent(&self, input: AgentRebindInput) -> Result<RebindAgentOutcome> {
         self.transaction(move |conn| rebind_agent_conn(conn, &input))
             .await
@@ -1380,6 +1416,144 @@ pub fn replace_agent_at_conn(
     Ok(InstallAgentOutcome::Installed(
         installation_by_id(conn, existing.installation_id)?.expect("updated installation"),
     ))
+}
+
+fn materialize_package_child_conn(
+    conn: &Connection,
+    input: &MaterializePackageChildInput,
+) -> Result<AgentInstallationRow> {
+    validate_digest(
+        &input.expected_parent_definition_digest,
+        "expected parent package definition digest",
+    )?;
+    validate_installation(&input.child)?;
+    ensure!(
+        input.child.installation_id != input.parent_installation_id,
+        "package child installation must differ from its parent"
+    );
+    ensure!(
+        !input.child_source_identity_guard.is_empty()
+            && input
+                .child
+                .source_identity
+                .contains(&input.child_source_identity_guard),
+        "package child source identity lacks its authenticated parent guard"
+    );
+    let parent = installation_by_id(conn, input.parent_installation_id)?
+        .context("package child parent installation is missing")?;
+    let parent_observation = observation_by_id(conn, input.parent_installation_id)?
+        .context("package child parent observation is missing")?;
+    ensure!(
+        parent.deleted_at_unix_ms.is_none()
+            && parent.installation_revision == input.expected_parent_installation_revision
+            && parent.source_digest == input.expected_parent_definition_digest
+            && parent_observation.reviewed
+            && parent_observation.observation_revision
+                == input.expected_parent_observation_revision
+            && parent_observation.observed_digest == input.expected_parent_definition_digest,
+        "package child parent generation is stale or unreviewed"
+    );
+
+    let row = match install_agent_conn(conn, &input.child)? {
+        InstallAgentOutcome::Installed(row) | InstallAgentOutcome::AlreadyInstalled(row) => row,
+        InstallAgentOutcome::Conflict => {
+            let scope = scope_key(
+                input.child.scope,
+                input.child.canonical_workspace_id.as_deref(),
+            )?;
+            let existing = installation_by_identity(
+                conn,
+                input.child.scope,
+                &scope,
+                &input.child.source_agent_id,
+            )?
+            .context("package child identity collided without an installation")?;
+            ensure!(
+                existing.installation_id == input.child.installation_id
+                    && existing
+                        .source_identity
+                        .contains(&input.child_source_identity_guard),
+                "package child identity collides with a different installation"
+            );
+            match replace_agent_at_conn(
+                conn,
+                existing.installation_id,
+                &input.child,
+                input.now_unix_ms,
+            )? {
+                InstallAgentOutcome::Installed(row)
+                | InstallAgentOutcome::AlreadyInstalled(row) => row,
+                InstallAgentOutcome::Conflict => bail!("package child replacement conflicted"),
+            }
+        }
+    };
+
+    let mut observation = observation_by_id(conn, row.installation_id)?
+        .context("materialized package child is missing its observation")?;
+    if !observation.reviewed || observation.observed_digest != input.child.source_digest {
+        conn.execute(
+            "UPDATE installation_observations SET observed_digest=?2,observation_revision=observation_revision+1,review_state='reviewed',observed_at_unix_ms=?3 WHERE installation_id=?1",
+            params![
+                row.installation_id.to_string(),
+                input.child.source_digest,
+                input.now_unix_ms
+            ],
+        )
+        .context("refreshing parent-authorized package child observation")?;
+        observation = observation_by_id(conn, row.installation_id)?
+            .context("materialized package child observation disappeared")?;
+    }
+
+    let mut slots = std::collections::BTreeSet::new();
+    for slot in &input.slot_bindings {
+        let slot_id = slot
+            .bindings
+            .first()
+            .map(|binding| binding.slot_id.as_str())
+            .context("package child binding set is empty")?;
+        ensure!(
+            slot.bindings
+                .iter()
+                .all(|binding| binding.slot_id == slot_id),
+            "package child binding set mixes slots"
+        );
+        ensure!(
+            slots.insert(slot_id.to_string()),
+            "package child binding request duplicates slot `{slot_id}`"
+        );
+        let expected_binding_revision = current_binding(
+            conn,
+            row.installation_id,
+            &input.child.source_digest,
+            slot_id,
+        )?
+        .map(|binding| binding.binding_revision);
+        let outcome = bind_agent_slot_set_conn(
+            conn,
+            &AgentBindSlotSetInput {
+                installation_id: row.installation_id,
+                expected_observation_revision: observation.observation_revision,
+                expected_definition_digest: input.child.source_digest.clone(),
+                expected_binding_revision,
+                idempotency_key: slot.idempotency_key.clone(),
+                request_fingerprint: slot.request_fingerprint.clone(),
+                bindings: slot.bindings.clone(),
+                now_unix_ms: input.now_unix_ms,
+            },
+        )?;
+        ensure!(
+            matches!(
+                outcome,
+                BindAgentOutcome::Bound(_) | BindAgentOutcome::AlreadyBound(_)
+            ),
+            "package child slot `{slot_id}` binding was refused: {outcome:?}"
+        );
+    }
+    ensure!(
+        slots.contains("primary"),
+        "package child materialization requires a primary slot"
+    );
+    Ok(row)
 }
 
 pub fn observe_agent_definition_conn(
@@ -3756,6 +3930,97 @@ mod tests {
             binding_revision_map_payload: revision_map,
             now_unix_ms: 12,
         }
+    }
+
+    fn package_child_input(
+        parent: &AgentInstallationRow,
+        parent_observation: &AgentObservationRow,
+        child: AgentInstallationInput,
+        model: &str,
+    ) -> MaterializePackageChildInput {
+        MaterializePackageChildInput {
+            parent_installation_id: parent.installation_id,
+            expected_parent_installation_revision: parent.installation_revision,
+            expected_parent_observation_revision: parent_observation.observation_revision,
+            expected_parent_definition_digest: parent.source_digest.clone(),
+            child_source_identity_guard: parent.installation_id.to_string(),
+            child,
+            slot_bindings: vec![PackageChildSlotBindingInput {
+                idempotency_key: format!("package-child-{model}"),
+                request_fingerprint: format!("package-child-{model}"),
+                bindings: vec![binding("primary", model)],
+            }],
+            now_unix_ms: 20,
+        }
+    }
+
+    #[tokio::test]
+    async fn package_child_materialization_cas_precedes_all_child_mutations() {
+        let db = Db::open_in_memory().unwrap();
+        let parent_input = installation(AgentInstallationScope::Global, None);
+        let parent = match db.install_agent(parent_input).await.unwrap() {
+            InstallAgentOutcome::Installed(row) => row,
+            outcome => panic!("expected parent install, got {outcome:?}"),
+        };
+        let parent_observation = db
+            .agent_observation(parent.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = installation(AgentInstallationScope::Global, None);
+        child.installation_id = Uuid::now_v7();
+        child.source_agent_id = "builder/helper".into();
+        child.source_identity = format!("package-child:{}:helper", parent.installation_id);
+        child.source_digest = digest("child-v1");
+        let installed = db
+            .materialize_package_child(package_child_input(
+                &parent,
+                &parent_observation,
+                child.clone(),
+                "model-a",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(installed.source_digest, digest("child-v1"));
+
+        assert!(matches!(
+            db.observe_agent_definition(
+                parent.installation_id,
+                digest("changed-whole-package"),
+                21,
+            )
+            .await
+            .unwrap(),
+            ObserveAgentOutcome::RebindRequired(_)
+        ));
+        child.source_digest = digest("child-v2");
+        assert!(
+            db.materialize_package_child(package_child_input(
+                &parent,
+                &parent_observation,
+                child,
+                "model-b",
+            ))
+            .await
+            .is_err(),
+            "a changed parent package must fail before replacing or rebinding its child"
+        );
+        let unchanged = db
+            .agent_installation(installed.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.source_digest, digest("child-v1"));
+        let binding = db
+            .current_agent_binding(
+                installed.installation_id,
+                digest("child-v1"),
+                "primary".into(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.model_id, "model-a");
     }
 
     #[tokio::test]

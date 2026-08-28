@@ -1254,17 +1254,57 @@ fn classify_readdir_result(
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "redox"
+))]
 fn set_readdir_errno_zero() {
     // SAFETY: errno is thread-local and this thread is about to call readdir.
     unsafe { *libc::__errno_location() = 0 }
 }
 
-#[cfg(all(unix, target_os = "macos"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd"
+))]
 fn set_readdir_errno_zero() {
     // SAFETY: errno is thread-local and this thread is about to call readdir.
     unsafe { *libc::__error() = 0 }
 }
+
+#[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+fn set_readdir_errno_zero() {
+    // SAFETY: errno is thread-local and this thread is about to call readdir.
+    unsafe { *libc::__errno() = 0 }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "redox",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
+))]
+compile_error!("secure package traversal has no verified errno accessor on this Unix target");
 
 /// Atomically rename a directory without replacing an existing destination.
 ///

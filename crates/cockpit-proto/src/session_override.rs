@@ -12,20 +12,35 @@
 //! compatibility guess crosses this boundary.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use cockpit_config::config::sandbox_mode::SandboxMode;
 
 pub const AGENT_EFFECTIVE_SETTINGS_DTO_VERSION: u32 = 1;
 
-/// Opaque choice identity for a focused node's immutable binding evidence.
-/// Package-private children are deliberately absent from the generic session
-/// setup candidates, so their contextual picker addresses the redacted
-/// `(provider, model)` binding directly without publishing the child agent.
-pub fn focused_model_binding_choice_id(provider_id: &str, model_id: &str) -> String {
-    format!(
-        "focused-binding-v1:{}:{provider_id}{model_id}",
-        provider_id.len()
-    )
+/// Opaque wire identity for one focused node route. The profile handle is
+/// included only in this one-way digest preimage: the returned value cannot
+/// reveal it, while two credential profiles with the same display provider
+/// and model remain independently selectable.
+pub fn focused_model_binding_choice_id(
+    provider_profile_handle: &str,
+    provider_id: &str,
+    model_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"flycockpit-focused-model-route-v2\0");
+    for component in [provider_profile_handle, provider_id, model_id] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(19 + digest.len() * 2);
+    encoded.push_str("focused-binding-v2-");
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 /// The focused agent node's daemon-resolved effective settings and the controls
@@ -78,6 +93,9 @@ pub struct AgentModelControlV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentModelRefV1 {
+    /// Opaque per-route selection key. This is neither a provider profile
+    /// handle nor a display-derived identity.
+    pub choice_id: String,
     pub provider_id: String,
     pub model_id: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -337,6 +355,17 @@ mod tests {
             model: AgentModelControlV1::default(),
         };
         assert_eq!(roundtrip(&snapshot), snapshot);
+    }
+
+    #[test]
+    fn focused_model_route_keys_are_opaque_and_profile_distinct() {
+        let first = focused_model_binding_choice_id("profile-secret-a", "openai", "gpt");
+        let second = focused_model_binding_choice_id("profile-secret-b", "openai", "gpt");
+        assert_ne!(first, second);
+        assert!(first.starts_with("focused-binding-v2-"));
+        assert!(!first.contains("profile-secret-a"));
+        assert!(!first.contains("openai"));
+        assert!(!first.contains("gpt"));
     }
 
     #[test]

@@ -1236,10 +1236,10 @@ pub struct Driver {
     deleg_shrinks: std::collections::HashMap<usize, PendingDelegationShrink>,
     /// Plan-level model override (prompt
     /// `plan-duplication-and-model-override.md`): when a plan run pins a
-    /// `model`, it overrides every spawned agent's frontmatter model. Carried
-    /// here so child [`SpawnArgs`] (built in [`Self::spawn_args`]) propagate it
-    /// to the whole delegation tree — builder, merge-resolver, any subagent.
-    /// `None` outside a plan run.
+    /// `model`, it overrides the root and legacy child frontmatter models.
+    /// Delegated vNext children discard it and resolve their own prepared slot
+    /// default (or their direct parent's explicit selector). `None` outside a
+    /// plan run.
     model_override: Option<Arc<crate::engine::model::Model>>,
     /// Fixed recursive-spawn depth ceiling.
     /// Hard ceiling on Swarm-spawning-Swarm; a `spawn` that
@@ -2285,10 +2285,9 @@ impl Driver {
 
     /// Install the plan-level model override (prompt
     /// `plan-duplication-and-model-override.md`) before the main loop starts,
-    /// so every child spawn propagates it. The root agent already runs under
-    /// the override (the session worker loads it with the override
-    /// [`SpawnArgs`]); this is what carries the override down to delegated
-    /// subagents whose frontmatter would otherwise win.
+    /// so the root and legacy children retain it. The delegated vNext spawn
+    /// boundary intentionally drops it in favor of the child's prepared slot
+    /// route.
     pub fn set_model_override(&mut self, model: Option<Arc<crate::engine::model::Model>>) {
         self.model_override = model;
     }
@@ -11932,8 +11931,10 @@ impl Driver {
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
-            // A plan-level model override propagates to the whole delegation
-            // tree so every spawned agent runs under it.
+            // Root construction may consume the plan-level model override.
+            // vNext children discard it at the delegated-spawn boundary and
+            // resolve their own prepared default unless their direct parent
+            // supplies a DelegationModelSelector.
             model_override: self.model_override.clone(),
             delegation_model: None,
             delegated: false,
@@ -11980,7 +11981,13 @@ impl Driver {
         model: Option<crate::engine::model_roles::DelegationModelSelector>,
         recursion: crate::engine::builtin::DelegationRecursionContext,
     ) -> crate::engine::builtin::SpawnArgs {
-        let model_override = if recursion.same_model_only {
+        let parent_is_vnext = self
+            .stack
+            .last()
+            .is_some_and(|frame| frame.agent.vnext_grant.is_some());
+        let model_override = if parent_is_vnext {
+            None
+        } else if recursion.same_model_only {
             self.stack.last().map(|frame| frame.agent.model.clone())
         } else {
             self.model_override.clone()
@@ -12030,7 +12037,13 @@ impl Driver {
         recursion: crate::engine::builtin::DelegationRecursionContext,
         confinement: DelegationConfinement,
     ) -> crate::engine::builtin::SpawnArgs {
-        let model_override = if recursion.same_model_only {
+        let parent_is_vnext = self
+            .stack
+            .last()
+            .is_some_and(|frame| frame.agent.vnext_grant.is_some());
+        let model_override = if parent_is_vnext {
+            None
+        } else if recursion.same_model_only {
             self.stack.last().map(|frame| frame.agent.model.clone())
         } else {
             self.model_override.clone()

@@ -1432,14 +1432,13 @@ mod imp {
         result
     }
 
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
+    #[cfg(any(
+        target_os = "linux",
         target_os = "dragonfly",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    )))]
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "redox"
+    ))]
     fn set_readdir_errno_zero() {
         unsafe { *libc::__errno_location() = 0 }
     }
@@ -1447,13 +1446,18 @@ mod imp {
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
         target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "netbsd",
-        target_os = "openbsd"
     ))]
     fn set_readdir_errno_zero() {
         unsafe { *libc::__error() = 0 }
+    }
+
+    #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+    fn set_readdir_errno_zero() {
+        unsafe { *libc::__errno() = 0 }
     }
 
     fn file_evidence(file: &File) -> Result<(String, String)> {

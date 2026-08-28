@@ -770,10 +770,10 @@ fn build_model_rows_with_control(
             rows.push(effective("  slot primary".to_string()));
             for model in &control.allowed {
                 let marker = if model.is_default { " (default)" } else { "" };
-                let current = control.effective.as_ref().is_some_and(|effective| {
-                    effective.provider_id == model.provider_id
-                        && effective.model_id == model.model_id
-                });
+                let current = control
+                    .effective
+                    .as_ref()
+                    .is_some_and(|effective| effective.choice_id == model.choice_id);
                 let arrow = if current { "✓" } else { "→" };
                 let text = format!(
                     "    {arrow} {}/{}{}",
@@ -786,10 +786,7 @@ fn build_model_rows_with_control(
                         text,
                         AgentSessionOverrideFieldV1::Model {
                             slot_id: "primary".to_string(),
-                            choice_id: cockpit_proto::focused_model_binding_choice_id(
-                                &model.provider_id,
-                                &model.model_id,
-                            ),
+                            choice_id: model.choice_id.clone(),
                         },
                     ));
                 }
@@ -1421,6 +1418,7 @@ mod tests {
             effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
         snapshot.installation_id = Some("inst-private-child".to_string());
         snapshot.model.allowed = vec![cockpit_proto::AgentModelRefV1 {
+            choice_id: "opaque-private-route".to_string(),
             provider_id: "openai".to_string(),
             model_id: "gpt".to_string(),
             is_default: true,
@@ -1442,10 +1440,61 @@ mod tests {
             matches!(
                 &row.field,
                 Some(AgentSessionOverrideFieldV1::Model { choice_id, .. })
-                    if choice_id
-                        == &cockpit_proto::focused_model_binding_choice_id("openai", "gpt")
+                    if choice_id == "opaque-private-route"
             )
         }));
+    }
+
+    #[test]
+    fn private_child_same_display_routes_use_exact_wire_choices() {
+        let mut pane = AgentTreePane::loading(false);
+        let mut snapshot =
+            effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.installation_id = Some("inst-private-child".to_string());
+        let first = cockpit_proto::AgentModelRefV1 {
+            choice_id: "opaque-profile-a".to_string(),
+            provider_id: "openai".to_string(),
+            model_id: "gpt".to_string(),
+            is_default: true,
+        };
+        let second = cockpit_proto::AgentModelRefV1 {
+            choice_id: "opaque-profile-b".to_string(),
+            is_default: false,
+            ..first.clone()
+        };
+        snapshot.model.allowed = vec![first.clone(), second.clone()];
+        snapshot.model.effective = Some(second);
+        snapshot.model.pending = Some(first);
+        pane.apply_effective_settings(snapshot);
+        pane.apply_model_choices(SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: Uuid::from_u128(1).to_string(),
+            config_generation: 1,
+            revision: 0,
+            selected_installation_id: Some("inst-root".to_string()),
+            candidates: Vec::new(),
+        });
+
+        let view = pane.override_view.as_ref().expect("override view open");
+        let actions = view
+            .rows
+            .iter()
+            .filter_map(|row| match &row.field {
+                Some(AgentSessionOverrideFieldV1::Model { choice_id, .. }) => {
+                    Some(choice_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actions, vec!["opaque-profile-a", "opaque-profile-b"]);
+        assert_eq!(
+            view.rows
+                .iter()
+                .filter(|row| row.text.contains("✓ openai/gpt"))
+                .count(),
+            1,
+            "same-display effective route must be matched by opaque choice, not label"
+        );
     }
 
     #[test]

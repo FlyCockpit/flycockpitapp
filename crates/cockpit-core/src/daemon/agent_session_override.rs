@@ -19,8 +19,8 @@
 //!
 //! The model axis is resolved against the session-setup snapshot for the
 //! focused node's own installation. Dispatch loads that snapshot; the policy
-//! below scopes the `(slot_id, choice_id)` to that node and maps the wire
-//! display token back to the credential-owning provider handle.
+//! below scopes the `(slot_id, choice_id)` to that node and maps the opaque
+//! route key back to the credential-owning provider handle.
 
 use cockpit_config::config::providers::ProvidersConfig;
 use cockpit_config::config::sandbox_mode::SandboxMode;
@@ -208,6 +208,11 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
                 .iter()
                 .filter(|binding| binding.slot_id == "primary")
                 .map(|binding| cockpit_proto::AgentModelRefV1 {
+                    choice_id: cockpit_proto::focused_model_binding_choice_id(
+                        &binding.provider_profile_handle,
+                        &binding.selected_provider_alias.provider_id,
+                        &binding.model_id,
+                    ),
                     provider_id: binding.selected_provider_alias.provider_id.clone(),
                     model_id: binding.model_id.clone(),
                     is_default: binding.is_default,
@@ -225,11 +230,21 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
                                 && candidate.model_id == binding.model
                         })
                         .map(|candidate| cockpit_proto::AgentModelRefV1 {
+                            choice_id: cockpit_proto::focused_model_binding_choice_id(
+                                &candidate.provider_profile_handle,
+                                &candidate.selected_provider_alias.provider_id,
+                                &candidate.model_id,
+                            ),
                             provider_id: candidate.selected_provider_alias.provider_id.clone(),
                             model_id: candidate.model_id.clone(),
                             is_default: candidate.is_default,
                         })
                         .unwrap_or(cockpit_proto::AgentModelRefV1 {
+                            choice_id: cockpit_proto::focused_model_binding_choice_id(
+                                &binding.provider,
+                                &binding.provider,
+                                &binding.model,
+                            ),
                             provider_id: binding.provider.clone(),
                             model_id: binding.model.clone(),
                             is_default: false,
@@ -257,11 +272,21 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
                                     && candidate.model_id == binding.model
                             })
                             .map(|candidate| cockpit_proto::AgentModelRefV1 {
+                                choice_id: cockpit_proto::focused_model_binding_choice_id(
+                                    &candidate.provider_profile_handle,
+                                    &candidate.selected_provider_alias.provider_id,
+                                    &candidate.model_id,
+                                ),
                                 provider_id: candidate.selected_provider_alias.provider_id.clone(),
                                 model_id: candidate.model_id.clone(),
                                 is_default: candidate.is_default,
                             })
                             .unwrap_or(cockpit_proto::AgentModelRefV1 {
+                                choice_id: cockpit_proto::focused_model_binding_choice_id(
+                                    &binding.provider,
+                                    "unavailable",
+                                    &binding.model,
+                                ),
                                 provider_id: "unavailable".to_string(),
                                 model_id: binding.model.clone(),
                                 is_default: false,
@@ -301,6 +326,7 @@ pub fn resolve_node_model_override(
         evidence.installation_id.to_string() == installation_id
             && binding.slot_id == slot_id
             && cockpit_proto::focused_model_binding_choice_id(
+                &binding.provider_profile_handle,
                 &binding.selected_provider_alias.provider_id,
                 &binding.model_id,
             ) == choice_id
@@ -1264,7 +1290,7 @@ mod tests {
         let snapshot = setup_snapshot("inst-root", Vec::new());
         let evidence = child_binding_evidence(Uuid::from_u128(99), "openai", "openai", "gpt");
         let installation_id = evidence.installation_id.to_string();
-        let choice_id = cockpit_proto::focused_model_binding_choice_id("openai", "gpt");
+        let choice_id = cockpit_proto::focused_model_binding_choice_id("openai", "openai", "gpt");
 
         let binding = resolve_node_model_override(
             &snapshot,
@@ -1281,6 +1307,36 @@ mod tests {
     }
 
     #[test]
+    fn private_child_same_display_routes_keep_distinct_opaque_choices() {
+        let providers = named_providers(&[
+            ("profile-a", Some("openai"), "gpt"),
+            ("profile-b", Some("openai"), "gpt"),
+        ]);
+        let snapshot = setup_snapshot("inst-root", Vec::new());
+        let installation_id = Uuid::from_u128(99);
+        let first = child_binding_evidence(installation_id, "profile-a", "openai", "gpt");
+        let mut second = child_binding_evidence(installation_id, "profile-b", "openai", "gpt");
+        second.binding.is_default = false;
+        let first_choice =
+            cockpit_proto::focused_model_binding_choice_id("profile-a", "openai", "gpt");
+        let second_choice =
+            cockpit_proto::focused_model_binding_choice_id("profile-b", "openai", "gpt");
+        assert_ne!(first_choice, second_choice);
+
+        let selected = resolve_node_model_override(
+            &snapshot,
+            Some(&installation_id.to_string()),
+            &[],
+            &[first, second],
+            "primary",
+            &second_choice,
+            &providers,
+        )
+        .expect("opaque route key must select the exact same-display profile");
+        assert_eq!(selected.provider, "profile-b");
+    }
+
+    #[test]
     fn private_child_model_override_rejects_route_stale_for_pinned_slot_requirements() {
         let providers = named_providers(&[("openai", Some("openai"), "gpt")]);
         let snapshot = setup_snapshot("inst-root", Vec::new());
@@ -1288,7 +1344,7 @@ mod tests {
         let installation_id = evidence.installation_id.to_string();
         evidence.slot_requirements.min_context_tokens = u64::MAX;
         let binding = evidence.binding.clone();
-        let choice_id = cockpit_proto::focused_model_binding_choice_id("openai", "gpt");
+        let choice_id = cockpit_proto::focused_model_binding_choice_id("openai", "openai", "gpt");
 
         assert_eq!(
             resolve_node_model_override(

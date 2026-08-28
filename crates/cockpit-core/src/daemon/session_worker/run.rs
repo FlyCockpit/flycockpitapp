@@ -146,6 +146,7 @@ fn installation_launch_target(
 async fn materialize_package_children(
     session: &std::sync::Arc<crate::session::Session>,
     parent: &cockpit_db::db::agent_installations::AgentInstallationRow,
+    parent_observation: &cockpit_db::db::agent_installations::AgentObservationRow,
     definition: &crate::agents::AgentDef,
     providers: &crate::config::providers::ProvidersConfig,
     now: i64,
@@ -174,7 +175,7 @@ async fn materialize_package_children(
             &parent.installation_id,
             format!("flycockpit-package-child-v1:{child_name}").as_bytes(),
         );
-        let input = cockpit_db::db::agent_installations::AgentInstallationInput {
+        let child_input = cockpit_db::db::agent_installations::AgentInstallationInput {
             installation_id: child_id,
             scope: parent.scope,
             canonical_workspace_id: parent.canonical_workspace_id.clone(),
@@ -184,45 +185,7 @@ async fn materialize_package_children(
             source_digest: definition_digest.clone(),
             fetched_at_unix_ms: parent.fetched_at_unix_ms,
         };
-        let row = match session.db.install_agent(input.clone()).await? {
-            cockpit_db::db::agent_installations::InstallAgentOutcome::Installed(row)
-            | cockpit_db::db::agent_installations::InstallAgentOutcome::AlreadyInstalled(row) => {
-                row
-            }
-            cockpit_db::db::agent_installations::InstallAgentOutcome::Conflict => {
-                let existing = session
-                    .db
-                    .agent_installation_by_source(
-                        parent.scope,
-                        parent.canonical_workspace_id.clone(),
-                        source_agent_id.clone(),
-                    )
-                    .await?
-                    .context("package child identity collided without an installation")?;
-                ensure!(
-                    crate::daemon::agent_installation::is_package_child_installation(&existing)
-                        && existing
-                            .source_identity
-                            .contains(&parent.installation_id.to_string()),
-                    "package child identity collides with a non-child installation"
-                );
-                match session.db.replace_agent(input, now).await? {
-                    cockpit_db::db::agent_installations::InstallAgentOutcome::Installed(row)
-                    | cockpit_db::db::agent_installations::InstallAgentOutcome::AlreadyInstalled(
-                        row,
-                    ) => row,
-                    cockpit_db::db::agent_installations::InstallAgentOutcome::Conflict => {
-                        anyhow::bail!("package child replacement conflicted")
-                    }
-                }
-            }
-        };
-        let observation = session
-            .db
-            .agent_observation(row.installation_id)
-            .await?
-            .context("package child installation lost its observation")?;
-
+        let mut slot_bindings = Vec::new();
         for (slot_id, slot) in &child_vnext.model_slots {
             let ranked = crate::agents::ranked_compatible_offerings(slot, &offerings, providers);
             let selected = if slot.models.is_empty() {
@@ -299,41 +262,37 @@ async fn materialize_package_children(
                     .collect::<Vec<_>>(),
             )?;
             let binding_set_digest = crate::intel::hex_lower(&Sha256::digest(binding_set_payload));
-            let expected_binding_revision = session
-                .db
-                .current_agent_binding(
-                    row.installation_id,
-                    definition_digest.clone(),
-                    slot_id.clone(),
-                )
-                .await?
-                .map(|binding| binding.binding_revision);
             let idempotency_key = format!(
                 "package-child-bind:{}:{child_name}:{definition_digest}:{slot_id}:{binding_set_digest}",
                 parent.installation_id
             );
-            let outcome = session
-                .db
-                .bind_agent_slot_set(cockpit_db::db::agent_installations::AgentBindSlotSetInput {
-                    installation_id: row.installation_id,
-                    expected_observation_revision: observation.observation_revision,
-                    expected_definition_digest: definition_digest.clone(),
-                    expected_binding_revision,
+            slot_bindings.push(
+                cockpit_db::db::agent_installations::PackageChildSlotBindingInput {
                     request_fingerprint: idempotency_key.clone(),
                     idempotency_key,
                     bindings,
-                    now_unix_ms: now,
-                })
-                .await?;
-            ensure!(
-                matches!(
-                    outcome,
-                    cockpit_db::db::agent_installations::BindAgentOutcome::Bound(_)
-                        | cockpit_db::db::agent_installations::BindAgentOutcome::AlreadyBound(_)
-                ),
-                "package child `{child_name}` slot `{slot_id}` binding was refused: {outcome:?}"
+                },
             );
         }
+        let row = session
+            .db
+            .materialize_package_child(
+                cockpit_db::db::agent_installations::MaterializePackageChildInput {
+                    parent_installation_id: parent.installation_id,
+                    expected_parent_installation_revision: parent.installation_revision,
+                    expected_parent_observation_revision: parent_observation.observation_revision,
+                    expected_parent_definition_digest: parent.source_digest.clone(),
+                    child_source_identity_guard: format!(
+                        "{}{}",
+                        crate::daemon::agent_installation::PACKAGE_CHILD_SOURCE_MARKER,
+                        parent.installation_id
+                    ),
+                    child: child_input,
+                    slot_bindings,
+                    now_unix_ms: now,
+                },
+            )
+            .await?;
         installed.push(row);
     }
     Ok(installed)
@@ -424,7 +383,7 @@ async fn prepare_fresh_installed_root_snapshot(
     )?;
     let selected_loaded = crate::agents::load_profile_definition_from_owned_path(
         selected.clone(),
-        selected_observation,
+        selected_observation.clone(),
         installation_profile_source(selected.scope),
         &selected_definition_path,
     )?;
@@ -434,10 +393,25 @@ async fn prepare_fresh_installed_root_snapshot(
         .as_ref()
         .context("installed root is not a vNext definition")?;
 
+    // Validate the complete package snapshot and reviewed generation before
+    // any derived child row can be installed, replaced, or rebound. The DB
+    // materialization call below repeats these exact installation/observation
+    // expectations inside the child mutation transaction.
+    let selected_definition_digest = crate::intel::hex_lower(&Sha256::digest(
+        selected_loaded.definition.vnext_digest_bytes()?,
+    ));
+    ensure!(
+        selected_observation.reviewed
+            && selected_observation.observed_digest == selected_definition_digest
+            && selected.source_digest == selected_definition_digest,
+        "installed root package changed since its reviewed whole-tree observation; rebind is required"
+    );
+
     let now = chrono::Utc::now().timestamp_millis();
     let package_children = materialize_package_children(
         session,
         &selected,
+        &selected_observation,
         &selected_loaded.definition,
         providers,
         now,
@@ -5989,10 +5963,10 @@ pub(super) async fn run_worker(
     // snapshot rather than from disk (`engine-config-snapshot-adoption`).
     driver.set_config_handle(SessionConfigHandle::new(config_snapshot.clone()));
     driver.set_assistant_identity_prefix(spawn_args.assistant_identity_prefix.clone());
-    // Propagate any plan-level model override to the whole delegation tree
-    // (`plan-duplication-and-model-override.md`): the root already runs under
-    // it (loaded with the override `SpawnArgs`); this carries it down to
-    // delegated subagents whose frontmatter would otherwise win.
+    // Retain any plan-level override for root reconstruction and legacy child
+    // spawns. The driver's delegated vNext boundary drops it so those children
+    // use their own prepared slot routes unless the parent explicitly selects
+    // one.
     driver.set_model_override(model_override);
     // Recursive-`Swarm` knobs (GOALS §24): the depth ceiling + the global
     // concurrency cap on simultaneously-running `bee` workers, enforced

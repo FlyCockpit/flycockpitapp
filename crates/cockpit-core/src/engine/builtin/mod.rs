@@ -130,13 +130,11 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
-    /// Plan-level model override (prompt
-    /// `plan-duplication-and-model-override.md`): when a plan pins a `model`,
-    /// every agent spawned by that plan's run uses it, **overriding** even an
-    /// agent's frontmatter `model` (precedence: plan → frontmatter → session).
-    /// `None` outside a plan run, where the session model + frontmatter behave
-    /// exactly as before. Resolved once when the session worker starts and
-    /// threaded onto every spawn.
+    /// Root/legacy plan-level model override. A delegated vNext child never
+    /// inherits this field: it resolves its own prepared slot default unless
+    /// its direct parent supplies [`Self::delegation_model`]. Keeping these
+    /// two fields separate preserves the authority/provenance of an explicit
+    /// parent choice.
     pub model_override: Option<Arc<Model>>,
     /// Optional structured model selector supplied by the delegating agent on
     /// `task`; honored only when the config toggle allows it.

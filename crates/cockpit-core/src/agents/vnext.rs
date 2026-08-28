@@ -382,13 +382,22 @@ impl LocalInstallationResolver {
         launch_target: &str,
     ) -> Option<crate::agents::AgentDef> {
         let delegation = parent.delegation.as_ref()?;
+        // `self` is a literal authored launch token. It deliberately does not
+        // equal the parent's agentId (and callers must not rewrite it to a
+        // display name). The resolver snapshots the parent definition under
+        // this package-local route when the session is prepared.
+        let package_route = if launch_target == SELF_CHILD_REF {
+            SELF_CHILD_REF
+        } else {
+            launch_target
+        };
         let permitted = delegation
             .allowed_children
             .iter()
             .any(|reference| match reference {
                 AllowedChild::PortableRef { portable_agent_ref } => {
                     portable_agent_ref == launch_target
-                        || portable_agent_ref == SELF_CHILD_REF && launch_target == parent.agent_id
+                        || portable_agent_ref == SELF_CHILD_REF && launch_target == SELF_CHILD_REF
                         || delegation
                             .package_children
                             .get(portable_agent_ref)
@@ -401,11 +410,11 @@ impl LocalInstallationResolver {
                 delegation
                     .package_definitions
                     .0
-                    .get(launch_target)
+                    .get(package_route)
                     .cloned()
                     .or_else(|| {
                         self.package_definitions
-                            .get(&(parent.agent_id.clone(), launch_target.to_string()))
+                            .get(&(parent.agent_id.clone(), package_route.to_string()))
                             .cloned()
                     })
             })
@@ -2567,6 +2576,13 @@ mod tests {
                 .primary_slot_routes_for_authorized_child(&grant, &parent)
                 .unwrap(),
             Some(vec![route])
+        );
+        assert_eq!(
+            resolver
+                .package_definition_for_parent_launch_target(&grant, SELF_CHILD_REF)
+                .as_ref(),
+            Some(&parent),
+            "literal self must resolve the authenticated parent package snapshot"
         );
         assert_eq!(
             resolver

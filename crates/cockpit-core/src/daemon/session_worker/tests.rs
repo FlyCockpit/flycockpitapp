@@ -290,7 +290,6 @@ fn config_application_gate_clear_never_releases_a_successor_revision() {
     assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 9);
 }
 
-
 #[test]
 fn installed_root_launch_routes_only_explicit_or_resumed_selection_as_override() {
     assert_eq!(

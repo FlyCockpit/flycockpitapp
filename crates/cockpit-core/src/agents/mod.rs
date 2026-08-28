@@ -71,16 +71,20 @@ pub use vnext::{
     ModelLocality, ModelRecommendation, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded,
     PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, PreparedPrimarySlotRoute,
     ProhibitedQuestionClass, ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder,
-    SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef, ToolClass,
-    VerificationAction, VerificationBudget, VerificationDispatch, VerificationEstimate,
-    VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
-    VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
-    VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
+    SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef, ToolClass, VerificationAction,
+    VerificationBudget, VerificationDispatch, VerificationEstimate, VerificationMode,
+    VerificationPolicy, VerificationRecipe, VerificationRule, VerificationSelector,
+    VerificationSessionReduction, VerificationSubject, VnextAgentDef, VnextHostPolicy,
+    delegation_kind_permitted, resolve_question_policy,
 };
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 /// Whole-tree cap for an agent definition package (`agents/<name>/`).
 const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_PACKAGE_ENTRIES: usize =
+    cockpit_host::private_fs::MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES;
+pub(crate) const MAX_PACKAGE_DEPTH: usize =
+    cockpit_host::private_fs::MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH;
 const PACKAGE_ROOT_FILE: &str = "agent.md";
 const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
 const PACKAGE_MCP_FILE: &str = "mcp.json";
@@ -1601,6 +1605,19 @@ pub fn load_profile_definition_from_owned_path(
     owned_path: &Path,
 ) -> Result<AgentProfileDefinition> {
     ensure!(
+        matches!(
+            (source, installation.scope),
+            (
+                AgentProfileInstallationSource::Global | AgentProfileInstallationSource::Builtin,
+                cockpit_db::db::agent_installations::AgentInstallationScope::Global
+            ) | (
+                AgentProfileInstallationSource::WorkspacePrivate,
+                cockpit_db::db::agent_installations::AgentInstallationScope::WorkspacePrivate
+            )
+        ),
+        "pathname profile loading is restricted to daemon-owned installation scopes"
+    );
+    ensure!(
         observation.installation_id == installation.installation_id,
         "profile observation belongs to a different installation"
     );
@@ -1655,8 +1672,7 @@ pub fn load_profile_definition_from_owned_path(
                 load_builtin_override_from_file(owned_path, name)?
             }
             AgentProfileInstallationSource::Global
-            | AgentProfileInstallationSource::WorkspacePrivate
-            | AgentProfileInstallationSource::WorkspaceShared => {
+            | AgentProfileInstallationSource::WorkspacePrivate => {
                 // The logical parse name and scope are daemon-owned metadata.
                 // Read the retained leaf through the no-follow owned-path
                 // loader: package children must never be reopened through the
@@ -1667,8 +1683,60 @@ pub fn load_profile_definition_from_owned_path(
                     profile_definition_scope(source, &installation.source_agent_id),
                 )?
             }
+            AgentProfileInstallationSource::WorkspaceShared => {
+                unreachable!("workspace-shared source was rejected before pathname loading")
+            }
         }
     };
+    profile_definition_from_loaded(
+        installation,
+        observation,
+        source,
+        definition,
+        "owned profile path",
+    )
+}
+
+/// Finish a workspace-shared profile from bytes read through the attach-time
+/// directory capability. This boundary deliberately accepts an already parsed
+/// definition rather than a path, so startup, SetAgent, and private package
+/// children cannot accidentally regain pathname authority.
+pub(crate) fn profile_definition_from_workspace_snapshot(
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+    definition: AgentDef,
+) -> Result<AgentProfileDefinition> {
+    ensure!(
+        installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared,
+        "attached workspace profile snapshot requires workspace-shared installation scope"
+    );
+    profile_definition_from_loaded(
+        installation,
+        observation,
+        AgentProfileInstallationSource::WorkspaceShared,
+        definition,
+        "attached workspace profile snapshot",
+    )
+}
+
+fn profile_definition_from_loaded(
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+    source: AgentProfileInstallationSource,
+    definition: AgentDef,
+    label: &str,
+) -> Result<AgentProfileDefinition> {
+    ensure!(
+        observation.installation_id == installation.installation_id,
+        "profile observation belongs to a different installation"
+    );
+    let launch_target = installation
+        .source_agent_id
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .context("profile installation has no launch target name")?;
     let vnext = definition
         .vnext
         .as_ref()
@@ -1687,7 +1755,7 @@ pub fn load_profile_definition_from_owned_path(
             || installation
                 .source_agent_id
                 .ends_with(&format!("/{}", definition.name)),
-        "owned profile path identity does not match its selected installation"
+        "{label} identity does not match its selected installation"
     );
     Ok(AgentProfileDefinition {
         installation,
@@ -1945,40 +2013,32 @@ fn load_legacy_prompt_override_dir(
 ) -> Result<AgentDef> {
     // Model IDs commonly contain `/`, so nested paths such as
     // `anthropic/claude-opus.md` become the key `anthropic/claude-opus`.
-    // Symlinked directories are not followed.
+    // Use the same no-follow, aggregate-byte, entry-count, and depth-bounded
+    // tree snapshot as packages. Legacy directories are still workspace input
+    // and must not retain their old unbounded pathname recursion.
     let mut overrides: BTreeMap<String, String> = BTreeMap::new();
     let mut first_override_def: Option<AgentDef> = None;
-    fn collect_override_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in std::fs::read_dir(dir)
-            .map_err(|e| anyhow::anyhow!("reading agent dir {}: {e}", dir.display()))?
-        {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let path = entry.path();
-            if file_type.is_dir() {
-                collect_override_files(&path, files)?;
-            } else if file_type.is_file()
-                && path.extension().and_then(|extension| extension.to_str()) == Some("md")
-            {
-                files.push(path);
-            }
-        }
-        Ok(())
-    }
-    let mut override_files = Vec::new();
-    collect_override_files(agent_dir, &mut override_files)?;
-    override_files.sort();
-    for path in override_files {
-        let relative = path.strip_prefix(agent_dir)?;
-        let mut key = relative.with_extension("").to_string_lossy().into_owned();
-        if std::path::MAIN_SEPARATOR != '/' {
-            key = key.replace(std::path::MAIN_SEPARATOR, "/");
-        }
-        if key.is_empty() {
+    let override_files = cockpit_host::private_fs::read_nofollow_directory_tree(
+        agent_dir,
+        MAX_MARKDOWN_BYTES,
+        MAX_PACKAGE_BYTES,
+    )
+    .map_err(anyhow::Error::from)
+    .with_context(|| format!("reading legacy agent override tree {}", agent_dir.display()))?;
+    let override_bytes = override_files.values().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(bytes.len() as u64)
+            .context("legacy agent override byte count overflow")
+    })?;
+    for (relative, bytes) in override_files {
+        let Some(key) = relative.strip_suffix(".md").filter(|key| !key.is_empty()) else {
             continue;
-        }
-        let text = read_agent_markdown(&path)?;
-        let parsed = parse_agent_with_scope(&text, name, path.clone(), scope)?;
+        };
+        let path = agent_dir.join(&relative);
+        let key = key.to_string();
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!("agent override {} is not UTF-8", path.display()))?;
+        let parsed = parse_agent_with_scope(text, name, path.clone(), scope)?;
         overrides.insert(key, parsed.prompt.clone());
         if first_override_def.is_none() {
             first_override_def = Some(parsed);
@@ -1990,6 +2050,10 @@ fn load_legacy_prompt_override_dir(
     let flat_path = dir.join(format!("{name}.md"));
     let flat_def = if flat_path.is_file() {
         let text = read_agent_markdown(&flat_path)?;
+        ensure!(
+            override_bytes.saturating_add(text.len() as u64) <= MAX_PACKAGE_BYTES,
+            "legacy agent `{name}` aggregate exceeds {MAX_PACKAGE_BYTES} byte limit"
+        );
         Some(parse_agent_with_scope(
             &text,
             name,

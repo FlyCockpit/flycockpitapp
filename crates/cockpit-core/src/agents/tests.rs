@@ -91,7 +91,23 @@ fn agent_profile_resolution_owned_path_uses_the_source_specific_loader() {
             AgentProfileInstallationSource::WorkspaceShared,
             &authored,
         )
-        .is_ok()
+        .is_err(),
+        "workspace-shared definitions must never enter the pathname loader"
+    );
+    let shared_definition = parse_agent(
+        &fs::read_to_string(&authored).unwrap(),
+        "shared",
+        "<attached-workspace-agent>".into(),
+    )
+    .unwrap();
+    assert!(
+        profile_definition_from_workspace_snapshot(
+            shared.clone(),
+            observation(&shared),
+            shared_definition,
+        )
+        .is_ok(),
+        "capability-loaded workspace bytes retain workspace provenance"
     );
 
     #[cfg(unix)]
@@ -597,6 +613,41 @@ fn load_from_dir_rejects_oversized_override_markdown() {
     let err = load_from_dir(&dir, "large").unwrap_err();
 
     assert!(err.to_string().contains("exceeds"), "{err}");
+}
+
+#[test]
+fn legacy_override_dir_rejects_aggregate_package_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("agents");
+    let agent_dir = dir.join("large");
+    fs::create_dir_all(&agent_dir).unwrap();
+    for index in 0..5 {
+        fs::write(
+            agent_dir.join(format!("model-{index}.md")),
+            vec![b'x'; 900 * 1024],
+        )
+        .unwrap();
+    }
+
+    let err = load_from_dir(&dir, "large").unwrap_err();
+
+    assert!(err.to_string().contains("package exceeds"), "{err}");
+}
+
+#[test]
+fn legacy_override_dir_rejects_excessive_depth() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("agents");
+    let mut nested = dir.join("deep");
+    for index in 0..=MAX_PACKAGE_DEPTH {
+        nested.push(format!("level-{index}"));
+    }
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("model.md"), b"definition").unwrap();
+
+    let err = load_from_dir(&dir, "deep").unwrap_err();
+
+    assert!(err.to_string().contains("directory depth limit"), "{err}");
 }
 
 #[test]

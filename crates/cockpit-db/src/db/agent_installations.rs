@@ -2312,6 +2312,34 @@ pub fn set_remote_session_agent_conn(
     now_unix_ms: i64,
 ) -> Result<()> {
     ensure!(!active_agent.trim().is_empty(), "remote agent is required");
+    let pinned_source: Option<String> = conn
+        .query_row(
+            "SELECT i.source_agent_id
+               FROM agent_profile_snapshots s
+               JOIN agent_installations i ON i.installation_id = s.installation_id
+              WHERE s.session_id = ?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("checking remote selection against the prepared root")?;
+    if let Some(source_agent_id) = pinned_source {
+        let pinned_agent = source_agent_id
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .context("prepared installed root has no launch target")?;
+        if pinned_agent != active_agent {
+            return Err(remote_installed_selection_ineligible(
+                "remote agent selection conflicts with the session's prepared root",
+            ));
+        }
+        // An exact replay/convergence request for the immutable root is safe
+        // regardless of today's inventory or preparation-claim state. Keep
+        // the pinned root and clear only stale snapshotless provenance.
+        Db::set_session_agent_conn(conn, session_id, active_agent)?;
+        return Ok(());
+    }
     let installed_matches: i64 = conn
         .query_row(
             "SELECT COUNT(*)
@@ -4907,6 +4935,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claim_count, 0, "failed selection must roll back its claim");
+    }
+
+    #[tokio::test]
+    async fn remote_selection_converges_only_to_the_exact_prepared_root() {
+        let db = Db::open_in_memory().unwrap();
+        let (installation_id, definition_digest) =
+            installed_and_bound_named_fixture(&db, "installed-root").await;
+        let session = db
+            .create_session("project", "/workspace", "installed-root")
+            .await
+            .unwrap();
+        let session_id = session.session_id;
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 40)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::Eligible
+        ));
+        let mut input = prepare_input(session_id, installation_id, definition_digest);
+        input.session_create.active_agent = "installed-root".into();
+        input.existing_session_claim_token = Some(session_id);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+
+        db.transaction(move |conn| {
+            set_remote_session_agent_conn(
+                conn,
+                session_id,
+                "installed-root",
+                "workspace:unused-for-global",
+                41,
+            )
+        })
+        .await
+        .expect("exact prepared root is a safe convergence request");
+
+        let error = db
+            .transaction(move |conn| {
+                set_remote_session_agent_conn(
+                    conn,
+                    session_id,
+                    "Build",
+                    "workspace:unused-for-global",
+                    42,
+                )
+            })
+            .await
+            .expect_err("built-in target must not replace a prepared root");
+        assert!(
+            error
+                .downcast_ref::<RemoteInstalledAgentSelectionIneligible>()
+                .is_some(),
+            "prepared-root mismatch must be a conflict-class admission refusal: {error:#}"
+        );
+        let retained = db.get_session(session_id).await.unwrap().unwrap();
+        assert_eq!(retained.active_agent, "installed-root");
+        assert_eq!(retained.pending_remote_agent_selection, None);
     }
 
     #[tokio::test]

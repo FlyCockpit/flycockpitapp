@@ -1009,6 +1009,9 @@ pub fn read_owned_file_nofollow(
     Ok(Some(bytes))
 }
 
+pub const MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES: usize = 4_096;
+pub const MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH: usize = 32;
+
 /// Read a bounded directory tree through one pinned root directory and
 /// no-follow, fd-relative opens for every descendant. Names returned by
 /// `readdir` are never resolved as paths: each is opened with `openat` against
@@ -1026,7 +1029,9 @@ pub fn read_nofollow_directory_tree(
         root: &Path,
         per_file_limit: u64,
         total_limit: u64,
+        depth: usize,
         total: &mut u64,
+        entries: &mut usize,
         files: &mut std::collections::BTreeMap<String, Vec<u8>>,
     ) -> std::result::Result<(), PrivateFsError> {
         use std::ffi::{CStr, CString};
@@ -1065,6 +1070,18 @@ pub fn read_nofollow_directory_tree(
                 let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
                 if name == b"." || name == b".." {
                     continue;
+                }
+                *entries = entries.checked_add(1).ok_or_else(|| {
+                    PrivateFsError::Containment(format!(
+                        "{}: package entry count overflow",
+                        root.display()
+                    ))
+                })?;
+                if *entries > MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package exceeds its entry count limit",
+                        root.display()
+                    )));
                 }
                 // Package paths use `/` as their portable component separator.
                 // A backslash is a legal Unix filename byte but a separator on
@@ -1113,13 +1130,21 @@ pub fn read_nofollow_directory_tree(
                 let os_name = std::ffi::OsString::from_vec(name.to_vec());
                 let relative = relative_dir.join(os_name);
                 if metadata.is_dir() {
+                    if depth >= MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH {
+                        return Err(PrivateFsError::Containment(format!(
+                            "{}: package exceeds its directory depth limit",
+                            root.display()
+                        )));
+                    }
                     visit(
                         &held,
                         &relative,
                         root,
                         per_file_limit,
                         total_limit,
+                        depth + 1,
                         total,
+                        entries,
                         files,
                     )?;
                     continue;
@@ -1175,13 +1200,16 @@ pub fn read_nofollow_directory_tree(
     let root_handle = walk_private_dir(root, false)?;
     let mut files = std::collections::BTreeMap::new();
     let mut total = 0;
+    let mut entries = 0;
     visit(
         &root_handle,
         Path::new(""),
         root,
         per_file_limit,
         total_limit,
+        0,
         &mut total,
+        &mut entries,
         &mut files,
     )?;
     Ok(files)
@@ -1206,7 +1234,13 @@ pub fn read_nofollow_directory_tree(
     let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(root)
         .map_err(|error| PrivateFsError::Containment(format!("opening held package: {error:#}")))?;
     authority
-        .read_directory_tree_relative_bounded(&[], per_file_limit, total_limit, 4_096, 32)
+        .read_directory_tree_relative_bounded(
+            &[],
+            per_file_limit,
+            total_limit,
+            MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES,
+            MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH,
+        )
         .map_err(|error| {
             PrivateFsError::Containment(format!("reading held package tree: {error:#}"))
         })?
@@ -3735,6 +3769,38 @@ mod tests {
             matches!(result, Err(PrivateFsError::Containment(message)) if message.contains("cross-platform path separator")),
             "portable package path collision must fail closed: {result:?}"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn public_nofollow_directory_tree_refuses_excess_depth() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        let mut nested = package.clone();
+        for index in 0..=MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH {
+            nested.push(format!("level-{index}"));
+        }
+        std::fs::create_dir_all(&nested).expect("nested package directories");
+        std::fs::write(nested.join("agent.md"), b"definition").expect("nested package file");
+
+        let error = read_nofollow_directory_tree(&package, 1_024, 4_096)
+            .expect_err("public traversal must enforce its shared depth cap");
+        assert!(error.to_string().contains("directory depth limit"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn public_nofollow_directory_tree_refuses_excess_entry_count() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir(&package).expect("package directory");
+        for index in 0..=MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES {
+            std::fs::write(package.join(format!("entry-{index}")), b"").expect("package entry");
+        }
+
+        let error = read_nofollow_directory_tree(&package, 1_024, 4_096)
+            .expect_err("public traversal must enforce its shared entry cap");
+        assert!(error.to_string().contains("entry count limit"));
     }
 
     #[cfg(windows)]

@@ -1739,7 +1739,7 @@ impl SessionRegistry {
         // overrides retain their existing derived-definition semantics.
         session_worker::prepare_fresh_installed_root_snapshot(
             &session,
-            &project_root,
+            &workspace_root_authority.attached_root,
             &providers_cfg,
             &extended_cfg,
             preserve_root_model_override,

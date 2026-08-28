@@ -57,8 +57,6 @@ pub(crate) fn is_package_child_installation(row: &AgentInstallationRow) -> bool 
 
 const MAX_AGENT_MARKDOWN_BYTES: usize = 1024 * 1024;
 const MAX_AGENT_PACKAGE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_AGENT_PACKAGE_ENTRIES: usize = 4_096;
-const MAX_AGENT_PACKAGE_DEPTH: usize = 32;
 /// Hook files share the bounded retained-workspace config policy.  Keep this
 /// explicit at the acquisition boundary: parser errors may be warnings, but
 /// an oversized capability-backed source is not safe to read or publish.
@@ -240,7 +238,7 @@ pub struct AuthorizedWorkspaceRoot {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum WorkspaceSharedDefinitionBytes {
+pub(crate) enum WorkspaceSharedDefinitionBytes {
     Flat(Vec<u8>),
     Package(BTreeMap<String, Vec<u8>>),
 }
@@ -294,6 +292,10 @@ impl AuthorizedWorkspaceRoot {
         &self.canonical_path
     }
 
+    pub(crate) fn canonical_workspace_id(&self) -> String {
+        canonical_workspace_id(&self.canonical_path)
+    }
+
     pub(crate) fn read_regular_file_relative(&self, components: &[&str]) -> Result<Vec<u8>> {
         self.held_directory.read_regular_file_relative(components)
     }
@@ -308,7 +310,7 @@ impl AuthorizedWorkspaceRoot {
         Ok(observed.canonical_path)
     }
 
-    fn read_workspace_shared_definition(
+    pub(crate) fn read_workspace_shared_definition(
         &self,
         name: &str,
     ) -> Result<WorkspaceSharedDefinitionBytes> {
@@ -323,8 +325,8 @@ impl AuthorizedWorkspaceRoot {
             &[".cockpit", "agents", name],
             MAX_AGENT_MARKDOWN_BYTES,
             MAX_AGENT_PACKAGE_BYTES,
-            MAX_AGENT_PACKAGE_ENTRIES,
-            MAX_AGENT_PACKAGE_DEPTH,
+            crate::agents::MAX_PACKAGE_ENTRIES,
+            crate::agents::MAX_PACKAGE_DEPTH,
         )? {
             return Ok(WorkspaceSharedDefinitionBytes::Package(files));
         }
@@ -8500,6 +8502,13 @@ mod tests {
             .expect("canonical symlink alias");
         assert_eq!(alias_id, direct_id);
         assert_eq!(alias_root, direct_root);
+        let direct_authority = AuthorizedWorkspaceRoot::capture(&allowed).expect("direct proof");
+        let alias_authority = AuthorizedWorkspaceRoot::capture(&alias).expect("alias proof");
+        assert_eq!(
+            direct_authority.canonical_workspace_id(),
+            alias_authority.canonical_workspace_id(),
+            "remote selection keys must come from canonical attached identity"
+        );
         std::fs::rename(&allowed, parent.path().join("moved")).expect("rename allowed root");
         std::fs::rename(&replacement, &allowed).expect("replace pathname");
         assert!(

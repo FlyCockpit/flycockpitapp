@@ -550,6 +550,77 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
 }
 
 #[test]
+fn installed_workspace_roots_retain_attach_authority_and_remote_snapshot_identity() {
+    let dispatch = include_str!("../src/daemon/server/dispatch.rs");
+    let worker = include_str!("../src/daemon/session_worker/run.rs");
+    let agents = include_str!("../src/agents/mod.rs");
+
+    let capability_loader = worker
+        .split("fn load_profile_definition_with_workspace_authority")
+        .nth(1)
+        .expect("workspace installed-root capability loader exists")
+        .split("fn load_installed_profile_definition")
+        .next()
+        .expect("workspace capability loader is bounded");
+    for required in [
+        "read_workspace_shared_definition",
+        "WorkspaceSharedDefinitionBytes::Flat",
+        "WorkspaceSharedDefinitionBytes::Package",
+        "private_subagents",
+        "profile_definition_from_workspace_snapshot",
+    ] {
+        assert!(
+            capability_loader.contains(required),
+            "workspace installed-root loading lost {required}"
+        );
+    }
+
+    let startup = worker
+        .split("pub(super) async fn run_worker")
+        .nth(1)
+        .expect("worker startup exists");
+    assert!(
+        startup.contains("workspace_root_authority.attached_root"),
+        "startup and SetAgent must retain the attach-time workspace root"
+    );
+    let owned_loader = agents
+        .split("pub fn load_profile_definition_from_owned_path")
+        .nth(1)
+        .expect("owned profile loader exists")
+        .split("pub(crate) fn profile_definition_from_workspace_snapshot")
+        .next()
+        .expect("owned profile loader is bounded");
+    assert!(
+        owned_loader
+            .contains("pathname profile loading is restricted to daemon-owned installation scopes"),
+        "pathname profile loading must reject workspace-shared authority"
+    );
+
+    let set_agent = dispatch
+        .split("Request::SetAgent { name } => {")
+        .nth(1)
+        .expect("SetAgent dispatch branch exists")
+        .split("Request::SetToolSurfaceOverride")
+        .next()
+        .expect("SetAgent dispatch branch is bounded");
+    let snapshot_admission = set_agent
+        .find("agent_profile_snapshot(session_id)")
+        .expect("remote SetAgent checks immutable prepared authority");
+    let receipt = set_agent
+        .find("execute_idempotent_adapter_remote_operation")
+        .expect("remote SetAgent receipt exists");
+    assert!(
+        snapshot_admission < receipt,
+        "prepared-root mismatch must be rejected before remote receipt"
+    );
+    assert!(
+        set_agent.contains("workspace_root_authority")
+            && set_agent.contains("canonical_workspace_id()"),
+        "remote installation lookup must use attached canonical workspace identity"
+    );
+}
+
+#[test]
 fn private_child_binding_receipts_are_scoped_to_reviewed_parent_generation() {
     let worker = include_str!("../src/daemon/session_worker/run.rs");
     let key = worker

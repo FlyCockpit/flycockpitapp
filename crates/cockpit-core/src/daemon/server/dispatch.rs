@@ -10509,12 +10509,59 @@ async fn handle_serialized_request_impl(
                     }
                     crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::Absent => {}
                 }
-                validate_set_agent(ctx, att, &name)?;
+                // A prepared profile is immutable session authority. Admit an
+                // exact request for that same root as convergence even if the
+                // mutable inventory changed, and reject every other target
+                // (installed, built-in, or legacy) before reserving/receipting
+                // the remote operation. The transaction repeats this check to
+                // close a concurrent preparation race.
+                let pinned_agent = match ctx
+                    .db
+                    .agent_profile_snapshot(session_id)
+                    .await
+                    .map_err(internal)?
+                {
+                    Some(snapshot) => {
+                        let installation = ctx
+                            .db
+                            .agent_installation(snapshot.installation_id)
+                            .await
+                            .map_err(internal)?
+                            .ok_or_else(|| internal("prepared root installation is missing"))?;
+                        Some(
+                            installation
+                                .source_agent_id
+                                .rsplit('/')
+                                .next()
+                                .filter(|target| !target.is_empty())
+                                .ok_or_else(|| internal("prepared root has no launch target"))?
+                                .to_string(),
+                        )
+                    }
+                    None => None,
+                };
+                if let Some(pinned_agent) = pinned_agent.as_deref() {
+                    if pinned_agent != name {
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: format!(
+                                "session already pins installed root `{pinned_agent}`"
+                            ),
+                        });
+                    }
+                } else {
+                    validate_set_agent(ctx, att, &name)?;
+                }
                 let desired = name.clone();
-                let canonical_workspace_id =
-                    crate::daemon::agent_installation::canonical_workspace_id(
-                        &att.handle.project_root,
-                    );
+                // Installation rows are keyed by the canonical workspace
+                // identity captured at attach, not by the client's original
+                // project-root spelling. A symlink/alias attachment must hit
+                // the exact same private/shared installation namespace.
+                let canonical_workspace_id = att
+                    .handle
+                    .workspace_root_authority
+                    .attached_root
+                    .canonical_workspace_id();
                 let selection_now_ms = chrono::Utc::now().timestamp_millis();
                 let remote_outcome = ctx.db.execute_idempotent_adapter_remote_operation(
                     reserve(),
@@ -10537,7 +10584,7 @@ async fn handle_serialized_request_impl(
                     if error.downcast_ref::<crate::db::agent_installations::RemoteInstalledAgentSelectionIneligible>().is_some() {
                         ErrorPayload {
                             code: ErrorCode::Conflict,
-                            message: "remote installed-agent selection requires an idle session".into(),
+                            message: "remote agent selection conflicts with prepared session authority".into(),
                         }
                     } else {
                         internal(error)

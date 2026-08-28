@@ -153,6 +153,133 @@ fn installation_launch_target(
         .filter(|name| !name.is_empty())
 }
 
+fn load_profile_definition_with_workspace_authority(
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+) -> anyhow::Result<crate::agents::AgentProfileDefinition> {
+    use crate::daemon::agent_installation::WorkspaceSharedDefinitionBytes;
+
+    ensure!(
+        installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared,
+        "workspace capability loader received a daemon-owned installation"
+    );
+    let (definition_name, child_name) =
+        if crate::daemon::agent_installation::is_package_child_installation(&installation) {
+            let (parent_source_agent_id, child_name) = installation
+                .source_agent_id
+                .rsplit_once('/')
+                .context("workspace package child has no parent identity")?;
+            let parent_name = parent_source_agent_id
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .context("workspace package child parent has no definition name")?;
+            (parent_name, Some(child_name))
+        } else {
+            (
+                installation_launch_target(&installation)
+                    .context("workspace installation has no definition name")?,
+                None,
+            )
+        };
+    let snapshot = workspace_root.read_workspace_shared_definition(definition_name)?;
+    let definition = match (snapshot, child_name) {
+        (WorkspaceSharedDefinitionBytes::Flat(bytes), None) => {
+            let text = std::str::from_utf8(&bytes)
+                .context("workspace-shared agent definition is not UTF-8")?;
+            let definition = crate::agents::parse_agent(
+                text,
+                definition_name,
+                PathBuf::from("<attached-workspace-agent>"),
+            )?;
+            crate::agents::validate_invariants(&definition)?;
+            definition
+        }
+        (WorkspaceSharedDefinitionBytes::Package(files), child_name) => {
+            let mut package =
+                crate::agents::load_workspace_package_from_files(definition_name, files)?;
+            match child_name {
+                Some(child_name) => package
+                    .private_subagents
+                    .remove(child_name)
+                    .with_context(|| {
+                        format!(
+                            "workspace package `{definition_name}` lost private child `{child_name}`"
+                        )
+                    })?,
+                None => package,
+            }
+        }
+        (WorkspaceSharedDefinitionBytes::Flat(_), Some(_)) => {
+            anyhow::bail!("workspace package child parent is no longer a package")
+        }
+    };
+    crate::agents::profile_definition_from_workspace_snapshot(installation, observation, definition)
+}
+
+fn load_installed_profile_definition(
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+    daemon_agents_dir: &Path,
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+) -> anyhow::Result<crate::agents::AgentProfileDefinition> {
+    if installation.scope
+        == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+    {
+        return load_profile_definition_with_workspace_authority(
+            workspace_root,
+            installation,
+            observation,
+        );
+    }
+    let definition_path = crate::daemon::agent_installation::setup_definition_path(
+        daemon_agents_dir,
+        &installation,
+        Some(workspace_root.canonical_path()),
+    )?;
+    let source = installation_profile_source(installation.scope);
+    crate::agents::load_profile_definition_from_owned_path(
+        installation,
+        observation,
+        source,
+        &definition_path,
+    )
+}
+
+fn profile_definition_from_loaded_package_child(
+    parent_source_agent_id: &str,
+    parent_definition: &crate::agents::AgentDef,
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+) -> anyhow::Result<crate::agents::AgentProfileDefinition> {
+    ensure!(
+        installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+            && crate::daemon::agent_installation::is_package_child_installation(&installation),
+        "loaded workspace package child has incompatible installation authority"
+    );
+    let (observed_parent, child_name) = installation
+        .source_agent_id
+        .rsplit_once('/')
+        .context("workspace package child has no parent identity")?;
+    ensure!(
+        observed_parent == parent_source_agent_id,
+        "workspace package child belongs to a different loaded parent"
+    );
+    let child = parent_definition
+        .private_subagents
+        .get(child_name)
+        .with_context(|| {
+            format!(
+                "loaded workspace package `{parent_source_agent_id}` lost private child `{child_name}`"
+            )
+        })?
+        .clone();
+    crate::agents::profile_definition_from_workspace_snapshot(installation, observation, child)
+}
+
 async fn materialize_package_children(
     session: &crate::session::Session,
     parent: &cockpit_db::db::agent_installations::AgentInstallationRow,
@@ -375,7 +502,7 @@ pub(super) fn snapshotless_remote_reconciliation_required(
 
 pub(crate) async fn prepare_fresh_installed_root_snapshot(
     session: &crate::session::Session,
-    project_root: &Path,
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
     providers: &crate::config::providers::ProvidersConfig,
     extended_cfg: &crate::config::extended::ExtendedConfig,
     preserve_root_model_override: bool,
@@ -411,7 +538,7 @@ pub(crate) async fn prepare_fresh_installed_root_snapshot(
     };
     let prepared = prepare_installed_root_snapshot_named(
         session,
-        project_root,
+        workspace_root,
         providers,
         extended_cfg,
         preserve_root_model_override,
@@ -429,7 +556,7 @@ pub(crate) async fn prepare_fresh_installed_root_snapshot(
 
 async fn prepare_installed_root_snapshot_named(
     session: &crate::session::Session,
-    project_root: &Path,
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
     providers: &crate::config::providers::ProvidersConfig,
     extended_cfg: &crate::config::extended::ExtendedConfig,
     preserve_root_model_override: bool,
@@ -445,11 +572,8 @@ async fn prepare_installed_root_snapshot_named(
         return Ok(None);
     }
 
-    let canonical_project_root = std::fs::canonicalize(project_root).with_context(|| {
-        format!("canonicalizing session project root for installed root `{active_agent}`")
-    })?;
-    let workspace_id =
-        crate::daemon::agent_installation::canonical_workspace_id(&canonical_project_root);
+    let canonical_project_root = workspace_root.canonical_path();
+    let workspace_id = workspace_root.canonical_workspace_id();
     let mut visible = session
         .db
         .list_agent_installations(
@@ -505,16 +629,11 @@ async fn prepare_installed_root_snapshot_named(
                 selected.source_agent_id
             )
         })?;
-    let selected_definition_path = crate::daemon::agent_installation::setup_definition_path(
+    let selected_loaded = load_installed_profile_definition(
+        workspace_root,
         &daemon_agents_dir,
-        &selected,
-        Some(&canonical_project_root),
-    )?;
-    let selected_loaded = crate::agents::load_profile_definition_from_owned_path(
         selected.clone(),
         selected_observation.clone(),
-        installation_profile_source(selected.scope),
-        &selected_definition_path,
     )?;
     let selected_vnext = selected_loaded
         .definition
@@ -608,17 +727,30 @@ async fn prepare_installed_root_snapshot_named(
             .with_context(|| {
                 format!("installed candidate `{installation_id}` has no reviewed observation")
             })?;
-        let definition_path = crate::daemon::agent_installation::setup_definition_path(
-            &daemon_agents_dir,
-            &installation,
-            Some(&canonical_project_root),
-        )?;
-        definitions.push(crate::agents::load_profile_definition_from_owned_path(
-            installation.clone(),
-            observation,
-            installation_profile_source(installation.scope),
-            &definition_path,
-        )?);
+        let loaded = if installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+            && crate::daemon::agent_installation::is_package_child_installation(&installation)
+            && installation
+                .source_agent_id
+                .rsplit_once('/')
+                .map(|pair| pair.0)
+                == Some(selected.source_agent_id.as_str())
+        {
+            profile_definition_from_loaded_package_child(
+                &selected.source_agent_id,
+                &selected_loaded.definition,
+                installation.clone(),
+                observation,
+            )?
+        } else {
+            load_installed_profile_definition(
+                workspace_root,
+                &daemon_agents_dir,
+                installation.clone(),
+                observation,
+            )?
+        };
+        definitions.push(loaded);
     }
     let catalog = crate::agents::AgentProfileInstallationCatalog::new(definitions)?;
     let bindings = session
@@ -833,7 +965,7 @@ async fn prepare_installed_root_snapshot_named(
 
 async fn prepared_root_launch_state(
     session: &std::sync::Arc<crate::session::Session>,
-    project_root: &Path,
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
 ) -> anyhow::Result<Option<PreparedRootLaunchState>> {
     let snapshot_row = session.db.agent_profile_snapshot(session.id).await?;
     let Some(snapshot_row) = snapshot_row else {
@@ -858,6 +990,7 @@ async fn prepared_root_launch_state(
 
     let mut definitions = std::collections::BTreeMap::new();
     let mut primary_slot_routes = std::collections::BTreeMap::new();
+    let mut loaded_workspace_packages = std::collections::BTreeMap::new();
     let mut root_agent_name = None;
     for installation_id in installation_ids {
         let installation = session
@@ -876,17 +1009,47 @@ async fn prepared_root_launch_state(
             observation.reviewed && observation.observed_digest == installation.source_digest,
             "prepared installation `{installation_id}` is unreviewed or no longer current"
         );
-        let definition_path = crate::daemon::agent_installation::setup_definition_path(
-            &daemon_agents_dir,
-            &installation,
-            Some(project_root),
-        )?;
-        let loaded = crate::agents::load_profile_definition_from_owned_path(
-            installation.clone(),
-            observation.clone(),
-            installation_profile_source(installation.scope),
-            &definition_path,
-        )?;
+        let loaded = if installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+            && crate::daemon::agent_installation::is_package_child_installation(&installation)
+        {
+            let parent_source_agent_id = installation
+                .source_agent_id
+                .rsplit_once('/')
+                .map(|pair| pair.0)
+                .context("prepared workspace package child has no parent identity")?;
+            match loaded_workspace_packages.get(parent_source_agent_id) {
+                Some(parent_definition) => profile_definition_from_loaded_package_child(
+                    parent_source_agent_id,
+                    parent_definition,
+                    installation.clone(),
+                    observation.clone(),
+                )?,
+                None => load_installed_profile_definition(
+                    workspace_root,
+                    &daemon_agents_dir,
+                    installation.clone(),
+                    observation.clone(),
+                )?,
+            }
+        } else {
+            load_installed_profile_definition(
+                workspace_root,
+                &daemon_agents_dir,
+                installation.clone(),
+                observation.clone(),
+            )?
+        };
+        if installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+            && !crate::daemon::agent_installation::is_package_child_installation(&installation)
+            && !loaded.definition.private_subagents.is_empty()
+        {
+            loaded_workspace_packages.insert(
+                installation.source_agent_id.clone(),
+                loaded.definition.clone(),
+            );
+        }
         let loaded_digest =
             crate::intel::hex_lower(&Sha256::digest(loaded.definition.vnext_digest_bytes()?));
         ensure!(
@@ -957,7 +1120,7 @@ async fn prepared_root_launch_state(
 /// the driver must install before rebuilding the root frame.
 async fn prepare_set_agent_installed_root(
     session: &std::sync::Arc<crate::session::Session>,
-    project_root: &Path,
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
     providers: &crate::config::providers::ProvidersConfig,
     extended_cfg: &crate::config::extended::ExtendedConfig,
     name: &str,
@@ -968,7 +1131,7 @@ async fn prepare_set_agent_installed_root(
         .await?
         .is_some()
     {
-        let launch = prepared_root_launch_state(session, project_root)
+        let launch = prepared_root_launch_state(session, workspace_root)
             .await?
             .context("installed-root session lost its prepared launch snapshot")?;
         ensure!(
@@ -980,7 +1143,7 @@ async fn prepare_set_agent_installed_root(
     }
     let Some(snapshot_row) = prepare_installed_root_snapshot_named(
         session,
-        project_root,
+        workspace_root,
         providers,
         extended_cfg,
         false,
@@ -994,7 +1157,7 @@ async fn prepare_set_agent_installed_root(
     };
     let snapshot = snapshot_row.reconstruct()?;
     let selection = prepared_primary_default_selection(&snapshot)?;
-    let launch = prepared_root_launch_state(session, project_root)
+    let launch = prepared_root_launch_state(session, workspace_root)
         .await?
         .context("installed root preparation committed no launch snapshot")?;
     ensure!(
@@ -5520,6 +5683,9 @@ pub(super) async fn run_worker(
         crate::engine::model::EndpointRecoveryAdditionalParams,
     >,
     project_root: PathBuf,
+    workspace_root_authority: std::sync::Arc<
+        crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority,
+    >,
     trust_policy: crate::config::trust::SharedWorkspaceTrustPolicy,
     mut work_rx: mpsc::Receiver<SessionWork>,
     event_tx: EventSender,
@@ -5562,24 +5728,25 @@ pub(super) async fn run_worker(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let extended_cfg = start_config.extended.clone();
-    let prepared_root_launch = match prepared_root_launch_state(&session, &project_root).await {
-        Ok(state) => state,
-        Err(error) => {
-            let message =
-                format!("could not load prepared installed-agent session snapshot: {error:#}");
-            tracing::error!(%message, %session_id, "session startup refused");
-            let mut driver_failed = false;
-            emit_session_driver_failed_once(
-                &event_tx,
-                &turn_completions,
-                &redaction,
-                session_id,
-                &mut driver_failed,
-                message,
-            );
-            return;
-        }
-    };
+    let prepared_root_launch =
+        match prepared_root_launch_state(&session, &workspace_root_authority.attached_root).await {
+            Ok(state) => state,
+            Err(error) => {
+                let message =
+                    format!("could not load prepared installed-agent session snapshot: {error:#}");
+                tracing::error!(%message, %session_id, "session startup refused");
+                let mut driver_failed = false;
+                emit_session_driver_failed_once(
+                    &event_tx,
+                    &turn_completions,
+                    &redaction,
+                    session_id,
+                    &mut driver_failed,
+                    message,
+                );
+                return;
+            }
+        };
     // A resumed installed root must run the model selection already persisted
     // on the session, even when the installed package's current default has
     // since changed. Route that selection through the root-only explicit /
@@ -11442,7 +11609,7 @@ pub(super) async fn run_worker(
                         .clone();
                     match prepare_set_agent_installed_root(
                         &session,
-                        &project_root,
+                        &workspace_root_authority.attached_root,
                         &held_config.providers,
                         &held_config.extended,
                         &name,

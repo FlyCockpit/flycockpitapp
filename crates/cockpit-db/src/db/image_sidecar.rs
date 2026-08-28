@@ -103,7 +103,13 @@ impl Db {
                  SET revoked_at_unix_ms=?4,version=version+1\
                  WHERE project_id=?1 AND grant_id=?2 AND version=?3\
                    AND revoked_at_unix_ms IS NULL",
-                    params![project_id, grant_id, expected_version, revoked_at_unix_ms],
+                    params![
+                        project_id,
+                        grant_id,
+                        i64::try_from(expected_version)
+                            .context("image-sidecar grant version is too large")?,
+                        revoked_at_unix_ms
+                    ],
                 )
                 .context("revoking image-sidecar grant")?;
             if changed == 0 {

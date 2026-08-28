@@ -234,6 +234,10 @@ pub struct DeferredTurnPlan {
     name_recoveries: Vec<Recovery>,
     recovered_markers: std::collections::HashMap<String, Recovery>,
     cursor: usize,
+    /// Call IDs this plan has already CAS-settled. Persist-on-re-entry is the
+    /// sole writer for still-unsettled in-flight sources; it must not retry a
+    /// row that serial production already committed (immediate ToolResult).
+    settled_call_ids: std::collections::BTreeSet<String>,
     active_tools: ToolBox,
     tool_ctx: ToolCtx,
     session: Arc<Session>,
@@ -423,19 +427,17 @@ impl DeferredSchedulerTerminalRecord {
 fn tool_result_body(messages: &[Message], call_id: &str) -> Option<String> {
     messages.iter().find_map(|message| match message {
         Message::User { content } => content.iter().find_map(|content| match content {
-            rig::message::UserContent::ToolResult(result) if result.id.to_string() == call_id => {
-                Some(
-                    result
-                        .content
-                        .iter()
-                        .filter_map(|content| match content {
-                            rig::message::ToolResultContent::Text(text) => Some(text.text.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(""),
-                )
-            }
+            rig::message::UserContent::ToolResult(result) if result.call == call_id => Some(
+                result
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        rig::message::ToolResultContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
             _ => None,
         }),
         _ => None,
@@ -527,26 +529,30 @@ impl DeferredTurnPlan {
     }
 
     /// Settle a driver-owned structural source exactly where its paired result
-    /// is created.  The continuation deliberately remains unsettled while the
-    /// child/action is in flight; replay then truthfully reports interruption
-    /// rather than inventing a transition body after a crash.
+    /// is created. Immediate ToolResult is CAS-settled at production; this
+    /// re-entry owner only writes still-unsettled in-flight sources. Replay
+    /// reports interruption for a genuinely unsettled row rather than
+    /// inventing a transition body after a crash.
     pub(crate) async fn persist_terminal_result_from_message(
-        &self,
+        &mut self,
         message: &Message,
     ) -> Result<()> {
         let Some(scheduled) = self
             .cursor
             .checked_sub(1)
-            .and_then(|index| self.scheduler.calls.get(index))
+            .and_then(|index| self.scheduler.calls.get(index).cloned())
         else {
             return Ok(());
         };
+        if self.settled_call_ids.contains(&scheduled.call_id) {
+            return Ok(());
+        }
         let body = tool_result_body(std::slice::from_ref(message), &scheduled.call_id);
         let Some(body) = body else {
             return Ok(());
         };
         self.record_terminal_with_body(
-            scheduled,
+            &scheduled,
             turn_scheduler::SchedulerTerminalOutcome::Transitioned,
             body,
         )
@@ -554,7 +560,7 @@ impl DeferredTurnPlan {
     }
 
     async fn record_terminal_with_body(
-        &self,
+        &mut self,
         scheduled: &turn_scheduler::ScheduledCall,
         outcome: turn_scheduler::SchedulerTerminalOutcome,
         terminal_result_body: String,
@@ -571,6 +577,7 @@ impl DeferredTurnPlan {
             )
             .await
             .with_context(|| format!("settling scheduler continuation {}", scheduled.call_id))?;
+        self.settled_call_ids.insert(scheduled.call_id.clone());
         self.session
             .record_event(
                 crate::db::session_log::SessionEventKind::ToolCallScheduling,
@@ -768,6 +775,10 @@ impl DeferredTurnPlan {
                         }
                         _ => turn_scheduler::SchedulerTerminalOutcome::Transitioned,
                     };
+                    // Immediate ToolResult is not in-flight: CAS-settle here so
+                    // unwind/replay keep the exact body. persist-on-re-entry
+                    // skips this call_id and remains the only writer for
+                    // still-unsettled parked sources.
                     if let TurnOutcome::ToolResult { body, .. } = &outcome {
                         self.record_terminal_with_body(&scheduled, terminal, body.clone())
                             .await?;
@@ -3114,6 +3125,7 @@ pub(crate) async fn run_turn(
             name_recoveries,
             recovered_markers,
             cursor: 0,
+            settled_call_ids: std::collections::BTreeSet::new(),
             active_tools,
             tool_ctx: ctx,
             session,
@@ -3636,6 +3648,7 @@ mod tests {
             name_recoveries,
             recovered_markers: std::collections::HashMap::new(),
             cursor: 0,
+            settled_call_ids: std::collections::BTreeSet::new(),
             active_tools: agent.tools.clone(),
             tool_ctx: crate::engine::tool::ToolCtx {
                 agent_id: agent.name.clone(),

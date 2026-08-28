@@ -47,6 +47,28 @@ pub struct MessageTagExpansion {
     pub ok: bool,
 }
 
+impl From<crate::TagExpansionMeta> for MessageTagExpansion {
+    fn from(tag: crate::TagExpansionMeta) -> Self {
+        Self {
+            tool: tag.tool,
+            path: tag.path,
+            detail: tag.detail,
+            ok: tag.ok,
+        }
+    }
+}
+
+impl From<MessageTagExpansion> for crate::TagExpansionMeta {
+    fn from(tag: MessageTagExpansion) -> Self {
+        Self {
+            tool: tag.tool,
+            path: tag.path,
+            detail: tag.detail,
+            ok: tag.ok,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendUserMessageV2 {

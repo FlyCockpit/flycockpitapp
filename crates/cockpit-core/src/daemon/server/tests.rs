@@ -27509,12 +27509,14 @@ async fn image_submission_exact_retry_case() {
                 client_submission_id: id,
                 text: text.to_string(),
                 display_text: Some("message with image".to_string()),
-                tag_expansions: vec![proto::TagExpansionMeta {
-                    tool: "read".to_string(),
-                    path: "image-test.png".to_string(),
-                    detail: "expanded image context".to_string(),
-                    ok: true,
-                }],
+                tag_expansions: vec![
+                    crate::proto_crate::send_user_message_v2::MessageTagExpansion {
+                        tool: "read".to_string(),
+                        path: "image-test.png".to_string(),
+                        detail: "expanded image context".to_string(),
+                        ok: true,
+                    },
+                ],
                 forced_skill: Some("image-skill".to_string()),
                 attachments: vec![attachment],
             },
@@ -27637,7 +27639,7 @@ async fn image_submission_exact_retry_case() {
     )
     .await
     .expect("exact retry with a durable attachment is idempotently acknowledged");
-    assert_eq!(retry, Response::Ack);
+    assert!(matches!(retry, Response::Ack));
 
     // A re-upload has a different durable attachment identity even when its
     // pixels match. Rebinding the accepted operation must conflict rather than

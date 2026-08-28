@@ -549,7 +549,8 @@ mod tests {
                     ctx,
                 )
                 .await?
-                .content)
+                .content
+                .to_string())
         })
         .await
     }
@@ -566,7 +567,8 @@ mod tests {
                     ctx,
                 )
                 .await?
-                .content)
+                .content
+                .to_string())
         })
         .await
     }

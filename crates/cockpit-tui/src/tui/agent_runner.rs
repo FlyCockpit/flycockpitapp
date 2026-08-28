@@ -2627,7 +2627,11 @@ async fn try_spawn_inner(
                                             client_submission_id,
                                             text: sub.text,
                                             display_text: sub.display_text,
-                                            tag_expansions: sub.tag_expansions,
+                                            tag_expansions: sub
+                                                .tag_expansions
+                                                .into_iter()
+                                                .map(Into::into)
+                                                .collect(),
                                             forced_skill: sub.forced_skill,
                                             attachments,
                                         },

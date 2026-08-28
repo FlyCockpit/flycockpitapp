@@ -326,7 +326,7 @@ pub mod integration {
                                 tag_expansions: tag_expansions
                                     .into_iter()
                                     .map(|(tool, path, detail, ok)| {
-                                        crate::daemon::proto::TagExpansionMeta {
+                                        crate::daemon::proto::send_user_message_v2::MessageTagExpansion {
                                             tool,
                                             path,
                                             detail,

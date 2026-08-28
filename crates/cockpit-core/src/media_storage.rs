@@ -326,6 +326,8 @@ impl MediaStorageRecovery {
             attachment_version: record.attachment_version,
             availability: LiveAttachmentAvailability::Ready,
             has_normalized_derivative,
+            #[cfg(test)]
+            synthetic_lease_authorized: false,
             media_kind: record.media_kind,
             mime_type: record.canonical_mime,
         };

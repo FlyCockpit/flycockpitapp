@@ -83,7 +83,7 @@ async fn resolve_tool_media_handoffs(
         .as_ref()
         .map(|provider| provider.call_id.as_str());
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let mut handoffs = Vec::with_capacity(references.len());
+    let mut handoffs: Vec<ResolvedToolMediaHandoff> = Vec::with_capacity(references.len());
     for reference in references {
         if !matches!(
             reference.purpose,

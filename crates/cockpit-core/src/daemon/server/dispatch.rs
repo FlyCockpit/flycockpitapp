@@ -2554,17 +2554,7 @@ pub(super) fn oversized_text_artifact_admission(
             client_submission_id,
             text: text.to_owned(),
             display_text: display_text.map(str::to_owned),
-            tag_expansions: tag_expansions
-                .iter()
-                .map(
-                    |tag| crate::proto_crate::send_user_message_v2::MessageTagExpansion {
-                        tool: tag.tool.clone(),
-                        path: tag.path.clone(),
-                        detail: tag.detail.clone(),
-                        ok: tag.ok,
-                    },
-                )
-                .collect(),
+            tag_expansions: tag_expansions.iter().cloned().map(Into::into).collect(),
             forced_skill: forced_skill.map(str::to_owned),
             attachments: Vec::new(),
         },
@@ -3015,16 +3005,7 @@ async fn handle_send_user_message_v2(
         None,
         request.text,
         request.display_text,
-        request
-            .tag_expansions
-            .into_iter()
-            .map(|tag| proto::TagExpansionMeta {
-                tool: tag.tool,
-                path: tag.path,
-                detail: tag.detail,
-                ok: tag.ok,
-            })
-            .collect(),
+        request.tag_expansions.into_iter().map(Into::into).collect(),
         Vec::new(),
         media,
         true,

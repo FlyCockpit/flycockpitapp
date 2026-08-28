@@ -5395,8 +5395,12 @@ mod forward_open_guard_tests {
                         kind: "retained_image".into(),
                         admission_id,
                         session_id,
-                        image_ref: ImageAttachmentRef { id: Uuid::new_v4() },
-                        attachment_version: 1,
+                        attachment: crate::send_user_message_v2::MessageAttachmentIdentity {
+                            attachment_id: Uuid::new_v4(),
+                            attachment_version: 1,
+                            checksum: [0; 32],
+                            kind: cockpit_db::media_attachments::MediaKind::Image,
+                        },
                         availability_generation: 1,
                         reservation_id: "reservation-1".into(),
                         normalized_sha256: "00".repeat(32),
@@ -5555,6 +5559,7 @@ mod proto_fixture_files {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::send_user_message_v2::MessageIngressV2;
 
     #[cfg(feature = "remote")]
     #[test]

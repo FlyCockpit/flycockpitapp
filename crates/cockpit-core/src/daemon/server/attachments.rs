@@ -1,3 +1,5 @@
+use rusqlite::OptionalExtension;
+
 use super::authz::session_access_for_row;
 use super::sessions::*;
 use super::*;

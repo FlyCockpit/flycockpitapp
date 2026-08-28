@@ -14,6 +14,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use super::revalidator::RevalidatedSubject;
 
 /// An admitted local-path handle — authority-owned, no-follow, with evidence.
@@ -92,6 +94,26 @@ pub struct AdmittedAttachment {
 pub struct AdmittedMediaBytes {
     pub bytes: Vec<u8>,
     pub duration_us: Option<u64>,
+    /// Present only for durable attachment derivatives. It keeps the exact
+    /// component lease live through the caller's authorization and provider
+    /// handoff, and its Drop path completes release if that caller is
+    /// cancelled.
+    pub(crate) retained_lease: Option<crate::media_storage::VerifiedHeldMedia>,
+}
+
+impl AdmittedMediaBytes {
+    pub(crate) async fn release_retained(
+        mut self,
+        now_unix_ms: i64,
+    ) -> Result<(), AdmissionDenial> {
+        let Some(lease) = self.retained_lease.take() else {
+            return Ok(());
+        };
+        lease
+            .release(now_unix_ms)
+            .await
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))
+    }
 }
 
 impl AdmittedAttachment {
@@ -140,6 +162,7 @@ pub enum AdmissionDenial {
 ///
 /// Existence-hiding: a `None` return does not distinguish "not found" from
 /// "not authorized".
+#[async_trait]
 pub trait AttachmentResolver: Send + Sync {
     /// Resolve an attachment by id for the given session.
     /// Returns `Ok(Some(...))` if found and authorized, `Ok(None)` otherwise.
@@ -165,7 +188,7 @@ pub trait AttachmentResolver: Send + Sync {
         ))
     }
 
-    fn read_media(
+    async fn read_media(
         &self,
         attachment: &AdmittedAttachment,
         max_bytes: u64,
@@ -173,6 +196,7 @@ pub trait AttachmentResolver: Send + Sync {
         Ok(AdmittedMediaBytes {
             bytes: self.read_bytes(attachment, max_bytes)?,
             duration_us: None,
+            retained_lease: None,
         })
     }
 }
@@ -388,7 +412,7 @@ impl SessionMediaAuthority {
         }
     }
 
-    pub fn read_media(
+    pub async fn read_media(
         &self,
         handle: &AdmittedHandle,
         max_bytes: u64,
@@ -396,11 +420,14 @@ impl SessionMediaAuthority {
         self.revalidate_current_subject()?;
         match handle {
             AdmittedHandle::Attachment(attachment) => {
-                self.attachment_resolver.read_media(attachment, max_bytes)
+                self.attachment_resolver
+                    .read_media(attachment, max_bytes)
+                    .await
             }
             AdmittedHandle::Local(local) => Ok(AdmittedMediaBytes {
                 bytes: self.local_path_policy.read_bytes(local, max_bytes)?,
                 duration_us: None,
+                retained_lease: None,
             }),
             AdmittedHandle::RetainedHttps(source) => Ok(AdmittedMediaBytes {
                 bytes: if source.content().len() as u64 > max_bytes {
@@ -411,6 +438,7 @@ impl SessionMediaAuthority {
                     source.content().to_vec()
                 },
                 duration_us: None,
+                retained_lease: None,
             }),
         }
     }
@@ -426,6 +454,7 @@ mod tests {
         attachments: std::collections::HashMap<[u8; 16], AdmittedAttachment>,
     }
 
+    #[async_trait]
     impl AttachmentResolver for FakeAttachmentResolver {
         fn resolve(
             &self,

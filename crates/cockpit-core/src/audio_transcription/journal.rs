@@ -165,18 +165,50 @@ pub async fn dispatch_prepared(
         biased;
         result = &mut send_fut => result,
         () = cancel.cancelled() => {
-            journal.request_cancellation(operation_id, now_wall_ms).await?;
+            // Never let a failed cancellation write drop an in-flight send:
+            // `dispatching` is already durable and its outcome must still be
+            // recorded. The fallback uses the ticket's preallocated capsule
+            // when SQLite is unavailable.
+            let _ = record_cancellation_after_dispatch(journal, &mut ticket, now_wall_ms).await;
             send_fut.await
         }
     };
-    let mut finish = Box::pin(finish_after_send(journal, &mut ticket, send, now_wall_ms));
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => {
-            journal.request_cancellation(operation_id, now_wall_ms).await?;
-            finish.await
+    finish_after_send(journal, &mut ticket, send, now_wall_ms, cancel).await
+}
+
+/// Persist cancellation after `dispatching` without making a journal outage an
+/// excuse to abandon a known provider outcome. `record_outcome` carries the
+/// same spool fallback and global fail-closed latch as ordinary outcomes.
+async fn record_cancellation_after_dispatch(
+    journal: &ExternalJournal,
+    ticket: &mut DispatchTicket,
+    now_wall_ms: i64,
+) -> Result<(), ExternalJournalError> {
+    match journal
+        .request_cancellation(ticket.operation_id, now_wall_ms)
+        .await
+    {
+        Ok(_) => {
+            ticket.note_cancellation_requested();
+            Ok(())
         }
-        result = &mut finish => result,
+        Err(request_error) => journal
+            .record_outcome(
+                ticket,
+                ExternalJournalState::CancellationRequested,
+                now_wall_ms,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|fallback_error| {
+                tracing::error!(
+                    operation_id = %ticket.operation_id,
+                    cancellation_error = %request_error,
+                    fallback_error = %fallback_error,
+                    "transcription cancellation could not be made durable before outcome recording"
+                );
+                fallback_error
+            }),
     }
 }
 
@@ -226,16 +258,37 @@ async fn finish_after_send(
     ticket: &mut DispatchTicket,
     send: Result<super::dispatch::TranscriptionHttpResponse, anyhow::Error>,
     now_wall_ms: i64,
+    cancel: &CancellationToken,
 ) -> Result<TranscriptionHandoff, ExternalJournalError> {
     let operation_id = ticket.operation_id;
+    // Cancellation can arrive after the multipart future resolves but before
+    // its accepted/terminal facts are committed. Record it first when
+    // possible; a failed write is deliberately retried below, after the
+    // provider outcome is known.
+    let mut cancellation_observed = cancel.is_cancelled();
+    if cancellation_observed {
+        let _ = record_cancellation_after_dispatch(journal, ticket, now_wall_ms).await;
+    }
     match send {
         Ok(response) => {
-            journal
+            let accepted = journal
                 .record_outcome(ticket, ExternalJournalState::Accepted, now_wall_ms)
-                .await?;
-            journal
-                .record_outcome(ticket, ExternalJournalState::Succeeded, now_wall_ms)
-                .await?;
+                .await;
+            if cancel.is_cancelled() {
+                cancellation_observed = true;
+                let _ = record_cancellation_after_dispatch(journal, ticket, now_wall_ms).await;
+            }
+            // Do not return after a failed accepted write: an already-known
+            // provider completion must still get its terminal attempt (or the
+            // journal's fail-closed unresolved-fact latch).
+            let terminal = if cancellation_observed {
+                ExternalJournalState::CompletedAfterCancel
+            } else {
+                ExternalJournalState::Succeeded
+            };
+            let completed = journal.record_outcome(ticket, terminal, now_wall_ms).await;
+            accepted?;
+            completed?;
             Ok(match ticket.state() {
                 ExternalJournalState::Succeeded => TranscriptionHandoff::Succeeded {
                     operation_id,
@@ -266,11 +319,9 @@ async fn finish_after_send(
                 });
             let next = if ambiguous {
                 ExternalJournalState::SubmissionUnknown
-            } else if ticket.state() == ExternalJournalState::CancellationRequested
-                || journal
-                    .get(operation_id)
-                    .await?
-                    .is_some_and(|record| record.is_cancellation_requested())
+            } else if cancellation_observed
+                || ticket.state() == ExternalJournalState::CancellationRequested
+                || matches!(journal.get(operation_id).await, Ok(Some(record)) if record.is_cancellation_requested())
             {
                 ExternalJournalState::Failed
             } else {
@@ -417,7 +468,7 @@ mod tests {
     use crate::audio_transcription::dispatch::{
         TranscriptionEgressError, TranscriptionHttpResponse,
     };
-    use crate::audio_transcription::request::{MultipartPart, plan_gpt_transcribe};
+    use crate::audio_transcription::request::plan_gpt_transcribe;
     use crate::external_journal::ExternalJournal;
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -495,8 +546,6 @@ mod tests {
             .await
             .expect("prepare")
     }
-
-    fn _use_part(_: MultipartPart) {}
 
     #[tokio::test]
     async fn transcription_cancel_before_admit_zero_send() {
@@ -591,7 +640,8 @@ mod tests {
             &transport,
         )
         .await;
-        let handoff = finish_after_send(&journal, &mut ticket, send, T0 + 3)
+        let cancel = cancellation(false);
+        let handoff = finish_after_send(&journal, &mut ticket, send, T0 + 3, &cancel)
             .await
             .expect("finish");
         assert!(matches!(
@@ -602,6 +652,36 @@ mod tests {
         assert_eq!(transport.send_count(), 1);
         let loaded = journal.get(prepared.operation_id).await.unwrap().unwrap();
         assert_eq!(loaded.state, ExternalJournalState::CompletedAfterCancel);
+    }
+
+    #[tokio::test]
+    async fn cancellation_write_failure_uses_ticket_fallback_before_terminal_outcome() {
+        let (_tmp, journal) = env_journal();
+        let prepared = prepare_one(&journal, "cancellation-write-fallback").await;
+        let mut ticket = journal
+            .begin_dispatch(prepared.operation_id, &prepared.projection, T0 + 1)
+            .await
+            .expect("dispatching");
+        journal.set_db_faults(crate::external_journal::DbFaults {
+            fail_cancellation_commit: true,
+            ..crate::external_journal::DbFaults::default()
+        });
+
+        record_cancellation_after_dispatch(&journal, &mut ticket, T0 + 2)
+            .await
+            .expect("ticket-backed cancellation fallback");
+
+        assert_eq!(ticket.state(), ExternalJournalState::CancellationRequested);
+        journal.set_db_faults(crate::external_journal::DbFaults::default());
+        journal
+            .record_outcome(&mut ticket, ExternalJournalState::Accepted, T0 + 3)
+            .await
+            .expect("accepted after cancellation");
+        journal
+            .record_outcome(&mut ticket, ExternalJournalState::Succeeded, T0 + 4)
+            .await
+            .expect("terminal after cancellation");
+        assert_eq!(ticket.state(), ExternalJournalState::CompletedAfterCancel);
     }
 
     #[tokio::test]

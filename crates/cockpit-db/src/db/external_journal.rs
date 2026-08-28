@@ -1178,6 +1178,42 @@ impl Db {
         .await
     }
 
+    /// Compare-and-set one provider outcome, preserving a cancellation fact
+    /// that was already durable when the outcome is committed.
+    ///
+    /// A successful provider response after cancellation is never plain
+    /// `succeeded`: the same writer transaction selects
+    /// `completed_after_cancel`. Keeping that decision beside the version
+    /// compare-and-set closes the gap between an async caller observing a
+    /// cancellation and recording its terminal outcome.
+    pub async fn record_external_operation_outcome(
+        &self,
+        operation_id: Uuid,
+        expected_version: i64,
+        outcome: ExternalJournalState,
+        now_wall_ms: i64,
+    ) -> Result<ExternalTransitionOutcome> {
+        self.transaction(move |conn| {
+            let current = external_operation_conn(conn, operation_id)?
+                .with_context(|| format!("unknown external journal operation {operation_id}"))?;
+            let effective = if current.is_cancellation_requested()
+                && outcome == ExternalJournalState::Succeeded
+            {
+                ExternalJournalState::CompletedAfterCancel
+            } else {
+                outcome
+            };
+            transition_external_operation_conn(
+                conn,
+                operation_id,
+                expected_version,
+                effective,
+                now_wall_ms,
+            )
+        })
+        .await
+    }
+
     /// Record the orthogonal cancellation fact and move to the state that the
     /// current state permits.
     ///
@@ -2733,6 +2769,43 @@ mod tests {
             terminals[0].cancellation_requested_at_wall_ms,
             Some(first_at)
         );
+    }
+
+    #[tokio::test]
+    async fn external_journal_outcome_commit_maps_success_after_cancel_atomically() {
+        let db = Db::open_in_memory().unwrap();
+        let record = dispatching(&db, "cancellation-aware-outcome", 1_000).await;
+        let cancelled = db
+            .request_external_operation_cancellation(record.operation_id, 1_500)
+            .await
+            .unwrap()
+            .record()
+            .clone();
+        let accepted = db
+            .transition_external_operation(
+                record.operation_id,
+                cancelled.version,
+                ExternalJournalState::Accepted,
+                1_600,
+            )
+            .await
+            .unwrap()
+            .record()
+            .clone();
+
+        let outcome = db
+            .record_external_operation_outcome(
+                record.operation_id,
+                accepted.version,
+                ExternalJournalState::Succeeded,
+                1_700,
+            )
+            .await
+            .unwrap()
+            .record()
+            .clone();
+        assert_eq!(outcome.state, ExternalJournalState::CompletedAfterCancel);
+        assert!(outcome.is_cancellation_requested());
     }
 
     #[tokio::test]

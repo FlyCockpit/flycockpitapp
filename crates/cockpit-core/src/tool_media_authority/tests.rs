@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::mcp::builtin::HostContext;
 
 use super::availability::MediaToolAvailability;
@@ -807,6 +809,7 @@ struct FakeAttachmentResolver {
     attachments: std::collections::HashMap<[u8; 16], AdmittedAttachment>,
 }
 
+#[async_trait]
 impl AttachmentResolver for FakeAttachmentResolver {
     fn resolve(
         &self,

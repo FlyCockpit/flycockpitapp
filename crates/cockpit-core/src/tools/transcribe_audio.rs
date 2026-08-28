@@ -195,7 +195,7 @@ fn admit_source(
     })
 }
 
-fn handle_identity(handle: &AdmittedHandle, audio: &[u8]) -> (String, String, u64) {
+fn handle_identity(handle: &AdmittedHandle) -> (String, String, u64) {
     match handle {
         AdmittedHandle::Attachment(att) => (
             Uuid::from_bytes(att.attachment_id())
@@ -492,8 +492,9 @@ impl Tool for TranscribeAudioTool {
         }
         let admitted = authority
             .read_media(&handle, MAX_FILE_BYTES)
+            .await
             .map_err(|error| anyhow::anyhow!("media_attachment_authority_unavailable: {error}"))?;
-        let audio = admitted.bytes;
+        let audio = &admitted.bytes;
         let interval_start_us = 0;
         let interval_end_us = admitted.duration_us.ok_or_else(|| anyhow::anyhow!(
             "media_attachment_authority_unavailable: source has no authoritative normalized-derivative duration"
@@ -506,11 +507,10 @@ impl Tool for TranscribeAudioTool {
             return Err(invalid_input("audio source exceeds the 25 MiB file cap"));
         }
 
-        let (attachment_id, attachment_checksum, attachment_version) =
-            handle_identity(&handle, &audio);
+        let (attachment_id, attachment_checksum, attachment_version) = handle_identity(&handle);
         if let AdmittedHandle::Attachment(attachment) = &handle {
-            let actual = Sha256::digest(&audio);
-            if actual.as_slice() != attachment.checksum() {
+            let actual: [u8; 32] = Sha256::digest(audio).into();
+            if actual != attachment.checksum() {
                 bail!(
                     "media_attachment_authority_unavailable: admitted attachment checksum changed"
                 );
@@ -575,7 +575,7 @@ impl Tool for TranscribeAudioTool {
         let idempotency_key = SafeToken::parse(request_digest.as_str()).map_err(|error| {
             anyhow::anyhow!("transcription_unavailable: idempotency key: {error}")
         })?;
-        let source_digest = Digest::of(&audio);
+        let source_digest = Digest::of(audio);
         let prompt_ref = prompt.clone();
         let keywords_ref = keywords.clone();
         let languages_ref = languages.clone();
@@ -609,19 +609,34 @@ impl Tool for TranscribeAudioTool {
         // transition instead of stranding a possibly submitted operation.
         let handoff = tokio::spawn(async move {
             let mut boundaries = std::iter::from_fn(|| Some(Uuid::new_v4().as_u128()));
-            dispatch
+            let handoff = dispatch
                 .dispatch(
                     &owner,
                     &idempotency_key,
                     source_digest,
                     duration_ms,
                     now_wall_ms,
-                    audio.as_slice(),
+                    admitted.bytes.as_slice(),
                     &mut boundaries,
                     build,
                     &cancel,
                 )
                 .await
+                .map_err(anyhow::Error::new);
+            // The lease covers the whole authorization-to-terminal handoff.
+            // This owned task remains alive if the outer tool future is
+            // cancelled, so a durable dispatch cannot strand the retained
+            // component lease.
+            let release = admitted
+                .release_retained(chrono::Utc::now().timestamp_millis())
+                .await;
+            match (handoff, release) {
+                (Ok(handoff), Ok(())) => Ok(handoff),
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(anyhow::anyhow!(
+                    "releasing retained transcription media lease failed: {error}"
+                )),
+            }
         })
         .await
         .map_err(|error| {
@@ -715,6 +730,7 @@ mod tests {
         attachments: HashMap<[u8; 16], (AdmittedAttachment, Vec<u8>)>,
     }
 
+    #[async_trait]
     impl AttachmentResolver for BytesResolver {
         fn resolve(
             &self,
@@ -745,7 +761,7 @@ mod tests {
             Ok(bytes)
         }
 
-        fn read_media(
+        async fn read_media(
             &self,
             attachment: &AdmittedAttachment,
             max_bytes: u64,
@@ -757,6 +773,7 @@ mod tests {
                 crate::tool_media_authority::session_authority::AdmittedMediaBytes {
                     bytes: self.read_bytes(attachment, max_bytes)?,
                     duration_us: Some(2_000),
+                    retained_lease: None,
                 },
             )
         }

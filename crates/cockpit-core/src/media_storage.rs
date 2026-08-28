@@ -135,17 +135,12 @@ impl HeldMediaComponentLease {
         &self.authority
     }
 
-    async fn release(self, now_unix_ms: i64) -> Result<()> {
+    async fn release(&self, now_unix_ms: i64) -> Result<()> {
         let lease_id = self.authority.lease_id;
         self.db
             .transaction(move |conn| {
                 cockpit_db::Db::release_media_component_lease_conn(conn, lease_id, now_unix_ms)
             })
-            .await
-    }
-
-    async fn block_after_failed_proof(&self, now_unix_ms: i64) -> Result<()> {
-        block_component_lease_after_failed_proof(&self.db, self.authority.clone(), now_unix_ms)
             .await
     }
 
@@ -178,20 +173,9 @@ impl HeldMediaComponentLease {
     /// Complete-read verification is deliberately coupled to durable release.
     /// Failure atomically blocks the aggregate/component and records evidence.
     pub(crate) async fn read_verified(mut self, now_unix_ms: i64) -> Result<Vec<u8>> {
-        let proof = self.verify_bytes();
-        let bytes = match proof {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.block_after_failed_proof(now_unix_ms).await?;
-                return Err(error);
-            }
-        };
-        let lease_id = self.authority.lease_id;
-        self.db
-            .transaction(move |conn| {
-                cockpit_db::Db::release_media_component_lease_conn(conn, lease_id, now_unix_ms)
-            })
-            .await?;
+        let verified = self.read_verified_retained(now_unix_ms).await?;
+        let bytes = verified.bytes.clone();
+        verified.release(now_unix_ms).await?;
         Ok(bytes)
     }
 
@@ -202,23 +186,142 @@ impl HeldMediaComponentLease {
         let bytes = match self.verify_bytes() {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.block_after_failed_proof(now_unix_ms).await?;
+                // Once proof has failed, dropping this future must not turn a
+                // required security transition into an abandoned live lease.
+                // The guard's Drop schedules the same durable transition if
+                // this await is cancelled.
+                let failed = FailedProofMediaLease::from_held(&self);
+                drop(self);
+                failed.block(now_unix_ms).await?;
                 return Err(error);
             }
         };
-        Ok(VerifiedHeldMedia { held: self, bytes })
+        Ok(VerifiedHeldMedia {
+            held: Some(self),
+            bytes,
+        })
     }
 }
 
 pub(crate) struct VerifiedHeldMedia {
-    held: HeldMediaComponentLease,
+    held: Option<HeldMediaComponentLease>,
     pub(crate) bytes: Vec<u8>,
 }
 
 impl VerifiedHeldMedia {
-    pub(crate) async fn release(self, now_unix_ms: i64) -> Result<()> {
-        self.held.release(now_unix_ms).await
+    /// Move verified bytes to the consumer while retaining the durable lease
+    /// guard that authorizes their later provider handoff.
+    pub(crate) fn into_bytes_and_retain_lease(mut self) -> (Vec<u8>, Self) {
+        (std::mem::take(&mut self.bytes), self)
     }
+
+    pub(crate) async fn release(mut self, now_unix_ms: i64) -> Result<()> {
+        let held = self
+            .held
+            .as_ref()
+            .expect("verified media lease is present until released");
+        held.release(now_unix_ms).await?;
+        self.held.take();
+        Ok(())
+    }
+}
+
+impl Drop for VerifiedHeldMedia {
+    fn drop(&mut self) {
+        if let Some(held) = self.held.take() {
+            schedule_component_lease_cleanup(
+                held.db.clone(),
+                held.authority.clone(),
+                ComponentLeaseCleanup::Release,
+            );
+        }
+    }
+}
+
+/// A proof failure must block the aggregate/component, not merely release the
+/// lease. This guard owns that obligation across cancellation of the async DB
+/// transition.
+struct FailedProofMediaLease {
+    cleanup: Option<(cockpit_db::Db, AcquiredMediaComponentLease)>,
+}
+
+impl FailedProofMediaLease {
+    fn from_held(held: &HeldMediaComponentLease) -> Self {
+        Self {
+            cleanup: Some((held.db.clone(), held.authority.clone())),
+        }
+    }
+
+    fn new(db: cockpit_db::Db, authority: AcquiredMediaComponentLease) -> Self {
+        Self {
+            cleanup: Some((db, authority)),
+        }
+    }
+
+    async fn block(mut self, now_unix_ms: i64) -> Result<()> {
+        let (db, authority) = self
+            .cleanup
+            .as_ref()
+            .expect("failed proof cleanup is present until blocked");
+        block_component_lease_after_failed_proof(db, authority.clone(), now_unix_ms).await?;
+        self.cleanup.take();
+        Ok(())
+    }
+}
+
+impl Drop for FailedProofMediaLease {
+    fn drop(&mut self) {
+        if let Some((db, authority)) = self.cleanup.take() {
+            schedule_component_lease_cleanup(
+                db,
+                authority,
+                ComponentLeaseCleanup::BlockAfterFailedProof,
+            );
+        }
+    }
+}
+
+enum ComponentLeaseCleanup {
+    Release,
+    BlockAfterFailedProof,
+}
+
+/// Cleanup is intentionally detached from the cancelled reader future. A
+/// live Tokio runtime owns all production media reads; if shutdown wins first,
+/// the durable lease remains for the existing restart reconciler rather than
+/// being silently forgotten.
+fn schedule_component_lease_cleanup(
+    db: cockpit_db::Db,
+    authority: AcquiredMediaComponentLease,
+    cleanup: ComponentLeaseCleanup,
+) {
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::error!(
+            lease_id = %authority.lease_id,
+            "media component lease cleanup escaped the runtime; restart reconciliation is required"
+        );
+        return;
+    };
+    runtime.spawn(async move {
+        let result = match cleanup {
+            ComponentLeaseCleanup::Release => db
+                .transaction(move |conn| {
+                    cockpit_db::Db::release_media_component_lease_conn(
+                        conn,
+                        authority.lease_id,
+                        now_unix_ms,
+                    )
+                })
+                .await,
+            ComponentLeaseCleanup::BlockAfterFailedProof => {
+                block_component_lease_after_failed_proof(&db, authority, now_unix_ms).await
+            }
+        };
+        if let Err(error) = result {
+            tracing::error!(%error, "durable media component lease cleanup failed; restart reconciliation remains required");
+        }
+    });
 }
 
 async fn block_component_lease_after_failed_proof(
@@ -255,7 +358,7 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
-    pub(crate) fn read_tool_attachment_derivative(
+    pub(crate) async fn read_tool_attachment_derivative(
         &self,
         attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
         max_bytes: u64,
@@ -264,92 +367,46 @@ impl MediaStorageRecovery {
         let expected_version = attachment.attachment_version();
         let expected_checksum = crate::intel::hex_lower(&attachment.checksum());
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let authority = self.db.blocking_read_for_sync_ui(|conn| {
-            let (version, generation, capability, availability) = conn.query_row(
-                "SELECT attachment_version, availability_generation, captured_capability_generation, availability FROM media_attachments WHERE attachment_id=?1",
-                [attachment_id.to_string()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
-            )?;
-            ensure!(version.parse::<u64>()? == expected_version && availability == "ready", "media_attachment_unavailable");
-            let authority = cockpit_db::Db::acquire_media_component_lease_conn(conn,
-                cockpit_db::media_attachments::AcquireMediaComponentLeaseInput {
-                    lease_id: Uuid::now_v7(), attachment_id, expected_version,
-                    expected_availability_generation: generation.parse()?,
-                    expected_capability_generation: capability.parse()?,
-                    kind: cockpit_db::media_attachments::MediaComponentLeaseKind::Model,
-                    now_unix_ms: now_ms,
-                })?.context("media_attachment_unavailable")?;
-            Ok(authority)
-        })?;
-        let read = (|| -> Result<Vec<u8>> {
-            ensure!(
-                authority.component.sha256 == expected_checksum,
-                "storage_security_violation"
-            );
-            let mut file = self
-                .owned_root
-                .open_file_verified(&authority.component.storage_id.to_string())
-                .map_err(anyhow::Error::new)?;
-            let before = stable_identity_digest(&file)?;
-            let (length, checksum) = read_full_digest(&mut file)?;
-            ensure!(
-                before == authority.component.stable_identity_digest
-                    && stable_identity_digest(&file)? == before
-                    && length == authority.component.byte_length
-                    && length <= max_bytes
-                    && checksum == authority.component.sha256,
-                "storage_security_violation"
-            );
-            file.seek(SeekFrom::Start(0))?;
-            let mut bytes = Vec::with_capacity(usize::try_from(length)?);
-            file.read_to_end(&mut bytes)?;
-            Ok(bytes)
-        })()
-        .context("storage_security_violation");
-        let bytes = match read {
-            Ok(bytes) => {
-                let lease_id = authority.lease_id;
-                self.db.blocking_read_for_sync_ui(|conn| {
-                    cockpit_db::Db::release_media_component_lease_conn(conn, lease_id, now_ms)?;
-                    Ok(())
-                })?;
-                bytes
-            }
-            Err(primary) => {
-                let security_failure = primary
-                    .chain()
-                    .any(|cause| cause.to_string().contains("storage_security_violation"));
-                let transition = if security_failure {
-                    self.db.blocking_read_for_sync_ui(|conn| {
-                        let next_attachment = authority.availability_generation.checked_add(1).context("availability generation overflow")?;
-                        let next_component = authority.component.component_generation.checked_add(1).context("component generation overflow")?;
-                        ensure!(conn.execute("UPDATE media_attachments SET availability='security_blocked',availability_generation=?1,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND attachment_version=?4 AND availability='ready' AND availability_generation=?5",params![next_attachment.to_string(),now_ms,authority.attachment_id.to_string(),authority.attachment_version.to_string(),authority.availability_generation.to_string()])?==1,"media security transition lost compare-and-swap");
-                        ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state='ready'",params![next_component.to_string(),now_ms,authority.component.component_id.to_string(),authority.component.component_generation.to_string()])?==1,"media component security transition lost compare-and-swap");
-                        conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'ready','security_blocked',?3,?4)",params![authority.attachment_id.to_string(),next_attachment.to_string(),authority.lease_id.to_string(),now_ms])?;
-                        conn.execute("INSERT INTO media_component_security_evidence(lease_id,attachment_id,component_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,'storage_security_violation',?4)",params![authority.lease_id.to_string(),authority.attachment_id.to_string(),authority.component.component_id.to_string(),now_ms])?;
-                        cockpit_db::Db::release_media_component_lease_conn(conn,authority.lease_id,now_ms)?;
-                        Ok(())
-                    })
-                } else {
-                    self.db.blocking_read_for_sync_ui(|conn| {
-                        cockpit_db::Db::release_media_component_lease_conn(
-                            conn,
-                            authority.lease_id,
-                            now_ms,
-                        )?;
-                        Ok(())
-                    })
-                };
-                if let Err(error) = transition {
-                    tracing::error!(%error, "failed to release or security-block media component after protected read failure");
-                }
-                return Err(primary);
-            }
-        };
+        let (availability_generation, capability_generation) = self
+            .db
+            .read(move |conn| {
+                let (version, generation, capability, availability) = conn.query_row(
+                    "SELECT attachment_version, availability_generation, captured_capability_generation, availability FROM media_attachments WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+                )?;
+                ensure!(version.parse::<u64>()? == expected_version && availability == "ready", "media_attachment_unavailable");
+                Ok((generation.parse()?, capability.parse()?))
+            })
+            .await?;
+        let held = self
+            .acquire_component_lease(AcquireComponentLeaseInput {
+                lease_id: Uuid::now_v7(),
+                attachment_id,
+                attachment_version: expected_version,
+                availability_generation,
+                capability_generation,
+                kind: MediaComponentLeaseKind::Model,
+                now_unix_ms: now_ms,
+            })
+            .await
+            .context("media_attachment_unavailable")?;
+        if held.authority().component.sha256 != expected_checksum
+            || held.authority().component.byte_length > max_bytes
+        {
+            let failed = FailedProofMediaLease::from_held(&held);
+            drop(held);
+            failed.block(now_ms).await?;
+            anyhow::bail!("storage_security_violation");
+        }
+        let verified = held.read_verified_retained(now_ms).await?;
+        let (bytes, verified) = verified.into_bytes_and_retain_lease();
+        let duration_us = canonical_pcm_wav_duration_us(&bytes);
         Ok(
             crate::tool_media_authority::session_authority::AdmittedMediaBytes {
-                duration_us: canonical_pcm_wav_duration_us(&bytes),
+                duration_us,
                 bytes,
+                retained_lease: Some(verified),
             },
         )
     }
@@ -629,9 +686,13 @@ impl MediaStorageRecovery {
         ) {
             Ok(mapping) => mapping,
             Err(error) => {
-                held.release(now_unix_ms)
-                    .await
-                    .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
+                VerifiedHeldMedia {
+                    held: Some(held),
+                    bytes: Vec::new(),
+                }
+                .release(now_unix_ms)
+                .await
+                .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
                 return Err(error);
             }
         };
@@ -2233,7 +2294,11 @@ impl MediaStorageRecovery {
         let file = match opened {
             Ok(file) => file,
             Err(error) => {
-                block_component_lease_after_failed_proof(&self.db, authority, now_unix_ms).await?;
+                // The DB lease is already durable here. Keep its required
+                // block transition owned across cancellation of this await.
+                FailedProofMediaLease::new(self.db.clone(), authority)
+                    .block(now_unix_ms)
+                    .await?;
                 return Err(error);
             }
         };

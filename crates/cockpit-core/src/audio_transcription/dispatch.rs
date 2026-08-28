@@ -155,7 +155,7 @@ pub async fn dispatch_multipart(
 
 #[cfg(test)]
 mod tests {
-    use super::super::request::{BOUNDARY_PREFIX, MultipartPart, plan_gpt_transcribe};
+    use super::super::request::{BOUNDARY_PREFIX, plan_gpt_transcribe};
     use super::*;
     use std::sync::Mutex;
 
@@ -268,8 +268,4 @@ mod tests {
         assert!(msg.contains("transcription_failed"));
         assert!(!msg.contains("secret provider error body"));
     }
-
-    // Silence unused-import warnings if the module grows.
-    #[allow(dead_code)]
-    fn _use_part(_: MultipartPart) {}
 }

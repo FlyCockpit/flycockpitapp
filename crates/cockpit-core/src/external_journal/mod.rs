@@ -181,6 +181,9 @@ pub(crate) struct DbFaults {
     pub db_offline: bool,
     pub fail_prepared_commit: bool,
     pub fail_dispatching_commit: bool,
+    /// Fail the direct cancellation write so consumers exercise the
+    /// ticket-backed cancellation fallback after provider handoff.
+    pub fail_cancellation_commit: bool,
     /// Fail *after* the `dispatching` commit succeeded, to exercise the
     /// post-commit path where the capsule must be retained.
     pub fail_after_dispatching_commit: bool,
@@ -207,6 +210,9 @@ pub struct DispatchTicket {
     version: i64,
     /// State the last written slot asserts.
     state: ExternalJournalState,
+    /// Monotonic cancellation fact, retained even after an accepted bridge
+    /// slot so a subsequent provider success remains content-discarding.
+    cancellation_requested: bool,
     /// Slot the last write landed in. The next write uses the other one.
     active_slot: u8,
     /// Version SQLite is known to hold. Lower than `version` exactly while a
@@ -231,6 +237,13 @@ impl DispatchTicket {
     /// The state the last written slot asserts.
     pub fn state(&self) -> ExternalJournalState {
         self.state
+    }
+
+    /// Note a cancellation that was committed through the separate
+    /// cancellation API. Callers holding this ticket must preserve the fact
+    /// when they later write outcome fallback slots.
+    pub fn note_cancellation_requested(&mut self) {
+        self.cancellation_requested = true;
     }
 
     /// Whether a spool fallback is still waiting to reach SQLite.
@@ -1125,6 +1138,7 @@ impl ExternalJournal {
             capsule_uuid,
             version: committed.version,
             state: ExternalJournalState::Dispatching,
+            cancellation_requested: false,
             active_slot: 1,
             committed_version: committed.version,
             projection: encoded.to_vec(),
@@ -1164,6 +1178,19 @@ impl ExternalJournal {
         outcome: ExternalJournalState,
         now_wall_ms: i64,
     ) -> Result<OutcomeDurability, ExternalJournalError> {
+        // A cancellation that reached the spool while SQLite was unavailable
+        // lives on the ticket until the chain can be imported. Preserve its
+        // content-discarding meaning for a later provider success instead of
+        // writing a plain `succeeded` slot behind it.
+        if outcome == ExternalJournalState::CancellationRequested {
+            ticket.cancellation_requested = true;
+        }
+        let outcome = if ticket.cancellation_requested && outcome == ExternalJournalState::Succeeded
+        {
+            ExternalJournalState::CompletedAfterCancel
+        } else {
+            outcome
+        };
         // A previous call fell back to the spool, so SQLite is behind the
         // capsule. Import the pending slot chain before layering another
         // outcome on top; otherwise this transition would compare-and-set
@@ -1187,7 +1214,7 @@ impl ExternalJournal {
             ))
         } else {
             self.db
-                .transition_external_operation(
+                .record_external_operation_outcome(
                     ticket.operation_id,
                     ticket.version,
                     outcome,
@@ -1291,6 +1318,7 @@ impl ExternalJournal {
     ) -> Result<(), ExternalJournalError> {
         ticket.version = record.version;
         ticket.state = record.state;
+        ticket.cancellation_requested = record.is_cancellation_requested();
         ticket.committed_version = record.version;
         if record.state.is_terminal() {
             // Terminal capsules are removed only after SQLite confirms.
@@ -1362,6 +1390,8 @@ impl ExternalJournal {
             Ok(()) => {
                 ticket.version = next_version;
                 ticket.state = outcome;
+                ticket.cancellation_requested |=
+                    outcome == ExternalJournalState::CancellationRequested;
                 ticket.active_slot = slot_index;
                 Ok(OutcomeDurability::SpoolFallback)
             }
@@ -1432,6 +1462,7 @@ impl ExternalJournal {
             .unwrap_or(record);
         ticket.version = refreshed.version;
         ticket.state = refreshed.state;
+        ticket.cancellation_requested = refreshed.is_cancellation_requested();
         ticket.committed_version = refreshed.version;
         Ok(chain.imported > 0)
     }
@@ -1442,6 +1473,11 @@ impl ExternalJournal {
         operation_id: Uuid,
         now_wall_ms: i64,
     ) -> Result<ExternalJournalRecord, ExternalJournalError> {
+        if self.db_faults().fail_cancellation_commit || self.db_faults().db_offline {
+            return Err(ExternalJournalError::Database(
+                "injected cancellation commit failure".to_string(),
+            ));
+        }
         let outcome = self
             .db
             .request_external_operation_cancellation(operation_id, now_wall_ms)

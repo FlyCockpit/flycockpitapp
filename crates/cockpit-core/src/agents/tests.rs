@@ -93,6 +93,24 @@ fn agent_profile_resolution_owned_path_uses_the_source_specific_loader() {
         )
         .is_ok()
     );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let following_leaf = tmp.path().join("shared-following.md");
+        symlink(&authored, &following_leaf).unwrap();
+        assert!(
+            load_profile_definition_from_owned_path(
+                shared.clone(),
+                observation(&shared),
+                AgentProfileInstallationSource::WorkspaceShared,
+                &following_leaf,
+            )
+            .is_err(),
+            "profile preparation must not reopen a private child through a following leaf loader"
+        );
+    }
 }
 
 /// A `.cockpit/` config dir under `cwd`, so the discovery walk-up finds a
@@ -2039,7 +2057,8 @@ fn package_digest_changes_iff_any_tree_file_changes() {
     .unwrap();
     fs::write(
         pkg.join("subagents").join("helper.md"),
-        vnext_agent_document("Helper", "HELPER BODY"),
+        vnext_agent_document("Helper", "HELPER BODY")
+            .replace("authored/reviewer", "authored/helper"),
     )
     .unwrap();
     fs::write(pkg.join("mcp.json"), "{\"mcpServers\":{}}").unwrap();
@@ -2073,7 +2092,8 @@ fn package_digest_changes_iff_any_tree_file_changes() {
 
     fs::write(
         pkg.join("subagents").join("helper.md"),
-        vnext_agent_document("Helper", "CHANGED HELPER"),
+        vnext_agent_document("Helper", "CHANGED HELPER")
+            .replace("authored/reviewer", "authored/helper"),
     )
     .unwrap();
     let after_child = trusted_resolve(tmp.path(), "pack")
@@ -2146,6 +2166,44 @@ fn package_rejects_mode_primary_private_subagent() {
 }
 
 #[test]
+fn package_rejects_private_identity_collisions_before_route_construction() {
+    fn package_error(children: &[(&str, &str)]) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents = project_agents_dir(tmp.path());
+        let pkg = agents.join("pack");
+        fs::create_dir_all(pkg.join("subagents")).unwrap();
+        fs::write(
+            pkg.join("agent.md"),
+            vnext_agent_document("Package root", "ROOT"),
+        )
+        .unwrap();
+        for (alias, agent_id) in children {
+            fs::write(
+                pkg.join("subagents").join(format!("{alias}.md")),
+                vnext_agent_document(alias, "CHILD").replace("authored/reviewer", agent_id),
+            )
+            .unwrap();
+        }
+        trusted_resolve(tmp.path(), "pack").unwrap_err().to_string()
+    }
+
+    let duplicate_id = package_error(&[
+        ("first", "authored/duplicate"),
+        ("second", "authored/duplicate"),
+    ]);
+    assert!(duplicate_id.contains("identity"), "{duplicate_id}");
+
+    let parent_collision = package_error(&[("helper", "authored/reviewer")]);
+    assert!(
+        parent_collision.contains("package root"),
+        "{parent_collision}"
+    );
+
+    let self_collision = package_error(&[(SELF_CHILD_REF, "authored/helper")]);
+    assert!(self_collision.contains("reserved self"), "{self_collision}");
+}
+
+#[test]
 fn nearest_project_wins_over_outer_project_agent_def() {
     let tmp = tempfile::tempdir().unwrap();
     let outer = tmp.path();
@@ -2213,7 +2271,7 @@ fn private_subagents_are_absent_from_inventory_listings() {
     .unwrap();
     fs::write(
         pkg.join("subagents").join("helper.md"),
-        vnext_agent_document("Helper", "HELPER"),
+        vnext_agent_document("Helper", "HELPER").replace("authored/reviewer", "authored/helper"),
     )
     .unwrap();
     let listings = trusted_list_all(tmp.path());
@@ -2241,7 +2299,7 @@ fn package_grant_prefers_private_child_identity() {
     fs::write(pkg.join("agent.md"), root).unwrap();
     fs::write(
         pkg.join("subagents").join("helper.md"),
-        vnext_agent_document("Helper", "HELPER"),
+        vnext_agent_document("Helper", "HELPER").replace("authored/reviewer", "authored/helper"),
     )
     .unwrap();
     let def = trusted_resolve(tmp.path(), "pack")

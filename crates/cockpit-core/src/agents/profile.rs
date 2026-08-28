@@ -737,16 +737,26 @@ pub fn resolve_agent_profile(
             offering.model_id == binding.model_id,
             "slot `{slot_id}` binding model does not match its selected provider offering"
         );
+        ensure!(
+            offering_is_compatible(slot, &offering, input.providers),
+            "slot `{slot_id}` default binding no longer satisfies hard model requirements"
+        );
+        if !slot.models.is_empty() {
+            ensure!(
+                slot.models.iter().any(|allowed| {
+                    allowed.provider_id == offering.provider_id
+                        && allowed.model_id == offering.model_id
+                }),
+                "slot `{slot_id}` default binding is outside its authored allowed model set"
+            );
+        }
         let mut choices = Vec::new();
         for live_binding in if explicit_bindings.is_empty() {
             vec![binding.clone()]
         } else {
             explicit_bindings
         } {
-            ensure!(
-                live_binding.hard_capability_verified,
-                "slot `{slot_id}` has an unverified live binding"
-            );
+            let is_default = live_binding.binding_id == binding.binding_id;
             let live_offering = offerings
                 .get(&(
                     live_binding.provider_profile_handle.clone(),
@@ -757,22 +767,30 @@ pub fn resolve_agent_profile(
                     fallback
                         .filter(|fallback| fallback.binding.binding_id == live_binding.binding_id)
                         .map(|fallback| fallback.offering.clone())
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!("slot `{slot_id}` references an unavailable provider profile")
-                })?;
-            ensure!(
-                offering_is_compatible(slot, &live_offering, input.providers),
-                "slot `{slot_id}` binding no longer satisfies hard model requirements"
-            );
-            if !slot.models.is_empty() {
+                });
+            let Some(live_offering) = live_offering else {
                 ensure!(
-                    slot.models
-                        .iter()
-                        .any(|allowed| allowed.provider_id == live_offering.provider_id
-                            && allowed.model_id == live_offering.model_id),
-                    "slot `{slot_id}` contains a binding outside its authored allowed model set"
+                    !is_default,
+                    "slot `{slot_id}` default binding references an unavailable provider profile"
                 );
+                continue;
+            };
+            let selectable = live_binding.hard_capability_verified
+                && offering_is_compatible(slot, &live_offering, input.providers)
+                && (slot.models.is_empty()
+                    || slot.models.iter().any(|allowed| {
+                        allowed.provider_id == live_offering.provider_id
+                            && allowed.model_id == live_offering.model_id
+                    }));
+            if !selectable {
+                ensure!(
+                    !is_default,
+                    "slot `{slot_id}` default binding is stale or unavailable"
+                );
+                // Alternates are selectable affordances, not profile
+                // authority. A stale alternate is omitted until rebind; it
+                // must not make an otherwise valid default unusable.
+                continue;
             }
             let live_recommendations =
                 resolve_recommendations(slot_id, &slot.suggested_models, &live_offering);
@@ -792,10 +810,6 @@ pub fn resolve_agent_profile(
             .find(|choice| choice.binding.is_default)
             .cloned()
             .context("resolved slot lost its default binding")?;
-        ensure!(
-            offering_is_compatible(slot, &offering, input.providers),
-            "slot `{slot_id}` binding no longer satisfies hard model requirements"
-        );
         let recommendations = resolve_recommendations(slot_id, &slot.suggested_models, &offering);
         let remaining_compatible_offerings =
             ranked_compatible_offerings(slot, &input.offerings, input.providers)
@@ -2020,6 +2034,49 @@ mod tests {
                 .iter()
                 .all(|recommendation| !recommendation.author_suggested)
         );
+    }
+
+    #[test]
+    fn agent_profile_resolution_omits_stale_alternate_but_requires_live_default() {
+        let definition = definition("");
+        let (catalog, installation_id, digest) = catalog(definition);
+        let providers = providers();
+        let default = binding(installation_id, digest.clone(), "model-a");
+        let mut stale_alternate = binding(installation_id, digest, "model-b");
+        stale_alternate.binding_id = Uuid::now_v7();
+        stale_alternate.is_default = false;
+
+        let profile = resolve_agent_profile(AgentProfileResolutionInput {
+            installation_id,
+            catalog: &catalog,
+            bindings: vec![default.clone(), stale_alternate],
+            offerings: vec![offering("model-a")],
+            utility_fallbacks: BTreeMap::new(),
+            providers: &providers,
+            host_policy: VnextHostPolicy::default(),
+            question_override: ProfileQuestionOverride::Inherit,
+            verification_reductions: BTreeMap::new(),
+        })
+        .expect("a stale alternate is omitted while the default remains valid");
+        assert_eq!(profile.slots["primary"].choices.len(), 1);
+        assert_eq!(
+            profile.slots["primary"].choice.binding.binding_id,
+            default.binding_id
+        );
+
+        let error = resolve_agent_profile(AgentProfileResolutionInput {
+            installation_id,
+            catalog: &catalog,
+            bindings: vec![default],
+            offerings: vec![offering("model-b")],
+            utility_fallbacks: BTreeMap::new(),
+            providers: &providers,
+            host_policy: VnextHostPolicy::default(),
+            question_override: ProfileQuestionOverride::Inherit,
+            verification_reductions: BTreeMap::new(),
+        })
+        .expect_err("an unavailable default must still fail closed");
+        assert!(error.to_string().contains("unavailable provider profile"));
     }
 
     #[test]

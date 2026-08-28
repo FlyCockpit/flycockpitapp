@@ -170,16 +170,25 @@ impl LocalInstallationResolver {
                 .expect("identity validated vNext")
                 .agent_id
                 .clone();
-            package_definitions.insert(
+            ensure_unique_package_definition_route(
+                &mut package_definitions,
                 (parent_id.clone(), SELF_CHILD_REF.to_string()),
                 definition.clone(),
-            );
+            )?;
             for (name, child) in &definition.private_subagents {
-                package_definitions.insert((parent_id.clone(), name.clone()), child.clone());
+                ensure_unique_package_definition_route(
+                    &mut package_definitions,
+                    (parent_id.clone(), name.clone()),
+                    child.clone(),
+                )?;
                 if let Some(child_vnext) = &child.vnext {
-                    package_definitions
-                        .entry((parent_id.clone(), child_vnext.agent_id.clone()))
-                        .or_insert_with(|| child.clone());
+                    if child_vnext.agent_id != *name {
+                        ensure_unique_package_definition_route(
+                            &mut package_definitions,
+                            (parent_id.clone(), child_vnext.agent_id.clone()),
+                            child.clone(),
+                        )?;
+                    }
                 }
             }
         }
@@ -596,11 +605,26 @@ impl LocalInstallationResolver {
         parent: &EffectiveVnextGrant,
         launch_target: &str,
     ) -> Result<Option<Uuid>> {
+        // `self` is an authored delegation token, not an installation launch
+        // target. Durable interactive and noninteractive publication must pin
+        // the child node to the already-authorized parent installation.
+        let requested_agent_id = if launch_target == SELF_CHILD_REF
+            && parent.delegation.as_ref().is_some_and(|delegation| {
+                delegation
+                    .allowed_children
+                    .iter()
+                    .any(AllowedChild::is_self)
+            }) {
+            Some(parent.agent_id.as_str())
+        } else {
+            None
+        };
         let matches = self
             .bindings
             .iter()
             .filter_map(|(installation_id, identity)| {
-                (identity.launch_target == launch_target
+                ((requested_agent_id == Some(identity.agent_id.as_str())
+                    || identity.launch_target == launch_target)
                     && self
                         .authorized_child_routes
                         .contains_key(&(parent.agent_id.clone(), identity.agent_id.clone())))
@@ -631,6 +655,20 @@ impl LocalInstallationResolver {
                 && bound.definition_digest == identity.definition_digest
         })
     }
+}
+
+fn ensure_unique_package_definition_route(
+    routes: &mut BTreeMap<(String, String), crate::agents::AgentDef>,
+    key: (String, String),
+    definition: crate::agents::AgentDef,
+) -> Result<()> {
+    ensure!(
+        routes.insert(key.clone(), definition).is_none(),
+        "package definition route `{}` -> `{}` is not unique",
+        key.0,
+        key.1
+    );
+    Ok(())
 }
 
 /// Deliberately bounded operational defaults for the daemon-owned vNext host
@@ -2548,6 +2586,13 @@ mod tests {
                 .installation_id_for_parent_launch_target(&grant, &external.name)
                 .unwrap(),
             Some(external_installation_id)
+        );
+        assert_eq!(
+            resolver
+                .installation_id_for_parent_launch_target(&grant, SELF_CHILD_REF)
+                .unwrap(),
+            Some(installation_id),
+            "literal self publication must pin the parent's authorized installation"
         );
     }
 

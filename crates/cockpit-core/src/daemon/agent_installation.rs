@@ -93,6 +93,10 @@ struct BindChoiceSet {
     /// owners and must never be reconstructed from, or exposed as, provider
     /// aliases in the wire DTO.
     routes: Vec<DurableBindingRoute>,
+    /// A concrete ModelSlot must retain its authored explicit/first default;
+    /// old/open-slot continuations derive the default from the submission.
+    #[serde(default)]
+    authored_default_required: bool,
     #[serde(default)]
     parent_receipt_status: Option<AgentInstallationReceiptStatusV1>,
     #[serde(default)]
@@ -110,6 +114,10 @@ struct DurableBindingRoute {
     slot_id: String,
     model_id: String,
     provider_profile_handle: String,
+    /// True when this route implements ModelSlot's explicit/first authored
+    /// default. Choice ids are positional aliases and never define this bit.
+    #[serde(default)]
+    authored_default: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2897,45 +2905,10 @@ impl AgentInstallationService {
                 .iter()
                 .find(|choice| choice.choice_id == submitted_choice)
                 .context("submitted installation choice was not offered")?;
-            let slot_routes = choice_set
-                .routes
-                .iter()
-                .filter(|route| route.slot_id == choice.slot_id)
-                .collect::<Vec<_>>();
-            ensure!(
-                !slot_routes.is_empty(),
-                "stored installation choice slot has no routes"
-            );
             let installation_id = Uuid::parse_str(&choice_set.installation_id)
                 .context("stored installation id is invalid")?;
-            let bindings = slot_routes
-                .iter()
-                .map(|route| {
-                    let slot_choice = choice_set
-                        .choices
-                        .iter()
-                        .find(|candidate| {
-                            candidate.slot_id == route.slot_id
-                                && candidate.choice_id == route.choice_id
-                                && candidate.model_id == route.model_id
-                        })
-                        .context("stored installation route has no selectable choice")?;
-                    ensure!(
-                        !route.provider_profile_handle.trim().is_empty(),
-                        "stored installation choice has no exact daemon-local profile route"
-                    );
-                    let payload = serde_json::to_vec(slot_choice)?;
-                    Ok(cockpit_db::db::agent_installations::AgentBindingInput {
-                        slot_id: route.slot_id.clone(),
-                        provider_profile_handle: route.provider_profile_handle.clone(),
-                        model_id: route.model_id.clone(),
-                        provenance_digest: sha256_hex(&payload),
-                        provenance_payload: payload,
-                        hard_capability_verified: true,
-                        is_default: route.choice_id == submitted_choice,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let bindings =
+                binding_inputs_for_submission(&choice_set, &choice.slot_id, submitted_choice)?;
             let outcome = self
                 .db
                 .bind_agent_slot_set(cockpit_db::db::agent_installations::AgentBindSlotSetInput {
@@ -3114,9 +3087,9 @@ impl AgentInstallationService {
             return Ok(receipt);
         }
         let (choices, unmatched_recommendations) = binding_choices(slot_id, slot, &ranked);
-        let routes = durable_binding_routes(&ranked, &choices)?;
+        let routes = durable_binding_routes(slot, &ranked, &choices)?;
         let automatic_choice = if request.auto_select_first_exact {
-            match first_exact_author_choice(&choices) {
+            match automatic_binding_choice(slot, &choices, &routes) {
                 Some(choice) => Some(choice),
                 None => {
                     let status = if slot_id == "primary" {
@@ -3156,6 +3129,7 @@ impl AgentInstallationService {
                     choices: choices.clone(),
                     unmatched_recommendations: unmatched_recommendations.clone(),
                     routes,
+                    authored_default_required: !slot.models.is_empty(),
                     parent_receipt_status,
                     parent_source_revision,
                     auto_choice_id: automatic_choice.clone(),
@@ -6340,6 +6314,7 @@ fn session_setup_revision(
 /// A wire choice only identifies the portable provider alias; a restart must
 /// never infer a credential-owning profile from that alias again.
 fn durable_binding_routes(
+    slot: &crate::agents::ModelSlot,
     compatible: &[crate::agents::AgentProfileModelOffering],
     choices: &[AgentInstallationChoiceV1],
 ) -> Result<Vec<DurableBindingRoute>> {
@@ -6364,11 +6339,23 @@ fn durable_binding_routes(
             matches.len() == 1 && !matches[0].trim().is_empty(),
             "selected installation choice has no exact daemon-local provider profile route"
         );
+        let offering = compatible
+            .iter()
+            .find(|offering| {
+                offering.provider_profile_handle.as_str() == matches[0].as_str()
+                    && offering.model_id.as_str() == choice.model_id.as_str()
+            })
+            .context("selected installation route offering disappeared")?;
+        let authored_default = slot.default_model().is_some_and(|default| {
+            default.provider_id.as_str() == offering.provider_id.as_str()
+                && default.model_id.as_str() == offering.model_id.as_str()
+        });
         routes.push(DurableBindingRoute {
             choice_id: choice.choice_id.clone(),
             slot_id: choice.slot_id.clone(),
             model_id: choice.model_id.clone(),
             provider_profile_handle: matches[0].clone(),
+            authored_default,
         });
     }
     Ok(routes)
@@ -6438,14 +6425,134 @@ pub(crate) fn resolvable_provider_handle_for_choice(
     }
 }
 
-/// `--yes` is deliberately narrower than normal interactive ranking. A
-/// locally available model is never an implicit default unless it preserves
-/// both an author suggestion and its exact declared alias.
+/// Legacy open-slot `--yes` is deliberately narrower than normal interactive
+/// ranking. Concrete `models` slots are handled by `automatic_binding_choice`.
 fn first_exact_author_choice(choices: &[AgentInstallationChoiceV1]) -> Option<String> {
     choices
         .iter()
         .find(|choice| choice.author_suggested && choice.exact_alias_match)
         .map(|choice| choice.choice_id.clone())
+}
+
+/// `--yes` follows the authored ModelSlot default when the slot declares a
+/// concrete model set. Suggested-model provenance is the legacy fallback only
+/// for an open slot.
+fn automatic_binding_choice(
+    slot: &crate::agents::ModelSlot,
+    choices: &[AgentInstallationChoiceV1],
+    routes: &[DurableBindingRoute],
+) -> Option<String> {
+    if slot.default_model().is_some() {
+        return choices
+            .iter()
+            .find(|choice| {
+                routes
+                    .iter()
+                    .any(|route| route.choice_id == choice.choice_id && route.authored_default)
+            })
+            .map(|choice| choice.choice_id.clone());
+    }
+    first_exact_author_choice(choices)
+}
+
+/// Reduce positional/recommendation choice aliases to the durable route set.
+/// The submitted choice selects a route, but a concrete ModelSlot retains its
+/// authored explicit/first default. Open slots retain the historical submitted
+/// choice default.
+fn binding_inputs_for_submission(
+    choice_set: &BindChoiceSet,
+    slot_id: &str,
+    submitted_choice: &str,
+) -> Result<Vec<cockpit_db::db::agent_installations::AgentBindingInput>> {
+    let slot_routes = choice_set
+        .routes
+        .iter()
+        .filter(|route| route.slot_id == slot_id)
+        .collect::<Vec<_>>();
+    ensure!(
+        !slot_routes.is_empty(),
+        "stored installation choice slot has no routes"
+    );
+    let submitted_route = slot_routes
+        .iter()
+        .find(|route| route.choice_id == submitted_choice)
+        .context("submitted installation choice has no durable route")?;
+    let submitted_key = (
+        submitted_route.provider_profile_handle.clone(),
+        submitted_route.model_id.clone(),
+    );
+
+    let mut durable = std::collections::BTreeMap::new();
+    for route in slot_routes {
+        ensure!(
+            !route.provider_profile_handle.trim().is_empty(),
+            "stored installation choice has no exact daemon-local profile route"
+        );
+        let slot_choice = choice_set
+            .choices
+            .iter()
+            .find(|candidate| {
+                candidate.slot_id == route.slot_id
+                    && candidate.choice_id == route.choice_id
+                    && candidate.model_id == route.model_id
+            })
+            .context("stored installation route has no selectable choice")?;
+        let key = (
+            route.provider_profile_handle.clone(),
+            route.model_id.clone(),
+        );
+        match durable.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((route, slot_choice));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                ensure!(
+                    entry.get().0.authored_default == route.authored_default,
+                    "choice aliases disagree about the authored slot default"
+                );
+                // Preserve the submitted alias as provenance for its durable
+                // route; otherwise stable choice order supplies the evidence.
+                if route.choice_id == submitted_choice {
+                    entry.insert((route, slot_choice));
+                }
+            }
+        }
+    }
+
+    let authored_defaults = durable
+        .iter()
+        .filter(|(_, (route, _))| choice_set.authored_default_required && route.authored_default)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    ensure!(
+        authored_defaults.len() <= 1,
+        "authored slot default resolves to multiple durable provider routes"
+    );
+    ensure!(
+        !choice_set.authored_default_required || authored_defaults.len() == 1,
+        "concrete model slot has no unique durable authored default route"
+    );
+    let default_key = authored_defaults.first().cloned().unwrap_or(submitted_key);
+    let bindings = durable
+        .into_iter()
+        .map(|(key, (route, slot_choice))| {
+            let payload = serde_json::to_vec(slot_choice)?;
+            Ok(cockpit_db::db::agent_installations::AgentBindingInput {
+                slot_id: route.slot_id.clone(),
+                provider_profile_handle: route.provider_profile_handle.clone(),
+                model_id: route.model_id.clone(),
+                provenance_digest: sha256_hex(&payload),
+                provenance_payload: payload,
+                hard_capability_verified: true,
+                is_default: key == default_key,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        bindings.iter().filter(|binding| binding.is_default).count() == 1,
+        "binding set must retain exactly one durable default"
+    );
+    Ok(bindings)
 }
 
 fn terminal_bind_refusal_code(
@@ -6491,10 +6598,13 @@ fn validate_durable_choice_set(choice_set: &BindChoiceSet) -> Result<()> {
         ensure!(
             choice_set.choices.iter().any(|choice| {
                 choice.choice_id == auto_choice_id
-                    && choice.author_suggested
-                    && choice.exact_alias_match
+                    && ((choice.author_suggested && choice.exact_alias_match)
+                        || (choice_set.authored_default_required
+                            && choice_set.routes.iter().any(|route| {
+                                route.choice_id == choice.choice_id && route.authored_default
+                            })))
             }),
-            "stored automatic installation choice is not an exact author route"
+            "stored automatic installation choice is not an authored default/exact route"
         );
     }
     let mut route_ids = std::collections::BTreeSet::new();
@@ -8005,7 +8115,9 @@ mod tests {
                 slot_id: "primary".into(),
                 model_id: "model".into(),
                 provider_profile_handle: "opaque-profile-handle".into(),
+                authored_default: false,
             }],
+            authored_default_required: false,
             parent_receipt_status: match requested_operation {
                 AgentInstallationOperationKind::Install => {
                     Some(AgentInstallationReceiptStatusV1::Installed)
@@ -11110,7 +11222,8 @@ mod tests {
         }
         let ranked = crate::agents::ranked_compatible_offerings(&slot, &offerings, &providers);
         let (choices, _) = binding_choices("primary", &slot, &ranked);
-        let routes = durable_binding_routes(&ranked, &choices).expect("exact durable routes");
+        let routes =
+            durable_binding_routes(&slot, &ranked, &choices).expect("exact durable routes");
         assert_eq!(routes.len(), 2);
         assert_eq!(
             routes
@@ -11149,6 +11262,7 @@ mod tests {
             choices,
             unmatched_recommendations: vec![],
             routes,
+            authored_default_required: false,
             parent_receipt_status: None,
             parent_source_revision: None,
             auto_choice_id: None,
@@ -11159,8 +11273,105 @@ mod tests {
             slot_id: persisted.routes[0].slot_id.clone(),
             model_id: persisted.routes[0].model_id.clone(),
             provider_profile_handle: "profile-other".into(),
+            authored_default: false,
         });
         assert!(validate_durable_choice_set(&persisted).is_err());
+    }
+
+    #[test]
+    fn binding_submission_deduplicates_choice_aliases_and_preserves_authored_default() {
+        let offerings = vec![
+            AgentProfileModelOffering {
+                offering_id: "route-a".into(),
+                provider_profile_handle: "profile".into(),
+                provider_id: "vendor".into(),
+                model_id: "model-a".into(),
+            },
+            AgentProfileModelOffering {
+                offering_id: "route-b".into(),
+                provider_profile_handle: "profile".into(),
+                provider_id: "vendor".into(),
+                model_id: "model-b".into(),
+            },
+        ];
+        let mut authored_slot = slot(vec![ModelCapability::TextGeneration], vec![]);
+        authored_slot.models = vec![
+            crate::agents::SlotModelRef {
+                provider_id: "vendor".into(),
+                model_id: "model-a".into(),
+                default: false,
+            },
+            crate::agents::SlotModelRef {
+                provider_id: "vendor".into(),
+                model_id: "model-b".into(),
+                default: false,
+            },
+        ];
+        let (choices, _) = binding_choices("primary", &authored_slot, &offerings);
+        let routes = durable_binding_routes(&authored_slot, &offerings, &choices).unwrap();
+        assert_eq!(
+            automatic_binding_choice(&authored_slot, &choices, &routes).as_deref(),
+            Some(choices[0].choice_id.as_str()),
+            "--yes must select the first authored model without suggestedModels"
+        );
+        let mut choice_set = BindChoiceSet {
+            installation_id: Uuid::new_v4().to_string(),
+            definition_digest: "digest".into(),
+            expected_observation_revision: 1,
+            expected_binding_revision: None,
+            choices: choices.clone(),
+            unmatched_recommendations: vec![],
+            routes,
+            authored_default_required: true,
+            parent_receipt_status: None,
+            parent_source_revision: None,
+            auto_choice_id: None,
+        };
+        choice_set.auto_choice_id = Some(choices[0].choice_id.clone());
+        assert!(validate_durable_choice_set(&choice_set).is_ok());
+        choice_set.auto_choice_id = None;
+        let bindings =
+            binding_inputs_for_submission(&choice_set, "primary", &choices[1].choice_id).unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert!(
+            bindings
+                .iter()
+                .find(|binding| binding.model_id == "model-a")
+                .is_some_and(|binding| binding.is_default),
+            "selecting an alternate route must not redefine the authored default"
+        );
+
+        let alias_slot = slot(
+            vec![ModelCapability::TextGeneration],
+            vec![
+                recommendation("first", "upstream/one", &[("vendor", "model-a")]),
+                recommendation("second", "upstream/two", &[("vendor", "model-a")]),
+            ],
+        );
+        let alias_offerings = &offerings[..1];
+        let (alias_choices, _) = binding_choices("primary", &alias_slot, alias_offerings);
+        let alias_routes =
+            durable_binding_routes(&alias_slot, alias_offerings, &alias_choices).unwrap();
+        let alias_set = BindChoiceSet {
+            choices: alias_choices.clone(),
+            routes: alias_routes,
+            authored_default_required: false,
+            ..choice_set
+        };
+        let alias_bindings =
+            binding_inputs_for_submission(&alias_set, "primary", &alias_choices[1].choice_id)
+                .unwrap();
+        assert_eq!(alias_bindings.len(), 1);
+        assert!(alias_bindings[0].is_default);
+        assert_eq!(
+            serde_json::from_slice::<AgentInstallationChoiceV1>(
+                &alias_bindings[0].provenance_payload
+            )
+            .unwrap()
+            .choice_id,
+            alias_choices[1].choice_id,
+            "submitted alias supplies provenance for its deduplicated durable route"
+        );
     }
 
     #[test]
@@ -11177,7 +11388,7 @@ mod tests {
         assert_eq!(choices[0].provider_id, "configured-provider-0");
         let wire = serde_json::to_string(&choices).expect("wire choices");
         assert!(!wire.contains("profile-secret"));
-        let routes = durable_binding_routes(&offerings, &choices).expect("durable route");
+        let routes = durable_binding_routes(&slot, &offerings, &choices).expect("durable route");
         assert_eq!(routes[0].provider_profile_handle, "profile-secret");
     }
 

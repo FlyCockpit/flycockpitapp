@@ -1093,15 +1093,30 @@ impl AgentDef {
                         bail!("package-private subagent `{name}` is not unique");
                     }
                     if child_vnext.agent_id != *name {
-                        delegation
-                            .package_children
-                            .entry(child_vnext.agent_id.clone())
-                            .or_insert_with(|| child_vnext.agent_id.clone());
+                        ensure!(
+                            delegation
+                                .package_children
+                                .insert(child_vnext.agent_id.clone(), child_vnext.agent_id.clone())
+                                .is_none(),
+                            "package-private subagent identity `{}` is not unique",
+                            child_vnext.agent_id
+                        );
                     }
-                    package_definitions.insert(name.clone(), child.clone());
-                    package_definitions
-                        .entry(child_vnext.agent_id.clone())
-                        .or_insert_with(|| child.clone());
+                    ensure!(
+                        package_definitions
+                            .insert(name.clone(), child.clone())
+                            .is_none(),
+                        "package-private subagent route `{name}` is not unique"
+                    );
+                    if child_vnext.agent_id != *name {
+                        ensure!(
+                            package_definitions
+                                .insert(child_vnext.agent_id.clone(), child.clone())
+                                .is_none(),
+                            "package-private subagent route `{}` is not unique",
+                            child_vnext.agent_id
+                        );
+                    }
                 }
             }
             if delegation
@@ -1638,21 +1653,16 @@ pub fn load_profile_definition_from_owned_path(
             }
             AgentProfileInstallationSource::Global
             | AgentProfileInstallationSource::WorkspacePrivate
-                if profile_definition_scope(source, &installation.source_agent_id)
-                    == DefinitionScope::DaemonLocal =>
-            {
-                // These records are daemon-local state.  In particular, they
-                // retain the local-installation child-reference contract and may
-                // not be parsed through ordinary workspace discovery.
-                load_daemon_local_named_from_file(owned_path, launch_target)?
-            }
-            AgentProfileInstallationSource::Global
-            | AgentProfileInstallationSource::WorkspacePrivate
             | AgentProfileInstallationSource::WorkspaceShared => {
-                // The logical parse name is daemon-owned source metadata, not a
-                // user-facing display name.  The vNext identity check below is
-                // the authority boundary.
-                load_workspace_named_from_file(owned_path, launch_target)?
+                // The logical parse name and scope are daemon-owned metadata.
+                // Read the retained leaf through the no-follow owned-path
+                // loader: package children must never be reopened through the
+                // ordinary workspace loader after the package tree was read.
+                load_owned_definition(
+                    owned_path,
+                    launch_target,
+                    profile_definition_scope(source, &installation.source_agent_id),
+                )?
             }
         }
     };
@@ -1751,7 +1761,9 @@ pub(crate) fn load_owned_definition(
         "owned agent definition exceeds the per-file limit"
     );
     let text = std::str::from_utf8(&bytes).context("owned agent definition is not UTF-8")?;
-    parse_agent_with_scope(text, name, path.to_path_buf(), scope)
+    let def = parse_agent_with_scope(text, name, path.to_path_buf(), scope)?;
+    validate_loaded_def(&def)?;
+    Ok(def)
 }
 
 fn load_package(agent_dir: &Path, name: &str, scope: DefinitionScope) -> Result<AgentDef> {
@@ -1770,10 +1782,29 @@ fn load_package(agent_dir: &Path, name: &str, scope: DefinitionScope) -> Result<
         )
     })?;
     let mut base = parse_agent_with_scope(text, name, agent_dir.join(PACKAGE_ROOT_FILE), scope)?;
+    ensure!(
+        name != SELF_CHILD_REF,
+        "agent package `{name}` uses the reserved self-delegation identity"
+    );
+
+    // Validate the complete route namespace before constructing any route
+    // maps. Both a filename alias and an authored agentId select a private
+    // child, so either may collide with another child, the parent, or `self`.
+    let mut package_identities = BTreeMap::new();
+    package_identities.insert(
+        SELF_CHILD_REF.to_string(),
+        "the reserved self route".to_string(),
+    );
+    package_identities.insert(name.to_string(), "the package root alias".to_string());
+    if let Some(root) = &base.vnext {
+        package_identities.insert(
+            root.agent_id.clone(),
+            "the package root agentId".to_string(),
+        );
+    }
 
     let mut overrides = BTreeMap::new();
     let mut private_subagents = BTreeMap::new();
-    let mut seen_subagent_ids = BTreeSet::new();
     for (rel, bytes) in &files {
         if rel == PACKAGE_ROOT_FILE || rel == PACKAGE_MCP_FILE {
             continue;
@@ -1786,12 +1817,6 @@ fn load_package(agent_dir: &Path, name: &str, scope: DefinitionScope) -> Result<
             if child == name {
                 bail!(
                     "agent package `{name}` ({}) has a private subagent that reuses the package name",
-                    agent_dir.display()
-                );
-            }
-            if !seen_subagent_ids.insert(child.to_string()) {
-                bail!(
-                    "agent package `{name}` ({}) has duplicate private subagent `{child}`",
                     agent_dir.display()
                 );
             }
@@ -1814,6 +1839,24 @@ fn load_package(agent_dir: &Path, name: &str, scope: DefinitionScope) -> Result<
                 );
             }
             validate_invariants(&child_def)?;
+            let child_vnext = child_def.vnext.as_ref().with_context(|| {
+                format!(
+                    "agent package `{name}` private subagent `{child}` must be a vNext definition"
+                )
+            })?;
+            let child_identities =
+                BTreeSet::from([child.to_string(), child_vnext.agent_id.clone()]);
+            for identity in child_identities {
+                if let Some(owner) = package_identities.get(&identity) {
+                    bail!(
+                        "agent package `{name}` private subagent `{child}` identity `{identity}` collides with {owner}"
+                    );
+                }
+                package_identities.insert(
+                    identity,
+                    format!("private subagent `{child}` alias/agentId"),
+                );
+            }
             if private_subagents
                 .insert(child.to_string(), child_def)
                 .is_some()
@@ -2210,16 +2253,18 @@ fn resolve_inner(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
         }
         return Ok(None);
     }
-    for dir in agent_search_dirs(cwd) {
-        let candidate = agent_path_in(&dir, name);
+    if let Some(candidate) = find_override(cwd, name) {
         if candidate.is_dir() {
+            let dir = candidate
+                .parent()
+                .context("agent package override has no parent directory")?;
             // Directory form: load every per-model-slot override file present.
             // Built-in packages retain override provenance only after their
             // trusted cockpit/* identity has been checked explicitly.
             return Ok(Some(if is_builtin_agent(name) {
-                load_builtin_override_from_dir(&dir, name)?
+                load_builtin_override_from_dir(dir, name)?
             } else {
-                load_from_dir(&dir, name, DefinitionScope::Workspace)?
+                load_from_dir(dir, name, DefinitionScope::Workspace)?
             }));
         }
         if candidate.is_file() {

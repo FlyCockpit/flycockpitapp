@@ -638,6 +638,21 @@ impl DeferredTurnPlan {
         .await
     }
 
+    /// Take a nested-runner plan only after its paired terminal row has
+    /// committed. Persist-on-re-entry is the sole writer for still-unsettled
+    /// in-flight sources; a persist failure must leave this owner in place
+    /// rather than dropping the plan via `take` on the error path.
+    pub(crate) async fn take_after_persisting_terminal_result(
+        owner: &mut Option<Self>,
+        message: &Message,
+    ) -> Result<Option<Self>> {
+        let Some(plan) = owner.as_mut() else {
+            return Ok(None);
+        };
+        plan.persist_terminal_result_from_message(message).await?;
+        Ok(owner.take())
+    }
+
     async fn record_terminal_with_body(
         &mut self,
         scheduled: &turn_scheduler::ScheduledCall,
@@ -4258,6 +4273,135 @@ mod tests {
         );
         assert_eq!(later.terminal_outcome, None);
         assert_eq!(later.terminal_result_body, None);
+    }
+
+    #[tokio::test]
+    async fn take_after_persisting_terminal_result_retains_owner_on_persist_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call("parked", "unknown_a", serde_json::json!({})),
+                identified_ordinary_call("later", "unknown_b", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.set_cursor_for_tests(2);
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let parked = continuations
+            .iter()
+            .find(|row| row.call_id == "parked")
+            .expect("parked continuation");
+        session
+            .db
+            .settle_turn_scheduler_call(
+                session.id,
+                parked.turn_id,
+                "parked".to_string(),
+                turn_scheduler::SchedulerTerminalOutcome::Transitioned
+                    .as_str()
+                    .to_string(),
+                "already settled by a racing writer".to_string(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+
+        let replay = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked",
+            None,
+            Some("fn-parked".to_string()),
+            "unknown_a",
+            "user answered the parked question",
+        );
+        let mut owner = Some(plan);
+        let error = DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &replay)
+            .await
+            .expect_err("CAS against an already-settled row must fail");
+        assert!(
+            owner.is_some(),
+            "persist failure must leave the nested-runner owner in place: {error:#}"
+        );
+        assert!(
+            owner
+                .as_ref()
+                .expect("owner retained")
+                .has_unsettled_claimed_calls(),
+            "failed persist must not mark the parked call settled in memory"
+        );
+        let parked = list_scheduler_continuations(&session)
+            .await
+            .into_iter()
+            .find(|row| row.call_id == "parked")
+            .expect("parked continuation");
+        assert_eq!(
+            parked.terminal_result_body.as_deref(),
+            Some("already settled by a racing writer"),
+            "failed persist must not overwrite the durable row"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_after_persisting_terminal_result_takes_only_after_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![identified_ordinary_call(
+                "parked",
+                "unknown_a",
+                serde_json::json!({}),
+            )],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.set_cursor_for_tests(1);
+
+        let replay = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked",
+            None,
+            Some("fn-parked".to_string()),
+            "unknown_a",
+            "user answered the parked question",
+        );
+        let mut owner = Some(plan);
+        let taken = DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &replay)
+            .await
+            .unwrap()
+            .expect("persist success must yield the committed plan");
+        assert!(
+            owner.is_none(),
+            "persist success is the only point at which the owner may be taken"
+        );
+        assert!(
+            !taken.has_unsettled_claimed_calls(),
+            "the taken plan must already include the CAS-settled parked call"
+        );
+        let parked = list_scheduler_continuations(&session)
+            .await
+            .into_iter()
+            .find(|row| row.call_id == "parked")
+            .expect("parked continuation");
+        assert_eq!(parked.terminal_outcome.as_deref(), Some("transitioned"));
+        assert_eq!(
+            parked.terminal_result_body.as_deref(),
+            Some("user answered the parked question")
+        );
     }
 
     #[tokio::test]

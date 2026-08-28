@@ -9904,17 +9904,28 @@ pub(crate) async fn run_noninteractive_resumable(
         // inference.md`). Passed into `turn`, which dispatches the shadows from
         // the exact post-redaction body; a pure DB-only observer that never
         // enters the child's history or affects its loop. `None`/empty = off.
-        let mut outcome = if let Some(mut plan) = pending_scheduled_turn.take() {
-            plan.persist_terminal_result_from_message(&next_prompt)
-                .await
-                .map_err(|error| {
-                    NoninteractiveRunError::new(
-                        error,
-                        history.clone(),
-                        fallback_decision.clone(),
-                        fallback_tried.clone(),
-                    )
-                })?;
+        // Keep the continuation owned until its exact paired terminal row has
+        // committed. A persist failure must leave the plan in
+        // `pending_scheduled_turn` rather than dropping it via `take` on the
+        // error path. Restore the popped result into the error history so the
+        // snapshot still has the pair; persist-on-re-entry remains the writer
+        // and remainder is not invoked here.
+        let mut outcome = if let Some(mut plan) =
+            crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
+                &mut pending_scheduled_turn,
+                &next_prompt,
+            )
+            .await
+            .map_err(|error| {
+                let mut failed_history = history.clone();
+                failed_history.push(next_prompt.clone());
+                NoninteractiveRunError::new(
+                    error,
+                    failed_history,
+                    fallback_decision.clone(),
+                    fallback_tried.clone(),
+                )
+            })? {
             history.push(next_prompt.clone());
             let result = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(

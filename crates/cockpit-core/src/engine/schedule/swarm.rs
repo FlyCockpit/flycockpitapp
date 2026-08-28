@@ -360,9 +360,17 @@ async fn run_swarm_loop(
 
     let mut pending_scheduled_turn = None;
     for _ in 0..SWARM_MAX_TURNS {
-        let mut outcome = if let Some(mut plan) = pending_scheduled_turn.take() {
-            plan.persist_terminal_result_from_message(&next_prompt)
-                .await?;
+        // Keep the continuation owned until its exact paired terminal row has
+        // committed. A persist failure must leave the plan in
+        // `pending_scheduled_turn` rather than dropping it via `take` on the
+        // error path.
+        let mut outcome = if let Some(mut plan) =
+            crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
+                &mut pending_scheduled_turn,
+                &next_prompt,
+            )
+            .await?
+        {
             history.push(next_prompt);
             let result = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(

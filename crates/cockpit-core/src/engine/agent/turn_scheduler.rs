@@ -866,6 +866,26 @@ mod tests {
         );
     }
 
+    /// Nested persist-on-re-entry must persist while the plan is still in
+    /// `pending_scheduled_turn` and take only after that CAS commits. Taking
+    /// first drops the only in-memory owner when persist fails.
+    #[test]
+    fn nested_persist_on_reentry_takes_plan_only_after_persist() {
+        for source in [
+            include_str!("../driver/noninteractive.rs"),
+            include_str!("../schedule/swarm.rs"),
+        ] {
+            assert!(
+                source.contains("take_after_persisting_terminal_result"),
+                "nested persist-on-re-entry must take the plan only after persist commits"
+            );
+            assert!(
+                !source.contains("persist_terminal_result_from_message"),
+                "nested runners must not persist-on-re-entry after taking the plan"
+            );
+        }
+    }
+
     /// The event payload never contains tool arguments or provider bodies.
     #[test]
     fn event_payload_omits_args_and_bodies() {

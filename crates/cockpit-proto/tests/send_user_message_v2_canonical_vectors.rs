@@ -50,13 +50,16 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
         "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
     ))
     .unwrap();
-    let command = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][0]["fcm2_hex"]
+    let mut command = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][0]["fcm2_hex"]
         .as_str()
         .unwrap()))
     .unwrap()
     .request;
     let request_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000001").unwrap();
     let operation_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000002").unwrap();
+    // Canonical FCM2 vectors may use placeholder v4 UUIDs; ingress identities
+    // are RFC UUIDv7 and must stay pairwise distinct from request/operation.
+    command.client_submission_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000003").unwrap();
     let validated = LocalOwnerDirectSendUserMessageV2 {
         operation_id,
         session_locator: "opaque-session".into(),

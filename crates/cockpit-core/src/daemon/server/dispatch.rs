@@ -2661,6 +2661,12 @@ async fn handle_send_user_message_v2(
     ingress: crate::proto_crate::send_user_message_v2::MessageIngressV2,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    if ctx.shutdown.is_draining() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: "daemon is shutting down; not accepting new messages".into(),
+        });
+    }
     // TODO(#69, remote): the `authenticated_remote_operation` branch must be
     // decoded only through the registered opaque FCM2 FCOR path with a bound
     // verified remote principal and the transactional remote-operation ledger.
@@ -2705,6 +2711,10 @@ async fn handle_send_user_message_v2(
             message: "message ingress session locator does not match the attached session".into(),
         });
     }
+    // Receipt tables foreign-key to `sessions`. Lazy attach holds the id in
+    // memory only; flush before the acceptance transaction so a first V2 send
+    // cannot commit a receipt against a missing parent row.
+    attached.handle.persist_if_needed().map_err(internal)?;
     let authoritative_model = attached.handle.authoritative_active_model_state();
     let request = validated.command;
     if request.text.len() > INLINE_USER_TEXT_BYTES {
@@ -2827,6 +2837,42 @@ async fn handle_send_user_message_v2(
         })
         .transpose()?;
     let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Some(terminal) = ctx
+        .db
+        .client_submission_terminal_receipt(session_id, request.client_submission_id)
+        .await
+        .map_err(internal)?
+    {
+        let mut probe = crate::engine::message::UserSubmission::text(request.text.clone());
+        probe.display_text = request.display_text.clone();
+        probe.tag_expansions = request
+            .tag_expansions
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
+        probe.forced_skill = request.forced_skill.clone();
+        probe.origin_principal = state.principal.tag();
+        if terminal.origin_principal.as_deref() != probe.origin_principal.as_deref()
+            || terminal.fingerprint != probe.client_fingerprint()
+        {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!(
+                    "client_submission_id {} was already used for a different payload",
+                    request.client_submission_id
+                ),
+            });
+        }
+        return Err(ErrorPayload {
+            code: ErrorCode::UserMessageTerminated,
+            message: format!(
+                "client_submission_id {} is terminal ({}) and will not be executed",
+                request.client_submission_id,
+                terminal.disposition.as_str()
+            ),
+        });
+    }
     let attachments = request
         .attachments
         .iter()
@@ -3019,27 +3065,12 @@ async fn handle_send_user_message_v2(
     match result {
         Ok(response) => Ok(response),
         Err(error) => {
+            // The durable V2 receipt already committed. Keep the worker's
+            // exact pre-engine diagnostic so resume-repair, drain, and
+            // terminal-UUID probes stay retryable with the original code.
+            // Only media acquisition (above) terminalizes a failed handoff.
             tracing::warn!(code = ?error.code, %session_id, "accepted V2 worker handoff failed");
-            ctx.db
-                .terminate_accepted_message(
-                    session_id,
-                    *request.client_submission_id.as_bytes(),
-                    crate::db::db::message_attachments::TerminalMessageState::TerminalRejected,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .await
-                .map_err(internal)?;
-            if let Err(cleanup_error) = ctx
-                .media_ledger
-                .return_downstream_ownership(&request.client_submission_id.to_string())
-                .await
-            {
-                tracing::warn!(%cleanup_error, %session_id, "failed V2 handoff media ownership cleanup remains retryable");
-            }
-            Err(ErrorPayload {
-                code: ErrorCode::UserMessageTerminated,
-                message: "message was durably rejected after acceptance".into(),
-            })
+            Err(error)
         }
     }
 }

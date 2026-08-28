@@ -14784,16 +14784,10 @@ async fn attached_state_with_worker_receiver(
     );
     let locks = Arc::new(LockManager::in_memory(ctx.db.clone()));
     let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
-    // Image-capable stub catalog first; the trust transition then tags this
-    // existing projection with the durable revision. Bare test handles start
-    // at revision 0, which `SetDefaultModel` now refuses at its attach-time fence.
-    handle.set_full_config_snapshot_for_tests(
-        crate::daemon::session_worker::SessionConfigSnapshot::new(
-            0,
-            stub_providers_config(),
-            crate::config::extended::ExtendedConfig::default(),
-        ),
-    );
+    // Project the context's config source (image-capable stub for default
+    // `test_ctx`, or a test-authored catalog) before tagging the snapshot
+    // with the durable trust revision. Bare test handles start at revision 0,
+    // which `SetDefaultModel` now refuses at its attach-time fence.
     let resolved_trust =
         crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
             &ctx.db,
@@ -14801,6 +14795,18 @@ async fn attached_state_with_worker_receiver(
         )
         .await
         .expect("attached test helper seeds the durable workspace trust revision");
+    let (providers, extended) = ctx
+        .config_source()
+        .load_effective_for_daemon(std::path::Path::new(&project_root), &resolved_trust.policy)
+        .unwrap_or_else(|_| {
+            (
+                stub_providers_config(),
+                crate::config::extended::ExtendedConfig::default(),
+            )
+        });
+    handle.set_full_config_snapshot_for_tests(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(0, providers, extended),
+    );
     let publication = handle.begin_trust_transition(&resolved_trust).await;
     assert!(handle.complete_trust_transition_for_test(resolved_trust.revision));
     drop(publication);
@@ -17536,7 +17542,7 @@ async fn dispatch_authz_request_after(
             .expect("revoke shared session before authz matrix request");
     }
 
-    let id = Uuid::new_v4();
+    let id = Uuid::now_v7();
     client
         .send(&Envelope::request(id, request))
         .await
@@ -17624,7 +17630,7 @@ async fn dispatch_matrix_request_after_collect_events(
             .expect("prelude request succeeds");
     }
 
-    let id = Uuid::new_v4();
+    let id = Uuid::now_v7();
     client
         .send(&Envelope::request(id, request))
         .await
@@ -20967,7 +20973,7 @@ async fn dispatch_attached_worker_request(
         "unexpected attach hydration: {hydration:?}"
     );
 
-    let id = Uuid::new_v4();
+    let id = Uuid::now_v7();
     client
         .send(&Envelope::request(id, request))
         .await
